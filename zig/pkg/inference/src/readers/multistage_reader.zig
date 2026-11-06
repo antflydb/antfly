@@ -28,24 +28,20 @@ const AssetResolver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     canonical_root: []u8,
+    published: @import("../registry/published_artifacts.zig").PublishedArtifacts,
 
     fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         model_path: []const u8,
     ) !AssetResolver {
-        return .{
-            .allocator = allocator,
-            .io = io,
-            .canonical_root = try realPathAlloc(
-                allocator,
-                io,
-                model_path,
-            ),
-        };
+        const canonical_root = try realPathAlloc(allocator, io, model_path);
+        errdefer allocator.free(canonical_root);
+        return .{ .allocator = allocator, .io = io, .canonical_root = canonical_root, .published = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, io, model_path, null) };
     }
 
     pub fn deinit(self: *AssetResolver) void {
+        self.published.deinit();
         self.allocator.free(self.canonical_root);
         self.* = undefined;
     }
@@ -53,19 +49,12 @@ const AssetResolver = struct {
     fn resolve(self: *const AssetResolver, relative: []const u8) ![]u8 {
         if (!metadata_mod.isSafeRelativeAssetPath(relative))
             return error.InvalidMetadata;
-        const joined = try std.fs.path.join(
-            self.allocator,
-            &.{ self.canonical_root, relative },
-        );
-        defer self.allocator.free(joined);
-        const canonical = try realPathAlloc(
-            self.allocator,
-            self.io,
-            joined,
-        );
+        const canonical = (self.published.resolve(relative) catch |err| switch (err) {
+            error.ModelArtifactOutsideRoot => return error.ModelAssetOutsideRoot,
+            else => return err,
+        }) orelse return error.FileNotFound;
         errdefer self.allocator.free(canonical);
-        if (!pathIsWithinRoot(self.canonical_root, canonical))
-            return error.ModelAssetOutsideRoot;
+        try self.published.verifyFile(relative);
         return canonical;
     }
 };
@@ -125,6 +114,9 @@ pub const LoadedMultiStageReader = struct {
             model_path,
         );
         defer asset_resolver.deinit();
+        if (control) |active| if (active.model_selection) |selected| {
+            if (!selected.matches(model_path) or !std.meta.eql(selected.publication, asset_resolver.published.publication)) return error.ModelArtifactsChanging;
+        };
         const component_paths = try collectComponentPaths(
             allocator,
             &asset_resolver,
@@ -135,6 +127,14 @@ pub const LoadedMultiStageReader = struct {
             allocator.free(component_paths);
         }
 
+        // Authenticate graph-owned external tensors before importer/session
+        // construction. Directory containment alone does not prove membership.
+        for (component_paths) |path| {
+            if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+            var graph = try backends.imported_onnx_session.inspectArtifactSet(allocator, path);
+            defer graph.deinit();
+            for (graph.external_paths) |external| try asset_resolver.published.verifyPath(external);
+        }
         var component_loader = try model_manager.componentLoaderForPathsWithContract(
             model_path,
             session_manager.preferred_backends,
@@ -152,7 +152,7 @@ pub const LoadedMultiStageReader = struct {
         var first_err: ?anyerror = null;
         for (component_loader.preferredBackends()) |backend| {
             var backend_loader = try component_loader.restrictToBackend(backend);
-            return loadFromDirWithSessionManager(
+            var result = loadFromDirWithSessionManager(
                 allocator,
                 model_path,
                 &asset_resolver,
@@ -170,6 +170,9 @@ pub const LoadedMultiStageReader = struct {
                 std.log.err("multistage reader backend {s} failed for {s}: {s}", .{ @tagName(backend), model_path, @errorName(err) });
                 continue;
             };
+            errdefer result.deinit();
+            try asset_resolver.published.verify();
+            return result;
         }
 
         return first_err orelse error.NoBackendAvailable;

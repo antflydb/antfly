@@ -1,0 +1,113 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! One constant-size freshness token for a model store. Publishers serialize
+//! only directory publication/recovery, never network download. Readers reject
+//! an active/crashed publication instead of caching a partial alias inventory.
+const std = @import("std");
+const download = @import("download.zig");
+pub const filename = ".antfly-catalog-generation";
+pub const Generation = struct {
+    kind: enum { legacy, publication, snapshot } = .legacy,
+    digest: [32]u8 = @splat(0),
+};
+pub fn read(a: std.mem.Allocator, io: std.Io, root: []const u8) !Generation {
+    for ([_][]const u8{ filename, "COMPLETE" }, 0..) |name, index| {
+        const path = try std.fs.path.join(a, &.{ root, name });
+        defer a.free(path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096)) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue,
+            else => return err,
+        };
+        defer a.free(bytes);
+        if (index == 0) {
+            if (bytes.len != 71 or !std.mem.startsWith(u8, bytes, "stable:")) return error.ModelArtifactsChanging;
+            for (bytes[7..]) |c| if (!std.ascii.isHex(c)) return error.ModelArtifactsChanging;
+        } else if (std.mem.indexOf(u8, bytes, "CATALOG.json") == null or std.mem.indexOf(u8, bytes, "SHA256SUMS") == null) return error.IncompleteManagedDownload;
+        // COMPLETE is the immutable GCS snapshot publication boundary, already
+        // checked by the snapshot checksum gate. Mutable legacy roots without
+        // either contract retain the conservative directory-watch fallback.
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return .{ .kind = if (index == 0) .publication else .snapshot, .digest = digest };
+    }
+    return .{};
+}
+
+pub fn require(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: Generation) !void {
+    if (!std.meta.eql(expected, try read(a, io, root))) return error.ModelArtifactsChanging;
+}
+
+pub const Publication = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []u8,
+    lock: std.Io.File,
+    finished: bool = false,
+
+    pub fn begin(a: std.mem.Allocator, io: std.Io, root: []const u8) !Publication {
+        const lock_path = try std.fs.path.join(a, &.{ root, ".antfly-catalog.lock" });
+        defer a.free(lock_path);
+        const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive });
+        errdefer lock.close(io);
+        const path = try std.fs.path.join(a, &.{ root, filename });
+        errdefer a.free(path);
+        try download.writeFileAtomically(a, io, path, "publishing\n");
+        return .{ .allocator = a, .io = io, .path = path, .lock = lock };
+    }
+    pub fn finish(self: *Publication) !void {
+        if (self.finished) return;
+        var random: [32]u8 = undefined;
+        self.io.random(&random);
+        const bytes = "stable:" ++ std.fmt.bytesToHex(random, .lower);
+        try download.writeFileAtomically(self.allocator, self.io, self.path, bytes);
+        self.finished = true;
+    }
+    pub fn deinit(self: *Publication) void {
+        const previous = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(previous);
+        // Only an explicit successful finish authenticates the namespace.
+        // A failed rollback may leave it partially restored; never erase that
+        // evidence in a destructor. The next locked pull recovers it.
+        self.lock.close(self.io);
+        self.allocator.free(self.path);
+    }
+};
+
+test "model selection catalog publication fences interrupted and concurrent mutation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try std.testing.expectEqual(.legacy, (try read(a, io, root)).kind);
+    var first = try Publication.begin(a, io, root);
+    try std.testing.expectError(error.ModelArtifactsChanging, read(a, io, root));
+    try first.finish();
+    const prior = try read(a, io, root);
+    first.deinit();
+    try std.testing.expectEqual(.publication, prior.kind);
+    // Simulate a killed publisher. Taking its OS lock and finishing the next
+    // publication restores a stable generation rather than serving stale data.
+    var aborted = try Publication.begin(a, io, root);
+    aborted.deinit();
+    try std.testing.expectError(error.ModelArtifactsChanging, read(a, io, root));
+    var recovery = try Publication.begin(a, io, root);
+    try recovery.finish();
+    recovery.deinit();
+    const next = try read(a, io, root);
+    try std.testing.expect(!std.meta.eql(prior, next));
+}

@@ -5571,7 +5571,7 @@ pub const Node = struct {
         defer listing.deinit();
         if (requiresQualifiedSpanClassification(listing)) {
             if (hypothesis_template != null) return error.UnsupportedDecisionHypothesisTemplate;
-            return self.classifyQualifiedSpanTexts(allocator, model_path, texts, labels, multi_label);
+            return self.classifyQualifiedSpanTexts(allocator, model_path_selection, texts, labels, multi_label);
         }
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
@@ -5669,7 +5669,7 @@ pub const Node = struct {
     fn classifyQualifiedSpanTexts(
         self: *Node,
         allocator: std.mem.Allocator,
-        model_path: []const u8,
+        selected: ResolvedModel,
         texts: []const []const u8,
         labels: []const []const u8,
         multi_label: bool,
@@ -5697,7 +5697,7 @@ pub const Node = struct {
         var failure = extraction_v2.FailureContext{};
         var response = try self.extractV2WithAdmission(allocator, .{ .typed = .{
             .model_name = "classification",
-            .resolved_span_path = model_path,
+            .resolved_span_selection = selected,
             .classification_compatibility = .provider,
             .request = .{
                 .inputs = inputs,
@@ -5705,7 +5705,7 @@ pub const Node = struct {
                 .options_json = "{\"include_confidence\":true}",
                 .schema_version = 2,
             },
-        } }, .direct, null, &failure, null, "classify");
+        } }, .direct, self.bindModelSelection(selected, null), &failure, null, "classify");
         defer response.deinit();
         return qualifiedClassificationScores(allocator, response.json, texts.len, labels, multi_label);
     }
@@ -6869,6 +6869,12 @@ pub const Node = struct {
         const model_path_selection = try self.resolveModelSelection(io, model.name, task_dir);
         const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
+        try self.warmSelectedLoadOnlyModel(model, model_path_selection);
+        std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
+    }
+
+    fn warmSelectedLoadOnlyModel(self: *Node, model: WarmModel, model_path_selection: ResolvedModel) !void {
+        const model_path = model_path_selection.path;
         var model_handle = if (model.cuda_precision) |precision|
             try self.model_manager.acquireFromDirWithGlinerCudaPrecisionAndControl(model_path, precision, self.bindModelSelection(model_path_selection, null))
         else if (model.backend) |backend|
@@ -6877,7 +6883,6 @@ pub const Node = struct {
             try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, null));
         defer model_handle.release();
         if (model.pin) model_handle.pin();
-        std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
     fn warmTranscriber(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
@@ -6892,6 +6897,12 @@ pub const Node = struct {
         // or the installed artifact is reached through a symlink.
         const model_path = try realPathExistingAlloc(allocator, io, resolved_path);
         defer allocator.free(model_path);
+        return self.warmSelectedTranscriber(allocator, model, resolved_path_selection.withPath(model_path));
+    }
+
+    fn warmSelectedTranscriber(self: *Node, allocator: std.mem.Allocator, model: WarmModel, selected: ResolvedModel) !void {
+        const model_path = selected.path;
+        _ = try self.model_manager.publicationForRequest(model_path, self.bindModelSelection(selected, null));
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
             defer allocator.free(paths.encoder);
@@ -6906,13 +6917,13 @@ pub const Node = struct {
                 preferred_backends,
                 .transcriber,
                 .whisper,
-                null,
+                self.bindModelSelection(selected, null),
             );
             defer handle.release();
             try handle.applyStartupPolicy(model.pin);
             return;
         } else |_| {}
-        try self.warmLoadOnlyModel(allocator, model);
+        try self.warmSelectedLoadOnlyModel(model, selected);
     }
 
     pub fn embedDenseJsonInputDirect(
@@ -11616,7 +11627,7 @@ pub const Node = struct {
             request: extracting_api.Request,
             // Only the trusted provider adapter sets this private field. HTTP
             // and public extraction requests always resolve a validated name.
-            resolved_span_path: ?[]const u8 = null,
+            resolved_span_selection: ?ResolvedModel = null,
             classification_compatibility: ClassificationCompatibility = .none,
         },
     };
@@ -11726,9 +11737,9 @@ pub const Node = struct {
         var allocation_failure = ExtractionAllocationFailure{};
         const scratch = allocation_failure.allocator(&bounded);
         defer std.debug.assert(bounded.live == 0);
-        const resolved_span_path = switch (input) {
+        const resolved_span_selection = switch (input) {
             .json, .legacy_classification_json, .decide_span => null,
-            .typed => |typed| typed.resolved_span_path,
+            .typed => |typed| typed.resolved_span_selection,
         };
         const classification_compatibility: ClassificationCompatibility = switch (input) {
             .json, .decide_span => .none,
@@ -11737,7 +11748,7 @@ pub const Node = struct {
         };
         const json = (switch (input) {
             .decide_span => |decision| self.extractDecideSpanInMemory(scratch, decision, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure),
-            else => self.extractV2InMemory(scratch, request_json, resolved_span_path, classification_compatibility, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure, decision_execution),
+            else => self.extractV2InMemory(scratch, request_json, resolved_span_selection, classification_compatibility, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure, decision_execution),
         }) catch |err| return allocation_failure.translate(err);
         defer scratch.free(json);
         observer.emit(.{ .phase = .teardown });
@@ -11884,7 +11895,7 @@ pub const Node = struct {
         self: *Node,
         scratch: std.mem.Allocator,
         request_json: []const u8,
-        resolved_span_path: ?[]const u8,
+        resolved_span_selection: ?ResolvedModel,
         classification_compatibility: ClassificationCompatibility,
         control: ?InferenceExecutionControl,
         failure: *extraction_v2.FailureContext,
@@ -11901,7 +11912,7 @@ pub const Node = struct {
             try @import("antfly_decisions").validateExtractionBoundary(envelope.value);
         }
         // Keep each model adapter behind its own schema and capability gate.
-        if (resolved_span_path == null and classification_compatibility == .none) {
+        if (resolved_span_selection == null and classification_compatibility == .none) {
             if (try self.tryExtractEmbeddingGemma2V2(scratch, request_json, control, response_limit, failure, observer)) |json| return json;
             if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure, decision_execution, working_bytes)) |json| return json;
         }
@@ -11935,8 +11946,8 @@ pub const Node = struct {
         const io = self.inferenceIo(scratch, null, &owned_io);
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
-        const model_path_selection = if (resolved_span_path) |path|
-            try @import("../registry/model_selection.zig").fromDirectory(scratch, io, try scratch.dupe(u8, path))
+        const model_path_selection = if (resolved_span_selection) |selected|
+            selected.withPath(try scratch.dupe(u8, selected.path))
         else
             try self.resolveRequestModelSelection(scratch, io, request.model, "extractors");
         const model_path = model_path_selection.path;
@@ -11948,12 +11959,12 @@ pub const Node = struct {
         // this gate, even for an otherwise small extraction request.
         var manifest = try self.loadBoundManifest(scratch, model_path, true, self.bindModelSelection(model_path_selection, model_path_selection_control));
         defer manifest.deinit();
-        if (resolved_span_path != null and !requiresQualifiedSpanClassification(manifest)) return error.UnsupportedClassificationExtraction;
+        if (resolved_span_selection != null and !requiresQualifiedSpanClassification(manifest)) return error.UnsupportedClassificationExtraction;
         // Declared SpanExtractor wrappers use the schema-v2 classifier route
         // on every qualified backend. The legacy decision executor below is
         // reserved for non-span label-marker bundles.
         if (usesDeclaredSpanV2Route(manifest))
-            return self.extractV2Span(scratch, model_path, &request, resolved_span_path != null, classification_compatibility, model_path_selection_control, failure, response_limit, budget, working_bytes, allocation_failure, observer, null, manifest.gliner_specialty_profile);
+            return self.extractV2Span(scratch, model_path, &request, resolved_span_selection != null, classification_compatibility, model_path_selection_control, failure, response_limit, budget, working_bytes, allocation_failure, observer, null, manifest.gliner_specialty_profile);
         if (manifest.gliner_classification_head == .label_marker_mlp) {
             try decision_executor.preflight(&request);
             failure.* = .{ .stage = "model" };
@@ -12999,6 +13010,7 @@ pub const Node = struct {
     }
 
     fn requestModelResolutionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
         return switch (requestModelResolutionErrorKind(err)) {
             .invalid => ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -23243,12 +23255,19 @@ pub const Node = struct {
         defer self.silero_weights_lock.unlock();
         if (self.silero_weights.get(cache_key)) |weights| return weights;
         stage.* = .load;
+        var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(ctx.allocator, ctx.io, model_path, .{ .publication = model_path_selection.publication });
+        defer artifacts.deinit();
         const candidates = [_][]const u8{ "onnx/model.onnx", "model.onnx", "silero_vad.onnx" };
         var loaded: ?silero_vad_mod.Weights = null;
         for (candidates) |candidate| {
-            const onnx_path = try std.fs.path.join(ctx.allocator, &.{ model_path, candidate });
-            defer ctx.allocator.free(onnx_path);
-            loaded = silero_vad_mod.Weights.load(self.allocator, onnx_path) catch continue;
+            const bytes = artifacts.read(candidate, 64 * 1024 * 1024) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer ctx.allocator.free(bytes);
+            // A listed file is authoritative. Corruption must not fall through
+            // to an unreceipted/stale sibling or swallow integrity errors.
+            loaded = try silero_vad_mod.Weights.loadFromBytes(self.allocator, bytes);
             break;
         }
         var weights = loaded orelse return error.InvalidSileroModel;
@@ -23265,6 +23284,7 @@ pub const Node = struct {
 
     fn sileroModelFailureResponse(ctx: *httpx.Context, stage: SileroModelStage, err: anyerror) !httpx.Response {
         if (err == error.OutOfMemory) return err;
+        if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
         return switch (stage) {
             .resolve => requestModelResolutionError(ctx, err),
             .load => ctx.status(400).json(.{
@@ -25320,22 +25340,21 @@ pub const Node = struct {
         entry: model_manager_mod.RuntimeSnapshotEntry,
     ) !?[]const u8 {
         _ = self;
-        if (entry.runtime_kind == .primary) {
-            const publication = @import("../registry/managed_receipt.zig").publicationGeneration(allocator, io, entry.model_dir) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                return null;
-            };
-            // A replacement receipt must never relabel a resident/loading
-            // runtime belonging to the preceding installation generation.
-            if (!std.meta.eql(publication, entry.managed_publication)) return null;
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        // The identifier and generation must come from the SAME receipt.
+        // A pre-check followed by another receipt read permits relabeling ABA.
+        const current = registry_mod.managedModelSelectionAlloc(scratch.allocator(), io, entry.model_dir) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return null;
+        };
+        if (current.rejected or !std.meta.eql(current.publication, entry.managed_publication)) return null;
+        if (current.names.len > 0) {
+            const canonical = if (current.names.len == 4) current.names[2] else current.names[current.names.len - 1];
+            return try allocator.dupe(u8, canonical);
         }
-        const identity = (try loadedModelRequestIdentityAlloc(
-            allocator,
-            io,
-            canonical_models_dir,
-            entry.model_dir,
-        )) orelse return null;
-        return identity.instanceIdentifier();
+        const relative = loadedModelRequestIdentifier(canonical_models_dir, entry.model_dir) orelse return null;
+        return try allocator.dupe(u8, stripRuntimeTaskPrefix(relative));
     }
 
     /// Build one resource per incarnation, independent of task catalog aliases.
@@ -25485,7 +25504,12 @@ pub const Node = struct {
     }
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const json_body = try self.listModelsJsonAlloc(ctx.allocator, ctx.io);
+        const catalog_publication = @import("../registry/catalog_publication.zig");
+        const catalog_generation = catalog_publication.read(ctx.allocator, ctx.io, self.config.models_dir) catch |err| return requestModelResolutionError(ctx, err);
+        const json_body = self.listModelsJsonAlloc(ctx.allocator, ctx.io) catch |err| {
+            if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
+            return err;
+        };
         defer ctx.allocator.free(json_body);
         // Scoped discovery pins one embedding or generator generation without
         // loading weights. Avoid fingerprinting every model in an unscoped catalog.
@@ -25494,10 +25518,10 @@ pub const Node = struct {
             var catalog = try std.json.parseFromSlice(std.json.Value, ctx.allocator, json_body, .{});
             defer catalog.deinit();
             if (catalog.value == .object) if (catalog.value.object.getPtr(category)) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
-                const path_selection = try self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category);
+                const path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category) catch |err| return requestModelResolutionError(ctx, err);
                 const path = path_selection.path;
                 defer ctx.allocator.free(path);
-                var manifest = try self.loadBoundManifest(ctx.allocator, path, false, self.bindModelSelection(path_selection, null));
+                var manifest = self.loadBoundManifest(ctx.allocator, path, false, self.bindModelSelection(path_selection, null)) catch |err| return modelLoadFailureResponse(ctx, err);
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
                 const revision = if (try self.model_manager.acquireLoadedModelWithControl(path, self.bindModelSelection(path_selection, null))) |cached| loaded: {
@@ -25510,7 +25534,10 @@ pub const Node = struct {
                 const hex = std.fmt.bytesToHex(revision, .lower);
                 const catalog_allocator = catalog.arena.allocator();
                 try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
-                if (std.mem.eql(u8, task, "generate")) return ctx.json(catalog.value);
+                if (std.mem.eql(u8, task, "generate")) {
+                    catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, catalog_generation) catch |err| return modelLoadFailureResponse(ctx, err);
+                    return ctx.json(catalog.value);
+                }
                 try info.object.put(catalog_allocator, "model_revision_pinning", .{ .bool = true });
                 // Registry-wide listing deliberately skips full geometry parsing.
                 // Scoped discovery already resolved metadata without loading weights.
@@ -25525,9 +25552,11 @@ pub const Node = struct {
                 const parsed_limits = try std.json.parseFromSlice(std.json.Value, ctx.allocator, limits_json, .{ .allocate = .alloc_always });
                 defer parsed_limits.deinit();
                 try info.object.put(catalog_allocator, "chunking_limits", parsed_limits.value);
+                catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, catalog_generation) catch |err| return modelLoadFailureResponse(ctx, err);
                 return ctx.json(catalog.value);
             };
         };
+        catalog_publication.require(ctx.allocator, ctx.io, self.config.models_dir, catalog_generation) catch |err| return modelLoadFailureResponse(ctx, err);
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(json_body);
         return ctx.response.build();
@@ -25967,6 +25996,7 @@ pub const Node = struct {
             }
         }
         filterOpenAiCatalogSelectors(&catalog.value);
+        try inventory.requireCurrentGeneration(io);
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
     }
 
@@ -50869,4 +50899,180 @@ test "model selection Decide embedding aliases follow ordered execution scopes" 
     const preferred = try node.resolveRequestModelSelection(a, io, "acme/demo:safetensors@" ++ revision, "deciders");
     defer a.free(preferred.path);
     try std.testing.expect(std.mem.endsWith(u8, preferred.path, "/extractors/acme/first"));
+}
+
+test "model selection qualified classification and transcriber warmup preserve the selected receipt" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const leaf = "models/extractors/acme/model";
+    try installModelSelectionFixture(tmp.dir, leaf, "gguf:Q4_0", "0123456789abcdef0123456789abcdef01234567");
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    const selected = try node.resolveRequestModelSelection(a, io, "acme/demo:gguf:Q4_0@0123456789abcdef0123456789abcdef01234567", "extractors");
+    defer a.free(selected.path);
+    try installModelSelectionFixture(tmp.dir, leaf, "gguf:Q4_0", "ffffffffffffffffffffffffffffffffffffffff");
+    try std.testing.expectError(error.ModelArtifactsChanging, node.classifyQualifiedSpanTexts(a, selected, &.{"test"}, &.{ "yes", "no" }, false));
+    try std.testing.expectError(error.ModelArtifactsChanging, node.warmSelectedTranscriber(a, .{ .name = "acme/demo", .kind = .transcriber }, selected));
+}
+
+test "model selection every runtime kind keeps its original instance revision" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const leaf = "models/transcribers/acme/model";
+    try installModelSelectionFixture(tmp.dir, leaf, "onnx", "0123456789abcdef0123456789abcdef01234567");
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const directory = try tmp.dir.realPathFileAlloc(io, leaf, a);
+    defer a.free(directory);
+    const prior = try @import("../registry/managed_receipt.zig").publicationGeneration(a, io, directory);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    for ([_]model_manager_mod.RuntimeKind{ .primary, .composite }) |kind| {
+        const entry = model_manager_mod.RuntimeSnapshotEntry{ .runtime_id = 17, .managed_publication = prior, .model_dir = directory, .state = .loaded, .runtime_kind = kind, .model_type = .transcriber, .task_mask = 0, .active_handles = 0, .startup_managed = false, .backend = .native, .residency_mode = .backend_managed, .last_used_ms = 0 };
+        const identifier = (try node.runtimeIdentifier(a, io, root, entry)).?;
+        defer a.free(identifier);
+        try std.testing.expectEqualStrings("acme/demo:onnx@0123456789abcdef0123456789abcdef01234567", identifier);
+    }
+    try installModelSelectionFixture(tmp.dir, leaf, "onnx", "ffffffffffffffffffffffffffffffffffffffff");
+    for ([_]model_manager_mod.RuntimeKind{ .primary, .composite }) |kind| {
+        const entry = model_manager_mod.RuntimeSnapshotEntry{ .runtime_id = 17, .managed_publication = prior, .model_dir = directory, .state = .loading, .runtime_kind = kind, .model_type = .transcriber, .task_mask = 0, .active_handles = 0, .startup_managed = false, .backend = .native, .residency_mode = .backend_managed, .last_used_ms = 0 };
+        try std.testing.expect((try node.runtimeIdentifier(a, io, root, entry)) == null);
+    }
+}
+
+test "model selection VAD verifies the consumed receipt artifact before parsing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const leaf = "models/classifiers/acme/vad";
+    try tmp.dir.createDirPath(io, leaf);
+    try tmp.dir.writeFile(io, .{ .sub_path = leaf ++ "/model.onnx", .data = "bad-onnx" });
+    const json = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "vad", .variant = "onnx", .resolved_revision = "0123456789abcdef0123456789abcdef01234567" }, .artifacts = .{.{ .path = "model.onnx", .size = @as(u64, 8), .sha256 = "0000000000000000000000000000000000000000000000000000000000000000" }} }, .{});
+    defer a.free(json);
+    try tmp.dir.writeFile(io, .{ .sub_path = leaf ++ "/.antfly-download-complete.json", .data = json });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    var ctx: httpx.Context = undefined;
+    ctx.allocator = a;
+    ctx.io = io;
+    var stage: Node.SileroModelStage = .resolve;
+    try std.testing.expectError(error.ChecksumMismatch, node.sileroWeightsForModel(&ctx, "acme/vad:onnx@0123456789abcdef0123456789abcdef01234567", &stage));
+    try std.testing.expectEqual(@as(usize, 0), node.silero_weights.count());
+}
+
+test "model selection catalog token keeps warm lookup filesystem work constant" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const publisher = @import("../registry/catalog_publication.zig");
+    const Probe = struct {
+        var count: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirStatFile") = undefined;
+        fn stat(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+            count += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var small_count: usize = 0;
+    for ([_]usize{ 8, 64 }) |n| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        for (0..n) |index| {
+            const leaf = try std.fmt.allocPrint(a, "models/generators/acme/model-{d}", .{index});
+            defer a.free(leaf);
+            const pin = try std.fmt.allocPrint(a, "{x:0>40}", .{index});
+            defer a.free(pin);
+            try installModelSelectionFixture(tmp.dir, leaf, "gguf:Q4_0", pin);
+        }
+        const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+        defer a.free(root);
+        var publication = try publisher.Publication.begin(a, io, root);
+        try publication.finish();
+        publication.deinit();
+        var cache = selection_mod.Cache.init(a);
+        defer cache.deinit();
+        const requested = "acme/demo:gguf:Q4_0@0000000000000000000000000000000000000000";
+        const initial = (try cache.resolveSelection(a, io, root, requested, "generators")).?;
+        a.free(initial.path);
+        var table = io.vtable.*;
+        Probe.original = table.dirStatFile;
+        table.dirStatFile = Probe.stat;
+        const counted_io = std.Io{ .userdata = io.userdata, .vtable = &table };
+        Probe.count = 0;
+        cache.current.?.rebuilt_at = .{ .nanoseconds = 0 };
+        const selected = (try cache.resolveSelection(a, counted_io, root, requested, "generators")).?;
+        a.free(selected.path);
+        try std.testing.expectEqual(@as(usize, 1), cache.rebuilds);
+        if (n == 8) small_count = Probe.count else try std.testing.expectEqual(small_count, Probe.count);
+        try std.testing.expect(Probe.count < 16);
+        std.debug.print("model selection warm stat calls: models={d} stats={d}\n", .{ n, Probe.count });
+        // Missing selectors must refresh immediately after a publication too.
+        var change = try publisher.Publication.begin(a, io, root);
+        try std.testing.expectError(error.ModelArtifactsChanging, cache.resolve(a, io, root, requested, "generators"));
+        const leaf = "models/generators/acme/new";
+        try installModelSelectionFixture(tmp.dir, leaf, "gguf:Q8_0", "ffffffffffffffffffffffffffffffffffffffff");
+        try change.finish();
+        change.deinit();
+        const added = (try cache.resolve(a, io, root, "acme/demo:gguf:Q8_0@ffffffffffffffffffffffffffffffffffffffff", "generators")).?;
+        a.free(added);
+        try std.testing.expectEqual(@as(usize, 2), cache.rebuilds);
+        // Raw filesystem imports also become discoverable through bounded
+        // miss refreshes, without scanning on existing pinned requests.
+        try installModelSelectionFixture(tmp.dir, "models/generators/acme/imported", "gguf:Q5_0", "ffffffffffffffffffffffffffffffffffffffff");
+        cache.current.?.rebuilt_at = .{ .nanoseconds = 0 };
+        const imported = (try cache.resolve(a, io, root, "acme/demo:gguf:Q5_0@ffffffffffffffffffffffffffffffffffffffff", "generators")).?;
+        a.free(imported);
+        try std.testing.expectEqual(@as(usize, 3), cache.rebuilds);
+    }
+}
+
+test "model selection immutable snapshot COMPLETE fences the cached catalog" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/model", "gguf:Q4_0", "0123456789abcdef0123456789abcdef01234567");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/COMPLETE", .data = "catalog1 CATALOG.json\nchecksum1 SHA256SUMS\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var cache = selection_mod.Cache.init(a);
+    defer cache.deinit();
+    var snapshot = try cache.snapshot(a, io, root);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(.snapshot, snapshot.generation.kind);
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/COMPLETE", .data = "catalog2 CATALOG.json\nchecksum2 SHA256SUMS\n" });
+    try std.testing.expectError(error.ModelArtifactsChanging, snapshot.requireCurrentGeneration(io));
+    var updated = try cache.snapshot(a, io, root);
+    defer updated.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cache.rebuilds);
+}
+
+test "model selection active catalog publication reports a retryable HTTP error" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/model", "gguf:Q4_0", "0123456789abcdef0123456789abcdef01234567");
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    var publication = try @import("../registry/catalog_publication.zig").Publication.begin(a, io, root);
+    defer publication.deinit();
+    var request = try httpx.Request.init(a, .GET, "/ai/v1/models");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.listModels(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
 }

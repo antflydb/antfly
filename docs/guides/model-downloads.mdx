@@ -25,6 +25,19 @@ For managed AI models, the completion receipt records the requested revision,
 resolved commit, and selected format. Repeating a pull resolves moving refs again and reuses only
 verified files; inference uses the installed snapshot without network refresh.
 
+Managed pulls publish a store-wide catalog generation while swapping completed
+installations. Inference checks that generation and the selected receipt, so warm
+pinned requests do not scan unrelated models. Interrupted publication remains
+unavailable until a subsequent pull recovers it. Legacy stores without a
+publication token retain conservative directory checks; raw filesystem imports
+also have bounded discovery and missing-selector refreshes.
+
+Read-only GCS snapshots use their `COMPLETE` marker as the catalog generation.
+Keep published snapshot prefixes immutable and publish a new prefix for changes.
+Direct readers and VAD consume only receipt-listed artifacts and verify available
+checksums against the bytes read or mapped; stale sibling files do not supply a
+missing model component.
+
 Traditional ML predictor pulls also resolve one snapshot before downloading,
 including explicit branches or commits:
 

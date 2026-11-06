@@ -7000,6 +7000,7 @@ pub const ModelManager = struct {
             errdefer allocator.free(owned_model_dir);
             try entries.append(allocator, .{
                 .runtime_id = assets.runtime_id,
+                .managed_publication = assets.managed_publication,
                 .unloadable = !assets.startup_managed and assets.active_handles == 0 and !self.compositeAssetsIsInFlightLocked(assets),
                 .model_dir = owned_model_dir,
                 .state = if (assets.active_handles == 0) .loaded else .in_use,
@@ -7051,6 +7052,7 @@ pub const ModelManager = struct {
             errdefer allocator.free(owned_model_dir);
             try entries.append(allocator, .{
                 .runtime_id = flight.runtime_id,
+                .managed_publication = flight.managed_publication,
                 .model_dir = owned_model_dir,
                 .state = .loading,
                 .runtime_kind = .composite,
@@ -16059,4 +16061,28 @@ test "model selection resident sessions and load flights fence receipt generatio
     try tmp.dir.writeFile(io, .{ .sub_path = "model/.antfly-download-complete.json", .data = "{\"version\":2,\"source\":{\"owner\":\"acme\",\"name\":\"model\",\"variant\":\"gguf:Q4_0\",\"resolved_revision\":\"cccccccccccccccccccccccccccccccccccccccc\"},\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}" });
     try std.testing.expect(manager.acquireLoadedModel(directory) == null);
     try std.testing.expect(fresh.get().retired);
+}
+
+test "model selection runtime snapshots carry composite asset and flight publications" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    const asset_publication: [32]u8 = @splat(0x41);
+    const flight_publication: [32]u8 = @splat(0x42);
+    var assets = CompositeAssets{ .runtime_id = 17, .model_dir = @constCast("/models/transcribers/loaded"), .managed_publication = asset_publication, .managed_tokenizer = undefined, .prompt_cache = null, .decoder_config = .{}, .generation = @splat(1) };
+    const key: ComponentPlanKey = @splat(1);
+    try manager.composite_assets.put(a, key, &assets);
+    defer _ = manager.composite_assets.remove(key);
+    var flight = CompositeAssetsLoadFlight{ .runtime_id = 18, .model_dir = @constCast("/models/transcribers/loading"), .managed_publication = flight_publication, .io = std.testing.io, .load_state = .{ .io = std.testing.io } };
+    const flight_key: ComponentPlanKey = @splat(2);
+    try manager.in_flight_composite_assets.put(a, flight_key, &flight);
+    defer _ = manager.in_flight_composite_assets.remove(flight_key);
+    var snapshot = try manager.runtimeSnapshot(a, null);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+    for (snapshot.entries) |entry| {
+        try std.testing.expectEqual(RuntimeKind.composite, entry.runtime_kind);
+        const expected = if (entry.runtime_id == 17) asset_publication else flight_publication;
+        try std.testing.expectEqual(expected, entry.managed_publication.?);
+    }
 }

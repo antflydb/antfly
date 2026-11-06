@@ -684,12 +684,23 @@ pub const ModelRegistry = struct {
             else
                 false;
             if (cached) {
+                var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir);
+                defer publication.deinit();
                 try download.finishVerifiedManagedInstall(self.allocator, io, dest);
+                try publication.finish();
                 return;
             }
         }
 
-        var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
+        var transaction = blk: {
+            // begin() can restore a backup after an interrupted publication.
+            var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir);
+            defer publication.deinit();
+            var pending = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
+            errdefer pending.deinit(io);
+            try publication.finish();
+            break :blk pending;
+        };
         defer transaction.deinit(io);
 
         if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
@@ -817,7 +828,10 @@ pub const ModelRegistry = struct {
                 try io.checkCancel();
             }
         }
+        var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir);
+        defer publication.deinit();
         try transaction.commit(io);
+        try publication.finish();
     }
 
     /// Companion MTP assistant ref for a Gemma4 QAT gguf model
@@ -3323,4 +3337,50 @@ test "resolveVariant ignores empty and incomplete legacy candidates" {
     const path = (try resolveVariant(a, io, root, "owner/model")).?;
     defer a.free(path);
     try std.testing.expect(std.mem.endsWith(u8, path, "model-q4"));
+}
+
+test "model selection registry pull publishes catalog generations and recovers cancellation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const local_http = @import("httpx");
+    const publication = @import("catalog_publication.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = @embedFile("testdata/hub_snapshot_server.py") });
+    const address = local_http.socket.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try local_http.TcpListener.init(address, io);
+    const port = listener.getLocalAddress().ip4.port;
+    listener.deinit();
+    var port_buf: [16]u8 = undefined;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", try std.fmt.bufPrint(&port_buf, "{d}", .{port}), "onnx-only" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    try io.sleep(std.Io.Duration.fromMilliseconds(200), .awake);
+    const temporary = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(temporary);
+    const root = try std.fs.path.join(a, &.{ temporary, "models" });
+    defer a.free(root);
+    const base_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{port});
+    defer a.free(base_url);
+    var registry = ModelRegistry.init(a, root);
+    defer registry.deinit();
+    try registry.pullWithProgress(io, "owner/model:onnx", .{ .base_url = base_url }, null, null, .auto, .{});
+    const first = try publication.read(a, io, root);
+    try std.testing.expectEqual(.publication, first.kind);
+    var cache = @import("selection.zig").Cache.init(a);
+    defer cache.deinit();
+    const pin = "owner/model:onnx@0123456789abcdef0123456789abcdef01234567";
+    const selected = (try cache.resolveSelection(a, io, root, pin, null)).?;
+    defer a.free(selected.path);
+    const cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, registry.pullWithProgress(io, "owner/model:onnx", .{ .base_url = base_url }, null, null, .auto, .{ .cancelled = &cancelled }));
+    try std.testing.expectEqual(.publication, (try publication.read(a, io, root)).kind);
+    const preserved = (try cache.resolveSelection(a, io, root, pin, null)).?;
+    defer a.free(preserved.path);
+    try std.testing.expectEqual(selected.publication, preserved.publication);
 }

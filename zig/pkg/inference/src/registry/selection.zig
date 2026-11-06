@@ -18,6 +18,7 @@
 //! artifacts are revalidated on the execution path. No model weights are read.
 const std = @import("std");
 const registry = @import("registry.zig");
+const catalog_publication = @import("catalog_publication.zig");
 pub const ResolvedModel = @import("model_selection.zig").ResolvedModel;
 
 pub const tasks = [_][]const u8{ "embedders", "rerankers", "chunkers", "generators", "extractors", "deciders", "rewriters", "readers", "transcribers", "classifiers" };
@@ -70,6 +71,7 @@ pub const Inventory = struct {
     names: []const []const []const u8,
     owners: [tasks.len]std.StringHashMapUnmanaged(Owner) = @splat(.empty),
     watches: []const Watch = &.{},
+    generation: catalog_publication.Generation = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, models_dir: []const u8) !Inventory {
         var temporary = std.heap.ArenaAllocator.init(allocator);
@@ -79,6 +81,7 @@ pub const Inventory = struct {
         errdefer result.deinit();
         const a = result.arena.allocator();
         result.models_dir = try a.dupe(u8, models_dir);
+        result.generation = try catalog_publication.read(a, io, models_dir);
         var paths = std.StringHashMapUnmanaged(?Stamp).empty;
         // Capture directory generations before enumeration, including empty
         // owner directories. Publishing their first model need not touch root.
@@ -211,8 +214,15 @@ pub const Inventory = struct {
     }
 
     fn changed(self: *const Inventory, io: std.Io) !bool {
+        const current = try catalog_publication.read(self.arena.child_allocator, io, self.models_dir);
+        if (!std.meta.eql(self.generation, current)) return true;
+        if (current.kind != .legacy) return false;
         for (self.watches) |watch| if (!std.meta.eql(watch.stamp, try stamp(io, watch.path))) return true;
         return false;
+    }
+
+    pub fn requireCurrentGeneration(self: *const Inventory, io: std.Io) !void {
+        if (try self.changed(io)) return error.ModelArtifactsChanging;
     }
 
     fn clone(self: *const Inventory, allocator: std.mem.Allocator) !Inventory {
@@ -220,6 +230,7 @@ pub const Inventory = struct {
         errdefer copy.deinit();
         const a = copy.arena.allocator();
         copy.models_dir = try a.dupe(u8, self.models_dir);
+        copy.generation = self.generation;
         const entries = try a.alloc(registry.ModelEntry, self.discovered.len);
         const names = try a.alloc([]const []const u8, self.names.len);
         for (self.discovered, self.names, entries, names) |entry, selectors, *out, *owned| {
@@ -232,6 +243,10 @@ pub const Inventory = struct {
         }
         copy.discovered = entries;
         copy.names = names;
+        // Full catalogs retain legacy watch evidence until serialization ends.
+        const watches = try a.alloc(Watch, self.watches.len);
+        for (self.watches, watches) |watch, *owned| owned.* = .{ .path = try a.dupe(u8, watch.path), .stamp = watch.stamp };
+        copy.watches = watches;
         try copy.buildOwners();
         return copy;
     }
@@ -287,13 +302,13 @@ pub const Cache = struct {
         slot.refs += 1;
         return .{ .cache = self, .slot = slot, .io = io };
     }
-    fn acquire(self: *Cache, io: std.Io, root: []const u8) !Lease {
+    fn acquire(self: *Cache, io: std.Io, root: []const u8, catalog_backstop: bool) !Lease {
         if (try self.retain(io)) |lease| {
             errdefer lease.release();
             const unchanged = std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io);
             if (unchanged) {
                 const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
-                if (age < 5 * std.time.ns_per_s) return lease;
+                if ((!catalog_backstop and lease.slot.inventory.generation.kind != .legacy) or age < 5 * std.time.ns_per_s) return lease;
                 // Another caller owns the bounded backstop refresh. Managed
                 // publications are unchanged and execution revalidates its
                 // selected receipt, so readers can retain this generation.
@@ -307,7 +322,7 @@ pub const Cache = struct {
         if (try self.retain(io)) |lease| {
             errdefer lease.release();
             const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
-            if (age < 5 * std.time.ns_per_s and std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io)) return lease;
+            if (((!catalog_backstop and lease.slot.inventory.generation.kind != .legacy) or age < 5 * std.time.ns_per_s) and std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io)) return lease;
             lease.release();
         }
         self.mutex.lockUncancelable(io);
@@ -338,7 +353,7 @@ pub const Cache = struct {
     }
 
     pub fn snapshot(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8) !Inventory {
-        const lease = try self.acquire(io, root);
+        const lease = try self.acquire(io, root, true);
         defer lease.release();
         return lease.slot.inventory.clone(allocator);
     }
@@ -348,16 +363,29 @@ pub const Cache = struct {
         return if (try self.resolveSelection(allocator, io, root, requested, task)) |selected| @constCast(selected.path) else null;
     }
     pub fn resolveSelection(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8) !?ResolvedModel {
-        const path = blk: {
-            const lease = try self.acquire(io, root);
+        // Full catalogs and misses get a bounded backstop for raw filesystem
+        // imports. Existing coordinated pinned hits never scan other models.
+        var retried_catalog = false;
+        const lookup = blk: while (true) {
+            const lease = try self.acquire(io, root, retried_catalog);
             defer lease.release();
-            const selected = (try lease.slot.inventory.lookup(requested, task)) orelse return null;
-            break :blk try allocator.dupe(u8, selected);
+            const selected = (try lease.slot.inventory.lookup(requested, task)) orelse {
+                if (!std.meta.eql(lease.slot.inventory.generation, try catalog_publication.read(allocator, io, root))) return error.ModelArtifactsChanging;
+                const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
+                if (!retried_catalog and age >= 5 * std.time.ns_per_s) {
+                    retried_catalog = true;
+                    continue;
+                }
+                return null;
+            };
+            break :blk .{ .path = try allocator.dupe(u8, selected), .generation = lease.slot.inventory.generation };
         };
+        const path = lookup.path;
         errdefer allocator.free(path);
         var temporary = std.heap.ArenaAllocator.init(allocator);
         defer temporary.deinit();
         const proof = try registry.managedModelSelectionAlloc(temporary.allocator(), io, path);
+        if (!std.meta.eql(lookup.generation, try catalog_publication.read(allocator, io, root))) return error.ModelArtifactsChanging;
         if (!proof.rejected) {
             for (proof.names) |name| if (std.mem.eql(u8, name, requested)) return .{ .path = path, .publication = proof.publication };
             if (proof.names.len == 0 and std.mem.indexOfAny(u8, requested, ":@") == null) return .{ .path = path, .publication = proof.publication };

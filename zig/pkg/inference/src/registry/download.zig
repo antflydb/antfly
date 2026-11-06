@@ -1573,7 +1573,7 @@ pub const ManagedModelTransaction = struct {
     }
 };
 
-fn writeFileAtomically(
+pub fn writeFileAtomically(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
