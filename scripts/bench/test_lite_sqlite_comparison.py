@@ -64,6 +64,16 @@ class MatchedDurabilityTests(unittest.TestCase):
                     "sqlite", path, False, None, [{"worker": 0, "successful_calls": 1}]
                 )
 
+    def test_compiler_processes_returns_a_list_without_raising(self):
+        # This process's own ancestry (pytest/uv/the test runner) must never
+        # itself look like a compiler to this check, and the function must
+        # tolerate whatever `ps -axo stat,comm` reports on the host without
+        # raising -- on a shared dev host this is routinely nonzero, which
+        # is why run_case()/main() record it instead of asserting it is
+        # empty (see compiler_contamination_samples / pre_run_compiler_processes).
+        result = bench.compiler_processes()
+        self.assertIsInstance(result, list)
+
 
 if __name__ == "__main__":
     unittest.main()
