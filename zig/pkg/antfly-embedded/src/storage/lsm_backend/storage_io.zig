@@ -598,6 +598,9 @@ pub const Storage = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        /// Direct transactional namespaces owned by the physical engine. Null
+        /// preserves the filesystem LSM provider, including unmigrated roots.
+        open_native_namespaces: ?*const fn (*anyopaque, Allocator, []const u8, bool) anyerror!?@import("../backend_erased.zig").NamespaceStore = null,
         /// No-ABA identity of the loaded logical file view. Equal non-null
         /// tokens permit owned metadata-cache reuse until local mutation or
         /// external generation adoption. Providers without such a view return null.
@@ -685,6 +688,11 @@ pub const Storage = struct {
     pub fn acquireImmutableStager(self: Storage, alloc: Allocator) !?@import("../immutable_artifact.zig").Stager {
         const acquire = self.vtable.acquire_immutable_stager orelse return null;
         return try BoundaryAbi.call("acquire_immutable_stager", self.boundary_dispatch, acquire, .{ self.ptr, alloc });
+    }
+
+    pub fn openNativeNamespaces(self: Storage, a: Allocator, root: []const u8, read_only: bool) !?@import("../backend_erased.zig").NamespaceStore {
+        const operation = self.vtable.open_native_namespaces orelse return null;
+        return BoundaryAbi.call("open_native_namespaces", self.boundary_dispatch, operation, .{ self.ptr, a, root, read_only });
     }
 
     pub fn fenceUncertainPublication(self: Storage) void {

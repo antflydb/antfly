@@ -222,7 +222,7 @@ pub const Registry = struct {
         self.owned_resources = .{ .manager = manager, .allocator = allocator };
     }
 
-    fn io(self: *Registry) std.Io {
+    pub fn io(self: *Registry) std.Io {
         return self.io_impl.io();
     }
 

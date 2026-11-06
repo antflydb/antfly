@@ -181,3 +181,35 @@ path/inode/value identity is checked again before any pooled source is reused.
 An uncertain outcome on either the detached or serving owner clears the handoff.
 Shutdown does not extend it. Source and decoded-lease resource owners continue
 to outlive any retained readers independently of the closed runtime.
+
+
+## Direct native namespace stage
+
+Hosted Native providers can open transactional namespaces directly in the native
+catalog. New persistent text main stores and logical WALs consume this capability;
+filesystem, memory and existing LSM roots keep their previous backend. A namespace
+layout marker is published with its first mutations. No empty native root may
+supersede existing LSM metadata. Native revision 13 fences older binaries before
+they could mistake these namespaces for empty LSMs.
+
+Namespace keys preserve byte ordering through bounded-component hex encoding.
+This keeps arbitrary binary names and keys compatible with generation manifests
+and repair without making the virtual filesystem responsible for the transaction.
+All main metadata, artifact activation and joined projection progress still share
+one native checkpoint. Prepared replacements can release the writer mutex before
+admission; binding checks the retained base and each deletion revision. Aborting a
+detached replacement does not dereference its former writer.
+
+Immutable leased sources keep their existing bounded handoff pool across runtime
+replacement. C API native visibility acknowledgements notify bounded retirement
+service; physical deletion remains the condition for returning replay credits.
+
+The direct backend is an architectural prerequisite, not evidence that the
+primary/index durability gap has closed. An intermediate 128-update diagnostic
+still recorded 544 foreground syncs. Combining foreground primary and index
+publication, batching posting deltas, completing semantic retirement separation,
+and introducing the crash-tested one-sync protocol remain outstanding. No new
+end-to-end or optimized performance qualification is claimed by this stage.
+
+Current-stage Debug validation and explicit qualification limits are recorded in
+[direct-native-namespaces-debug.json](direct-native-namespaces-debug.json).

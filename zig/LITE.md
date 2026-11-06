@@ -1168,16 +1168,36 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-12 files (`AFLITE\x0cP`) with packed records and
+Native owners create revision-13 files (`AFLITE\x0dP`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3, 7, 8, 9, 10 and 11 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8, 9, 10, 11 and 12 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-12 signature before checkpoint selection.
+and older binaries reject the revision-13 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-12 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-13 image.
+
+
+New hosted native text indexes store their main namespaces and logical WAL
+entries directly in the native index catalog. They do not create inner LSM
+manifests, mutable tables or replay WALs for those stores. The `AFNS1` generation
+record identifies this namespace layout. Namespace names and keys use ordered
+hex encoding with bounded path components, keeping binary keys compatible with
+generation manifests, subtree deletion and repair. Existing LSM roots retain
+the compatibility backend until their generation is rebuilt; selecting an empty
+native namespace must never bypass an existing LSM root.
+
+Native namespace transactions prepare owned changes and generation witnesses
+before queuing publication, release their metadata snapshot before waiting for
+writer admission, and validate the exact inode, file namespace and generation at
+commit. Artifact activation and projection progress participate in that same
+native transaction. Prepared text snapshots release writer serialization while
+waiting, then validate both base-snapshot identity and deletion revisions before
+binding the live writer for durable publication and allocation-free activation.
+This index transaction remains separate from its foreground primary transaction;
+combined primary/index cohorts and a crash-safe one-sync protocol are unfinished.
 
 Struct and JSON document batches capture an owned catalog plan under a short
 lifetime guard, then map document, graph-field and direct embedding inputs before

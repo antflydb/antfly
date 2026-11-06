@@ -190,11 +190,21 @@ pub const ReplayIndexPublication = struct {
     leave: *const fn (*anyopaque) void,
 };
 
+/// The owner guarantees bounded physical retirement service independently of
+/// visibility acknowledgement. A request grants no reusable-byte credits.
+pub const ReplayRetirementService = struct {
+    ptr: *anyopaque,
+    table_id: u64,
+    incarnation: u128,
+    request: *const fn (*anyopaque, u64, u128) void,
+};
+
 pub const AsyncContext = struct {
     /// Work proportional to prepared text families, excluding cursor setup,
     /// capacity waits, durable publication and continuation checkpoints.
     full_text_preparation_ns: std.atomic.Value(u64) = .init(0),
     replay_index_publication: ?ReplayIndexPublication = null,
+    replay_retirement_service: ?ReplayRetirementService = null,
     replay_metadata_publication: ?ReplayMetadataPublication = null,
     apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,

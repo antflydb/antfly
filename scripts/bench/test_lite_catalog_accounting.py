@@ -62,7 +62,7 @@ class NativeAccountingParity(unittest.TestCase):
                 self.assertTrue(native["valid"])
             source = CatalogAccounting(database)
             try:
-                self.assertEqual(source.version, 12)
+                self.assertEqual(source.version, 13)
                 offline = source.account(include_documents=True)
                 document_index = source.slot[7]
                 page_size = source.page_size

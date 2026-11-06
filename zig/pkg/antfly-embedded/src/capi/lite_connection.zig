@@ -1857,6 +1857,14 @@ pub const Owner = struct {
             state.* = .{ .allocator = alloc };
             entry.value_ptr.group_sources = state;
         }
+        if (self.options.profile == .native and database.open_mode != .query_readonly and database.open_mode != .status_only and database.core.store.runtime_store.capabilities().bounded_replay_admission) {
+            database.async_context.replay_retirement_service = .{
+                .ptr = self,
+                .table_id = database.core.identity_namespace.table_id,
+                .incarnation = database.root_incarnation,
+                .request = notifySourceMutation,
+            };
+        }
         return entry.value_ptr.group_sources.?;
     }
 
@@ -10166,6 +10174,47 @@ test "capi native maintenance text source reuse refreshes primary observations a
     try std.testing.expect(try cache.matches(file));
     try file.putDocument(@import("../storage/db/resolver_projection.zig").epoch_key, "changed");
     try std.testing.expect(!try owner.text_source_runtime_cache.?.matches(file));
+}
+
+test "capi native visibility acknowledgement queues physical replay retirement without returning credits" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("visibility-retirement-service", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"one\":{\"text\":\"visible before physical retirement\"}},\"sync_level\":\"full_index\"}"), &output));
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try fixture.connection.owner.refresh();
+        try std.testing.expect(root.db.async_context.replay_retirement_service != null);
+        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        var debt = (try file.replayAdmission()).?;
+        try std.testing.expect(debt.bytes > 0 and debt.records > 0);
+        const target = root.db.core.nextDerivedSequence();
+        try std.testing.expect(try root.db.core.loadAppliedSequence(alloc, "text") >= target);
+        const snapshot = root.db.core.index_manager.textIndex("text").?.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+        // A visibility acknowledgement releases no physical credits. Fill
+        // the producer record quota exactly, then prove admission still fails.
+        debt.limits.records = debt.records;
+        try file.putDocument(native.replay_admission.key, &debt.encode());
+        try std.testing.expectError(error.LiteReplayBacklogExceeded, file.requireReplayProducerCapacity());
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const root = try fixture.connection.owner.refresh();
+    const file = &root.owned_lite_backend.?.native_docstore.?.file;
+    const debt = (try file.replayAdmission()).?;
+    try std.testing.expectEqual(@as(u64, 0), debt.bytes);
+    try std.testing.expectEqual(@as(u64, 0), debt.records);
+    try file.requireReplayProducerCapacity();
+    try std.testing.expect((try file.check()).valid);
 }
 
 test "capi native retirement coalesces consumer lanes in one physical publication" {

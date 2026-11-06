@@ -56691,6 +56691,7 @@ fn applyDerivedBatchToIndexReplayContext(
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
         .replay_index_publication = if (ctx.async_context) |active| active.replay_index_publication else null,
+        .replay_retirement_service = if (ctx.async_context) |active| active.replay_retirement_service else null,
         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
     };
     if (benchMetricsEnabled()) {
@@ -58552,6 +58553,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
         .replay_index_publication = self.async_context.replay_index_publication,
+        .replay_retirement_service = self.async_context.replay_retirement_service,
         .text_merge_runtime = self.async_context.text_merge_runtime,
     };
     const measure_preparation = index_ref.kind == .full_text and resources.store.runtime_store.capabilities().bounded_replay_admission;
@@ -58807,6 +58809,13 @@ const clampReplayTruncationForRepairPins = local_mutation.clampReplayTruncationF
 
 fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.store.deferred_replay_retirement == null) if (ctx.replay_retirement_service) |service| {
+        // Index visibility is already durable. The native owner combines
+        // physical deletion in its retirement lane; only that deletion refunds
+        // the native journal ledger. Standalone runtimes retain inline service.
+        service.request(service.ptr, service.table_id, service.incarnation);
+        return;
+    };
     if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
     defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
     if (ctx.store.runtime_store.capabilities().bounded_replay_admission) {

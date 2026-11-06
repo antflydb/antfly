@@ -53,6 +53,7 @@ pub const Store = struct {
     read_snapshot: ?*docstore.Txn = null,
 
     const vtable: StorageIo.VTable = .{
+        .open_native_namespaces = if (supports_native_artifact_leases) openNativeNamespaces else null,
         .loaded_content_revision = loadedContentRevision,
         .loaded_wal_metadata_revision = loadedWalMetadataRevision,
         .acquire_read_snapshot = acquireReadSnapshot,
@@ -131,6 +132,12 @@ pub const Store = struct {
 fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
+}
+
+fn openNativeNamespaces(raw: *anyopaque, a: Allocator, root: []const u8, read_only: bool) !?@import("../backend_erased.zig").NamespaceStore {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    try validateIndexPath(self, root);
+    return @import("namespace_store.zig").openIfSupported(a, self.docs, root, read_only);
 }
 
 fn lockStore(store: *docstore.Store) void {
@@ -404,45 +411,12 @@ fn appendPublication(raw: *anyopaque, path: []const u8, contents: []const u8, sy
         contents: []const u8,
         participant: native_publication.Participant,
         file: ?*native.NativeFile = null,
-        fn link(ptr: *anyopaque, inode: u64, key: []const u8, destination: []const u8, length: usize) !void {
-            const request: *@This() = @ptrCast(@alignCast(ptr));
-            try validateWritePath(request.store, destination);
-            const file = request.file.?;
-            if ((try file.file.stat(file.runtime())).inode != inode) return error.StaleArtifactConstruction;
-            try file.linkArtifactConstruction(key, destination, length);
-        }
-        fn put(ptr: *anyopaque, inode: u64, destination: []const u8, bytes: []const u8) !void {
-            const request: *@This() = @ptrCast(@alignCast(ptr));
-            try validateWritePath(request.store, destination);
-            const file = request.file.?;
-            if ((try file.file.stat(file.runtime())).inode != inode) return error.StaleArtifactConstruction;
-            if (try file.getIndexCatalogRecordSize(destination) != null) return error.PathAlreadyExists;
-            try file.putIndexCatalogRecord(destination, bytes);
-        }
-        fn metadataKey(request: *@This(), alloc: Allocator, scope: native_publication.Scope, key: []const u8) ![]u8 {
-            if (key.len < 2 or key[0] != 0 or key[1] != 0 or (scope.prefix.len != 0 and scope.prefix[scope.prefix.len - 1] != 0)) return error.InvalidCommitMetadata;
-            const file = request.file.?;
-            if ((try file.file.stat(file.runtime())).inode != scope.inode or !std.mem.eql(u8, &file.header.reader_epoch_namespace, &scope.file_namespace)) return error.StaleArtifactConstruction;
-            return std.mem.concat(alloc, u8, &.{ scope.prefix, key });
-        }
-        fn getMetadata(ptr: *anyopaque, alloc: Allocator, scope: native_publication.Scope, key: []const u8) ![]u8 {
-            const request: *@This() = @ptrCast(@alignCast(ptr));
-            const full = try request.metadataKey(alloc, scope, key);
-            defer alloc.free(full);
-            return (try request.file.?.getDocumentAlloc(alloc, full)) orelse error.NotFound;
-        }
-        fn putMetadata(ptr: *anyopaque, scope: native_publication.Scope, key: []const u8, value: []const u8) !void {
-            const request: *@This() = @ptrCast(@alignCast(ptr));
-            const alloc = request.store.allocator;
-            const full = try request.metadataKey(alloc, scope, key);
-            defer alloc.free(full);
-            try request.file.?.putDocument(full, value);
-        }
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const request: *@This() = @ptrCast(@alignCast(ptr));
             request.file = file;
             defer request.file = null;
-            try request.participant.apply(.{ .ptr = request, .link_fn = link, .put_fn = put, .get_metadata_fn = getMetadata, .put_metadata_fn = putMetadata });
+            var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = request.store.allocator, .index_prefix = request.store.namespace_prefix };
+            try request.participant.apply(host.view());
             try file.appendIndexCatalogRecord(request.path, request.contents);
         }
     };
@@ -1076,10 +1050,12 @@ fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
 }
 
 fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
-    // A logical rename and its namespace update publish through one native
-    // checkpoint. Syncing the container is therefore both the file-content
-    // and logical-parent durability barrier.
-    return try syncContentsAbsolute(ptr, path);
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
+    // Directories are virtual. Native file creation and rename already publish
+    // their namespace and bytes in one durable checkpoint; they create no
+    // separate parent dentry to flush. Explicit content barriers still use
+    // syncContentsAbsolute, including after an unsynced append.
 }
 
 fn loadedWalMetadataRevision(ptr: *anyopaque, root_dir: []const u8) ?StorageIo.ContentRevision {
@@ -3177,6 +3153,38 @@ test "lite detached artifact read admission also fences pooled sources" {
     try std.testing.expectEqualStrings("immutable payload", &actual);
 }
 
+test "lite virtual parent sync has no independent publication or writer admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "virtual-parent-sync.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const Admission = struct {
+        calls: usize = 0,
+        fn enter(ptr: *anyopaque, _: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.FileBusy;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var admission: Admission = .{};
+    docs.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer docs.writer_admission = null;
+    docs.file.last_synced_header = null;
+    const before = docs.file.header;
+    try adapter.storage().syncParentAbsolute("/indexes/text");
+    try std.testing.expectEqual(@as(usize, 0), admission.calls);
+    try std.testing.expectEqualDeep(before, docs.file.header);
+    try std.testing.expect(!docs.file.syncAlreadyComplete());
+    try std.testing.expectError(error.FileBusy, adapter.storage().syncFileContentsAbsolute("/indexes/text/wal"));
+    try std.testing.expectEqual(@as(usize, 1), admission.calls);
+}
+
 test "lite artifact leases transfer retired inode accounting between readers" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4145,4 +4153,185 @@ test "lite native inline publication source outlives request scratch and its sto
     try std.testing.expect(source.ranges.retention_artifact_only);
     try std.testing.expectEqual(input.len, source.ranges.retained_bytes.?(source.ranges.ptr));
     try std.testing.expect(source.ranges.retention_overhead_bytes >= input.len);
+}
+
+test "lite native namespaces ordered overlay snapshots and semantic conflict" {
+    const backend = @import("namespace_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-namespaces.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/indexes/text/index", false);
+    defer store.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    var seed = try store.beginWrite();
+    errdefer seed.abort();
+    try seed.put(.{ .name = "binary\x00/ns" }, "\x00/\xff", "binary record");
+    const long_key: [300]u8 = @splat(0xff);
+    try seed.put(.{ .name = "binary\x00/ns" }, &long_key, "long binary key");
+    try seed.put(ns, "a", "one");
+    try seed.put(ns, "c", "three");
+    try seed.put(.{}, "a", "unnamed");
+    try seed.put(.{ .name = "" }, "a", "empty");
+    try seed.commit();
+    var old = try store.beginRead();
+    defer old.abort();
+    var write = try store.beginWrite();
+    errdefer write.abort();
+    try write.delete(ns, "a");
+    try write.put(ns, "b", "two");
+    try write.put(ns, "c", "replaced");
+    {
+        var cursor = try write.openCursor(ns);
+        defer cursor.close();
+        try std.testing.expectEqualStrings("b", (try cursor.first()).?.key);
+        try std.testing.expectEqualStrings("replaced", (try cursor.next()).?.value);
+        try std.testing.expect((try cursor.next()) == null);
+        try std.testing.expectEqualStrings("c", (try cursor.last()).?.key);
+        try std.testing.expectEqualStrings("b", (try cursor.prev()).?.key);
+        try std.testing.expect((try cursor.prev()) == null);
+        try std.testing.expectEqualStrings("b", (try cursor.seekAtOrAfter("a")).?.key);
+        try std.testing.expectEqualStrings("b", (try cursor.seekAtOrBefore("bb")).?.key);
+        try std.testing.expectError(error.TransactionCursorActive, write.commit());
+    }
+    // Artifact bookkeeping does not change semantic namespace authority.
+    var adapter = Store.init(a, &docs);
+    try adapter.storage().writeFileAbsolute("/indexes/text/obsolete", "garbage");
+    try adapter.storage().deleteFileAbsolute("/indexes/text/obsolete");
+    try write.commit();
+    try std.testing.expectEqualStrings("one", try old.get(ns, "a"));
+    try std.testing.expectEqualStrings("binary record", try old.get(.{ .name = "binary\x00/ns" }, "\x00/\xff"));
+    {
+        var binary = try old.openCursor(.{ .name = "binary\x00/ns" });
+        defer binary.close();
+        try std.testing.expectEqualStrings("\x00/\xff", (try binary.first()).?.key);
+        try std.testing.expectEqualSlices(u8, &long_key, (try binary.last()).?.key);
+        try std.testing.expectEqualSlices(u8, &long_key, (try binary.seekAtOrAfter(&long_key)).?.key);
+    }
+    try std.testing.expectEqualStrings("unnamed", try old.get(.{}, "a"));
+    try std.testing.expectEqualStrings("empty", try old.get(.{ .name = "" }, "a"));
+    var first = try store.beginWrite();
+    errdefer first.abort();
+    var stale = try store.beginWrite();
+    defer stale.abort();
+    try first.put(ns, "d", "winner");
+    try stale.put(ns, "d", "stale");
+    try first.commit();
+    try std.testing.expectError(error.FileBusy, stale.commit());
+    var check = try store.beginRead();
+    defer check.abort();
+    try std.testing.expectEqualStrings("winner", try check.get(ns, "d"));
+    try std.testing.expectError(error.NotFound, check.get(ns, "a"));
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native namespaces share artifact and progress rollback" {
+    const backend = @import("namespace_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-namespace-publication.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/standalone/index", false);
+    defer store.deinit();
+    const Participant = struct {
+        inode: u64,
+        fail: bool = true,
+        fn stage(raw: *anyopaque, view: native_publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try view.put(self.inode, "/standalone/segment", "postings");
+            if (self.fail) return error.InjectedFailure;
+        }
+    };
+    var participant: Participant = .{ .inode = (try docs.file.file.stat(docs.file.runtime())).inode };
+    {
+        var txn = try store.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "meta" }, "progress", "one");
+        try std.testing.expectError(error.InjectedFailure, txn.commitWithPublication(.{ .ptr = &participant, .stage = Participant.stage }));
+    }
+    try std.testing.expect((try docs.file.getIndexCatalogRecordSize("/standalone/segment")) == null);
+    var check = try store.beginRead();
+    defer check.abort();
+    try std.testing.expectError(error.NotFound, check.get(.{ .name = "meta" }, "progress"));
+    participant.fail = false;
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(.{ .name = "meta" }, "progress", "one");
+    try txn.commitWithPublication(.{ .ptr = &participant, .stage = Participant.stage });
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(?usize, 8), try docs.file.getIndexCatalogRecordSize("/standalone/segment"));
+    var latest = try store.beginRead();
+    defer latest.abort();
+    try std.testing.expectEqualStrings("one", try latest.get(.{ .name = "meta" }, "progress"));
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native namespace readers retain backend and IO after owner close" {
+    const backend = @import("namespace_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-namespace-reader.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/indexes/text/index", false);
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(.{}, "a", "survives");
+    try txn.commit();
+    var read = try store.beginRead();
+    defer read.abort();
+    store.deinit();
+    store_open = false;
+    docs.close();
+    docs_open = false;
+    try std.testing.expectEqualStrings("survives", try read.get(.{}, "a"));
+    var cursor = try read.openCursor(.{});
+    defer cursor.close();
+    try std.testing.expectEqualStrings("survives", (try cursor.first()).?.value);
+}
+
+test "lite native namespace capability preserves legacy authority and reopens native roots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-namespace-selection.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    try storage.writeFileAbsolute("/indexes/legacy/index/manifest.bin", "legacy authority");
+    try std.testing.expect((try storage.openNativeNamespaces(a, "/indexes/legacy/index", false)) == null);
+    var direct = (try storage.openNativeNamespaces(a, "/indexes/text/index", false)).?;
+    var direct_open = true;
+    defer if (direct_open) direct.deinit();
+    var txn = try direct.beginWrite();
+    errdefer txn.abort();
+    try txn.put(.{ .name = "meta" }, "active", "native authority");
+    try txn.commit();
+    direct.deinit();
+    direct_open = false;
+    var reopened = (try storage.openNativeNamespaces(a, "/indexes/text/index", true)).?;
+    defer reopened.deinit();
+    try std.testing.expectError(error.ReadOnly, reopened.beginWrite());
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("native authority", try read.get(.{ .name = "meta" }, "active"));
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }

@@ -203,6 +203,7 @@ test "persistent index routes wal lsm profile options" {
 
     switch (idx.wal.store_owner) {
         .lsm => |handle| try std.testing.expectEqual(@as(usize, 88), handle.backend.options.flush_threshold),
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -1065,10 +1066,12 @@ fn runtimeNamespace(keyspace: MainKeyspace) backend_types.Namespace {
 
 const MainStoreOwner = union(enum) {
     mem: *mem_backend.Backend,
+    native: void,
     lsm: lsm_backend.BackendHandle,
 
-    fn externallyPublishedWal(self: *const MainStoreOwner) bool {
+    fn supportsAtomicNativePublication(self: *const MainStoreOwner) bool {
         return switch (self.*) {
+            .native => true,
             .mem => false,
             .lsm => |handle| handle.backend.options.wal_enabled and
                 if (handle.backend.storage) |storage| storage.requiresForegroundPublication() else false,
@@ -1077,6 +1080,7 @@ const MainStoreOwner = union(enum) {
 
     fn close(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
+            .native => {},
             .mem => |backend| {
                 backend.close();
                 alloc.destroy(backend);
@@ -1085,7 +1089,7 @@ const MainStoreOwner = union(enum) {
                 // These handles are reconstructible caches of committed WAL
                 // state. Cache teardown must not publish a new generation from
                 // replayed mutable state while a detached owner is computing.
-                if (self.externallyPublishedWal()) handle.closePreservingWal() else handle.close();
+                if (self.supportsAtomicNativePublication()) handle.closePreservingWal() else handle.close();
             },
         }
         self.* = undefined;
@@ -1093,6 +1097,7 @@ const MainStoreOwner = union(enum) {
 
     fn abandonAfterCrash(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
+            .native => {},
             .mem => |backend| {
                 backend.close();
                 alloc.destroy(backend);
@@ -1104,84 +1109,84 @@ const MainStoreOwner = union(enum) {
 
     fn sync(self: *MainStoreOwner, force: bool) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native => {},
             .lsm => |*handle| try handle.backend.sync(force),
         }
     }
 
     fn syncReplayState(self: *MainStoreOwner) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native => {},
             .lsm => |*handle| try handle.backend.syncReplayState(),
         }
     }
 
     fn lsmMaintenanceScore(self: *const MainStoreOwner) u64 {
         return switch (self.*) {
-            .mem => 0,
+            .mem, .native => 0,
             .lsm => |handle| handle.backend.maintenanceScore(),
         };
     }
 
     fn snapshotLsmMaintenanceStats(self: *const MainStoreOwner) ?lsm_backend.Backend.MaintenanceStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
         };
     }
 
     fn snapshotLsmWriteStats(self: *const MainStoreOwner) ?lsm_backend.Backend.WriteStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.snapshotWriteStats(),
         };
     }
 
     fn snapshotLsmOpenStats(self: *const MainStoreOwner) ?lsm_backend.Backend.OpenStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.snapshotOpenStats(),
         };
     }
 
     fn checkpointLsmWalAfterDurableBoundary(self: *MainStoreOwner) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native => {},
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
         }
     }
 
     fn pinNativeCheckpoint(self: *MainStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.*) {
-            .mem => error.Unsupported,
+            .mem, .native => error.Unsupported,
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
         };
     }
 
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
         };
     }
 
     fn runLsmMaintenanceStep(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .mem => false,
+            .mem, .native => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStep(),
         };
     }
 
     fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .mem => false,
+            .mem, .native => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
         };
     }
 
     fn commitStatsSnapshot(self: *MainStoreOwner) ?CommitStats {
         return switch (self.*) {
-            .mem, .lsm => null,
+            .mem, .native, .lsm => null,
         };
     }
 };
@@ -1309,7 +1314,7 @@ pub const PersistentIndex = struct {
     }
 
     pub fn acquireReplayStager(self: *PersistentIndex, alloc: Allocator) !?immutable_artifact.Stager {
-        if (!self.main_store_owner.externallyPublishedWal()) return null;
+        if (!self.main_store_owner.supportsAtomicNativePublication()) return null;
         const files = self.segment_files orelse return null;
         return files.storage.acquireImmutableStager(alloc);
     }
@@ -1346,7 +1351,7 @@ pub const PersistentIndex = struct {
         if (metadata != null and (!checkpoint.position.applied or checkpoint.position.next_item != checkpoint.position.total_items)) return error.InvalidDerivedApplyState;
         self.lockStorage();
         defer self.unlockStorage();
-        if (!self.main_store_owner.externallyPublishedWal()) return error.Unsupported;
+        if (!self.main_store_owner.supportsAtomicNativePublication()) return error.Unsupported;
         const files = if (self.segment_files) |*value| value else return error.Unsupported;
         {
             var previous_txn = try self.beginReadMainTxn();
@@ -1474,8 +1479,10 @@ pub const PersistentIndex = struct {
             segments: []PreparedReplaySegment,
             metadata: ?ReplayPublicationMetadata,
             snapshot_publication: ?*index_mod.IndexWriter.PreparedSegmentReplacement,
+            target_writer: *index_mod.IndexWriter,
             fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
+                if (self_.snapshot_publication) |prepared| try prepared.bind(self_.target_writer);
                 for (self_.segments) |segment| try segment.artifact.stageLink(view);
                 if (self_.metadata) |joined| {
                     // Arm only at the actual native boundary, after LSM
@@ -1490,7 +1497,9 @@ pub const PersistentIndex = struct {
             .segments = segments,
             .metadata = metadata,
             .snapshot_publication = if (publication) |*prepared| prepared else null,
+            .target_writer = &self.writer,
         };
+        if (publication) |*prepared| try prepared.detach();
         try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage });
         if (publication) |*prepared| prepared.publish();
         published = true;
@@ -1775,6 +1784,9 @@ pub const PersistentIndex = struct {
                 };
             },
             .lsm => {
+                if (opts.main_lsm_storage orelse opts.main_lsm_options.storage) |storage| {
+                    if (try storage.openNativeNamespaces(alloc, index_path, opts.read_only)) |store| return .{ .store = store, .owner = .{ .native = {} } };
+                }
                 var handle = try lsm_backend.BackendHandle.open(alloc, index_path, resolvedMainLsmOptions(opts, false));
                 errdefer handle.close();
 
@@ -1857,7 +1869,7 @@ pub const PersistentIndex = struct {
             opened_main.owner.close(alloc);
         }
 
-        const cache_lifecycle = opened_main.owner.externallyPublishedWal();
+        const cache_lifecycle = opened_main.owner.supportsAtomicNativePublication();
         // Managed Native caches already recover committed namespaces from WAL.
         // An empty setup commit can otherwise flush that recovered state and
         // invalidate a concurrent detached publication merely by opening.
@@ -2335,7 +2347,7 @@ pub const PersistentIndex = struct {
 
     pub fn lsmMaintenanceDebtHint(self: *const PersistentIndex) u64 {
         return switch (self.main_store_owner) {
-            .mem => 0,
+            .mem, .native => 0,
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
         };
     }
@@ -2343,7 +2355,7 @@ pub const PersistentIndex = struct {
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
         if (self.retirement_reconcile_pending) return 0;
         const storage_delay: ?u64 = switch (self.main_store_owner) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
         const retirement_delay = if (self.retired_segment_file_deleter) |deleter| deleter.nextWakeDelayNs() else null;
@@ -2353,7 +2365,7 @@ pub const PersistentIndex = struct {
 
     pub fn refreshLsmMaintenanceDebtHint(self: *PersistentIndex) void {
         switch (self.main_store_owner) {
-            .mem => {},
+            .mem, .native => {},
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
         }
     }
@@ -7852,7 +7864,13 @@ test "lite persistent cache lifecycle preserves replayed WAL without publication
     defer docs.close();
     docs.maintenance_start_suppressed = true;
     var storage = lite_indexes.Store.init(a, &docs);
-    const opts = PersistentIndexOptions{ .path = "/lite-text", .io = std.testing.io, .main_lsm_options = .{ .flush_threshold = 1024 }, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    // This regression exercises recovery of the compatibility LSM's WAL.
+    // Native namespaces have no main-store WAL or flush counter.
+    var compatibility_vtable = storage.storage().vtable.*;
+    compatibility_vtable.open_native_namespaces = null;
+    var compatibility = storage.storage();
+    compatibility.vtable = &compatibility_vtable;
+    const opts = PersistentIndexOptions{ .path = "/lite-text", .io = std.testing.io, .main_lsm_options = .{ .flush_threshold = 1024 }, .main_lsm_storage = compatibility, .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
     for ([_][]const u8{ "first", "replacement" }) |value| {
         {
             var index = try PersistentIndex.open(a, opts);
@@ -7995,13 +8013,19 @@ test "lite atomic replay activates deletion segments and continuation together a
     var docs_live = true;
     defer if (docs_live) docs.close();
     var storage = lite_indexes.Store.init(a, &docs);
+    // Exercise the compatibility WAL fault points deliberately. The direct
+    // native backend is covered independently and never appends this LSM WAL.
+    var compatibility_vtable = storage.storage().vtable.*;
+    compatibility_vtable.open_native_namespaces = null;
+    var compatibility = storage.storage();
+    compatibility.vtable = &compatibility_vtable;
     const opts: PersistentIndexOptions = .{
         .path = "/atomic/index",
         .io = std.testing.io,
         .main_backend = .lsm,
-        .main_lsm_storage = storage.storage(),
+        .main_lsm_storage = compatibility,
         .wal_backend = .lsm,
-        .wal_storage = storage.storage(),
+        .wal_storage = compatibility,
         .main_lsm_options = .{ .flush_threshold = 32 * 1024 * 1024 },
         .main_no_sync = true,
         .wal_no_sync = true,
@@ -8121,13 +8145,17 @@ test "persistent rebuild page preserves possibly committed artifacts across reop
         var docs_live = true;
         defer if (docs_live) docs.close();
         var storage = lite_indexes.Store.init(a, &docs);
+        var compatibility_vtable = storage.storage().vtable.*;
+        compatibility_vtable.open_native_namespaces = null;
+        var compatibility = storage.storage();
+        compatibility.vtable = &compatibility_vtable;
         const opts: PersistentIndexOptions = .{
             .path = "/rebuild/index",
             .io = std.testing.io,
             .main_backend = .lsm,
-            .main_lsm_storage = storage.storage(),
+            .main_lsm_storage = compatibility,
             .wal_backend = .lsm,
-            .wal_storage = storage.storage(),
+            .wal_storage = compatibility,
             .main_lsm_options = .{ .flush_threshold = 32 * 1024 * 1024 },
             .main_no_sync = true,
             .wal_no_sync = true,
@@ -8168,4 +8196,64 @@ test "persistent rebuild page preserves possibly committed artifacts across reop
         try std.testing.expectEqual(@as(usize, if (after_wal) 1 else 0), try persistentSearchHitCount(a, index.snapshot(), "recovered"));
         try std.testing.expect((try docs.file.check()).valid);
     }
+}
+
+test "lite direct native replay publishes metadata and artifacts in one checkpoint and reopens" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/direct-native-replay.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts: PersistentIndexOptions = .{
+        .path = "/indexes/text",
+        .io = std.testing.io,
+        .main_backend = .lsm,
+        .main_lsm_storage = storage.storage(),
+        .wal_backend = .lsm,
+        .wal_storage = storage.storage(),
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    try std.testing.expect(index.main_store_owner == .native);
+    try std.testing.expect(index.wal.store_owner == .native);
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    try index.indexSegment(alpha);
+    const old = index.acquireSnapshot();
+    defer old.release();
+    var stager = (try index.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    const beta = try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    var staged = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, beta)};
+    defer for (&staged) |*segment| segment.deinit();
+    const identity: ReplayFragment.Identity = .{ .generation = 4, .config_hash = 5, .incarnation = 6 };
+    const checkpoint: ReplayFragment.Checkpoint = .{ .identity = identity, .position = .{ .sequence = 1, .next_item = 1, .total_items = 1, .fingerprint = @splat(7), .applied = true } };
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    const deletes = try index.publishReplay(&staged, &.{"doc:a"}, checkpoint);
+    index.freeDeleteInfos(deletes);
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expect(index.snapshotLsmWriteStats() == null);
+    index.close();
+    index_live = false;
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expect(index.main_store_owner == .native);
+    try std.testing.expect(index.wal.store_owner == .native);
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expect((try docs.file.check()).valid);
 }

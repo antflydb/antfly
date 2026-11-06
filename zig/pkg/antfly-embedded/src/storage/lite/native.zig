@@ -1171,9 +1171,10 @@ const revision8_magic = "AFLITE\x08P";
 const revision9_magic = "AFLITE\x09P";
 const revision10_magic = "AFLITE\x0aP";
 const revision11_magic = "AFLITE\x0bP";
-const indexed_magic = "AFLITE\x0cP";
+const revision12_magic = "AFLITE\x0cP";
+const indexed_magic = "AFLITE\x0dP";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 12;
+pub const indexed_format_version: u32 = 13;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -2946,6 +2947,17 @@ pub const CatalogCursor = struct {
         const value = try file.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.index.checkpoint);
         errdefer allocator.free(value);
         return .{ .key = try allocator.dupe(u8, key.key), .value = value };
+    }
+
+    /// Read an already located index entry without another tree lookup. The
+    /// cursor's checkpoint and metadata fence protect its record reference.
+    pub fn valueForEntryAlloc(self: *CatalogCursor, allocator: Allocator, indexed: DocumentIndexEntry, keys_only: bool) !?[]u8 {
+        const file = self.index.file;
+        const entry = try decodeCatalogEntry(try self.records.read(file, file.allocator, self.index.checkpoint, indexed.document_page_id, .catalog));
+        if (!std.mem.eql(u8, indexed.key, entry.key)) return error.InvalidDocumentIndex;
+        if (entry.is_delete) return null;
+        if (keys_only) return &.{};
+        return try file.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.index.checkpoint);
     }
 
     /// The caller owns the returned key, allocated with the native file allocator.
@@ -13532,7 +13544,7 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else if (header.indexed_revision == 12) revision12_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
     std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) header.indexed_revision else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
@@ -13556,12 +13568,13 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const revision9 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision9_magic);
     const revision10 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision10_magic);
     const revision11 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision11_magic);
-    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
+    const revision12 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision12_magic);
+    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or revision12 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
+    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (revision12) @as(u32, 12) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -14196,7 +14209,7 @@ fn headerChecksum(raw: []const u8) u32 {
     var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
-    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic)) logical_generations_end else checkpoint_slots_end;
+    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic) or std.mem.eql(u8, raw[0..revision12_magic.len], revision12_magic)) logical_generations_end else checkpoint_slots_end;
     crc.update(raw[end..header_checksum_offset]);
     return crc.final();
 }

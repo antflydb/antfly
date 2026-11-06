@@ -2748,8 +2748,12 @@ pub const IndexWriter = struct {
     /// mutex. Persistent stores prepare this before committing their metadata
     /// transaction, making publication after durable commit infallible.
     pub const PreparedSegmentReplacement = struct {
-        writer: *IndexWriter,
+        writer: ?*IndexWriter,
         snapshot: *IndexSnapshot,
+        /// A detached candidate retains its exact base without borrowing the
+        /// writer. The caller binds a live target under lifecycle admission.
+        detached_base: ?*IndexSnapshot = null,
+        detached_revisions: []u64 = &.{},
         retired: []SegmentEntry,
         reused_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
         staging_alloc: Allocator,
@@ -2758,21 +2762,54 @@ pub const IndexWriter = struct {
         active: bool = true,
         external_visibility_owned: bool = false,
 
+        /// Release writer serialization before waiting for native admission.
+        /// Abort remains independent of the writer's lifetime after detaching.
+        pub fn detach(self: *PreparedSegmentReplacement) !void {
+            std.debug.assert(self.active and !self.external_visibility_owned and self.detached_base == null);
+            const writer = self.writer.?;
+            const base = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
+            const revisions = try self.staging_alloc.alloc(u64, base.segments.len);
+            for (base.segments, revisions) |segment, *revision| revision.* = segment.shared.deletion_revision.load(.acquire);
+            self.detached_revisions = revisions;
+            self.detached_base = base.retain();
+            self.writer = null;
+            writer.mu.unlock();
+        }
+
+        /// Exact base identity prevents publishing a prepared deletion bitmap
+        /// or carried inventory over an intervening mutation. The retained base
+        /// prevents pointer ABA. The caller fences the live writer's lifetime.
+        pub fn bind(self: *PreparedSegmentReplacement, writer: *IndexWriter) !void {
+            std.debug.assert(self.active and self.writer == null);
+            writer.lockMutex();
+            if (@atomicLoad(*IndexSnapshot, &writer.current, .acquire) != self.detached_base.?) {
+                writer.mu.unlock();
+                return error.EnrichmentWaitCanceled;
+            }
+            for (self.detached_base.?.segments, self.detached_revisions) |segment, revision| {
+                if (segment.shared.deletion_revision.load(.acquire) != revision) {
+                    writer.mu.unlock();
+                    return error.EnrichmentWaitCanceled;
+                }
+            }
+            self.writer = writer;
+        }
+
         pub fn guardExternalVisibility(self: *PreparedSegmentReplacement) void {
             std.debug.assert(self.active and !self.external_visibility_owned);
-            @import("antfly_platform").sync.lockYielding(&self.writer.external_visibility_gate);
+            @import("antfly_platform").sync.lockYielding(&self.writer.?.external_visibility_gate);
             self.external_visibility_owned = true;
         }
 
         fn releaseExternalVisibility(self: *PreparedSegmentReplacement) void {
             if (!self.external_visibility_owned) return;
             self.external_visibility_owned = false;
-            self.writer.external_visibility_gate.unlock();
+            self.writer.?.external_visibility_gate.unlock();
         }
 
         pub fn publish(self: *PreparedSegmentReplacement) void {
             std.debug.assert(self.active);
-            const writer = self.writer;
+            const writer = self.writer.?;
             const old = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
 
             for (self.snapshot.segments[0..self.carried_count]) |*seg| seg.retain();
@@ -2793,23 +2830,31 @@ pub const IndexWriter = struct {
             self.releaseExternalVisibility();
             old.release();
             writer.mu.unlock();
+            self.staging_alloc.free(self.detached_revisions);
+            self.detached_revisions = &.{};
+            if (self.detached_base) |base| base.release();
+            self.detached_base = null;
             self.active = false;
         }
 
         pub fn abort(self: *PreparedSegmentReplacement) void {
             if (!self.active) return;
             self.releaseExternalVisibility();
-            const writer = self.writer;
+            const alloc = self.snapshot.alloc;
             for (self.snapshot.segments[self.carried_count..]) |*seg| {
-                SegmentEntry.destroyShared(writer.alloc, seg.shared);
+                SegmentEntry.destroyShared(alloc, seg.shared);
                 seg.reader.deinit();
             }
-            writer.alloc.free(self.snapshot.segments);
-            self.snapshot.global_total_field_len.deinit(writer.alloc);
-            writer.alloc.destroy(self.snapshot);
+            alloc.free(self.snapshot.segments);
+            self.snapshot.global_total_field_len.deinit(alloc);
+            alloc.destroy(self.snapshot);
             self.reused_ids.deinit(self.staging_alloc);
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
-            writer.mu.unlock();
+            if (self.writer) |writer| writer.mu.unlock();
+            self.staging_alloc.free(self.detached_revisions);
+            self.detached_revisions = &.{};
+            if (self.detached_base) |base| base.release();
+            self.detached_base = null;
             self.active = false;
         }
     };
@@ -6442,4 +6487,54 @@ test "external progress publication gates new index snapshots through activation
         try std.testing.expectEqual(@as(usize, if (commit) 0 else 1), context.count);
         try std.testing.expectEqual(@as(usize, 1), retained.segments.len);
     }
+}
+
+test "detached index publication releases serialization and validates snapshot and deletion revisions" {
+    const a = std.testing.allocator;
+    for ([_]enum { unchanged, replaced, deleted }{ .unchanged, .replaced, .deleted }) |change| {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+        defer a.free(bytes);
+        try writer.addSegment(bytes);
+        var prepared = try writer.prepareSegmentsManyData(&.{1}, &.{});
+        defer prepared.abort();
+        try prepared.detach();
+        try std.testing.expect(writer.mu.tryLock());
+        writer.mu.unlock();
+        switch (change) {
+            .unchanged => {
+                try prepared.bind(&writer);
+                prepared.guardExternalVisibility();
+                prepared.publish();
+                try std.testing.expectEqual(@as(usize, 0), writer.current.segments.len);
+            },
+            .replaced => {
+                try writer.addSegment(bytes);
+                try std.testing.expectError(error.EnrichmentWaitCanceled, prepared.bind(&writer));
+            },
+            .deleted => {
+                const pointer = writer.current;
+                try std.testing.expect(try writer.deleteById("old"));
+                try std.testing.expect(pointer == writer.current);
+                try std.testing.expectError(error.EnrichmentWaitCanceled, prepared.bind(&writer));
+            },
+        }
+    }
+}
+
+test "detached index publication abort owns its lifetime after writer shutdown" {
+    const a = std.testing.allocator;
+    var writer = try IndexWriter.init(a);
+    var writer_live = true;
+    defer if (writer_live) writer.deinit();
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    var prepared = try writer.prepareSegmentsManyData(&.{1}, &.{});
+    defer prepared.abort();
+    try prepared.detach();
+    writer.deinit();
+    writer_live = false;
+    prepared.abort();
 }
