@@ -2488,6 +2488,7 @@ pub const RuntimeState = enum {
 };
 
 pub const RuntimeSnapshotEntry = struct {
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId,
     unloadable: bool = false,
     model_dir: []u8,
@@ -2644,6 +2645,7 @@ pub const ChunkPlanningAssets = struct {
 };
 
 pub const LoadedModel = struct {
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     residency_mode: RuntimeResidencyMode = .backend_managed,
     chunk_planning: ?ChunkPlanningSnapshot = null,
@@ -2980,6 +2982,24 @@ pub const LoadedModel = struct {
         );
     }
 
+    fn checkOwnerSelection(self: *const LoadedModel, control: ?InferenceExecutionControl) !void {
+        if (control) |active| {
+            try active.check();
+            if (active.model_selection) |selected| {
+                if (!selected.matches(self.model_dir) or !std.meta.eql(selected.publication, self.managed_publication)) return error.ModelArtifactsChanging;
+            }
+        }
+    }
+
+    fn publicationIo(self: *const LoadedModel, control: ?InferenceExecutionControl) std.Io {
+        return if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io;
+    }
+
+    fn verifyOwnerPublication(self: *const LoadedModel, control: ?InferenceExecutionControl) !void {
+        try self.checkOwnerSelection(control);
+        if (!std.meta.eql(self.managed_publication, try managed_receipt.publicationGeneration(self.allocator, self.publicationIo(control), self.model_dir))) return error.ModelArtifactsChanging;
+    }
+
     fn ensureOptionalSessionWithControl(
         self: *LoadedModel,
         kind: DeclaredOptionalSessionKind,
@@ -2988,9 +3008,13 @@ pub const LoadedModel = struct {
         path: ?[]const u8,
         control: ?InferenceExecutionControl,
     ) !bool {
-        if (control) |active| try active.check();
+        try self.checkOwnerSelection(control);
         if (slot.* != null) return false;
         const session_path = path orelse return false;
+        const io = self.publicationIo(control);
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, self.model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyOwnerPublication(control);
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
         const strict_backend = [_]backends.BackendType{if (shared_ctx) |shared|
             shared.backendType()
@@ -3014,7 +3038,7 @@ pub const LoadedModel = struct {
             control,
         );
         defer loaded.deinit();
-        if (control) |active| try active.check();
+        try self.verifyOwnerPublication(control);
         const owned = loaded.take();
         slot.* = owned.session;
         lease_slot.* = owned.resource_lease;
@@ -3512,11 +3536,22 @@ pub const LoadedModel = struct {
     /// The model's open projector file, opened on first use. Null when the
     /// manifest has no GGUF projector.
     pub fn ensureProjectorStore(self: *LoadedModel) !?*gemma4_projector.ProjectorStore {
+        return self.ensureProjectorStoreWithControl(null);
+    }
+
+    pub fn ensureProjectorStoreWithControl(self: *LoadedModel, control: ?InferenceExecutionControl) !?*gemma4_projector.ProjectorStore {
         const path = self.manifest.gguf_projector_path orelse return null;
-        platform.sync.lockYielding(&self.projector_store_mutex);
+        try self.checkOwnerSelection(control);
+        if (control) |active| try active.lock(&self.projector_store_mutex) else platform.sync.lockYielding(&self.projector_store_mutex);
         defer self.projector_store_mutex.unlock();
         if (self.projector_store) |store| return store;
+        const io = self.publicationIo(control);
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, self.model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyOwnerPublication(control);
         const store = try gemma4_projector.ProjectorStore.open(self.allocator, path);
+        errdefer store.close();
+        try self.verifyOwnerPublication(control);
         self.projector_store = store;
         return store;
     }
@@ -3756,6 +3791,7 @@ test "embedding asset rollback closes only newly acquired primary sessions" {
     var existing_vision_probe = CloseProbe{};
     var visual_probe = CloseProbe{};
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.text_projection = text_probe.session();
     model.vision_session = existing_vision_probe.session();
     model.visual_projection = visual_probe.session();
@@ -3818,6 +3854,7 @@ test "audio asset rollback closes every ephemeral session" {
     var audio_probe = CloseProbe{};
     var projection_probe = CloseProbe{};
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.audio_session = audio_probe.session();
     model.audio_projection = projection_probe.session();
     model.audio_resource_lease = null;
@@ -3849,6 +3886,7 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
 }
 
 const LoadFlight = struct {
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     model_dir: ?[]u8 = null,
     completed: std.Io.Event = .unset,
@@ -3932,6 +3970,7 @@ const LoadFlightControl = struct {
 };
 
 const LoadTask = struct {
+    managed_publication: ?[32]u8 = null,
     manager: *ModelManager,
     flight: *LoadFlight,
     flight_key: []u8,
@@ -4080,6 +4119,7 @@ test "load flight retirement reservations exclude the manager task" {
 }
 
 const CompositeAssetsLoadFlight = struct {
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     model_dir: ?[]u8 = null,
     kind: CompositeKind = .whisper_metadata,
@@ -4365,6 +4405,7 @@ pub const CompositeKind = enum { whisper_metadata, whisper, seq2seq };
 /// One immutable publication pinned across tokenization, encode and decode.
 /// Component sessions keep their resident admission and backend ownership.
 pub const CompositeAssets = struct {
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     allocator: std.mem.Allocator = std.heap.page_allocator,
     model_dir: []u8 = &.{},
@@ -4696,7 +4737,16 @@ pub const ModelManager = struct {
         }
     };
 
+    fn verifyArtifactPublication(self: *ModelManager, model_dir: []const u8, man: *const manifest_mod.ModelManifest) !void {
+        const io = self.session_manager.io orelse std.Options.debug_io;
+        if (!std.meta.eql(man.managed_publication, try managed_receipt.publicationGeneration(self.allocator, io, model_dir))) return error.ModelArtifactsChanging;
+    }
+
     pub fn loadGenerationTokenizerAssets(self: *ModelManager, model_dir: []const u8, man: *const manifest_mod.ModelManifest) !TokenizerAssets {
+        const io = self.session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyArtifactPublication(model_dir, man);
         try self.ensureResourceOwnerReady();
         const kind = if (shouldPreferSentencePieceOverride(man.*, model_dir, self.allocator))
             manifest_mod.TokenizerType.sentencepiece
@@ -4730,6 +4780,7 @@ pub const ModelManager = struct {
             ct.* = try generation.ChatTemplate.init(self.allocator, source, man.bos_token, man.eos_token, man.unk_token, man.pad_token);
             assets.chat_tmpl = ct;
         }
+        try self.verifyArtifactPublication(model_dir, man);
         if (lease) |*active| try active.retain(plan.resident);
         assets.lease = lease;
         return assets;
@@ -4738,6 +4789,10 @@ pub const ModelManager = struct {
     /// Load only the admitted backend session. Artifact callers already own
     /// tokenizer assets and must not parse or retain a second tokenizer.
     pub fn loadArtifactSession(self: *ModelManager, model_dir: []const u8, man: manifest_mod.ModelManifest) !ArtifactSession {
+        const io = self.session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyArtifactPublication(model_dir, &man);
         var managed = try loadSessionForPreferredBackends(self, &.{.native}, model_dir, man, &self.session_manager, null);
         var result = ArtifactSession{ .allocator = self.allocator, .managed = managed.take(), .session = managed.session };
         errdefer result.deinit();
@@ -4754,6 +4809,7 @@ pub const ModelManager = struct {
             result.shared_prefetch = state;
             try session_factory.attachSharedPrefetchState(result.session, state);
         }
+        try self.verifyArtifactPublication(model_dir, &man);
         return result;
     }
 
@@ -5221,6 +5277,14 @@ pub const ModelManager = struct {
             if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(bytes) == 0) return err;
             return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
         };
+    }
+
+    /// Auxiliary resident models share the physical host domain with primary
+    /// sessions. The constructor shrinks this lease to actual owned weights.
+    pub fn admitHostWeights(self: *ModelManager, peak_bytes: usize) !runtime.tier.memory.AdmissionLease {
+        try self.ensureResourceOwnerReady();
+        const domain = self.resource_domain.?;
+        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true);
     }
 
     /// Exact admission ownership held by the live Hugging Face tokenizer
@@ -6974,19 +7038,42 @@ pub const ModelManager = struct {
         return modelCacheHasPublicationCapacity(self.loaded.count(), self.max_loaded_models);
     }
 
+    pub fn publicationForRequest(self: *ModelManager, model_dir: []const u8, control: ?InferenceExecutionControl) !?[32]u8 {
+        if (control) |active| try active.check();
+        const current = try managed_receipt.publicationGeneration(self.allocator, if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io, model_dir);
+        if (control) |active| if (active.model_selection) |selected| {
+            if (!selected.matches(model_dir) or !std.meta.eql(selected.publication, current)) return error.ModelArtifactsChanging;
+        };
+        return current;
+    }
+
     pub fn acquireLoadedModel(self: *ModelManager, model_dir: []const u8) ?ModelHandle {
+        return self.acquireLoadedModelWithControl(model_dir, .{}) catch null;
+    }
+
+    pub fn acquireLoadedModelWithControl(self: *ModelManager, model_dir: []const u8, control: InferenceExecutionControl) !?ModelHandle {
+        const expected = try self.publicationForRequest(model_dir, control);
         self.lockLoadedModels();
-        defer self.unlockLoadedModels();
-        const model = self.loaded.get(model_dir) orelse
-            self.loaded_aliases.get(model_dir) orelse return null;
+        const model = self.loaded.get(model_dir) orelse self.loaded_aliases.get(model_dir) orelse {
+            self.unlockLoadedModels();
+            return null;
+        };
         model.active_handles += 1;
-        return .{ .manager = self, .model = model };
+        self.unlockLoadedModels();
+        var handle: ModelHandle = .{ .manager = self, .model = model };
+        try self.requireManagedPublication(&handle, expected);
+        return handle;
     }
 
     /// Pin the same cached publication selected by ordinary request loading,
     /// including required-backend and A4B policy keys. Never load cold assets
     /// or join a load flight while reading request-admission metadata.
     pub fn acquireCachedFromDir(self: *ModelManager, model_dir: []const u8) !?ModelHandle {
+        return self.acquireCachedFromDirWithControl(model_dir, .{});
+    }
+
+    pub fn acquireCachedFromDirWithControl(self: *ModelManager, model_dir: []const u8, control: InferenceExecutionControl) !?ModelHandle {
+        const publication = try self.publicationForRequest(model_dir, control);
         const defaults = self.defaultModelLoadPolicy(model_dir);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
@@ -6994,22 +7081,41 @@ pub const ModelManager = struct {
             &required_backend_scratch,
         );
         self.lockLoadedModels();
-        defer self.unlockLoadedModels();
-        const model = (try self.lookupLoadedModelLocked(
+        const model = (self.lookupLoadedModelLocked(
             model_dir,
             effective_backends,
             true,
             defaults.cache_policy,
-        )) orelse return null;
+        ) catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        }) orelse {
+            self.unlockLoadedModels();
+            return null;
+        };
         model.active_handles += 1;
-        return .{ .manager = self, .model = model };
+        self.unlockLoadedModels();
+        var handle: ModelHandle = .{ .manager = self, .model = model };
+        try self.requireManagedPublication(&handle, publication);
+        return handle;
+    }
+
+    fn requireManagedPublication(self: *ModelManager, handle: *ModelHandle, expected: ?[32]u8) !void {
+        _ = self;
+        if (std.meta.eql(handle.get().managed_publication, expected)) return;
+        handle.retire();
+        return error.ModelArtifactsChanging;
     }
 
     /// Return owned warm-request metadata without holding a second runtime
     /// owner through execution or integrity recovery. Cold paths still inspect
     /// the manifest before loading assets.
     pub fn copyCachedQwenEmbeddingManifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        return self.copyCachedQwenEmbeddingManifestWithControl(allocator, model_dir, .{});
+    }
+
+    pub fn copyCachedQwenEmbeddingManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
         defer handle.release();
         const model = handle.get();
         if (model.manifest.embedding_style != .qwen3_embedding or model.session.backend() != .metal) return null;
@@ -7021,7 +7127,11 @@ pub const ModelManager = struct {
     /// generation before consuming input. Explicit retirement/reload publishes
     /// a different manifest instead of reparsing the tokenizer per request.
     pub fn copyCachedEmbeddingGemma2Manifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        return self.copyCachedEmbeddingGemma2ManifestWithControl(allocator, model_dir, .{});
+    }
+
+    pub fn copyCachedEmbeddingGemma2ManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
         defer handle.release();
         const model = handle.get();
         if (model.manifest.embedding_style != .embedding_gemma2) return null;
@@ -7032,7 +7142,11 @@ pub const ModelManager = struct {
     /// Clone under a short cache pin so invalid requests and slow media uploads
     /// do not prevent eviction or recovery. Execution rechecks its own manifest.
     pub fn copyCachedGenerationManifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        return self.copyCachedGenerationManifestWithControl(allocator, model_dir, .{});
+    }
+
+    pub fn copyCachedGenerationManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
         defer handle.release();
         const model = handle.get();
         if (model.manifest.model_type != .generator) return null;
@@ -7100,6 +7214,7 @@ pub const ModelManager = struct {
             errdefer allocator.free(owned_model_dir);
             try entries.append(allocator, .{
                 .runtime_id = model.runtime_id,
+                .managed_publication = model.managed_publication,
                 .unloadable = !model.pinned and model.active_handles == 0 and !self.modelIsInFlightLocked(model),
                 .model_dir = owned_model_dir,
                 .state = if (model.active_handles == 0) .loaded else .in_use,
@@ -7130,6 +7245,7 @@ pub const ModelManager = struct {
             errdefer allocator.free(owned_model_dir);
             try entries.append(allocator, .{
                 .runtime_id = assets.runtime_id,
+                .managed_publication = assets.managed_publication,
                 .unloadable = !assets.startup_managed and assets.active_handles == 0 and !self.compositeAssetsIsInFlightLocked(assets),
                 .model_dir = owned_model_dir,
                 .state = if (assets.active_handles == 0) .loaded else .in_use,
@@ -7157,6 +7273,7 @@ pub const ModelManager = struct {
             errdefer allocator.free(owned_model_dir);
             try entries.append(allocator, .{
                 .runtime_id = flight.runtime_id,
+                .managed_publication = flight.managed_publication,
                 .model_dir = owned_model_dir,
                 .state = .loading,
                 .runtime_kind = .primary,
@@ -7180,6 +7297,7 @@ pub const ModelManager = struct {
             errdefer allocator.free(owned_model_dir);
             try entries.append(allocator, .{
                 .runtime_id = flight.runtime_id,
+                .managed_publication = flight.managed_publication,
                 .model_dir = owned_model_dir,
                 .state = .loading,
                 .runtime_kind = .composite,
@@ -7543,7 +7661,7 @@ pub const ModelManager = struct {
         const manager = task.manager;
         defer manager.releaseCompositeAssetsLoadFlight(task.key, task.flight);
         var active = LoadFlightControl{ .flight = &task.flight.load_state };
-        const assets = manager.loadCompositeAssetsUncached(task.model_dir, task.paths, task.preferred_backends, task.key, task.flight.runtime_id, task.flight.model_type, task.kind, active.control()) catch |err| {
+        const assets = manager.loadCompositeAssetsUncached(task.model_dir, task.paths, task.preferred_backends, task.key, task.flight.runtime_id, task.flight.model_type, task.kind, (@import("../registry/model_selection.zig").ResolvedModel{ .path = task.model_dir, .publication = task.flight.managed_publication }).bind(active.control())) catch |err| {
             manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
             return;
         };
@@ -7553,6 +7671,12 @@ pub const ModelManager = struct {
             manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
             return;
         };
+        if (!std.meta.eql(assets.managed_publication, task.flight.managed_publication)) {
+            assets.deinit();
+            manager.allocator.destroy(assets);
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, error.ModelArtifactsChanging);
+            return;
+        }
         var handle = manager.publishCompositeAssets(task.key, assets) catch |err| {
             manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
             return;
@@ -7566,6 +7690,7 @@ pub const ModelManager = struct {
         tokenizer_path: []u8,
         config_path: []u8,
         generation_config_path: ?[]u8,
+        managed_publication: ?[32]u8,
 
         pub fn deinit(self: *ResolvedWhisperSidecars) void {
             self.allocator.free(self.tokenizer_path);
@@ -7618,6 +7743,7 @@ pub const ModelManager = struct {
             .tokenizer_path = owned_tokenizer_path,
             .config_path = owned_config_path,
             .generation_config_path = generation_config_path,
+            .managed_publication = manifest.managed_publication,
         };
     }
 
@@ -7697,8 +7823,13 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !*CompositeAssets {
         if (control) |active| try active.check();
+        const publication_io = if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, publication_io, model_dir);
+        defer publication_lease.deinit(publication_io);
+        const publication = try self.publicationForRequest(model_dir, control);
         var sidecars = try self.resolveWhisperSidecars(model_dir);
         defer sidecars.deinit();
+        if (publication != null and !std.meta.eql(publication, sidecars.managed_publication)) return error.ModelArtifactsChanging;
 
         var managed_tokenizer = try self.loadManagedHfTokenizerFile(sidecars.tokenizer_path);
         errdefer managed_tokenizer.deinit();
@@ -7773,7 +7904,9 @@ pub const ModelManager = struct {
         errdefer self.allocator.free(owned_model_dir);
         const owned_preferred_backends = try self.allocator.dupe(backends.BackendType, preferred_backends);
         errdefer self.allocator.free(owned_preferred_backends);
+        if (!std.meta.eql(publication, try managed_receipt.publicationGeneration(self.allocator, self.session_manager.io orelse std.Options.debug_io, model_dir))) return error.ModelArtifactsChanging;
         assets.* = .{
+            .managed_publication = publication,
             .runtime_id = runtime_id,
             .allocator = self.allocator,
             .model_dir = owned_model_dir,
@@ -7884,6 +8017,7 @@ pub const ModelManager = struct {
         const generation_key = try self.compositeAssetGenerationSignature(model_dir, paths);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(&generation_key);
+        if (try managed_receipt.publicationGeneration(self.allocator, self.session_manager.io orelse std.Options.debug_io, model_dir)) |publication| hash.update(&publication);
         hash.update(@tagName(kind));
         hash.update(@tagName(model_type));
         for (preferred_backends) |backend| {
@@ -8034,6 +8168,14 @@ pub const ModelManager = struct {
     }
 
     fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, preferred_backends: []const backends.BackendType, model_type: manifest_mod.ModelType, kind: CompositeKind, control: ?InferenceExecutionControl) !CompositeAssetsHandle {
+        const publication = try self.publicationForRequest(model_dir, control);
+        var handle = try self.acquireCompositeRuntimePlannedInner(model_dir, component_paths, preferred_backends, model_type, kind, control, publication);
+        errdefer handle.release();
+        if (!std.meta.eql(publication, handle.get().managed_publication)) return error.ModelArtifactsChanging;
+        return handle;
+    }
+
+    fn acquireCompositeRuntimePlannedInner(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, preferred_backends: []const backends.BackendType, model_type: manifest_mod.ModelType, kind: CompositeKind, control: ?InferenceExecutionControl, publication: ?[32]u8) !CompositeAssetsHandle {
         const asset_generation = try self.compositeRuntimeKey(
             model_dir,
             component_paths,
@@ -8071,6 +8213,7 @@ pub const ModelManager = struct {
             return err;
         };
         flight.* = .{
+            .managed_publication = publication,
             .runtime_id = self.nextRuntimeIdLocked(),
             .model_dir = flight_model_dir,
             .kind = kind,
@@ -8095,7 +8238,7 @@ pub const ModelManager = struct {
             return err;
         };
         self.unlockLoadedModels();
-        if (control != null) {
+        if (control != null and control.?.request_owned) {
             self.load_group.concurrent(coordination_io, runCompositeLoadTask, .{task}) catch |err| {
                 self.finishCompositeAssetsLoadFlight(flight, null, err);
                 task.deinit();
@@ -8163,6 +8306,10 @@ pub const ModelManager = struct {
     /// Explicit GLiNER precision is immutable and part of both the resident
     /// variant and in-flight load identity. Later ordinary requests may reuse
     /// the default alias published by this startup preload.
+    pub fn acquireFromDirWithGlinerCudaPrecisionAndControl(self: *ModelManager, model_dir: []const u8, precision: session_factory.GlinerCudaPrecision, control: InferenceExecutionControl) !ModelHandle {
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = &.{.cuda}, .gliner_cuda_precision = precision }, true, control);
+    }
+
     pub fn acquireFromDirWithGlinerCudaPrecision(self: *ModelManager, model_dir: []const u8, precision: session_factory.GlinerCudaPrecision) !ModelHandle {
         return self.acquireResolvedModel(model_dir, .{ .preferred_backends = &.{.cuda}, .gliner_cuda_precision = precision }, true, null);
     }
@@ -8214,6 +8361,24 @@ pub const ModelManager = struct {
     /// Compatibility API for offline tools that keep a raw model pointer. Such
     /// callers explicitly pin the model because their pointer lifetime cannot
     /// be observed by the cache.
+    pub fn loadFromDirWithControl(self: *ModelManager, path: []const u8, control: InferenceExecutionControl) !*LoadedModel {
+        var handle = try self.acquireFromDirWithControl(path, control);
+        handle.pin();
+        const model = handle.get();
+        handle.release();
+        return model;
+    }
+    pub fn loadFromDirWithPreferredBackendsAndControl(self: *ModelManager, path: []const u8, backends_: []const backends.BackendType, cache_default_alias: bool, control: InferenceExecutionControl) !*LoadedModel {
+        var handle = try self.acquireFromDirWithPreferredBackendsAndControl(path, backends_, cache_default_alias, control);
+        handle.pin();
+        const model = handle.get();
+        handle.release();
+        return model;
+    }
+    pub fn acquireCompositeAssetsWithControl(self: *ModelManager, path: []const u8, components: []const []const u8, control: InferenceExecutionControl) !CompositeAssetsHandle {
+        return self.acquireCompositeRuntime(path, components, .whisper_metadata, control);
+    }
+
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
         var handle = try self.acquireFromDir(model_dir);
         handle.pin();
@@ -8311,7 +8476,8 @@ pub const ModelManager = struct {
                 },
             );
         defer self.allocator.free(prefix);
-        const precision_prefix = try std.fmt.allocPrint(self.allocator, "{s}gliner_cuda_precision={s}:", .{ prefix, if (policy.gliner_cuda_precision) |value| @tagName(value) else "none" });
+        const publication_hex = if (policy.managed_publication) |value| std.fmt.bytesToHex(value, .lower) else @as([64]u8, @splat('-'));
+        const precision_prefix = try std.fmt.allocPrint(self.allocator, "{s}publication={s}:gliner_cuda_precision={s}:", .{ prefix, publication_hex, if (policy.gliner_cuda_precision) |value| @tagName(value) else "none" });
         defer self.allocator.free(precision_prefix);
         const key = try self.allocator.alloc(u8, precision_prefix.len + preferred_backends.len);
         @memcpy(key[0..precision_prefix.len], precision_prefix);
@@ -8369,14 +8535,26 @@ pub const ModelManager = struct {
         defer manager.releaseLoadFlight(task.flight_key, task.flight);
 
         var load_control = LoadFlightControl{ .flight = task.flight };
+        const publication = managed_receipt.publicationGeneration(manager.allocator, task.session_manager.io orelse std.Options.debug_io, task.model_dir) catch |err| {
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        if (!std.meta.eql(publication, task.managed_publication)) {
+            manager.finishLoadFlight(task.flight, null, error.ModelArtifactsChanging);
+            return;
+        }
         var handle = manager.loadFromDirUncached(
             task.model_dir,
             &task.session_manager,
             task.cache_default_alias,
             task.a4b_request,
             task.flight.runtime_id,
-            load_control.control(),
+            (@import("../registry/model_selection.zig").ResolvedModel{ .path = task.model_dir, .publication = task.managed_publication }).bind(load_control.control()),
         ) catch |err| {
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        manager.requireManagedPublication(&handle, task.managed_publication) catch |err| {
             manager.finishLoadFlight(task.flight, null, err);
             return;
         };
@@ -8554,11 +8732,13 @@ pub const ModelManager = struct {
             preferred_backends,
             &required_backend_scratch,
         );
+        var checked_policy = policy;
+        checked_policy.managed_publication = try self.publicationForRequest(model_dir, control);
         const flight_key = try self.loadFlightKey(
             model_dir,
             effective_backends,
             cache_default_alias,
-            policy,
+            checked_policy,
         );
         defer self.allocator.free(flight_key);
 
@@ -8567,7 +8747,7 @@ pub const ModelManager = struct {
             model_dir,
             effective_backends,
             cache_default_alias,
-            policy,
+            checked_policy,
         ) catch |err| {
             self.unlockLoadedModels();
             return err;
@@ -8575,7 +8755,9 @@ pub const ModelManager = struct {
         if (cached) |model| {
             model.active_handles += 1;
             self.unlockLoadedModels();
-            return .{ .manager = self, .model = model };
+            var handle: ModelHandle = .{ .manager = self, .model = model };
+            try self.requireManagedPublication(&handle, checked_policy.managed_publication);
+            return handle;
         }
         if (self.joinableLoadFlightLocked(flight_key)) |flight| {
             flight.refs += 1;
@@ -8609,6 +8791,7 @@ pub const ModelManager = struct {
             return err;
         };
         flight.* = .{
+            .managed_publication = checked_policy.managed_publication,
             .runtime_id = self.nextRuntimeIdLocked(),
             .model_dir = flight_model_dir,
             .io = coordination_io,
@@ -8670,6 +8853,7 @@ pub const ModelManager = struct {
             .session_manager = session_manager,
             .cache_default_alias = cache_default_alias,
             .a4b_request = policy.a4b_request,
+            .managed_publication = checked_policy.managed_publication,
         };
         self.in_flight_loads.put(self.allocator, owned_flight_key, flight) catch |err| {
             task.deinit();
@@ -8679,7 +8863,7 @@ pub const ModelManager = struct {
             return err;
         };
         self.unlockLoadedModels();
-        if (control != null) {
+        if (control != null and control.?.request_owned) {
             self.load_group.concurrent(coordination_io, runLoadTask, .{task}) catch |err| {
                 // `Group.async` is allowed to execute eagerly when its async pool is
                 // saturated. A request-scoped cold load must never run on the request
@@ -8701,9 +8885,13 @@ pub const ModelManager = struct {
     }
 
     pub fn loadChunkPlanningAssets(self: *ModelManager, model_dir: []const u8, io: std.Io, control: InferenceExecutionControl) !ChunkPlanningAssets {
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer publication_lease.deinit(io);
+        const publication = try self.publicationForRequest(model_dir, control);
         try control.check();
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
+        if (publication != null and !std.meta.eql(publication, man.managed_publication)) return error.ModelArtifactsChanging;
         const revision = try self.modelIdentityForManifest(model_dir, man);
         const planning = try chunkPlanningSnapshotWithControl(self.allocator, io, man, revision, control);
         const kind = if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) manifest_mod.TokenizerType.sentencepiece else man.tokenizer_type orelse return error.NoTokenizerFound;
@@ -8737,6 +8925,7 @@ pub const ModelManager = struct {
         else
             std.fmt.bytesToHex(revision, .lower);
         if (lease) |*active| try active.retain(plan.resident);
+        _ = try self.publicationForRequest(model_dir, control);
         try control.check();
         return .{ .model_dir = model_dir, .identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, io, model_dir, man.safetensors_path.?) else null, .allocator = self.allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
     }
@@ -8755,11 +8944,16 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !ModelHandle {
         if (control) |active| try active.update(.loading_model, 0, 4);
+        const publication_io = if (control) |active| active.io orelse sm.io orelse std.Options.debug_io else sm.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, publication_io, model_dir);
+        defer publication_lease.deinit(publication_io);
 
+        const managed_publication = try self.publicationForRequest(model_dir, control);
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         var man_owned = true;
         errdefer if (man_owned) man.deinit();
+        if (managed_publication != null and !std.meta.eql(managed_publication, man.managed_publication)) return error.ModelArtifactsChanging;
         if (control) |active| try active.update(.loading_model, 1, 4);
         var policy_backend_scratch: [7]backends.BackendType = undefined;
         if (self.serving_policy) |policy| {
@@ -9045,6 +9239,7 @@ pub const ModelManager = struct {
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
+            .managed_publication = managed_publication,
             .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
             .native_kv_asset_generation = native_kv_asset_generation,
@@ -9147,6 +9342,7 @@ pub const ModelManager = struct {
         }
 
         if (control) |active| try active.check();
+        if (!std.meta.eql(managed_publication, try managed_receipt.publicationGeneration(self.allocator, sm.io orelse std.Options.debug_io, model_dir))) return error.ModelArtifactsChanging;
         unpublished_model_owned = false;
         return self.publishLoadedModel(model, cache_default_alias, a4b_request, sm.gliner_cuda_precision, runtime_id);
     }
@@ -9192,6 +9388,10 @@ pub const ModelManager = struct {
         while (true) {
             self.lockLoadedModels();
             if (self.loaded.get(variant_key)) |existing| {
+                if (!std.meta.eql(existing.managed_publication, model.managed_publication)) {
+                    self.unlockLoadedModels();
+                    return error.ModelArtifactsChanging;
+                }
                 if (alias_key != null and
                     self.loaded.get(model.model_dir) == null and
                     self.loaded_aliases.get(model.model_dir) == null)
@@ -9274,6 +9474,7 @@ fn modelCacheHasPublicationCapacity(loaded_count: usize, max_loaded_models: usiz
 }
 
 const ModelLoadCachePolicy = struct {
+    managed_publication: ?[32]u8 = null,
     gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
     a4b_request: ?backend_contracts.A4bInferenceRequest = null,
     accept_default_alias: bool = true,
@@ -9637,6 +9838,7 @@ test "explicit backend lookup reuses only a matching default alias" {
 
     var probe = BackendProbe{ .backend_type = .metal };
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.session = probe.session();
     try manager.loaded_aliases.put(
         allocator,
@@ -9699,6 +9901,7 @@ test "explicit A4B loads ignore unqualified model aliases" {
     }
 
     var default_model: LoadedModel = undefined;
+    default_model.managed_publication = null;
     try manager.loaded_aliases.put(
         allocator,
         try allocator.dupe(u8, "model"),
@@ -9719,6 +9922,7 @@ test "explicit A4B loads ignore unqualified model aliases" {
     try std.testing.expect(alias_miss == null);
 
     var streamed_model: LoadedModel = undefined;
+    streamed_model.managed_publication = null;
     const streamed_key = try backendVariantCacheKey(allocator, "model", .metal, request);
     try manager.loaded.put(allocator, streamed_key, &streamed_model);
     manager.lockLoadedModels();
@@ -9737,6 +9941,7 @@ fn admissionEvictionTestModel(last_used_ns: u64) LoadedModel {
         var probe: TeardownTestProbe = .{};
     };
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     // Metadata-only tests never enter or close this foreign architecture.
     model.session = .{ .ptr = &Stub.probe, .vtable = &TeardownTestProbe.vtable };
     model.active_handles = 0;
@@ -9767,14 +9972,17 @@ test "model cache eviction skips active and pinned models and removes aliases" {
     }
 
     var idle: LoadedModel = undefined;
+    idle.managed_publication = null;
     idle.active_handles = 0;
     idle.last_used_ns = 10;
     idle.pinned = false;
     var active: LoadedModel = undefined;
+    active.managed_publication = null;
     active.active_handles = 1;
     active.last_used_ns = 1;
     active.pinned = false;
     var pinned: LoadedModel = undefined;
+    pinned.managed_publication = null;
     pinned.active_handles = 0;
     pinned.last_used_ns = 0;
     pinned.pinned = true;
@@ -9819,6 +10027,7 @@ test "loaded model snapshot preserves TTL while ordinary inference release recor
     }
     manager.configureModelCache(1, 1);
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.active_handles = 0;
     model.last_used_ns = 1;
     model.pinned = false;
@@ -9890,6 +10099,7 @@ test "loaded model snapshot allocation failure preserves lifetime usage and retr
         manager.in_flight_loads.deinit(allocator);
     }
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.active_handles = 0;
     model.last_used_ns = 123;
     model.pinned = false;
@@ -10018,6 +10228,7 @@ test "failed loaded model retires from lookup while active handles unwind" {
     };
 
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.model_dir = "owner/model";
     model.session = .{ .ptr = @ptrCast(&SessionProbe.state), .vtable = &SessionProbe.vtable };
     model.active_handles = 2;
@@ -10189,6 +10400,7 @@ test "model cache idle expiration can be disabled" {
     }
 
     var idle: LoadedModel = undefined;
+    idle.managed_publication = null;
     idle.active_handles = 0;
     idle.last_used_ns = 1;
     idle.pinned = false;
@@ -11739,6 +11951,8 @@ test "optional session adoption owns rollback and transfers admission exactly on
         defer primary.deinit();
         const baseline = manager.admissionController().snapshot();
         var model: LoadedModel = undefined;
+        model.managed_publication = null;
+        model.model_dir = root;
         model.allocator = allocator;
         model.session = primary.session;
         model.session_manager = &manager.session_manager;
@@ -14925,12 +15139,16 @@ const TeardownTestProbe = struct {
 };
 
 fn teardownTestModel(manager: *ModelManager, probe: *TeardownTestProbe) !*LoadedModel {
+    return teardownTestModelWithHostLimit(manager, probe, 64);
+}
+
+fn teardownTestModelWithHostLimit(manager: *ModelManager, probe: *TeardownTestProbe, host_limit_bytes: usize) !*LoadedModel {
     const allocator = manager.allocator;
     const model = try allocator.create(LoadedModel);
     errdefer allocator.destroy(model);
     const path = try allocator.dupe(u8, "teardown-fixture");
     errdefer allocator.free(path);
-    var lease = try manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_weight_bytes = 64 });
+    var lease = try manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = host_limit_bytes }, .{ .host_weight_bytes = 64 });
     errdefer lease.release();
     probe.controller = manager.admissionController();
     const session = try probe.session(manager);
@@ -15710,6 +15928,7 @@ test "chunk planning survives metadata-only re-pulls and rejects changed tokeniz
     defer manager.deinit();
     // Only planning metadata is exercised; no tokenizer/backend is loaded.
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.allocator = a;
     model.model_dir = root;
     model.manifest = manifest;
@@ -15738,6 +15957,7 @@ test "chunk planning survives metadata-only re-pulls and rejects changed tokeniz
 
 test "embedding identity validation without asset signatures remains cancellable and performs no discovery" {
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.embedding_identity_mutex = .unlocked;
     model.embedding_validation = null;
     // Other fields deliberately have no valid allocator, paths or session:
@@ -15767,6 +15987,7 @@ test "GGUF chunk planning verifies embedded tokenizer bytes while preserving unc
     var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
     defer manager.deinit();
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.allocator = a;
     model.model_dir = root;
     model.manifest = manifest;
@@ -15841,6 +16062,7 @@ test "GGUF chunk planning cancellation leaves revalidation retryable" {
     var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
     defer manager.deinit();
     var model: LoadedModel = undefined;
+    model.managed_publication = null;
     model.allocator = a;
     model.model_dir = root;
     model.manifest = manifest;
@@ -16142,6 +16364,162 @@ test "permanent memory admission failures retain estimates and release reservati
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
     try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireRequestsWithEviction(&.{.{ .backend_class = .cpu, .limits = limits, .amounts = .{ .host_scratch_bytes = 30 } }}));
     try std.testing.expectEqual(@as(u64, 2), manager.memoryAdmissionDiagnostic().denied_count);
+}
+
+test "model selection resident sessions and load flights fence receipt generations" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "weights" });
+    const directory = try tmp.dir.realPathFileAlloc(io, "model", a);
+    defer a.free(directory);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/.antfly-download-complete.json", .data = "{\"version\":2,\"source\":{\"owner\":\"acme\",\"name\":\"model\",\"variant\":\"gguf:Q4_0\",\"resolved_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}" });
+    var manager = ModelManager.init(a, .{ .allocator = a, .io = io, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 256 });
+    try manager.ensureResourceOwnerReady();
+    const first_publication = try managed_receipt.publicationGeneration(a, io, directory);
+    var old_probe = TeardownTestProbe{};
+    const old = try teardownTestModelWithHostLimit(&manager, &old_probe, 256);
+    old_probe.controller = null; // Several protected fixture sessions coexist.
+    a.free(old.model_dir);
+    old.model_dir = try a.dupe(u8, directory);
+    old.managed_publication = first_publication;
+    var original = try manager.publishLoadedModel(old, true, null, null, 0);
+    defer original.release();
+    const old_runtime = original.get().runtime_id;
+    var reused = try manager.acquireFromDirWithControl(directory, .{});
+    reused.release();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/.antfly-download-complete.json", .data = "{\"version\":2,\"source\":{\"owner\":\"acme\",\"name\":\"model\",\"variant\":\"gguf:Q4_0\",\"resolved_revision\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}" });
+    const next_publication = try managed_receipt.publicationGeneration(a, io, directory);
+    try std.testing.expectError(error.ModelArtifactsChanging, manager.acquireFromDirWithControl(directory, .{}));
+    try std.testing.expect(original.get().retired);
+    const first_flight = try manager.loadFlightKey(directory, &.{.metal}, true, .{ .managed_publication = first_publication });
+    defer a.free(first_flight);
+    const next_flight = try manager.loadFlightKey(directory, &.{.metal}, true, .{ .managed_publication = next_publication });
+    defer a.free(next_flight);
+    try std.testing.expect(!std.mem.eql(u8, first_flight, next_flight));
+    var new_probe = TeardownTestProbe{};
+    const replacement = try teardownTestModelWithHostLimit(&manager, &new_probe, 256);
+    new_probe.controller = null; // Several protected fixture sessions coexist.
+    a.free(replacement.model_dir);
+    replacement.model_dir = try a.dupe(u8, directory);
+    replacement.managed_publication = next_publication;
+    var fresh = try manager.publishLoadedModel(replacement, true, null, null, 0);
+    defer fresh.release();
+    try std.testing.expect(fresh.get().runtime_id != old_runtime);
+    var cached = (try manager.acquireCachedFromDir(directory)).?;
+    defer cached.release();
+    try std.testing.expectEqual(fresh.get().runtime_id, cached.get().runtime_id);
+    var late_probe = TeardownTestProbe{};
+    const late = try teardownTestModelWithHostLimit(&manager, &late_probe, 256);
+    late_probe.controller = null; // Several protected fixture sessions coexist.
+    a.free(late.model_dir);
+    late.model_dir = try a.dupe(u8, directory);
+    late.managed_publication = first_publication;
+    try std.testing.expectError(error.ModelArtifactsChanging, manager.publishLoadedModel(late, true, null, null, 0));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/.antfly-download-complete.json", .data = "{\"version\":2,\"source\":{\"owner\":\"acme\",\"name\":\"model\",\"variant\":\"gguf:Q4_0\",\"resolved_revision\":\"cccccccccccccccccccccccccccccccccccccccc\"},\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}" });
+    try std.testing.expect(manager.acquireLoadedModel(directory) == null);
+    try std.testing.expect(fresh.get().retired);
+}
+
+test "model selection runtime snapshots carry composite asset and flight publications" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    const asset_publication: [32]u8 = @splat(0x41);
+    const flight_publication: [32]u8 = @splat(0x42);
+    var assets = CompositeAssets{ .runtime_id = 17, .model_dir = @constCast("/models/transcribers/loaded"), .managed_publication = asset_publication, .managed_tokenizer = undefined, .prompt_cache = null, .decoder_config = .{}, .generation = @splat(1) };
+    const key: ComponentPlanKey = @splat(1);
+    try manager.composite_assets.put(a, key, &assets);
+    defer _ = manager.composite_assets.remove(key);
+    var flight = CompositeAssetsLoadFlight{ .runtime_id = 18, .model_dir = @constCast("/models/transcribers/loading"), .managed_publication = flight_publication, .io = std.testing.io, .load_state = .{ .io = std.testing.io } };
+    const flight_key: ComponentPlanKey = @splat(2);
+    try manager.in_flight_composite_assets.put(a, flight_key, &flight);
+    defer _ = manager.in_flight_composite_assets.remove(flight_key);
+    var snapshot = try manager.runtimeSnapshot(a, null);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+    for (snapshot.entries) |entry| {
+        try std.testing.expectEqual(RuntimeKind.composite, entry.runtime_kind);
+        const expected = if (entry.runtime_id == 17) asset_publication else flight_publication;
+        try std.testing.expectEqual(expected, entry.managed_publication.?);
+    }
+}
+
+test "model selection lazy optional component retains primary publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const gguf = try std.fs.path.join(a, &.{ root, "model.gguf" });
+    defer a.free(gguf);
+    const size = (try tmp.dir.statFile(io, "model.gguf", .{})).size;
+    const receipt_a = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "gguf", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{.{ .path = "model.gguf", .size = size }} }, .{});
+    defer a.free(receipt_a);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt_a });
+    var original_manifest = try manifest_mod.loadFromDir(a, root);
+    defer original_manifest.deinit();
+    const publication_a = try managed_receipt.publicationGeneration(a, io, root);
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null);
+    defer primary.deinit();
+    var model: LoadedModel = undefined;
+    model.managed_publication = publication_a;
+    model.model_dir = root;
+    model.allocator = a;
+    model.session = primary.session;
+    model.session_manager = &manager.session_manager;
+    model.model_manager = &manager;
+    model.kernel_jit_profile_bundle = null;
+    model.manifest = .{ .allocator = a, .gguf_projector_path = gguf };
+    model.projector_store_mutex = .unlocked;
+    model.projector_store = null;
+    const old_selection = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = publication_a };
+    const control = old_selection.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process });
+    var existing: ?backends.Session = null;
+    var existing_lease: ?runtime.tier.memory.AdmissionLease = null;
+    defer if (existing_lease) |*held| held.release();
+    defer if (existing) |session| session.close();
+    try std.testing.expect(try model.ensureOptionalSessionWithControl(.text_projection, &existing, &existing_lease, root, control));
+    const previous_session = existing.?.ptr;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, gguf, a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    std.mem.writeInt(u32, bytes[bytes.len - 4 ..][0..4], @bitCast(@as(f32, 1.0)), .little);
+    try @import("../registry/download.zig").writeFileAtomically(a, io, gguf, bytes);
+    const receipt_b = try a.dupe(u8, receipt_a);
+    defer a.free(receipt_b);
+    const pin = std.mem.indexOf(u8, receipt_b, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").?;
+    @memset(receipt_b[pin..][0..40], 'b');
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt_b });
+    try std.testing.expect(!std.meta.eql(publication_a, try managed_receipt.publicationGeneration(a, io, root)));
+    if (manager.loadArtifactSession(root, original_manifest)) |loaded| {
+        var unexpected = loaded;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.ModelArtifactsChanging, err);
+    if (manager.loadGenerationTokenizerAssets(root, &original_manifest)) |loaded| {
+        var unexpected = loaded;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.ModelArtifactsChanging, err);
+    // Already materialized A remains safe for the request that owns A.
+    try std.testing.expect(!try model.ensureOptionalSessionWithControl(.text_projection, &existing, &existing_lease, root, control));
+    try std.testing.expect(existing.?.ptr == previous_session);
+    try std.testing.expectError(error.ModelArtifactsChanging, model.ensureProjectorStoreWithControl(control));
+    var slot: ?backends.Session = null;
+    var lease: ?runtime.tier.memory.AdmissionLease = null;
+    defer if (lease) |*held| held.release();
+    defer if (slot) |session| session.close();
+    try std.testing.expectError(error.ModelArtifactsChanging, model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, root, control));
 }
 
 test "shared model load admission combined cap spans CPU and GPU on every platform" {
