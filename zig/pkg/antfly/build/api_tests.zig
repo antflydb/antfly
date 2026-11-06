@@ -1180,6 +1180,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table reads translate request deadlines into the routing clock",
             "api query contract graph evaluation preserves base hit paging and shard windows",
             "distributed reranking widens retrieval and stays coordinator owned",
+            "retained single-carrier window moves short and empty cursor pages without merging",
+            "hosted retained local and remote carriers finalize short cursor windows once",
             "reranker candidate and output windows have distinct bounds",
             "reranker paging preserves the underlying retrieval total",
             "coordinator prunes the final score domain before paging",
@@ -1279,6 +1281,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_public_table_http_docid_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
+            "public artifact enrichment",
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
             "public table batch handler exposes pending HA durability without claiming rollback",

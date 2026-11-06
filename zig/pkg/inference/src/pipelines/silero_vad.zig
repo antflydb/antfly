@@ -141,6 +141,32 @@ pub const Weights = struct {
     }
 };
 
+/// Reference-counted residency shared by the bounded cache, requests and
+/// streaming sessions. Eviction releases only the cache's ownership.
+pub const SharedWeights = struct {
+    allocator: std.mem.Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
+    weights: Weights,
+    admission: ?@import("../runtime/root.zig").tier.memory.AdmissionLease = null,
+
+    pub fn retain(self: *SharedWeights) void {
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != 0);
+    }
+    pub fn release(self: *SharedWeights) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.weights.deinit();
+        if (self.admission) |*lease| lease.release();
+        self.allocator.destroy(self);
+    }
+};
+
+pub fn residentWeightBytes(weights: *const Weights) usize {
+    var count = weights.stft_basis.len + weights.lstm_w.len + weights.lstm_r.len + weights.lstm_b.len + weights.decoder_weight.len;
+    for (weights.encoder) |encoder| count += encoder.weight.len + encoder.bias.len;
+    return count * @sizeOf(f32) + @sizeOf(SharedWeights);
+}
+
 /// Recurrent state plus the 64-sample context carried between chunks.
 pub const State = struct {
     h: [hidden]f32 = @as([hidden]f32, @splat(0)),

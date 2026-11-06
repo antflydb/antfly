@@ -102,6 +102,12 @@ pub const PjrtValueBindingMeta = struct {
     node_id: u32,
     name: []const u8 = "",
     layer_index: ?u32 = null,
+
+    pub fn kvIdentity(self: @This()) ?@import("graph/pjrt_kv_identity.zig").Identity {
+        const Kind = @import("graph/pjrt_kv_identity.zig").Kind;
+        const kind: Kind = if (std.mem.eql(u8, self.kind, pjrt_binding_past_key) or std.mem.eql(u8, self.kind, pjrt_binding_present_key)) .key else if (std.mem.eql(u8, self.kind, pjrt_binding_past_value) or std.mem.eql(u8, self.kind, pjrt_binding_present_value)) .value else return null;
+        return .{ .layer_index = self.layer_index, .name = self.name, .kind = kind };
+    }
 };
 
 pub const PjrtInputBindingMeta = PjrtValueBindingMeta;
@@ -281,12 +287,78 @@ pub fn readManifest(
     io: std.Io,
     manifest_path: []const u8,
 ) !std.json.Parsed(Manifest) {
-    const raw = try readFileAllocAtPath(io, manifest_path, allocator);
+    const file = try std.Io.Dir.cwd().openFile(io, manifest_path, .{});
+    defer file.close(io);
+    return readManifestFile(allocator, io, file);
+}
+
+/// Reuse the inspected descriptor; full parsing always starts at offset zero.
+pub fn readManifestFile(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) !std.json.Parsed(Manifest) {
+    const raw = try readFileAlloc(io, file, allocator);
     defer allocator.free(raw);
     return std.json.parseFromSlice(Manifest, allocator, raw, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
+}
+
+/// Request inspection is only a filter. Revalidate the fully parsed manifest
+/// from the same descriptor, including after concurrent in-place changes.
+pub fn readManifestIf(a: std.mem.Allocator, io: std.Io, path: []const u8, context: anytype, comptime matches: anytype) !?std.json.Parsed(Manifest) {
+    return readManifestMatching(a, io, path, context, matches, false);
+}
+
+/// Selection must reject lower-priority metadata before full parsing, including
+/// small JSON files whose shape/binding arrays expand far beyond their text.
+pub fn readManifestIfInspected(a: std.mem.Allocator, io: std.Io, path: []const u8, context: anytype, comptime matches: anytype) !?std.json.Parsed(Manifest) {
+    return readManifestMatching(a, io, path, context, matches, true);
+}
+
+fn readManifestMatching(a: std.mem.Allocator, io: std.Io, path: []const u8, context: anytype, comptime matches: anytype, comptime inspect_small: bool) !?std.json.Parsed(Manifest) {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    if (!try inspectRequest(a, io, file, context, matches, inspect_small)) return null;
+    var parsed = try readManifestFile(a, io, file);
+    if (!matches(parsed.value, context)) {
+        parsed.deinit();
+        return null;
+    }
+    return parsed;
+}
+
+/// Parse only the request identity and profile. The streaming scanner skips
+/// bindings, shapes, and unknown fields without allocating their values. Generic
+/// readers keep the small-file single-parse path; selection always inspects.
+/// Matching files are fully parsed and revalidated before use, so inspection
+/// cannot weaken ABI,
+/// identity, duplicate-candidate, or selected-chain failure handling.
+fn inspectRequest(a: std.mem.Allocator, io: std.Io, file: std.Io.File, context: anytype, comptime matches: anytype, comptime inspect_small: bool) !bool {
+    const stat = try file.stat(io);
+    if (!inspect_small and stat.size <= 16 * 1024) return true;
+    const Header = struct {
+        kind: []const u8,
+        backend: []const u8,
+        model_dir: []const u8,
+        artifact_role: []const u8 = artifact_role_prefill,
+        seq_len: usize,
+        query_seq_len: usize,
+        attention_mode: []const u8,
+        pjrt_parameter_mode: []const u8 = pjrt_parameter_mode_embedded,
+        pjrt_memory_plan: ?PjrtMemoryPlan = null,
+        partition_signature: []const u8 = "",
+
+        fn manifest(self: @This()) Manifest {
+            return .{ .kind = self.kind, .backend = self.backend, .model_dir = self.model_dir, .artifact_role = self.artifact_role, .seq_len = self.seq_len, .query_seq_len = self.query_seq_len, .attention_mode = self.attention_mode, .pjrt_parameter_mode = self.pjrt_parameter_mode, .pjrt_memory_plan = self.pjrt_memory_plan, .partition_signature = self.partition_signature, .artifact_path = "", .prompt_tokens = 0, .raw_prompt = false, .chat_template_applied = false };
+        }
+    };
+    const buffer = try a.alloc(u8, @intCast(@max(1, @min(stat.size, 8192))));
+    defer a.free(buffer);
+    var reader = file.reader(io, buffer);
+    var scanner = std.json.Reader.init(a, &reader.interface);
+    defer scanner.deinit();
+    const header = std.json.parseFromTokenSource(Header, a, &scanner, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| return reader.err orelse err;
+    defer header.deinit();
+    return matches(header.value.manifest(), context);
 }
 
 pub fn writePackageManifest(
@@ -333,15 +405,22 @@ fn writeFileAtPath(io: std.Io, path: []const u8, data: []const u8) !void {
 }
 
 fn readFileAllocAtPath(io: std.Io, path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    if (!std.fs.path.isAbsolute(path)) {
-        return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.math.maxInt(usize)));
-    }
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    return readFileAlloc(io, file, allocator);
+}
 
-    const parent = std.fs.path.dirname(path) orelse return error.BadPathName;
-    const base = std.fs.path.basename(path);
-    var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{});
-    defer dir.close(io);
-    return dir.readFileAlloc(io, base, allocator, .limited(std.math.maxInt(usize)));
+fn readFileAlloc(io: std.Io, file: std.Io.File, allocator: std.mem.Allocator) ![]u8 {
+    const info = try file.stat(io);
+    const size = std.math.cast(usize, info.size) orelse return error.ResourceLimitExceeded;
+    // A single exact allocation avoids geometric growth peaks, and an opened
+    // descriptor's size bounds memory even if the path is replaced or grows.
+    const bytes = try allocator.alloc(u8, size);
+    errdefer allocator.free(bytes);
+    if (try file.readPositionalAll(io, bytes, 0) != size) return error.InvalidArtifact;
+    var extra: [1]u8 = undefined;
+    if (try file.readPositionalAll(io, &extra, info.size) != 0) return error.InvalidArtifact;
+    return bytes;
 }
 
 pub fn validatePackageManifest(
@@ -436,12 +515,15 @@ fn findMatchingArtifactPathMode(
         const manifest_path = try std.fs.path.join(allocator, &.{ search_dir, entry.name });
         errdefer allocator.free(manifest_path);
 
-        var parsed = readManifest(allocator, io, manifest_path) catch |err| switch (err) {
+        var parsed = (readManifestIfInspected(allocator, io, manifest_path, req, matchesRequest) catch |err| switch (err) {
             error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => {
                 allocator.free(manifest_path);
                 continue;
             },
             else => return err,
+        }) orelse {
+            allocator.free(manifest_path);
+            continue;
         };
         defer parsed.deinit();
 

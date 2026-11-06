@@ -302,6 +302,7 @@ pub const listing_compatibility_sidecars = [_][]const u8{
 
 /// Resolved model configuration loaded from a model directory.
 pub const ModelManifest = struct {
+    managed_publication: ?[32]u8 = null,
     allocator: std.mem.Allocator,
 
     // Identity
@@ -946,7 +947,7 @@ const onnx_subdirs = [_][]const u8{ "", "onnx" };
 fn ignoreNonResourceMetadataError(result: anytype) !void {
     const metadata_result: anyerror!void = result;
     metadata_result catch |err| switch (err) {
-        error.OutOfMemory => return err,
+        error.OutOfMemory, error.ChecksumMismatch, error.InvalidManagedDownload => return err,
         error.InvalidGlinerBoundaryConfig,
         error.UnsupportedGlinerArchitecture,
         error.UnsupportedGlinerBoundaryVersion,
@@ -1092,7 +1093,10 @@ const ArtifactCatalog = struct {
     fn readOptionalUnchecked(self: *const ArtifactCatalog, name: []const u8) !?[]u8 {
         if (self.receipt != null) {
             const artifact = self.find(name) orelse return null;
-            return try c_file.readFile(self.allocator, artifact.canonical_path);
+            const bytes = try c_file.readFile(self.allocator, artifact.canonical_path);
+            errdefer self.allocator.free(bytes);
+            try managed_receipt.verifyArtifactBytes(artifact, bytes);
+            return bytes;
         }
         return c_file.readFileFromDir(self.allocator, self.model_dir_path, name) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -1188,6 +1192,15 @@ const DirectGgufArtifact = struct {
             ancestor = parent;
         }
 
+        // An alias outside the installation still inherits the target's
+        // receipt. Check requested ancestors first so an unlisted/escaping
+        // file inside a managed directory cannot become an unmanaged alias.
+        if (!std.mem.eql(u8, resolved_requested_path, canonical_path)) {
+            const target = try DirectGgufArtifact.init(allocator, canonical_path);
+            allocator.free(canonical_path);
+            allocator.free(resolved_requested_path);
+            return target;
+        }
         return .{
             .allocator = allocator,
             .path = canonical_path,
@@ -1248,7 +1261,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
         var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
         defer direct.deinit();
-        var manifest = ModelManifest{ .allocator = allocator };
+        var manifest = ModelManifest{ .allocator = allocator, .managed_publication = if (direct.catalog.receipt) |receipt| receipt.publication_generation else null };
         errdefer manifest.deinit();
         manifest.gguf_path = direct.takePath();
         try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(
@@ -1266,6 +1279,19 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
     return loadFromCatalog(allocator, &catalog);
+}
+
+/// Parse execution/admission metadata under the same construction fence as
+/// weights. A receipt captured before a rename cannot authenticate sidecars
+/// reopened from the replacement installation.
+pub fn loadBoundFromDir(a: std.mem.Allocator, io: std.Io, path: []const u8, expected: ?[32]u8, comptime listing: bool) !ModelManifest {
+    var lease = try @import("../registry/publication_lease.zig").Lease.shared(a, io, path);
+    defer lease.deinit(io);
+    if (!std.meta.eql(expected, try managed_receipt.publicationGeneration(a, io, path))) return error.ModelArtifactsChanging;
+    var manifest = if (listing) try loadListingFromDir(a, path) else try loadFromDir(a, path);
+    errdefer manifest.deinit();
+    if (!std.meta.eql(expected, manifest.managed_publication) or !std.meta.eql(expected, try managed_receipt.publicationGeneration(a, io, path))) return error.ModelArtifactsChanging;
+    return manifest;
 }
 
 /// Probe an explicit Antfly capability without opening architecture or tokenizer
@@ -1462,7 +1488,7 @@ fn validateGlinerSpecialtySidecars(manifest: *const ModelManifest) !void {
 
 fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !ModelManifest {
     const model_dir_path = catalog.model_dir_path;
-    var manifest = ModelManifest{ .allocator = allocator };
+    var manifest = ModelManifest{ .allocator = allocator, .managed_publication = if (catalog.receipt) |value| value.publication_generation else null };
     errdefer manifest.deinit();
     manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
@@ -1629,11 +1655,13 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
         defer direct.deinit();
         manifest.gguf_path = direct.takePath();
+        manifest.managed_publication = if (direct.catalog.receipt) |receipt| receipt.publication_generation else null;
         return manifest;
     }
 
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
+    manifest.managed_publication = if (catalog.receipt) |value| value.publication_generation else null;
     manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {

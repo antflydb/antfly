@@ -3115,9 +3115,10 @@ fn localModelCapabilitiesInScope(
         .rewrite => "rewriters",
         .transcribe => "transcribers",
     };
-    const model_path = if (task == .read and scope_override == null) try node.resolveReadModelPath(io, if (model.len > 0) model else null) else try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
+    const selected = if (task == .read and scope_override == null) try node.resolveReadModelSelection(io, if (model.len > 0) model else null) else try node.resolveModelSelection(io, if (model.len > 0) model else null, scope);
+    const model_path = selected.path;
     defer node.allocator.free(model_path);
-    var manifest = try inference.models.manifest.loadFromDir(node.allocator, model_path);
+    var manifest = try node.manifestForSelection(node.allocator, selected);
     defer manifest.deinit();
 
     var modalities = inference_work.Modalities{};

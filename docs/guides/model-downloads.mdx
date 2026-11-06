@@ -25,6 +25,36 @@ For managed AI models, the completion receipt records the requested revision,
 resolved commit, and selected format. Repeating a pull resolves moving refs again and reuses only
 verified files; inference uses the installed snapshot without network refresh.
 
+Managed pulls publish a store-wide catalog generation while swapping completed
+installations. Waiting for active model construction and comparing unchanged
+content happen while the catalog remains readable. The busy journal covers only
+namespace mutation and its durability boundary. Inference checks the generation
+and selected receipt, so warm
+pinned requests do not scan unrelated models. Interrupted publication remains
+unavailable until a subsequent pull recovers the interrupted installation named
+in its durable journal, even when that pull requests another model. Invalid
+recovery evidence remains blocked rather than publishing a partial catalog.
+Legacy stores without a publication token retain conservative directory checks; raw filesystem imports
+also have bounded discovery and missing-selector refreshes.
+
+Read-only GCS snapshots use their `COMPLETE` marker as the catalog generation.
+Pull refuses to modify a completed snapshot. Publish a new prefix for changes.
+For mutable installations, use managed pull rather than editing published files
+in place; publication coordinates with model construction to keep reopened
+components in the same generation.
+Direct readers and VAD consume only receipt-listed artifacts and verify available
+checksums against the bytes read or mapped; stale sibling files do not supply a
+missing model component. Multistage readers reuse checksum verification within
+one acquisition while the file identity remains unchanged, then recheck those
+identities before returning the reader. Lazy secondary sessions and GGUF
+projectors retain the owning primary runtime's publication; an update cannot
+combine new components with an older primary.
+Execution metadata and split encoder/decoder readers hold the same construction
+lease. Direct GGUF files and file aliases inherit their owning installation's
+receipt and publication boundary. VAD keeps a bounded cache of idle models;
+requests and streaming sessions retain their selected generation through eviction,
+and resident weights participate in the shared host memory budget.
+
 Traditional ML predictor pulls also resolve one snapshot before downloading,
 including explicit branches or commits:
 
