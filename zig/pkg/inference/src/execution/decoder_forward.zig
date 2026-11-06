@@ -2591,3 +2591,112 @@ test "predictor verification window preserves actual Native mapped rows cached f
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     try @import("../ops/media_residency_test.zig").onNative(populateDeviceStepWeights, checkActualPredictorWindow);
 }
+
+fn checkActualCudaPendingCandidates(cb_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &cb_value;
+    const config = @import("../models/gpt.zig").Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    const kv = @import("../runtime/root.zig").kv;
+    var manager = kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .cuda, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 4, .store_cpu_bytes = false });
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    try state.notePrefill(2);
+    var numerical = Runtime{ .context = .{ .allocator = a, .cb = cb, .gpt_config = &config, .weight_semantics = .traced_decoder } };
+    const input = (try cb.fromInt32Shape(&.{1}, &.{ 1, 1 })) orelse return error.UnsupportedBackend;
+    defer cb.free(input);
+    const request = PendingCandidateRequest{ .token_ids = &.{ 0, 1 }, .sequence_length = 2, .generated_tokens = 1, .input_token_tensor = input, .pure_greedy = true, .grammar_active = false };
+    var physical = BorrowedDecodeStateRuntime.init(&state);
+    const decode = physical.makeDecodeContext(2, 1);
+    if (decode.kv_cache == null) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 1), decode.query_sequence_len);
+
+    const Check = struct {
+        fn clear(backend: *const ComputeBackend, value: PendingCandidate) void {
+            switch (value) {
+                .tensor => |tensor| backend.free(tensor),
+                .scalar => |token| if (token.token_tensor) |tensor| backend.free(tensor),
+                .declined => {},
+            }
+        }
+        fn resolve(backend: *const ComputeBackend, allocator: std.mem.Allocator, value: PendingCandidate) !?usize {
+            return switch (value) {
+                .tensor => |tensor| try (DeviceToken{ .backend = backend, .tensor = tensor }).resolve(allocator),
+                .scalar => |token| token.token,
+                .declined => null,
+            };
+        }
+    };
+
+    // Reproduce the old lookahead adapter directly: route metadata followed
+    // by the SAME tensor callback, with no scalar fallback or host selection.
+    var original_tensor_events = PendingCandidateEvents{ .attempts = 1 };
+    original_tensor_events.tensor_route = numerical.deviceRoute(&state, .{ .mode = .tensor, .generated_tokens = 1, .pure_greedy = true, .grammar_active = false });
+    const original_tensor = if (original_tensor_events.tensor_route.? == .eligible)
+        try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, &original_tensor_events.handoff)
+    else
+        null;
+    defer if (original_tensor) |tensor| cb.free(tensor);
+    var lookahead_events = PendingCandidateEvents{};
+    const lookahead = try numerical.pendingTensorCandidate(&state, request, &lookahead_events);
+    defer if (lookahead) |tensor| cb.free(tensor);
+    try std.testing.expectEqualDeep(original_tensor_events, lookahead_events);
+    try std.testing.expectEqual(@as(usize, 1), lookahead_events.attempts);
+    try std.testing.expect(lookahead_events.scalar_route == null);
+    try std.testing.expectEqual(original_tensor == null, lookahead == null);
+    if (original_tensor) |tensor| {
+        try std.testing.expectEqual(try (DeviceToken{ .backend = cb, .tensor = tensor }).resolve(a), try (DeviceToken{ .backend = cb, .tensor = lookahead.? }).resolve(a));
+        try std.testing.expectEqual(@as(usize, 1), lookahead_events.handoff.handoff_hits);
+    }
+
+    // Independently reproduce the old candidate's tensor-then-scalar adapter
+    // sequence. Actual default/opt-out policy controls every eligibility check;
+    // this fixture never forces a route or changes a backend table.
+    var original_events = PendingCandidateEvents{ .attempts = 1 };
+    original_events.tensor_route = numerical.deviceRoute(&state, .{ .mode = .tensor, .generated_tokens = 1, .pure_greedy = true, .grammar_active = false });
+    var original: PendingCandidate = .declined;
+    if (original_events.tensor_route.? == .eligible) {
+        if (try numerical.forwardDeviceTokenTensor(&state, 2, input, request.prefetch_drain_budget, &original_events.handoff)) |tensor| original = .{ .tensor = tensor };
+    }
+    if (original == .declined) {
+        original_events.attempts += 1;
+        original_events.scalar_route = numerical.deviceRoute(&state, .{ .mode = .scalar, .generated_tokens = 1, .pure_greedy = true, .grammar_active = false });
+        if (original_events.scalar_route.? == .eligible) {
+            const result = try numerical.forwardDeviceStep(&state, .{ .token_ids = request.token_ids, .sequence_length = 2, .input_token_tensor = input, .prefetch_drain_budget = request.prefetch_drain_budget }, &original_events.handoff);
+            original = switch (result) {
+                .token => |token| .{ .scalar = token },
+                .declined => .declined,
+                .logits => |values| {
+                    a.free(values);
+                    return error.UnexpectedSampledPendingResult;
+                },
+            };
+        }
+    }
+    defer Check.clear(cb, original);
+    var actual_events = PendingCandidateEvents{};
+    const actual = try numerical.pendingCandidate(&state, request, &actual_events);
+    defer Check.clear(cb, actual);
+    try std.testing.expectEqual(std.meta.activeTag(original), std.meta.activeTag(actual));
+    try std.testing.expectEqualDeep(original_events, actual_events);
+    try std.testing.expectEqual(try Check.resolve(cb, a, original), try Check.resolve(cb, a, actual));
+    try std.testing.expect(actual != .declined);
+    if (actual == .tensor) try std.testing.expectEqual(@as(usize, 1), actual_events.attempts);
+    if (actual == .scalar) try std.testing.expectEqual(@as(usize, 2), actual_events.attempts);
+    try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 2), manager.tokenCount(state.sequence_id.?).?);
+    var guarded = request;
+    guarded.grammar_active = true;
+    var guarded_events = PendingCandidateEvents{};
+    try std.testing.expect(try numerical.pendingCandidate(&state, guarded, &guarded_events) == .declined);
+    try std.testing.expectEqualDeep(PendingCandidateEvents{}, guarded_events);
+    guarded = request;
+    guarded.pure_greedy = false;
+    try std.testing.expect(try numerical.pendingCandidate(&state, guarded, &guarded_events) == .declined);
+    try std.testing.expectEqualDeep(PendingCandidateEvents{}, guarded_events);
+}
+
+test "CUDA pending candidates preserve original tensor scalar callback sequence and tensor only lookahead" {
+    try @import("../ops/media_residency_test.zig").onCuda(populateDeviceStepWeights, checkActualCudaPendingCandidates);
+}

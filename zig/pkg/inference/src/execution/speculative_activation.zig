@@ -664,3 +664,7 @@ fn checkActualResidentDraftRound(cb_value: ComputeBackend, _: ComputeBackend) !v
 test "predictor round preserves actual Metal resident assistant schedule and one-time deferred activation handoff" {
     try @import("../ops/media_residency_test.zig").onMetal(populateRoundWeights, checkActualResidentDraftRound);
 }
+
+test "predictor round invokes original CUDA assistant with unchanged host chain and retained earlier rows" {
+    try @import("../ops/media_residency_test.zig").onCuda(populateRoundWeights, checkActualDraftRound);
+}

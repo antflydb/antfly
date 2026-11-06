@@ -54047,12 +54047,36 @@ const PreparedDenseRegionFixture = struct {
         }
         var analysis = try interpreter.CachedAnalysis.compute(a, graph);
         defer analysis.deinit(a);
-        var executable = try @import("../execution/executable.zig").prepareAnalyzedGraph(a, graph, analysis, &cb, .partitioned, .{ .immutable_input_bindings = bindings[0..parameter_count], .input_bindings = inputs[0..parameter_count] });
+        var executable = try @import("../execution/executable.zig").prepareAnalyzedGraph(a, graph, analysis, &cb, .partitioned, .{ .immutable_input_bindings = bindings[1..parameter_count], .input_bindings = inputs[0..parameter_count] });
         defer executable.deinit();
         var profile = (try @import("../execution/region_execution_profile.zig").acquire(cb, graph)) orelse return error.MissingMetalRegionProfile;
         defer profile.deinitChecked() catch unreachable;
         const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
-        const selected = (try pool.prepareRoutesWithProfile(bindings[0..parameter_count], .select_regions, profile.profile)) orelse return error.MissingPreparedRoutes;
+        // Model weights are immutable bindings; the activation is an actual
+        // resident runtime input. Runtime facts must never duplicate immutable
+        // nodes or impersonate a model tensor with the .tensor tag.
+        const ownership = @import("../execution/storage_ownership.zig");
+        const Resident = struct {
+            planes: [8]ownership.Plane = undefined,
+            count: usize = 0,
+            fn emit(raw: *anyopaque, report: ownership.Report) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                switch (report) {
+                    .backing => {},
+                    .plane => |plane| {
+                        if (self.count == self.planes.len) return error.TooManyStoragePlanes;
+                        self.planes[self.count] = plane;
+                        self.count += 1;
+                    },
+                }
+            }
+        };
+        const functions = cb.vtable.kernels.?;
+        try std.testing.expect(functions.accepts(cb.vtable));
+        var resident = Resident{};
+        try std.testing.expectEqual(ownership.Coverage.complete, try functions.storageOwnership.?(cb.ptr, values[0], .{ .context = &resident, .visit = Resident.emit }));
+        const activation = route.InputBinding{ .node_id = nodes[0], .value = .{ .resident = .{ .logical = graph.node(nodes[0]).output_shape, .planes = resident.planes[0..resident.count], .implementation = .{ .context = cb.ptr, .table = cb.vtable } } } };
+        const selected = (try pool.prepareRoutesWithProfile(&.{activation}, .select_regions, profile.profile)) orelse return error.MissingPreparedRoutes;
         defer selected.release();
         try std.testing.expectEqual(@as(usize, 1), selected.pool.regions.len);
         var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
