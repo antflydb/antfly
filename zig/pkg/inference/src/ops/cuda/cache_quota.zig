@@ -39,7 +39,7 @@ pub const Quota = union(enum) {
             .raw => |lease| lease,
             .prepared => |charge| switch (charge.quota) {
                 .run => |lease| lease,
-                .unarmed, .storage => @panic("invalid prepared cache quota"),
+                .unarmed, .storage, .cache_component => @panic("invalid prepared cache quota"),
             },
         };
     }

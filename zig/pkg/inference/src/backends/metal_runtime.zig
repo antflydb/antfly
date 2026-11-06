@@ -50914,7 +50914,7 @@ pub extern fn antfly_metal_packed_projection_forget(runtime: ?*RawMetalDecodeRun
 pub extern fn antfly_metal_packed_projection_create(runtime: *RawMetalDecodeRuntime, count: usize, slots: [*]const usize, generations: [*]const u64, declarations: [*]const u64, width: usize, widths: [*]const usize, weight: ?*anyopaque, bias: ?*anyopaque, entry: *?*anyopaque) c_int;
 pub extern fn antfly_metal_packed_projection_retain(entry: *anyopaque) ?*anyopaque;
 pub extern fn antfly_metal_packed_projection_release(entry: *anyopaque) void;
-pub extern fn antfly_metal_packed_projection_matches(runtime: *RawMetalDecodeRuntime, entry: *anyopaque) c_int;
+pub extern fn antfly_metal_packed_projection_matches(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
 pub extern fn antfly_metal_packed_projection_is_cached(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
 pub extern fn antfly_metal_packed_projection_buffers(entry: *anyopaque, weight: *?*anyopaque, bias: *?*anyopaque) c_int;
 pub extern fn antfly_metal_apply_packed_projection_assigned(runtime: *RawMetalDecodeRuntime, entry: *anyopaque, input: ?*anyopaque, input_offset: usize, rows: usize, outputs: [*]const ?*anyopaque, offsets: [*]const usize, workspace: ?*anyopaque, workspace_offset: usize) c_int;

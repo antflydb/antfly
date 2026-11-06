@@ -907,7 +907,7 @@ pub const SharedCache = struct {
             for (&self.parts) |*part| try part.fundOutsideExecution(pin);
         }
         pub fn validatePhysicalBacking(self: *const @This()) !void {
-            for (self.parts) |*part| try part.validatePhysicalBacking();
+            for (&self.parts) |*part| try part.validatePhysicalBacking();
         }
         pub fn commit(self: *@This()) !void {
             if (self.committed) return error.PreparedCacheGrowthAlreadyCommitted;
