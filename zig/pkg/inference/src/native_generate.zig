@@ -412,6 +412,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .xla => "xla",
         else => null,
     };
+    if (artifact_backend != null and (opts.compiled_target == .partitioned or opts.raw_decode_bench or effective_draft_model != null or opts.video_path != null or opts.image_count != 0 or opts.audio_count != 0)) {
+        print("error: bounded XLA generation requires whole-model executable artifacts and text-only generation without a draft model\n", .{});
+        return error.UnsupportedPjrtFeature;
+    }
     const resolved_artifact_dir = if (artifact_backend != null)
         if (opts.artifact_dir) |artifact_dir|
             try allocator.dupe(u8, artifact_dir)
@@ -451,28 +455,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var draft_model_manager = model_manager_mod.ModelManager.init(allocator, draft_session_manager);
     defer draft_model_manager.deinit();
     try load_budget.configure(&draft_model_manager);
-
-    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
-        var artifact_arena = std.heap.ArenaAllocator.init(allocator);
-        defer artifact_arena.deinit();
-        const artifact_allocator = artifact_arena.allocator();
-        if (try native_run_artifact.tryRunMatchingArtifact(
-            artifact_allocator,
-            io,
-            resolved_artifact_dir.?,
-            artifact_backend.?,
-            opts.model_dir,
-            opts.prompt,
-            opts.no_chat_template,
-            opts.raw_prompt,
-            try load_budget.policy(),
-        )) |artifact_result_const| {
-            var artifact_result = artifact_result_const;
-            defer artifact_result.deinit(artifact_allocator);
-            const finished_generate_at = std.Io.Timestamp.now(io, .awake);
-            emitArtifactResultAndExit(&artifact_result, &opts, started_at, finished_generate_at);
-        }
-    }
 
     generation.gemma4_mtp_debug_override = opts.debug_mtp;
     try warmInitCudaBeforeLargeModelScan(opts.backend);
@@ -555,20 +537,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         prompt_media_allowance,
     ) catch return error.PromptTooLong;
 
-    if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
-        if (try tryRunArtifactForPromptShape(
-            allocator,
-            io,
-            &opts,
-            resolved_artifact_dir.?,
-            artifact_backend.?,
-            prompt_tokens,
-            prompt_tokens,
-            "paged_prefill",
-            try load_budget.policy(),
-        )) return;
-    }
-
     if (opts.print_chat_template_status) {
         print("chat_template={}\n", .{apply_chat_template});
     }
@@ -600,7 +568,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     try native_backend_choice.validateRequiredCompiledBackend(&session_manager, explicit_partition_backend);
     const compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = opts.compiled_target orelse blk: {
-        if (compiled_mode_requested and explicit_partition_backend == .metal) break :blk .whole_model;
+        if (explicit_partition_backend == .pjrt or (compiled_mode_requested and explicit_partition_backend == .metal)) break :blk .whole_model;
         break :blk .partitioned;
     };
     const graph_mode = native_backend_choice.forcesGraphMode(opts.backend) or
@@ -742,6 +710,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .config = gpt_config,
         .kv_capacity_policy = kv_capacity_policy,
         .workspace_capacity = model.session.generationWorkspaceCapacity(),
+        .backend_owns_kv = explicit_partition_backend == .pjrt,
+        .fixed_prefill_shape = explicit_partition_backend == .pjrt,
     };
     var budget_component_count: usize = 1;
     if (draft_gpt_config) |draft_cfg| {
@@ -765,6 +735,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             else
                 (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
         );
+    if (explicit_partition_backend == .pjrt and opts.prefill_chunk_size != 0 and opts.prefill_chunk_size < prompt_tokens) return error.UnsupportedPjrtFeature;
     const admission_prefill_ceiling = if (opts.prefill_chunk_size > 0)
         @min(opts.prefill_chunk_size, scheduler_prefill_ceiling)
     else
@@ -902,7 +873,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer if (draft_cb) |*backend| backend.deinit();
 
-    const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    var kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    if (explicit_partition_backend == .pjrt) kv_pool_config.store_cpu_bytes = false;
     const pool_id = try kv_manager.addPool(kv_pool_config);
     var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
     defer kv_storage.deinit();
@@ -953,14 +925,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const use_scheduler = !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and !graph_mode and !decoder_runtime_scheduler_override and nativeGenerateSchedulerEnabled();
     var graph_cache = graph_mod.cache.GraphCache.init(allocator);
     defer graph_cache.deinit();
-    var pjrt_client: ?pjrt_lib.pjrt.Client = null;
-    defer if (pjrt_client) |*client| client.deinit();
+    const pjrt_admission_policy = @import("graph/pjrt_admission.zig").Context{ .allocator = allocator, .manager = &model_manager, .policy = try load_budget.policy(), .decode_steps_limit = @as(usize, @intCast(@max(opts.max_tokens, 1))) - 1 };
     var pjrt_plugin_path: ?[:0]u8 = null;
     defer if (pjrt_plugin_path) |path| allocator.free(path);
     if (explicit_partition_backend == .pjrt) {
         pjrt_plugin_path = try native_backend_choice.pjrtPluginPathFromEnv(allocator);
         const plugin_path = pjrt_plugin_path orelse return error.MissingPjrtPluginPath;
-        pjrt_client = try pjrt_lib.pjrt.Client.init(plugin_path);
+        _ = plugin_path;
+        if (compiled_attachment_target != .whole_model or draft_model != null or opts.video_path != null or opts.image_count != 0 or opts.audio_count != 0) return error.UnsupportedPjrtFeature;
     }
 
     var pipeline = generation.NativeGenerationPipeline{
@@ -974,10 +946,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .kv_dtype = kv_dtype,
         .shared_moe_cache = model.shared_moe_cache,
         .tokenizer = tokenizer,
-        .add_bos_token = model.manifest.add_bos_token,
+        .add_bos_token = !opts.no_bos and model.manifest.add_bos_token,
         .bos_token = model.manifest.bos_token,
         .chat_template = if (opts.no_chat_template) null else model.chat_tmpl,
-        .prompt_override = if (opts.raw_prompt) rendered_prompt else null,
+        .prompt_override = if (opts.raw_prompt and explicit_partition_backend != .pjrt) rendered_prompt else null,
+        .preformatted_prompt = if (explicit_partition_backend == .pjrt) rendered_prompt else null,
+        .pre_encoded_prompt = if (explicit_partition_backend == .pjrt) .{ .ids = prompt_encoded.ids, .attention_mask = prompt_encoded.attention_mask, .prompt_token_limit = prompt_token_limit } else null,
         .return_raw_token_ids = opts.print_token_ids,
         .print_timing = opts.print_timing,
         .model_dir = opts.model_dir,
@@ -992,7 +966,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .graph_cache = if (graph_mode) &graph_cache else null,
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
-        .pjrt_client = if (pjrt_client) |*client| client else null,
+        .pjrt_client = null,
+        .pjrt_admission = if (explicit_partition_backend == .pjrt) &pjrt_admission_policy else null,
+        .pjrt_plugin_path = pjrt_plugin_path,
     };
 
     const profile_started = if (opts.kernel_jit_profile_out != null)
@@ -7075,81 +7051,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
     return true;
 }
 
-fn tryRunArtifactForPromptShape(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    opts: *const Options,
-    artifact_dir: []const u8,
-    artifact_backend: []const u8,
-    seq_len: usize,
-    query_seq_len: usize,
-    attention_mode: []const u8,
-    load_policy: model_manager_mod.ModelLoadPolicy,
-) !bool {
-    const artifact_started_at = std.Io.Timestamp.now(io, .awake);
-    var artifact_arena = std.heap.ArenaAllocator.init(allocator);
-    defer artifact_arena.deinit();
-    const artifact_allocator = artifact_arena.allocator();
-    var found = (try compiled_artifact.findMatchingArtifactPath(allocator, io, artifact_dir, .{
-        .backend = artifact_backend,
-        .kind = null,
-        .model_dir = opts.model_dir,
-        .seq_len = seq_len,
-        .query_seq_len = query_seq_len,
-        .attention_mode = attention_mode,
-    })) orelse return false;
-    defer found.deinit(allocator);
-
-    var artifact_result = try native_run_artifact.runArtifactPrompt(
-        artifact_allocator,
-        io,
-        found.manifest_path,
-        opts.prompt,
-        false,
-        opts.no_chat_template,
-        opts.raw_prompt,
-        load_policy,
-    );
-    defer artifact_result.deinit(artifact_allocator);
-    const finished_generate_at = std.Io.Timestamp.now(io, .awake);
-    emitArtifactResultAndExit(&artifact_result, opts, artifact_started_at, finished_generate_at);
-    return true;
-}
-
-fn emitArtifactResultAndExit(
-    artifact_result: *const native_run_artifact.RunResult,
-    opts: *const Options,
-    started_at: std.Io.Timestamp,
-    finished_at: std.Io.Timestamp,
-) noreturn {
-    print(
-        "using offline artifact backend={s} manifest={s}\n",
-        .{ artifact_result.backend, artifact_result.manifest_path },
-    );
-    if (!artifact_result.has_token) std.process.exit(1);
-    print("{s}\n", .{artifact_result.token_text});
-    if (opts.print_token_ids) {
-        print("token_ids: {d}\n", .{artifact_result.token_id});
-    }
-    if (opts.print_finish_reason or opts.print_token_count) {
-        if (opts.print_finish_reason and opts.print_token_count) {
-            print("finish_reason=max_tokens tokens=1\n", .{});
-        } else if (opts.print_finish_reason) {
-            print("finish_reason=max_tokens\n", .{});
-        } else {
-            print("tokens=1\n", .{});
-        }
-    }
-    if (opts.print_timing) {
-        const total_ms = durationMillis(started_at, finished_at);
-        print(
-            "timing_ms: load_model=0 prompt_prep=0 scheduler=0 backend_setup=0 decode_setup=0 generate={d} total={d}\n",
-            .{ total_ms, total_ms },
-        );
-    }
-    std.process.exit(0);
-}
-
 const CliStreamPrinter = struct {
     wrote_text: bool = false,
 
@@ -8143,21 +8044,16 @@ fn acquireCliGenerationResources(
                 .resources = .{
                     .backend_class = if (component.backend == .native) .cpu else .gpu,
                     .limits = limits,
-                    .amounts = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGenerationForKvPolicy(
-                        component.backend,
-                        component.kv_dtype,
-                        component.config,
-                        prompt_tokens,
-                        max_tokens,
-                        chunk.*,
-                        component.kv_capacity_policy,
-                    )),
+                    .amounts = memory.AdmissionAmounts.fromEstimate(try component.estimate(prompt_tokens, max_tokens, chunk.*)),
                 },
             };
         }
         return manager.acquireGenerationResources(requests[0..components.len]) catch |err| {
             if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
             if (chunk.* <= 32) return err;
+            for (components) |component| if (component.fixed_prefill_shape) {
+                return err;
+            };
             const ceiling = std.math.ceilPowerOfTwo(usize, chunk.*) catch chunk.*;
             const smaller = @max(@as(usize, 32), ceiling / 2);
             budget.* = runtime.tier.memory.RunBudget.init(limits);

@@ -102,6 +102,7 @@ pub const PjrtExecutor = struct {
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
     ) ![]pjrt_lib.pjrt.Buffer {
+        const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
         const num_inputs = self.input_bindings.len;
         const debug = pjrtExecDebugEnabled();
         if (debug) {
@@ -182,8 +183,8 @@ pub const PjrtExecutor = struct {
                             }
                             return error.MissingValue;
                         };
-                        const f32_data = try self.host_backend.toFloat32(ct, allocator);
-                        defer allocator.free(f32_data);
+                        const f32_data = try self.host_backend.toFloat32(ct, staging_allocator);
+                        defer staging_allocator.free(f32_data);
                         const upload_shape = resolveUploadShapeFromTensor(
                             allocator,
                             self.host_backend,
@@ -226,8 +227,8 @@ pub const PjrtExecutor = struct {
                             }
                             return error.MissingValue;
                         };
-                        const f32_data = try self.host_backend.toFloat32(ct, allocator);
-                        defer allocator.free(f32_data);
+                        const f32_data = try self.host_backend.toFloat32(ct, staging_allocator);
+                        defer staging_allocator.free(f32_data);
                         const upload_shape = resolveUploadShapeFromTensor(
                             allocator,
                             self.host_backend,
@@ -773,6 +774,9 @@ fn retainedEntryMatchesSemanticInput(
 }
 
 pub const PjrtModelExecutor = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    owned_graph: ?*Graph = null,
+    artifact_owner: ?*@import("pjrt_admission.zig").Package = null,
     allocator: Allocator,
     graph: *const Graph,
     executor: *PjrtExecutor,
@@ -813,11 +817,16 @@ pub const PjrtModelExecutor = struct {
             .semantic_output_bindings = self.semantic_output_bindings,
             .decode_variants = self.decode_variants,
         };
+        if (self.artifact_owner != null) {
+            _ = self.references.fetchAdd(1, .monotonic);
+            runtime_ctx.artifact_executor_owner = self;
+        }
         return .{ .ptr = runtime_ctx, .vtable = &PjrtModelRuntime.runtime_vtable };
     }
 
     pub fn deinit(ctx: *anyopaque) void {
         const self: *PjrtModelExecutor = @ptrCast(@alignCast(ctx));
+        if (self.artifact_owner != null and self.references.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor deinit begin", .{});
         self.executor.partitionExecutor().deinitExecutor();
@@ -826,6 +835,11 @@ pub const PjrtModelExecutor = struct {
         freeSemanticOutputBindings(allocator, self.semantic_output_bindings);
         freeDecodeVariants(allocator, self.decode_variants);
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor decode variants deinit complete", .{});
+        if (self.owned_graph) |graph| {
+            graph.deinit();
+            allocator.destroy(graph);
+        }
+        if (self.artifact_owner) |owner| owner.deinit();
         allocator.destroy(self);
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor deinit complete", .{});
     }
@@ -836,6 +850,7 @@ pub fn deinitModelExecutorPtr(ctx: *anyopaque) void {
 }
 
 const PjrtModelRuntime = struct {
+    artifact_executor_owner: ?*PjrtModelExecutor = null,
     allocator: Allocator,
     graph: *const Graph,
     executor: *PjrtExecutor,
@@ -992,8 +1007,9 @@ const PjrtModelRuntime = struct {
                 .{ logits_index, phase.executor.output_shapes[logits_index], size_bytes },
             );
         }
-        const output_f32 = try outputs[logits_index].toFloat32(allocator);
-        defer allocator.free(output_f32);
+        const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
+        const output_f32 = try outputs[logits_index].toFloat32(staging_allocator);
+        defer staging_allocator.free(output_f32);
         if (debug) std.log.info("PJRT ModelRuntime logits read floats={d}", .{output_f32.len});
         const logits = try sliceLastLogits(allocator, output_f32, phase.executor.output_shapes[logits_index], query_seq_len);
         if (debug) std.log.info("PJRT ModelRuntime returning logits floats={d}", .{logits.len});
@@ -1041,6 +1057,7 @@ const PjrtModelRuntime = struct {
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit begin", .{});
         self.retained_buffers.deinit();
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime retained buffers deinit complete", .{});
+        if (self.artifact_executor_owner) |owner| PjrtModelExecutor.deinit(owner);
         allocator.destroy(self);
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit complete", .{});
     }
@@ -1661,7 +1678,7 @@ fn findSemanticInputBinding(bindings: []const PjrtSemanticInputBinding, input_in
     return null;
 }
 
-fn detectInputMaterialization(
+pub fn detectInputMaterialization(
     input_bindings: []const compiler.InputBinding,
     semantic_input_bindings: []const PjrtSemanticInputBinding,
     semantic_output_bindings: []const PjrtSemanticOutputBinding,

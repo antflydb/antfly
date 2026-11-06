@@ -2969,19 +2969,31 @@ pub const GptGenerationBudgetComponent = struct {
     /// bounds constrain chunk selection independently of the process envelope.
     /// Null means ordinary admission; zero capacity provides no workspace.
     workspace_capacity: ?AdmissionAmounts = null,
+    /// Host graph preparation for a managed executable owns page geometry,
+    /// while the executable's own admission owns the actual KV storage.
+    backend_owns_kv: bool = false,
+    /// A persisted prefill executable has one exact prompt shape; reducing
+    /// chunk rows would select a different executable, not a smaller workspace.
+    fixed_prefill_shape: bool = false,
 
-    fn reserveEstimate(self: @This(), budget: *RunBudget, estimate: Estimate) !void {
+    pub fn estimate(self: @This(), prompt_tokens: usize, max_tokens: usize, chunk: usize) !Estimate {
+        var result = try estimateGptGenerationForKvPolicy(self.backend, self.kv_dtype, self.config, prompt_tokens, max_tokens, chunk, self.kv_capacity_policy);
+        if (self.backend == .native and self.backend_owns_kv) result.kv_bytes = 0;
+        return result;
+    }
+
+    fn reserveEstimate(self: @This(), budget: *RunBudget, estimated: Estimate) !void {
         if (self.workspace_capacity) |capacity| {
-            if (estimate.kv_tier == .backend and estimate.kv_bytes > capacity.backend_kv_bytes) {
-                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = estimate.kv_bytes }, 0, estimate.kv_bytes, capacity.backend_kv_bytes);
+            if (estimated.kv_tier == .backend and estimated.kv_bytes > capacity.backend_kv_bytes) {
+                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = estimated.kv_bytes }, 0, estimated.kv_bytes, capacity.backend_kv_bytes);
                 return error.MemoryBudgetExceeded;
             }
-            if (estimate.scratch_tier == .backend and estimate.scratch_bytes > capacity.backend_scratch_bytes) {
-                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = estimate.scratch_bytes }, 0, estimate.scratch_bytes, capacity.backend_scratch_bytes);
+            if (estimated.scratch_tier == .backend and estimated.scratch_bytes > capacity.backend_scratch_bytes) {
+                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = estimated.scratch_bytes }, 0, estimated.scratch_bytes, capacity.backend_scratch_bytes);
                 return error.MemoryBudgetExceeded;
             }
         }
-        try budget.reserveEstimate(estimate);
+        try budget.reserveEstimate(estimated);
     }
 };
 
@@ -3021,20 +3033,14 @@ pub fn reserveGptGenerationPrefill(
     chunk_ceiling: usize,
 ) !GptGenerationPrefillAdmission {
     const scratch_before = budget.scratchTotalBytes();
-    var chunk = @max(chunk_ceiling, 1);
+    var fixed_shape = false;
+    for (components) |component| fixed_shape = fixed_shape or component.fixed_prefill_shape;
+    var chunk = if (fixed_shape) @max(prompt_tokens, 1) else @max(chunk_ceiling, 1);
     while (true) {
         var trial = budget.*;
         var failed = false;
         for (components) |component| {
-            component.reserveEstimate(&trial, try estimateGptGenerationForKvPolicy(
-                component.backend,
-                component.kv_dtype,
-                component.config,
-                prompt_tokens,
-                max_tokens,
-                chunk,
-                component.kv_capacity_policy,
-            )) catch |err| {
+            component.reserveEstimate(&trial, try component.estimate(prompt_tokens, max_tokens, chunk)) catch |err| {
                 if (err != error.MemoryBudgetExceeded) return err;
                 failed = true;
                 break;
@@ -3048,7 +3054,7 @@ pub fn reserveGptGenerationPrefill(
                 .max_scratch_bytes = selected_scratch,
             };
         }
-        if (chunk <= 32) {
+        if (chunk <= 32 or fixed_shape) {
             const denial_count = trial.denials;
             const last_denial = trial.last_denial;
             budget.denials = denial_count;
@@ -4819,4 +4825,18 @@ test "shared invocation quotas aggregate CPU and GPU KV and scratch atomically" 
         }, false));
         try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
     }
+}
+
+test "generation budget preserves managed prefill shape and external KV ownership" {
+    const cfg = gpt_mod.Config{ .hidden_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 8, .vocab_size = 1, .position_encoding = .rope };
+    const component = GptGenerationBudgetComponent{ .backend = .native, .kv_dtype = .f32, .config = cfg, .backend_owns_kv = true, .fixed_prefill_shape = true };
+    const expected = try component.estimate(200, 8, 200);
+    try std.testing.expectEqual(@as(usize, 0), expected.kv_bytes);
+    var roomy = RunBudget.init(.{});
+    const admitted = try reserveGptGenerationPrefill(&roomy, &.{component}, 200, 8, 32);
+    try std.testing.expectEqual(@as(usize, 200), admitted.max_chunk_rows);
+    try std.testing.expectEqual(expected.scratch_bytes, admitted.max_scratch_bytes);
+    var tight = RunBudget.init(.{ .scratch_limit_bytes = expected.scratch_bytes - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationPrefill(&tight, &.{component}, 200, 8, 32));
+    try std.testing.expectEqual(@as(usize, 0), tight.scratchTotalBytes());
 }

@@ -17,7 +17,7 @@
 //! and free; exported counters verify constructor ordering and C API ownership.
 const std = @import("std");
 const c = @import("pjrt_c_types.zig");
-var counters: [8]usize = @splat(0);
+var counters: [11]usize = @splat(0);
 var device: u8 = 0;
 var devices = [_]?*c.PjrtDevice{@ptrCast(&device)};
 const serialized = "fixture executable";
@@ -65,9 +65,11 @@ fn compile(args: *c.ClientCompileArgs) callconv(.c) ?*c.PjrtError {
     return null;
 }
 fn deserialize(args: *c.ExecutableDeserializeAndLoadArgs) callconv(.c) ?*c.PjrtError {
-    std.debug.assert(std.mem.eql(u8, args.serialized_executable.?[0..args.serialized_executable_size], serialized));
+    const bytes = args.serialized_executable.?[0..args.serialized_executable_size];
+    const kind: u8 = if (std.mem.eql(u8, bytes, serialized)) 0 else if (std.mem.eql(u8, bytes, "fixture paged prefill")) 1 else if (std.mem.eql(u8, bytes, "fixture paged decode")) 2 else @panic("invalid fixture executable");
     counters[3] += 1;
     args.loaded_executable = handle(c.PjrtLoadedExecutable);
+    @as(*u8, @ptrCast(args.loaded_executable.?)).* = kind;
     return null;
 }
 fn destroyLoaded(args: *c.LoadedExecutableDestroyArgs) callconv(.c) ?*c.PjrtError {
@@ -78,6 +80,7 @@ fn destroyLoaded(args: *c.LoadedExecutableDestroyArgs) callconv(.c) ?*c.PjrtErro
 fn executable(args: *c.LoadedExecutableGetExecutableArgs) callconv(.c) ?*c.PjrtError {
     counters[5] += 1;
     args.executable = handle(c.PjrtExecutable);
+    @as(*u8, @ptrCast(args.executable.?)).* = @as(*const u8, @ptrCast(args.loaded_executable.?)).*;
     return null;
 }
 fn destroyExecutable(args: *c.ExecutableDestroyArgs) callconv(.c) ?*c.PjrtError {
@@ -99,10 +102,65 @@ fn serialize(args: *c.ExecutableSerializeArgs) callconv(.c) ?*c.PjrtError {
 fn stats(args: *c.ExecutableGetCompiledMemoryStatsArgs) callconv(.c) ?*c.PjrtError {
     args.generated_code_size_in_bytes = 64;
     args.argument_size_in_bytes = 4096;
-    args.output_size_in_bytes = 8;
+    args.output_size_in_bytes = if (@as(*const u8, @ptrCast(args.executable.?)).* == 0) 8 else 16;
     args.temp_size_in_bytes = 128;
     return null;
 }
+const DataBuffer = struct { bytes: []u8 };
+fn dataBuffer(raw: ?*c.PjrtBuffer) *DataBuffer {
+    return @ptrCast(@alignCast(raw.?));
+}
+fn newBuffer(bytes: []const u8) *c.PjrtBuffer {
+    const buffer = std.heap.c_allocator.create(DataBuffer) catch @panic("fixture allocation");
+    buffer.bytes = std.heap.c_allocator.dupe(u8, bytes) catch @panic("fixture allocation");
+    counters[8] += 1;
+    return @ptrCast(buffer);
+}
+fn upload(args: *c.ClientBufferFromHostBufferArgs) callconv(.c) ?*c.PjrtError {
+    var bytes: usize = if (args.buffer_type == .int64) 8 else 4;
+    for (args.dims.?[0..args.num_dims]) |dim| bytes *= @intCast(dim);
+    args.buffer = newBuffer(@as([*]const u8, @ptrCast(args.data.?))[0..bytes]);
+    args.done_with_host_buffer = null;
+    return null;
+}
+fn destroyBuffer(args: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+    const buffer = dataBuffer(args.buffer);
+    std.heap.c_allocator.free(buffer.bytes);
+    std.heap.c_allocator.destroy(buffer);
+    counters[9] += 1;
+    return null;
+}
+fn bufferSize(args: *c.BufferOnDeviceSizeInBytesArgs) callconv(.c) ?*c.PjrtError {
+    args.on_device_size_in_bytes = dataBuffer(args.buffer).bytes.len;
+    return null;
+}
+fn download(args: *c.BufferToHostBufferArgs) callconv(.c) ?*c.PjrtError {
+    const data = dataBuffer(args.src).bytes;
+    std.debug.assert(args.dst_size >= data.len);
+    @memcpy(@as([*]u8, @ptrCast(args.dst.?))[0..data.len], data);
+    args.event = null;
+    return null;
+}
+fn execute(args: *c.LoadedExecutableExecuteArgs) callconv(.c) ?*c.PjrtError {
+    const kind = @as(*const u8, @ptrCast(args.executable.?)).*;
+    const lists: [*][*]?*c.PjrtBuffer = @ptrCast(@alignCast(args.output_lists.?));
+    if (kind == 2) {
+        std.debug.assert(args.num_args == 3);
+        const inputs: [*][*]?*c.PjrtBuffer = @ptrCast(@alignCast(args.argument_lists.?));
+        std.debug.assert(std.mem.bytesToValue(f32, dataBuffer(inputs[0][1]).bytes[0..4]) == 1);
+        std.debug.assert(std.mem.bytesToValue(f32, dataBuffer(inputs[0][2]).bytes[0..4]) == 1);
+    }
+    const logits = if (kind == 1) [_]f32{ 0, 1 } else [_]f32{ 1, 0 };
+    lists[0][0] = newBuffer(std.mem.sliceAsBytes(&logits));
+    if (kind != 0) {
+        const kv = [_]f32{@floatFromInt(kind)};
+        lists[0][1] = newBuffer(std.mem.sliceAsBytes(&kv));
+        lists[0][2] = newBuffer(std.mem.sliceAsBytes(&kv));
+    }
+    counters[10] += 1;
+    return null;
+}
+
 var api: c.Api = blk: {
     var value = std.mem.zeroes(c.Api);
     value.struct_size = @sizeOf(c.Api);
@@ -112,11 +170,16 @@ var api: c.Api = blk: {
     value._fns[12] = @ptrCast(&name);
     value._fns[16] = @ptrCast(&addressable);
     value._fns[20] = @ptrCast(&compile);
+    value._fns[22] = @ptrCast(&upload);
     value._fns[41] = @ptrCast(&destroyExecutable);
     value._fns[49] = @ptrCast(&serialize);
     value._fns[50] = @ptrCast(&destroyLoaded);
     value._fns[51] = @ptrCast(&executable);
+    value._fns[55] = @ptrCast(&execute);
     value._fns[56] = @ptrCast(&deserialize);
+    value._fns[58] = @ptrCast(&destroyBuffer);
+    value._fns[64] = @ptrCast(&bufferSize);
+    value._fns[70] = @ptrCast(&download);
     value._fns[96] = @ptrCast(&stats);
     break :blk value;
 };

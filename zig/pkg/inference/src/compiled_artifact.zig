@@ -130,6 +130,7 @@ pub fn pjrtBindingIsKvCache(binding: PjrtValueBindingMeta) bool {
 }
 
 pub const MatchRequest = struct {
+    require_pjrt_memory_plan: bool = false,
     backend: []const u8,
     model_dir: []const u8,
     seq_len: usize,
@@ -382,7 +383,7 @@ pub fn findUniqueMatchingPackageEntry(
 }
 
 pub fn matchesRequest(manifest: Manifest, req: MatchRequest) bool {
-    return std.mem.eql(u8, manifest.backend, req.backend) and
+    return (!req.require_pjrt_memory_plan or hasManagedPjrtPlan(manifest)) and std.mem.eql(u8, manifest.backend, req.backend) and
         (req.kind == null or std.mem.eql(u8, manifest.kind, req.kind.?)) and
         (req.artifact_role == null or std.mem.eql(u8, manifest.artifact_role, req.artifact_role.?)) and
         (req.partition_signature == null or std.mem.eql(u8, manifest.partition_signature, req.partition_signature.?)) and
@@ -830,4 +831,34 @@ test "findUniqueMatchingArtifactPath rejects ambiguous matches" {
         .query_seq_len = 1,
         .attention_mode = "paged_decode",
     }));
+}
+
+pub fn hasManagedPjrtPlan(manifest: Manifest) bool {
+    const plan = manifest.pjrt_memory_plan orelse return false;
+    return plan.version == 1 and (std.mem.eql(u8, manifest.kind, "pjrt_executable") or std.mem.eql(u8, manifest.kind, "pjrt_partition_executable"));
+}
+
+/// Select only executable packages this loader can actually execute. Old HLO
+/// and unprofiled caches must not hide a usable standalone artifact.
+pub fn findManagedPjrtPackage(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, backend: []const u8, model_dir: []const u8, seq_len: usize, query_seq_len: usize, attention_mode: []const u8) !?[]u8 {
+    if (!std.mem.eql(u8, backend, "xla")) return null;
+    for ([_][]const u8{ pjrt_parameter_mode_embedded, pjrt_parameter_mode_inputs }) |mode| {
+        const path = try packageManifestPath(allocator, directory, backend, model_dir, "pjrt_executable", mode);
+        defer allocator.free(path);
+        var package = readPackageManifest(allocator, io, path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer package.deinit();
+        try validatePackageManifest(package.value, backend, model_dir, "pjrt_executable", mode);
+        const entry = (try findUniqueMatchingPackageEntry(package.value, .{ .artifact_role = artifact_role_prefill, .seq_len = seq_len, .query_seq_len = query_seq_len, .attention_mode = attention_mode })) orelse continue;
+        var prefill = readManifest(allocator, io, entry.manifest_path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer prefill.deinit();
+        if (!matchesRequest(prefill.value, .{ .backend = backend, .model_dir = model_dir, .kind = "pjrt_executable", .artifact_role = artifact_role_prefill, .seq_len = seq_len, .query_seq_len = query_seq_len, .attention_mode = attention_mode, .pjrt_parameter_mode = mode, .require_pjrt_memory_plan = true })) continue;
+        return try allocator.dupe(u8, path);
+    }
+    return null;
 }

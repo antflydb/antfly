@@ -329,6 +329,9 @@ fn hasCompilablePartition(
     context: compiled_backend.AttachContext,
     _: compiled_backend.CompileMode,
 ) bool {
+    // Persisted executables are qualified by their verified artifact ABI and
+    // memory plan, not by the inline compiler's partition support heuristics.
+    if (context.pjrt_admission != null) return context.attachment_target == .whole_model;
     if (context.attachment_target == .whole_model and graphHasUnsupportedDynamicReshape(graph)) return false;
     if (!attachmentTargetAllowsPjrtPlan(graph, dpp, context.attachment_target)) {
         if (context.attachment_target == .whole_model) logPjrtWholeModelBlockers(graph, dpp);
@@ -348,6 +351,10 @@ fn attachExecutorsViaDefinition(
     context: compiled_backend.AttachContext,
     _: compiled_backend.CompileMode,
 ) !void {
+    if (context.pjrt_admission != null) {
+        if (context.attachment_target == .whole_model) return;
+        return error.PjrtLoadOnlyArtifactsRequired;
+    }
     const client = context.pjrt_client orelse return error.MissingPjrtClient;
     return attachPjrtExecutors(allocator, entry, graph, dpp, context.cb, client, context.attachment_target);
 }
@@ -372,6 +379,7 @@ fn executeModelForwardViaDefinition(
             .decode => |decode_request| {
                 var output = runtime.decode(allocator, decode_request) catch |err| switch (err) {
                     error.UnsupportedDecode, error.UnsupportedShape, error.MissingPastKeyValue, error.MissingValue => {
+                        if (context.pjrt_admission != null) return err;
                         logPjrtRuntimeDecline("cached runtime", err, request);
                         return null;
                     },
@@ -383,10 +391,37 @@ fn executeModelForwardViaDefinition(
         }
     }
 
+    if (entry.compiled_model_status == .uninitialized) if (context.pjrt_admission) |policy| {
+        const directory = context.artifact_dir orelse return error.PjrtLoadOnlyArtifactsRequired;
+        const model_dir = context.model_dir orelse return error.PjrtLoadOnlyArtifactsRequired;
+        const plugin = context.pjrt_plugin_path orelse return error.MissingPjrtPluginPath;
+        const shape = wholeModelArtifactShape(request) orelse return error.UnsupportedShape;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const executor = if (try compiled_artifact.findManagedPjrtPackage(allocator, io, directory, "xla", model_dir, shape.seq_len, shape.query_seq_len, shape.attention_mode)) |package| found: {
+            defer allocator.free(package);
+            break :found try pjrt_artifact_executor_mod.createAdmittedModelExecutorFromPackageManifestPath(allocator, io, package, shape.seq_len, shape.query_seq_len, shape.attention_mode, graph, context.cb, policy, plugin);
+        } else found: {
+            var prefill = (compiled_artifact.findUniqueMatchingArtifactPath(allocator, io, directory, .{ .backend = "xla", .model_dir = model_dir, .kind = "pjrt_executable", .artifact_role = compiled_artifact.artifact_role_prefill, .seq_len = shape.seq_len, .query_seq_len = shape.query_seq_len, .attention_mode = shape.attention_mode, .require_pjrt_memory_plan = true }) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            }) orelse return error.PjrtLoadOnlyArtifactsRequired;
+            defer prefill.deinit(allocator);
+            const decode = try findMatchingPjrtWholeModelDecodeArtifacts(allocator, io, directory, prefill.manifest_path, policy.decode_steps_limit);
+            defer freePjrtArtifactMatches(allocator, decode);
+            const paths = try allocator.alloc([]const u8, decode.len);
+            defer allocator.free(paths);
+            for (decode, paths) |variant, *path| path.* = variant.manifest_path;
+            break :found try pjrt_artifact_executor_mod.createAdmittedModelExecutorFromManifestPaths(allocator, io, prefill.manifest_path, paths, graph, context.cb, policy, plugin);
+        };
+        entry.compiled_model_executor = .{ .ptr = executor, .deinit = &pjrt_executor_mod.deinitModelExecutorPtr };
+        entry.compiled_model_status = .ready;
+    };
+
     if (entry.compiled_model_status == .uninitialized) {
-        const client_raw = context.pjrt_client orelse return error.MissingPjrtClient;
         const pjrt_lib = @import("pjrt");
-        const client: *pjrt_lib.pjrt.Client = @ptrCast(@alignCast(client_raw));
+        const client: ?*pjrt_lib.pjrt.Client = if (context.pjrt_client) |raw| @ptrCast(@alignCast(raw)) else null;
 
         if (context.artifact_dir != null and context.model_dir != null) artifact_blk: {
             if (std.meta.activeTag(request) != .prefill) break :artifact_blk;
@@ -412,7 +447,7 @@ fn executeModelForwardViaDefinition(
                     shape.attention_mode,
                     graph,
                     context.cb,
-                    client,
+                    client orelse return error.MissingPjrtClient,
                 );
                 std.log.info("PJRT whole-model artifact package attached: package={s}", .{package_manifest_path});
                 entry.compiled_model_executor = .{
@@ -436,6 +471,7 @@ fn executeModelForwardViaDefinition(
                 io_check.io(),
                 context.artifact_dir.?,
                 found.manifest_path,
+                null,
             );
             defer freePjrtArtifactMatches(allocator, decode_found);
 
@@ -454,7 +490,7 @@ fn executeModelForwardViaDefinition(
                 decode_manifest_paths,
                 graph,
                 context.cb,
-                client,
+                client orelse return error.MissingPjrtClient,
             );
             if (decode_found.len > 0) {
                 std.log.info("PJRT whole-model artifact package attached via manifest fallback: prefill_manifest={s} decode_buckets={d} first_decode_seq_len={d} last_decode_seq_len={d}", .{
@@ -473,6 +509,8 @@ fn executeModelForwardViaDefinition(
             entry.compiled_model_status = .ready;
         }
     }
+
+    if (entry.compiled_model_status == .uninitialized and context.pjrt_admission != null) return error.PjrtLoadOnlyArtifactsRequired;
 
     if (entry.compiled_model_status == .uninitialized) {
         if (!attachmentTargetAllowsPjrtPlan(graph, dpp, .whole_model)) return null;
@@ -521,6 +559,7 @@ fn executeModelForwardViaDefinition(
     var output = switch (request) {
         .decode => |decode_request| runtime.decode(allocator, decode_request) catch |err| switch (err) {
             error.UnsupportedDecode, error.UnsupportedShape, error.MissingPastKeyValue, error.MissingValue => {
+                if (context.pjrt_admission != null) return err;
                 logPjrtRuntimeDecline("runtime", err, request);
                 return null;
             },
@@ -537,6 +576,7 @@ fn executeModelForwardViaDefinition(
                 error.UnsupportedTensorType,
                 error.MissingValue,
                 => {
+                    if (context.pjrt_admission != null) return err;
                     logPjrtRuntimeDecline("runtime", err, request);
                     return null;
                 },
@@ -699,12 +739,14 @@ fn findMatchingPjrtWholeModelDecodeArtifacts(
     io: std.Io,
     artifact_dir: []const u8,
     prefill_manifest_path: []const u8,
+    max_decode_steps: ?usize,
 ) ![]PjrtArtifactMatch {
+    if (max_decode_steps == 0) return &.{};
     var prefill_parsed = try compiled_artifact.readManifest(allocator, io, prefill_manifest_path);
     defer prefill_parsed.deinit();
 
-    var matches = (try findMatchingPjrtDecodeArtifactsFromPackage(allocator, io, artifact_dir, prefill_parsed.value)) orelse
-        try findMatchingPjrtDecodeArtifactsForPrefill(allocator, io, artifact_dir, prefill_parsed.value);
+    var matches = (try findMatchingPjrtDecodeArtifactsFromPackage(allocator, io, artifact_dir, prefill_parsed.value, max_decode_steps)) orelse
+        try findMatchingPjrtDecodeArtifactsForPrefill(allocator, io, artifact_dir, prefill_parsed.value, max_decode_steps);
     errdefer freePjrtArtifactMatches(allocator, matches);
 
     if (matches.len == 0) return matches;
@@ -750,6 +792,7 @@ fn findMatchingPjrtDecodeArtifactsFromPackage(
     io: std.Io,
     artifact_dir: []const u8,
     prefill_manifest: compiled_artifact.Manifest,
+    max_decode_steps: ?usize,
 ) !?[]PjrtArtifactMatch {
     const package_path = compiled_artifact.packageManifestPath(
         allocator,
@@ -785,6 +828,7 @@ fn findMatchingPjrtDecodeArtifactsFromPackage(
             .attention_mode = "paged_decode",
         })) continue;
         if (entry.seq_len <= prefill_manifest.seq_len) continue;
+        if (max_decode_steps) |limit| if (entry.seq_len > prefill_manifest.seq_len +| limit) continue;
         try out.append(allocator, .{
             .manifest_path = try allocator.dupe(u8, entry.manifest_path),
             .artifact_path = try allocator.dupe(u8, entry.artifact_path),
@@ -919,6 +963,7 @@ fn findMatchingPjrtDecodeArtifactsForPrefill(
     io: std.Io,
     artifact_dir: []const u8,
     prefill_manifest: compiled_artifact.Manifest,
+    max_decode_steps: ?usize,
 ) ![]PjrtArtifactMatch {
     var dir = if (std.fs.path.isAbsolute(artifact_dir))
         try std.Io.Dir.openDirAbsolute(io, artifact_dir, .{ .iterate = true })
@@ -946,6 +991,14 @@ fn findMatchingPjrtDecodeArtifactsForPrefill(
         defer parsed.deinit();
 
         const manifest = parsed.value;
+        if (max_decode_steps) |limit| if (manifest.seq_len > prefill_manifest.seq_len +| limit) {
+            allocator.free(manifest_path);
+            continue;
+        };
+        if (compiled_artifact.hasManagedPjrtPlan(prefill_manifest) and !compiled_artifact.hasManagedPjrtPlan(manifest)) {
+            allocator.free(manifest_path);
+            continue;
+        }
         if (!std.mem.eql(u8, manifest.backend, "xla") or
             !std.mem.eql(u8, manifest.kind, prefill_manifest.kind) or
             !std.mem.eql(u8, manifest.artifact_role, compiled_artifact.artifact_role_decode) or
@@ -1101,7 +1154,7 @@ test "PJRT whole-model decode artifact lookup collects sorted decode buckets" {
         },
     });
 
-    const found = try findMatchingPjrtWholeModelDecodeArtifacts(allocator, io, base_dir, prefill_manifest_path);
+    const found = try findMatchingPjrtWholeModelDecodeArtifacts(allocator, io, base_dir, prefill_manifest_path, null);
     defer freePjrtArtifactMatches(allocator, found);
     try std.testing.expectEqual(@as(usize, 2), found.len);
     try std.testing.expectEqual(@as(usize, 3), found[0].seq_len);
@@ -1152,7 +1205,7 @@ test "PJRT whole-model decode artifact lookup rejects first missing decode bucke
         .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs,
     });
 
-    const found = try findMatchingPjrtWholeModelDecodeArtifacts(allocator, io, base_dir, prefill_manifest_path);
+    const found = try findMatchingPjrtWholeModelDecodeArtifacts(allocator, io, base_dir, prefill_manifest_path, null);
     defer freePjrtArtifactMatches(allocator, found);
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }

@@ -5161,6 +5161,22 @@ pub const ModelManager = struct {
         return &self.resource_domain.?.admission;
     }
 
+    /// Keep the accounting domain alive for an executor whose handles outlive
+    /// its manager. This does not keep the manager itself or model caches alive.
+    pub const ResourceLifetime = struct {
+        domain: *ResourceDomain,
+        pub fn deinit(self: @This()) void {
+            self.domain.release();
+        }
+    };
+
+    pub fn retainResourceLifetime(self: *ModelManager) !ResourceLifetime {
+        try self.ensureResourceOwnerReady();
+        const domain = self.resource_domain.?;
+        if (!domain.retain()) return error.ResourceOwnerShuttingDown;
+        return .{ .domain = domain };
+    }
+
     /// A provider discovered after tokenizer construction can tighten the
     /// shared physical envelope without replacing any outstanding leases.
     pub fn tightenUnifiedDeviceCapacity(self: *ModelManager, bytes: usize) !void {

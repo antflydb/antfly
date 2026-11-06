@@ -238,6 +238,10 @@ const ArtifactContext = struct {
         return .{ .allocator = allocator, .manager = manager, .model_dir = model_dir, .manifest = manifest, .assets = assets, .policy = policy };
     }
 
+    fn admissionContext(self: *const @This()) pjrt_admission.Context {
+        return .{ .allocator = self.allocator, .manager = self.manager, .policy = self.policy };
+    }
+
     fn deinit(self: *@This()) void {
         self.assets.deinit();
         self.manifest.deinit();
@@ -521,7 +525,7 @@ pub fn tryRunMatchingArtifact(
         return null;
     }
 
-    if (try findMatchingFullModelPackageManifest(
+    if (try compiled_artifact.findManagedPjrtPackage(
         allocator,
         io,
         search_dir,
@@ -658,9 +662,10 @@ fn findMatchingFullModelArtifact(
     attention_mode: []const u8,
 ) !?compiled_artifact.LocatedArtifact {
     if (std.mem.eql(u8, backend, "xla")) {
-        const xla_kinds = [_][]const u8{ "pjrt_executable", "pjrt_hlo" };
+        const xla_kinds = [_][]const u8{"pjrt_executable"};
         for (xla_kinds) |kind| {
             if (try compiled_artifact.findMatchingArtifactPath(allocator, io, search_dir, .{
+                .require_pjrt_memory_plan = true,
                 .backend = backend,
                 .kind = kind,
                 .model_dir = model_dir,
@@ -1148,234 +1153,9 @@ fn admitArtifactRun(manager: *model_manager_mod.ModelManager, session: backends.
     } }});
 }
 
-fn artifactShapeBytes(shape: []const i64, element_bytes: usize) !usize {
-    var bytes = element_bytes;
-    for (shape) |dim| {
-        const size = std.math.cast(usize, dim) orelse return error.InvalidArtifactShape;
-        bytes = std.math.mul(usize, bytes, size) catch return error.ResourceLimitExceeded;
-    }
-    return bytes;
-}
-
-/// Compiler-derived residency and workspace are admitted before a provider
-/// can create a client or deserialize native code. No post-load budget growth.
-const ArtifactDeviceAdmission = struct {
-    manager: *model_manager_mod.ModelManager,
-    limits: runtime.tier.memory.Limits,
-    cpu: bool,
-    planned: runtime.tier.memory.AdmissionAmounts,
-    initial: runtime.tier.memory.AdmissionLease,
-    device_bytes: usize = 0,
-
-    const Capacity = struct { total_bytes: usize, unified: bool };
-
-    fn plan(artifact: compiled_artifact.Manifest) !compiled_artifact.PjrtMemoryPlan {
-        if (!std.mem.eql(u8, artifact.kind, "pjrt_executable") and
-            !std.mem.eql(u8, artifact.kind, "pjrt_partition_executable")) return error.UnsupportedPjrtFeature;
-        const profile = artifact.pjrt_memory_plan orelse return error.UnsupportedPjrtFeature;
-        if (profile.version != 1) return error.UnsupportedPjrtFeature;
-        return profile;
-    }
-
-    fn limitsFor(context: *ArtifactContext, cpu: bool) runtime.tier.memory.Limits {
-        const memory = runtime.tier.memory;
-        var limits = memory.defaultLimitsForBackend(if (cpu) .cpu else .gpu);
-        if (context.policy) |policy| limits = memory.applyLimitOverrides(limits, policy.limits);
-        return limits;
-    }
-
-    fn plannedAmounts(artifact: compiled_artifact.Manifest) !runtime.tier.memory.AdmissionAmounts {
-        const profile = try plan(artifact);
-        var amounts = try executionAmounts(artifact, profile.memory, profile.platform == .cpu);
-        if (profile.platform == .cuda) {
-            // BFC regions/arguments need alignment and bounded fragmentation
-            // headroom. Charge that persistent allocator capacity as residency.
-            const quantum: usize = 2 * 1024 * 1024;
-            const bytes = try std.math.add(usize, try std.math.add(usize, amounts.backend_weight_bytes, amounts.backend_kv_bytes), amounts.backend_scratch_bytes);
-            const rounded = (std.math.add(usize, try std.math.add(usize, bytes, quantum), quantum - 1) catch return error.ResourceLimitExceeded) & ~(quantum - 1);
-            amounts.backend_weight_bytes = try std.math.add(usize, amounts.backend_weight_bytes, rounded - bytes);
-        }
-        return amounts;
-    }
-
-    fn init(context: *ArtifactContext, artifact: compiled_artifact.Manifest) !@This() {
-        const profile = try plan(artifact);
-        const amounts = try plannedAmounts(artifact);
-        // Impossible operator caps must reject before even a CUDA capacity
-        // probe, and long before plugin initialization or Client_Create.
-        if (!try amounts.fitsLimits(limitsFor(context, profile.platform == .cpu))) return error.ResourceLimitExceeded;
-        var capacity: ?Capacity = null;
-        if (profile.platform == .cuda) {
-            var driver = try @import("ops/cuda/driver.zig").CudaDriver.open();
-            defer driver.deinit();
-            const device = try driver.defaultDeviceMemory(); // no CUDA context
-            capacity = .{ .total_bytes = device.total_bytes, .unified = device.unified };
-        }
-        return initForCapacity(context, artifact, capacity);
-    }
-
-    fn initForCapacity(context: *ArtifactContext, artifact: compiled_artifact.Manifest, capacity: ?Capacity) !@This() {
-        const memory = runtime.tier.memory;
-        const profile = try plan(artifact);
-        const cpu = profile.platform == .cpu;
-        const amounts = try plannedAmounts(artifact);
-        var limits = limitsFor(context, cpu);
-        if (!cpu) {
-            const physical = capacity orelse return error.UnsupportedPjrtFeature;
-            limits = memory.clampDiscreteDeviceLimits(limits, physical.total_bytes, 0);
-            if (physical.unified) {
-                limits = memory.clampUnifiedDeviceLimits(limits, physical.total_bytes);
-                try context.manager.tightenUnifiedDeviceCapacity(physical.total_bytes);
-            }
-        }
-        return .{
-            .manager = context.manager,
-            .limits = limits,
-            .cpu = cpu,
-            .planned = amounts,
-            .initial = try context.manager.acquireRunResourceAmounts(if (cpu) .cpu else .gpu, limits, amounts),
-            .device_bytes = if (capacity) |physical| physical.total_bytes else 0,
-        };
-    }
-
-    fn bufferAmounts(artifact: compiled_artifact.Manifest) !runtime.tier.memory.AdmissionAmounts {
-        if (artifact.pjrt_input_shapes.len != artifact.pjrt_input_bindings.len or
-            artifact.pjrt_output_shapes.len != artifact.pjrt_output_node_ids.len)
-            return error.MissingArtifactMetadata;
-        var amounts = runtime.tier.memory.AdmissionAmounts{};
-        for (artifact.pjrt_input_shapes, artifact.pjrt_input_bindings) |shape, binding| {
-            const bytes = try artifactShapeBytes(shape, if (compiled_artifact.pjrtBindingIsInputIds(binding)) 8 else 4);
-            const field = if (compiled_artifact.pjrtBindingIsKvCache(binding)) &amounts.backend_kv_bytes else &amounts.backend_weight_bytes;
-            field.* = try std.math.add(usize, field.*, bytes);
-        }
-        for (artifact.pjrt_output_shapes, artifact.pjrt_output_node_ids) |shape, node_id| {
-            var kv = false;
-            for (artifact.pjrt_output_bindings) |binding| {
-                if (binding.node_id == node_id and compiled_artifact.pjrtBindingIsKvCache(binding)) kv = true;
-            }
-            const field = if (kv) &amounts.backend_kv_bytes else &amounts.backend_scratch_bytes;
-            field.* = try std.math.add(usize, field.*, try artifactShapeBytes(shape, 4));
-        }
-        return amounts;
-    }
-
-    fn executionAmounts(artifact: compiled_artifact.Manifest, stats: compiled_artifact.PjrtMemoryStats, cpu: bool) !runtime.tier.memory.AdmissionAmounts {
-        var required = try bufferAmounts(artifact);
-        const shape_arguments = blk: {
-            var bytes: usize = 0;
-            for (artifact.pjrt_input_shapes, artifact.pjrt_input_bindings) |shape, binding| {
-                bytes = try std.math.add(usize, bytes, try artifactShapeBytes(shape, if (compiled_artifact.pjrtBindingIsInputIds(binding)) 8 else 4));
-            }
-            break :blk bytes;
-        };
-        // Do not credit input/output aliasing: inputs remain borrowed until
-        // execution completes and outputs are retained by the runtime.
-        required.backend_weight_bytes = try std.math.add(usize, required.backend_weight_bytes, stats.code);
-        required.backend_weight_bytes = try std.math.add(usize, required.backend_weight_bytes, stats.arguments -| shape_arguments);
-        const shape_outputs = blk: {
-            var bytes: usize = 0;
-            for (artifact.pjrt_output_shapes) |shape| bytes = try std.math.add(usize, bytes, try artifactShapeBytes(shape, 4));
-            break :blk bytes;
-        };
-        required.backend_scratch_bytes = try std.math.add(usize, required.backend_scratch_bytes, stats.outputs -| shape_outputs);
-        required.backend_scratch_bytes = try std.math.add(usize, required.backend_scratch_bytes, stats.temporary);
-        const accounted = try std.math.add(usize, try std.math.add(usize, required.backend_weight_bytes, required.backend_kv_bytes), required.backend_scratch_bytes);
-        required.backend_scratch_bytes = try std.math.add(usize, required.backend_scratch_bytes, @max(stats.peak, stats.total) -| accounted);
-        required.host_weight_bytes = try std.math.add(usize, stats.host_code, stats.host_arguments);
-        required.host_scratch_bytes = try std.math.add(usize, stats.host_outputs, stats.host_temporary);
-        if (cpu) required = try mergeHostAmounts(required);
-        return required;
-    }
-
-    fn verifyLoaded(artifact: compiled_artifact.Manifest, stats: @import("pjrt").pjrt.CompiledMemoryStats) !void {
-        const profile = try plan(artifact);
-        const actual = compiled_artifact.PjrtMemoryStats.fromCompiler(stats);
-        inline for (@typeInfo(compiled_artifact.PjrtMemoryStats).@"struct".field_names) |name| {
-            if (@field(actual, name) > @field(profile.memory, name)) return error.InvalidArtifact;
-        }
-    }
-
-    fn mergeHostAmounts(amounts: runtime.tier.memory.AdmissionAmounts) !runtime.tier.memory.AdmissionAmounts {
-        return .{
-            .host_weight_bytes = try std.math.add(usize, amounts.host_weight_bytes, amounts.backend_weight_bytes),
-            .host_kv_bytes = try std.math.add(usize, amounts.host_kv_bytes, amounts.backend_kv_bytes),
-            .host_scratch_bytes = try std.math.add(usize, amounts.host_scratch_bytes, amounts.backend_scratch_bytes),
-        };
-    }
-
-    fn deinit(self: *@This()) void {
-        self.initial.release();
-    }
-};
-
-/// Own the serialized buffer and all construction permits outside the client
-/// lifetime. Read/hash once; the executor factory must borrow this same buffer.
-const PreparedPjrtArtifact = struct {
-    allocator: std.mem.Allocator,
-    bytes: []u8,
-    encoded_bytes: usize,
-    staging: runtime.tier.memory.AdmissionLease,
-    device: ArtifactDeviceAdmission,
-
-    fn init(context: *ArtifactContext, artifact: compiled_artifact.Manifest, plugin_path: [:0]const u8) !@This() {
-        const profile = try ArtifactDeviceAdmission.plan(artifact);
-        const c_file = @import("util/c_file.zig");
-        const allocator = platform.allocator.reclaimingScratch(context.allocator);
-        const encoded = std.math.cast(usize, try c_file.fileSize(allocator, artifact.artifact_path)) orelse return error.ResourceLimitExceeded;
-        if (encoded == 0) return error.InvalidArtifact;
-        // One serialized input plus a constructor-owned copy, and a bounded
-        // plugin hashing buffer. No mapping/reading can precede this permit.
-        const peak = try std.math.add(usize, try std.math.mul(usize, encoded, 2), 64 * 1024);
-        var staging = try context.manager.acquireRunResourceAmounts(.cpu, ArtifactDeviceAdmission.limitsFor(context, true), .{ .host_weight_bytes = peak });
-        errdefer staging.release();
-        const bytes = try c_file.readFileMax(allocator, artifact.artifact_path, encoded);
-        errdefer allocator.free(bytes);
-        if (bytes.len != encoded) return error.InvalidArtifact;
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        if (!std.mem.eql(u8, &digest, &profile.artifact_sha256)) return error.InvalidArtifact;
-        const plugin_digest = try c_file.sha256File(allocator, plugin_path);
-        if (!std.mem.eql(u8, &plugin_digest, &profile.plugin_sha256)) return error.InvalidArtifact;
-        try staging.retain(.{ .host_weight_bytes = try std.math.mul(usize, encoded, 2) });
-        return .{
-            .allocator = allocator,
-            .bytes = bytes,
-            .encoded_bytes = encoded,
-            .staging = staging,
-            .device = try ArtifactDeviceAdmission.init(context, artifact),
-        };
-    }
-
-    fn createClient(self: *const @This(), plugin_path: [:0]const u8) !@import("pjrt").pjrt.Client {
-        const Client = @import("pjrt").pjrt.Client;
-        var client = try Client.initWithMemoryPolicy(plugin_path, if (self.device.cpu) .cpu else .{ .cuda = .{
-            .capacity_bytes = self.device.planned.backendTotalBytes(),
-            .device_bytes = self.device.device_bytes,
-        } });
-        errdefer client.deinit();
-        if (!client.api.hasCompiledMemoryStats()) return error.UnsupportedPjrtFeature;
-        const name = try client.platformName();
-        if (self.device.cpu) {
-            if (!try client.isCpu()) return error.InvalidArtifact;
-        } else if (!std.ascii.eqlIgnoreCase(name, "cuda")) return error.InvalidArtifact;
-        return client;
-    }
-
-    fn loaded(self: *@This(), artifact: compiled_artifact.Manifest, stats: @import("pjrt").pjrt.CompiledMemoryStats) !void {
-        try ArtifactDeviceAdmission.verifyLoaded(artifact, stats);
-        self.allocator.free(self.bytes);
-        self.bytes = &.{};
-        // The provider may retain its own serialized representation. Keep that
-        // bound until client destruction even after freeing our input copy.
-        try self.staging.retain(.{ .host_weight_bytes = self.encoded_bytes });
-    }
-
-    fn deinit(self: *@This()) void {
-        if (self.bytes.len != 0) self.allocator.free(self.bytes);
-        self.staging.release();
-        self.device.deinit();
-    }
-};
+const pjrt_admission = @import("graph/pjrt_admission.zig");
+const ArtifactDeviceAdmission = pjrt_admission.ArtifactDeviceAdmission;
+const PreparedPjrtArtifact = pjrt_admission.PreparedPjrtArtifact;
 
 fn runPjrtHloArtifactFull(
     allocator: std.mem.Allocator,
@@ -1478,7 +1258,7 @@ fn runPjrtHloArtifactFull(
         &decode_context,
     );
 
-    var prepared = try PreparedPjrtArtifact.init(context, artifact, plugin_path);
+    var prepared = try PreparedPjrtArtifact.init(&context.admissionContext(), artifact, plugin_path);
     defer prepared.deinit();
     var client = try prepared.createClient(plugin_path);
     defer client.deinit();
@@ -1648,7 +1428,7 @@ fn runPjrtPartitionArtifact(
     const plugin_path = try native_backend_choice.pjrtPluginPathFromEnv(allocator) orelse return error.MissingPjrtPlugin;
     defer allocator.free(plugin_path);
 
-    var prepared = try PreparedPjrtArtifact.init(context, artifact, plugin_path);
+    var prepared = try PreparedPjrtArtifact.init(&context.admissionContext(), artifact, plugin_path);
     defer prepared.deinit();
     var client = try prepared.createClient(plugin_path);
     defer client.deinit();
@@ -2218,10 +1998,11 @@ fn comparePjrtPartitionOutputs(
     defer out.deinit(allocator);
     for (output_node_ids, output_buffers, 0..) |node_id, buffer, idx| {
         const capture_idx = findCapturedNodeIndex(captured_node_ids, node_id) orelse return error.MissingRuntimeInput;
-        const host_data = try cb.toFloat32(captured_values[capture_idx], allocator);
-        defer allocator.free(host_data);
-        const pjrt_data = try buffer.toFloat32(allocator);
-        defer allocator.free(pjrt_data);
+        const staging_allocator = platform.allocator.reclaimingScratch(allocator);
+        const host_data = try cb.toFloat32(captured_values[capture_idx], staging_allocator);
+        defer staging_allocator.free(host_data);
+        const pjrt_data = try buffer.toFloat32(staging_allocator);
+        defer staging_allocator.free(pjrt_data);
         if (host_data.len != pjrt_data.len) return error.ArtifactShapeMismatch;
         var max_abs_diff: f32 = 0.0;
         for (host_data, pjrt_data) |host_v, pjrt_v| {
@@ -2748,16 +2529,16 @@ test "run-artifact PJRT admission covers buffers workspace CPU placement and ref
         .memory = .{ .code = 64 * mib },
     };
     // Even probing CUDA must follow rejection of an impossible footprint.
-    try std.testing.expectError(error.ResourceLimitExceeded, ArtifactDeviceAdmission.init(&context, artifact));
+    try std.testing.expectError(error.ResourceLimitExceeded, ArtifactDeviceAdmission.init(&context.admissionContext(), artifact));
     try std.testing.expectEqualDeep(before, context.manager.currentAdmissionAmounts());
     artifact.pjrt_memory_plan.?.platform = .cpu;
     artifact.pjrt_memory_plan.?.memory = .{ .arguments = 64, .outputs = 64, .temporary = 128, .host_temporary = 256 };
     {
-        var admitted = try ArtifactDeviceAdmission.init(&context, artifact);
+        var admitted = try ArtifactDeviceAdmission.init(&context.admissionContext(), artifact);
         defer admitted.deinit();
         const during = context.manager.currentAdmissionAmounts();
         try std.testing.expectEqual(@as(usize, 0), during.backendTotalBytes());
-        try std.testing.expectEqual(before.hostTotalBytes() + 512, during.hostTotalBytes());
+        try std.testing.expectEqual(before.hostTotalBytes() + 640, during.hostTotalBytes());
         const Stats = @import("pjrt").pjrt.CompiledMemoryStats;
         var stats = std.mem.zeroes(Stats);
         stats.arguments = 64;
@@ -2771,15 +2552,15 @@ test "run-artifact PJRT admission covers buffers workspace CPU placement and ref
     }
     try std.testing.expectEqualDeep(before, context.manager.currentAdmissionAmounts());
     artifact.pjrt_memory_plan.?.memory.temporary = 2 * mib;
-    try std.testing.expectError(error.ResourceLimitExceeded, ArtifactDeviceAdmission.init(&context, artifact));
+    try std.testing.expectError(error.ResourceLimitExceeded, ArtifactDeviceAdmission.init(&context.admissionContext(), artifact));
     try std.testing.expectEqualDeep(before, context.manager.currentAdmissionAmounts());
     artifact.pjrt_memory_plan.?.platform = .cuda;
     artifact.pjrt_memory_plan.?.memory = .{};
     const cuda = try ArtifactDeviceAdmission.plannedAmounts(artifact);
-    try std.testing.expectEqual(@as(usize, 4 * mib), cuda.backendTotalBytes());
-    try std.testing.expectError(error.ResourceLimitExceeded, ArtifactDeviceAdmission.initForCapacity(&context, artifact, .{ .total_bytes = mib, .unified = false }));
+    try std.testing.expectEqual(@as(usize, 6 * mib), cuda.backendTotalBytes());
+    try std.testing.expectError(error.ResourceLimitExceeded, ArtifactDeviceAdmission.initForCapacity(&context.admissionContext(), artifact, .{ .total_bytes = mib, .unified = false }));
     artifact.pjrt_memory_plan = null;
-    try std.testing.expectError(error.UnsupportedPjrtFeature, ArtifactDeviceAdmission.init(&context, artifact));
+    try std.testing.expectError(error.UnsupportedPjrtFeature, ArtifactDeviceAdmission.init(&context.admissionContext(), artifact));
     input_shape[0] = -1;
     try std.testing.expectError(error.InvalidArtifactShape, ArtifactDeviceAdmission.bufferAmounts(artifact));
     input_shape[0] = std.math.maxInt(i64);
@@ -2833,7 +2614,7 @@ fn preparedArtifactScenario(a: std.mem.Allocator, root: []const u8, artifact: co
     const before = context.manager.currentAdmissionAmounts();
     defer std.debug.assert(std.meta.eql(before, context.manager.currentAdmissionAmounts()));
     {
-        var prepared = try PreparedPjrtArtifact.init(&context, artifact, plugin);
+        var prepared = try PreparedPjrtArtifact.init(&context.admissionContext(), artifact, plugin);
         defer prepared.deinit();
         const staged = context.manager.currentAdmissionAmounts();
         try std.testing.expect(staged.host_weight_bytes >= before.host_weight_bytes + 2 * prepared.encoded_bytes);
@@ -2885,16 +2666,16 @@ test "run-artifact PJRT constructors require admitted verified bytes and refund 
         const before = context.manager.currentAdmissionAmounts();
         const original = artifact.pjrt_memory_plan.?;
         artifact.pjrt_memory_plan = null;
-        try std.testing.expectError(error.UnsupportedPjrtFeature, PreparedPjrtArtifact.init(&context, artifact, plugin));
+        try std.testing.expectError(error.UnsupportedPjrtFeature, PreparedPjrtArtifact.init(&context.admissionContext(), artifact, plugin));
         artifact.pjrt_memory_plan = original;
         artifact.pjrt_memory_plan.?.artifact_sha256[0] ^= 1;
-        try std.testing.expectError(error.InvalidArtifact, PreparedPjrtArtifact.init(&context, artifact, plugin));
+        try std.testing.expectError(error.InvalidArtifact, PreparedPjrtArtifact.init(&context.admissionContext(), artifact, plugin));
         artifact.pjrt_memory_plan = original;
         artifact.pjrt_memory_plan.?.plugin_sha256[0] ^= 1;
-        try std.testing.expectError(error.InvalidArtifact, PreparedPjrtArtifact.init(&context, artifact, plugin));
+        try std.testing.expectError(error.InvalidArtifact, PreparedPjrtArtifact.init(&context.admissionContext(), artifact, plugin));
         artifact.pjrt_memory_plan = original;
         artifact.pjrt_memory_plan.?.memory.code = 64 * 1024 * 1024;
-        try std.testing.expectError(error.ResourceLimitExceeded, PreparedPjrtArtifact.init(&context, artifact, plugin));
+        try std.testing.expectError(error.ResourceLimitExceeded, PreparedPjrtArtifact.init(&context.admissionContext(), artifact, plugin));
         artifact.pjrt_memory_plan = original;
         // Sparse oversized serialized input is rejected before reading it.
         const oversized = try tmp.dir.createFile(std.testing.io, "large.exec", .{});
@@ -2903,7 +2684,7 @@ test "run-artifact PJRT constructors require admitted verified bytes and refund 
         const large = try std.fs.path.join(a, &.{ root, "large.exec" });
         defer a.free(large);
         artifact.artifact_path = large;
-        try std.testing.expectError(error.ResourceLimitExceeded, PreparedPjrtArtifact.init(&context, artifact, plugin));
+        try std.testing.expectError(error.ResourceLimitExceeded, PreparedPjrtArtifact.init(&context.admissionContext(), artifact, plugin));
         artifact.artifact_path = path;
         try std.testing.expectEqualDeep(before, context.manager.currentAdmissionAmounts());
         try std.testing.expectEqual(@as(usize, 0), count(0));
@@ -2946,4 +2727,263 @@ test "run-artifact trace pools keep geometry without duplicating native KV stora
             try std.testing.expectEqual(@as(usize, 0), actual);
         } else try std.testing.expect(actual > 0);
     }
+}
+
+fn admittedPjrtPackageScenario(a: std.mem.Allocator, root: []const u8, prefill: []const u8, decode: []const u8, plugin: [:0]const u8) !void {
+    var context = try ArtifactContext.init(a, std.testing.io, root, .{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 } });
+    defer context.deinit();
+    const before = context.manager.currentAdmissionAmounts();
+    defer std.debug.assert(std.meta.eql(before, context.manager.currentAdmissionAmounts()));
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const parameter = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{1}));
+    try graph.markOutput(parameter);
+    var backend: ops.ComputeBackend = undefined; // the load-only fixture does not execute
+
+    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{decode}, &graph, &backend, &context.admissionContext(), plugin);
+    var owned = executor.modelExecutor();
+    var owns_executor = true;
+    defer if (owns_executor) owned.deinit();
+    {
+        var single_token = context.admissionContext();
+        single_token.decode_steps_limit = 0;
+        const prefill_only = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{"unused-missing-decode.json"}, &graph, &backend, &single_token, plugin);
+        var prefill_only_owner = prefill_only.modelExecutor();
+        defer prefill_only_owner.deinit();
+        try std.testing.expectEqual(@as(usize, 0), prefill_only.decode_variants.len);
+    }
+    var retained_runtime = try owned.createRuntime(a);
+    defer retained_runtime.deinit();
+    owned.deinit();
+    owns_executor = false;
+    try std.testing.expect(executor.graph != &graph);
+    try std.testing.expectEqual(@as(usize, 4096), (try executor.executor.executable.compiledMemoryStats()).arguments);
+    try std.testing.expectEqual(@as(usize, 1), executor.decode_variants.len);
+    // Code is retained twice, argument buffers are shared across phases, and
+    // both provider-owned serialized representations remain charged.
+    try std.testing.expectEqual(before.host_weight_bytes + 2 * 64 + 4096 + 2 * "fixture executable".len + executor.artifact_owner.?.metadata_bytes, context.manager.currentAdmissionAmounts().host_weight_bytes);
+}
+
+test "run-artifact admitted PJRT packages share phase memory and refund every failed allocation" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeArtifactAdmissionFixture(tmp.dir);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plugin", .data = @import("pjrt_admission_fixture").bytes });
+    const plugin = try std.fmt.allocPrintSentinel(a, "{s}/plugin", .{root}, 0);
+    defer a.free(plugin);
+    var lib = try std.DynLib.open(plugin);
+    defer lib.close();
+    const reset = lib.lookup(*const fn () callconv(.c) void, "AntflyTestReset").?;
+    const count = lib.lookup(*const fn (usize) callconv(.c) usize, "AntflyTestRead").?;
+    reset();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.exec", .data = "fixture executable" });
+    const path = try std.fs.path.join(a, &.{ root, "model.exec" });
+    defer a.free(path);
+    var artifact = testPjrtManifest(path);
+    artifact.model_dir = root;
+    var shape = [_]i64{1};
+    var shapes = [_][]i64{&shape};
+    var bindings = [_]compiled_artifact.PjrtInputBindingMeta{.{ .kind = compiled_artifact.pjrt_binding_graph_node, .node_id = 0 }};
+    var outputs = [_]u32{0};
+    artifact.pjrt_input_shapes = &shapes;
+    artifact.pjrt_input_bindings = &bindings;
+    artifact.pjrt_output_shapes = &shapes;
+    artifact.pjrt_output_node_ids = &outputs;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("fixture executable", &digest, .{});
+    artifact.pjrt_memory_plan = .{ .platform = .cpu, .artifact_sha256 = digest, .plugin_sha256 = try @import("util/c_file.zig").sha256File(a, plugin), .memory = .{ .code = 64, .arguments = 4096, .outputs = 8, .temporary = 128 } };
+    const prefill = try std.fs.path.join(a, &.{ root, "prefill.inference.json" });
+    defer a.free(prefill);
+    const decode = try std.fs.path.join(a, &.{ root, "decode.inference.json" });
+    defer a.free(decode);
+    try compiled_artifact.writeManifest(a, std.testing.io, prefill, artifact);
+    artifact.seq_len += 1;
+    artifact.query_seq_len = 1;
+    artifact.attention_mode = "paged_decode";
+    artifact.artifact_role = compiled_artifact.artifact_role_decode;
+    const profile = artifact.pjrt_memory_plan;
+    artifact.pjrt_memory_plan = null;
+    try compiled_artifact.writeManifest(a, std.testing.io, decode, artifact);
+    try std.testing.expectError(error.UnsupportedPjrtFeature, admittedPjrtPackageScenario(a, root, prefill, decode, plugin));
+    try std.testing.expectEqual(@as(usize, 0), count(0));
+    artifact.pjrt_memory_plan = profile;
+    artifact.pjrt_memory_plan.?.artifact_sha256[0] ^= 1;
+    try compiled_artifact.writeManifest(a, std.testing.io, decode, artifact);
+    try std.testing.expectError(error.InvalidArtifact, admittedPjrtPackageScenario(a, root, prefill, decode, plugin));
+    try std.testing.expectEqual(count(1), count(2));
+    try std.testing.expectEqual(count(3), count(4));
+    artifact.pjrt_memory_plan = profile;
+    try compiled_artifact.writeManifest(a, std.testing.io, decode, artifact);
+    try platform.allocator.checkAllAllocationFailures(a, admittedPjrtPackageScenario, .{ root, prefill, decode, plugin });
+    try std.testing.expectEqual(count(1), count(2));
+    try std.testing.expectEqual(count(3), count(4));
+    try std.testing.expectEqual(count(5), count(6));
+}
+
+test "run-artifact reserves host upload and comparison staging outside compiler statistics" {
+    const mib: usize = 1024 * 1024;
+    var artifact = testPjrtManifest("");
+    var shape = [_]i64{8 * mib};
+    var shapes = [_][]i64{&shape};
+    var bindings = [_]compiled_artifact.PjrtInputBindingMeta{.{ .kind = compiled_artifact.pjrt_binding_graph_node, .node_id = 0 }};
+    artifact.pjrt_input_shapes = &shapes;
+    artifact.pjrt_input_bindings = &bindings;
+    artifact.pjrt_memory_plan = .{ .platform = .cuda, .artifact_sha256 = @splat(0), .plugin_sha256 = @splat(0), .memory = .{ .arguments = 32 * mib } };
+    const input = try ArtifactDeviceAdmission.plannedAmounts(artifact);
+    try std.testing.expectEqual(32 * mib, input.host_scratch_bytes);
+    const a = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    const limits = runtime.tier.memory.Limits{ .host_limit_bytes = 40 * mib, .backend_limit_bytes = 128 * mib, .combined_limit_bytes = 168 * mib, .scratch_limit_bytes = 64 * mib };
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = limits };
+    try policy.configure(&manager);
+    var resident = try manager.admitHostPreflight(32 * mib);
+    defer resident.release();
+    const before = manager.currentAdmissionAmounts();
+    const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, ArtifactDeviceAdmission.initForCapacity(&context, artifact, .{ .total_bytes = 128 * mib, .unified = false }));
+    try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+    artifact.pjrt_input_bindings = &.{};
+    artifact.pjrt_input_shapes = &.{};
+    var outputs = [_]u32{0};
+    artifact.pjrt_output_shapes = &shapes;
+    artifact.pjrt_output_node_ids = &outputs;
+    const output = try ArtifactDeviceAdmission.plannedAmounts(artifact);
+    try std.testing.expectEqual(64 * mib, output.host_scratch_bytes);
+}
+
+test "run-artifact selection skips HLO packages and unprofiled standalone executables" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var artifact = testPjrtManifest("model.exec");
+    artifact.model_dir = root;
+    artifact.attention_mode = "paged_prefill";
+    const legacy = try std.fs.path.join(a, &.{ root, "old.inference.json" });
+    defer a.free(legacy);
+    try compiled_artifact.writeManifest(a, std.testing.io, legacy, artifact);
+    artifact.pjrt_memory_plan = .{ .platform = .cpu, .artifact_sha256 = @splat(0), .plugin_sha256 = @splat(0), .memory = .{} };
+    const fresh = try std.fs.path.join(a, &.{ root, "new.inference.json" });
+    defer a.free(fresh);
+    try compiled_artifact.writeManifest(a, std.testing.io, fresh, artifact);
+    const hlo = try compiled_artifact.packageManifestPath(a, root, "xla", root, "pjrt_hlo", compiled_artifact.pjrt_parameter_mode_embedded);
+    defer a.free(hlo);
+    try compiled_artifact.writePackageManifest(a, std.testing.io, hlo, .{ .backend = "xla", .model_dir = root, .kind = "pjrt_hlo", .artifacts = &.{.{ .manifest_path = legacy, .artifact_path = "old.hlo", .artifact_role = compiled_artifact.artifact_role_prefill, .seq_len = 16, .query_seq_len = 16, .attention_mode = "paged_prefill" }} });
+    try std.testing.expectEqual(null, try compiled_artifact.findManagedPjrtPackage(a, std.testing.io, root, "xla", root, 16, 16, "paged_prefill"));
+    var found = (try findMatchingFullModelArtifact(a, std.testing.io, root, "xla", root, 16, 16, "paged_prefill")).?;
+    defer found.deinit(a);
+    try std.testing.expectEqualStrings(fresh, found.manifest_path);
+}
+
+test "run-artifact managed decode runtime survives executor graph and manager teardown" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plugin", .data = @import("pjrt_admission_fixture").bytes });
+    const plugin = try std.fmt.allocPrintSentinel(a, "{s}/plugin", .{root}, 0);
+    defer a.free(plugin);
+    var lib = try std.DynLib.open(plugin);
+    defer lib.close();
+    const reset = lib.lookup(*const fn () callconv(.c) void, "AntflyTestReset").?;
+    const count = lib.lookup(*const fn (usize) callconv(.c) usize, "AntflyTestRead").?;
+    reset();
+    const prefill = try std.fs.path.join(a, &.{ root, "prefill.inference.json" });
+    defer a.free(prefill);
+    const decode = try std.fs.path.join(a, &.{ root, "decode.inference.json" });
+    defer a.free(decode);
+    var artifact = testPjrtManifest("");
+    artifact.model_dir = root;
+    artifact.attention_mode = "paged_prefill";
+    var ids_shape = [_]i64{16};
+    var kv_shape = [_]i64{1};
+    var logits_shape = [_]i64{2};
+    var prefill_shapes = [_][]i64{&ids_shape};
+    var decode_shapes = [_][]i64{ &kv_shape, &kv_shape, &kv_shape };
+    var output_shapes = [_][]i64{ &logits_shape, &kv_shape, &kv_shape };
+    var inputs = [_]compiled_artifact.PjrtInputBindingMeta{.{ .kind = compiled_artifact.pjrt_binding_input_ids, .node_id = 0 }};
+    var decode_inputs = [_]compiled_artifact.PjrtInputBindingMeta{
+        .{ .kind = compiled_artifact.pjrt_binding_input_ids, .node_id = 0 },
+        .{ .kind = compiled_artifact.pjrt_binding_past_key, .node_id = 1, .layer_index = 0, .name = "past.0.key" },
+        .{ .kind = compiled_artifact.pjrt_binding_past_value, .node_id = 2, .layer_index = 0, .name = "past.0.value" },
+    };
+    var outputs = [_]u32{ 0, 1, 2 };
+    var output_bindings = [_]compiled_artifact.PjrtOutputBindingMeta{
+        .{ .kind = compiled_artifact.pjrt_binding_present_key, .node_id = 1, .layer_index = 0, .name = "present.0.key" },
+        .{ .kind = compiled_artifact.pjrt_binding_present_value, .node_id = 2, .layer_index = 0, .name = "present.0.value" },
+    };
+    artifact.pjrt_input_bindings = &inputs;
+    artifact.pjrt_input_shapes = &prefill_shapes;
+    artifact.pjrt_output_shapes = &output_shapes;
+    artifact.pjrt_output_node_ids = &outputs;
+    artifact.pjrt_output_bindings = &output_bindings;
+    const plugin_hash = try @import("util/c_file.zig").sha256File(a, plugin);
+    for ([_][]const u8{ "fixture paged prefill", "fixture paged decode" }, 0..) |bytes, i| {
+        const name = if (i == 0) "prefill.exec" else "decode.exec";
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+        const path = try std.fs.path.join(a, &.{ root, name });
+        defer a.free(path);
+        artifact.artifact_path = path;
+        if (i == 1) {
+            artifact.seq_len = 17;
+            artifact.query_seq_len = 1;
+            artifact.artifact_role = compiled_artifact.artifact_role_decode;
+            artifact.attention_mode = "paged_decode";
+            artifact.pjrt_input_bindings = &decode_inputs;
+            artifact.pjrt_input_shapes = &decode_shapes;
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        artifact.pjrt_memory_plan = .{ .platform = .cpu, .artifact_sha256 = digest, .plugin_sha256 = plugin_hash, .memory = .{ .code = 64, .arguments = 4096, .outputs = 16, .temporary = 128 } };
+        try compiled_artifact.writeManifest(a, std.testing.io, if (i == 0) prefill else decode, artifact);
+    }
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 } };
+    try policy.configure(&manager);
+    const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy };
+    var graph = ml.graph.Graph.init(a);
+    var graph_live = true;
+    defer if (graph_live) graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const parameter = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
+    try graph.markOutput(parameter);
+    var backend: ops.ComputeBackend = undefined; // semantic ABI needs no host weights
+    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{decode}, &graph, &backend, &context, plugin);
+    var owned = executor.modelExecutor();
+    var executor_live = true;
+    defer if (executor_live) owned.deinit();
+    var run = try owned.createRuntime(a);
+    var runtime_live = true;
+    defer if (runtime_live) run.deinit();
+    const ids: [16]i64 = @splat(1);
+    var first = try run.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+    defer first.deinit(a);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, try first.hostLogits(a));
+    owned.deinit();
+    executor_live = false;
+    graph.deinit();
+    graph_live = false;
+    manager.deinit();
+    manager_live = false;
+    try std.testing.expectEqual(@as(usize, 0), count(2));
+    var second = try run.decode(a, .{ .token_id = 1, .position = 16 });
+    defer second.deinit(a);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, try second.hostLogits(a));
+    run.deinit();
+    runtime_live = false;
+    try std.testing.expectEqual(@as(usize, 2), count(10));
+    try std.testing.expectEqual(count(1), count(2));
+    try std.testing.expectEqual(count(3), count(4));
+    try std.testing.expectEqual(count(8), count(9));
 }

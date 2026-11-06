@@ -118,9 +118,27 @@ fn awaitAndDestroyEvent(api: *const c.Api, event: *c.PjrtEvent) PjrtError!void {
     destroyEvent(api, event);
 }
 
+/// OpenXLA runtime flags can override Client_Create's allocator and fraction,
+/// and host preallocation is controlled independently of device preallocation.
+/// A bounded client cannot inherit those uncontrolled process-wide policies.
+pub fn validateBoundedCudaEnvironment() PjrtError!void {
+    if (std.c.getenv("XLA_FLAGS")) |raw| if (std.mem.trim(u8, std.mem.span(raw), " \t\r\n").len != 0) return error.UnsupportedPjrtFeature;
+    for ([_][:0]const u8{ "XLA_PJRT_GPU_HOST_MEMORY_PREALLOCATE", "TF_FORCE_UNIFIED_MEMORY" }) |name| {
+        if (std.c.getenv(name)) |raw| {
+            const value = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+            if (value.len != 0 and !std.mem.eql(u8, value, "0") and !std.ascii.eqlIgnoreCase(value, "false")) return error.UnsupportedPjrtFeature;
+        }
+    }
+}
+
 fn cudaClientOptions(capacity: usize, device: usize, visible: []const i64) PjrtError![6]c.NamedValue {
-    if (capacity == 0 or device == 0 or capacity > device) return error.InvalidMemoryStats;
-    const ratio = @as(f64, @floatFromInt(capacity)) / @as(f64, @floatFromInt(device));
+    const quantum: usize = 2 * 1024 * 1024;
+    if (capacity < 2 * quantum or device == 0 or capacity > device) return error.InvalidMemoryStats;
+    // OpenXLA rounds BFC limits upward to 2 MiB. Round our default pool down
+    // first, and explicitly bound the separate collective pool: zero means an
+    // automatic pool covering the rest of VRAM, not a disabled allocator.
+    const default_capacity = (capacity - quantum) & ~(quantum - 1);
+    const ratio = @as(f64, @floatFromInt(default_capacity)) / @as(f64, @floatFromInt(device));
     // Round down: converting to f32 must never widen an operator's byte cap.
     var fraction: f32 = @floatCast(ratio);
     if (@as(f64, fraction) > ratio) fraction = @bitCast(@as(u32, @bitCast(fraction)) - 1);
@@ -129,7 +147,7 @@ fn cudaClientOptions(capacity: usize, device: usize, visible: []const i64) PjrtE
         .{ .name = "allocator", .name_size = "allocator".len, .type = .string, .value = .{ .string_value = "bfc" }, .value_size = 3 },
         .{ .name = "memory_fraction", .name_size = "memory_fraction".len, .type = .float, .value = .{ .float_value = fraction } },
         .{ .name = "preallocate", .name_size = "preallocate".len, .type = .boolean, .value = .{ .bool_value = false } },
-        .{ .name = "collective_memory_size", .name_size = "collective_memory_size".len, .type = .int64, .value = .{ .int64_value = 0 } },
+        .{ .name = "collective_memory_size", .name_size = "collective_memory_size".len, .type = .int64, .value = .{ .int64_value = quantum } },
         .{ .name = "visible_devices", .name_size = "visible_devices".len, .type = .int64_list, .value = .{ .int64_array_value = visible.ptr }, .value_size = visible.len },
         .{ .name = "should_stage_host_to_device_transfers", .name_size = "should_stage_host_to_device_transfers".len, .type = .boolean, .value = .{ .bool_value = false } },
     };
@@ -364,6 +382,7 @@ pub const Client = struct {
     };
 
     pub fn initWithMemoryPolicy(plugin_path: [:0]const u8, policy: ?MemoryPolicy) PjrtError!Client {
+        if (policy) |bounded| if (bounded == .cuda) try validateBoundedCudaEnvironment();
         // Load plugin shared library
         var lib = std.DynLib.open(plugin_path) catch return PjrtError.PluginLoadFailed;
         errdefer lib.close();
@@ -977,14 +996,17 @@ test "compiled memory CPU placement follows the PJRT platform" {
 
 test "bounded CUDA client options never widen the leased device capacity" {
     const visible = [_]i64{0};
-    for ([_]usize{ 1, 3, 1234567, 8000000001 }) |capacity| {
+    for ([_]usize{ 4194304, 4194305, 12345678, 8000000001 }) |capacity| {
         const device: usize = 16000000003;
         const options = try cudaClientOptions(capacity, device, &visible);
         try std.testing.expectEqualStrings("bfc", options[0].value.string_value[0..options[0].value_size]);
         const fraction = options[1].value.float_value;
-        try std.testing.expect(@as(f64, fraction) * @as(f64, @floatFromInt(device)) <= @as(f64, @floatFromInt(capacity)));
+        const quantum: usize = 2 * 1024 * 1024;
+        const default_bytes: usize = @intFromFloat(@as(f64, fraction) * @as(f64, @floatFromInt(device)));
+        const rounded_default = (default_bytes + quantum - 1) & ~(quantum - 1);
+        try std.testing.expect(rounded_default + quantum <= capacity);
         try std.testing.expect(!options[2].value.bool_value);
-        try std.testing.expectEqual(@as(i64, 0), options[3].value.int64_value);
+        try std.testing.expectEqual(@as(i64, 2 * 1024 * 1024), options[3].value.int64_value);
         try std.testing.expectEqual(@as(usize, 1), options[4].value_size);
         try std.testing.expectEqual(@as(i64, 0), options[4].value.int64_array_value[0]);
         try std.testing.expect(!options[5].value.bool_value);
@@ -1038,4 +1060,37 @@ test "serialize releases both caller-owned PJRT handles on allocation failure" {
     try std.testing.expectEqual(@as(usize, 0), Fake.serialized);
     api._fns[41] = null;
     try std.testing.expectError(error.UnsupportedPjrtFeature, executable.serialize(std.testing.allocator));
+}
+
+test "bounded CUDA clients reject allocator environment overrides before plugin initialization" {
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const a = std.testing.allocator;
+    const names = [_][:0]const u8{ "XLA_FLAGS", "XLA_PJRT_GPU_HOST_MEMORY_PREALLOCATE", "TF_FORCE_UNIFIED_MEMORY" };
+    var saved: [3]?[:0]u8 = @splat(null);
+    var initialized: usize = 0;
+    defer {
+        for (names[0..initialized], saved[0..initialized]) |name, value| {
+            if (value) |original| {
+                _ = Env.setenv(name, original, 1);
+                a.free(original);
+            } else _ = Env.unsetenv(name);
+        }
+    }
+    for (names, 0..) |name, i| {
+        if (std.c.getenv(name)) |value| saved[i] = try a.dupeSentinel(u8, std.mem.span(value), 0);
+        initialized += 1;
+        try std.testing.expectEqual(@as(c_int, 0), Env.unsetenv(name));
+    }
+    try validateBoundedCudaEnvironment();
+    for (names, [_][:0]const u8{ "--xla_gpu_memory_fraction_policy=0.9", "true", "1" }) |name, value| {
+        try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, value, 1));
+        try std.testing.expectError(error.UnsupportedPjrtFeature, Client.initWithMemoryPolicy("missing-provider", .{ .cuda = .{ .capacity_bytes = 1, .device_bytes = 2 } }));
+        try std.testing.expectEqual(@as(c_int, 0), Env.unsetenv(name));
+    }
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "false", 1));
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[2], "0", 1));
+    try validateBoundedCudaEnvironment();
 }
