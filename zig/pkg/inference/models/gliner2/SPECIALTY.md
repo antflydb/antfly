@@ -13,13 +13,26 @@ marker IDs. A model name or handwritten manifest cannot grant this contract.
 The specialty profiles are independent of the modern span declarations and the
 Decide API. Quantized or converted artifacts are outside this contract.
 
-Each item must fit within **512 prepared tokens, including schema tokens**.
-Oversized items and long-document requests are rejected. Schema tasks are not
-automatically split across forwards. Public request cardinality follows the
-server's configured limits. GLiGuard and entity-only PII group up to eight items
-per physical GPU forward and preserve input order. PII batches pad ragged words
-and labels while retaining each item's schema, threshold, count gate and offsets.
-Native CPU PII executes serially.
+Each prepared input must fit within **512 tokens, including schema tokens**.
+Without explicit windowing, oversized inputs are rejected. PII accepts
+`options.long_document.mode: "window"`: source-word windows pass exact
+tokenizer/schema admission before any forward, and their spans are rebased to
+the immutable source and deduplicated. A successful response reports
+`long_document.window_count`; incomplete or over-budget processing fails rather
+than returning partial findings. The serving route allows at most 64 prepared
+windows per input, with the existing request-wide token/work/output bounds.
+GLiGuard continues to reject long-document requests.
+
+Public request cardinality follows the server's configured limits. GLiGuard and
+entity-only PII group up to eight ordinary items per physical GPU forward and
+preserve input order. Explicit PII document windows batch up to eight compatible
+windows within a document. PII batches pad ragged words and labels while retaining
+each item's schema, threshold, count gate and offsets. Native CPU PII executes
+serially. Cross-document batching of windowed requests is not implemented.
+
+The long-document extension is not covered by the historical hardware campaigns
+below. Its tokenizer admission/planning and scratch contracts have unit coverage;
+fresh long-document Metal/CUDA qualification is still required.
 
 ## Consolidated physical PII batch qualification
 

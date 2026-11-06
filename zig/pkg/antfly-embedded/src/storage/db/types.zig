@@ -1437,6 +1437,11 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Private table-admin privacy inspection. Never accepted by public parsers.
+    privacy_original: bool = false,
     /// Local output allocation policy; never parsed from public requests.
     /// Raw copies and flat native projections already allocate exact bodies.
     output_exact: bool = false,
@@ -1567,6 +1572,13 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
+    /// Private table-admin privacy inspection. Never accepted by public parsers.
+    privacy_original: bool = false,
+    /// Private administration census; emits value-free inspection status.
+    privacy_status: bool = false,
     /// Retain the full document only for a version-fenced SQL mutation.
     sql_document_preimage: bool = false,
     /// Collect durable logical range guards only for explicitly guarded SQL.
@@ -1603,6 +1615,10 @@ pub const ScanOptions = struct {
     /// scan lifetime.
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+
+    /// Private maintenance continuation: exclude from_key even when empty.
+    /// Only trusted internal transports preserve this marker.
+    resume_from_key: bool = false,
 
     pub fn isRelational(self: ScanOptions) bool {
         return self.relational_query != null or self.relational_query_json.len != 0;
@@ -1691,6 +1707,23 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     to_key: []const u8 = "",
     limit: u32 = 100,
     shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
+    /// Private continuation marker: from_key is the last admitted identifier,
+    /// even when empty. Keep the identifier in one place on the owner wire.
+    resume_from_key: bool = false,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        // Preserve the legacy initial-request envelope. Only actual resumes
+        // add the marker; an empty cursor remains distinct from an open bound.
+        inline for (comptime std.meta.fieldNames(@This())) |name| {
+            const emit = if (comptime std.mem.eql(u8, name, "resume_from_key")) self.resume_from_key else true;
+            if (emit) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const DocumentArtifactReprocessFailure = struct {
@@ -1952,6 +1985,9 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Private authoritative metadata assertion. Zero means no active masking;
+    /// a nonzero value must match the installed policy before reading data.
+    privacy_policy_version: ?[64]u8 = null,
     /// Trusted graph admission workspace; never part of the public wire DSL.
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
@@ -2174,6 +2210,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "privacy_policy_version",
     "graph_work_budget",
     // Conditional delivery runs after child authorization and retrieval.
     "field_projection_json",

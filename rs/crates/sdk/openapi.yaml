@@ -8,6 +8,10 @@ info:
 servers:
   - url: /
 tags:
+  - name: table_privacy
+    x-displayName: Table Privacy
+    description: Table policies, bounded previews, durable inspection scans and source-bound findings.
+      Privacy inspection and configuration require table administration permission.
   - name: resolver_curation
     description: Durable resolver identity correction, suppression, review and replay.
   - name: getting_started
@@ -1836,6 +1840,706 @@ security:
   - ApiKeyAuth: []
   - BearerAuth: []
 paths:
+  /db/v1/tables/{tableName}/privacy:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - table_privacy
+      operationId: getTablePrivacy
+      summary: Read table privacy policy and coverage
+      responses:
+        '200':
+          description: Read table privacy policy and coverage
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      tags:
+        - table_privacy
+      operationId: putTablePrivacy
+      summary: Apply table privacy policy
+      parameters:
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+          description: Required exact ETag when replacing an existing policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyPolicy'
+      responses:
+        '202':
+          description: Apply table privacy policy
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/privacy/preview:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags:
+        - table_privacy
+      operationId: previewTablePrivacy
+      summary: Inspect a bounded sample without saving the policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyPreviewRequest'
+      responses:
+        '200':
+          description: Inspect a bounded sample without saving the policy
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyPreview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/privacy/scans:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags:
+        - table_privacy
+      operationId: startTablePrivacyScan
+      summary: Start a durable privacy rescan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyScanRequest'
+      responses:
+        '202':
+          description: Start a durable privacy rescan
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyScan'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Sixteen scans are active; retry after one finishes. Active scans are never evicted
+            to admit a later request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/privacy/scans/{scanId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: scanId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - table_privacy
+      operationId: getTablePrivacyScan
+      summary: Read privacy scan progress
+      responses:
+        '200':
+          description: Read privacy scan progress
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyScan'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/privacy/findings:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - table_privacy
+      operationId: listTablePrivacyFindings
+      summary: List current privacy findings
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: document
+          in: query
+          schema:
+            type: string
+        - name: field
+          in: query
+          schema:
+            type: string
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: policy_version
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyFindingsPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      tags:
+        - table_privacy
+      operationId: queryTablePrivacyFindings
+      summary: List current privacy findings with body filters
+      description: Equivalent to GET findings, with filters and continuation in JSON so large document
+        identifiers do not exceed URL limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyFindingsRequest'
+      responses:
+        '200':
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyFindingsPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/lake/catalog:
     parameters:
       - name: tableName
@@ -12217,6 +12921,756 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - table_privacy
+      operationId: getNamespaceTablePrivacy
+      summary: Read table privacy policy and coverage
+      responses:
+        '200':
+          description: Read table privacy policy and coverage
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      tags:
+        - table_privacy
+      operationId: putNamespaceTablePrivacy
+      summary: Apply table privacy policy
+      parameters:
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+          description: Required exact ETag when replacing an existing policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyPolicy'
+      responses:
+        '202':
+          description: Apply table privacy policy
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/preview:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags:
+        - table_privacy
+      operationId: previewNamespaceTablePrivacy
+      summary: Inspect a bounded sample without saving the policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyPreviewRequest'
+      responses:
+        '200':
+          description: Inspect a bounded sample without saving the policy
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyPreview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags:
+        - table_privacy
+      operationId: startNamespaceTablePrivacyScan
+      summary: Start a durable privacy rescan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyScanRequest'
+      responses:
+        '202':
+          description: Start a durable privacy rescan
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyScan'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Sixteen scans are active; retry after one finishes. Active scans are never evicted
+            to admit a later request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans/{scanId}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: scanId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - table_privacy
+      operationId: getNamespaceTablePrivacyScan
+      summary: Read privacy scan progress
+      responses:
+        '200':
+          description: Read privacy scan progress
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyScan'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - table_privacy
+      operationId: listNamespaceTablePrivacyFindings
+      summary: List current privacy findings
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: document
+          in: query
+          schema:
+            type: string
+        - name: field
+          in: query
+          schema:
+            type: string
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: policy_version
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyFindingsPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      tags:
+        - table_privacy
+      operationId: queryNamespaceTablePrivacyFindings
+      summary: List current privacy findings with body filters
+      description: Equivalent to GET findings, with filters and continuation in JSON so large document
+        identifiers do not exceed URL limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyFindingsRequest'
+      responses:
+        '200':
+          description: List current privacy findings
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyFindingsPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '403':
+          description: Table privacy administration permission required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '412':
+          description: Policy ETag no longer matches
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '422':
+          description: Unsupported policy or invalid privacy producer contract
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+        '428':
+          description: Policy replacement requires If-Match
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - message
+                properties:
+                  code:
+                    type: string
+                  message:
+                    type: string
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /auth/v1/me:
     get:
       tags:
@@ -21864,6 +23318,463 @@ components:
         type: string
         example: role:tenant_reader
   schemas:
+    PrivacyProducer:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - config
+      properties:
+        type:
+          type: string
+          enum:
+            - extractor
+            - generator
+        revision:
+          type: string
+          description: Immutable provider/model deployment revision. The qualified default native model
+            resolves its pinned revision automatically.
+        config:
+          description: Shared artifact producer configuration; privacy owns required categories and literal
+            source spans. Credentials must use secret references or environment defaults.
+          anyOf:
+            - $ref: '#/components/schemas/ExtractionConfig'
+            - $ref: '#/components/schemas/GeneratedExtractorConfig'
+            - $ref: '#/components/schemas/ConstrainedGeneratorProducerConfig'
+    PrivacyCategory:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: ^[a-zA-Z0-9_]+$
+        description:
+          type: string
+        threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+    PrivacyPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - mode
+        - fields
+      properties:
+        mode:
+          type: string
+          enum:
+            - monitor
+            - redact_for_search_and_ai
+            - redact_before_storage
+          description: Policies, previews, and rescans require document storage without an external base
+            source. Unsupported storage or modes fail with a typed 422 response; pre-storage protection
+            is never substituted with asynchronous inspection.
+        fields:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 512
+          description: Literal source document field names, matching artifact source field semantics.
+        category_groups:
+          type: array
+          maxItems: 4
+          uniqueItems: true
+          items:
+            type: string
+            enum:
+              - contact_details
+              - personal_identifiers
+              - financial
+              - credentials
+        categories:
+          type: array
+          maxItems: 128
+          description: Add categories or override group categories. The union of explicit and expanded
+            group categories must contain at most 128 distinct names.
+          items:
+            $ref: '#/components/schemas/PrivacyCategory'
+        sensitivity:
+          type: string
+          enum:
+            - conservative
+            - balanced
+            - thorough
+          default: balanced
+        replacement:
+          type: string
+          enum:
+            - category
+            - mask
+            - remove
+          default: category
+        producer:
+          $ref: '#/components/schemas/PrivacyProducer'
+        execution:
+          type: object
+          additionalProperties: false
+          properties:
+            batch_items:
+              type: integer
+              minimum: 1
+              maximum: 8
+              default: 8
+            max_attempts:
+              type: integer
+              minimum: 1
+              maximum: 5
+              default: 3
+    PrivacyFinding:
+      type: object
+      required:
+        - document
+        - field
+        - category
+        - start
+        - end
+        - policy_version
+      properties:
+        document:
+          type: string
+        field:
+          type: string
+        category:
+          type: string
+        start:
+          type: integer
+          minimum: 0
+        end:
+          type: integer
+          minimum: 0
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        policy_version:
+          type: string
+        source_fingerprint:
+          type: string
+        producer_revision:
+          type: string
+      description: Half-open UTF-8 byte offsets into the immutable source field. Matched values are not
+        persisted in findings. Confidence is omitted when unavailable.
+    PrivacyStatus:
+      type: object
+      required:
+        - configured
+      properties:
+        configured:
+          type: boolean
+        policy:
+          $ref: '#/components/schemas/PrivacyPolicy'
+        policy_version:
+          type: string
+        resource_version:
+          type: integer
+          format: uint64
+        generation:
+          type: integer
+          format: uint64
+        scan_id:
+          type: string
+        etag:
+          type: string
+        resolved_producer:
+          $ref: '#/components/schemas/PrivacyProducer'
+        external_processing:
+          type: boolean
+        coverage:
+          type: object
+          properties:
+            available:
+              type: boolean
+            refreshing:
+              type: boolean
+              description: A bounded background census is building the next complete result.
+            started_at_millis:
+              type: integer
+              format: int64
+              description: Start of the published observation interval; counts are informational and are
+                not an atomic cross-shard snapshot.
+            completed_at_millis:
+              type: integer
+              format: int64
+              description: Completion of the published census. Counts refresh asynchronously as documents
+                change and never authorize protected serving.
+            total:
+              type: integer
+              format: uint64
+              nullable: true
+            current:
+              type: integer
+              format: uint64
+              nullable: true
+            pending:
+              type: integer
+              format: uint64
+              nullable: true
+            failed:
+              type: integer
+              format: uint64
+              nullable: true
+            with_findings:
+              type: integer
+              format: uint64
+              nullable: true
+            protected_ready:
+              type: integer
+              format: uint64
+              nullable: true
+            protected_blocked:
+              type: integer
+              format: uint64
+              nullable: true
+            categories:
+              type: object
+              additionalProperties:
+                type: integer
+                format: uint64
+            fields:
+              type: object
+              additionalProperties:
+                type: integer
+                format: uint64
+              description: Findings by field across current inspections; pending and failed sources contribute
+                no counts.
+            failed_known:
+              type: integer
+              format: uint64
+              description: Source-bound failures observed so far; failed remains null while other work
+                is unclassified.
+            failures:
+              description: Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON.
+                Failure counts include rows whose identifiers exceed this detail budget.
+              type: array
+              maxItems: 100
+              items:
+                type: object
+                additionalProperties: true
+            next_key:
+              type: string
+              nullable: true
+              description: Reserved for bounded internal census pages; omitted from public coverage snapshots.
+    PrivacyPreviewRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - policy
+      properties:
+        policy:
+          $ref: '#/components/schemas/PrivacyPolicy'
+        sample:
+          type: object
+          additionalProperties: false
+          properties:
+            keys:
+              type: array
+              minItems: 1
+              maxItems: 50
+              uniqueItems: true
+              items:
+                type: string
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 50
+              default: 10
+    PrivacyPreview:
+      type: object
+      required:
+        - policy_version
+        - documents
+        - sampled
+        - complete_table_scan
+      properties:
+        policy_version:
+          type: string
+        sampled:
+          type: integer
+          minimum: 0
+        complete_table_scan:
+          type: boolean
+          enum:
+            - false
+        external_processing:
+          type: boolean
+        documents:
+          type: array
+          items:
+            type: object
+            required:
+              - document
+              - fields
+            properties:
+              document:
+                type: string
+              fields:
+                type: array
+                items:
+                  type: object
+                  required:
+                    - field
+                    - original
+                    - text
+                    - findings
+                  properties:
+                    field:
+                      type: string
+                    original:
+                      type: string
+                    text:
+                      type: string
+                    findings:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/PrivacyFinding'
+    PrivacyScanRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        from_key:
+          type: string
+        to_key:
+          type: string
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+    PrivacyScan:
+      type: object
+      required:
+        - scan_id
+        - policy_version
+        - phase
+      properties:
+        scan_id:
+          type: string
+        policy_version:
+          type: string
+        phase:
+          type: string
+          enum:
+            - queued
+            - running
+            - processing
+            - succeeded
+            - failed
+            - superseded
+        scanned:
+          type: integer
+          format: uint64
+        reprocessed:
+          type: integer
+          format: uint64
+          description: Documents scheduled for inspection; processing verifies current receipts and publication
+            before success.
+        failed:
+          type: integer
+          format: uint64
+        next_key:
+          type: string
+          nullable: true
+          deprecated: true
+          description: Reserved internal checkpoint; omitted from public scan status.
+        skipped:
+          type: integer
+          format: uint64
+        last_error:
+          type: string
+          nullable: true
+        consecutive_errors:
+          type: integer
+          minimum: 0
+        retry_after_millis:
+          type: integer
+          format: int64
+        updated_at_millis:
+          type: integer
+          format: int64
+        verification_cursor:
+          type: string
+          nullable: true
+          deprecated: true
+          description: Reserved internal checkpoint; omitted from public scan status.
+        verification_current:
+          type: integer
+          format: uint64
+        verification_pending:
+          type: integer
+          format: uint64
+        verification_failed:
+          type: integer
+          format: uint64
+        verification_blocked:
+          type: integer
+          format: uint64
+        failures:
+          description: Optional failure examples, limited to 100 entries and 1 MiB of serialized JSON.
+            Failure counts include rows whose identifiers exceed this detail budget.
+          type: array
+          nullable: true
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: true
+    PrivacyFindingsRequest:
+      type: object
+      additionalProperties: false
+      description: Findings filters and opaque continuation in the request body, avoiding URL limits for
+        large document identifiers.
+      properties:
+        cursor:
+          type: string
+        document:
+          type: string
+        field:
+          type: string
+        category:
+          type: string
+        policy_version:
+          type: string
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+    PrivacyFindingsPage:
+      type: object
+      required:
+        - findings
+        - policy_version
+      properties:
+        policy_version:
+          type: string
+        findings:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrivacyFinding'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque continuation bound to the table, policy version, and filters. Pass it unchanged;
+            its size depends on the document identifier.
+        examined_documents:
+          type: integer
+          minimum: 0
+        pending_documents:
+          type: integer
+          minimum: 0
     LakeCatalogCreateRequest:
       type: object
       additionalProperties: false
@@ -35850,1766 +37761,27 @@ components:
             are applied as additional narrowing.
       required:
         - name
-    SQLNumericModifier:
-      type: object
-      additionalProperties: false
-      required:
-        - precision
-        - scale
-      description: PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element,
-        not dimensions. Absent means unconstrained NUMERIC.
-      properties:
-        precision:
-          type: integer
-          minimum: 1
-          maximum: 1000
-        scale:
-          type: integer
-          minimum: -1000
-          maximum: 1000
-    RerankerProvider:
+    ExtractionProvider:
       type: string
       enum:
-        - cloudflare
         - antfly
-        - cohere
-        - vertex
-      description: The reranking provider to use.
-    GraphPathObjective:
-      type: string
-      enum:
-        - min_hops
-        - min_weight_sum
-        - max_weight_product
-      description: >
-        Objective used to rank graph paths:
-
-        - min_hops: Minimize the number of edges.
-
-        - min_weight_sum: Minimize the sum of finite non-negative edge weights.
-
-        - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to
-        be in [0,1].
-    CloudflareEmbedderConfig:
-      type: object
-      description: Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
-      properties:
-        provider:
-          type: string
-          enum:
-            - cloudflare
-        account_id:
-          type: string
-          minLength: 1
-        gateway_id:
-          type: string
-          minLength: 1
-          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
-        model:
-          type: string
-          default: '@cf/baai/bge-base-en-v1.5'
-        api_key:
-          type: string
-          writeOnly: true
-        url:
-          type: string
-          description: Optional deployment-owned endpoint override.
-        dimensions:
-          type: integer
-          minimum: 1
-          description: Expected fixed model output dimension; the adapter validates returned vectors and
-            never requests unsupported resizing.
-        dimension:
-          type: integer
-          minimum: 1
-          description: Alias of dimensions.
-      required:
-        - provider
-        - account_id
-        - model
-    EmbeddingRetrievalConfig:
-      type: object
-      additionalProperties: false
-      description: >-
-        Advanced retrieval-role overrides. Antfly assigns canonical task intent
-
-        automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
-
-        and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
-
-        how a provider or instruction-aware model represents that intent.
-      properties:
-        query_input_type:
-          type: string
-          description: >-
-            Provider-specific query role, such as `search_query` for Cohere.
-
-            When omitted, the provider adapter derives it from
-
-            `RETRIEVAL_QUERY`.
-        document_input_type:
-          type: string
-          description: >-
-            Provider-specific document role, such as `search_document` for
-
-            Cohere. When omitted, the provider adapter derives it from
-
-            `RETRIEVAL_DOCUMENT`.
-        query_instruction:
-          type: string
-          description: >-
-            Optional instruction sent only with retrieval-query embeddings by
-
-            instruction-aware Antfly inference models. Provider adapters that
-
-            do not support free-form instructions reject this field.
-    GoogleEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the Google AI (Gemini) embedding provider.
-
-
-        API key via `api_key` field or `GEMINI_API_KEY` environment variable.
-
-
-        **Example Models:** gemini-embedding-2 (default, 3072 dims)
-
-
-        **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
-      properties:
-        request_format:
-          type: string
-          enum:
-            - embed_content
-            - batch_embed_contents
-          description: Wire protocol. New configurations default to embed_content; existing catalogs retain
-            their pinned protocol. No automatic fallback.
-          default: embed_content
-        task_encoding:
-          type: string
-          enum:
-            - prompt
-            - task_type
-            - none
-          description: Retrieval task representation, independent of model name. Defaults to prompt with
-            embed_content and task_type with legacy protocols. Changing it requires re-embedding.
-        batch_size:
-          type: integer
-          minimum: 1
-          description: Maximum inputs per upstream request. embed_content requires 1 so independent records
-            never become one aggregated embedding.
-        provider:
-          type: string
-          enum:
-            - gemini
-        project_id:
-          type: string
-          description: The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
-        location:
-          type: string
-          description: The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional
-            for Gemini API.
-        model:
-          type: string
-          description: The name of the embedding model to use.
-          default: gemini-embedding-2
-          example: gemini-embedding-2
-        dimension:
-          type: integer
-          description: The dimension of the embedding vector (768, 1536, or 3072 recommended).
-          default: 3072
-        api_key:
-          type: string
-          writeOnly: true
-          description: The Google API key. Can also be set via GEMINI_API_KEY environment variable.
-        url:
-          type: string
-          format: uri
-          description: The URL of the Google API endpoint (optional, uses default if not specified).
-        retrieval:
-          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
-      required:
-        - provider
-      example:
-        provider: gemini
-        model: gemini-embedding-2
-        dimension: 3072
-        api_key: your-api-key
-    VertexEmbedderConfig:
-      type: object
-      description: >
-        Configuration for Google Cloud Vertex AI embedding models (enterprise-grade).
-
-
-        Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
-
-
-        **Example Model:** gemini-embedding-2 (default, 3072 dims)
-
-
-        Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
-
-        instead of being flattened or silently discarded.
-
-
-        **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
-      properties:
-        request_format:
-          type: string
-          enum:
-            - embed_content
-            - predict
-          description: Wire protocol. New configurations default to embed_content; existing catalogs retain
-            their pinned protocol. No automatic fallback.
-          default: embed_content
-        task_encoding:
-          type: string
-          enum:
-            - prompt
-            - task_type
-            - none
-          description: Retrieval task representation, independent of model name. Defaults to prompt with
-            embed_content and task_type with legacy protocols. Changing it requires re-embedding.
-        batch_size:
-          type: integer
-          minimum: 1
-          description: Maximum inputs per upstream request. embed_content requires 1 so independent records
-            never become one aggregated embedding.
-        provider:
-          type: string
-          enum:
-            - vertex
-        model:
-          type: string
-          description: The name of the Vertex AI embedding model to use.
-          default: gemini-embedding-2
-          example: gemini-embedding-2
-        project_id:
-          type: string
-          description: Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
-        location:
-          type: string
-          description: Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can
-            also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'global' for new configurations.
-          default: global
-        credentials_path:
-          type: string
-          writeOnly: true
-          description: Path to an ADC credential JSON file (service-account, authorized-user, or external-account).
-            Alternative to the default ADC chain.
-        dimension:
-          type: integer
-          description: The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-2).
-          default: 3072
-        retrieval:
-          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
-      required:
-        - provider
-      example:
-        provider: vertex
-        model: gemini-embedding-2
-        project_id: my-gcp-project
-        location: global
-        dimension: 3072
-    OllamaEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the Ollama embedding provider.
-
-
-        Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var.
-
-
-        **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384
-        dims)
-
-
-        **Docs:** https://ollama.com/search?c=embedding
-      properties:
-        provider:
-          type: string
-          enum:
-            - ollama
-        model:
-          type: string
-          description: The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
-          example: nomic-embed-text
-        url:
-          type: string
-          format: uri
-          description: The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment
-            variable.
-          default: http://localhost:11434
-          example: http://localhost:11434
-      required:
-        - provider
-        - model
-      example:
-        provider: ollama
-        model: nomic-embed-text
-        url: http://localhost:11434
-    OpenAIEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the OpenAI embedding provider.
-
-
-        API key via `api_key` field or `OPENAI_API_KEY` environment variable.
-
-        Supports OpenAI-compatible APIs via `url` field.
-
-
-        **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072
-        dims)
-
-
-        **Docs:** https://platform.openai.com/docs/guides/embeddings
-      properties:
-        provider:
-          type: string
-          enum:
-            - openai
-        model:
-          type: string
-          description: The name of the OpenAI model to use.
-          default: text-embedding-3-small
-          example: text-embedding-3-small
-        url:
-          type: string
-          format: uri
-          description: The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL
-            environment variable.
-          default: https://api.openai.com
-          example: https://api.openai.com
-        api_key:
-          type: string
-          writeOnly: true
-          description: The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable.
-        dimensions:
-          type: integer
-          description: 'Output dimension for the embedding (uses MRL for dimension reduction). Recommended:
-            256, 512, 1024, 1536, or 3072.'
-      required:
-        - provider
-        - model
-      example:
-        provider: openai
-        model: text-embedding-3-small
-        api_key: sk-...
-    OpenRouterEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the OpenRouter embedding provider.
-
-
-        OpenRouter provides a unified API for multiple embedding models from different providers.
-
-        API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
-
-
-        Antfly currently supports dense text embeddings through this provider.
-
-
-        **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
-
-        google/gemini-embedding-001, qwen/qwen3-embedding-8b
-
-
-        **Docs:** https://openrouter.ai/docs/api/reference/embeddings
-      properties:
-        provider:
-          type: string
-          enum:
-            - openrouter
-        model:
-          type: string
-          description: The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
-          default: openai/text-embedding-3-small
-          example: openai/text-embedding-3-small
-        url:
-          type: string
-          format: uri
-          description: The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
-        api_key:
-          type: string
-          writeOnly: true
-          description: The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
-        dimensions:
-          type: integer
-          description: Output dimension for the embedding (if supported by the model).
-      required:
-        - provider
-        - model
-      example:
-        provider: openrouter
-        model: openai/text-embedding-3-small
-        api_key: sk-or-...
-    BedrockEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the AWS Bedrock embedding provider.
-
-
-        Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task
-        roles, and EC2 instance roles.
-
-
-        **Example Models:** cohere.embed-v4:0, amazon.titan-embed-text-v2:0
-
-
-        **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
-      properties:
-        provider:
-          type: string
-          enum:
-            - bedrock
-        model:
-          type: string
-          description: The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4:0',
-            'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
-          example: cohere.embed-v4:0
-        request_format:
-          type: string
-          enum:
-            - auto
-            - titan_text
-            - titan_multimodal
-            - cohere_v3
-            - cohere_v4
-          description: >-
-            Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
-
-            foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
-
-            for application inference profiles, provisioned throughput, custom models, and
-
-            other aliases whose invocation target does not identify the underlying model.
-          default: auto
-        region:
-          type: string
-          description: The AWS region for the Bedrock service (e.g., 'us-east-1').
-          example: us-east-1
-        dimension:
-          type: integer
-          description: Output dimension for Bedrock embedding models that support configurable dimensions.
-        dimensions:
-          type: integer
-          description: Alias for output dimension when using OpenAI-compatible configuration fields.
-        input_type:
-          type: string
-          description: Cohere Bedrock input type, such as search_document, search_query, classification,
-            or clustering.
-        truncate:
-          type: string
-          description: Cohere Bedrock truncate behavior.
-        strip_new_lines:
-          type: boolean
-          description: Whether to strip new lines from the input text before embedding.
-          default: false
-        batch_size:
-          type: integer
-          description: The batch size for embedding requests to optimize throughput.
-          default: 1
-        retrieval:
-          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
-      required:
-        - provider
-        - model
-      example:
-        provider: bedrock
-        model: cohere.embed-v4:0
-        request_format: cohere_v4
-        region: us-east-1
-    CohereEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the Cohere embedding provider.
-
-
-        API key via `api_key` field or `COHERE_API_KEY` environment variable.
-
-
-        **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0
-
-
-        **Docs:** https://docs.cohere.com/reference/embed
-      properties:
-        provider:
-          type: string
-          enum:
-            - cohere
-        model:
-          type: string
-          description: The name of the Cohere embedding model to use.
-          default: embed-english-v3.0
-          example: embed-english-v3.0
-        api_key:
-          type: string
-          writeOnly: true
-          description: The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-        input_type:
-          type: string
-          deprecated: true
-          description: >-
-            Legacy fixed input type applied to every embedding operation. When omitted,
-
-            Antfly derives `search_query` for semantic searches and `search_document`
-
-            for indexed documents. Prefer the role-specific fields under `retrieval`.
-          enum:
-            - search_document
-            - search_query
-            - classification
-            - clustering
-        truncate:
-          type: string
-          description: How to handle inputs longer than the max token length.
-          enum:
-            - NONE
-            - START
-            - END
-          default: END
-        retrieval:
-          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
-      required:
-        - provider
-        - model
-      example:
-        provider: cohere
-        model: embed-english-v3.0
-        input_type: search_document
-    AntflyEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the Antfly inference embedding provider.
-
-
-        Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
-
-
-        **Features:**
-
-        - Local ONNX-based embedding generation
-
-        - Query-time embeddings are served from an in-memory cache (64 MiB budget,
-          5-minute TTL by default) with concurrent identical requests coalesced onto
-          a single computation; there is no persistent on-disk cache tier
-
-        **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
-
-
-        Models are loaded from the `models/embedders/{name}/` directory.
-      properties:
-        model_identity:
-          type: string
-          pattern: ^[0-9a-f]{64}$
-          description: Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this
-            when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector
-            publication.
-        provider:
-          type: string
-          enum:
-            - antfly
-        model:
-          type: string
-          description: The embedding model name (maps to models/embedders/{name}/ directory).
-          example: bge-base-en-v1.5
-        api_url:
-          type: string
-          format: uri
-          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
-            environment variable.
-          example: http://localhost:8082
-        retrieval:
-          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
-      required:
-        - provider
-        - model
-      example:
-        provider: antfly
-        model: bge-base-en-v1.5
-        api_url: http://localhost:8082
-    RequestPacing:
-      type: string
-      enum:
-        - token_bucket
-        - completion
-      description: >
-        token_bucket limits admission rate while allowing overlapping attempts.
-
-        completion serializes attempts and waits one RPM interval after each
-
-        attempt finishes, including streamed writes and transport failures.
-
-        This prevents delayed connection setup from compressing successful
-
-        request spacing, at the cost of response latency plus one interval per
-
-        request. Requires requests_per_minute and burst=1. Neither mode can
-
-        guarantee zero upstream 429s or coordinate other processes.
-    RateLimitConfig:
-      type: object
-      x-go-type-skip-optional-pointer: false
-      additionalProperties: false
-      description: >
-        Outbound provider limits shared within one Antfly process by effective
-
-        endpoint, operation, model, credential source, project and region/location.
-
-        Conflicting policies for an active scope are rejected. These limits do
-
-        not coordinate across replicas or infer the provider's account quota.
-      properties:
-        pacing:
-          $ref: '#/components/schemas/RequestPacing'
-          description: Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1
-            uses completion pacing.
-        requests_per_minute:
-          type: integer
-          format: int64
-          minimum: 1
-          maximum: 4294967295
-        burst:
-          type: integer
-          format: int64
-          minimum: 1
-          maximum: 4294967295
-          default: 1
-        tokens_per_minute:
-          type: integer
-          format: int64
-          minimum: 1
-          description: >
-            Conservative text budget: each HTTP attempt reserves its serialized
-
-            UTF-8 body byte count plus the configured generation output cap.
-
-            Reservations are not refunded. A request larger than this budget
-
-            is rejected. This is not provider billing token accounting; media
-
-            requests are not supported with this limit.
-        max_concurrency:
-          type: integer
-          format: int64
-          minimum: 1
-          maximum: 4294967295
-          description: Maximum in-flight HTTP attempts, held through response completion.
-    EnrichmentKind:
-      type: string
-      enum:
-        - chunk
-        - asset
-        - embedding
-        - group
-      description: Managed generated artifact kind.
-    GroupedArtifactSource:
-      type: object
-      additionalProperties: false
-      required:
-        - group_by
-        - order_by
-        - field
-      properties:
-        group_by:
-          type: string
-          minLength: 1
-        order_by:
-          type: string
-          minLength: 1
-          description: Field containing an integer ordinal. Ties use the document key.
-        segment_by:
-          type: string
-          minLength: 1
-        field:
-          type: string
-          minLength: 1
-        filter:
-          type: object
-          additionalProperties: true
-          description: Canonical row filter evaluated on the source projection.
-        max_bytes:
-          type: integer
-          minimum: 1
-          maximum: 4194304
-          default: 32768
-          description: UTF-8 text bytes per unit, including joining newlines. An oversized single member
-            fails explicitly.
-        max_members:
-          type: integer
-          minimum: 1
-          maximum: 4096
-          default: 1024
-          description: Maximum members per unit; larger partitions emit multiple units.
-        window_ordinals:
-          type: integer
-          minimum: 1
-          maximum: 4096
-          default: 128
-          description: Fixed ordinal cells bound repartitioning and incremental work for long groups.
-    PriorArtifactContext:
-      type: object
-      additionalProperties: false
-      required:
-        - artifact
-        - render
-      properties:
-        artifact:
-          type: string
-          minLength: 1
-          description: Artifact providing earlier items, including this producer's own artifact.
-        render:
-          type: string
-          minLength: 1
-          description: Template rendered for each prior item, newest first.
-        max_items:
-          type: integer
-          minimum: 1
-          maximum: 256
-          default: 40
-        max_bytes:
-          type: integer
-          minimum: 1
-          maximum: 1048576
-          default: 16384
-        horizon_segments:
-          type: integer
-          minimum: 1
-          maximum: 128
-          default: 8
-          description: Earlier segments available for context and the maximum later segments invalidated
-            at each affected position of an original source change. A move invalidates the old and new
-            neighborhoods independently; recomputed outputs never extend either interval.
-    TextChunkOptions:
-      type: object
-      description: Options specific to text chunking.
-      properties:
-        target_tokens:
-          type: integer
-          minimum: 0
-          maximum: 1000000
-          description: Target number of tokens per chunk.
-        overlap_tokens:
-          type: integer
-          minimum: 0
-          maximum: 1000000
-          description: Number of tokens to overlap between consecutive chunks. Helps maintain context
-            across chunk boundaries. Only used by fixed-size chunkers.
-        min_chars:
-          type: integer
-          minimum: 0
-          maximum: 1000000
-          default: 0
-          description: Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks
-            are omitted before storage and embedding; original source offsets are preserved. Zero disables
-            filtering (default). Does not filter model-aware media windows or image/audio chunks.
-        separator:
-          type: string
-          description: Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size
-            chunkers.
-    AudioChunkOptions:
-      type: object
-      description: Options specific to audio chunking.
-      properties:
-        window_duration_ms:
-          type: integer
-          minimum: 0
-          maximum: 86400000
-          description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
-        overlap_duration_ms:
-          type: integer
-          minimum: 0
-          maximum: 86400000
-          description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
-    ChunkEmbeddingTarget:
-      type: object
-      required:
-        - model
-      properties:
-        model:
-          type: string
-          minLength: 1
-        model_identity:
-          type: string
-          minLength: 64
-          maxLength: 64
-          pattern: ^[0-9a-f]{64}$
-          description: Optional required embedding-weight/recipe identity; a changed model is rejected
-            before delivery.
-        task_type:
-          type: string
-          default: RETRIEVAL_DOCUMENT
-        dimensions:
-          type: integer
-          minimum: 1
-        execute:
-          type: boolean
-          x-go-type-skip-optional-pointer: false
-          default: true
-          description: False resolves model limits and plans descriptors without running embedding inference.
-        allow_partial:
-          type: boolean
-          default: false
-          description: Return explicit per-chunk failures and gaps instead of aborting on the first non-retryable
-            embedding failure.
-    ChunkDiarizationConfig:
-      type: object
-      description: Source-wide online speaker clustering on a fixed 1.5 s grid with 3 s embedding windows.
-        Identities are stable within a source and recipe. Silence and ambiguous voices remain unassigned.
-        Analysis advances incrementally; admitted cached timelines and durable centroid/sample-position
-        checkpoints are shared across matching outputs and continuations. Missing checkpoints reconstruct
-        the required prefix deterministically.
-      properties:
-        model:
-          type: string
-          description: Speaker ONNX registry reference; defaults to 3D-Speaker CAM++. For kind=diarize
-            the target model selects the speaker model.
-        model_identity:
-          type: string
-          pattern: ^[0-9a-f]{64}$
-          description: Optional SHA-256 pin of the speaker ONNX file, including when paired with a transcription
-            model.
-        similarity_threshold:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-          default: 0.45
-        ambiguity_margin:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-          default: 0.03
-        min_rms:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-          default: 0.01
-        max_speakers:
-          type: integer
-          minimum: 1
-          maximum: 64
-          default: 64
-    ChunkOutputTarget:
-      type: object
-      required:
-        - name
-        - kind
-        - model
-      properties:
-        name:
-          type: string
-          minLength: 1
-          maxLength: 128
-        kind:
-          type: string
-          enum:
-            - embedding
-            - transcribe
-            - classify
-            - diarize
-        model:
-          type: string
-          minLength: 1
-          maxLength: 4096
-        execute:
-          type: boolean
-          default: true
-          description: False retains this model as a planning boundary while skipping its inference; used
-            for independent output repairs.
-        skip_windows:
-          type: array
-          maxItems: 4096
-          description: Execution-only repair mask for already accepted sub-windows; does not affect the
-            model recipe or boundary plan. Skipped windows return receipts with status skipped.
-          items:
-            type: object
-            required:
-              - ordinal
-              - sub_index
-            properties:
-              ordinal:
-                type: integer
-                format: uint64
-                minimum: 0
-              sub_index:
-                type: integer
-                format: uint32
-                minimum: 0
-        required:
-          type: boolean
-          default: true
-        model_identity:
-          type: string
-          pattern: ^[0-9a-f]{64}$
-        task_type:
-          type: string
-          default: RETRIEVAL_DOCUMENT
-        dimensions:
-          type: integer
-          minimum: 1
-        language:
-          type: string
-        diarize:
-          type: boolean
-          default: false
-          description: Convenience option on transcription outputs; enables source-wide diarization with
-            the default speaker model.
-        diarization:
-          description: Speaker settings for diarize or transcribe outputs; also accepted on the selected
-            audio embedding boundary with audio_speaker_turns=true.
-          $ref: '#/components/schemas/ChunkDiarizationConfig'
-        top_k:
-          type: integer
-          minimum: 1
-          maximum: 128
-          default: 5
-    ChunkOutputs:
-      type: object
-      required:
-        - boundary_model
-        - targets
-      description: Named independent media outputs. The named boundary model alone determines the shared
-        plan; adding or changing another output preserves parent IDs. The compatibility embedding target
-        is named embedding. Smaller output windows are identified by the parent ordinal and sub_index.
-      properties:
-        boundary_model:
-          type: string
-          minLength: 1
-        targets:
-          type: array
-          minItems: 1
-          maxItems: 16
-          items:
-            $ref: '#/components/schemas/ChunkOutputTarget'
-    MediaChunkPolicy:
-      type: object
-      description: Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
-      properties:
-        max_text_bytes:
-          type: integer
-          minimum: 4
-          maximum: 16777216
-          default: 1048576
-          description: Explicit byte ceiling per text chunk, independently of the target tokenizer budget.
-        target_tokens:
-          type: integer
-          minimum: 1
-          maximum: 1000000
-          default: 500
-        overlap_tokens:
-          x-go-type-skip-optional-pointer: false
-          type: integer
-          minimum: 0
-          default: 50
-        window_ns:
-          type: integer
-          format: int64
-          minimum: 1
-          default: 32000000000
-        overlap_ns:
-          type: integer
-          format: int64
-          minimum: 0
-          default: 0
-        step_ns:
-          type: integer
-          format: int64
-          minimum: 1
-          default: 1000000000
-        video_hold:
-          type: integer
-          minimum: 0
-          maximum: 1
-          default: 1
-          x-go-type-skip-optional-pointer: false
-          description: Select the displayed picture at each video cadence target, including VFR holds.
-            Zero retains at-or-after timestamp sampling.
-        max_frames:
-          type: integer
-          minimum: 1
-          maximum: 32
-          default: 32
-        tile_width:
-          type: integer
-          minimum: 0
-          default: 0
-        tile_height:
-          type: integer
-          minimum: 0
-          default: 0
-        tile_overlap:
-          type: integer
-          minimum: 0
-          default: 0
-        audio_speaker_turns:
-          type: boolean
-          default: false
-          description: Split audio chunks at detected speaker transitions, additionally respecting the
-            boundary model limits. Requires a diarization-enabled boundary target, zero overlap_ns and
-            zero audio_pause_ns. The boundary diarization recipe participates in plan identity. Analysis
-            runs even with execute=false because these boundaries depend on audio inference.
-        audio_pause_ns:
-          type: integer
-          format: int64
-          minimum: 0
-          default: 0
-          description: Optional minimum silence duration for choosing an earlier boundary; no samples
-            are discarded.
-        audio_pause_search_ns:
-          type: integer
-          format: int64
-          minimum: 0
-          default: 5000000000
-        audio_silence_milli:
-          x-go-type-skip-optional-pointer: false
-          type: integer
-          minimum: 0
-          maximum: 1000
-          default: 10
-          description: Absolute normalized PCM amplitude threshold in thousandths.
-    ChunkOptions:
-      type: object
-      description: Per-request configuration for chunking. All fields are optional - zero/omitted values
-        use chunker defaults.
-      properties:
-        max_chunks:
-          type: integer
-          minimum: 0
-          maximum: 4096
-          description: 'Maximum chunks in one response; zero requests the full result. Model-aware responses
-            return continuation coverage when a page is full: follow next_continuation until source_complete.
-            Embedded model-aware enrichment uses this as its page size and continues through the entire
-            source. Fixed chunking without model-aware outputs retains its per-call truncation behavior.'
-        threshold:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-          description: Confidence threshold for model-based chunking (0.0-1.0).
-        text:
-          $ref: '#/components/schemas/TextChunkOptions'
-        audio:
-          $ref: '#/components/schemas/AudioChunkOptions'
-        embedding:
-          $ref: '#/components/schemas/ChunkEmbeddingTarget'
-        outputs:
-          $ref: '#/components/schemas/ChunkOutputs'
-        policy:
-          $ref: '#/components/schemas/MediaChunkPolicy'
-    AntflyChunkerConfig:
-      description: >
-        Configuration for the Antfly inference chunking provider.
-
-
-        Antfly inference is Antfly's built-in ML service for local chunking.
-
-
-        **Chunking Models:**
-
-        - fixed: Fixed-size chunking by token count, with fixed time windows for audio
-          (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer`). This is the
-          only chunking model Antfly inference implements; other model names are
-          rejected as unsupported.
-
-        **Deduplication:**
-
-        - Within a single document write, chunk results are deduplicated when multiple
-          indexes share the same source text and chunker configuration, so the source
-          is chunked at most once per write.
-      allOf:
-        - $ref: '#/components/schemas/ChunkOptions'
-        - type: object
-          properties:
-            api_url:
-              type: string
-              format: uri
-              description: The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can
-                also be set via ANTFLY_INFERENCE_URL environment variable.
-              example: http://localhost:8080
-            model:
-              type: string
-              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
-                other values select a model from models/chunkers/{name}/. Successful create responses
-                include the effective model.
-              default: fixed
-              example: fixed
-      example:
-        provider: antfly
-        api_url: http://localhost:8080
-        model: fixed
-        text:
-          target_tokens: 500
-          overlap_tokens: 50
-          separator: >2+
-
-
-    ChunkerProvider:
-      type: string
-      enum:
-        - mock
-        - antfly
-      description: The chunking provider to use.
-    ChunkerConfig:
-      description: A unified configuration for a chunking provider.
-      allOf:
-        - $ref: '#/components/schemas/AntflyChunkerConfig'
-        - type: object
-          properties:
-            provider:
-              $ref: '#/components/schemas/ChunkerProvider'
-            store_chunks:
-              x-go-type-skip-optional-pointer: true
-              type: boolean
-              description: Controls whether chunk data is persisted to storage. When false (default),
-                fixed chunks are generated in memory and only embeddings are stored. Model-aware streams
-                always retain descriptor recipes; false omits their payloads. When true, chunk payloads
-                are also stored. Vectors remain in the embedding artifact family.
-              default: false
-            full_text_index:
-              x-go-type-skip-optional-pointer: true
-              type: object
-              description: >
-                Configuration for full-text indexing of chunks.
-
-                When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native
-                full-text index, queryable and projectable via the document's `_chunks` field.
-
-                When absent, chunks are generated only to drive vector embeddings and are not indexed
-                for full-text search (unless `store_chunks` is also set).
-              additionalProperties: true
-            api_url:
-              type: string
-              format: uri
-              description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
-              example: http://localhost:8080
-            model:
-              type: string
-              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
-                other values select a model from models/chunkers/{name}/. Successful create responses
-                include the effective model.
-              default: fixed
-              example: fixed
-            max_chunks:
-              type: integer
-              minimum: 0
-              maximum: 4096
-              description: Maximum chunks per invocation. Model-aware enrichment treats this as a page
-                size and resumes until source completion; zero selects the worker page size. Fixed chunking
-                retains its per-document cap, with zero meaning unlimited.
-            threshold:
-              type: number
-              format: float
-              minimum: 0
-              maximum: 1
-            text:
-              $ref: '#/components/schemas/TextChunkOptions'
-            audio:
-              $ref: '#/components/schemas/AudioChunkOptions'
-            embedding:
-              $ref: '#/components/schemas/ChunkEmbeddingTarget'
-            outputs:
-              $ref: '#/components/schemas/ChunkOutputs'
-            policy:
-              $ref: '#/components/schemas/MediaChunkPolicy'
-          required:
-            - provider
-      example:
-        provider: antfly
-        model: fixed
-        text:
-          target_tokens: 500
-          overlap_tokens: 50
-    CloudflareGeneratorConfig:
-      type: object
-      description: Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
-      properties:
-        provider:
-          type: string
-          enum:
-            - cloudflare
-        account_id:
-          type: string
-          minLength: 1
-        gateway_id:
-          type: string
-          minLength: 1
-          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
-        model:
-          type: string
-          default: '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
-        api_key:
-          type: string
-          writeOnly: true
-        url:
-          type: string
-          description: Optional deployment-owned endpoint override.
-        max_tokens:
-          type: integer
-          minimum: 1
-        temperature:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 2
-        top_p:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-        frequency_penalty:
-          type: number
-          format: float
-          minimum: -2
-          maximum: 2
-        presence_penalty:
-          type: number
-          format: float
-          minimum: -2
-          maximum: 2
-      required:
-        - provider
-        - account_id
-        - model
-    GoogleGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the Google generative AI provider (Gemini).
-      properties:
-        provider:
-          type: string
-          enum:
-            - gemini
-        project_id:
-          type: string
-          description: The Google Cloud project ID.
-        location:
-          type: string
-          description: The Google Cloud location (e.g., 'us-central1').
-        model:
-          type: string
-          description: The name of the generative model to use.
-          default: gemini-2.5-flash
-          example: gemini-2.5-flash
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-2.0).
-          minimum: 0.0
-          maximum: 2.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter.
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-          description: Top-k sampling parameter.
-        api_key:
-          type: string
-          writeOnly: true
-          description: The Google API key.
-        url:
-          type: string
-          format: uri
-          description: The URL of the Google API endpoint.
-      required:
-        - provider
-        - model
-    VertexGeneratorConfig:
-      type: object
-      description: >
-        Configuration for Google Cloud Vertex AI generative models.
-      properties:
-        provider:
-          type: string
-          enum:
-            - vertex
-        model:
-          type: string
-          description: The name of the Vertex AI model to use.
-          default: gemini-2.5-flash
-          example: gemini-2.5-flash
-        project_id:
-          type: string
-          description: Google Cloud project ID.
-        location:
-          type: string
-          description: Google Cloud region for Vertex AI API.
-          default: us-central1
-        credentials_path:
-          type: string
-          writeOnly: true
-          description: Path to service account JSON key file.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-2.0).
-          minimum: 0.0
-          maximum: 2.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate in the response.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-          description: Top-k sampling parameter.
-      required:
-        - provider
-        - model
-    BedrockGeneratorConfig:
-      type: object
-      description: >
-        AWS Bedrock Converse generation, including image inputs and tools for
-
-        models that support them. Uses the AWS default credential chain unless
-
-        an explicit Bedrock API key is configured. Image capability is declared
-
-        per target through inference_capabilities; model IDs are not allowlisted.
-      properties:
-        provider:
-          type: string
-          enum:
-            - bedrock
-        url:
-          type: string
-          description: Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint.
-        api_key:
-          type: string
-          description: Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests
-            and the default credential chain.
-        model:
-          type: string
-          description: The Bedrock model ID to use.
-          example: anthropic.claude-sonnet-4-5-20250929-v1:0
-        region:
-          type: string
-          description: AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter.
-          minimum: 0.0
-          maximum: 1.0
-      required:
-        - provider
-        - model
-    AnthropicGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the Anthropic generative AI provider.
-      properties:
-        provider:
-          type: string
-          enum:
-            - anthropic
-        workspace_id:
-          type: string
-          description: Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
-        model:
-          type: string
-          description: The full model ID of the Anthropic model to use.
-          default: claude-sonnet-4-5-20250929
-          example: claude-sonnet-4-5-20250929
-        api_key:
-          type: string
-          writeOnly: true
-          description: Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY.
-        url:
-          type: string
-          format: uri
-          description: Messages API base URL. Defaults to https://api.anthropic.com/v1.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate in the response.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-          description: Top-k sampling parameter.
-      required:
-        - provider
-        - model
-    OpenAIReasoningEffort:
-      type: string
-      enum:
-        - none
-        - minimal
-        - low
-        - medium
-        - high
-        - xhigh
-        - max
-      description: OpenAI reasoning effort; model support varies. Omit to use the model default.
-    OllamaGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the Ollama generative AI provider.
-      properties:
-        provider:
-          type: string
-          enum:
-            - ollama
-        model:
-          type: string
-          description: The name of the Ollama model to use.
-          example: llama3.3:70b
-        url:
-          type: string
-          format: uri
-          description: The URL of the Ollama API endpoint.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-2.0).
-          minimum: 0.0
-          maximum: 2.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate, including reasoning tokens for thinking models.
-        reasoning_effort:
-          $ref: '#/components/schemas/OpenAIReasoningEffort'
-          description: Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to
-            disable thinking on models that support it; supported values depend on the model.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter.
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-          description: Top-k sampling parameter.
-        timeout:
-          type: integer
-          description: HTTP response timeout in seconds for Ollama API calls.
-          minimum: 1
-      required:
-        - provider
-        - model
-    AntflyGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the Antfly inference generative AI provider.
-      properties:
-        provider:
-          type: string
-          enum:
-            - antfly
-        model:
-          type: string
-          description: The name of the generator model.
-          example: ggml-org/gemma-4-E4B-it-GGUF
-        api_url:
-          type: string
-          format: uri
-          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
-            environment variable.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-2.0).
-          minimum: 0.0
-          maximum: 2.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter.
-          minimum: 0.0
-          maximum: 1.0
-        top_k:
-          type: integer
-          description: Top-k sampling parameter.
-        timeout:
-          type: integer
-          description: HTTP response timeout in seconds for Inference API calls.
-          minimum: 1
-      required:
-        - provider
-        - model
-    ChatGPTGeneratorConfig:
-      type: object
-      description: Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime.
-      required:
-        - provider
-        - model
-        - connection_id
-      properties:
-        provider:
-          type: string
-          enum:
-            - chatgpt
-        reasoning_effort:
-          $ref: '#/components/schemas/OpenAIReasoningEffort'
-        model:
-          type: string
-        connection_id:
-          type: string
-          description: Opaque personal registration owned by the authenticated caller.
-    OpenAIGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the OpenAI generative AI provider.
-      properties:
-        provider:
-          type: string
-          enum:
-            - openai
-        model:
-          type: string
-          description: The name of the OpenAI model to use.
-          default: gpt-4.1
-          example: gpt-4.1
-        url:
-          type: string
-          format: uri
-          description: The URL of the OpenAI API endpoint.
-        api_key:
-          type: string
-          writeOnly: true
-          description: The OpenAI API key.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-2.0).
-          minimum: 0.0
-          maximum: 2.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate.
-        max_completion_tokens:
-          type: integer
-          minimum: 1
-          description: >
-            OpenAI completion budget, including visible output and reasoning tokens.
-
-            Use for reasoning models instead of max_tokens; the two are mutually exclusive.
-        reasoning_effort:
-          $ref: '#/components/schemas/OpenAIReasoningEffort'
-          description: Optional reasoning effort. Supported values depend on the selected OpenAI model.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter.
-          minimum: 0.0
-          maximum: 1.0
-        frequency_penalty:
-          type: number
-          format: float
-          description: Penalty for token frequency (-2.0 to 2.0).
-          minimum: -2.0
-          maximum: 2.0
-        presence_penalty:
-          type: number
-          format: float
-          description: Penalty for token presence (-2.0 to 2.0).
-          minimum: -2.0
-          maximum: 2.0
-      required:
-        - provider
-        - model
-    OpenRouterGeneratorConfig:
-      type: object
-      description: >
-        Configuration for the OpenRouter generative AI provider.
-      properties:
-        provider:
-          type: string
-          enum:
-            - openrouter
-        model:
-          type: string
-          description: The OpenRouter model identifier to use.
-          example: openai/gpt-4.1
-        url:
-          type: string
-          format: uri
-          description: The URL of the OpenRouter API endpoint.
-          default: https://openrouter.ai/api/v1
-        api_key:
-          type: string
-          writeOnly: true
-          description: The OpenRouter API key.
-        temperature:
-          type: number
-          format: float
-          description: Controls randomness in generation (0.0-2.0).
-          minimum: 0.0
-          maximum: 2.0
-        max_tokens:
-          type: integer
-          description: Maximum number of tokens to generate in the response.
-        top_p:
-          type: number
-          format: float
-          description: Nucleus sampling parameter (0.0-1.0).
-          minimum: 0.0
-          maximum: 1.0
-        frequency_penalty:
-          type: number
-          format: float
-          description: Penalty for token frequency (-2.0 to 2.0).
-          minimum: -2.0
-          maximum: 2.0
-        presence_penalty:
-          type: number
-          format: float
-          description: Penalty for token presence (-2.0 to 2.0).
-          minimum: -2.0
-          maximum: 2.0
-      required:
-        - provider
-        - model
-    AppleGeneratorConfig:
-      type: object
-      description: On-device Apple Foundation Models generation. Requires a macOS Apple provider build,
-        Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling
-        and media attachments are not supported.
-      properties:
-        provider:
-          type: string
-          enum:
-            - apple
-        max_tokens:
-          type: integer
-          minimum: 1
-          default: 256
-        temperature:
-          type: number
-          minimum: 0
-          maximum: 2
-    GeneratorProvider:
-      type: string
-      enum:
+        - pioneer
         - cloudflare
+        - openai
         - gemini
         - vertex
-        - bedrock
         - anthropic
-        - ollama
-        - openai
-        - chatgpt
-        - openrouter
-        - antfly
-        - apple
-      description: Generator providers implemented by Antfly's generation runtime.
-    GeneratorConfig:
-      description: >
-        A unified configuration for a generative AI provider.
-      allOf:
-        - oneOf:
-            - $ref: '#/components/schemas/CloudflareGeneratorConfig'
-            - $ref: '#/components/schemas/GoogleGeneratorConfig'
-            - $ref: '#/components/schemas/VertexGeneratorConfig'
-            - $ref: '#/components/schemas/BedrockGeneratorConfig'
-            - $ref: '#/components/schemas/AnthropicGeneratorConfig'
-            - $ref: '#/components/schemas/OllamaGeneratorConfig'
-            - $ref: '#/components/schemas/AntflyGeneratorConfig'
-            - $ref: '#/components/schemas/ChatGPTGeneratorConfig'
-            - $ref: '#/components/schemas/OpenAIGeneratorConfig'
-            - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
-            - $ref: '#/components/schemas/AppleGeneratorConfig'
-        - properties:
-            max_image_input_tokens:
-              x-go-type-skip-optional-pointer: false
-              type: integer
-              format: int64
-              minimum: 1
-              description: Conservative input-token ceiling per image. Required for image calls when tokens_per_minute
-                is configured; choose a bound valid for the model and image policy.
-            rate_limit:
-              x-go-type-skip-optional-pointer: false
-              $ref: '#/components/schemas/RateLimitConfig'
-            provider:
-              $ref: '#/components/schemas/GeneratorProvider'
-          required:
-            - provider
-      example:
-        provider: openai
-        model: gpt-4.1
-        temperature: 0.7
-        max_tokens: 2048
-    ConstrainedOutput:
-      type: string
+        - bedrock
+        - mock
+    ExtractionSchemaVersion:
+      type: integer
       enum:
-        - auto
-        - tool_call
-        - json_schema
-        - grammar
-      default: auto
-      description: Provider and model admission selects a supported constrained mechanism. Auto prefers
-        forced tools, then provider JSON schema, then native grammar. Free-text parsing is not a mode.
-    ConstrainedGenerationBatch:
-      type: object
-      additionalProperties: false
-      properties:
-        max_items_per_call:
-          type: integer
-          minimum: 1
-          maximum: 256
-          default: 8
-        max_input_bytes:
-          type: integer
-          minimum: 1
-          maximum: 4194304
-          default: 65536
-    ConstrainedGeneratorProducerConfig:
-      type: object
-      additionalProperties: false
-      required:
-        - generator
-        - output_schema
-      properties:
-        generator:
-          $ref: '#/components/schemas/GeneratorConfig'
-        instructions:
-          type: string
-          maxLength: 65536
-        output_schema:
-          type: object
-          additionalProperties: true
-          description: JSON schema enforced before artifact publication. Unsupported schema vocabulary
-            fails admission. Invalid or missing batch items receive one validation retry; successful siblings
-            are retained.
-        output:
-          $ref: '#/components/schemas/ConstrainedOutput'
-        batch:
-          $ref: '#/components/schemas/ConstrainedGenerationBatch'
+        - 1
+        - 2
+      default: 1
+      description: Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task
+        schemas, per-input replacements and explicit offsets; the selected model/runtime must support
+        every requested feature.
     ExtractionProbability:
       type: number
       format: double
@@ -38618,14 +38790,6 @@ components:
             - $ref: '#/components/schemas/ExtractionJointSchema'
           x-go-type-skip-optional-pointer: false
       additionalProperties: true
-    ConstrainedProbabilities:
-      type: string
-      enum:
-        - token_logprobs
-        - verdict_only
-      default: token_logprobs
-      description: Token probabilities require complete decoder evidence for the allowed values. Verdict-only
-        is explicit opt-in; model-reported confidence is never used.
     ExtractionOffsetUnit:
       type: string
       description: Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes.
@@ -38858,6 +39022,689 @@ components:
         resolver:
           $ref: '#/components/schemas/ExtractionResolverOptions'
       additionalProperties: true
+    ExtractionConfig:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: '#/components/schemas/ExtractionProvider'
+        model:
+          type: string
+        schema_version:
+          allOf:
+            - $ref: '#/components/schemas/ExtractionSchemaVersion'
+          x-go-type-skip-optional-pointer: false
+        url:
+          type: string
+        api_url:
+          type: string
+        project_id:
+          type: string
+          description: Google Cloud project for the vertex provider.
+        location:
+          type: string
+          description: Vertex AI location.
+        region:
+          type: string
+          description: AWS region for the bedrock provider.
+        credentials_path:
+          type: string
+          description: Path to Google service account credentials for the vertex provider.
+        account_id:
+          type: string
+          description: Cloudflare Workers AI account identifier.
+        gateway_id:
+          type: string
+          description: Optional Cloudflare AI Gateway identifier.
+        api_key:
+          type: string
+        bearer_token:
+          type: string
+        schema:
+          $ref: '#/components/schemas/ExtractionSchema'
+        options:
+          $ref: '#/components/schemas/ExtractionOptions'
+    CloudflareGeneratorConfig:
+      type: object
+      description: Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum:
+            - cloudflare
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        frequency_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+        presence_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+      required:
+        - provider
+        - account_id
+        - model
+    GoogleGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the Google generative AI provider (Gemini).
+      properties:
+        provider:
+          type: string
+          enum:
+            - gemini
+        project_id:
+          type: string
+          description: The Google Cloud project ID.
+        location:
+          type: string
+          description: The Google Cloud location (e.g., 'us-central1').
+        model:
+          type: string
+          description: The name of the generative model to use.
+          default: gemini-2.5-flash
+          example: gemini-2.5-flash
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter.
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: Top-k sampling parameter.
+        api_key:
+          type: string
+          writeOnly: true
+          description: The Google API key.
+        url:
+          type: string
+          format: uri
+          description: The URL of the Google API endpoint.
+      required:
+        - provider
+        - model
+    VertexGeneratorConfig:
+      type: object
+      description: >
+        Configuration for Google Cloud Vertex AI generative models.
+      properties:
+        provider:
+          type: string
+          enum:
+            - vertex
+        model:
+          type: string
+          description: The name of the Vertex AI model to use.
+          default: gemini-2.5-flash
+          example: gemini-2.5-flash
+        project_id:
+          type: string
+          description: Google Cloud project ID.
+        location:
+          type: string
+          description: Google Cloud region for Vertex AI API.
+          default: us-central1
+        credentials_path:
+          type: string
+          writeOnly: true
+          description: Path to service account JSON key file.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate in the response.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: Top-k sampling parameter.
+      required:
+        - provider
+        - model
+    BedrockGeneratorConfig:
+      type: object
+      description: >
+        AWS Bedrock Converse generation, including image inputs and tools for
+
+        models that support them. Uses the AWS default credential chain unless
+
+        an explicit Bedrock API key is configured. Image capability is declared
+
+        per target through inference_capabilities; model IDs are not allowlisted.
+      properties:
+        provider:
+          type: string
+          enum:
+            - bedrock
+        url:
+          type: string
+          description: Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint.
+        api_key:
+          type: string
+          description: Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests
+            and the default credential chain.
+        model:
+          type: string
+          description: The Bedrock model ID to use.
+          example: anthropic.claude-sonnet-4-5-20250929-v1:0
+        region:
+          type: string
+          description: AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter.
+          minimum: 0.0
+          maximum: 1.0
+      required:
+        - provider
+        - model
+    AnthropicGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the Anthropic generative AI provider.
+      properties:
+        provider:
+          type: string
+          enum:
+            - anthropic
+        workspace_id:
+          type: string
+          description: Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
+        model:
+          type: string
+          description: The full model ID of the Anthropic model to use.
+          default: claude-sonnet-4-5-20250929
+          example: claude-sonnet-4-5-20250929
+        api_key:
+          type: string
+          writeOnly: true
+          description: Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY.
+        url:
+          type: string
+          format: uri
+          description: Messages API base URL. Defaults to https://api.anthropic.com/v1.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate in the response.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: Top-k sampling parameter.
+      required:
+        - provider
+        - model
+    OpenAIReasoningEffort:
+      type: string
+      enum:
+        - none
+        - minimal
+        - low
+        - medium
+        - high
+        - xhigh
+        - max
+      description: OpenAI reasoning effort; model support varies. Omit to use the model default.
+    OllamaGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the Ollama generative AI provider.
+      properties:
+        provider:
+          type: string
+          enum:
+            - ollama
+        model:
+          type: string
+          description: The name of the Ollama model to use.
+          example: llama3.3:70b
+        url:
+          type: string
+          format: uri
+          description: The URL of the Ollama API endpoint.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate, including reasoning tokens for thinking models.
+        reasoning_effort:
+          $ref: '#/components/schemas/OpenAIReasoningEffort'
+          description: Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to
+            disable thinking on models that support it; supported values depend on the model.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter.
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: Top-k sampling parameter.
+        timeout:
+          type: integer
+          description: HTTP response timeout in seconds for Ollama API calls.
+          minimum: 1
+      required:
+        - provider
+        - model
+    AntflyGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the Antfly inference generative AI provider.
+      properties:
+        provider:
+          type: string
+          enum:
+            - antfly
+        model:
+          type: string
+          description: The name of the generator model.
+          example: ggml-org/gemma-4-E4B-it-GGUF
+        api_url:
+          type: string
+          format: uri
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+            environment variable.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter.
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: Top-k sampling parameter.
+        timeout:
+          type: integer
+          description: HTTP response timeout in seconds for Inference API calls.
+          minimum: 1
+      required:
+        - provider
+        - model
+    ChatGPTGeneratorConfig:
+      type: object
+      description: Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime.
+      required:
+        - provider
+        - model
+        - connection_id
+      properties:
+        provider:
+          type: string
+          enum:
+            - chatgpt
+        reasoning_effort:
+          $ref: '#/components/schemas/OpenAIReasoningEffort'
+        model:
+          type: string
+        connection_id:
+          type: string
+          description: Opaque personal registration owned by the authenticated caller.
+    OpenAIGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the OpenAI generative AI provider.
+      properties:
+        provider:
+          type: string
+          enum:
+            - openai
+        model:
+          type: string
+          description: The name of the OpenAI model to use.
+          default: gpt-4.1
+          example: gpt-4.1
+        url:
+          type: string
+          format: uri
+          description: The URL of the OpenAI API endpoint.
+        api_key:
+          type: string
+          writeOnly: true
+          description: The OpenAI API key.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate.
+        max_completion_tokens:
+          type: integer
+          minimum: 1
+          description: >
+            OpenAI completion budget, including visible output and reasoning tokens.
+
+            Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+        reasoning_effort:
+          $ref: '#/components/schemas/OpenAIReasoningEffort'
+          description: Optional reasoning effort. Supported values depend on the selected OpenAI model.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter.
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: Penalty for token frequency (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: Penalty for token presence (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+      required:
+        - provider
+        - model
+    OpenRouterGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the OpenRouter generative AI provider.
+      properties:
+        provider:
+          type: string
+          enum:
+            - openrouter
+        model:
+          type: string
+          description: The OpenRouter model identifier to use.
+          example: openai/gpt-4.1
+        url:
+          type: string
+          format: uri
+          description: The URL of the OpenRouter API endpoint.
+          default: https://openrouter.ai/api/v1
+        api_key:
+          type: string
+          writeOnly: true
+          description: The OpenRouter API key.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-2.0).
+          minimum: 0.0
+          maximum: 2.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate in the response.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        frequency_penalty:
+          type: number
+          format: float
+          description: Penalty for token frequency (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+        presence_penalty:
+          type: number
+          format: float
+          description: Penalty for token presence (-2.0 to 2.0).
+          minimum: -2.0
+          maximum: 2.0
+      required:
+        - provider
+        - model
+    AppleGeneratorConfig:
+      type: object
+      description: On-device Apple Foundation Models generation. Requires a macOS Apple provider build,
+        Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling
+        and media attachments are not supported.
+      properties:
+        provider:
+          type: string
+          enum:
+            - apple
+        max_tokens:
+          type: integer
+          minimum: 1
+          default: 256
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+    RequestPacing:
+      type: string
+      enum:
+        - token_bucket
+        - completion
+      description: >
+        token_bucket limits admission rate while allowing overlapping attempts.
+
+        completion serializes attempts and waits one RPM interval after each
+
+        attempt finishes, including streamed writes and transport failures.
+
+        This prevents delayed connection setup from compressing successful
+
+        request spacing, at the cost of response latency plus one interval per
+
+        request. Requires requests_per_minute and burst=1. Neither mode can
+
+        guarantee zero upstream 429s or coordinate other processes.
+    RateLimitConfig:
+      type: object
+      x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: >
+        Outbound provider limits shared within one Antfly process by effective
+
+        endpoint, operation, model, credential source, project and region/location.
+
+        Conflicting policies for an active scope are rejected. These limits do
+
+        not coordinate across replicas or infer the provider's account quota.
+      properties:
+        pacing:
+          $ref: '#/components/schemas/RequestPacing'
+          description: Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1
+            uses completion pacing.
+        requests_per_minute:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+        burst:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+          default: 1
+        tokens_per_minute:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >
+            Conservative text budget: each HTTP attempt reserves its serialized
+
+            UTF-8 body byte count plus the configured generation output cap.
+
+            Reservations are not refunded. A request larger than this budget
+
+            is rejected. This is not provider billing token accounting; media
+
+            requests are not supported with this limit.
+        max_concurrency:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+          description: Maximum in-flight HTTP attempts, held through response completion.
+    GeneratorProvider:
+      type: string
+      enum:
+        - cloudflare
+        - gemini
+        - vertex
+        - bedrock
+        - anthropic
+        - ollama
+        - openai
+        - chatgpt
+        - openrouter
+        - antfly
+        - apple
+      description: Generator providers implemented by Antfly's generation runtime.
+    GeneratorConfig:
+      description: >
+        A unified configuration for a generative AI provider.
+      allOf:
+        - oneOf:
+            - $ref: '#/components/schemas/CloudflareGeneratorConfig'
+            - $ref: '#/components/schemas/GoogleGeneratorConfig'
+            - $ref: '#/components/schemas/VertexGeneratorConfig'
+            - $ref: '#/components/schemas/BedrockGeneratorConfig'
+            - $ref: '#/components/schemas/AnthropicGeneratorConfig'
+            - $ref: '#/components/schemas/OllamaGeneratorConfig'
+            - $ref: '#/components/schemas/AntflyGeneratorConfig'
+            - $ref: '#/components/schemas/ChatGPTGeneratorConfig'
+            - $ref: '#/components/schemas/OpenAIGeneratorConfig'
+            - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
+            - $ref: '#/components/schemas/AppleGeneratorConfig'
+        - properties:
+            max_image_input_tokens:
+              x-go-type-skip-optional-pointer: false
+              type: integer
+              format: int64
+              minimum: 1
+              description: Conservative input-token ceiling per image. Required for image calls when tokens_per_minute
+                is configured; choose a bound valid for the model and image policy.
+            rate_limit:
+              x-go-type-skip-optional-pointer: false
+              $ref: '#/components/schemas/RateLimitConfig'
+            provider:
+              $ref: '#/components/schemas/GeneratorProvider'
+          required:
+            - provider
+      example:
+        provider: openai
+        model: gpt-4.1
+        temperature: 0.7
+        max_tokens: 2048
+    ConstrainedOutput:
+      type: string
+      enum:
+        - auto
+        - tool_call
+        - json_schema
+        - grammar
+      default: auto
+      description: Provider and model admission selects a supported constrained mechanism. Auto prefers
+        forced tools, then provider JSON schema, then native grammar. Free-text parsing is not a mode.
+    ConstrainedProbabilities:
+      type: string
+      enum:
+        - token_logprobs
+        - verdict_only
+      default: token_logprobs
+      description: Token probabilities require complete decoder evidence for the allowed values. Verdict-only
+        is explicit opt-in; model-reported confidence is never used.
+    ConstrainedGenerationBatch:
+      type: object
+      additionalProperties: false
+      properties:
+        max_items_per_call:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 8
+        max_input_bytes:
+          type: integer
+          minimum: 1
+          maximum: 4194304
+          default: 65536
     GeneratedExtractorConfig:
       type: object
       additionalProperties: false
@@ -38889,6 +39736,1134 @@ components:
           $ref: '#/components/schemas/ConstrainedGenerationBatch'
         options:
           $ref: '#/components/schemas/ExtractionOptions'
+    ConstrainedGeneratorProducerConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - generator
+        - output_schema
+      properties:
+        generator:
+          $ref: '#/components/schemas/GeneratorConfig'
+        instructions:
+          type: string
+          maxLength: 65536
+        output_schema:
+          type: object
+          additionalProperties: true
+          description: JSON schema enforced before artifact publication. Unsupported schema vocabulary
+            fails admission. Invalid or missing batch items receive one validation retry; successful siblings
+            are retained.
+        output:
+          $ref: '#/components/schemas/ConstrainedOutput'
+        batch:
+          $ref: '#/components/schemas/ConstrainedGenerationBatch'
+    SQLNumericModifier:
+      type: object
+      additionalProperties: false
+      required:
+        - precision
+        - scale
+      description: PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element,
+        not dimensions. Absent means unconstrained NUMERIC.
+      properties:
+        precision:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        scale:
+          type: integer
+          minimum: -1000
+          maximum: 1000
+    RerankerProvider:
+      type: string
+      enum:
+        - cloudflare
+        - antfly
+        - cohere
+        - vertex
+      description: The reranking provider to use.
+    GraphPathObjective:
+      type: string
+      enum:
+        - min_hops
+        - min_weight_sum
+        - max_weight_product
+      description: >
+        Objective used to rank graph paths:
+
+        - min_hops: Minimize the number of edges.
+
+        - min_weight_sum: Minimize the sum of finite non-negative edge weights.
+
+        - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to
+        be in [0,1].
+    CloudflareEmbedderConfig:
+      type: object
+      description: Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum:
+            - cloudflare
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: '@cf/baai/bge-base-en-v1.5'
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        dimensions:
+          type: integer
+          minimum: 1
+          description: Expected fixed model output dimension; the adapter validates returned vectors and
+            never requests unsupported resizing.
+        dimension:
+          type: integer
+          minimum: 1
+          description: Alias of dimensions.
+      required:
+        - provider
+        - account_id
+        - model
+    EmbeddingRetrievalConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Advanced retrieval-role overrides. Antfly assigns canonical task intent
+
+        automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+
+        and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+
+        how a provider or instruction-aware model represents that intent.
+      properties:
+        query_input_type:
+          type: string
+          description: >-
+            Provider-specific query role, such as `search_query` for Cohere.
+
+            When omitted, the provider adapter derives it from
+
+            `RETRIEVAL_QUERY`.
+        document_input_type:
+          type: string
+          description: >-
+            Provider-specific document role, such as `search_document` for
+
+            Cohere. When omitted, the provider adapter derives it from
+
+            `RETRIEVAL_DOCUMENT`.
+        query_instruction:
+          type: string
+          description: >-
+            Optional instruction sent only with retrieval-query embeddings by
+
+            instruction-aware Antfly inference models. Provider adapters that
+
+            do not support free-form instructions reject this field.
+    GoogleEmbedderConfig:
+      type: object
+      description: >-
+        Configuration for the Google AI (Gemini) embedding provider.
+
+
+        API key via `api_key` field or `GEMINI_API_KEY` environment variable.
+
+
+        **Example Models:** gemini-embedding-2 (default, 3072 dims)
+
+
+        **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
+      properties:
+        request_format:
+          type: string
+          enum:
+            - embed_content
+            - batch_embed_contents
+          description: Wire protocol. New configurations default to embed_content; existing catalogs retain
+            their pinned protocol. No automatic fallback.
+          default: embed_content
+        task_encoding:
+          type: string
+          enum:
+            - prompt
+            - task_type
+            - none
+          description: Retrieval task representation, independent of model name. Defaults to prompt with
+            embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+        batch_size:
+          type: integer
+          minimum: 1
+          description: Maximum inputs per upstream request. embed_content requires 1 so independent records
+            never become one aggregated embedding.
+        provider:
+          type: string
+          enum:
+            - gemini
+        project_id:
+          type: string
+          description: The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
+        location:
+          type: string
+          description: The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional
+            for Gemini API.
+        model:
+          type: string
+          description: The name of the embedding model to use.
+          default: gemini-embedding-2
+          example: gemini-embedding-2
+        dimension:
+          type: integer
+          description: The dimension of the embedding vector (768, 1536, or 3072 recommended).
+          default: 3072
+        api_key:
+          type: string
+          writeOnly: true
+          description: The Google API key. Can also be set via GEMINI_API_KEY environment variable.
+        url:
+          type: string
+          format: uri
+          description: The URL of the Google API endpoint (optional, uses default if not specified).
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
+      required:
+        - provider
+      example:
+        provider: gemini
+        model: gemini-embedding-2
+        dimension: 3072
+        api_key: your-api-key
+    VertexEmbedderConfig:
+      type: object
+      description: >
+        Configuration for Google Cloud Vertex AI embedding models (enterprise-grade).
+
+
+        Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
+
+
+        **Example Model:** gemini-embedding-2 (default, 3072 dims)
+
+
+        Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
+
+        instead of being flattened or silently discarded.
+
+
+        **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+      properties:
+        request_format:
+          type: string
+          enum:
+            - embed_content
+            - predict
+          description: Wire protocol. New configurations default to embed_content; existing catalogs retain
+            their pinned protocol. No automatic fallback.
+          default: embed_content
+        task_encoding:
+          type: string
+          enum:
+            - prompt
+            - task_type
+            - none
+          description: Retrieval task representation, independent of model name. Defaults to prompt with
+            embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+        batch_size:
+          type: integer
+          minimum: 1
+          description: Maximum inputs per upstream request. embed_content requires 1 so independent records
+            never become one aggregated embedding.
+        provider:
+          type: string
+          enum:
+            - vertex
+        model:
+          type: string
+          description: The name of the Vertex AI embedding model to use.
+          default: gemini-embedding-2
+          example: gemini-embedding-2
+        project_id:
+          type: string
+          description: Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
+        location:
+          type: string
+          description: Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can
+            also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'global' for new configurations.
+          default: global
+        credentials_path:
+          type: string
+          writeOnly: true
+          description: Path to an ADC credential JSON file (service-account, authorized-user, or external-account).
+            Alternative to the default ADC chain.
+        dimension:
+          type: integer
+          description: The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-2).
+          default: 3072
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
+      required:
+        - provider
+      example:
+        provider: vertex
+        model: gemini-embedding-2
+        project_id: my-gcp-project
+        location: global
+        dimension: 3072
+    OllamaEmbedderConfig:
+      type: object
+      description: >-
+        Configuration for the Ollama embedding provider.
+
+
+        Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var.
+
+
+        **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384
+        dims)
+
+
+        **Docs:** https://ollama.com/search?c=embedding
+      properties:
+        provider:
+          type: string
+          enum:
+            - ollama
+        model:
+          type: string
+          description: The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
+          example: nomic-embed-text
+        url:
+          type: string
+          format: uri
+          description: The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment
+            variable.
+          default: http://localhost:11434
+          example: http://localhost:11434
+      required:
+        - provider
+        - model
+      example:
+        provider: ollama
+        model: nomic-embed-text
+        url: http://localhost:11434
+    OpenAIEmbedderConfig:
+      type: object
+      description: >-
+        Configuration for the OpenAI embedding provider.
+
+
+        API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+
+        Supports OpenAI-compatible APIs via `url` field.
+
+
+        **Example Models:** text-embedding-3-small (default, 1536 dims), text-embedding-3-large (3072
+        dims)
+
+
+        **Docs:** https://platform.openai.com/docs/guides/embeddings
+      properties:
+        provider:
+          type: string
+          enum:
+            - openai
+        model:
+          type: string
+          description: The name of the OpenAI model to use.
+          default: text-embedding-3-small
+          example: text-embedding-3-small
+        url:
+          type: string
+          format: uri
+          description: The URL of the OpenAI API endpoint. Defaults to OpenAI's API. Can be set via OPENAI_BASE_URL
+            environment variable.
+          default: https://api.openai.com
+          example: https://api.openai.com
+        api_key:
+          type: string
+          writeOnly: true
+          description: The OpenAI API key. Can also be set via OPENAI_API_KEY environment variable.
+        dimensions:
+          type: integer
+          description: 'Output dimension for the embedding (uses MRL for dimension reduction). Recommended:
+            256, 512, 1024, 1536, or 3072.'
+      required:
+        - provider
+        - model
+      example:
+        provider: openai
+        model: text-embedding-3-small
+        api_key: sk-...
+    OpenRouterEmbedderConfig:
+      type: object
+      description: >-
+        Configuration for the OpenRouter embedding provider.
+
+
+        OpenRouter provides a unified API for multiple embedding models from different providers.
+
+        API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
+
+
+        Antfly currently supports dense text embeddings through this provider.
+
+
+        **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
+
+        google/gemini-embedding-001, qwen/qwen3-embedding-8b
+
+
+        **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+      properties:
+        provider:
+          type: string
+          enum:
+            - openrouter
+        model:
+          type: string
+          description: The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
+          default: openai/text-embedding-3-small
+          example: openai/text-embedding-3-small
+        url:
+          type: string
+          format: uri
+          description: The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+        api_key:
+          type: string
+          writeOnly: true
+          description: The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
+        dimensions:
+          type: integer
+          description: Output dimension for the embedding (if supported by the model).
+      required:
+        - provider
+        - model
+      example:
+        provider: openrouter
+        model: openai/text-embedding-3-small
+        api_key: sk-or-...
+    BedrockEmbedderConfig:
+      type: object
+      description: >-
+        Configuration for the AWS Bedrock embedding provider.
+
+
+        Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task
+        roles, and EC2 instance roles.
+
+
+        **Example Models:** cohere.embed-v4:0, amazon.titan-embed-text-v2:0
+
+
+        **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+      properties:
+        provider:
+          type: string
+          enum:
+            - bedrock
+        model:
+          type: string
+          description: The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4:0',
+            'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
+          example: cohere.embed-v4:0
+        request_format:
+          type: string
+          enum:
+            - auto
+            - titan_text
+            - titan_multimodal
+            - cohere_v3
+            - cohere_v4
+          description: >-
+            Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
+
+            foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
+
+            for application inference profiles, provisioned throughput, custom models, and
+
+            other aliases whose invocation target does not identify the underlying model.
+          default: auto
+        region:
+          type: string
+          description: The AWS region for the Bedrock service (e.g., 'us-east-1').
+          example: us-east-1
+        dimension:
+          type: integer
+          description: Output dimension for Bedrock embedding models that support configurable dimensions.
+        dimensions:
+          type: integer
+          description: Alias for output dimension when using OpenAI-compatible configuration fields.
+        input_type:
+          type: string
+          description: Cohere Bedrock input type, such as search_document, search_query, classification,
+            or clustering.
+        truncate:
+          type: string
+          description: Cohere Bedrock truncate behavior.
+        strip_new_lines:
+          type: boolean
+          description: Whether to strip new lines from the input text before embedding.
+          default: false
+        batch_size:
+          type: integer
+          description: The batch size for embedding requests to optimize throughput.
+          default: 1
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
+      required:
+        - provider
+        - model
+      example:
+        provider: bedrock
+        model: cohere.embed-v4:0
+        request_format: cohere_v4
+        region: us-east-1
+    CohereEmbedderConfig:
+      type: object
+      description: >-
+        Configuration for the Cohere embedding provider.
+
+
+        API key via `api_key` field or `COHERE_API_KEY` environment variable.
+
+
+        **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0
+
+
+        **Docs:** https://docs.cohere.com/reference/embed
+      properties:
+        provider:
+          type: string
+          enum:
+            - cohere
+        model:
+          type: string
+          description: The name of the Cohere embedding model to use.
+          default: embed-english-v3.0
+          example: embed-english-v3.0
+        api_key:
+          type: string
+          writeOnly: true
+          description: The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+        input_type:
+          type: string
+          deprecated: true
+          description: >-
+            Legacy fixed input type applied to every embedding operation. When omitted,
+
+            Antfly derives `search_query` for semantic searches and `search_document`
+
+            for indexed documents. Prefer the role-specific fields under `retrieval`.
+          enum:
+            - search_document
+            - search_query
+            - classification
+            - clustering
+        truncate:
+          type: string
+          description: How to handle inputs longer than the max token length.
+          enum:
+            - NONE
+            - START
+            - END
+          default: END
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
+      required:
+        - provider
+        - model
+      example:
+        provider: cohere
+        model: embed-english-v3.0
+        input_type: search_document
+    AntflyEmbedderConfig:
+      type: object
+      description: >-
+        Configuration for the Antfly inference embedding provider.
+
+
+        Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
+
+
+        **Features:**
+
+        - Local ONNX-based embedding generation
+
+        - Query-time embeddings are served from an in-memory cache (64 MiB budget,
+          5-minute TTL by default) with concurrent identical requests coalesced onto
+          a single computation; there is no persistent on-disk cache tier
+
+        **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
+
+
+        Models are loaded from the `models/embedders/{name}/` directory.
+      properties:
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this
+            when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector
+            publication.
+        provider:
+          type: string
+          enum:
+            - antfly
+        model:
+          type: string
+          description: The embedding model name (maps to models/embedders/{name}/ directory).
+          example: bge-base-en-v1.5
+        api_url:
+          type: string
+          format: uri
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+            environment variable.
+          example: http://localhost:8082
+        retrieval:
+          $ref: '#/components/schemas/EmbeddingRetrievalConfig'
+      required:
+        - provider
+        - model
+      example:
+        provider: antfly
+        model: bge-base-en-v1.5
+        api_url: http://localhost:8082
+    EnrichmentKind:
+      type: string
+      enum:
+        - chunk
+        - asset
+        - embedding
+        - group
+      description: Managed generated artifact kind.
+    GroupedArtifactSource:
+      type: object
+      additionalProperties: false
+      required:
+        - group_by
+        - order_by
+        - field
+      properties:
+        group_by:
+          type: string
+          minLength: 1
+        order_by:
+          type: string
+          minLength: 1
+          description: Field containing an integer ordinal. Ties use the document key.
+        segment_by:
+          type: string
+          minLength: 1
+        field:
+          type: string
+          minLength: 1
+        filter:
+          type: object
+          additionalProperties: true
+          description: Canonical row filter evaluated on the source projection.
+        max_bytes:
+          type: integer
+          minimum: 1
+          maximum: 4194304
+          default: 32768
+          description: UTF-8 text bytes per unit, including joining newlines. An oversized single member
+            fails explicitly.
+        max_members:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 1024
+          description: Maximum members per unit; larger partitions emit multiple units.
+        window_ordinals:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 128
+          description: Fixed ordinal cells bound repartitioning and incremental work for long groups.
+    PriorArtifactContext:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+        - render
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: Artifact providing earlier items, including this producer's own artifact.
+        render:
+          type: string
+          minLength: 1
+          description: Template rendered for each prior item, newest first.
+        max_items:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 40
+        max_bytes:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 16384
+        horizon_segments:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 8
+          description: Earlier segments available for context and the maximum later segments invalidated
+            at each affected position of an original source change. A move invalidates the old and new
+            neighborhoods independently; recomputed outputs never extend either interval.
+    TextChunkOptions:
+      type: object
+      description: Options specific to text chunking.
+      properties:
+        target_tokens:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: Target number of tokens per chunk.
+        overlap_tokens:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: Number of tokens to overlap between consecutive chunks. Helps maintain context
+            across chunk boundaries. Only used by fixed-size chunkers.
+        min_chars:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 0
+          description: Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks
+            are omitted before storage and embedding; original source offsets are preserved. Zero disables
+            filtering (default). Does not filter model-aware media windows or image/audio chunks.
+        separator:
+          type: string
+          description: Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size
+            chunkers.
+    AudioChunkOptions:
+      type: object
+      description: Options specific to audio chunking.
+      properties:
+        window_duration_ms:
+          type: integer
+          minimum: 0
+          maximum: 86400000
+          description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
+        overlap_duration_ms:
+          type: integer
+          minimum: 0
+          maximum: 86400000
+          description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
+    ChunkEmbeddingTarget:
+      type: object
+      required:
+        - model
+      properties:
+        model:
+          type: string
+          minLength: 1
+        model_identity:
+          type: string
+          minLength: 64
+          maxLength: 64
+          pattern: ^[0-9a-f]{64}$
+          description: Optional required embedding-weight/recipe identity; a changed model is rejected
+            before delivery.
+        task_type:
+          type: string
+          default: RETRIEVAL_DOCUMENT
+        dimensions:
+          type: integer
+          minimum: 1
+        execute:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          default: true
+          description: False resolves model limits and plans descriptors without running embedding inference.
+        allow_partial:
+          type: boolean
+          default: false
+          description: Return explicit per-chunk failures and gaps instead of aborting on the first non-retryable
+            embedding failure.
+    ChunkDiarizationConfig:
+      type: object
+      description: Source-wide online speaker clustering on a fixed 1.5 s grid with 3 s embedding windows.
+        Identities are stable within a source and recipe. Silence and ambiguous voices remain unassigned.
+        Analysis advances incrementally; admitted cached timelines and durable centroid/sample-position
+        checkpoints are shared across matching outputs and continuations. Missing checkpoints reconstruct
+        the required prefix deterministically.
+      properties:
+        model:
+          type: string
+          description: Speaker ONNX registry reference; defaults to 3D-Speaker CAM++. For kind=diarize
+            the target model selects the speaker model.
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Optional SHA-256 pin of the speaker ONNX file, including when paired with a transcription
+            model.
+        similarity_threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0.45
+        ambiguity_margin:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0.03
+        min_rms:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0.01
+        max_speakers:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 64
+    ChunkOutputTarget:
+      type: object
+      required:
+        - name
+        - kind
+        - model
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        kind:
+          type: string
+          enum:
+            - embedding
+            - transcribe
+            - classify
+            - diarize
+        model:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        execute:
+          type: boolean
+          default: true
+          description: False retains this model as a planning boundary while skipping its inference; used
+            for independent output repairs.
+        skip_windows:
+          type: array
+          maxItems: 4096
+          description: Execution-only repair mask for already accepted sub-windows; does not affect the
+            model recipe or boundary plan. Skipped windows return receipts with status skipped.
+          items:
+            type: object
+            required:
+              - ordinal
+              - sub_index
+            properties:
+              ordinal:
+                type: integer
+                format: uint64
+                minimum: 0
+              sub_index:
+                type: integer
+                format: uint32
+                minimum: 0
+        required:
+          type: boolean
+          default: true
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        task_type:
+          type: string
+          default: RETRIEVAL_DOCUMENT
+        dimensions:
+          type: integer
+          minimum: 1
+        language:
+          type: string
+        diarize:
+          type: boolean
+          default: false
+          description: Convenience option on transcription outputs; enables source-wide diarization with
+            the default speaker model.
+        diarization:
+          description: Speaker settings for diarize or transcribe outputs; also accepted on the selected
+            audio embedding boundary with audio_speaker_turns=true.
+          $ref: '#/components/schemas/ChunkDiarizationConfig'
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 5
+    ChunkOutputs:
+      type: object
+      required:
+        - boundary_model
+        - targets
+      description: Named independent media outputs. The named boundary model alone determines the shared
+        plan; adding or changing another output preserves parent IDs. The compatibility embedding target
+        is named embedding. Smaller output windows are identified by the parent ordinal and sub_index.
+      properties:
+        boundary_model:
+          type: string
+          minLength: 1
+        targets:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/ChunkOutputTarget'
+    MediaChunkPolicy:
+      type: object
+      description: Semantic chunk policy. Execution batch size and queue depth are deliberately separate.
+      properties:
+        max_text_bytes:
+          type: integer
+          minimum: 4
+          maximum: 16777216
+          default: 1048576
+          description: Explicit byte ceiling per text chunk, independently of the target tokenizer budget.
+        target_tokens:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          default: 500
+        overlap_tokens:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          minimum: 0
+          default: 50
+        window_ns:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 32000000000
+        overlap_ns:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+        step_ns:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 1000000000
+        video_hold:
+          type: integer
+          minimum: 0
+          maximum: 1
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          description: Select the displayed picture at each video cadence target, including VFR holds.
+            Zero retains at-or-after timestamp sampling.
+        max_frames:
+          type: integer
+          minimum: 1
+          maximum: 32
+          default: 32
+        tile_width:
+          type: integer
+          minimum: 0
+          default: 0
+        tile_height:
+          type: integer
+          minimum: 0
+          default: 0
+        tile_overlap:
+          type: integer
+          minimum: 0
+          default: 0
+        audio_speaker_turns:
+          type: boolean
+          default: false
+          description: Split audio chunks at detected speaker transitions, additionally respecting the
+            boundary model limits. Requires a diarization-enabled boundary target, zero overlap_ns and
+            zero audio_pause_ns. The boundary diarization recipe participates in plan identity. Analysis
+            runs even with execute=false because these boundaries depend on audio inference.
+        audio_pause_ns:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          description: Optional minimum silence duration for choosing an earlier boundary; no samples
+            are discarded.
+        audio_pause_search_ns:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 5000000000
+        audio_silence_milli:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          minimum: 0
+          maximum: 1000
+          default: 10
+          description: Absolute normalized PCM amplitude threshold in thousandths.
+    ChunkOptions:
+      type: object
+      description: Per-request configuration for chunking. All fields are optional - zero/omitted values
+        use chunker defaults.
+      properties:
+        max_chunks:
+          type: integer
+          minimum: 0
+          maximum: 4096
+          description: 'Maximum chunks in one response; zero requests the full result. Model-aware responses
+            return continuation coverage when a page is full: follow next_continuation until source_complete.
+            Embedded model-aware enrichment uses this as its page size and continues through the entire
+            source. Fixed chunking without model-aware outputs retains its per-call truncation behavior.'
+        threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Confidence threshold for model-based chunking (0.0-1.0).
+        text:
+          $ref: '#/components/schemas/TextChunkOptions'
+        audio:
+          $ref: '#/components/schemas/AudioChunkOptions'
+        embedding:
+          $ref: '#/components/schemas/ChunkEmbeddingTarget'
+        outputs:
+          $ref: '#/components/schemas/ChunkOutputs'
+        policy:
+          $ref: '#/components/schemas/MediaChunkPolicy'
+    AntflyChunkerConfig:
+      description: >
+        Configuration for the Antfly inference chunking provider.
+
+
+        Antfly inference is Antfly's built-in ML service for local chunking.
+
+
+        **Chunking Models:**
+
+        - fixed: Fixed-size chunking by token count, with fixed time windows for audio
+          (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer`). This is the
+          only chunking model Antfly inference implements; other model names are
+          rejected as unsupported.
+
+        **Deduplication:**
+
+        - Within a single document write, chunk results are deduplicated when multiple
+          indexes share the same source text and chunker configuration, so the source
+          is chunked at most once per write.
+      allOf:
+        - $ref: '#/components/schemas/ChunkOptions'
+        - type: object
+          properties:
+            api_url:
+              type: string
+              format: uri
+              description: The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can
+                also be set via ANTFLY_INFERENCE_URL environment variable.
+              example: http://localhost:8080
+            model:
+              type: string
+              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
+                other values select a model from models/chunkers/{name}/. Successful create responses
+                include the effective model.
+              default: fixed
+              example: fixed
+      example:
+        provider: antfly
+        api_url: http://localhost:8080
+        model: fixed
+        text:
+          target_tokens: 500
+          overlap_tokens: 50
+          separator: >2+
+
+
+    ChunkerProvider:
+      type: string
+      enum:
+        - mock
+        - antfly
+      description: The chunking provider to use.
+    ChunkerConfig:
+      description: A unified configuration for a chunking provider.
+      allOf:
+        - $ref: '#/components/schemas/AntflyChunkerConfig'
+        - type: object
+          properties:
+            provider:
+              $ref: '#/components/schemas/ChunkerProvider'
+            store_chunks:
+              x-go-type-skip-optional-pointer: true
+              type: boolean
+              description: Controls whether chunk data is persisted to storage. When false (default),
+                fixed chunks are generated in memory and only embeddings are stored. Model-aware streams
+                always retain descriptor recipes; false omits their payloads. When true, chunk payloads
+                are also stored. Vectors remain in the embedding artifact family.
+              default: false
+            full_text_index:
+              x-go-type-skip-optional-pointer: true
+              type: object
+              description: >
+                Configuration for full-text indexing of chunks.
+
+                When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native
+                full-text index, queryable and projectable via the document's `_chunks` field.
+
+                When absent, chunks are generated only to drive vector embeddings and are not indexed
+                for full-text search (unless `store_chunks` is also set).
+              additionalProperties: true
+            api_url:
+              type: string
+              format: uri
+              description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
+              example: http://localhost:8080
+            model:
+              type: string
+              description: The chunking model to use. Defaults to 'fixed' for simple token-based chunking;
+                other values select a model from models/chunkers/{name}/. Successful create responses
+                include the effective model.
+              default: fixed
+              example: fixed
+            max_chunks:
+              type: integer
+              minimum: 0
+              maximum: 4096
+              description: Maximum chunks per invocation. Model-aware enrichment treats this as a page
+                size and resumes until source completion; zero selects the worker page size. Fixed chunking
+                retains its per-document cap, with zero meaning unlimited.
+            threshold:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 1
+            text:
+              $ref: '#/components/schemas/TextChunkOptions'
+            audio:
+              $ref: '#/components/schemas/AudioChunkOptions'
+            embedding:
+              $ref: '#/components/schemas/ChunkEmbeddingTarget'
+            outputs:
+              $ref: '#/components/schemas/ChunkOutputs'
+            policy:
+              $ref: '#/components/schemas/MediaChunkPolicy'
+          required:
+            - provider
+      example:
+        provider: antfly
+        model: fixed
+        text:
+          target_tokens: 500
+          overlap_tokens: 50
     VectorLabelsConfig:
       type: object
       additionalProperties: false
@@ -66217,15 +68192,6 @@ components:
           description: Request speaker labels and temporal segments. Defaults to false. Whisper requires
             the local speaker embedding model; unavailable models cause an explicit error. Implies timestamp
             decoding.
-    ExtractionSchemaVersion:
-      type: integer
-      enum:
-        - 1
-        - 2
-      default: 1
-      description: Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task
-        schemas, per-input replacements and explicit offsets; the selected model/runtime must support
-        every requested feature.
     DocumentSource:
       type: object
       additionalProperties: false

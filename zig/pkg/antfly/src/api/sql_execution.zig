@@ -776,8 +776,16 @@ pub const Adapter = struct {
         return signed;
     }
 
+    fn requireUnprotectedMutation(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
+        const source = self.server.table_reads orelse return;
+        if (source.vtable.privacy_policy_version == null) return;
+        const version = try source.privacyPolicyVersion(alloc, table.physical_name, self.context.deadline_ns);
+        if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedSqlExecution;
+    }
+
     fn prepareScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !helpers.OwnedScanKeysRequest {
         try self.verify(alloc, table);
+        if (request.include_document or request.include_primary_digest) try self.requireUnprotectedMutation(alloc, table);
         if (request.index_equality) |probe| {
             if (self.range_reads == null or request.primary_key != null or request.after != null or request.primary_order or
                 probe.name.len == 0 or probe.values.len == 0 or probe.values.len > 32) return error.UnsupportedSqlExecution;
@@ -1872,6 +1880,7 @@ pub const Adapter = struct {
     fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
+        try self.requireUnprotectedMutation(alloc, table);
         const images = @import("antfly_local_sources").sql_mutation_images;
         const writes = try images.writes(db_types.BatchWrite, alloc, input);
         if (writes.len == 0) return input;
@@ -1912,6 +1921,7 @@ pub const Adapter = struct {
     fn mutateInternal(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, already_prepared: bool) !catalog.MutationOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
+        try self.requireUnprotectedMutation(alloc, table);
         const guards = try conflictGuards(alloc, input);
         if (self.active_transaction) |id| {
             const txn = @import("transactions.zig");

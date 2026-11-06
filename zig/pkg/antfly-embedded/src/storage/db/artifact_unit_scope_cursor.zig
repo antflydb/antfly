@@ -77,7 +77,7 @@ pub fn Cursor(comptime Txn: type) type {
         }
 
         fn unit(self: *const Self, i: usize, row: Entry) ![]const u8 {
-            if (row.key.len > 1024 * 1024) return error.ResourceBudgetExceeded;
+            if (row.key.len > publication.max_cursor_bytes) return error.ResourceBudgetExceeded;
             const suffix = if (i == 2) blk: {
                 if (!keys.isChunkArtifactRecordKey(row.key)) return error.ArtifactCatalogCorrupt;
                 // Physical cursors do not resolve an external payload. This

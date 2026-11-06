@@ -109,10 +109,18 @@ const std = @import("std");
 /// Version 76 requires attempt-aware commit proofs and joined connection refusals.
 /// Version 77 isolates issuer outboxes in shared transaction stores.
 /// Version 78 requires backend-wide coordination of shared session mutations.
-pub const current_version: u16 = 78;
+/// Version 79 admits privacy-owned consumer graphs and serving fences.
+/// Version 80 stores private range checkpoints as immutable, owner-fenced blobs.
+/// Version 81 accounts retained checkpoint bytes through final reclamation.
+/// Version 82 requires compact, authoritative privacy read bindings.
+pub const current_version: u16 = 82;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
+pub const privacy_version: u16 = 82;
+pub fn usesPrivacy(indexes_json: []const u8) bool {
+    return std.mem.indexOf(u8, indexes_json, "\"_privacy\"") != null or std.mem.indexOf(u8, indexes_json, "_privacy_document") != null;
+}
 pub const job_state_version: u16 = 59;
 pub const resolver_records_version: u16 = 58;
 pub const native_service_tables_version: u16 = 38;

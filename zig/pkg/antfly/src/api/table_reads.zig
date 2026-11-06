@@ -2504,6 +2504,7 @@ pub const BoundTableReadSource = struct {
                 .lsm_storage_stats = lsmStorageStats,
                 .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest = documentArtifactManifest,
+                .document_artifact_manifest_controlled = documentArtifactManifestControlled,
                 .document_artifact_manifests = documentArtifactManifests,
             },
         };
@@ -2517,9 +2518,21 @@ pub const BoundTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestControlled(ptr, alloc, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.reads.documentArtifactManifestWithConsistency(alloc, self.db, doc_key, artifact_name, consistency);
+        return try self.reads.documentArtifactManifestWithConsistencyControlled(alloc, self.db, doc_key, artifact_name, consistency, opts);
     }
 
     fn documentArtifactManifests(
@@ -3683,6 +3696,7 @@ pub const ProvisionedTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocalPhysical,
                 .graph_edges_group_local = graphEdgesGroupLocalPhysical,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocalPhysical,
+                .document_artifact_manifest_group_local_controlled = documentArtifactManifestGroupLocalPhysicalControlled,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocalPhysical,
             },
         };
@@ -4123,72 +4137,90 @@ pub const ProvisionedTableReadSource = struct {
         return self.groupLocalSourceWithFence(fence).tryStatementReadFenceGroupLocal(alloc, group_id, table_name, opts, consistency);
     }
 
+    fn privacyPolicyVersion(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, deadline: ?u64) ![64]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return capturePrivacyPolicyVersion(alloc, self.catalog, table, deadline);
+    }
+
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
             .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else !control_only_storage_sources,
             .remote_statement_fences_safe = if (self.local_read_source) |local| local.remote_statement_fences_safe else false,
             .supports_sql_range_guards = true,
-            .vtable = &.{
-                .acquire_join_view = JoinReadBinding(ProvisionedTableReadSource).acquire,
-                .open_relational_read = openRelationalRead,
-                .open_relational_statement = openRelationalStatement,
-                .open_relational_statement_snapshot = openRelationalStatementSnapshot,
-                .open_relational_read_group_local_routed = openRelationalReadGroupRouted,
-                .try_statement_read_fence_group_local_routed = tryStatementReadFenceGroupRouted,
-                .lookup = lookup,
-                .scan = scan,
-                .scan_stream = scanStream,
-                .query = query,
-                .query_with_delivery = queryWithDelivery,
-                .preflight_query = preflightQuery,
-                .preflight_query_group_local = preflightQueryGroupLocal,
-                .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
-                .lookup_group_local = lookupGroupLocal,
-                .lookup_group_local_routed = lookupGroupLocalRouted,
-                .scan_group_local = scanGroupLocal,
-                .scan_group_local_stream = scanGroupLocalStream,
-                .scan_group_local_routed = scanGroupLocalRouted,
-                .scan_group_local_routed_stream = scanGroupLocalRoutedStream,
-                .query_group_local = queryGroupCoordinator,
-                .query_group_local_routed = queryGroupLocalRouted,
-                .search_result_group_local = searchResultGroupCoordinator,
-                .search_result_group_local_routed = searchResultGroupLocalRouted,
-                .text_stats_group_local = textStatsGroupLocal,
-                .text_stats_group_local_routed = textStatsGroupLocalRouted,
-                .algebraic_partials_group_local = algebraicPartialsGroupLocal,
-                // Route only the remote half of exact-group join work. Local
-                // routes return a typed sentinel so distributed_join executes
-                // against this source's resident DB and admission owner
-                // exactly once; a failed remote request must never be mistaken
-                // for permission to execute a foreign group locally.
-                .join_partition_group_local_with_timeout = joinPartitionGroupRemote,
-                .join_rows_group_local_with_timeout = joinRowsGroupRemote,
-                .join_unmatched_group_local_with_timeout = joinUnmatchedGroupRemote,
-                .join_finalize_group_local_with_timeout = joinFinalizeGroupRemote,
-                .join_job_state_group_local = joinJobStateGroupRemote,
-                .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
-                .join_partition_group_local = null,
-                .join_rows_group_local = null,
-                .join_unmatched_group_local = null,
-                .join_finalize_group_local = null,
-                .graph_expand_group_local = graphExpandGroupLocal,
-                .graph_expand_group_local_routed = graphExpandGroupLocalRouted,
-                .graph_hydrate_group_local = graphHydrateGroupLocal,
-                .graph_hydrate_group_local_routed = graphHydrateGroupLocalRouted,
-                .graph_edges_group_local = graphEdgesGroupLocal,
-                .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
-                .local_runtime_statuses = localRuntimeStatuses,
-                .lsm_storage_stats = lsmStorageStats,
-                .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
-                .document_artifact_manifest = documentArtifactManifest,
-                .document_artifact_manifests = documentArtifactManifests,
-                .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
-                .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
-                .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
-                .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
-                .bind_incoming_graph_routes = bindIncomingGraphRoutes,
-            },
+            // Both alternatives have static lifetime. A runtime conditional
+            // inside an address-of literal would leave a stack-backed vtable.
+            .vtable = if (self.catalog.vtable.privacy_policy_binding != null or self.catalog.vtable.linearizable_table_routing_snapshot != null)
+                &comptime sourceVTable(true)
+            else
+                &comptime sourceVTable(false),
+        };
+    }
+
+    fn sourceVTable(comptime with_privacy: bool) TableReadSource.VTable {
+        return .{
+            .privacy_policy_version = if (with_privacy) privacyPolicyVersion else null,
+            .acquire_join_view = JoinReadBinding(ProvisionedTableReadSource).acquire,
+            .open_relational_read = openRelationalRead,
+            .open_relational_statement = openRelationalStatement,
+            .open_relational_statement_snapshot = openRelationalStatementSnapshot,
+            .open_relational_read_group_local_routed = openRelationalReadGroupRouted,
+            .try_statement_read_fence_group_local_routed = tryStatementReadFenceGroupRouted,
+            .lookup = lookup,
+            .scan = scan,
+            .scan_stream = scanStream,
+            .query = query,
+            .query_with_delivery = queryWithDelivery,
+            .preflight_query = preflightQuery,
+            .preflight_query_group_local = preflightQueryGroupLocal,
+            .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
+            .lookup_group_local = lookupGroupLocal,
+            .lookup_group_local_routed = lookupGroupLocalRouted,
+            .scan_group_local = scanGroupLocal,
+            .scan_group_local_stream = scanGroupLocalStream,
+            .scan_group_local_routed = scanGroupLocalRouted,
+            .scan_group_local_routed_stream = scanGroupLocalRoutedStream,
+            .query_group_local = queryGroupCoordinator,
+            .query_group_local_routed = queryGroupLocalRouted,
+            .search_result_group_local = searchResultGroupCoordinator,
+            .search_result_group_local_routed = searchResultGroupLocalRouted,
+            .text_stats_group_local = textStatsGroupLocal,
+            .text_stats_group_local_routed = textStatsGroupLocalRouted,
+            .algebraic_partials_group_local = algebraicPartialsGroupLocal,
+            // Route only the remote half of exact-group join work. Local
+            // routes return a typed sentinel so distributed_join executes
+            // against this source's resident DB and admission owner
+            // exactly once; a failed remote request must never be mistaken
+            // for permission to execute a foreign group locally.
+            .join_partition_group_local_with_timeout = joinPartitionGroupRemote,
+            .join_rows_group_local_with_timeout = joinRowsGroupRemote,
+            .join_unmatched_group_local_with_timeout = joinUnmatchedGroupRemote,
+            .join_finalize_group_local_with_timeout = joinFinalizeGroupRemote,
+            .join_job_state_group_local = joinJobStateGroupRemote,
+            .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
+            .join_partition_group_local = null,
+            .join_rows_group_local = null,
+            .join_unmatched_group_local = null,
+            .join_finalize_group_local = null,
+            .graph_expand_group_local = graphExpandGroupLocal,
+            .graph_expand_group_local_routed = graphExpandGroupLocalRouted,
+            .graph_hydrate_group_local = graphHydrateGroupLocal,
+            .graph_hydrate_group_local_routed = graphHydrateGroupLocalRouted,
+            .graph_edges_group_local = graphEdgesGroupLocal,
+            .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
+            .local_runtime_statuses = localRuntimeStatuses,
+            .lsm_storage_stats = lsmStorageStats,
+            .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
+            .document_artifact_manifest = documentArtifactManifest,
+            .document_artifact_manifest_controlled = documentArtifactManifestControlled,
+            .document_artifact_manifests = documentArtifactManifests,
+            .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+            .document_artifact_manifest_group_local_controlled = documentArtifactManifestGroupLocalControlled,
+            .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
+            .document_artifact_manifest_group_local_routed_controlled = documentArtifactManifestGroupLocalRoutedControlled,
+            .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
+            .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
+            .bind_incoming_graph_routes = bindIncomingGraphRoutes,
         };
     }
 
@@ -4702,31 +4734,36 @@ pub const ProvisionedTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestControlled(ptr, alloc, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
-            return HostedProvisionedTableReadSource.documentArtifactManifest(
-                &hosted,
-                alloc,
-                table_name,
-                doc_key,
-                artifact_name,
-                consistency,
-            );
+            return HostedProvisionedTableReadSource.documentArtifactManifestControlled(&hosted, alloc, table_name, doc_key, artifact_name, consistency, opts);
         }
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
-            var prepared = try self.prepareRoutedKeyRead(alloc, table_name, doc_key, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general);
+            var prepared = try self.prepareRoutedKeyRead(alloc, table_name, doc_key, .{ .lookup = .{ .key = doc_key, .opts = opts } }, consistency, .general);
             defer prepared.deinit();
             const route = prepared.route orelse return null;
             const group_id = route.group_id;
             const result = if (comptime control_only_storage_sources)
-                self.groupLocalSourceWithFence(prepared.fence(.{}, null).?).documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .stale)
+                self.groupLocalSourceWithFence(prepared.fence(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation).?).documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .stale, opts)
             else if (self.local_read_source != null)
-                self.groupLocalSourceWithFence(prepared.fence(.{}, null).?).documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .stale)
+                self.groupLocalSourceWithFence(prepared.fence(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation).?).documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .stale, opts)
             else
-                documentArtifactManifestProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, .stale, prepared.activity != null, docIdentityNamespaceForRoute(route));
+                documentArtifactManifestProvisionedHostedLocalControlled(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, .stale, prepared.activity != null, docIdentityNamespaceForRoute(route), opts);
             return result catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
@@ -5196,12 +5233,26 @@ pub const ProvisionedTableReadSource = struct {
     }
 
     fn documentArtifactManifestGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, artifact_name: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalRoutedControlled(ptr, alloc, fence, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalRoutedControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: ProvisionedTableReadSource = undefined;
         try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
-        return try documentArtifactManifestGroupLocal(&routed, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+        return try documentArtifactManifestGroupLocalControlled(&routed, alloc, group_id, table_name, doc_key, artifact_name, consistency, opts);
     }
 
     fn documentArtifactManifestsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
@@ -5397,14 +5448,27 @@ pub const ProvisionedTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalControlled(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
-            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general, 0);
+            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = doc_key, .opts = opts } }, consistency, .general, 0);
             defer if (read_activity) |*activity| activity.deinit();
-            const local_source = try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{}, null);
-            return local_source.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .stale) catch |err| switch (err) {
+            const local_source = try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation);
+            return local_source.documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .stale, opts) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -5427,8 +5491,21 @@ pub const ProvisionedTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalPhysicalControlled(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalPhysicalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try documentArtifactManifestProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency, self.callerReadActivityHeld(), self.expectedIdentityNamespace(group_id));
+        return try documentArtifactManifestProvisionedHostedLocalControlled(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency, self.callerReadActivityHeld(), self.expectedIdentityNamespace(group_id), opts);
     }
 
     fn documentArtifactManifestsGroupLocal(
@@ -6438,7 +6515,7 @@ pub const HostedProvisionedTableReadSource = struct {
         return key.len == 0 and consistency == .read_index and
             (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
                 std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}")) and
-            !opts.include_primary_digest and !opts.relational_integrity_catalog and !opts.relational_integrity_action and
+            !opts.privacy_original and !opts.include_primary_digest and !opts.relational_integrity_catalog and !opts.relational_integrity_action and
             !opts.generation_handoff_install_read_index_certified and
             opts.relational_integrity_jobs_json.len == 0 and opts.group_source_query_json.len == 0 and opts.relational_index_status_json.len == 0 and
             opts.relational_activation_json.len == 0 and opts.fields.len == 0 and
@@ -6670,6 +6747,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocalPhysical,
                 .graph_edges_group_local = graphEdgesGroupLocalPhysical,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocalPhysical,
+                .document_artifact_manifest_group_local_controlled = documentArtifactManifestGroupLocalPhysicalControlled,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocalPhysical,
             },
         };
@@ -6768,12 +6846,26 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 
     fn documentArtifactManifestGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, artifact_name: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalRoutedControlled(ptr, alloc, fence, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalRoutedControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: HostedProvisionedTableReadSource = undefined;
         try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
-        return try documentArtifactManifestGroupLocal(&routed, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+        return try documentArtifactManifestGroupLocalControlled(&routed, alloc, group_id, table_name, doc_key, artifact_name, consistency, opts);
     }
 
     fn documentArtifactManifestsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
@@ -6915,61 +7007,79 @@ pub const HostedProvisionedTableReadSource = struct {
         return try graphEdgesGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
     }
 
+    fn privacyPolicyVersion(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, deadline: ?u64) ![64]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return capturePrivacyPolicyVersion(alloc, self.catalog, table, deadline);
+    }
+
     pub fn source(self: *HostedProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
             .supports_sql_range_guards = true,
             .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
-            .vtable = &.{
-                .acquire_join_view = JoinReadBinding(HostedProvisionedTableReadSource).acquire,
-                .open_relational_read = openRelationalRead,
-                .open_relational_statement = openRelationalStatement,
-                .lookup = lookup,
-                .scan = scan,
-                .scan_stream = scanStream,
-                .query = query,
-                .query_with_delivery = queryWithDelivery,
-                .preflight_query = preflightQuery,
-                .preflight_query_group_local = preflightQueryGroupLocal,
-                .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
-                .lookup_group_local = lookupGroupLocal,
-                .lookup_group_local_routed = lookupGroupLocalRouted,
-                .scan_group_local = scanGroupLocal,
-                .scan_group_local_stream = scanGroupLocalStream,
-                .scan_group_local_routed = scanGroupLocalRouted,
-                .scan_group_local_routed_stream = scanGroupLocalRoutedStream,
-                .query_group_local = queryGroupLocal,
-                .query_group_local_routed = queryGroupLocalRouted,
-                .search_result_group_local = searchResultGroupLocal,
-                .search_result_group_local_routed = searchResultGroupLocalRouted,
-                .text_stats_group_local = textStatsGroupLocal,
-                .text_stats_group_local_routed = textStatsGroupLocalRouted,
-                .algebraic_partials_group_local = algebraicPartialsGroupLocal,
-                .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
-                .join_partition_group_local_with_timeout = joinPartitionGroupLocal,
-                .join_rows_group_local_with_timeout = joinRowsGroupLocal,
-                .join_unmatched_group_local_with_timeout = joinUnmatchedGroupLocal,
-                .join_finalize_group_local_with_timeout = joinFinalizeGroupLocal,
-                .join_partition_group_local_routed_with_timeout = joinPartitionGroupLocalRouted,
-                .join_rows_group_local_routed_with_timeout = joinRowsGroupLocalRouted,
-                .join_unmatched_group_local_routed_with_timeout = joinUnmatchedGroupLocalRouted,
-                .join_finalize_group_local_routed_with_timeout = joinFinalizeGroupLocalRouted,
-                .join_job_state_group_local = joinJobStateGroupLocal,
-                .graph_expand_group_local = graphExpandGroupLocal,
-                .graph_expand_group_local_routed = graphExpandGroupLocalRouted,
-                .graph_hydrate_group_local = graphHydrateGroupLocal,
-                .graph_hydrate_group_local_routed = graphHydrateGroupLocalRouted,
-                .graph_edges_group_local = graphEdgesGroupLocal,
-                .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
-                .local_runtime_statuses = localRuntimeStatuses,
-                .document_artifact_manifest = documentArtifactManifest,
-                .document_artifact_manifests = documentArtifactManifests,
-                .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
-                .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
-                .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
-                .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
-                .bind_incoming_graph_routes = bindIncomingGraphRoutes,
-            },
+            // Both alternatives have static lifetime. A runtime conditional
+            // inside an address-of literal would leave a stack-backed vtable.
+            .vtable = if (self.catalog.vtable.privacy_policy_binding != null or self.catalog.vtable.linearizable_table_routing_snapshot != null)
+                &comptime sourceVTable(true)
+            else
+                &comptime sourceVTable(false),
+        };
+    }
+
+    fn sourceVTable(comptime with_privacy: bool) TableReadSource.VTable {
+        return .{
+            .privacy_policy_version = if (with_privacy) privacyPolicyVersion else null,
+            .acquire_join_view = JoinReadBinding(HostedProvisionedTableReadSource).acquire,
+            .open_relational_read = openRelationalRead,
+            .open_relational_statement = openRelationalStatement,
+            .lookup = lookup,
+            .scan = scan,
+            .scan_stream = scanStream,
+            .query = query,
+            .query_with_delivery = queryWithDelivery,
+            .preflight_query = preflightQuery,
+            .preflight_query_group_local = preflightQueryGroupLocal,
+            .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
+            .lookup_group_local = lookupGroupLocal,
+            .lookup_group_local_routed = lookupGroupLocalRouted,
+            .scan_group_local = scanGroupLocal,
+            .scan_group_local_stream = scanGroupLocalStream,
+            .scan_group_local_routed = scanGroupLocalRouted,
+            .scan_group_local_routed_stream = scanGroupLocalRoutedStream,
+            .query_group_local = queryGroupLocal,
+            .query_group_local_routed = queryGroupLocalRouted,
+            .search_result_group_local = searchResultGroupLocal,
+            .search_result_group_local_routed = searchResultGroupLocalRouted,
+            .text_stats_group_local = textStatsGroupLocal,
+            .text_stats_group_local_routed = textStatsGroupLocalRouted,
+            .algebraic_partials_group_local = algebraicPartialsGroupLocal,
+            .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
+            .join_partition_group_local_with_timeout = joinPartitionGroupLocal,
+            .join_rows_group_local_with_timeout = joinRowsGroupLocal,
+            .join_unmatched_group_local_with_timeout = joinUnmatchedGroupLocal,
+            .join_finalize_group_local_with_timeout = joinFinalizeGroupLocal,
+            .join_partition_group_local_routed_with_timeout = joinPartitionGroupLocalRouted,
+            .join_rows_group_local_routed_with_timeout = joinRowsGroupLocalRouted,
+            .join_unmatched_group_local_routed_with_timeout = joinUnmatchedGroupLocalRouted,
+            .join_finalize_group_local_routed_with_timeout = joinFinalizeGroupLocalRouted,
+            .join_job_state_group_local = joinJobStateGroupLocal,
+            .graph_expand_group_local = graphExpandGroupLocal,
+            .graph_expand_group_local_routed = graphExpandGroupLocalRouted,
+            .graph_hydrate_group_local = graphHydrateGroupLocal,
+            .graph_hydrate_group_local_routed = graphHydrateGroupLocalRouted,
+            .graph_edges_group_local = graphEdgesGroupLocal,
+            .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
+            .local_runtime_statuses = localRuntimeStatuses,
+            .document_artifact_manifest = documentArtifactManifest,
+            .document_artifact_manifest_controlled = documentArtifactManifestControlled,
+            .document_artifact_manifests = documentArtifactManifests,
+            .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+            .document_artifact_manifest_group_local_controlled = documentArtifactManifestGroupLocalControlled,
+            .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
+            .document_artifact_manifest_group_local_routed_controlled = documentArtifactManifestGroupLocalRoutedControlled,
+            .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
+            .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
+            .bind_incoming_graph_routes = bindIncomingGraphRoutes,
         };
     }
 
@@ -7038,8 +7148,20 @@ pub const HostedProvisionedTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestControlled(ptr, alloc, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const routed = try table_catalog.routedGroupSnapshotUntil(alloc, hosted.catalog, table_name, doc_key, null);
+        const routed = try table_catalog.routedGroupSnapshotUntil(alloc, hosted.catalog, table_name, doc_key, lookupRoutingDeadline(hosted.catalog, opts));
         const fence = routed.fence() orelse return null;
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(hosted.catalog, table_name, fence, &route_storage);
@@ -7047,7 +7169,7 @@ pub const HostedProvisionedTableReadSource = struct {
         routed_source.catalog = pinned.source();
         const self = &routed_source;
         const group_id = fence.route.group_id;
-        return try documentArtifactManifestHostedRoute(self, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+        return try documentArtifactManifestHostedRouteControlled(self, alloc, group_id, table_name, doc_key, artifact_name, consistency, opts);
     }
 
     fn documentArtifactManifests(
@@ -7078,11 +7200,24 @@ pub const HostedProvisionedTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        return documentArtifactManifestHostedRouteControlled(self, alloc, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestHostedRouteControlled(
+        self: *HostedProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(opts)), group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
-            .local => (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{}, null)).documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency),
-            .remote => |remote| documentArtifactManifestRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            .local => (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation)).documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, consistency, opts),
+            .remote => |remote| documentArtifactManifestRemoteControlled(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name, opts) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
             },
@@ -7636,8 +7771,21 @@ pub const HostedProvisionedTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalControlled(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{}, null)).documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency);
+        return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation)).documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, consistency, opts);
     }
 
     fn documentArtifactManifestGroupLocalPhysical(
@@ -7649,8 +7797,21 @@ pub const HostedProvisionedTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
+        return documentArtifactManifestGroupLocalPhysicalControlled(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency, .{});
+    }
+
+    fn documentArtifactManifestGroupLocalPhysicalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try documentArtifactManifestProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency, false, null);
+        return try documentArtifactManifestProvisionedHostedLocalControlled(null, null, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency, false, null, opts);
     }
 
     fn documentArtifactManifestsGroupLocal(
@@ -11991,10 +12152,31 @@ fn documentArtifactManifestProvisionedLocal(
     read_activity_held: bool,
     expected_identity_namespace: ?db_mod.DocIdentityNamespace,
 ) !?db_mod.types.DocumentArtifactManifest {
+    return documentArtifactManifestProvisionedLocalControlled(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, consistency, read_activity_held, expected_identity_namespace, .{});
+}
+
+fn documentArtifactManifestProvisionedLocalControlled(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    read_safety_barrier: raft_mod.ReadSafetyBarrier,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
+    expected_identity_namespace: ?db_mod.DocIdentityNamespace,
+    opts: db_mod.types.LookupOptions,
+) !?db_mod.types.DocumentArtifactManifest {
     var owner = try provisionedLocalQueryDbOwnerPinned(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held, expected_identity_namespace);
     defer owner.deinit();
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
-    return try reads.documentArtifactManifestWithConsistency(alloc, owner.db(), doc_key, artifact_name, consistency);
+    return try reads.documentArtifactManifestWithConsistencyControlled(alloc, owner.db(), doc_key, artifact_name, consistency, opts);
 }
 
 fn documentArtifactManifestProvisionedHostedLocal(
@@ -12014,8 +12196,29 @@ fn documentArtifactManifestProvisionedHostedLocal(
     read_activity_held: bool,
     expected_identity_namespace: ?db_mod.DocIdentityNamespace,
 ) !?db_mod.types.DocumentArtifactManifest {
-    return documentArtifactManifestProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, consistency, read_activity_held, expected_identity_namespace) catch |err| switch (err) {
-        error.NotLeader => if (consistency == .stale) err else try documentArtifactManifestProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, .stale, read_activity_held, expected_identity_namespace),
+    return documentArtifactManifestProvisionedHostedLocalControlled(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, consistency, read_activity_held, expected_identity_namespace, .{});
+}
+
+fn documentArtifactManifestProvisionedHostedLocalControlled(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    read_safety_barrier: raft_mod.ReadSafetyBarrier,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
+    expected_identity_namespace: ?db_mod.DocIdentityNamespace,
+    opts: db_mod.types.LookupOptions,
+) !?db_mod.types.DocumentArtifactManifest {
+    return documentArtifactManifestProvisionedLocalControlled(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, consistency, read_activity_held, expected_identity_namespace, opts) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try documentArtifactManifestProvisionedLocalControlled(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, .stale, read_activity_held, expected_identity_namespace, opts),
         else => err,
     };
 }
@@ -14710,6 +14913,7 @@ fn encodeExplicitTextStatsRequestForSearchRequest(
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var top_first = true;
+    if (req.privacy_policy_version) |version| try appendJsonFieldString(alloc, &out, &top_first, "_privacy_policy_version", if (std.mem.allEqual(u8, &version, 0)) "none" else &version);
     if (req.native_query_cut) |cut| {
         try appendJsonFieldName(alloc, &out, &top_first, "_native_cut");
         const encoded_cut = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
@@ -14757,6 +14961,7 @@ fn encodeBackgroundTextStatsRequestForSearchRequest(
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var top_first = true;
+    if (req.privacy_policy_version) |version| try appendJsonFieldString(alloc, &out, &top_first, "_privacy_policy_version", if (std.mem.allEqual(u8, &version, 0)) "none" else &version);
     if (req.native_query_cut) |cut| {
         try appendJsonFieldName(alloc, &out, &top_first, "_native_cut");
         const encoded_cut = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
@@ -15456,6 +15661,13 @@ fn collectProvisionedHostedLocalTextStats(
     defer parsed.deinit(alloc);
     var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
     defer owner.deinit();
+    if (catalog.vtable.privacy_policy_binding != null or catalog.vtable.linearizable_table_routing_snapshot != null) {
+        const version = try capturePrivacyPolicyVersion(alloc, catalog, table_name, null);
+        if (!std.mem.allEqual(u8, &version, 0)) {
+            var summary = try owner.db().collectPlanningStats(alloc, .{ .privacy_policy_version = version }, 1);
+            summary.deinit(alloc);
+        }
+    }
     return switch (parsed) {
         .background_fields => blk: {
             const stats = try collectBackgroundTextStatsFromDbForRequest(alloc, owner.db(), parsed);
@@ -15487,6 +15699,13 @@ fn collectProvisionedHostedLocalAlgebraicPartials(
     defer parsed.deinit(alloc);
     var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
     defer owner.deinit();
+    if (catalog.vtable.privacy_policy_binding != null or catalog.vtable.linearizable_table_routing_snapshot != null) {
+        const version = try capturePrivacyPolicyVersion(alloc, catalog, table_name, null);
+        if (!std.mem.allEqual(u8, &version, 0)) {
+            var summary = try owner.db().collectPlanningStats(alloc, .{ .privacy_policy_version = version }, 1);
+            summary.deinit(alloc);
+        }
+    }
     const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, owner.db(), parsed);
     defer db_mod.algebraic.distributed.freePartials(alloc, partials);
     return .{ .json = try encodeAlgebraicPartialsResponse(alloc, partials) };
@@ -15851,6 +16070,8 @@ fn lookupRemote(
         opts.restore_staging_scope,
         opts.restore_staging_plan_id,
         opts.include_primary_digest,
+        opts.privacy_original,
+        opts.privacy_policy_version,
     ) catch |err| return if (err == error.ConcurrencyUnavailable)
         // Keep proven local scheduling pressure distinct from unavailable
         // peers/consistency failures for admission-aware primary prefetch.
@@ -15889,8 +16110,21 @@ fn documentArtifactManifestRemote(
     doc_key: []const u8,
     artifact_name: []const u8,
 ) !?db_mod.types.DocumentArtifactManifest {
+    return documentArtifactManifestRemoteControlled(executor, alloc, base_uri, group_id, table_name, doc_key, artifact_name, .{});
+}
+
+fn documentArtifactManifestRemoteControlled(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    opts: db_mod.types.LookupOptions,
+) !?db_mod.types.DocumentArtifactManifest {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupDocumentArtifactManifest(base_uri, group_id, table_name, doc_key, artifact_name);
+    var result = try client.fetchGroupDocumentArtifactManifestControlled(base_uri, group_id, table_name, doc_key, artifact_name, opts);
     defer result.deinit(alloc);
     return try parseStorageKernelDocumentArtifactManifestResponse(alloc, result.body);
 }
@@ -15976,6 +16210,17 @@ fn scanRemoteToSink(
         else => return err,
     };
     if (streamed) |handled| if (handled) return true;
+    // Metadata workers can use an executor without response streaming. A
+    // bounded value-free census is still one request over one owner snapshot;
+    // never paginate ordinary document reads to emulate that snapshot.
+    if (opts.privacy_status and opts.limit > 0 and opts.limit <= 100) {
+        var response = try streaming_client.fetchGroupScanControlled(base_uri, group_id, table_name, stream_body, timeout_ms, cancellation);
+        defer response.deinit(alloc);
+        _ = try scanRemainingTimeoutMs(opts);
+        try sink.start();
+        try sink.write(response.body);
+        return true;
+    }
     // Surface this as retryable availability rather than an internal error;
     // rolling deployments can recover as soon as the routed executor exposes
     // the snapshot-streaming capability.
@@ -16060,7 +16305,7 @@ fn queryResponseRemote(
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
     const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
-    const vector_body = try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, req);
+    const vector_body = if (req.privacy_policy_version != null and !std.mem.allEqual(u8, &req.privacy_policy_version.?, 0)) null else try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, req);
     const body = if (vector_body) |owned_vector_body|
         owned_vector_body
     else
@@ -16122,7 +16367,15 @@ fn textStatsRemote(
 ) !?query_api.QueryResponse {
     const bound = try @import("antfly_local_sources").api_table_read_source.bindNativeCutBodyAlloc(alloc, input, group_id);
     defer if (bound) |bytes| alloc.free(bytes);
-    const body = bound orelse input;
+    const unbound_body = bound orelse input;
+    const body = if (req.privacy_policy_version) |version| blk: {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, unbound_body, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        try parsed.value.object.put(alloc, "_privacy_policy_version", .{ .string = if (std.mem.allEqual(u8, &version, 0)) "none" else &version });
+        break :blk try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    } else try alloc.dupe(u8, unbound_body);
+    defer alloc.free(body);
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
@@ -16482,6 +16735,25 @@ fn encodeLookupFields(alloc: std.mem.Allocator, opts: db_mod.types.LookupOptions
     return try out.toOwnedSlice(alloc);
 }
 
+test "privacy scan continuations preserve empty keys through internal and owner codecs" {
+    const a = std.testing.allocator;
+    const opts = db_mod.types.ScanOptions{ .privacy_original = true, .privacy_status = true, .resume_from_key = true, .limit = 1 };
+    const raw = try encodeScanRequest(a, "", "", opts);
+    defer a.free(raw);
+    var trusted = try http_route_helpers.parseInternalScanKeysRequest(a, raw);
+    defer trusted.deinit(a);
+    try std.testing.expect(trusted.opts.resume_from_key and trusted.opts.privacy_status);
+    try std.testing.expectEqualStrings("", trusted.from);
+    var public = try http_route_helpers.parseScanKeysRequest(a, raw);
+    defer public.deinit(a);
+    try std.testing.expect(!public.opts.resume_from_key and !public.opts.privacy_status and !public.opts.privacy_original);
+    const packet = try encodeStorageKernelScanRequest(a, "", "", opts);
+    defer a.free(packet);
+    var decoded = try std.json.parseFromSlice(StorageKernelScanWireRequest, a, packet, .{});
+    defer decoded.deinit();
+    try std.testing.expect(decoded.value.options().resume_from_key);
+}
+
 fn encodeScanRequest(
     alloc: std.mem.Allocator,
     from_key: []const u8,
@@ -16508,6 +16780,12 @@ fn encodeScanRequest(
         try appendJsonFieldName(alloc, &out, &first, "filter_query");
         try out.appendSlice(alloc, opts.filter_query_json);
     }
+    if (opts.privacy_policy_version) |version| try appendJsonFieldString(alloc, &out, &first, "_privacy_policy_version", if (std.mem.allEqual(u8, &version, 0)) "none" else &version);
+    if (opts.privacy_original) try appendJsonFieldBool(alloc, &out, &first, "_privacy_original", true);
+    if (opts.privacy_status) try appendJsonFieldBool(alloc, &out, &first, "_privacy_status", true);
+    if (opts.resume_from_key) try appendJsonFieldBool(alloc, &out, &first, "_resume_from_key", true);
+    if (opts.inclusive_from) try appendJsonFieldBool(alloc, &out, &first, "inclusive_from", true);
+    if (opts.exclusive_to) try appendJsonFieldBool(alloc, &out, &first, "exclusive_to", true);
     if (opts.include_content_hashes) {
         try appendJsonFieldBool(alloc, &out, &first, "_include_content_hashes", true);
     }
@@ -16518,8 +16796,6 @@ fn encodeScanRequest(
             defer alloc.free(encoded);
             try out.appendSlice(alloc, encoded);
         } else try out.appendSlice(alloc, opts.relational_query_json);
-        try appendJsonFieldBool(alloc, &out, &first, "exclusive_to", opts.exclusive_to);
-        try appendJsonFieldBool(alloc, &out, &first, "inclusive_from", opts.inclusive_from);
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -17136,6 +17412,39 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "privacy source vtables retain static lifetime across capability selection" {
+            const Fake = struct {
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    unreachable;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+                    unreachable;
+                }
+                fn table(_: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    unreachable;
+                }
+            };
+            var context: u8 = 0;
+            const capable: table_catalog.CatalogSource = .{ .ptr = &context, .vtable = &.{ .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free, .linearizable_table_routing_snapshot = Fake.table } };
+            const legacy: table_catalog.CatalogSource = .{ .ptr = &context, .vtable = &.{ .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } };
+            inline for (.{ ProvisionedTableReadSource, HostedProvisionedTableReadSource }) |Provider| {
+                // source() only observes these capability fields. No provider
+                // callbacks, storage, router, or executor are invoked here.
+                var provider: Provider = undefined;
+                provider.catalog = capable;
+                provider.local_read_source = null;
+                const first = @call(.never_inline, Provider.source, .{&provider});
+                provider.catalog = legacy;
+                const second = @call(.never_inline, Provider.source, .{&provider});
+                try std.testing.expect(first.vtable != second.vtable);
+                try std.testing.expect(first.vtable.privacy_policy_version != null);
+                try std.testing.expect(second.vtable.privacy_policy_version == null);
+                provider.catalog = capable;
+                const again = @call(.never_inline, Provider.source, .{&provider});
+                try std.testing.expectEqual(first.vtable, again.vtable);
+            }
+        }
+
         test "relational statement retries unavailable capture and releases fences before pages or deadline" {
             const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
             const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
@@ -35464,4 +35773,21 @@ test "public graph metric borrowed wire scan producer sink preserves bytes and f
     // An already expired request fails before forwarding buffered bytes.
     capture.fail = false;
     try std.testing.expectError(error.DeadlineExceeded, writeBorrowedScanLine(entry, capture.sink(), .{ .execution_deadline_ns = 1 }));
+}
+
+fn capturePrivacyPolicyVersion(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, deadline: ?u64) ![64]u8 {
+    if (catalog.vtable.privacy_policy_binding) |capture| {
+        const binding = try capture(catalog.ptr, table_name, deadline);
+        try binding.validate();
+        return binding.policy_version;
+    }
+    // Foreign/test catalog adapters may only provide the older owned snapshot.
+    // First-party adapters use the compact capability above, including remotely.
+    const capture = catalog.vtable.linearizable_table_routing_snapshot orelse return error.PrivacyReadFenceUnavailable;
+    var snapshot = try capture(catalog.ptr, table_name, deadline);
+    defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+    const table = for (snapshot.tables) |*entry| {
+        if (std.mem.eql(u8, entry.name, table_name)) break entry;
+    } else return @splat(0);
+    return @import("antfly_local_sources").privacy_catalog.policyBinding(a, table.indexes_json);
 }

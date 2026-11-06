@@ -76,6 +76,7 @@ import QueryBuilder from "../components/querybuilder/QueryBuilder";
 import { QueryResultsList } from "../components/results";
 import SearchBoxBuilder from "../components/SearchBoxBuilder";
 import DocumentSchemasForm from "../components/schema-builder/DocumentSchemasForm";
+import { TablePrivacyPanel } from "../components/table/TablePrivacyPanel";
 import { DocumentArtifactsPanel } from "../components/table/DocumentArtifactsPanel";
 import { TableReprocessPanel } from "../components/table/TableReprocessPanel";
 import { useApi } from "../hooks/use-api-config";
@@ -863,6 +864,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     bulk: "Upload",
     "document-builder": "Manual Entry",
     artifacts: "Artifacts",
+    privacy: "Privacy",
     reprocess: "Reprocess",
   };
 
@@ -1575,6 +1577,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         {/* Manual Entry Section */}
         {currentSection === "document-builder" && (
           <DocumentBuilder tableName={tableName || ""} schema={tableSchema} />
+        )}
+
+        {currentSection === "privacy" && (
+          <TablePrivacyPanel key={tableName} tableName={tableName || ""} />
         )}
 
         {/* Artifacts Section */}

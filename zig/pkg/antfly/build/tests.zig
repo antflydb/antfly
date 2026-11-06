@@ -224,7 +224,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const batch_contract_tests = b.addTest(.{
         .name = "storage-batch-contract-tests",
         .root_module = batch_contract_mod,
-        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance" }),
+        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector", "privacy ordered artifact tombstone", "privacy base vectors", "privacy local source audit", "privacy base vector source updates", "privacy publication callback", "privacy independent roots", "privacy ID scans", "privacy discovery", "public graph metric borrowed wire document scan" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("storage-batch-contract-test", "Verify collector OOM ownership and bounded provider batches without HTTP discovery")
@@ -5311,6 +5311,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"system catalog standalone relation coordinator"},
     });
     b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+    const standalone_privacy_binding_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"privacy standalone compact bindings refresh on policy publication and survive progress"},
+    });
+    b.step("antfly-standalone-privacy-binding-test", "Verify compact privacy bindings across standalone publication and progress").dependOn(&addFilteredTestRunArtifact(b, standalone_privacy_binding_tests).step);
+    const standalone_cors_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"standalone CORS"},
+    });
+    b.step("antfly-standalone-cors-test", "Verify public CORS defaults and explicit operator overrides").dependOn(&addFilteredTestRunArtifact(b, standalone_cors_tests).step);
     const standalone_cdc_tests = b.addTest(.{
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"standalone cdc"},
@@ -5345,6 +5355,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
+            "privacy standalone progress retains routing and join planning generations",
+            "privacy standalone compact bindings refresh on policy publication and survive progress",
             "standalone metadata admission observes cancellation",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",

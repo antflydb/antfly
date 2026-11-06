@@ -73,3 +73,85 @@ test "appendSlicePossiblyAliased preserves self-referential sources across growt
 
     try std.testing.expectEqualStrings("abcdefbcde", list.items);
 }
+
+/// Compare long binary keys in fixed-width chunks, including in checked builds.
+/// Slice loads keep unaligned input safe; the first differing lane determines
+/// exactly the same unsigned lexicographic order as std.mem.order.
+pub fn orderBytes(lhs: []const u8, rhs: []const u8) std.math.Order {
+    const length = @min(lhs.len, rhs.len);
+    if (lhs.ptr == rhs.ptr) return std.math.order(lhs.len, rhs.len);
+    const width = 16;
+    var offset: usize = 0;
+    while (length - offset >= width) : (offset += width) {
+        const left: @Vector(width, u8) = lhs[offset..][0..width].*;
+        const right: @Vector(width, u8) = rhs[offset..][0..width].*;
+        if (std.simd.firstTrue(left != right)) |different| {
+            return std.math.order(lhs[offset + different], rhs[offset + different]);
+        }
+    }
+    const tail = std.mem.order(u8, lhs[offset..length], rhs[offset..length]);
+    return if (tail == .eq) std.math.order(lhs.len, rhs.len) else tail;
+}
+
+test "privacy binary key order matches scalar order across vector lanes alignment and tails" {
+    var lhs: [160]u8 = undefined;
+    var rhs: [160]u8 = undefined;
+    for (&lhs, 0..) |*byte, i| byte.* = @truncate(i * 37 + 11);
+    rhs = lhs;
+    for (0..17) |alignment| {
+        for (0..81) |length| {
+            const a = lhs[alignment..][0..length];
+            const b = rhs[alignment..][0..length];
+            try std.testing.expectEqual(std.mem.order(u8, a, b), orderBytes(a, b));
+            for (0..length) |different| {
+                rhs[alignment + different] ^= 0xff;
+                try std.testing.expectEqual(std.mem.order(u8, a, b), orderBytes(a, b));
+                try std.testing.expectEqual(std.mem.order(u8, b, a), orderBytes(b, a));
+                rhs[alignment + different] ^= 0xff;
+            }
+            for (0..length + 1) |prefix| {
+                try std.testing.expectEqual(std.mem.order(u8, a, a[0..prefix]), orderBytes(a, a[0..prefix]));
+                try std.testing.expectEqual(std.mem.order(u8, a, b[0..prefix]), orderBytes(a, b[0..prefix]));
+                try std.testing.expectEqual(std.mem.order(u8, b[0..prefix], a), orderBytes(b[0..prefix], a));
+            }
+        }
+    }
+}
+
+/// Exact shared-prefix length for unaligned binary slices. Checked builds
+/// inspect fixed-width chunks instead of issuing a branch for every byte.
+pub fn commonPrefixBytes(lhs: []const u8, rhs: []const u8) usize {
+    const length = @min(lhs.len, rhs.len);
+    if (lhs.ptr == rhs.ptr) return length;
+    const width = 16;
+    var offset: usize = 0;
+    while (length - offset >= width) : (offset += width) {
+        const left: @Vector(width, u8) = lhs[offset..][0..width].*;
+        const right: @Vector(width, u8) = rhs[offset..][0..width].*;
+        if (std.simd.firstTrue(left != right)) |different| return offset + different;
+    }
+    while (offset < length and lhs[offset] == rhs[offset]) : (offset += 1) {}
+    return offset;
+}
+
+test "privacy binary common prefix preserves lanes alignment tails and prefix slices" {
+    var lhs: [160]u8 = undefined;
+    for (&lhs, 0..) |*byte, i| byte.* = @truncate(i * 37 + 11);
+    var rhs = lhs;
+    for (0..17) |alignment| {
+        for (0..81) |length| {
+            const a = lhs[alignment..][0..length];
+            const b = rhs[alignment..][0..length];
+            try std.testing.expectEqual(length, commonPrefixBytes(a, b));
+            for (0..length) |different| {
+                rhs[alignment + different] ^= 0xff;
+                try std.testing.expectEqual(different, commonPrefixBytes(a, b));
+                rhs[alignment + different] ^= 0xff;
+            }
+            for (0..length + 1) |prefix| {
+                try std.testing.expectEqual(prefix, commonPrefixBytes(a, b[0..prefix]));
+                try std.testing.expectEqual(prefix, commonPrefixBytes(a[0..prefix], a));
+            }
+        }
+    }
+}
