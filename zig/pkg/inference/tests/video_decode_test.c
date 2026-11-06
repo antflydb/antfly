@@ -29,8 +29,10 @@ static int fake_reserve(void *user, unsigned width, unsigned height, unsigned su
 static void fake_release(void *user) {
     (void)user; assert(live_budgets); live_budgets--; releases++;
 }
+static unsigned caps_mask = 1;
+static cudaVideoSurfaceFormat created_format = cudaVideoSurfaceFormat_NV12;
 static CUresult CUDAAPI fake_caps(CUVIDDECODECAPS *c) {
-    c->bIsSupported = 1; c->nOutputFormatMask = 1;
+    c->bIsSupported = 1; c->nOutputFormatMask = caps_mask;
     c->nMinWidth = c->nMinHeight = 48;
     c->nMaxWidth = c->nMaxHeight = 4096; c->nMaxMBCount = 65536;
     return CUDA_SUCCESS;
@@ -38,7 +40,7 @@ static CUresult CUDAAPI fake_caps(CUVIDDECODECAPS *c) {
 static CUresult CUDAAPI fake_create(CUvideodecoder *out, CUVIDDECODECREATEINFO *c) {
     assert(c->ulNumDecodeSurfaces <= 32 && c->ulNumOutputSurfaces == 1);
     if (fail_create) return (CUresult)2; // simulated allocation failure
-    created_codec = c->CodecType;
+    created_codec = c->CodecType; created_format = c->OutputFormat;
     *out = (CUvideodecoder)(uintptr_t)1; creates++; return CUDA_SUCCESS;
 }
 static CUresult CUDAAPI fake_destroy(CUvideodecoder decoder) {
@@ -54,7 +56,8 @@ static CUresult CUDAAPI fake_unmap(CUvideodecoder decoder, unsigned long long de
 static CUresult CUDAAPI fake_status(CUvideodecoder decoder, int index, CUVIDGETDECODESTATUS *status) {
     (void)index; assert(decoder); status->decodeStatus = cuvidDecodeStatus_Success; return CUDA_SUCCESS;
 }
-static int fake_frame(void *user, uint64_t device, unsigned pitch, unsigned w, unsigned h, int64_t pts, unsigned matrix, unsigned full) {
+static int fake_frame(void *user, uint64_t device, unsigned pitch, unsigned w, unsigned h, int64_t pts, unsigned matrix, unsigned full, unsigned depth, unsigned transfer) {
+    (void)depth; (void)transfer;
     (void)user; (void)pitch; (void)w; (void)h; (void)pts; (void)matrix; (void)full;
     if (!device) return selection;
     consumes++; return consume_result;
@@ -76,7 +79,7 @@ static Decoder decoder(void) {
     Decoder d = {0};
     d.expected_width = 160; d.expected_height = 96;
     d.expected_codec = cudaVideoCodec_H264;
-    d.matrix_override = d.range_override = -1;
+    d.matrix_override = d.range_override = d.transfer_override = d.primaries_override = -1;
     d.reserve_budget = fake_reserve; d.release_budget = fake_release;
     d.caps = fake_caps; d.create_decoder = fake_create; d.destroy_decoder = fake_destroy;
     d.map = fake_map; d.unmap = fake_unmap; d.status = fake_status; d.frame = fake_frame;
@@ -122,8 +125,9 @@ int main(void) {
     for (unsigned i = 0; i < 9; i++) {
         d = decoder(); f = format();
         switch (i) {
-            case 0: f.video_signal_description.transfer_characteristics = 16; break;
-            case 1: f.video_signal_description.transfer_characteristics = 18; break;
+            // HDR needs a consistent gamut, as the portable policy does.
+            case 0: f.video_signal_description.transfer_characteristics = 16; f.video_signal_description.color_primaries = 5; break;
+            case 1: f.video_signal_description.transfer_characteristics = 18; f.video_signal_description.color_primaries = 5; break;
             case 2: f.video_signal_description.color_primaries = 9; break;
             case 3: f.display_aspect_ratio.x = 16; f.display_aspect_ratio.y = 9; break;
             case 4: f.min_num_decode_surfaces = 33; break;
@@ -134,6 +138,23 @@ int main(void) {
         }
         assert(sequence(&d, &f) == 0 && d.failed == 2 && !d.decoder);
     }
+
+    // Main 10 HDR decodes to P016 when the device offers it, and declines otherwise.
+    d = decoder(); f = format(); caps_mask = 3;
+    f.bit_depth_luma_minus8 = f.bit_depth_chroma_minus8 = 2;
+    f.video_signal_description.transfer_characteristics = 18;
+    f.video_signal_description.color_primaries = 9;
+    f.video_signal_description.matrix_coefficients = 9;
+    assert(sequence(&d, &f) == 4 && created_format == cudaVideoSurfaceFormat_P016 && d.bit_depth == 10 && d.transfer == 18);
+    fake_destroy(d.decoder); release_budget(&d);
+    d = decoder(); f.bit_depth_chroma_minus8 = 0;
+    assert(sequence(&d, &f) == 0 && d.failed == 2);
+    caps_mask = 1;
+    // A container SAR explains a bitstream aspect that would otherwise conflict.
+    d = decoder(); f = format(); d.sar_h = 5 * 96; d.sar_v = 3 * 160;
+    f.display_aspect_ratio.x = 5; f.display_aspect_ratio.y = 3;
+    assert(sequence(&d, &f) == 4);
+    fake_destroy(d.decoder); release_budget(&d);
 
     // Same-geometry clips may reuse surfaces only when their codecs match.
     const cudaVideoCodec codecs[] = {

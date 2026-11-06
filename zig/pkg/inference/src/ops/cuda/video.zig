@@ -29,7 +29,7 @@ const Callback = *const fn (*anyopaque, u64, u32, u32, u32, i64, u32, u32, u32, 
 extern fn antfly_nvdec_open(*?*anyopaque, ?*anyopaque, *anyopaque, Callback) c_int;
 extern fn antfly_nvdec_packet(*anyopaque, ?[*]const u8, u32, i64, c_int) c_int;
 extern fn antfly_nvdec_close(*anyopaque) void;
-extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int) c_int;
+extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32) c_int;
 extern fn antfly_nvdec_finish(*anyopaque) void;
 
 extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
@@ -419,7 +419,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         .av1 => 11,
         .mjpeg => return error.UnsupportedVideoFormat,
     };
-    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries));
+    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
     switch (track.codec) {
@@ -1180,7 +1180,7 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     var sampler = try EmbeddingSampler.init(1, 1_000_000, 1_000_000);
     sampler.repetitions = 3;
     state.embedding_sampler = sampler;
-    try std.testing.expectEqual(@as(c_int, 1), DecodeState.callback(&state, 1, 256, 160, 96, 0, 2, 0));
+    try std.testing.expectEqual(@as(c_int, 1), DecodeState.callback(&state, 1, 256, 160, 96, 0, 2, 0, 8, 2));
     try std.testing.expectEqual(@as(usize, 1), consumer.calls);
     try std.testing.expectEqual(@as(usize, 3), consumer.copies);
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);

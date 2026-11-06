@@ -40,6 +40,7 @@ typedef struct {
     unsigned surfaces, expected_width, expected_height;
     cudaVideoCodec codec, expected_codec;
     int display_left, display_top, matrix_override, range_override, transfer_override, primaries_override;
+    unsigned sar_h, sar_v;
     tcuvidCreateVideoParser *create_parser;
     tcuvidDestroyVideoParser *destroy_parser;
     tcuvidParseVideoData *parse;
@@ -87,6 +88,9 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
         f->coded_width > 4096 || f->coded_height > 4096 ||
         f->display_area.left < 0 || f->display_area.top < 0 ||
         f->display_area.right > (int)f->coded_width || f->display_area.bottom > (int)f->coded_height ||
+        // The container's SAR drives display geometry, so the bitstream must agree.
+        (f->display_aspect_ratio.x && f->display_aspect_ratio.y &&
+         (uint64_t)f->display_aspect_ratio.x * h * (d->sar_v ? d->sar_v : 1) != (uint64_t)f->display_aspect_ratio.y * w * (d->sar_h ? d->sar_h : 1)) ||
         (hdr ? !((matrix == 9 && primaries == 9) || (matrix == 1 && primaries == 1))
              : ((matrix != 1 && matrix != 2 && matrix != 5 && matrix != 6) ||
                 (primaries != 1 && primaries != 2 && primaries != 5 && primaries != 6) ||
@@ -197,13 +201,13 @@ int antfly_nvdec_open(Decoder **out, void *stream, void *user, frame_callback ca
 }
 // The previous request must have drained EOS before reuse. A new parser owns
 // the new stream's reference-picture state; compatible decoder surfaces persist.
-int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range, int transfer, int primaries) {
+int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range, int transfer, int primaries, unsigned sar_h, unsigned sar_v) {
     if (d->parser) return 3;
     if (codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC && codec != cudaVideoCodec_AV1) return 2;
     d->stream = stream; d->user = user; d->frame = callback;
     d->failed = 0; d->sequence_seen = 0;
     d->expected_width = width; d->expected_height = height; d->matrix_override = matrix; d->range_override = range;
-    d->transfer_override = transfer; d->primaries_override = primaries;
+    d->transfer_override = transfer; d->primaries_override = primaries; d->sar_h = sar_h; d->sar_v = sar_v;
     d->expected_codec = codec;
     CUVIDPARSERPARAMS p = {0};
     p.CodecType = codec; p.ulMaxNumDecodeSurfaces = 1;
