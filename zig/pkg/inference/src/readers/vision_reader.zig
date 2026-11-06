@@ -95,6 +95,7 @@ pub const LoadedVisionReader = struct {
                 session_manager.preferred_backends,
                 &.{ paths.encoder, paths.decoder },
             );
+            loader = loader.withArtifacts(&artifacts);
             var reader = try loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, preproc, &loader, null, control);
             errdefer reader.deinit();
             try artifacts.verify();

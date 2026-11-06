@@ -142,6 +142,7 @@ pub const LoadedMultiStageReader = struct {
             component_paths,
             .multistage_ocr,
         );
+        component_loader = component_loader.withArtifacts(&asset_resolver.published);
         var preflight = try PreflightAssets.load(
             allocator,
             &asset_resolver,

@@ -35,6 +35,116 @@ const model_compatibility = @import("../models/compatibility.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
 const gliner_specialty = @import("../models/gliner_specialty_qualification.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
+const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
+const ResolvedModel = @import("../registry/model_selection.zig").ResolvedModel;
+
+/// One cold construction owns its publication fence. Bundle callers can lend
+/// their verifier to share checksum proofs across graphs and backend retries.
+const ComponentConstruction = struct {
+    io: std.Io,
+    lease: @import("../registry/publication_lease.zig").Lease,
+    owned: ?PublishedArtifacts,
+    borrowed: ?*PublishedArtifacts,
+
+    fn init(a: std.mem.Allocator, io: std.Io, selected: ResolvedModel, control: ?InferenceExecutionControl, borrowed: ?*PublishedArtifacts) !ComponentConstruction {
+        if (control) |active| {
+            try active.check();
+            if (active.model_selection) |expected| {
+                if (!expected.matches(selected.path) or !std.meta.eql(expected.publication, selected.publication)) return error.ModelArtifactsChanging;
+            }
+        }
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(a, io, selected.path);
+        errdefer lease.deinit(io);
+        if (borrowed) |provided| {
+            if (!std.mem.eql(u8, provided.root, selected.path) or !std.meta.eql(provided.publication, selected.publication)) return error.ModelArtifactsChanging;
+            try selected.verify(a, io);
+            return .{ .io = io, .lease = lease, .owned = null, .borrowed = provided };
+        }
+        return .{ .io = io, .lease = lease, .owned = try PublishedArtifacts.init(a, io, selected.path, .{ .publication = selected.publication }), .borrowed = null };
+    }
+    fn artifacts(self: *ComponentConstruction) *PublishedArtifacts {
+        return self.borrowed orelse &self.owned.?;
+    }
+    fn verifyPath(self: *ComponentConstruction, path: []const u8) !void {
+        if (std.mem.endsWith(u8, path, ".onnx")) {
+            try self.artifacts().verifyOnnx(path);
+        } else if (std.mem.endsWith(u8, path, ".gguf") or std.mem.endsWith(u8, path, ".safetensors")) {
+            try self.artifacts().verifyPath(path);
+        }
+    }
+    fn verifyDirectory(self: *ComponentConstruction, path: []const u8, backend: backends.BackendType) !void {
+        if (self.artifacts().receipt == null or (try std.Io.Dir.cwd().statFile(self.io, path, .{})).kind != .directory) return;
+        // Directory components may select an ONNX primary too. Preserve
+        // native-format preference rather than authenticating an unused graph.
+        var man = try manifest_mod.loadFromDir(self.artifacts().allocator, path);
+        defer man.deinit();
+        if (backend == .wasm or !manifestHasNativeAssets(man)) {
+            if (man.onnx_path) |onnx| try self.artifacts().verifyOnnx(onnx);
+        }
+    }
+    fn finish(self: *ComponentConstruction) !void {
+        try self.artifacts().verify();
+    }
+    fn deinit(self: *ComponentConstruction) void {
+        if (self.owned) |*owned| owned.deinit();
+        self.lease.deinit(self.io);
+    }
+};
+
+/// Receipt membership is immutable within a publication. Cache positive and
+/// negative answers without retaining request memory or walking weight files
+/// on warm hits. Unmanaged directories deliberately bypass this cache.
+const MergedDecoderMembershipCache = struct {
+    const capacity = 128;
+    const Entry = struct { key: [32]u8, path: ?[]u8, used: u64 };
+    const Lookup = union(enum) { miss, hit: ?[]u8 };
+    mutex: std.atomic.Mutex = .unlocked,
+    builders: [8]std.atomic.Mutex = @splat(.unlocked),
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    clock: u64 = 0,
+
+    fn keyFor(selected: ResolvedModel) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&selected.binding().directory);
+        hash.update(&selected.publication.?);
+        return hash.finalResult();
+    }
+    fn get(self: *MergedDecoderMembershipCache, a: std.mem.Allocator, key: [32]u8) !Lookup {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, &entry.key, &key)) {
+            self.clock +|= 1;
+            entry.used = self.clock;
+            return .{ .hit = if (entry.path) |path| try a.dupe(u8, path) else null };
+        };
+        return .miss;
+    }
+    fn put(self: *MergedDecoderMembershipCache, a: std.mem.Allocator, key: [32]u8, path: ?[]const u8) !void {
+        const owned = if (path) |value| try a.dupe(u8, value) else null;
+        errdefer if (owned) |value| a.free(value);
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        self.clock +|= 1;
+        const next = Entry{ .key = key, .path = owned, .used = self.clock };
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, &entry.key, &key)) {
+            if (entry.path) |value| a.free(value);
+            entry.* = next;
+            return;
+        };
+        if (self.entries.items.len < capacity) return self.entries.append(a, next);
+        var oldest: usize = 0;
+        for (self.entries.items, 0..) |entry, i| if (entry.used < self.entries.items[oldest].used) {
+            oldest = i;
+        };
+        if (self.entries.items[oldest].path) |value| a.free(value);
+        self.entries.items[oldest] = next;
+    }
+    fn deinit(self: *MergedDecoderMembershipCache, a: std.mem.Allocator) void {
+        for (self.entries.items) |entry| if (entry.path) |path| a.free(path);
+        self.entries.deinit(a);
+    }
+};
+
 const safetensors_mod = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
@@ -3036,6 +3146,8 @@ pub const LoadedModel = struct {
             shared_ctx,
             &session_manager,
             control,
+            .{ .path = self.model_dir, .publication = self.managed_publication },
+            null,
         );
         defer loaded.deinit();
         try self.verifyOwnerPublication(control);
@@ -5079,6 +5191,7 @@ pub const ModelManager = struct {
         *ComponentPlanCacheEntry,
     ) = .empty,
     component_plan_cache_lock: std.atomic.Mutex = .unlocked,
+    merged_decoder_membership: MergedDecoderMembershipCache = .{},
     unhealthy_backend_lock: std.atomic.Mutex = .unlocked,
     unhealthy_model_backends: std.AutoHashMapUnmanaged(ModelBackendHealthKey, u64) = .empty,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
@@ -6424,11 +6537,34 @@ pub const ModelManager = struct {
         const PathDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
         manager: *ModelManager,
+        // Inline storage survives loader copies and heap-owned session pools.
+        owner_path: [std.fs.max_path_bytes]u8 = undefined,
+        owner_path_len: usize = 0,
+        owner_publication: ?[32]u8 = null,
+        borrowed_artifacts: ?*PublishedArtifacts = null,
         validated_generation: ?ComponentPlanKey = null,
         allowed_backends: [7]backends.BackendType = undefined,
         allowed_backend_count: usize = 0,
         component_path_digests: [max_component_paths]PathDigest = undefined,
         component_path_count: usize = 0,
+
+        fn bindOwner(self: *ComponentLoader, path: []const u8, publication: ?[32]u8) !void {
+            if (path.len > self.owner_path.len) return error.NameTooLong;
+            @memcpy(self.owner_path[0..path.len], path);
+            self.owner_path_len = path.len;
+            self.owner_publication = publication;
+        }
+        fn selection(self: *const ComponentLoader) !ResolvedModel {
+            if (self.owner_path_len == 0) return error.UnvalidatedModelComponent;
+            return .{ .path = self.owner_path[0..self.owner_path_len], .publication = self.owner_publication };
+        }
+        /// Synchronous bundle construction may reuse its artifact proofs.
+        /// sessionPoolLoader() drops this borrow before extending plan lifetime.
+        pub fn withArtifacts(self: ComponentLoader, artifacts: *PublishedArtifacts) ComponentLoader {
+            var result = self;
+            result.borrowed_artifacts = artifacts;
+            return result;
+        }
 
         pub fn preferredBackends(self: *const ComponentLoader) []const backends.BackendType {
             return self.allowed_backends[0..self.allowed_backend_count];
@@ -6480,6 +6616,8 @@ pub const ModelManager = struct {
                 self.preferredBackends(),
                 null,
                 null,
+                try self.selection(),
+                self.borrowed_artifacts,
             );
         }
 
@@ -6494,6 +6632,8 @@ pub const ModelManager = struct {
                 self.preferredBackends(),
                 null,
                 control,
+                try self.selection(),
+                self.borrowed_artifacts,
             );
         }
 
@@ -6508,6 +6648,8 @@ pub const ModelManager = struct {
                 self.preferredBackends(),
                 shared_backend_ctx,
                 null,
+                try self.selection(),
+                self.borrowed_artifacts,
             );
         }
 
@@ -6529,6 +6671,8 @@ pub const ModelManager = struct {
                 .allocator = self.manager.allocator,
                 .loader = self.*,
             };
+            // A pool can outlive the resolver that produced this plan.
+            context.loader.borrowed_artifacts = null;
             return .{
                 .context = context,
                 .load_fn = loadForSessionPool,
@@ -6695,6 +6839,7 @@ pub const ModelManager = struct {
         if (loader.component_path_count == 0) return error.IncompleteModelBundle;
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         defer man.deinit();
+        try loader.bindOwner(model_dir, man.managed_publication);
         const allowed = if (self.serving_policy) |policy| blk: {
             const key = componentPlanKey(
                 model_dir,
@@ -6833,6 +6978,8 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         control: ?InferenceExecutionControl,
+        selected: ResolvedModel,
+        borrowed: ?*PublishedArtifacts,
     ) !ManagedSession {
         return self.loadManagedSessionWithAdmissionUsingManager(
             model_path,
@@ -6840,6 +6987,8 @@ pub const ModelManager = struct {
             shared_backend_ctx,
             &self.session_manager,
             control,
+            selected,
+            borrowed,
         );
     }
 
@@ -6850,8 +6999,14 @@ pub const ModelManager = struct {
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         source_session_manager: *const backends.SessionManager,
         control: ?InferenceExecutionControl,
+        selected: ResolvedModel,
+        borrowed: ?*PublishedArtifacts,
     ) !ManagedSession {
         if (control) |active| try active.update(.loading_model, 0, 1);
+        const io = if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io;
+        var construction_proof = try ComponentConstruction.init(self.allocator, io, selected, control, borrowed);
+        defer construction_proof.deinit();
+        try construction_proof.verifyPath(model_path);
         var device_order_scratch: backends.BackendOrderBuffer = undefined;
         const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
         var required_backend_scratch: [1]backends.BackendType = undefined;
@@ -6869,6 +7024,7 @@ pub const ModelManager = struct {
         for (effective_backends) |backend| {
             if (control) |active| try active.check();
             if (!backend.supportsDirectSessionLoad()) continue;
+            try construction_proof.verifyDirectory(model_path, backend);
             if (shared_backend_ctx) |shared| {
                 if (shared.backendType() != backend) continue;
             }
@@ -6971,6 +7127,7 @@ pub const ModelManager = struct {
                         self,
                     );
                 }
+                try construction_proof.finish();
                 return loaded.take();
             } else |err| {
                 rememberPreferredLoadError(&first_err, err);
@@ -7451,6 +7608,7 @@ pub const ModelManager = struct {
         var component_plan_it = self.component_plan_cache.iterator();
         while (component_plan_it.next()) |entry| entry.value_ptr.*.release();
         self.component_plan_cache.deinit(self.allocator);
+        self.merged_decoder_membership.deinit(self.allocator);
         self.unhealthy_model_backends.deinit(self.allocator);
         var composite_assets_it = self.composite_assets.iterator();
         while (composite_assets_it.next()) |entry| {
@@ -7873,7 +8031,7 @@ pub const ModelManager = struct {
                 const selected = [_][]const u8{ component_paths[0], component_paths[2] };
                 // Optional graph support must not constrain fallback placement.
                 const loaded = blk: {
-                    var loader = self.componentLoaderForPaths(model_dir, preferred_backends, &selected) catch |err| break :blk err;
+                    var loader = (self.componentLoaderForPaths(model_dir, preferred_backends, &selected) catch |err| break :blk err).withArtifacts(&artifacts);
                     encoder = (if (control) |active| loader.loadWithControl(selected[0], active) else loader.load(selected[0])) catch |err| break :blk err;
                     var strict = loader.restrictToBackend(encoder.?.session.backend()) catch |err| break :blk err;
                     decoder = (if (control) |active| strict.loadWithControl(selected[1], active) else strict.load(selected[1])) catch |err| break :blk err;
@@ -7892,7 +8050,7 @@ pub const ModelManager = struct {
                 }
             }
             if (decoder == null) {
-                var loader = try self.componentLoaderForPaths(model_dir, preferred_backends, component_paths[0..2]);
+                var loader = (try self.componentLoaderForPaths(model_dir, preferred_backends, component_paths[0..2])).withArtifacts(&artifacts);
                 encoder = if (control) |active| try loader.loadWithControl(component_paths[0], active) else try loader.load(component_paths[0]);
                 var strict = try loader.restrictToBackend(encoder.?.session.backend());
                 decoder = if (control) |active| try strict.loadWithControl(component_paths[1], active) else try strict.load(component_paths[1]);
@@ -8160,28 +8318,62 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !CompositeAssetsHandle {
         if (control) |active| try active.check();
+        const publication = try self.publicationForRequest(model_dir, control);
         if (kind != .whisper_metadata and component_paths.len == 2 and std.mem.endsWith(u8, component_paths[1], ".onnx")) {
-            if (try encoder_decoder.findMergedDecoder(self.allocator, model_dir)) |candidate| {
+            if (try self.findMergedDecoderCached(model_dir, control)) |candidate| {
                 defer self.allocator.free(candidate);
                 if (!std.mem.eql(u8, candidate, component_paths[1])) {
                     const planned = [_][]const u8{ component_paths[0], component_paths[1], candidate };
                     // The runtime single-flight pins metadata-only selection.
                     // Artifact identity includes the optional graph; backend
                     // policy is applied only to the selected executable pair.
-                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, preferred_backends, model_type, kind, control) catch |err| switch (err) {
+                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, preferred_backends, model_type, kind, control, publication) catch |err| switch (err) {
                         error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => {
                             // Planning can reject a graph before its constructor
                             // runs. Compatibility fallback must not conceal a
                             // corrupt receipt-listed graph or external tensor.
                             try self.verifyOptionalOnnxForFallback(model_dir, candidate, control);
-                            return self.acquireCompositeRuntimePlanned(model_dir, component_paths, preferred_backends, model_type, kind, control);
+                            return self.acquireCompositeRuntimePlanned(model_dir, component_paths, preferred_backends, model_type, kind, control, publication);
                         },
                         else => return err,
                     };
                 }
             }
         }
-        return self.acquireCompositeRuntimePlanned(model_dir, component_paths, preferred_backends, model_type, kind, control);
+        return self.acquireCompositeRuntimePlanned(model_dir, component_paths, preferred_backends, model_type, kind, control, publication);
+    }
+
+    fn findMergedDecoderCached(self: *ModelManager, model_dir: []const u8, supplied: ?InferenceExecutionControl) !?[]const u8 {
+        const io = if (supplied) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io;
+        const control = supplied orelse InferenceExecutionControl{ .io = io };
+        try control.check();
+        const selected = ResolvedModel{ .path = model_dir, .publication = try self.publicationForRequest(model_dir, supplied) };
+        const key: ?[32]u8 = if (selected.publication != null) MergedDecoderMembershipCache.keyFor(selected) else null;
+        var builder: ?*std.atomic.Mutex = null;
+        defer if (builder) |mutex| mutex.unlock();
+        if (key) |value| {
+            switch (try self.merged_decoder_membership.get(self.allocator, value)) {
+                .hit => |path| return path,
+                .miss => {},
+            }
+            const mutex = &self.merged_decoder_membership.builders[value[0] % self.merged_decoder_membership.builders.len];
+            try control.lockWithPoll(mutex, 100 * std.time.ns_per_us);
+            builder = mutex;
+            switch (try self.merged_decoder_membership.get(self.allocator, value)) {
+                .hit => |path| return path,
+                .miss => {},
+            }
+        }
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer lease.deinit(io);
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = selected.publication });
+        defer artifacts.deinit();
+        const path = try encoder_decoder.findMergedDecoderWithArtifacts(&artifacts);
+        errdefer if (path) |value| self.allocator.free(value);
+        try artifacts.verify();
+        try control.check();
+        if (key) |value| self.merged_decoder_membership.put(self.allocator, value, path) catch {};
+        return path;
     }
 
     fn verifyOptionalOnnxForFallback(self: *ModelManager, model_dir: []const u8, path: []const u8, control: ?InferenceExecutionControl) !void {
@@ -8194,8 +8386,8 @@ pub const ModelManager = struct {
         try artifacts.verify();
     }
 
-    fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, preferred_backends: []const backends.BackendType, model_type: manifest_mod.ModelType, kind: CompositeKind, control: ?InferenceExecutionControl) !CompositeAssetsHandle {
-        const publication = try self.publicationForRequest(model_dir, control);
+    fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, preferred_backends: []const backends.BackendType, model_type: manifest_mod.ModelType, kind: CompositeKind, control: ?InferenceExecutionControl, publication: ?[32]u8) !CompositeAssetsHandle {
+        if (!std.meta.eql(publication, try self.publicationForRequest(model_dir, control))) return error.ModelArtifactsChanging;
         var handle = try self.acquireCompositeRuntimePlannedInner(model_dir, component_paths, preferred_backends, model_type, kind, control, publication);
         errdefer handle.release();
         if (!std.meta.eql(publication, handle.get().managed_publication)) return error.ModelArtifactsChanging;
@@ -8289,7 +8481,8 @@ pub const ModelManager = struct {
     ) !void {
         const assets = handle.get();
         const current = if (assets.considered_merged_decoder and component_paths.len == 2) blk: {
-            const candidate = try encoder_decoder.findMergedDecoder(self.allocator, model_dir) orelse return error.ModelArtifactsChanging;
+            const selected = ResolvedModel{ .path = model_dir, .publication = assets.managed_publication };
+            const candidate = try self.findMergedDecoderCached(model_dir, selected.bind(InferenceExecutionControl{ .io = self.session_manager.io orelse std.Options.debug_io })) orelse return error.ModelArtifactsChanging;
             defer self.allocator.free(candidate);
             break :blk try self.compositeRuntimeKey(model_dir, &.{ component_paths[0], component_paths[1], candidate }, assets.kind, assets.preferred_backends, assets.model_type);
         } else try self.compositeRuntimeKey(model_dir, component_paths, assets.kind, assets.preferred_backends, assets.model_type);
@@ -11317,8 +11510,8 @@ fn loadSessionForPreferredBackends(
     control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
     if (control) |active| try active.check();
-    var artifacts: ?@import("../registry/published_artifacts.zig").PublishedArtifacts = null;
-    defer if (artifacts) |*published| published.deinit();
+    var proof: ?ComponentConstruction = null;
+    defer if (proof) |*construction| construction.deinit();
     var verified_onnx_path: ?[]const u8 = null;
     var device_order_scratch: backends.BackendOrderBuffer = undefined;
     const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
@@ -11373,15 +11566,16 @@ fn loadSessionForPreferredBackends(
         if (std.mem.endsWith(u8, candidate_path, ".onnx") and
             (verified_onnx_path == null or !std.mem.eql(u8, verified_onnx_path.?, candidate_path)))
         {
-            if (artifacts == null) artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(
+            if (proof == null) proof = try ComponentConstruction.init(
                 manager.allocator,
                 if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io,
-                model_dir,
-                .{ .publication = man.managed_publication },
+                .{ .path = model_dir, .publication = man.managed_publication },
+                control,
+                null,
             );
             // Integrity failures terminate the load rather than selecting a
             // different backend that would reopen the same unauthenticated data.
-            try artifacts.?.verifyOnnx(candidate_path);
+            try proof.?.verifyPath(candidate_path);
             verified_onnx_path = candidate_path;
         }
         if (control) |active| try active.updateDetail(
@@ -11515,7 +11709,7 @@ fn loadSessionForPreferredBackends(
             // keeping the construction peak leased until preparation drains.
             try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
             try session_factory.prepareLayaResident(loaded.session, control);
-            if (artifacts) |*published| try published.verify();
+            if (proof) |*construction| try construction.finish();
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             return loaded.take();
         } else |err| {
@@ -11992,7 +12186,7 @@ test "optional session adoption owns rollback and transfers admission exactly on
         manager.configureServingPolicy(.{ .allow_unknown = true });
         manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
         try manager.ensureResourceOwnerReady();
-        var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null);
+        var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null);
         defer primary.deinit();
         const baseline = manager.admissionController().snapshot();
         var model: LoadedModel = undefined;
@@ -12051,11 +12245,11 @@ test "component construction arms cancellation before backend entry and releases
     };
     var boundary = Boundary{ .manager = &manager };
     for (0..3) |_| {
-        try std.testing.expectError(error.ProcessIsolationRequired, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{}));
+        try std.testing.expectError(error.ProcessIsolationRequired, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{}, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null));
         try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
         try std.testing.expectError(error.OutOfMemory, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{
             .hard_cancellation = .{ .ptr = &boundary, .arm_fn = Boundary.arm, .disarm_fn = Boundary.disarm },
-        }));
+        }, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null));
         try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
     }
     try std.testing.expectEqual(@as(usize, 3), boundary.arms);
@@ -12081,7 +12275,7 @@ test "managed constructors retain cooperative fallback without a process boundar
     defer man.deinit();
     for ([_]bool{ false, true }) |component| {
         var loaded = if (component)
-            try manager.loadManagedSessionWithAdmission(root, &.{ .metal, .native }, null, .{})
+            try manager.loadManagedSessionWithAdmission(root, &.{ .metal, .native }, null, .{}, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null)
         else
             try loadSessionForPreferredBackends(&manager, &.{ .metal, .native }, root, man, &manager.session_manager, .{});
         try std.testing.expectEqual(backends.BackendType.native, loaded.session.backend());
@@ -16518,7 +16712,7 @@ test "model selection lazy optional component retains primary publication" {
     sm.preferred_backends = &.{.native};
     var manager = ModelManager.init(a, sm);
     defer manager.deinit();
-    var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null);
+    var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null, .{ .path = root, .publication = try managed_receipt.publicationGeneration(a, std.testing.io, root) }, null);
     defer primary.deinit();
     var model: LoadedModel = undefined;
     model.managed_publication = publication_a;
@@ -16836,4 +17030,259 @@ test "model selection primary ONNX requires receipted external weights and verif
     defer corrupt_manager.deinit();
     corrupt_manager.configureServingPolicy(.{ .allow_unknown = true });
     try std.testing.expectError(error.ChecksumMismatch, corrupt_manager.acquireFromDirWithControl(root, included_control));
+}
+
+test "model selection lazy ONNX sessions enforce graph and external tensor receipts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const weight = try b.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.add(input, weight));
+    const values = [_]f32{ 2, 4, 6, 8 };
+    var exported = try onnx_graph.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&values) } }} }, "unlisted.data");
+    defer exported.deinit(a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "optional.onnx", .data = exported.model_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "unlisted.data", .data = exported.external_data.?.bytes });
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "gguf", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.gguf", .size = (try tmp.dir.statFile(io, "model.gguf", .{})).size }, .{ .path = "optional.onnx", .size = exported.model_bytes.len } } }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const optional = try tmp.dir.realPathFileAlloc(io, "optional.onnx", a);
+    defer a.free(optional);
+    const selected = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process });
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, control, selected, null);
+    defer primary.deinit();
+    var model: LoadedModel = undefined;
+    model.managed_publication = selected.publication;
+    model.model_dir = root;
+    model.allocator = a;
+    model.session = primary.session;
+    model.session_manager = &manager.session_manager;
+    model.model_manager = &manager;
+    model.kernel_jit_profile_bundle = null;
+    var slot: ?backends.Session = null;
+    var lease: ?runtime.tier.memory.AdmissionLease = null;
+    defer if (lease) |*held| held.release();
+    defer if (slot) |session| session.close();
+    const before = manager.currentAdmissionAmounts();
+    for ([_]DeclaredOptionalSessionKind{ .vision, .audio, .text_projection, .visual_projection, .audio_projection }) |kind| {
+        try std.testing.expectError(error.InvalidManagedDownload, model.ensureOptionalSessionWithControl(kind, &slot, &lease, optional, control));
+        try std.testing.expect(slot == null and lease == null);
+        try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(exported.external_data.?.bytes, &digest, .{});
+    const complete = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "gguf", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.gguf", .size = (try tmp.dir.statFile(io, "model.gguf", .{})).size }, .{ .path = "optional.onnx", .size = exported.model_bytes.len }, .{ .path = "unlisted.data", .size = exported.external_data.?.bytes.len, .sha256 = std.fmt.bytesToHex(digest, .lower) } } }, .{});
+    defer a.free(complete);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = complete });
+    try std.testing.expectError(error.ModelArtifactsChanging, model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, optional, control));
+    const current = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const current_control = current.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process });
+    var current_primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, current_control, current, null);
+    defer current_primary.deinit();
+    model.managed_publication = current.publication;
+    model.session = current_primary.session;
+    try std.testing.expect(try model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, optional, current_control));
+    var tensor = try backends.Tensor.initFloat32(a, "input", &.{4}, &.{ 0, 0, 0, 0 });
+    defer tensor.deinit();
+    const outputs = try slot.?.runWithControl(&.{tensor}, a, current_control);
+    defer {
+        for (outputs) |*output| output.deinit();
+        a.free(outputs);
+    }
+    try std.testing.expectEqualSlices(f32, &values, outputs[0].asFloat32());
+    // Bundle loaders reuse checksum proofs across component construction.
+    const Opens = struct {
+        var count: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.endsWith(u8, path, "unlisted.data")) count += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var table = io.vtable.*;
+    Opens.original = table.dirOpenFile;
+    table.dirOpenFile = Opens.open;
+    const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+    {
+        var published = try PublishedArtifacts.init(a, counted, root, .{ .publication = current.publication });
+        defer published.deinit();
+        const plan = (try manager.componentLoaderForPaths(root, &.{.native}, &.{optional})).withArtifacts(&published);
+        Opens.count = 0;
+        for (0..2) |_| {
+            var loaded = try plan.loadWithControl(optional, current_control);
+            loaded.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), Opens.count);
+    }
+    // A lazy pool owns the path/proof and cannot retain a transient resolver.
+    var pool_loader = blk: {
+        const transient_root = try a.dupe(u8, root);
+        defer a.free(transient_root);
+        var published = try PublishedArtifacts.init(a, io, root, .{ .publication = current.publication });
+        defer published.deinit();
+        const plan = (try manager.componentLoaderForPaths(transient_root, &.{.native}, &.{optional})).withArtifacts(&published);
+        break :blk try plan.sessionPoolLoader();
+    };
+    defer pool_loader.deinit();
+    var pooled = try pool_loader.load(optional);
+    defer pooled.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "unlisted.onnx", .data = exported.model_bytes });
+    const unlisted = try tmp.dir.realPathFileAlloc(io, "unlisted.onnx", a);
+    defer a.free(unlisted);
+    var absent: ?backends.Session = null;
+    var absent_lease: ?runtime.tier.memory.AdmissionLease = null;
+    try std.testing.expectError(error.InvalidManagedDownload, model.ensureOptionalSessionWithControl(.vision, &absent, &absent_lease, unlisted, current_control));
+    try std.testing.expect(absent == null and absent_lease == null);
+    const corrupt = try a.dupe(u8, exported.external_data.?.bytes);
+    defer a.free(corrupt);
+    corrupt[0] ^= 1;
+    const external_path = try tmp.dir.realPathFileAlloc(io, "unlisted.data", a);
+    defer a.free(external_path);
+    try @import("../registry/download.zig").writeFileAtomically(a, io, external_path, corrupt);
+    // The already materialized generation stays usable; a new cold component
+    // cannot adopt bytes that disagree with that generation's receipt.
+    try std.testing.expect(!try model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, optional, current_control));
+    var fresh: ?backends.Session = null;
+    var fresh_lease: ?runtime.tier.memory.AdmissionLease = null;
+    try std.testing.expectError(error.ChecksumMismatch, model.ensureOptionalSessionWithControl(.vision, &fresh, &fresh_lease, optional, current_control));
+    try std.testing.expect(fresh == null and fresh_lease == null);
+    const replacement = try a.dupe(u8, complete);
+    defer a.free(replacement);
+    const pin = std.mem.indexOf(u8, replacement, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").?;
+    @memset(replacement[pin..][0..40], 'b');
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = replacement });
+    try std.testing.expectError(error.ModelArtifactsChanging, pool_loader.load(optional));
+}
+
+test "model selection warm merged membership has constant filesystem work and tracks receipts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Probe = struct {
+        var count: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirStatFile") = undefined;
+        fn stat(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+            count += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var small_count: ?usize = null;
+    for ([_]usize{ 8, 512 }) |count| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const Artifact = struct { path: []const u8, size: u64 = 4 };
+        const entries = try alloc.alloc(Artifact, count);
+        for (entries, 0..) |*entry, i| {
+            const name = if (i == 0) "encoder_model.onnx" else try std.fmt.allocPrint(alloc, "aux-{d}.bin", .{i});
+            entry.* = .{ .path = name };
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "data" });
+        }
+        const receipt = try std.json.Stringify.valueAlloc(alloc, .{ .version = @as(u32, 2), .artifacts = entries }, .{});
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+        var table = io.vtable.*;
+        Probe.original = table.dirStatFile;
+        table.dirStatFile = Probe.stat;
+        const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+        var sm = backends.SessionManager.initWithIo(a, counted);
+        sm.preferred_backends = &.{.native};
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+        Probe.count = 0;
+        for (0..10) |_| try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+        if (small_count) |expected| {
+            try std.testing.expectEqual(expected, Probe.count);
+        } else small_count = Probe.count;
+        std.debug.print("warm merged membership artifacts={d} stat_calls={d}\n", .{ count, Probe.count });
+        // Adding an unlisted file must not change a cached negative answer.
+        try tmp.dir.writeFile(io, .{ .sub_path = "decoder_model_merged.onnx", .data = "data" });
+        try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+        const expanded = try alloc.alloc(Artifact, entries.len + 1);
+        @memcpy(expanded[0..entries.len], entries);
+        expanded[entries.len] = .{ .path = "decoder_model_merged.onnx" };
+        const complete = try std.json.Stringify.valueAlloc(alloc, .{ .version = @as(u32, 2), .artifacts = expanded }, .{});
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = complete });
+        const path = (try manager.findMergedDecoderCached(root, null)).?;
+        defer a.free(path);
+        try std.testing.expect(std.mem.endsWith(u8, path, "decoder_model_merged.onnx"));
+        Probe.count = 0;
+        const warm = (try manager.findMergedDecoderCached(root, null)).?;
+        a.free(warm);
+        try std.testing.expectEqual(small_count.? / 10, Probe.count);
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+    }
+}
+
+test "model selection merged membership remains bounded and legacy misses remain discoverable" {
+    const a = std.testing.allocator;
+    var cache: MergedDecoderMembershipCache = .{};
+    defer cache.deinit(a);
+    for (0..MergedDecoderMembershipCache.capacity * 2) |i| {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(std.mem.asBytes(&i));
+        try cache.put(a, hash.finalResult(), if (i % 2 == 0) "decoder.onnx" else null);
+    }
+    try std.testing.expectEqual(@as(usize, MergedDecoderMembershipCache.capacity), cache.entries.items.len);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "decoder_model_merged.onnx", .data = "data" });
+    const found = (try manager.findMergedDecoderCached(root, null)).?;
+    defer a.free(found);
+    try std.testing.expectEqual(@as(usize, 0), manager.merged_decoder_membership.entries.items.len);
+}
+
+test "model selection merged membership cancellation releases its cold builder gate" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_model.onnx", .data = "data" });
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data =
+        \\{"version":2,"artifacts":[{"path":"encoder_model.onnx","size":4}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const key = MergedDecoderMembershipCache.keyFor(selected);
+    const builder = &manager.merged_decoder_membership.builders[key[0] % manager.merged_decoder_membership.builders.len];
+    try std.testing.expect(builder.tryLock());
+    const Cancel = struct {
+        var calls: usize = 0;
+        fn check(_: ?*anyopaque) !void {
+            calls += 1;
+            if (calls > 1) return error.Canceled;
+        }
+    };
+    Cancel.calls = 0;
+    try std.testing.expectError(error.Canceled, manager.findMergedDecoderCached(root, selected.bind(InferenceExecutionControl{ .io = io, .check_fn = Cancel.check })));
+    builder.unlock();
+    try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+    try std.testing.expect(builder.tryLock());
+    builder.unlock();
 }
