@@ -390,24 +390,12 @@ fn createAdmittedModelExecutorWithAllocator(
 /// Compute the union once at load time. Runtimes preallocate cache entries and
 /// replace by semantic identity, even when phases use different binding names.
 fn retainedCapacity(a: std.mem.Allocator, prefill: []const pjrt_executor.PjrtSemanticOutputBinding, variants: []const pjrt_executor.PjrtModelExecutor.DecodeVariant) !usize {
-    const Key = struct { layer: ?u32, kind: pjrt_executor.PjrtRetainedBufferKind, name: []const u8 };
-    const Context = struct {
-        pub fn hash(_: @This(), key: Key) u64 {
-            var h = std.hash.Wyhash.init(0);
-            if (key.layer) |layer| h.update(std.mem.asBytes(&layer)) else h.update(key.name);
-            h.update(std.mem.asBytes(&key.kind));
-            return h.final();
-        }
-        pub fn eql(_: @This(), a_key: Key, b_key: Key) bool {
-            return a_key.layer == b_key.layer and a_key.kind == b_key.kind and
-                (a_key.layer != null or std.mem.eql(u8, a_key.name, b_key.name));
-        }
-    };
-    var keys: std.HashMapUnmanaged(Key, void, Context, 80) = .empty;
+    const Identity = @import("pjrt_kv_identity.zig").Identity;
+    var keys: std.HashMapUnmanaged(Identity, void, Identity.Context, 80) = .empty;
     defer keys.deinit(a);
-    for (prefill) |binding| try keys.put(a, .{ .layer = binding.layer_index, .kind = binding.kind, .name = binding.name }, {});
+    for (prefill) |binding| try keys.put(a, binding.identity(), {});
     for (variants) |variant| for (variant.semantic_output_bindings) |binding| {
-        try keys.put(a, .{ .layer = binding.layer_index, .kind = binding.kind, .name = binding.name }, {});
+        try keys.put(a, binding.identity(), {});
     };
     return keys.count();
 }
@@ -702,7 +690,7 @@ fn buildSemanticOutputBindings(
         if (binding.name.len == 0) return error.MissingArtifactMetadata;
         const output_index = findOutputBindingIndex(output_node_ids, binding.node_id) orelse return error.MissingArtifactMetadata;
         for (out.items) |existing| {
-            if (existing.output_index == output_index) return error.MissingArtifactMetadata;
+            if (existing.output_index == output_index or existing.identity().eql(binding.kvIdentity().?)) return error.MissingArtifactMetadata;
         }
         try out.ensureUnusedCapacity(allocator, 1);
         const name = try allocator.dupe(u8, binding.name);
@@ -979,4 +967,12 @@ test "managed PJRT capacity keeps layerless named states distinct" {
         .{ .output_index = 3, .name = "decode", .layer_index = 0, .kind = .key },
     };
     try std.testing.expectEqual(@as(usize, 3), try retainedCapacity(std.testing.allocator, &bindings, &.{}));
+}
+
+test "managed PJRT rejects duplicate logical output state" {
+    const bindings = [_]compiled_artifact.PjrtOutputBindingMeta{
+        .{ .kind = compiled_artifact.pjrt_binding_present_key, .node_id = 1, .layer_index = 0, .name = "one" },
+        .{ .kind = compiled_artifact.pjrt_binding_present_key, .node_id = 2, .layer_index = 0, .name = "two" },
+    };
+    try std.testing.expectError(error.MissingArtifactMetadata, buildSemanticOutputBindings(std.testing.allocator, &.{ 1, 2 }, &bindings));
 }

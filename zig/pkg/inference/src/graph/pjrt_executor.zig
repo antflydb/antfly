@@ -121,8 +121,9 @@ pub const PjrtExecutor = struct {
             if (owned_input_bufs[i]) buf.deinit();
         };
 
+        var semantic_inputs = try SemanticInputCursor.init(semantic_input_bindings, num_inputs);
         for (self.input_bindings, 0..) |binding, i| {
-            if (findSemanticInputBinding(semantic_input_bindings, i)) |semantic_binding| {
+            if (semantic_inputs.at(i)) |semantic_binding| {
                 const cache = retained_cache orelse {
                     if (debug) {
                         std.log.warn(
@@ -672,16 +673,17 @@ fn inputBindingsRequireHostMaterialization(input_bindings: []const compiler.Inpu
     return false;
 }
 
-pub const PjrtRetainedBufferKind = enum {
-    key,
-    value,
-};
+pub const PjrtRetainedBufferKind = @import("pjrt_kv_identity.zig").Kind;
+const KvIdentity = @import("pjrt_kv_identity.zig").Identity;
 
 pub const PjrtSemanticOutputBinding = struct {
     output_index: usize,
     name: []const u8,
     layer_index: ?u32,
     kind: PjrtRetainedBufferKind,
+    pub fn identity(self: @This()) KvIdentity {
+        return .{ .layer_index = self.layer_index, .kind = self.kind, .name = self.name };
+    }
 };
 
 pub const PjrtSemanticInputBinding = struct {
@@ -689,6 +691,9 @@ pub const PjrtSemanticInputBinding = struct {
     name: []const u8,
     layer_index: ?u32,
     kind: PjrtRetainedBufferKind,
+    pub fn identity(self: @This()) KvIdentity {
+        return .{ .layer_index = self.layer_index, .kind = self.kind, .name = self.name };
+    }
 };
 
 pub const PjrtRetainedBufferCache = struct {
@@ -707,6 +712,9 @@ pub const PjrtRetainedBufferCache = struct {
         layer_index: ?u32,
         kind: PjrtRetainedBufferKind,
         buffer: pjrt_lib.pjrt.Buffer,
+        fn identity(self: @This()) KvIdentity {
+            return .{ .layer_index = self.layer_index, .kind = self.kind, .name = self.name };
+        }
     };
 
     pub fn init(allocator: Allocator) PjrtRetainedBufferCache {
@@ -752,7 +760,6 @@ pub const PjrtRetainedBufferCache = struct {
             const index = self.semantic_index[slot];
             return if (index == 0) null else &self.entries.items[index - 1].buffer;
         }
-        if (self.get(binding.name)) |buffer| return buffer;
         for (self.entries.items) |*entry| {
             if (retainedEntryMatchesSemanticInput(entry.*, binding)) return &entry.buffer;
         }
@@ -777,13 +784,11 @@ pub const PjrtRetainedBufferCache = struct {
     }
 
     fn semanticSlot(self: *const @This(), name: []const u8, layer: ?u32, kind: PjrtRetainedBufferKind) usize {
-        var h = std.hash.Wyhash.init(0);
-        if (layer) |value| h.update(std.mem.asBytes(&value)) else h.update(name);
-        h.update(std.mem.asBytes(&kind));
-        var slot = h.final() % self.semantic_index.len;
+        const identity = KvIdentity{ .name = name, .layer_index = layer, .kind = kind };
+        var slot = identity.hash() % self.semantic_index.len;
         while (self.semantic_index[slot] != 0) : (slot = (slot + 1) % self.semantic_index.len) {
             const entry = self.entries.items[self.semantic_index[slot] - 1];
-            if (entry.layer_index == layer and entry.kind == kind and (layer != null or std.mem.eql(u8, entry.name, name))) break;
+            if (entry.identity().eql(identity)) break;
         }
         return slot;
     }
@@ -792,7 +797,7 @@ pub const PjrtRetainedBufferCache = struct {
         const indexed_slot: ?usize = if (!owns_name and self.semantic_index.len != 0) self.semanticSlot(name, layer_index, kind) else null;
         const candidates = if (indexed_slot) |slot| if (self.semantic_index[slot] == 0) self.entries.items[0..0] else self.entries.items[self.semantic_index[slot] - 1 .. self.semantic_index[slot]] else self.entries.items;
         for (candidates) |*entry| {
-            const matches = if (owns_name) std.mem.eql(u8, entry.name, name) else entry.layer_index == layer_index and entry.kind == kind and (layer_index != null or std.mem.eql(u8, entry.name, name));
+            const matches = entry.identity().eql(.{ .layer_index = layer_index, .kind = kind, .name = name });
             if (!matches) continue;
             entry.buffer.deinit();
             if (entry.owns_name) self.allocator.free(entry.name);
@@ -825,7 +830,7 @@ fn retainedEntryMatchesSemanticInput(
     entry: PjrtRetainedBufferCache.Entry,
     binding: PjrtSemanticInputBinding,
 ) bool {
-    return entry.kind == binding.kind and entry.layer_index == binding.layer_index and (binding.layer_index != null or std.mem.eql(u8, entry.name, binding.name));
+    return entry.identity().eql(binding.identity());
 }
 
 pub const PjrtModelExecutor = struct {
@@ -1140,8 +1145,9 @@ const PjrtModelRuntime = struct {
     }
 
     fn materializeGraphInputs(self: *PjrtModelRuntime, values: []?CT, phase: Phase) !void {
+        var semantic_inputs = try SemanticInputCursor.init(phase.semantic_input_bindings, phase.executor.input_bindings.len);
         for (phase.executor.input_bindings, 0..) |binding, input_index| {
-            if (findSemanticInputBinding(phase.semantic_input_bindings, input_index) != null) continue;
+            if (semantic_inputs.at(input_index) != null) continue;
             switch (binding) {
                 .graph_node => |node_id| {
                     if (node_id >= values.len) return error.MissingArtifactMetadata;
@@ -1799,12 +1805,30 @@ fn findSemanticOutputBinding(bindings: []const PjrtSemanticOutputBinding, output
     return null;
 }
 
-fn findSemanticInputBinding(bindings: []const PjrtSemanticInputBinding, input_index: usize) ?PjrtSemanticInputBinding {
-    for (bindings) |binding| {
-        if (binding.input_index == input_index) return binding;
+/// Bindings are sorted once by the owner. Each forward pass traverses them
+/// alongside input positions, including sparse semantic inputs, in O(inputs +
+/// bindings) time. Validation keeps direct low-level callers from silently
+/// executing with duplicate, unordered, or out-of-range binding metadata.
+const SemanticInputCursor = struct {
+    bindings: []const PjrtSemanticInputBinding,
+    position: usize = 0,
+
+    fn init(bindings: []const PjrtSemanticInputBinding, num_inputs: usize) !@This() {
+        for (bindings, 0..) |binding, i| {
+            if (binding.input_index >= num_inputs or (i > 0 and bindings[i - 1].input_index >= binding.input_index)) return error.MissingArtifactMetadata;
+        }
+        return .{ .bindings = bindings };
     }
-    return null;
-}
+
+    // Called with increasing input positions by both execution passes.
+    fn at(self: *@This(), input_index: usize) ?PjrtSemanticInputBinding {
+        if (self.position == self.bindings.len) return null;
+        const binding = self.bindings[self.position];
+        if (binding.input_index != input_index) return null;
+        self.position += 1;
+        return binding;
+    }
+};
 
 pub fn detectInputMaterialization(
     input_bindings: []const compiler.InputBinding,
@@ -1838,6 +1862,14 @@ fn cloneSemanticInputBindings(
             .kind = binding.kind,
         };
         initialized += 1;
+    }
+    std.mem.sort(PjrtSemanticInputBinding, out, {}, struct {
+        fn lessThan(_: void, a: PjrtSemanticInputBinding, b: PjrtSemanticInputBinding) bool {
+            return a.input_index < b.input_index;
+        }
+    }.lessThan);
+    for (out, 0..) |binding, i| {
+        if (i > 0 and out[i - 1].input_index == binding.input_index) return error.MissingArtifactMetadata;
     }
     return out;
 }
@@ -1976,8 +2008,9 @@ test "PJRT semantic binding helper detects backend owned state with semantic cac
         PjrtInputMaterialization.backend_owned_state,
         detectInputMaterialization(&no_graph_inputs, &semantic_input_bindings, &semantic_output_bindings),
     );
-    try std.testing.expect(findSemanticInputBinding(&semantic_input_bindings, 1) != null);
-    try std.testing.expect(findSemanticInputBinding(&semantic_input_bindings, 0) == null);
+    var cursor = try SemanticInputCursor.init(&semantic_input_bindings, 2);
+    try std.testing.expect(cursor.at(0) == null);
+    try std.testing.expect(cursor.at(1) != null);
 }
 
 test "PJRT semantic cache bindings still report host-assisted when graph inputs remain" {
@@ -2129,4 +2162,52 @@ test "managed PJRT semantic index resolves collisions without allocation" {
         try std.testing.expect(cache.getForSemanticInput(.{ .input_index = 0, .name = "absent", .layer_index = 999, .kind = .key }) == null);
         cache.clear();
     }
+}
+
+test "managed PJRT semantic cursor traverses sparse inputs once" {
+    var bindings: [1024]PjrtSemanticInputBinding = undefined;
+    for (&bindings, 0..) |*binding, i| binding.* = .{ .input_index = i * 3 + 1, .name = "past", .layer_index = @intCast(i), .kind = .key };
+    var cursor = try SemanticInputCursor.init(&bindings, 3073);
+    for (0..3073) |i| {
+        const binding = cursor.at(i);
+        if (i % 3 == 1) try std.testing.expectEqual(i, binding.?.input_index) else try std.testing.expect(binding == null);
+    }
+    try std.testing.expectEqual(bindings.len, cursor.position);
+    try std.testing.expectError(error.MissingArtifactMetadata, SemanticInputCursor.init(&bindings, 100));
+    bindings[1].input_index = bindings[0].input_index;
+    try std.testing.expectError(error.MissingArtifactMetadata, SemanticInputCursor.init(&bindings, 3073));
+}
+
+test "managed PJRT binding clones canonicalize order and reject duplicates" {
+    const Scenario = struct {
+        fn run(a: Allocator) !void {
+            var bindings = [_]PjrtSemanticInputBinding{
+                .{ .input_index = 4, .name = "last", .layer_index = 1, .kind = .key },
+                .{ .input_index = 1, .name = "first", .layer_index = 0, .kind = .key },
+            };
+            const result = try cloneSemanticInputBindings(a, &bindings);
+            defer freeSemanticInputBindings(a, result);
+            var cursor = try SemanticInputCursor.init(result, 5);
+            try std.testing.expect(cursor.at(0) == null);
+            try std.testing.expectEqualStrings("first", cursor.at(1).?.name);
+            bindings[1].input_index = 4;
+            const duplicate = cloneSemanticInputBindings(a, &bindings) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.MissingArtifactMetadata, err);
+                return;
+            };
+            freeSemanticInputBindings(a, duplicate);
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "managed PJRT KV identity hashing agrees with equality" {
+    const a = KvIdentity{ .name = "prefill", .layer_index = 0, .kind = .key };
+    const b = KvIdentity{ .name = "past", .layer_index = 0, .kind = .key };
+    try std.testing.expect(a.eql(b));
+    try std.testing.expectEqual(a.hash(), b.hash());
+    try std.testing.expect(!(KvIdentity{ .name = "a", .layer_index = null, .kind = .key }).eql(.{ .name = "b", .layer_index = null, .kind = .key }));
+    try std.testing.expect(!a.eql(.{ .name = "prefill", .layer_index = 0, .kind = .value }));
 }

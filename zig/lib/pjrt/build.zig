@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
     const test_files = [_][]const u8{
         "src/hlo.zig",
         "src/pjrt.zig",
+        "src/abi_test.zig",
     };
 
     for (test_files) |file| {
@@ -66,6 +67,10 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "xla_proto", .module = xla_proto_mod },
             },
         });
+        if (std.mem.eql(u8, file, "src/abi_test.zig")) {
+            mod.addIncludePath(b.path("vendor/openxla"));
+            mod.addCSourceFile(.{ .file = b.path("src/abi_test.c"), .flags = &.{"-std=c11"} });
+        }
         const t = b.addTest(.{ .root_module = mod });
         t.root_module.link_libc = true;
         test_step.dependOn(&b.addRunArtifact(t).step);

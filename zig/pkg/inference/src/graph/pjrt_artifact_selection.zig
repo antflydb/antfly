@@ -128,14 +128,14 @@ pub fn kvShapesCompatible(source: artifact.Manifest, target: artifact.Manifest) 
         const present_kind = if (std.mem.eql(u8, input.kind, artifact.pjrt_binding_past_key)) artifact.pjrt_binding_present_key else if (std.mem.eql(u8, input.kind, artifact.pjrt_binding_past_value)) artifact.pjrt_binding_present_value else continue;
         var found = false;
         for (source.pjrt_output_bindings) |output| {
-            if (output.layer_index != input.layer_index or !std.mem.eql(u8, output.kind, present_kind)) continue;
+            if (!std.mem.eql(u8, output.kind, present_kind) or !output.kvIdentity().?.eql(input.kvIdentity().?)) continue;
+            if (found) return false; // Two outputs cannot own the same state.
             for (source.pjrt_output_node_ids, source.pjrt_output_shapes) |node, output_shape| {
                 if (node != output.node_id) continue;
                 if (!std.mem.eql(i64, output_shape, shape)) return false;
                 found = true;
                 break;
             }
-            if (found) break;
         }
         if (!found) return false;
     }
@@ -463,4 +463,39 @@ test "managed PJRT streaming inspection skips unrelated large fields before full
             try std.testing.expectEqual(@as(usize, 0), quota.largest_rejected_growth);
         }
     }
+}
+
+test "managed PJRT layerless chain compatibility uses the runtime identity" {
+    var small = [_]i64{1};
+    var large = [_]i64{2};
+    var outputs = [_][]i64{ &small, &large };
+    var inputs = [_][]i64{&large};
+    var nodes = [_]u32{ 1, 2 };
+    var present = [_]artifact.PjrtOutputBindingMeta{
+        .{ .kind = artifact.pjrt_binding_present_key, .node_id = 1, .name = "state.a" },
+        .{ .kind = artifact.pjrt_binding_present_key, .node_id = 2, .name = "state.b" },
+    };
+    var past = [_]artifact.PjrtInputBindingMeta{.{ .kind = artifact.pjrt_binding_past_key, .node_id = 3, .name = "state.b" }};
+    var source = artifact.Manifest{ .backend = "xla", .kind = "pjrt_executable", .model_dir = "model", .artifact_path = "unused", .prompt_tokens = 1, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill", .raw_prompt = true, .chat_template_applied = false, .pjrt_output_shapes = &outputs, .pjrt_output_node_ids = &nodes, .pjrt_output_bindings = &present };
+    var target = source;
+    target.pjrt_input_shapes = &inputs;
+    target.pjrt_input_bindings = &past;
+    // The first output has a different identity and shape; skip it.
+    try std.testing.expect(kvShapesCompatible(source, target));
+    past[0].name = "state.missing";
+    try std.testing.expect(!kvShapesCompatible(source, target));
+    past[0].name = "state.a";
+    try std.testing.expect(!kvShapesCompatible(source, target));
+    past[0].name = "state.b";
+    source.pjrt_output_bindings = present[0..1];
+    try std.testing.expect(!kvShapesCompatible(source, target));
+    source.pjrt_output_bindings = &present;
+    // Layered phase aliases remain compatible regardless of name.
+    past[0].layer_index = 7;
+    present[1].layer_index = 7;
+    past[0].name = "past.alias";
+    try std.testing.expect(kvShapesCompatible(source, target));
+    // Ambiguous sources cannot share one logical state.
+    present[0].layer_index = 7;
+    try std.testing.expect(!kvShapesCompatible(source, target));
 }

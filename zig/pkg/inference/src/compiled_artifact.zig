@@ -102,6 +102,12 @@ pub const PjrtValueBindingMeta = struct {
     node_id: u32,
     name: []const u8 = "",
     layer_index: ?u32 = null,
+
+    pub fn kvIdentity(self: @This()) ?@import("graph/pjrt_kv_identity.zig").Identity {
+        const Kind = @import("graph/pjrt_kv_identity.zig").Kind;
+        const kind: Kind = if (std.mem.eql(u8, self.kind, pjrt_binding_past_key) or std.mem.eql(u8, self.kind, pjrt_binding_present_key)) .key else if (std.mem.eql(u8, self.kind, pjrt_binding_past_value) or std.mem.eql(u8, self.kind, pjrt_binding_present_value)) .value else return null;
+        return .{ .layer_index = self.layer_index, .name = self.name, .kind = kind };
+    }
 };
 
 pub const PjrtInputBindingMeta = PjrtValueBindingMeta;

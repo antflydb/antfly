@@ -973,7 +973,7 @@ test "compiled memory statistics honor API extent and reject unknown sizes" {
     };
     var api = std.mem.zeroes(c.Api);
     api.struct_size = @sizeOf(c.Api);
-    api._fns[41] = @ptrCast(&Fake.destroy);
+    api._fns[40] = @ptrCast(&Fake.destroy);
     api._fns[51] = @ptrCast(&Fake.get);
     api._fns[96] = @ptrCast(&Fake.stats);
     const executable = LoadedExecutable{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .num_outputs = 1 };
@@ -1073,7 +1073,7 @@ test "serialize releases both caller-owned PJRT handles on allocation failure" {
     };
     var api = std.mem.zeroes(c.Api);
     api.struct_size = @sizeOf(c.Api);
-    api._fns[41] = @ptrCast(&Fake.destroy);
+    api._fns[40] = @ptrCast(&Fake.destroy);
     api._fns[51] = @ptrCast(&Fake.get);
     api._fns[49] = @ptrCast(&Fake.serialize);
     api._fns[56] = @ptrCast(&Fake.deserialize);
@@ -1081,7 +1081,7 @@ test "serialize releases both caller-owned PJRT handles on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fake.scenario, .{executable});
     try std.testing.expectEqual(@as(usize, 0), Fake.owned);
     try std.testing.expectEqual(@as(usize, 0), Fake.serialized);
-    api._fns[41] = null;
+    api._fns[40] = null;
     try std.testing.expectError(error.UnsupportedPjrtFeature, executable.serialize(std.testing.allocator));
 }
 

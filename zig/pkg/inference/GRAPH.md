@@ -621,3 +621,15 @@ KV identity is `(layer_index, kind)` when a layer is supplied and `(name, kind)`
 otherwise. Admitted runtime slots preallocate a semantic hash index alongside
 retained entries; KV lookup and replacement require no per-step allocation and
 have expected constant cost per binding. Reset clears both entries and the index.
+
+The PJRT wrapper's function slots and executable argument layouts are checked
+against an independently vendored upstream C header by `zig/lib/pjrt`'s
+`zig build test`. The provider fixture must use the upstream table order; matching
+hand-written wrapper and fixture numbers alone do not establish ABI compatibility.
+
+KV selection, shape compatibility, cache capacity, and runtime lookup share the
+same identity implementation. Layerless names must match across phases; layered
+names may differ. A phase cannot give two outputs ownership of one logical KV
+state. Semantic input bindings are canonicalized by input position when cloned.
+Execution validates this ordering and traverses sparse bindings alongside inputs
+in linear time, without creating an index or copying names on each step.
