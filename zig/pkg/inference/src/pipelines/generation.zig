@@ -20742,12 +20742,14 @@ test "LightOnOCR3 packed prefix publication separates device choices host logits
     // or leave an intermediate chunk waiting. Invalid GPU IDs fail the whole
     // claim before any result is published.
     for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+        var decode_state = NativeDecodeState.initContiguous(a);
+        defer decode_state.deinit();
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
         var sampled = P.PendingPrefillBatchWork{ .allocator = if (mode == 1) failing.allocator() else a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = true };
         defer if (sampled.logits) |values| sampled.allocator.free(values);
         var greedy = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = mode != 3, .wants_greedy = true };
         var middle = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = undefined, .token_ids = &.{}, .seq_len = 1, .query_seq_len = 1, .wants_last_logits = false };
-        var decode = P.PendingDecodeBatchWork{ .allocator = a, .decode_state = undefined, .token_id = 0, .seq_len = 1, .wants_greedy = true };
+        var decode = P.PendingDecodeBatchWork{ .allocator = a, .decode_state = &decode_state, .token_id = 0, .seq_len = 1, .wants_greedy = true };
         const Item = runtime.scheduler.native_generate.StepItem;
         const items = [_]Item{
             .{ .work_ptr = &sampled, .phase = .prefill, .query_sequence_len = 1, .total_sequence_len = 1, .kv_sequence_len = 1, .kv_position_offset = 0 },
