@@ -4334,17 +4334,22 @@ const SileroWeightCache = struct {
         prior.owner.release();
     }
     fn trimIdle(self: *SileroWeightCache, a: std.mem.Allocator) void {
-        var i: usize = 0;
-        while (i < self.entries.items.len) {
-            const entry = self.entries.items[i];
-            if (entry.owner.refs.load(.acquire) != 1) {
-                i += 1;
-                continue;
+        _ = self.reclaimIdle(a, std.math.maxInt(usize));
+    }
+    fn reclaimIdle(self: *SileroWeightCache, a: std.mem.Allocator, target_bytes: usize) usize {
+        var released: usize = 0;
+        while (released < target_bytes) {
+            var oldest: ?usize = null;
+            for (self.entries.items, 0..) |entry, i| {
+                if (entry.owner.refs.load(.acquire) != 1) continue;
+                if (oldest == null or entry.used < self.entries.items[oldest.?].used) oldest = i;
             }
-            _ = self.entries.swapRemove(i);
+            const entry = self.entries.swapRemove(oldest orelse break);
+            released +|= silero_vad_mod.residentWeightBytes(&entry.owner.weights);
             a.free(entry.path);
             entry.owner.release();
         }
+        return released;
     }
     fn deinit(self: *SileroWeightCache, a: std.mem.Allocator) void {
         for (self.entries.items) |entry| {
@@ -4352,6 +4357,25 @@ const SileroWeightCache = struct {
             entry.owner.release();
         }
         self.entries.deinit(a);
+    }
+};
+
+// Stable callback context from initialization through teardown, even when
+// Node moves after init. Admission never waits for a request's cache lock.
+const HostCaches = struct {
+    allocator: std.mem.Allocator,
+    media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
+    silero_weights: SileroWeightCache = .{},
+    silero_weights_lock: std.atomic.Mutex = .unlocked,
+
+    fn reclaim(raw: *anyopaque, target_bytes: usize) usize {
+        const self: *HostCaches = @ptrCast(@alignCast(raw));
+        var freed = @import("../pipelines/media_index_cache.zig").Cache.reclaim(&self.media_index_cache, target_bytes);
+        if (freed < target_bytes and self.silero_weights_lock.tryLock()) {
+            defer self.silero_weights_lock.unlock();
+            freed +|= self.silero_weights.reclaimIdle(self.allocator, target_bytes - freed);
+        }
+        return freed;
     }
 };
 
@@ -4372,7 +4396,7 @@ pub const Node = struct {
     extraction_reader_resolver: extractors_mod.ReaderResolver,
     tabular_registry: tabular_mod.registry.Registry,
     embed_cache: cache_mod.ResultCache([]const f32),
-    media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
+    host_caches: *HostCaches,
     media_audio_plan_store: @import("../pipelines/media_audio_plan.zig").Store = .{},
     media_speaker_store: @import("../pipelines/media_speaker_state.zig").Store = .{},
     speaker_flights: @import("../pipelines/media_speaker_flights.zig").Registry = .{},
@@ -4383,10 +4407,7 @@ pub const Node = struct {
     inference_admission: inference_admission_mod.InferenceAdmission,
     /// Live streaming transcription sessions (voice API).
     transcription_sessions: transcription_sessions.Registry,
-    /// Bounded idle VAD residency by installation. Requests and streaming
-    /// sessions retain their own generation independently of eviction.
-    silero_weights: SileroWeightCache = .{},
-    silero_weights_lock: std.Io.Mutex = .init,
+    /// Coalesce cold VAD construction independently of the warm cache lock.
     silero_load_lock: std.atomic.Mutex = .unlocked,
     speaker_models: @import("../pipelines/speaker_model_cache.zig").Cache = .{},
     /// Lazily allocates only while compatible native executor work is queued.
@@ -4547,7 +4568,11 @@ pub const Node = struct {
             selector_cache.deinit();
             allocator.destroy(selector_cache);
         }
+        const host_caches = try allocator.create(HostCaches);
+        host_caches.* = .{ .allocator = allocator };
+        errdefer allocator.destroy(host_caches);
         var node: Node = .{
+            .host_caches = host_caches,
             .cuda_device_budget_owner = cuda_owner,
             .config = config,
             .allocator = allocator,
@@ -4564,6 +4589,7 @@ pub const Node = struct {
             .compatibility_cache = .empty,
             .hard_cancellation_watchdog = hard_cancellation_watchdog,
         };
+        node.model_manager.setHostCacheReclaimer(.{ .context = host_caches, .reclaim = HostCaches.reclaim });
         try node.model_manager.configureResourceOwnership(config.resource_ownership);
         node.model_manager.configureProcessMemoryLimit(
             config.process_memory_limit_bytes,
@@ -4675,12 +4701,13 @@ pub const Node = struct {
         }
         self.fixed_chunk_runtime.deinit();
         self.model_manager.setHostCacheReclaimer(null);
-        self.media_index_cache.deinit();
+        self.host_caches.media_index_cache.deinit();
         self.speaker_flights.deinit(self.allocator);
         self.speaker_revision_cache.deinit(self.allocator);
         // Release session-owned PCM and VAD residency before runtime teardown.
         self.transcription_sessions.deinit();
-        self.silero_weights.deinit(self.allocator);
+        self.host_caches.silero_weights.deinit(self.allocator);
+        self.allocator.destroy(self.host_caches);
         self.speaker_models.deinit(self.allocator);
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
@@ -14407,7 +14434,6 @@ pub const Node = struct {
 
     fn chunkAndEmbedAdmitted(self: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, supplied_request: @import("../pipelines/media_chunking.zig").Request, target: @import("chunk_response.zig").Target, sink: @import("../pipelines/media_chunking.zig").Sink) anyerror!@import("chunk_response.zig").Execution {
         var request = supplied_request;
-        self.model_manager.setHostCacheReclaimer(.{ .context = &self.media_index_cache, .reclaim = @import("../pipelines/media_index_cache.zig").Cache.reclaim });
         const IndexAdmission = struct {
             fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
                 const manager: *model_manager_mod.ModelManager = @ptrCast(@alignCast(raw));
@@ -14415,7 +14441,7 @@ pub const Node = struct {
             }
         };
         request.audio_plan_store = .{ .store = &self.media_audio_plan_store, .io = io, .models_dir = self.config.models_dir };
-        request.index_cache = &self.media_index_cache;
+        request.index_cache = &self.host_caches.media_index_cache;
         request.index_cache_admission = .{ .context = &self.model_manager, .acquire = IndexAdmission.acquire };
         if (request.outputs) |outputs_config| if (request.output_executor == null) {
             var consumers = try MediaOutputExecution.init(self, a, io, supplied, outputs_config, request.allow_partial);
@@ -23348,18 +23374,18 @@ pub const Node = struct {
         defer ctx.allocator.free(model_path);
         try model_path_selection.verify(ctx.allocator, ctx.io);
         {
-            try self.silero_weights_lock.lock(ctx.io);
-            defer self.silero_weights_lock.unlock(ctx.io);
-            if (self.silero_weights.get(model_path, model_path_selection.publication)) |owner| return owner;
+            try control.lockWithPoll(&self.host_caches.silero_weights_lock, 100 * std.time.ns_per_us);
+            defer self.host_caches.silero_weights_lock.unlock();
+            if (self.host_caches.silero_weights.get(model_path, model_path_selection.publication)) |owner| return owner;
         }
         // Serialize cold constructors while warm hits use only the short
         // ownership lock. No disk IO or model parsing holds that lock.
         try control.lockWithPoll(&self.silero_load_lock, 100 * std.time.ns_per_us);
         defer self.silero_load_lock.unlock();
         {
-            try self.silero_weights_lock.lock(ctx.io);
-            defer self.silero_weights_lock.unlock(ctx.io);
-            if (self.silero_weights.get(model_path, model_path_selection.publication)) |owner| return owner;
+            try control.lockWithPoll(&self.host_caches.silero_weights_lock, 100 * std.time.ns_per_us);
+            defer self.host_caches.silero_weights_lock.unlock();
+            if (self.host_caches.silero_weights.get(model_path, model_path_selection.publication)) |owner| return owner;
         }
         var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(ctx.allocator, ctx.io, model_path);
         defer publication_lease.deinit(ctx.io);
@@ -23377,13 +23403,7 @@ pub const Node = struct {
             const size = (try std.Io.Dir.cwd().statFile(ctx.io, path, .{})).size;
             if (size > 64 * 1024 * 1024) return error.FileTooLarge;
             const peak = @as(usize, @intCast(size)) * 4 + 8 * 1024 * 1024;
-            admission = self.model_manager.admitHostWeights(peak) catch |err| blk: {
-                if (err != error.ResourceTemporarilyUnavailable) return err;
-                try self.silero_weights_lock.lock(ctx.io);
-                self.silero_weights.trimIdle(self.allocator);
-                self.silero_weights_lock.unlock(ctx.io);
-                break :blk try self.model_manager.admitHostWeights(peak);
-            };
+            admission = try self.model_manager.admitHostWeights(peak);
             const bytes = artifacts.read(candidate, 64 * 1024 * 1024) catch |err| switch (err) {
                 error.FileNotFound => return error.ModelArtifactsChanging,
                 else => return err,
@@ -23402,9 +23422,9 @@ pub const Node = struct {
         errdefer self.allocator.destroy(owned);
         try admission.?.retain(.{ .host_weight_bytes = silero_vad_mod.residentWeightBytes(&weights) });
         owned.* = .{ .allocator = self.allocator, .weights = weights, .admission = admission };
-        try self.silero_weights_lock.lock(ctx.io);
-        defer self.silero_weights_lock.unlock(ctx.io);
-        try self.silero_weights.put(self.allocator, model_path, model_path_selection.publication, owned);
+        try control.lockWithPoll(&self.host_caches.silero_weights_lock, 100 * std.time.ns_per_us);
+        defer self.host_caches.silero_weights_lock.unlock();
+        try self.host_caches.silero_weights.put(self.allocator, model_path, model_path_selection.publication, owned);
         owned.retain(); // The request owns a reference separate from the cache.
         return owned;
     }
@@ -48173,13 +48193,13 @@ const MediaOutputExecution = struct {
             state.timeline.max_blocks = (budget / groups - @sizeOf(SpeakerState) - root_bytes) / @sizeOf(speaker_checkpoint.timeline.Block);
             if (!cacheable) continue;
             var memory_hit = false;
-            if (self.node.media_index_cache.get(identity)) |entry| {
-                defer if (state.borrowed != entry) self.node.media_index_cache.release(entry);
+            if (self.node.host_caches.media_index_cache.get(identity)) |entry| {
+                defer if (state.borrowed != entry) self.node.host_caches.media_index_cache.release(entry);
                 if (entry.data == .speaker_analysis) {
                     memory_hit = true;
                     if (entry.data.speaker_analysis.complete) try state.borrowComplete(self.allocator, entry) else try state.restore(self.allocator, entry.data.speaker_analysis);
                     state.memory_window = state.next_window;
-                    state.disk_cursor = self.node.media_index_cache.speakerDisk(identity);
+                    state.disk_cursor = self.node.host_caches.media_index_cache.speakerDisk(identity);
                     state.disk_window = if (state.disk_cursor) |cursor| cursor.window else 0;
                 }
             }
@@ -48191,9 +48211,9 @@ const MediaOutputExecution = struct {
             } else |_| {};
             if (state.registry.count > self.config.targets[i].speakerConfig().max_speakers) return error.InvalidSpeakerCheckpoint;
             if (state.next_window > state.memory_window) {
-                self.node.media_index_cache.remember(std.heap.smp_allocator, identity, .{ .speaker_analysis = state.snapshot(provider.sample_rate) }, self.speaker_cache_admission.?);
+                self.node.host_caches.media_index_cache.remember(std.heap.smp_allocator, identity, .{ .speaker_analysis = state.snapshot(provider.sample_rate) }, self.speaker_cache_admission.?);
                 state.memory_window = state.next_window;
-                if (state.disk_cursor) |cursor| self.node.media_index_cache.recordSpeakerDisk(identity, cursor);
+                if (state.disk_cursor) |cursor| self.node.host_caches.media_index_cache.recordSpeakerDisk(identity, cursor);
             }
         }
         self.speakers_prepared = true;
@@ -48269,13 +48289,13 @@ const MediaOutputExecution = struct {
         }
         for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
             if (!self.leader(i) or !state.cacheable or self.enough(state, start, end, stop_at_turn)) continue;
-            if (self.node.media_index_cache.get(state.identity)) |entry| {
-                defer self.node.media_index_cache.release(entry);
+            if (self.node.host_caches.media_index_cache.get(state.identity)) |entry| {
+                defer self.node.host_caches.media_index_cache.release(entry);
                 if (entry.data == .speaker_analysis and entry.data.speaker_analysis.next_window > state.next_window) {
                     try state.restore(self.allocator, entry.data.speaker_analysis);
                     state.memory_window = state.next_window;
                 }
-                state.disk_cursor = self.node.media_index_cache.speakerDisk(state.identity);
+                state.disk_cursor = self.node.host_caches.media_index_cache.speakerDisk(state.identity);
                 state.disk_window = if (state.disk_cursor) |cursor| cursor.window else state.disk_window;
             }
         };
@@ -48382,10 +48402,10 @@ const MediaOutputExecution = struct {
             if (!self.leader(i) or !state.valid or !state.cacheable or state.next_window == 0) continue;
             const snapshot = state.snapshot(provider.sample_rate);
             if (state.next_window > state.memory_window) {
-                self.node.media_index_cache.remember(std.heap.smp_allocator, state.identity, .{ .speaker_analysis = snapshot }, self.speaker_cache_admission.?);
+                self.node.host_caches.media_index_cache.remember(std.heap.smp_allocator, state.identity, .{ .speaker_analysis = snapshot }, self.speaker_cache_admission.?);
                 state.memory_window = state.next_window;
             }
-            if (self.node.media_index_cache.speakerDisk(state.identity)) |cursor| if (cursor.window > state.disk_window) {
+            if (self.node.host_caches.media_index_cache.speakerDisk(state.identity)) |cursor| if (cursor.window > state.disk_window) {
                 state.disk_cursor = cursor;
                 state.disk_window = cursor.window;
             };
@@ -48393,7 +48413,7 @@ const MediaOutputExecution = struct {
                 const cursor = speaker_checkpoint.Store.saveWithCursor(self.speakerContext(), self.speaker_scratch, state.identity, snapshot, state.disk_cursor) catch continue;
                 state.disk_cursor = cursor;
                 state.disk_window = cursor.window;
-                self.node.media_index_cache.recordSpeakerDisk(state.identity, cursor);
+                self.node.host_caches.media_index_cache.recordSpeakerDisk(state.identity, cursor);
             }
         };
     }
@@ -48482,7 +48502,7 @@ const MediaOutputExecution = struct {
             if (!self.leader(i)) continue;
             if (owned.embedder) |lease| lease.deinit();
             owned.timeline.deinit(a);
-            if (owned.borrowed) |entry| self.node.media_index_cache.release(entry);
+            if (owned.borrowed) |entry| self.node.host_caches.media_index_cache.release(entry);
             a.destroy(owned);
         };
         if (self.speaker_lease) |*lease| lease.release();
@@ -51168,7 +51188,7 @@ test "model selection VAD verifies the consumed receipt artifact before parsing"
     try std.testing.expectError(error.Cancelled, node.sileroWeightsForModel(&ctx, "acme/vad", &stage));
     ctx.cancellation = null;
     try std.testing.expectError(error.ChecksumMismatch, node.sileroWeightsForModel(&ctx, "acme/vad:onnx@0123456789abcdef0123456789abcdef01234567", &stage));
-    try std.testing.expectEqual(@as(usize, 0), node.silero_weights.count());
+    try std.testing.expectEqual(@as(usize, 0), node.host_caches.silero_weights.count());
 }
 
 test "model selection catalog token keeps warm lookup filesystem work constant" {

@@ -1460,12 +1460,16 @@ fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destinati
 /// excludes pathname-based readers while recovery restores a prior generation.
 /// This lets an unrelated pull repair a killed publisher without lock inversion.
 pub fn recoverManagedPublication(allocator: std.mem.Allocator, io: std.Io, destination: []const u8) !void {
+    return recoverManagedPublicationJournaled(allocator, io, destination, null);
+}
+
+pub fn recoverManagedPublicationJournaled(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, journal: ?publication_lease.MutationJournal) !void {
     const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
     defer allocator.free(backup);
     if (!try pathExists(std.Io.Dir.cwd(), io, backup)) return;
     var lease = try publication_lease.WriteLease.acquire(allocator, io, destination);
     defer lease.deinit(io);
-    return recoverManagedPublicationWithLease(allocator, io, destination, &lease, null);
+    return recoverManagedPublicationWithLease(allocator, io, destination, &lease, journal);
 }
 
 pub fn recoverManagedPublicationWithLease(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, lease: *const publication_lease.WriteLease, journal: ?publication_lease.MutationJournal) !void {
@@ -1554,27 +1558,49 @@ pub const ManagedModelTransaction = struct {
 
     pub fn commit(self: *ManagedModelTransaction, io: std.Io) !void {
         if (self.committed) return error.ManagedDownloadAlreadyCommitted;
+        {
+            var shared = try publication_lease.Lease.shared(self.allocator, io, self.destination);
+            defer shared.deinit(io);
+            if (try self.finishIfUnchanged(io)) return;
+        }
         var lease = try publication_lease.WriteLease.acquire(self.allocator, io, self.destination);
         defer lease.deinit(io);
-        return self.commitWithLease(io, &lease, null);
+        return self.publishWithLease(io, &lease, null);
     }
 
     pub fn commitWithLease(self: *ManagedModelTransaction, io: std.Io, lease: *const publication_lease.WriteLease, journal: ?publication_lease.MutationJournal) !void {
         try lease.requireDestination(io, self.destination);
+        if (try self.finishIfUnchanged(io)) return;
+        return self.publishWithLease(io, lease, journal);
+    }
+
+    /// The catalog publisher holds its writer lock and a shared destination
+    /// lease while comparing content. Readers may keep constructing from the
+    /// unchanged installation throughout this potentially large hash pass.
+    pub fn finishIfUnchanged(self: *ManagedModelTransaction, io: std.Io) !bool {
         if (self.committed) return error.ManagedDownloadAlreadyCommitted;
         if (managedDownloadState(self.allocator, io, self.staging) != .complete) {
             return error.IncompleteManagedDownload;
         }
 
-        const cwd = std.Io.Dir.cwd();
         // Mutable refs still fetch and verify their selected revision. If its
         // complete executable contract is unchanged, preserve the published
         // directory and every hot runtime instead of swapping identical files.
         if (try unchangedPublishedInstall(self.allocator, io, self.destination, self.staging)) {
-            try removeTreeIfExists(cwd, io, self.staging);
+            try removeTreeIfExists(std.Io.Dir.cwd(), io, self.staging);
             self.committed = true;
-            return;
+            return true;
         }
+        return false;
+    }
+
+    /// Publish a changed installation without repeating the unchanged-content
+    /// hash pass under an exclusive lease. Staging is private to its publisher.
+    pub fn publishWithLease(self: *ManagedModelTransaction, io: std.Io, lease: *const publication_lease.WriteLease, journal: ?publication_lease.MutationJournal) !void {
+        try lease.requireDestination(io, self.destination);
+        if (self.committed) return error.ManagedDownloadAlreadyCommitted;
+        if (managedDownloadState(self.allocator, io, self.staging) != .complete) return error.IncompleteManagedDownload;
+        const cwd = std.Io.Dir.cwd();
         if (journal) |active| try active.beforeMutation();
         try removeTreeIfExists(cwd, io, self.backup);
         const had_destination = try pathExists(cwd, io, self.destination);

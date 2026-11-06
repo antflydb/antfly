@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The only filesystem authority for request-owned model readers. A receipt
+//! Filesystem authority for managed model construction and readers. A receipt
 //! authenticates its listed files, never arbitrary siblings in the directory.
 const std = @import("std");
 const managed = @import("managed_receipt.zig");
@@ -105,6 +105,16 @@ pub const PublishedArtifacts = struct {
             const index = self.canonical_index.get(canonical) orelse return error.InvalidManagedDownload;
             try self.verifyIndex(index);
         }
+    }
+    /// Authenticate the complete graph dependency set before a pathname-based
+    /// importer can read it. Callers retain a shared publication lease through
+    /// construction and call verify() before publishing the resulting session.
+    pub fn verifyOnnx(self: *PublishedArtifacts, path: []const u8) !void {
+        if (self.receipt == null) return;
+        try self.verifyPath(path);
+        var graph = try @import("../backends/imported_onnx_session.zig").inspectArtifactSet(self.allocator, path);
+        defer graph.deinit();
+        for (graph.external_paths) |external| try self.verifyPath(external);
     }
     pub fn verify(self: *const PublishedArtifacts) !void {
         if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
