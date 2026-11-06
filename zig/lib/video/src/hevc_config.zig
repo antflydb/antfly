@@ -19,6 +19,7 @@ const std = @import("std");
 const bits_mod = @import("hevc_bits.zig");
 const nal = @import("hevc_nal.zig");
 const params = @import("hevc_params.zig");
+const media = @import("antfly_media");
 
 pub const Signal = struct {
     primaries: ?u8 = null,
@@ -59,42 +60,131 @@ pub fn parse(a: std.mem.Allocator, config: []const u8) !?Signal {
     return null;
 }
 
-/// `hev1` clips may carry parameter sets only in their samples. A record built from
-/// the first sample lets routes that need them up front treat the clip like any
-/// other. Caller owns the result; null when the record has sets or the sample has none.
-pub fn fromInband(a: std.mem.Allocator, config: []const u8, sample: []const u8, length_bytes: u3) !?[]u8 {
-    if (config.len < 23) return error.MalformedVideoConfig;
-    if (config[22] != 0) return null;
-    var units: [3]std.ArrayList([]const u8) = @splat(.empty);
-    defer for (&units) |*list| list.deinit(a);
-    var cursor: usize = 0;
-    while (cursor < sample.len) {
-        if (sample.len - cursor < length_bytes) return error.MalformedVideoConfig;
-        var size: usize = 0;
-        for (sample[cursor..][0..length_bytes]) |byte| size = (size << 8) | byte;
-        cursor += length_bytes;
-        if (size < 2 or size > sample.len - cursor) return error.MalformedVideoConfig;
-        const unit = sample[cursor..][0..size];
-        cursor += size;
-        const kind = (unit[0] >> 1) & 0x3f;
-        if (kind < 32) break;
-        if (kind <= 34) try units[kind - 32].append(a, unit);
+/// Parameter-set identities have codec-defined bounds (16 VPS, 16 SPS, 64 PPS).
+/// Merge into fixed slots, replacing the same ID with the sample's newer value.
+/// Bound parsing work too: repeated IDs must not turn a small request into an
+/// unbounded number of parameter-set parses or allocations.
+const max_parameter_units = 256;
+const SetTable = struct {
+    units: [3][64]?[]const u8 = @splat(@splat(null)),
+    ids: [3][64]u8 = undefined,
+    counts: [3]u8 = @splat(0),
+    parsed: usize = 0,
+
+    fn put(self: *SetTable, a: std.mem.Allocator, kind: u6, unit: []const u8, control: media.source.Control) !bool {
+        try control.check();
+        if (self.parsed == max_parameter_units) return error.ResourceLimitExceeded;
+        self.parsed += 1;
+        if (unit.len > std.math.maxInt(u16)) return error.MalformedVideoConfig;
+        const header = try nal.parseHeader(unit);
+        if (header.header.nal_unit_type.raw() != kind or header.header.layer_id != 0) return error.UnsupportedVideoProfile;
+        var bits = try bits_mod.Bits.initControlled(a, header.rbsp, control);
+        defer bits.deinit();
+        const id = switch (kind) {
+            32 => try bits.read(4),
+            33 => try params.parseSpsId(&bits),
+            34 => try bits.ueBounded(params.max_pps_count - 1),
+            else => unreachable,
+        };
+        const slot = &self.units[kind - 32][id];
+        if (slot.*) |previous| if (std.mem.eql(u8, previous, unit)) return false;
+        if (slot.* == null) {
+            const group = kind - 32;
+            self.ids[group][self.counts[group]] = @intCast(id);
+            self.counts[group] += 1;
+        }
+        slot.* = unit;
+        return true;
     }
-    if (units[1].items.len == 0 or units[2].items.len == 0) return null;
+    fn count(self: *const SetTable, kind: usize) u16 {
+        return self.counts[kind];
+    }
+};
+
+/// Array count alone says nothing about which parameter sets are available.
+pub fn hasParameterSets(config: []const u8) bool {
+    const record = nal.parseConfigurationRecord(config) catch return false;
+    var sps = false;
+    var pps = false;
+    var arrays = record.arrays();
+    while (arrays.next() catch return false) |array| {
+        var nals = array.nals;
+        if ((nals.next() catch return false) == null) continue;
+        sps = sps or array.nal_unit_type == 33;
+        pps = pps or array.nal_unit_type == 34;
+    }
+    return sps and pps;
+}
+
+/// Own the normalized configuration alongside any reader copies borrowing it.
+/// Only hev1 reads a sample; ordinary hvc1/AVC/AV1 inspection stays metadata-only.
+pub fn normalizeReader(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
+    if (reader.track.codec != .hevc or !reader.track.inband_parameter_sets or reader.packets.len == 0) return null;
+    var first = try reader.readPacket(0);
+    defer first.deinit();
+    const config = try fromInbandControlled(a, reader.track.codec_config, first.bytes, reader.track.nal_length_bytes, reader.input.control);
+    if (config) |bytes| reader.track.codec_config = bytes;
+    return config;
+}
+
+/// Merge first-sample parameter sets with hvcC, including partially populated or
+/// empty arrays. Preserve non-parameter arrays. Null means no sample set changed
+/// the record, or the combined record still lacks SPS/PPS. Caller owns the result.
+pub fn fromInband(a: std.mem.Allocator, config: []const u8, sample: []const u8, length_bytes: u3) !?[]u8 {
+    return fromInbandControlled(a, config, sample, length_bytes, .{});
+}
+
+pub fn fromInbandControlled(a: std.mem.Allocator, config: []const u8, sample: []const u8, length_bytes: u3, control: media.source.Control) !?[]u8 {
+    try control.check();
+    if (length_bytes == 0 or length_bytes > 4) return error.MalformedVideoConfig;
+    const record = try nal.parseConfigurationRecord(config);
+    if (record.length_size != length_bytes) return error.MalformedVideoConfig;
+    var sets: SetTable = .{};
+    var retained_arrays: u16 = 0;
+    var arrays = record.arrays();
+    while (try arrays.next()) |array| {
+        if (array.nal_unit_type < 32 or array.nal_unit_type > 34) {
+            retained_arrays += 1;
+            continue;
+        }
+        var nals = array.nals;
+        while (try nals.next()) |unit| _ = try sets.put(a, array.nal_unit_type, unit, control);
+    }
+    var changed = false;
+    var packets = nal.LengthPrefixedIterator{ .bytes = sample, .length_size = length_bytes };
+    while (packets.next() catch return error.MalformedVideoConfig) |unit| {
+        try control.check();
+        if (unit.len < 2) return error.MalformedVideoConfig;
+        const kind: u6 = @intCast((unit[0] >> 1) & 0x3f);
+        if (kind < 32) break;
+        if (kind <= 34) changed = (try sets.put(a, kind, unit, control)) or changed;
+    }
+    if (!changed or sets.count(1) == 0 or sets.count(2) == 0) return null;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     try out.appendSlice(a, config[0..22]);
-    var arrays: u8 = 0;
-    for (&units) |*list| arrays += @intFromBool(list.items.len != 0);
-    try out.append(a, arrays);
-    for (&units, 32..) |*list, kind| {
-        if (list.items.len == 0) continue;
-        try out.append(a, @intCast(kind));
-        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(list.items.len))));
-        for (list.items) |unit| {
-            try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u16, std.math.cast(u16, unit.len) orelse return error.MalformedVideoConfig)));
+    var total_arrays = retained_arrays;
+    for (0..3) |kind| total_arrays += @intFromBool(sets.count(kind) != 0);
+    try out.append(a, std.math.cast(u8, total_arrays) orelse return error.MalformedVideoConfig);
+    for (0..3) |kind| {
+        const count = sets.count(kind);
+        if (count == 0) continue;
+        // hev1 permits later updates: don't declare these arrays complete.
+        try out.append(a, @intCast(kind + 32));
+        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u16, count)));
+        // Keep container order stable; replacement updates an existing slot.
+        for (sets.ids[kind][0..count]) |id| {
+            const unit = sets.units[kind][id].?;
+            try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(unit.len))));
             try out.appendSlice(a, unit);
         }
+    }
+    arrays = record.arrays();
+    while (try arrays.next()) |array| {
+        if (array.nal_unit_type >= 32 and array.nal_unit_type <= 34) continue;
+        try out.append(a, @as(u8, array.nal_unit_type) | (if (array.completeness) @as(u8, 0x80) else 0));
+        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u16, array.nals.remaining)));
+        try out.appendSlice(a, array.nals.bytes);
     }
     return try out.toOwnedSlice(a);
 }
@@ -268,4 +358,116 @@ test "A record built from in-band parameter sets parses like an out-of-band one"
     // Only VPS, SPS and PPS are kept; a sample with no SPS yields nothing.
     try std.testing.expect((try fromInband(a, &empty, &.{ 0, 0, 0, 3, 19 << 1, 1, 0 }, 4)) == null);
     try std.testing.expectError(error.MalformedVideoConfig, fromInband(a, &empty, &.{ 0, 0, 0, 9, 32 << 1 }, 4));
+}
+
+fn testSample(a: std.mem.Allocator, config: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var arrays = (try nal.parseConfigurationRecord(config)).arrays();
+    while (try arrays.next()) |array| {
+        var nals = array.nals;
+        while (try nals.next()) |unit| {
+            try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u32, @intCast(unit.len))));
+            try out.appendSlice(a, unit);
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+test "HEVC normalization merges partial and empty arrays and preserves other arrays" {
+    const a = std.testing.allocator;
+    const full = @embedFile("../testdata/hevc-hlg-config.bin");
+    const sample = try testSample(a, full);
+    defer a.free(sample);
+    var empty: [32]u8 = undefined;
+    @memcpy(empty[0..22], full[0..22]);
+    @memcpy(empty[22..], &[_]u8{ 3, 32, 0, 0, 33, 0, 0, 34, 0, 0 });
+    try std.testing.expect(!hasParameterSets(&empty));
+    const merged = (try fromInband(a, &empty, sample, 4)).?;
+    defer a.free(merged);
+    try std.testing.expect(hasParameterSets(merged));
+    try std.testing.expectEqual(try parse(a, full), try parse(a, merged));
+    // Retain VPS in hvcC and put SPS/PPS in the sample. Also retain a non-set
+    // array verbatim so normalizing the sets doesn't discard decoder metadata.
+    var partial: std.ArrayList(u8) = .empty;
+    defer partial.deinit(a);
+    try partial.appendSlice(a, full[0..22]);
+    try partial.append(a, 2);
+    var arrays = (try nal.parseConfigurationRecord(full)).arrays();
+    const vps = (try arrays.next()).?;
+    try std.testing.expectEqual(@as(u6, 32), vps.nal_unit_type);
+    try partial.append(a, 32);
+    try partial.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u16, vps.nals.remaining)));
+    try partial.appendSlice(a, vps.nals.bytes);
+    const extra = [_]u8{ 0x80 | 39, 0, 1, 0, 3, 39 << 1, 1, 0x80 };
+    try partial.appendSlice(a, &extra);
+    const completed = (try fromInband(a, partial.items, sample, 4)).?;
+    defer a.free(completed);
+    try std.testing.expect(hasParameterSets(completed));
+    try std.testing.expectEqual(try parse(a, full), try parse(a, completed));
+    try std.testing.expect(std.mem.endsWith(u8, completed, &extra));
+    // Repeated sets don't grow the configuration or cause another allocation
+    // for the serialized output when it already describes the first sample.
+    try std.testing.expect((try fromInband(a, completed, sample, 4)) == null);
+}
+
+test "HEVC normalization bounds repeated parameter sets before serialization" {
+    const a = std.testing.allocator;
+    const full = @embedFile("../testdata/hevc-hlg-config.bin");
+    var empty: [23]u8 = undefined;
+    @memcpy(empty[0..22], full[0..22]);
+    empty[22] = 0;
+    var arrays = (try nal.parseConfigurationRecord(full)).arrays();
+    _ = try arrays.next();
+    var sps = (try arrays.next()).?.nals;
+    const unit = (try sps.next()).?;
+    var sample: std.ArrayList(u8) = .empty;
+    defer sample.deinit(a);
+    // This used to reach an unchecked u16 cast. Reject work well before 65536.
+    for (0..65536) |_| {
+        try sample.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u32, @intCast(unit.len))));
+        try sample.appendSlice(a, unit);
+    }
+    try std.testing.expectError(error.ResourceLimitExceeded, fromInband(a, &empty, sample.items, 4));
+    try std.testing.expectError(error.MalformedVideoConfig, fromInband(a, &empty, sample.items, 0));
+    const Cancel = struct {
+        fn check(_: ?*const anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, fromInbandControlled(a, &empty, sample.items, 4, .{ .check_fn = Cancel.check }));
+}
+
+test "HEVC normalization releases all allocations on failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const full = @embedFile("../testdata/hevc-hlg-config.bin");
+            const sample = try testSample(a, full);
+            defer a.free(sample);
+            var empty: [23]u8 = undefined;
+            @memcpy(empty[0..22], full[0..22]);
+            empty[22] = 0;
+            const merged = (try fromInband(a, &empty, sample, 4)).?;
+            defer a.free(merged);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "HEVC normalization replaces a matching identity rather than duplicating it" {
+    const a = std.testing.allocator;
+    const old = @embedFile("../testdata/hevc-hlg-config.bin");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/hevc-mp4.mp4") }, .identity = "sdr-config" };
+    var reader = try media.mp4.Reader.init(a, &source, .{ .codecs = std.EnumSet(media.mp4.Codec).initOne(.hevc) });
+    defer reader.deinit();
+    const sample = try testSample(a, reader.track.codec_config);
+    defer a.free(sample);
+    const merged = (try fromInband(a, old, sample, 4)).?;
+    defer a.free(merged);
+    try std.testing.expectEqual(try parse(a, reader.track.codec_config), try parse(a, merged));
+    var arrays = (try nal.parseConfigurationRecord(merged)).arrays();
+    while (try arrays.next()) |array| {
+        if (array.nal_unit_type >= 32 and array.nal_unit_type <= 34)
+            try std.testing.expectEqual(@as(u16, 1), array.nals.remaining);
+    }
 }

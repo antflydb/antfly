@@ -846,16 +846,7 @@ pub const PacketInput = struct {
         }
         var input = PacketInput{ .reader = try media.mp4.Reader.init(a, source, video.mp4_coded.limits), .allocator = a };
         errdefer input.deinit();
-        if (input.reader.track.codec == .hevc and input.reader.track.inband_parameter_sets and input.reader.packets.len != 0) {
-            var first = try input.reader.readPacket(0);
-            defer first.deinit();
-            // A malformed sample is the decoder's to report.
-            input.inband_config = video.hevc_config.fromInband(a, input.reader.track.codec_config, first.bytes, input.reader.track.nal_length_bytes) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => null,
-            };
-            if (input.inband_config) |config| input.reader.track.codec_config = config;
-        }
+        input.inband_config = try video.hevc_config.normalizeReader(a, &input.reader);
         return input;
     }
     pub fn deinit(self: *PacketInput) void {

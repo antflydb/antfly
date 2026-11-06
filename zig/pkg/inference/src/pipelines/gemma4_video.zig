@@ -530,9 +530,13 @@ test "gemma4 video tone maps HEVC whose HDR signal is only in the bitstream" {
     };
     var tone: Tone = .{};
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
-    const bytes = @embedFile("../testdata/video/codecs/hevc-hlg-nocolr.mp4");
-    try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &tone, .accept = Tone.accept }, .sampling = sampling, .pool = &pool });
-    try std.testing.expect(tone.seen != 0);
+    inline for (.{ "hevc-hlg-nocolr.mp4", "hevc-hlg-partial-inband.mp4" }) |name| {
+        tone.seen = 0;
+        const bytes = @embedFile("../testdata/video/codecs/" ++ name);
+        try std.testing.expect(reservation(a, bytes).surface_bytes != 0);
+        try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &tone, .accept = Tone.accept }, .sampling = sampling, .pool = &pool });
+        try std.testing.expect(tone.seen != 0);
+    }
 }
 
 test "gemma4 video reports presentation size for anamorphic containers" {
@@ -564,4 +568,33 @@ test "gemma4 video reports presentation size for anamorphic containers" {
             try std.testing.expectEqual(record.raster_width, record.width);
         }
     }
+}
+
+test "HEVC inband SAR agrees across admission planning and decoded presentation" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const inband = @embedFile("../testdata/video/codecs/hevc-sar-inband.mp4");
+    const original = @embedFile("../testdata/video/codecs/hevc-sar-nopasp.mp4");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
+    const expected = try embedding_video.inspectPlan(a, original, .{}, sampling, &pool, true);
+    const actual = try embedding_video.inspectPlan(a, inband, .{}, sampling, &pool, true);
+    try std.testing.expectEqual(expected.sequence_tokens, actual.sequence_tokens);
+    try std.testing.expectEqual(expected.patch_output_bytes, actual.patch_output_bytes);
+    try std.testing.expectEqual(reservation(a, original), reservation(a, inband));
+    const Record = struct {
+        seen: usize = 0,
+        fn accept(raw: *anyopaque, _: usize, frame: video.preparation.BorrowedFrame, options: video.preparation.Options, control: media.source.Control) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u32, 128), options.presentation_width);
+            try std.testing.expectEqual(@as(u32, 64), options.presentation_height);
+            var displayed = try frame.display(std.testing.allocator, options, control);
+            defer displayed.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u32, 64), displayed.width);
+            try std.testing.expectEqual(@as(u32, 64), displayed.height);
+            self.seen += 1;
+        }
+    };
+    var record: Record = .{};
+    try embedding_video.observeConfigured(a, inband, null, .{}, .{ .observer = .{ .context = &record, .accept = Record.accept }, .sampling = sampling, .pool = &pool });
+    try std.testing.expect(record.seen != 0);
 }

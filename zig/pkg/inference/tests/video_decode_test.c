@@ -158,6 +158,14 @@ int main(void) {
     assert(sequence(&d, &f) == 4);
     fake_destroy(d.decoder); release_budget(&d);
 
+    // First-sample HEVC SPS normalization supplies SAR even without a pasp box.
+    d = decoder(); f = format();
+    d.expected_codec = f.codec = cudaVideoCodec_HEVC;
+    d.sar_h = 2; d.sar_v = 1;
+    f.display_aspect_ratio.x = 10; f.display_aspect_ratio.y = 3;
+    assert(sequence(&d, &f) == 4 && !d.aspect_declared);
+    fake_destroy(d.decoder); release_budget(&d);
+
     // A declared container aspect wins over a conflicting bitstream ratio.
     d = decoder(); f = format(); d.aspect_declared = 1;
     f.display_aspect_ratio.x = 16; f.display_aspect_ratio.y = 9;

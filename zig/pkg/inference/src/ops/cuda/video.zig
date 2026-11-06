@@ -216,13 +216,15 @@ test "embeddinggemma2 video container preflight shares six second sampling and c
     }.run, .{bytes});
 }
 
-/// Container-only inspection under the caller's host preprocessing permit.
-/// Uses the decoder's validation and sampler, without opening NVDEC.
+/// Inspection under the caller's host preprocessing permit, without NVDEC.
+/// hev1 also reads sample zero to resolve in-band parameter sets before sizing.
 pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control: media.source.Control) !EmbeddingInspection {
     if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
     var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
     defer reader.deinit();
+    const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
+    defer if (normalized) |config| allocator.free(config);
     try validateTrack(reader.track);
     const end_us = try validateTimeline(reader.track, reader.packets);
     const sampler = try embeddingSamplerForReader(&reader, end_us);
@@ -403,6 +405,8 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = .{ .context = &state, .check_fn = sourceCheck } };
     var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
     defer reader.deinit();
+    const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
+    defer if (normalized) |config| allocator.free(config);
     const track = reader.track;
     try validateTrack(track);
     const color = try containerColor(track.color_info);
@@ -1339,4 +1343,27 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);
     try std.testing.expectEqual(@as(usize, 1), Mock.synchronizations);
     try std.testing.expectEqual(error.Cancelled, state.failure.?);
+}
+
+test "HEVC inband inspection preserves stream SAR and partial configuration color" {
+    const a = std.testing.allocator;
+    const original = try inspectEmbedding(a, @embedFile("../../testdata/video/codecs/hevc-sar-nopasp.mp4"), .{});
+    const inband = try inspectEmbedding(a, @embedFile("../../testdata/video/codecs/hevc-sar-inband.mp4"), .{});
+    try std.testing.expectEqual(original, inband);
+    try std.testing.expectEqual(@as(u32, 128), inband.display_width);
+    try std.testing.expectEqual(@as(u32, 64), inband.display_height);
+    const bytes = @embedFile("../../testdata/video/codecs/hevc-hlg-partial-inband.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "partial-hevc" };
+    var reader = try media.mp4.Reader.init(a, &source, mp4Limits(true));
+    defer reader.deinit();
+    const config = (try @import("antfly_video").hevc_config.normalizeReader(a, &reader)).?;
+    defer a.free(config);
+    const signal = (try @import("antfly_video").hevc_config.parse(a, reader.track.codec_config)).?;
+    try std.testing.expectEqual(@as(?u8, 18), signal.transfer);
+    try std.testing.expectEqual(@as(?u8, 9), signal.primaries);
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = try inspectEmbedding(allocator, @embedFile("../../testdata/video/codecs/hevc-sar-inband.mp4"), .{});
+        }
+    }.run, .{});
 }

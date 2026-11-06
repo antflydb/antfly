@@ -56,7 +56,7 @@ pub fn format(config: []const u8, full: bool) !apple.Format {
     };
 }
 pub fn hasParameterSets(config: []const u8) bool {
-    return config.len >= 23 and config[22] != 0;
+    return config_info.hasParameterSets(config);
 }
 
 const Capture = struct {

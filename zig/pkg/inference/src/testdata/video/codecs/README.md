@@ -59,3 +59,10 @@ to `free`, so its 2:1 pixel aspect is only in the SPS.
 
 `hevc-sar-pasp-square.mp4` is the same clip with its `pasp` box rewritten to 1:1, so the
 container's explicit square pixels conflict with the stream's 2:1 SAR.
+
+`hevc-sar-inband.mp4` and `hevc-hlg-partial-inband.mp4` move VPS/SPS/PPS
+into the first `hev1` sample and leave `hvcC` empty or VPS-only respectively.
+They preserve the source samples, HDR signal and SAR; neither has `pasp`.
+Regenerate with `python3 zig/pkg/inference/scripts/video/generate_inband_hevc_fixtures.py`
+from the repository root (requires FFmpeg). The generator updates box lengths,
+sample sizes and chunk offsets; no runtime code depends on FFmpeg.

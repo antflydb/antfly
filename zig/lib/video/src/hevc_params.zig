@@ -86,6 +86,17 @@ fn parseProfileTierLevel(bits: *Bits, max_sub_layers_minus1: u3) !ProfileTierLev
     return result;
 }
 
+/// Read only the SPS identity for configuration merging. Reconstruction policy
+/// validates the full active SPS later; unrelated parameter sets need not use
+/// the same supported tools or color signal.
+pub fn parseSpsId(bits: *Bits) !u32 {
+    _ = try bits.read(4);
+    const layers: u3 = @intCast(try bits.read(3));
+    _ = try bits.flag();
+    _ = try parseProfileTierLevel(bits, layers);
+    return bits.ueBounded(max_sps_count - 1);
+}
+
 /// clause 7.3.7, derived per 7.4.8. `UsedByCurrPic{S0,S1}` are folded into the
 /// delta array as the sign-preserving entries so `num_entries` stays a single
 /// bound; S0 (negative, nearest first) precedes S1 (positive, nearest first)
