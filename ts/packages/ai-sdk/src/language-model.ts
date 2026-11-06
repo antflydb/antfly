@@ -9,8 +9,8 @@ import type {
   SharedV4Warning,
 } from "@ai-sdk/provider";
 import type { AntflyClient, GenerateRequest, InferenceClient } from "@antfly/sdk";
-import { resolveCatalogResource } from "./asset/catalog.js";
-import { decodeAssetReference } from "./asset/reference.js";
+import { resolveAuthorizedAsset } from "./asset/catalog.js";
+import { type AuthorizeAsset, decodeAssetReference } from "./asset/reference.js";
 import {
   type ResolveAssetReference,
   toInferenceMessages,
@@ -29,6 +29,13 @@ export interface AntflyChatLanguageModelOptions {
    * (antfly#1505's typed `source` asset flow). Without it, such a part throws.
    */
   client?: AntflyClient;
+  /**
+   * The app's decision on whether the current user may use a referenced asset.
+   * References aren't signed and can come from a browser, so without this they
+   * are refused even when `client` is set. Bind it to the current user, for
+   * example by creating the model per request.
+   */
+  authorizeAsset?: AuthorizeAsset;
 }
 
 /**
@@ -61,10 +68,11 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     this.inference = options.inference;
     this.modelId = options.modelId;
     this.provider = options.providerId ?? "antfly";
-    const client = options.client;
-    this.resolveSource = client
-      ? (id: string) => resolveCatalogResource(client, decodeAssetReference(id))
-      : undefined;
+    const { client, authorizeAsset } = options;
+    this.resolveSource =
+      client && authorizeAsset
+        ? (id: string) => resolveAuthorizedAsset(client, authorizeAsset, decodeAssetReference(id))
+        : undefined;
   }
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {

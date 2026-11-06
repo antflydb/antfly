@@ -303,6 +303,7 @@ describe("providerReference.antfly file parts", () => {
     const withClient = new AntflyChatLanguageModel({
       inference: new InferenceClient({ baseUrl: "http://generate.test" }),
       client: new AntflyClient({ baseUrl: "http://generate.test" }),
+      authorizeAsset: () => true,
       modelId: "test-model",
     });
     await withClient.doGenerate({
@@ -340,6 +341,42 @@ describe("providerReference.antfly file parts", () => {
           },
         ],
       })
-    ).rejects.toThrow(/client to resolve/);
+    ).rejects.toThrow(/authorizeAsset/);
+  });
+
+  it("refuses forged references without an access decision, or against one", async () => {
+    const part = {
+      type: "file" as const,
+      mediaType: "video/mp4",
+      data: {
+        type: "reference" as const,
+        reference: assetProviderReference({ table: "secrets", key: "x" }),
+      },
+    };
+    const options = { prompt: [{ role: "user" as const, content: [part] }] };
+    const inference = {
+      generate: vi.fn(async () => {
+        throw new Error("must not reach the model");
+      }),
+    } as never;
+    const client = { getRawClient: () => ({ GET: vi.fn() }) } as never;
+    const unconfigured = new AntflyChatLanguageModel({ inference, modelId: "m", client });
+    await expect(unconfigured.doGenerate(options as never)).rejects.toThrow("authorizeAsset");
+    const denied = new AntflyChatLanguageModel({
+      inference,
+      modelId: "m",
+      client,
+      authorizeAsset: () => false,
+    });
+    await expect(denied.doGenerate(options as never)).rejects.toThrow("denied");
+    const throwing = new AntflyChatLanguageModel({
+      inference,
+      modelId: "m",
+      client,
+      authorizeAsset: () => {
+        throw new Error("session lookup failed");
+      },
+    });
+    await expect(throwing.doGenerate(options as never)).rejects.toThrow("denied");
   });
 });

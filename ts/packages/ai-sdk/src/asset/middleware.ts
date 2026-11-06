@@ -7,8 +7,8 @@ import type {
 } from "@ai-sdk/provider";
 import type { AntflyClient } from "@antfly/sdk";
 import { type LanguageModelMiddleware, uploadFile, wrapLanguageModel } from "ai";
-import { type CatalogResource, resolveCatalogResource } from "./catalog.js";
-import { antflyAssetReferenceFrom } from "./reference.js";
+import { type CatalogResource, resolveAuthorizedAsset } from "./catalog.js";
+import { type AuthorizeAsset, antflyAssetReferenceFrom } from "./reference.js";
 
 export interface AssetUploadCacheEntry {
   reference: Record<string, string>;
@@ -38,6 +38,8 @@ export function createInMemoryAssetUploadCache(): AssetUploadCache {
 
 export interface AssetMiddlewareOptions {
   client: AntflyClient;
+  /** The app's decision on each referenced asset, bound to the current user. Required. */
+  authorize: AuthorizeAsset;
   /**
    * Upload the asset to the external provider's own files API, once per
    * provider and content digest. Default `false`: vendor uploads are
@@ -121,7 +123,7 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
     if (part.data.type !== "reference") return part;
     const reference = antflyAssetReferenceFrom(part.data.reference);
     if (!reference) return part;
-    const resource = await resolveCatalogResource(options.client, reference);
+    const resource = await resolveAuthorizedAsset(options.client, options.authorize, reference);
 
     if (options.allowVendorUpload && options.files) {
       const cached = await cache.get(resource.version, provider);

@@ -6,20 +6,19 @@ import type { SharedV4ProviderReference } from "@ai-sdk/provider";
  * source descriptor (`document-v3.json`'s `content.resource`: `type`,
  * `uri`, `mime_type`, `version`, `version_kind`, `length`).
  *
- * The opaque id is base64url JSON of this shape. It is not a capability URL
- * and is not fetchable on its own -- resolving it always goes through an
- * authenticated `AntflyClient`, which is itself scoped to the caller's
- * tenant, so there is no separate tenant check to apply here (antfly#1505's
- * "clients only send opaque IDs, checked against the tenant" requirement is
- * met by routing resolution through that authenticated client rather than
- * letting a browser- or model-supplied URL be fetched directly).
+ * The opaque id is base64url JSON of this shape, and it isn't signed: anyone can
+ * write one for any table and key, and file parts can originate in a browser.
+ * The server resolves it with the app's own credential, which reaches further
+ * than one end user should, so every resolution needs the app's own decision
+ * (`AuthorizeAsset`) and nothing resolves without one.
  */
 export interface AntflyAssetReference {
   table: string;
   key: string;
-  database?: string;
-  namespace?: string;
 }
+
+/** The app's decision on whether the current user may use this asset. */
+export type AuthorizeAsset = (reference: AntflyAssetReference) => boolean | Promise<boolean>;
 
 export function encodeAssetReference(reference: AntflyAssetReference): string {
   return Buffer.from(JSON.stringify(reference), "utf8").toString("base64url");
@@ -40,12 +39,7 @@ export function decodeAssetReference(id: string): AntflyAssetReference {
   ) {
     throw new InvalidAssetReferenceError(id);
   }
-  const reference = parsed as AntflyAssetReference;
-  if (reference.database !== undefined && typeof reference.database !== "string")
-    throw new InvalidAssetReferenceError(id);
-  if (reference.namespace !== undefined && typeof reference.namespace !== "string")
-    throw new InvalidAssetReferenceError(id);
-  return reference;
+  return parsed as AntflyAssetReference;
 }
 
 /** Builds the `providerReference` a `FilePart`/`FileUIPart` should carry. */

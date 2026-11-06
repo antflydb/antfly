@@ -80,7 +80,7 @@ describe.skipIf(!ready)(
     function getClients() {
       if (!clients) {
         clients = {
-          antfly: createAntfly({ baseUrl }),
+          antfly: createAntfly({ baseUrl, authorizeAsset: () => true }),
           sources: new StandaloneSourcesClient({
             baseUrl: sourceUrl as string,
             token: sourceToken as string,

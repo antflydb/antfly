@@ -143,7 +143,7 @@ async function fileToContentPart(
         throw new UnsupportedFunctionalityError({
           functionality: "providerReference file parts",
           message:
-            "This file part carries providerReference.antfly, but the model was constructed without a client to resolve it. Pass `client` to AntflyChatLanguageModel / createAntfly().",
+            "This file part carries providerReference.antfly, but the model has no authorizeAsset. References can come from a browser, so they are only resolved with the app's own access decision. Pass authorizeAsset to the provider or model.",
         });
       }
       const resource = await resolveSource(part.data.reference.antfly as string);

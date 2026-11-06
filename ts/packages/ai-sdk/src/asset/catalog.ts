@@ -1,5 +1,5 @@
 import type { AntflyClient } from "@antfly/sdk";
-import type { AntflyAssetReference } from "./reference.js";
+import type { AntflyAssetReference, AuthorizeAsset } from "./reference.js";
 
 /** `document-v3.json`'s `content.resource`: the typed, version-pinned source descriptor. */
 export interface CatalogResource {
@@ -16,6 +16,29 @@ export class AssetNotFoundError extends Error {
     super(`Asset not found: ${reference.table}/${reference.key}`);
     this.name = "AssetNotFoundError";
   }
+}
+
+export class AssetAccessDeniedError extends Error {
+  constructor(readonly reference: AntflyAssetReference) {
+    super("Access to this asset was denied.");
+    this.name = "AssetAccessDeniedError";
+  }
+}
+
+/** The only path from a client-suppliable reference to a catalog row. A thrown decision denies. */
+export async function resolveAuthorizedAsset(
+  client: AntflyClient,
+  authorize: AuthorizeAsset,
+  reference: AntflyAssetReference
+): Promise<CatalogResource> {
+  let allowed = false;
+  try {
+    allowed = await authorize(reference);
+  } catch {
+    allowed = false;
+  }
+  if (!allowed) throw new AssetAccessDeniedError(reference);
+  return resolveCatalogResource(client, reference);
 }
 
 export class AssetMissingResourceError extends Error {

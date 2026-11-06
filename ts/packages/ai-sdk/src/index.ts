@@ -1,7 +1,9 @@
 export {
+  AssetAccessDeniedError,
   AssetMissingResourceError,
   AssetNotFoundError,
   type CatalogResource,
+  resolveAuthorizedAsset,
   resolveCatalogResource,
 } from "./asset/catalog.js";
 export {
@@ -33,6 +35,7 @@ export {
 // external models, source upload, and the browser-display route helper.
 export {
   type AntflyAssetReference,
+  type AuthorizeAsset,
   antflyAssetReferenceFrom,
   assetProviderReference,
   decodeAssetReference,

@@ -67,7 +67,7 @@ function stubCatalogAndMediaFetch(): ReturnType<typeof vi.fn> {
 describe("createAssetMiddleware", () => {
   it("leaves the prompt untouched for the antfly provider itself", async () => {
     const client = new AntflyClient({ baseUrl: "http://catalog.test" });
-    const middleware = createAssetMiddleware({ client });
+    const middleware = createAssetMiddleware({ authorize: () => true, client });
     const params = paramsWithReferencePart();
     const result = await middleware.transformParams?.({
       type: "generate",
@@ -80,7 +80,7 @@ describe("createAssetMiddleware", () => {
   it("fetches the asset and inlines it for an external model by default (no vendor upload)", async () => {
     stubCatalogAndMediaFetch();
     const client = new AntflyClient({ baseUrl: "http://catalog.test" });
-    const middleware = createAssetMiddleware({ client });
+    const middleware = createAssetMiddleware({ authorize: () => true, client });
     const params = paramsWithReferencePart();
     const result = await middleware.transformParams?.({
       type: "generate",
@@ -106,7 +106,12 @@ describe("createAssetMiddleware", () => {
       warnings: [],
     });
     const files = { specificationVersion: "v4" as const, provider: "openai", uploadFile };
-    const middleware = createAssetMiddleware({ client, allowVendorUpload: true, files });
+    const middleware = createAssetMiddleware({
+      authorize: () => true,
+      client,
+      allowVendorUpload: true,
+      files,
+    });
     const params = paramsWithReferencePart();
 
     const first = await middleware.transformParams?.({
@@ -142,7 +147,12 @@ describe("createAssetMiddleware", () => {
       warnings: [],
     });
     const files = { specificationVersion: "v4" as const, provider: "openai", uploadFile };
-    const middleware = createAssetMiddleware({ client, allowVendorUpload: true, files });
+    const middleware = createAssetMiddleware({
+      authorize: () => true,
+      client,
+      allowVendorUpload: true,
+      files,
+    });
     await middleware.transformParams?.({
       type: "generate",
       params: paramsWithReferencePart(),
@@ -171,7 +181,7 @@ describe("createAssetMiddleware", () => {
       })
     );
     const client = new AntflyClient({ baseUrl: "http://catalog.test" });
-    const middleware = createAssetMiddleware({ client });
+    const middleware = createAssetMiddleware({ authorize: () => true, client });
     await expect(
       middleware.transformParams?.({
         type: "generate",
@@ -196,7 +206,7 @@ describe("createAssetMiddleware", () => {
       })
     );
     const client = new AntflyClient({ baseUrl: "http://catalog.test" });
-    const middleware = createAssetMiddleware({ client });
+    const middleware = createAssetMiddleware({ authorize: () => true, client });
     try {
       await middleware.transformParams?.({
         type: "generate",
@@ -208,5 +218,22 @@ describe("createAssetMiddleware", () => {
       expect(error).toBeInstanceOf(AssetFetchError);
       expect((error as Error).message).not.toContain(resource.uri);
     }
+  });
+
+  it("refuses a reference the app doesn't authorize before reading the catalog", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const middleware = createAssetMiddleware({
+      client: new AntflyClient({ baseUrl: "http://db.test" }),
+      authorize: () => false,
+    });
+    await expect(
+      middleware.transformParams?.({
+        type: "generate",
+        params: paramsWithReferencePart(),
+        model: {} as never,
+      })
+    ).rejects.toThrow("denied");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

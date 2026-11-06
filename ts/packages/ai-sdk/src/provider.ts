@@ -1,4 +1,4 @@
-import type { ImageModelV4, ProviderV4, RerankingModelV4 } from "@ai-sdk/provider";
+import type { ImageModelV4, LanguageModelV4, ProviderV4, RerankingModelV4 } from "@ai-sdk/provider";
 import { NoSuchModelError } from "@ai-sdk/provider";
 import {
   type AntflyClient,
@@ -6,11 +6,18 @@ import {
   type InferenceClient,
   type SDKConfig,
 } from "@antfly/sdk";
+import type { AuthorizeAsset } from "./asset/reference.js";
 import { AntflyEmbeddingModel } from "./embedding-model.js";
 import { AntflyChatLanguageModel } from "./language-model.js";
 import { AntflyRerankingModel } from "./reranking-model.js";
 
-export type AntflyProviderOptions = SDKConfig;
+export type AntflyProviderOptions = SDKConfig & {
+  /**
+   * The app's decision on referenced assets. Without it, file parts carrying
+   * `providerReference.antfly` are refused.
+   */
+  authorizeAsset?: AuthorizeAsset;
+};
 
 /**
  * An Antfly `ProviderV4`, plus the underlying `AntflyClient` so callers can
@@ -18,7 +25,13 @@ export type AntflyProviderOptions = SDKConfig;
  * `createSearchTool`, `createGraphTool`, `createSqlTool`) and the chat
  * history persistence helper without constructing a second client.
  */
+export interface AntflyLanguageModelOptions {
+  /** Overrides the provider's `authorizeAsset`, for a decision bound to one user. */
+  authorizeAsset?: AuthorizeAsset;
+}
+
 export interface AntflyProvider extends ProviderV4 {
+  languageModel(modelId: string, options?: AntflyLanguageModelOptions): LanguageModelV4;
   readonly client: AntflyClient;
   readonly inference: InferenceClient;
   // Narrowed from ProviderV4's optional `rerankingModel?`: this provider
@@ -47,8 +60,14 @@ export function createAntfly(options: AntflyProviderOptions): AntflyProvider {
     client,
     inference,
     specificationVersion: "v4",
-    languageModel: (modelId: string) =>
-      new AntflyChatLanguageModel({ inference, client, modelId, providerId: "antfly" }),
+    languageModel: (modelId: string, modelOptions?: AntflyLanguageModelOptions) =>
+      new AntflyChatLanguageModel({
+        inference,
+        modelId,
+        providerId: "antfly",
+        client,
+        authorizeAsset: modelOptions?.authorizeAsset ?? options.authorizeAsset,
+      }),
     embeddingModel: (modelId: string) =>
       new AntflyEmbeddingModel({ inference, modelId, providerId: "antfly" }),
     rerankingModel: (modelId: string) =>

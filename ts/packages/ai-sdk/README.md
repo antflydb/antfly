@@ -38,11 +38,17 @@ Gemma 4's one-video-per-request limit) surface as `InferenceAPIError` /
 
 ## Asset flow (antfly#1505)
 
+References aren't signed and can come from a browser, while the server resolves
+them with its own credential. So nothing resolves without your decision: pass
+`authorizeAsset` to `createAntfly` or `languageModel(id, { authorizeAsset })`, or
+`authorize` to the middleware, and check the current user against the reference
+there. Create the model per request when the decision depends on the user.
+
 A `FilePart`/`FileUIPart` can carry `providerReference: { antfly: <id> }`
 instead of bytes or a URL. The `<id>` is an opaque, base64url-encoded
-reference built by `assetProviderReference({ table, key })`; resolving it
-always goes through an authenticated `AntflyClient`, so a browser or model
-never gets to choose what gets fetched.
+reference built by `assetProviderReference({ table, key })`. It names a catalog
+row, never a URL, so a browser or model can't point the server at an arbitrary
+address, and your `authorizeAsset` decides which rows each user can name.
 
 ```ts
 import { assetProviderReference, createAntfly } from "@antfly/ai-sdk";
