@@ -150,6 +150,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const applyDerivedBatchProfiled = S.applyDerivedBatchProfiled;
         const applyDerivedBatchTargetsProfiled = S.applyDerivedBatchTargetsProfiled;
         const applyDerivedBatchToIndexContext = S.applyDerivedBatchToIndexContext;
+        const InlineTextPublication = S.InlineTextPublication;
+        const prepareInlineTextPublication = S.prepareInlineTextPublication;
         const attachPreparedUpsertDocumentProjections = S.attachPreparedUpsertDocumentProjections;
         const augmentExtractedWriteWithGraphFieldEdges = S.augmentExtractedWriteWithGraphFieldEdges;
         const augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed = S.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed;
@@ -3052,6 +3054,59 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 write_buffers.store_writes.items,
             );
             defer authored_acceptance.deinit();
+            // WS4 phase 2: for a synchronous full_text write with no
+            // background executor workers (today's inline-apply case,
+            // below at `applyDerivedBatchTargetsProfiled`), try to
+            // prepare each target index's inline publication now, before
+            // the primary write is staged, so it can be attached as a
+            // commit_participant and land in the SAME native transaction
+            // -- instead of the existing post-commit path's own several
+            // commits (indexSegmentOwned/publishProjectionSeal/progress).
+            // An index whose write does not fit the fast path (a
+            // multi-chunk plan, a projection change mid-build, a
+            // non-`.native_catalog` index, ...) simply fails to prepare
+            // here and falls through to that existing path unchanged,
+            // further down this function.
+            var inline_text_publications: [@import("../commit_participant.zig").List.max_participants]?*InlineTextPublication = @splat(null);
+            // Captured once at prepare time, never nulled: `install` below
+            // nulls `inline_text_publications` slots so its own cleanup
+            // `defer` knows what still needs `abort`, but the filter at
+            // `applyDerivedBatchTargetsProfiled` (further down) must still
+            // know which index names were handled inline regardless.
+            var inline_text_handled_names: [@import("../commit_participant.zig").List.max_participants][]const u8 = undefined;
+            var inline_text_publication_count: usize = 0;
+            defer for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
+                // Only still non-null if `install` below never ran for it
+                // (an error elsewhere in this function, or the primary
+                // write's own commit/ticket failed) -- `install` nulls
+                // its slot out once it has taken over the cleanup.
+                if (maybe_prepared) |prepared| prepared.abort();
+            };
+            if (append_derived_replay and effective_req.sync_level == .full_text and
+                !S.ownerField(self, "executor").*.hasWorkers() and materialized_derived_batch != null)
+            {
+                for (sync_targets.full_text_indexes) |target_name| {
+                    if (inline_text_publication_count >= inline_text_publications.len) break;
+                    const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = target_name, .kind = .full_text };
+                    const prepared = prepareInlineTextPublication(
+                        S.ownerField(self, "alloc").*,
+                        S.ownerField(self, "core").*.store,
+                        S.ownerField(self, "core").*.index_manager,
+                        materialized_derived_batch.?,
+                        index_ref,
+                    ) catch continue;
+                    inline_text_publications[inline_text_publication_count] = prepared;
+                    inline_text_handled_names[inline_text_publication_count] = target_name;
+                    inline_text_publication_count += 1;
+                }
+            }
+            var commit_participants: @import("../commit_participant.zig").List = .{};
+            if (authored_acceptance.vectors.len != 0) try commit_participants.append(authored_acceptance.participant());
+            for (inline_text_publications[0..inline_text_publication_count]) |maybe_prepared| {
+                if (maybe_prepared) |prepared| try commit_participants.append(prepared.participant());
+            }
+            const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
+                if (commit_participants.len != 0) commit_participants.participant() else null;
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
                 test_before_primary_commit = null;
@@ -3095,7 +3150,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     write_buffers.delete_keys.items,
                     replay_append,
                     store_batch_options,
-                    if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                    combined_commit_participant,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
@@ -3207,6 +3262,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var owned_ticket = ticket;
                 try owned_ticket.wait();
             }
+            // WS4 phase 2: the primary commit is durable now, and every
+            // inline text publication's mutations rode in that SAME
+            // native transaction (commit_participant.List.stage ran
+            // before it, under store.putBatchWithReplayStagedAndParticipant
+            // above). Install each one's in-memory snapshot and null its
+            // slot out so the top-of-function `defer` no longer aborts
+            // it; from here, a later failure in this function must not
+            // undo an already-durable, already-installed publication.
+            for (inline_text_publications[0..inline_text_publication_count], 0..) |maybe_prepared, i| {
+                if (maybe_prepared) |prepared| {
+                    prepared.install();
+                    inline_text_publications[i] = null;
+                }
+            }
             snapshot_mutation.release();
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
@@ -3296,7 +3365,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
                     const derived_apply_start_ns = monotonicTimeNs();
                     if (effective_req.sync_level == .full_text) {
-                        try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
+                        // WS4 phase 2: every index this write already
+                        // published inline (same native transaction as
+                        // the primary commit, already installed above)
+                        // must not also run through this post-commit
+                        // path -- that would re-index it a second time.
+                        if (inline_text_publication_count == 0) {
+                            try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
+                        } else {
+                            var remaining_targets = std.ArrayListUnmanaged([]const u8).empty;
+                            defer remaining_targets.deinit(S.ownerField(self, "alloc").*);
+                            remaining: for (sync_targets.full_text_indexes) |target_name| {
+                                for (inline_text_handled_names[0..inline_text_publication_count]) |handled_name| {
+                                    if (std.mem.eql(u8, handled_name, target_name)) continue :remaining;
+                                }
+                                try remaining_targets.append(S.ownerField(self, "alloc").*, target_name);
+                            }
+                            if (remaining_targets.items.len != 0) {
+                                try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, remaining_targets.items, profile);
+                            }
+                        }
                     } else {
                         try applyDerivedBatchProfiled(self, materialized_derived_batch.?, profile);
                     }

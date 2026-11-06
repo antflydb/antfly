@@ -3193,6 +3193,22 @@ pub const IndexManager = struct {
             self.manager.catalog_mutex.unlockShared();
             self.* = undefined;
         }
+
+        /// WS4 phase 2: enforces -- not just documents -- that a caller
+        /// holding this guard across a native commit (an inline
+        /// publication's prepare-to-install window) still holds it at
+        /// install/abort time, instead of some other path having already
+        /// released it. `std.atomic.Mutex` is not reentrant, so a
+        /// `tryLock` that succeeds here means nothing held it; restore
+        /// that (wrong) state immediately rather than leave it
+        /// double-locked, since the caller is about to assert and panic.
+        pub fn locked(self: *const ManagedIndexApplyGuard) bool {
+            if (self.mutex.tryLock()) {
+                self.mutex.unlock();
+                return false;
+            }
+            return true;
+        }
     };
 
     fn analysisContributionCache(self: *IndexManager, docs: []const introducer_mod.TextDocument) ?*introducer_mod.AnalyzedContributionCache {

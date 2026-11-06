@@ -65,6 +65,10 @@ const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
+const commit_participant = @import("../commit_participant.zig");
+const native_catalog_backend = @import("../native_catalog_backend.zig");
+const persistent_mod = @import("../persistent.zig");
+const projection_seal = @import("../projection_seal.zig");
 const relational_store = @import("relational_store.zig");
 const resolver_lib = @import("antfly_resolver");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -3450,6 +3454,242 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 runtime.notify();
             }
             if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
+        }
+
+        /// WS4 phase 2: a prepared full_text inline publication, built by
+        /// `prepareInlineTextPublication` and attached as a
+        /// `commit_participant.Participant` so its segment, seal and
+        /// delete-tracking mutations land in the SAME native transaction as
+        /// the write's own primary rows. Holds `index_ref`'s apply guard
+        /// from prepare through `install`/`abort` -- the whole window is
+        /// serialized against every other writer of this index (the one
+        /// deliberate concurrency trade of this fast path: see the WS4
+        /// phase 2 design note).
+        pub const InlineTextPublication = struct {
+            pub const max_segments = 4;
+
+            alloc: Allocator,
+            entry: *index_manager_mod.IndexManager.TextIndex,
+            apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            segments: [max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined,
+            segment_count: usize = 0,
+            seal: ?persistent_mod.PersistentIndex.SealPublication = null,
+            delete: persistent_mod.PersistentIndex.PreparedDeleteByIds = .{ .delete_infos = &.{}, .seg_keys = &.{} },
+            progress: apply_state.Progress,
+
+            fn mutationsAlloc(self: *const InlineTextPublication, alloc: Allocator) ![]native_catalog_backend.Mutation {
+                var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+                errdefer out.deinit(alloc);
+                for (self.segments[0..self.segment_count]) |*seg| try out.appendSlice(alloc, &seg.mutations());
+                if (self.seal) |*seal| try out.append(alloc, seal.mutation());
+                const delete_mutations = try self.delete.mutationsAlloc(alloc);
+                defer alloc.free(delete_mutations);
+                try out.appendSlice(alloc, delete_mutations);
+                return try out.toOwnedSlice(alloc);
+            }
+
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
+                const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
+                const scope = self.entry.persistent.nativeCatalogScope() orelse return error.NotNativeCatalogBackend;
+                const mutations = try self.mutationsAlloc(self.alloc);
+                defer self.alloc.free(mutations);
+                if (mutations.len != 0) try view.putIndexCatalog(scope, mutations);
+                try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            /// `commit_participant.Participant.stage` is called BEFORE the
+            /// host's native commit, so by the time it returns, `self`'s
+            /// mutations are staged into the SAME transaction as the
+            /// write's primary rows -- but not yet durable. Call `install`
+            /// only once that transaction's commit has actually returned
+            /// successfully (e.g. after `Ticket.wait()`), never from
+            /// inside `stage` itself.
+            pub fn participant(self: *InlineTextPublication) commit_participant.Participant {
+                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            }
+
+            /// Runs only after this publication's mutations are durable:
+            /// syncs the `.native_catalog` backend's own in-memory read
+            /// mirror (it never saw `stage`'s `view.putIndexCatalog` call,
+            /// which wrote the native file directly), installs the
+            /// in-memory writer snapshot for every segment and the
+            /// delete-tracking state, then releases the apply guard held
+            /// since `prepareInlineTextPublication`.
+            pub fn install(self: *InlineTextPublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                if (self.mutationsAlloc(self.alloc)) |mutations| {
+                    defer self.alloc.free(mutations);
+                    self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations) catch |err| {
+                        std.log.err("inline text publication install: native_catalog mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                    };
+                } else |err| {
+                    std.log.err("inline text publication install: rebuilding mutations failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                }
+                for (self.segments[0..self.segment_count]) |*seg| self.entry.persistent.installInlineSegmentPublication(seg);
+                self.entry.persistent.installInlineDeleteByIdsTracked(self.alloc, &self.delete);
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+
+            /// The mutations were never committed (preparation succeeded
+            /// but the caller fell back, or the primary write itself
+            /// failed before committing): undo every in-memory change
+            /// `prepareInlineTextPublication` already made and release the
+            /// apply guard.
+            pub fn abort(self: *InlineTextPublication) void {
+                std.debug.assert(self.apply_guard.locked());
+                for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
+                self.entry.persistent.abortInlineDeleteByIdsTracked(self.alloc, &self.delete);
+                self.apply_guard.unlock();
+                self.alloc.destroy(self);
+            }
+        };
+
+        fn buildInlineProjectionSeal(
+            index_manager: *index_manager_mod.IndexManager,
+            store: *docstore_mod.DocStore,
+            entry: *index_manager_mod.IndexManager.TextIndex,
+            sequence: u64,
+        ) !?projection_seal.Seal {
+            if (index_manager.artifact_projection_root == 0) return null;
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const selected = (try @import("artifact_publication.zig").authority(&read)) orelse return null;
+            return .{
+                .root = index_manager.artifact_projection_root,
+                .namespace = selected.namespace,
+                .generation = entry.config.coverage_generation,
+                .config_hash = types.indexConfigHash(entry.config),
+                .applied_sequence = sequence,
+            };
+        }
+
+        /// WS4 phase 2 fast path: prepares one managed full_text index's
+        /// segment, seal and delete-tracking mutations for publication in
+        /// the same native transaction as the write's own primary rows,
+        /// instead of each going through its own commit via
+        /// `applyPreparedTextMapperPublicationByNameWithOptions`/
+        /// `indexSegmentOwned`/`publishProjectionSeal`.
+        ///
+        /// Returns `error.InlineTextPublicationUnsupported` for every case
+        /// outside the simple, single-chunk, non-reprojected,
+        /// `.native_catalog` case -- a multi-chunk plan, a projection
+        /// change mid-build, an observed-analyzer update, or a
+        /// non-`.native_catalog` index -- so the caller falls back to
+        /// `applyDerivedBatchToIndexContextProfiled`, which remains
+        /// correct (and is not changed by any of this) for all of them.
+        pub fn prepareInlineTextPublication(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_manager: *index_manager_mod.IndexManager,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+        ) !*InlineTextPublication {
+            if (index_ref.kind != .full_text) return error.InlineTextPublicationUnsupported;
+
+            // Cheap precheck before any tokenization: bail out immediately
+            // for anything but a `.native_catalog` index, so a hosted/
+            // LSM-backed full_text write never pays for
+            // `prepareTextMapperDocsPublication`'s real tokenization work
+            // here just to discard it and redo it in the existing
+            // post-commit path below.
+            {
+                index_manager.catalog_mutex.lockShared();
+                defer index_manager.catalog_mutex.unlockShared();
+                const precheck_entry = index_manager.textIndexEntry(index_ref.name) orelse return error.InlineTextPublicationUnsupported;
+                if (precheck_entry.persistent.main_backend != .native_catalog) return error.InlineTextPublicationUnsupported;
+            }
+
+            var publication_context = try index_manager.acquireTextPublicationContext(alloc, index_ref.name);
+            defer publication_context.deinit();
+
+            var collected = try collectTextDocumentWritesForIndex(
+                alloc,
+                store,
+                index_manager,
+                batch.documents,
+                index_ref.name,
+                publication_context.chunk_backed,
+                index_manager.byte_range,
+                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
+            );
+            defer collected.deinit();
+            if (collected.missing_required != 0 or collected.docs.items.len == 0) return error.InlineTextPublicationUnsupported;
+
+            var publication_plan = try index_manager.planTextMapperDocsPublication(
+                index_ref.name,
+                &publication_context,
+                collected.docs.items,
+                std.math.maxInt(usize),
+            );
+            defer publication_plan.deinit();
+            if (publication_plan.chunks.len != 1) return error.InlineTextPublicationUnsupported;
+
+            var prepared_publication = index_manager.prepareTextMapperDocsPublication(
+                alloc,
+                store,
+                index_ref.name,
+                &publication_context,
+                collected.docs.items,
+            ) catch |err| switch (err) {
+                error.TextProjectionChanged => return error.InlineTextPublicationUnsupported,
+                else => return err,
+            };
+            defer prepared_publication.deinit();
+            if (prepared_publication.observed_field_analyzers.len != 0) return error.InlineTextPublicationUnsupported;
+            if (prepared_publication.segments.len > InlineTextPublication.max_segments) return error.InlineTextPublicationUnsupported;
+
+            var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
+            errdefer apply_guard.unlock();
+
+            if ((try index_manager.refreshTextPublicationContextAssumeCatalogLocked(index_ref.name, &publication_context)) == .projection_changed)
+                return error.InlineTextPublicationUnsupported;
+
+            const entry = index_manager.textIndexEntry(index_ref.name) orelse return error.InlineTextPublicationUnsupported;
+            if (entry.persistent.main_backend != .native_catalog) return error.InlineTextPublicationUnsupported;
+
+            const delete_keys = try collectTextReplayDeleteKeys(alloc, index_manager, batch, index_ref.name, publication_context);
+            defer if (delete_keys.len > 0) alloc.free(delete_keys);
+
+            var prepared_delete = try entry.persistent.prepareInlineDeleteByIdsTracked(alloc, delete_keys);
+            errdefer entry.persistent.abortInlineDeleteByIdsTracked(alloc, &prepared_delete);
+
+            var prepared_segments: [InlineTextPublication.max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined;
+            var prepared_segment_count: usize = 0;
+            errdefer for (prepared_segments[0..prepared_segment_count]) |*seg| seg.abort(alloc);
+            for (prepared_publication.segments, 0..) |*segment, i| {
+                if (segment.len == 0) continue;
+                const owned = segment.*;
+                segment.* = &.{};
+                prepared_segments[i] = entry.persistent.prepareInlineSegmentPublication(owned) catch |err| {
+                    alloc.free(owned);
+                    return err;
+                };
+                prepared_segment_count += 1;
+            }
+
+            const seal_value = try buildInlineProjectionSeal(index_manager, store, entry, batch.sequence);
+            const prepared_seal = if (seal_value) |seal| try entry.persistent.prepareInlineProjectionSealMutation(seal) else null;
+
+            const result = try alloc.create(InlineTextPublication);
+            result.* = .{
+                .alloc = alloc,
+                .entry = entry,
+                .apply_guard = apply_guard,
+                .segments = prepared_segments,
+                .segment_count = prepared_segment_count,
+                .seal = prepared_seal,
+                .delete = prepared_delete,
+                .progress = .{
+                    .consumer = index_ref.name,
+                    .sequence = batch.sequence,
+                    .generation = entry.config.coverage_generation,
+                    .config_hash = types.indexConfigHash(entry.config),
+                },
+            };
+            return result;
         }
 
         pub fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {

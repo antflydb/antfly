@@ -1439,6 +1439,54 @@ pub const PersistentIndex = struct {
         try self.main_store_owner.sync(true);
     }
 
+    /// WS4 phase 2: one merged, encoded seal record ready for an externally
+    /// owned native transaction. `mutation()`'s returned `Mutation` borrows
+    /// `self.encoded`; keep this value alive until that mutation has been
+    /// handed to `commit_participant.View.putIndexCatalog`.
+    pub const SealPublication = struct {
+        encoded: projection_seal.Seal.Encoded,
+
+        pub fn mutation(self: *const SealPublication) native_catalog_backend.Mutation {
+            return .{ .namespace = "meta", .key = projection_seal.metadata_key, .value = &self.encoded };
+        }
+    };
+
+    /// A Txn-free variant of `publishProjectionSeal`'s "read the previous
+    /// seal, merge baseline/applied_sequence" step, for a `.native_catalog`
+    /// index. Returns the merged, encoded seal as one more mutation for the
+    /// caller to fold into an externally-owned native transaction, or
+    /// `null` if the merge is identical to what is already durable
+    /// (nothing to write -- mirrors `publishProjectionSeal`'s
+    /// `already_covered` early return). Does not commit, sync, or install
+    /// anything: `loadProjectionSeal` always reads through the main store,
+    /// so once the returned mutation is durable there is nothing further
+    /// to install, unlike `installInlineSegmentPublication`'s in-memory
+    /// writer snapshot.
+    ///
+    /// Caller must serialize this with any other seal publication for the
+    /// same index (the same per-index apply lane `publishProjectionSeal`'s
+    /// own doc comment requires) -- this reads the previous seal without
+    /// taking `lockStorage`, so a concurrent writer could otherwise race
+    /// the merge.
+    pub fn prepareInlineProjectionSealMutation(self: *PersistentIndex, seal: projection_seal.Seal) !?SealPublication {
+        if (self.read_only) return error.ReadOnly;
+        if (self.main_backend != .native_catalog) return error.NotNativeCatalogBackend;
+        var next = seal;
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        const previous = read.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
+        if (previous) |raw| {
+            const old = try projection_seal.Seal.decode(raw);
+            if (!old.sameIdentity(seal)) return error.ProjectionSealIdentityChanged;
+            // Incremental replay preserves the completed baseline of this
+            // physical generation. Reset/removal deletes the entire seal.
+            if (next.baseline == null) next.baseline = old.baseline;
+            next.applied_sequence = @max(next.applied_sequence, old.applied_sequence);
+            if (std.meta.eql(old, next)) return null;
+        }
+        return .{ .encoded = try next.encode() };
+    }
+
     /// Physical segments, including fully-deleted segments, are projection
     /// history. They prevent changing a generation's analyzer semantics.
     pub fn hasPhysicalSegments(self: *PersistentIndex) bool {
@@ -2204,6 +2252,22 @@ pub const PersistentIndex = struct {
         };
     }
 
+    /// WS4 phase 2: syncs this index's `.native_catalog` backend's own
+    /// in-memory read mirror with mutations an external transaction
+    /// already committed durably (see `native_catalog_backend.zig`'s
+    /// `Backend.applyExternallyCommittedMutations`, which this forwards
+    /// to) -- the step a caller using `commit_participant.View.
+    /// putIndexCatalog` instead of this index's own `MainTxn` must run
+    /// after that commit succeeds, so this index's own reads (segment
+    /// ranges, the active set, the seal) see it. A no-op, not an error,
+    /// on every other backend.
+    pub fn applyExternallyCommittedMutationsIfNativeCatalog(self: *PersistentIndex, mutations: []const native_catalog_backend.Mutation) !void {
+        switch (self.main_store_owner) {
+            .native_catalog => |backend| try backend.applyExternallyCommittedMutations(mutations),
+            .mem, .lsm => {},
+        }
+    }
+
     /// A small ("inline") segment publication prepared for a
     /// `.native_catalog` index, built OUTSIDE any lock and without
     /// committing anything: `prepareInlineSegmentPublication` below
@@ -2944,6 +3008,71 @@ pub const PersistentIndex = struct {
 
     pub fn freeDeleteInfos(self: *PersistentIndex, delete_infos: []index_mod.IndexWriter.DeleteInfo) void {
         index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+    }
+
+    /// WS4 phase 2: `deleteByIdsTracked`'s own in-memory lookup
+    /// (`writer.deleteAllByIdsTracked`), split from its commit. Common case
+    /// for a batch of brand-new document keys: no matching postings exist
+    /// anywhere yet, so `delete_infos.len == 0` and there is nothing to
+    /// write at all -- the caller's inline fast path can proceed with no
+    /// `.deletions` mutation. When postings DO exist (an update or delete
+    /// of a previously-indexed document), `mutationsAlloc` builds the same
+    /// per-segment bitmap mutations `deleteByIdsTracked`'s own commit loop
+    /// would have written, for the caller to fold into an externally-owned
+    /// native transaction. Exactly one of `installInlineDeleteByIdsTracked`
+    /// (mutations committed durably) or `abortInlineDeleteByIdsTracked`
+    /// (they did not, or the caller fell back to another path) must run
+    /// exactly once -- mirrors `deleteByIdsTracked`'s own persisted/
+    /// rollback split.
+    pub const PreparedDeleteByIds = struct {
+        delete_infos: []index_mod.IndexWriter.DeleteInfo,
+        seg_keys: [][8]u8,
+
+        pub fn isEmpty(self: *const PreparedDeleteByIds) bool {
+            return self.delete_infos.len == 0;
+        }
+
+        pub fn mutationsAlloc(self: *const PreparedDeleteByIds, alloc: Allocator) ![]native_catalog_backend.Mutation {
+            const out = try alloc.alloc(native_catalog_backend.Mutation, self.delete_infos.len);
+            for (self.delete_infos, self.seg_keys, out) |info, *seg_key, *mutation| {
+                mutation.* = .{ .namespace = "deletions", .key = seg_key, .value = info.bitmap_bytes };
+            }
+            return out;
+        }
+    };
+
+    pub fn prepareInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, doc_ids: []const []const u8) !PreparedDeleteByIds {
+        if (self.main_backend != .native_catalog) return error.NotNativeCatalogBackend;
+        if (doc_ids.len == 0) return .{ .delete_infos = &.{}, .seg_keys = &.{} };
+        self.lockStorage();
+        defer self.unlockStorage();
+        const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, doc_ids);
+        errdefer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+        if (delete_infos.len == 0) return .{ .delete_infos = delete_infos, .seg_keys = &.{} };
+        const seg_keys = try alloc.alloc([8]u8, delete_infos.len);
+        for (delete_infos, seg_keys) |info, *seg_key| seg_key.* = std.mem.toBytes(std.mem.nativeToBig(u64, info.seg_id));
+        return .{ .delete_infos = delete_infos, .seg_keys = seg_keys };
+    }
+
+    /// Runs only after `prepared`'s mutations are already durable in an
+    /// externally-owned transaction's commit: the in-memory writer
+    /// tracking state was already updated synchronously by
+    /// `deleteAllByIdsTracked` inside `prepareInlineDeleteByIdsTracked`, so
+    /// there is nothing left to "install" -- just release the bookkeeping.
+    pub fn installInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, prepared: *PreparedDeleteByIds) void {
+        if (prepared.seg_keys.len > 0) alloc.free(prepared.seg_keys);
+        index_mod.IndexWriter.freeDeleteInfos(self.alloc, prepared.delete_infos);
+        prepared.* = undefined;
+    }
+
+    /// The mutations were never committed (or the caller fell back to
+    /// another path before reaching a commit at all): undo the in-memory
+    /// writer tracking change `deleteAllByIdsTracked` already made.
+    pub fn abortInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, prepared: *PreparedDeleteByIds) void {
+        self.writer.rollbackDeleteInfos(prepared.delete_infos);
+        if (prepared.seg_keys.len > 0) alloc.free(prepared.seg_keys);
+        index_mod.IndexWriter.freeDeleteInfos(self.alloc, prepared.delete_infos);
+        prepared.* = undefined;
     }
 
     /// Tombstone a batch and return the exact newly-deleted local document IDs
@@ -5124,7 +5253,69 @@ test "persistent index prepares an inline segment publication, applies it throug
     }
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 
+    // WS4 phase 2: deleting a key with no matching posting anywhere (the
+    // common brand-new-document case) needs no commit at all -- confirmed
+    // directly by isEmpty(), and aborting an empty one is a safe no-op.
+    var empty_delete = try pi.prepareInlineDeleteByIdsTracked(alloc, &.{"doc:never-indexed"});
+    try std.testing.expect(empty_delete.isEmpty());
+    pi.abortInlineDeleteByIdsTracked(alloc, &empty_delete);
+
+    // Deleting the key just published above DOES find a posting and needs
+    // a `.deletions` mutation, committed the same way as everything else.
+    var real_delete = try pi.prepareInlineDeleteByIdsTracked(alloc, &.{"doc:a"});
+    try std.testing.expect(!real_delete.isEmpty());
+    const delete_mutations = try real_delete.mutationsAlloc(alloc);
+    defer alloc.free(delete_mutations);
+    switch (pi.main_store_owner) {
+        .native_catalog => |backend| try backend.applyExternallyCommittedMutations(delete_mutations),
+        else => return error.TestUnexpectedResult,
+    }
+    pi.installInlineDeleteByIdsTracked(alloc, &real_delete);
+
     _ = scope;
+}
+
+test "persistent index prepares a merged seal mutation without committing, and returns null once already covered" {
+    const alloc = std.testing.allocator;
+
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    var pi = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer pi.close();
+
+    const first: projection_seal.Seal = .{ .root = 1, .namespace = @splat(1), .generation = 1, .config_hash = 1, .applied_sequence = 5 };
+    var publication = (try pi.prepareInlineProjectionSealMutation(first)) orelse return error.TestUnexpectedResult;
+    const mutation = publication.mutation();
+    try std.testing.expectEqualStrings(projection_seal.metadata_key, mutation.key);
+    try std.testing.expect((try projection_seal.Seal.decode(mutation.value)).applied_sequence == 5);
+    // Not committed yet: this index's own read must not see it.
+    try std.testing.expect((try pi.loadProjectionSeal(alloc)) == null);
+
+    switch (pi.main_store_owner) {
+        .native_catalog => |backend| try backend.applyExternallyCommittedMutations(&.{mutation}),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const loaded = (try pi.loadProjectionSeal(alloc)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 5), loaded.applied_sequence);
+
+    // A second publication with an older applied_sequence merges forward
+    // (never backward) and is reported as already covered.
+    const second: projection_seal.Seal = .{ .root = 1, .namespace = @splat(1), .generation = 1, .config_hash = 1, .applied_sequence = 3 };
+    try std.testing.expect((try pi.prepareInlineProjectionSealMutation(second)) == null);
+
+    // A different identity is refused.
+    const mismatched: projection_seal.Seal = .{ .root = 2, .namespace = @splat(1), .generation = 1, .config_hash = 1, .applied_sequence = 9 };
+    try std.testing.expectError(error.ProjectionSealIdentityChanged, pi.prepareInlineProjectionSealMutation(mismatched));
 }
 
 test "persistent index open prunes stale active segment references" {
