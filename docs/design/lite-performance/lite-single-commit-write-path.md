@@ -140,6 +140,35 @@ Rejected: an in-file redo log with lazy checkpoints. Every reader process would 
 
 - The hosted LSM backend implements `commitStaged` as an already-durable ticket.
 
+### 3.2a Durability budget: one fsync per group, background rides along
+
+Lite has a single durability domain: the native file. Primary rows, journal records, index publications, consumer progress, the credit ledger and durable obligations all change through native transactions. Nothing keeps its own WAL.
+
+**Who pays for an fsync.** A foreground group pays exactly one `syncData` for all of its members. The only other durability barriers are:
+
+- close;
+- cross-process path-lease handoff, so the next owner sees a durable tip;
+- page reuse that needs the durable epoch to advance;
+- an idle-flush timer or undurable-bytes threshold, so ride-along work becomes durable when no foreground writer comes.
+
+**Ride-along members.** Background work joins the group-commit queue as ride-along members: `Store.stageRideAlong(plan)`, committed with `durability = false`. It never closes a group and never forces a sync. The next foreground group's fsync makes it durable, because the next durable copy-on-write checkpoint includes every earlier transaction. This covers retirement, reclamation, merges, catch-up progress and status.
+
+Each kind of ride-along work is safe to lose in a crash because it can be recomputed:
+
+| Work | Why losing it is safe |
+|---|---|
+| Retirement | Redone from the durable progress watermark. Its ledger release is in the same transaction. |
+| Reclamation | A freed page is reusable only at the durable epoch. |
+| Merge | Redone. Readers see the inputs until the merged output is durable. |
+| Catch-up progress | Replay restarts from durable progress, and the work is idempotent. |
+| Status | Derived from live state. |
+
+**Credits.** A credit release takes effect for producers only once `durableSequence()` covers the transaction that released it. So credits still return only after deletion is durable, with no dedicated fsync.
+
+**Journal.** A consumer whose publication rides in the acknowledgement's commit (a synchronous `full_text` write) needs no journal record for that write.
+
+**Crash invariant.** Ride-along work may be lost at a crash. Acknowledged work may not, and credits may not leak.
+
 ### 3.3 One physical commit for a small indexed write
 
 **`CommitPlan`** is a typed list of native operations in one native transaction:
