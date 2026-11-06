@@ -1958,10 +1958,11 @@ fallback bounds worst-case work and smaller-partition recursion bounds stack
 space.
 Metadata resolution shares one decoded object-stream frame and validated offset
 index per page. Both count against the retained/live byte allowance; codec
-scratch has a separate per-decode cumulative allowance. Output ownership moves
-between accounting ledgers without copying or double-charging the shared
-backing allocator. Required reads evict unrelated frames, and large selected
-clones release a frame before competing with its decoded scratch value.
+scratch has a separate per-decode cumulative allowance. Decoded frames and
+projected object graphs move between accounting ledgers without copying or
+double-charging the shared backing allocator. Required reads evict unrelated
+frames; retained-budget pressure may also evict a frame before adopting a
+selected value.
 Metadata scanning polls cancellation throughout tokens, strings, whitespace,
 comments, and skipped compound values. A page-local work allowance of 16 times
 the working-set byte limit (at least 1 MiB, at most 2 GiB) charges scanned bytes,

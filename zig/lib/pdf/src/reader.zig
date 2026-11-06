@@ -390,15 +390,18 @@ const DecodeBudgetAllocator = struct {
     }
 
     fn adopt(self: *DecodeBudgetAllocator, source: *DecodeBudgetAllocator, bytes: []u8) !void {
-        // Transfer ledger ownership without copying or charging the shared
-        // backing allocator twice. Transient codec churn stays per decode;
-        // retained output is charged to the page's cumulative allowance.
+        try self.adoptAllocation(source, bytes.len);
+    }
+
+    fn adoptAllocation(self: *DecodeBudgetAllocator, source: *DecodeBudgetAllocator, byte_count: usize) !void {
+        // Move ownership between ledgers sharing one backing allocator;
+        // neither copy the data nor charge the backing live bytes twice.
         std.debug.assert(self.backing.ptr == source.backing.ptr and self.backing.vtable == source.backing.vtable);
-        std.debug.assert(source.live_bytes >= bytes.len);
-        if (!self.permitsGrowth(bytes.len)) return error.OutOfMemory;
-        source.live_bytes -= bytes.len;
-        self.live_bytes += bytes.len;
-        self.recordSuccessfulGrowth(bytes.len);
+        std.debug.assert(source.live_bytes >= byte_count);
+        if (!self.permitsGrowth(byte_count)) return error.OutOfMemory;
+        source.live_bytes -= byte_count;
+        self.live_bytes += byte_count;
+        self.recordSuccessfulGrowth(byte_count);
     }
 
     fn allocator(self: *DecodeBudgetAllocator) Allocator {
@@ -3291,7 +3294,7 @@ const TextResourceCache = struct {
 
     // Metadata is parsed with a temporary per-object allocation allowance,
     // sharing the live-byte ceiling with retained cache entries. Only fields
-    // used by native extraction are copied into the retained cache. Unknown
+    // used by native extraction enter the retained cache. Unknown
     // payloads can never accumulate merely because a dictionary was inspected.
     const Purpose = enum { resources, required_resources, resource_properties, container_properties, property_table, property };
     const ResourceSource = struct { reference: syntax.ObjRef, container: bool = false };
@@ -3423,14 +3426,28 @@ const TextResourceCache = struct {
         self.beginResolution();
         const resource_object = if (purpose == .container_properties) parsed.get("Resources") else &parsed;
         const properties_only = purpose == .resource_properties or purpose == .container_properties;
-        const metadata = if (properties_only) (if (resource_object) |resources_object| (if (resources_object.get("Properties")) |props| props.* else syntax.Object.null) else syntax.Object.null) else parsed;
-        // Parsed values own their bytes. Evict the optional frame before a
-        // large retained clone would otherwise compete with both the frame
-        // and its scratch parse (small/dense lookups keep sharing the frame).
-        const live_limit = @min(self.budget.max_live_bytes, if (self.live_budget) |live| live.max_live_bytes else self.budget.max_live_bytes);
-        const available = live_limit -| self.budget.live_bytes -| scratch.live_bytes;
-        if (scratch.live_bytes > available) self.frames.deinit();
-        const value = try self.cloneMetadata(reader, metadata, if (properties_only) .property_table else purpose);
+        var value: syntax.Object = .null;
+        if (properties_only) {
+            if (resource_object) |resources_object| if (resources_object.get("Properties")) |properties| {
+                value = properties.*;
+                @constCast(properties).* = .null;
+            };
+        } else {
+            value = parsed;
+            parsed = .null;
+        }
+        parsed.deinit(scratch.allocator());
+        parsed = .null;
+        if (value != .dict and value != .obj_ref and value != .deferred) {
+            value.deinit(scratch.allocator());
+            value = .null;
+        }
+        errdefer value.deinit(scratch.allocator());
+        // Projection already removed unused fields. Retain its owned graph
+        // directly, avoiding a second copy alongside a decoded source frame.
+        if (scratch.live_bytes > self.budget.max_live_bytes -| self.budget.live_bytes) self.frames.deinit();
+        try self.budget.adoptAllocation(&scratch, scratch.live_bytes);
+        std.debug.assert(scratch.live_bytes == 0);
         self.objects.putAssumeCapacity(key, .{ .object = value });
         return value;
     }
