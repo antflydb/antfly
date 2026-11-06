@@ -374,6 +374,9 @@ const DecodeBudgetAllocator = struct {
     max_cumulative_growth_bytes: usize = std.math.maxInt(usize),
     rejected_growth_charge: usize = 0,
     limit_exceeded: bool = false,
+    reclaimer: ?Reclaimer = null,
+
+    const Reclaimer = struct { context: *anyopaque, reclaim: *const fn (*anyopaque) void };
 
     fn init(backing: Allocator, initial_live_bytes: usize, max_live_bytes: usize) DecodeBudgetAllocator {
         return .{
@@ -417,8 +420,14 @@ const DecodeBudgetAllocator = struct {
     }
 
     fn permitsGrowth(self: *DecodeBudgetAllocator, additional_bytes: usize) bool {
-        const live_permitted = additional_bytes <= self.max_live_bytes -| self.live_bytes;
+        var live_permitted = additional_bytes <= self.max_live_bytes -| self.live_bytes;
         const cumulative_permitted = additional_bytes <= self.max_cumulative_growth_bytes -| self.cumulative_growth_bytes;
+        if (!live_permitted and cumulative_permitted) if (self.reclaimer) |reclaimer| {
+            // Reclaim optional retained bytes before classifying a live quota
+            // rejection. Never retry or conceal a backing-allocator OOM.
+            reclaimer.reclaim(reclaimer.context);
+            live_permitted = additional_bytes <= self.max_live_bytes -| self.live_bytes;
+        };
         if (live_permitted and cumulative_permitted) return true;
         if (!live_permitted) self.rejected_growth_charge = @max(self.rejected_growth_charge, self.max_live_bytes);
         if (!cumulative_permitted) self.rejected_growth_charge = @max(self.rejected_growth_charge, self.max_cumulative_growth_bytes);
@@ -3160,11 +3169,18 @@ const MetadataObjectStreamCache = struct {
     live_budget: ?*DecodeBudgetAllocator = null,
     frame: ?Frame = null,
     loads: usize = 0,
+    pins: usize = 0,
 
     const Entry = struct { id: u32, start: usize, end: usize };
     const Frame = struct { id: u32, bytes: []u8, first: usize, entries: []Entry };
 
+    fn reclaim(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.pins == 0) self.deinit();
+    }
+
     fn deinit(self: *@This()) void {
+        std.debug.assert(self.pins == 0);
         if (self.frame) |frame| {
             const a = self.budget.?.allocator();
             a.free(frame.entries);
@@ -3253,6 +3269,9 @@ const TextResourceCache = struct {
             self.scan_control = metadataScanControl(reader);
             self.frames.budget = self.budget;
             self.frames.live_budget = self.live_budget;
+            const reclaimer = DecodeBudgetAllocator.Reclaimer{ .context = &self.frames, .reclaim = MetadataObjectStreamCache.reclaim };
+            self.budget.reclaimer = reclaimer;
+            if (self.live_budget) |live| live.reclaimer = reclaimer;
             self.scan_ready = true;
         }
     }
@@ -3275,6 +3294,10 @@ const TextResourceCache = struct {
         for (self.direct_resources.items) |*object| object.deinit(a);
         self.direct_resources.deinit(a);
         self.frames.deinit();
+        if (self.scan_ready) {
+            self.budget.reclaimer = null;
+            if (self.live_budget) |live| live.reclaimer = null;
+        }
     }
 
     // Call only at a cache-budget allocation boundary, never around work
@@ -5333,6 +5356,16 @@ pub const Reader = struct {
         return self.cancellation.check();
     }
 
+    fn scannerControl(self: *const Reader, local: *syntax.ScanControl) ?*syntax.ScanControl {
+        if (self.metadata_scan) |shared| return shared;
+        if (self.cancellation.is_cancelled_fn == null) return null;
+        local.* = .{
+            .context = self.cancellation.context,
+            .is_cancelled_fn = self.cancellation.is_cancelled_fn,
+        };
+        return local;
+    }
+
     fn beginImageCacheScope(self: *Reader) !void {
         const cache = self.image_cache orelse return;
         if (cache.scope_depth == 0) cache.clear(self.alloc);
@@ -5720,7 +5753,8 @@ pub const Reader = struct {
         var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[entry.offset..], entry.offset);
         scanner.max_object_depth = self.object_depth_limit;
         scanner.source_ref = ptr;
-        scanner.control = self.metadata_scan;
+        var scan_control: syntax.ScanControl = undefined;
+        scanner.control = self.scannerControl(&scan_control);
         defer scanner.deinit();
 
         var parsed = try scanner.readObjectProjected(projection);
@@ -5749,7 +5783,8 @@ pub const Reader = struct {
         var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[location.start..location.end], location.start);
         scanner.max_object_depth = self.object_depth_limit;
         scanner.source_ref = location.reference;
-        scanner.control = self.metadata_scan;
+        var scan_control: syntax.ScanControl = undefined;
+        scanner.control = self.scannerControl(&scan_control);
         defer scanner.deinit();
         var value = try scanner.readObjectProjected(projection);
         errdefer value.deinit(self.alloc);
@@ -7334,6 +7369,8 @@ pub const Reader = struct {
         if (self.metadata_frames) |cache| if (cache.frame) |*frame| {
             if (frame.id == obj_stream_id) {
                 if (obj_index >= frame.entries.len) return error.ObjectNotFound;
+                cache.pins += 1;
+                defer cache.pins -= 1;
                 return self.parseCompressedObject(frame.bytes, frame.first, frame.entries[obj_index], ptr, projection, location);
             }
         };
@@ -7354,6 +7391,8 @@ pub const Reader = struct {
         };
         if (keep_frame) if (self.metadata_frames) |cache| {
             const frame = try cache.load(self, obj_stream_id, &obj_stream, first, count);
+            cache.pins += 1;
+            defer cache.pins -= 1;
             return self.parseCompressedObject(frame.bytes, frame.first, frame.entries[obj_index], ptr, projection, location);
         };
         if (self.metadata_frames) |frames| frames.deinit();
@@ -7366,7 +7405,8 @@ pub const Reader = struct {
     fn scanObjectStreamIndex(self: *const Reader, decoded: []const u8, first: usize, count: usize, selected: usize, output: ?[]MetadataObjectStreamCache.Entry) !MetadataObjectStreamCache.Entry {
         if (first > decoded.len) return error.InvalidObjectStream;
         var scanner = syntax.Scanner.init(self.alloc, decoded[0..first]);
-        scanner.control = self.metadata_scan;
+        var scan_control: syntax.ScanControl = undefined;
+        scanner.control = self.scannerControl(&scan_control);
         defer scanner.deinit();
         var result: ?MetadataObjectStreamCache.Entry = null;
         var previous_offset: ?usize = null;
@@ -7402,7 +7442,8 @@ pub const Reader = struct {
         if (start >= end or end > bytes.len) return error.InvalidObjectOffset;
         var scanner = syntax.Scanner.initWithOffset(self.alloc, bytes[start..end], start);
         scanner.source_ref = ptr;
-        scanner.control = self.metadata_scan;
+        var scan_control: syntax.ScanControl = undefined;
+        scanner.control = self.scannerControl(&scan_control);
         scanner.allow_stream = false;
         scanner.max_object_depth = self.object_depth_limit;
         defer scanner.deinit();
@@ -37043,6 +37084,20 @@ test "reader inherited direct properties skip large opaque payloads during metad
 }
 
 fn buildObjectStreamBoundaryTestPdfAlloc(a: Allocator, objects: []const []const u8, header_override: ?[]const u8) ![]u8 {
+    return buildObjectStreamFixtureAlloc(a, .{ .objects = objects, .header_override = header_override });
+}
+
+const ObjectStreamFixture = struct {
+    objects: []const []const u8,
+    header_override: ?[]const u8 = null,
+    content: []const u8 = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET",
+    extra: []const []const u8 = &.{},
+    flate: bool = true,
+    indirect_length: bool = false,
+};
+
+fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]u8 {
+    const objects = fixture.objects;
     var header = std.ArrayList(u8).empty;
     defer header.deinit(a);
     var object_offset: usize = 0;
@@ -37050,21 +37105,28 @@ fn buildObjectStreamBoundaryTestPdfAlloc(a: Allocator, objects: []const []const 
         try header.print(a, "{d} {d} ", .{ 7 + i, object_offset });
         object_offset += object.len + 1;
     }
-    const header_bytes = header_override orelse header.items;
+    const header_bytes = fixture.header_override orelse header.items;
     var compressed = try std.Io.Writer.Allocating.initCapacity(a, 256);
     defer compressed.deinit();
     var history: [std.compress.flate.max_window_len]u8 = undefined;
     var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);
-    try compressor.writer.writeAll(header_bytes);
+    var raw = try std.Io.Writer.Allocating.initCapacity(a, 256);
+    defer raw.deinit();
+    const writer = if (fixture.flate) &compressor.writer else &raw.writer;
+    try writer.writeAll(header_bytes);
     for (objects) |object| {
-        try compressor.writer.writeAll(object);
-        try compressor.writer.writeByte(' ');
+        try writer.writeAll(object);
+        try writer.writeByte(' ');
     }
-    try compressor.finish();
-    const content = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET";
+    if (fixture.flate) try compressor.finish();
+    const encoded = if (fixture.flate) compressed.written() else raw.written();
+    const content = fixture.content;
+    const length_id = 7 + objects.len + fixture.extra.len;
+    const length = if (fixture.indirect_length) try std.fmt.allocPrint(a, "{d} 0 R", .{length_id}) else try std.fmt.allocPrint(a, "{d}", .{encoded.len});
+    defer a.free(length);
     const paint = try std.fmt.allocPrint(a, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ content.len, content });
     defer a.free(paint);
-    const stream = try std.fmt.allocPrint(a, "<< /Type /ObjStm /N {d} /First {d} /Filter /FlateDecode /Length {d} >>\nstream\n{s}\nendstream", .{ objects.len, header_bytes.len, compressed.written().len, compressed.written() });
+    const stream = try std.fmt.allocPrint(a, "<< /Type /ObjStm /N {d} /First {d} {s}/Length {s} >>\nstream\n{s}\nendstream", .{ objects.len, header_bytes.len, if (fixture.flate) "/Filter /FlateDecode " else "", length, encoded });
     defer a.free(stream);
     const fixed = [_][]const u8{
         "<< /Type /Catalog /Pages 2 0 R >>",
@@ -37077,19 +37139,31 @@ fn buildObjectStreamBoundaryTestPdfAlloc(a: Allocator, objects: []const []const 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(a);
     try out.appendSlice(a, "%PDF-1.7\n");
-    var offsets: [7]usize = @splat(0);
+    const xref_id = length_id + @intFromBool(fixture.indirect_length);
+    const offsets = try a.alloc(usize, xref_id + 1);
+    defer a.free(offsets);
+    @memset(offsets, 0);
     for (fixed, 1..) |object, id| {
         offsets[id] = out.items.len;
         try out.print(a, "{d} 0 obj\n{s}\nendobj\n", .{ id, object });
     }
-    const xref_id = 7 + objects.len;
+    for (fixture.extra, 7 + objects.len..) |object, id| {
+        offsets[id] = out.items.len;
+        try out.print(a, "{d} 0 obj\n{s}\nendobj\n", .{ id, object });
+    }
+    if (fixture.indirect_length) {
+        offsets[length_id] = out.items.len;
+        try out.print(a, "{d} 0 obj\n{d}\nendobj\n", .{ length_id, encoded.len });
+    }
     const xref = out.items.len;
+    offsets[xref_id] = xref;
     try out.print(a, "{d} 0 obj\n<< /Type /XRef /Size {d} /Root 1 0 R /W [1 4 2] /Length {d} >>\nstream\n", .{ xref_id, xref_id + 1, (xref_id + 1) * 7 });
     for (0..xref_id + 1) |id| {
         var record: [7]u8 = undefined;
-        record[0] = if (id == 0) 0 else if (id < 7 or id == xref_id) 1 else 2;
-        std.mem.writeInt(u32, record[1..5], @intCast(if (id == xref_id) xref else if (id < 7) offsets[id] else 6), .big);
-        std.mem.writeInt(u16, record[5..7], @intCast(if (id == 0) 65535 else if (id < 7 or id == xref_id) 0 else id - 7), .big);
+        const compressed_object = id >= 7 and id < 7 + objects.len;
+        record[0] = if (id == 0) 0 else if (compressed_object) 2 else 1;
+        std.mem.writeInt(u32, record[1..5], @intCast(if (compressed_object) 6 else offsets[id]), .big);
+        std.mem.writeInt(u16, record[5..7], @intCast(if (id == 0) 65535 else if (compressed_object) id - 7 else 0), .big);
         try out.appendSlice(a, &record);
     }
     try out.print(a, "\nendstream\nendobj\nstartxref\n{d}\n%%EOF\n", .{xref});
@@ -37581,4 +37655,179 @@ test "reader cancellable property introsort preserves ordering and permutation w
         }
         try std.testing.expectEqual(@as(usize, 0), budget.cumulative_growth_bytes);
     };
+}
+
+fn buildMetadataFramePressureTestPdfAlloc(a: Allocator) ![]u8 {
+    const padding = try a.alloc(u8, 150 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const resources = try std.fmt.allocPrint(a, "<< /Font << /F1 5 0 R >> /Properties << /A 8 0 R /B 9 0 R /Unused << /Private ({s}) >> >> >>", .{padding});
+    defer a.free(resources);
+    const first = try std.fmt.allocPrint(a, "<< /ActualText ({s}) >>", .{padding[0 .. 60 * 1024]});
+    defer a.free(first);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{resources},
+        .extra = &.{ first, first },
+        .flate = false,
+        .content = "/Span /A BDC BT /F1 10 Tf (SOURCE) Tj ET EMC /Span /B BDC BT /F1 10 Tf (SOURCE) Tj ET EMC",
+    });
+}
+
+fn exerciseMetadataFramePressureAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 256 * 1024, .max_working_set_bytes = 256 * 1024 });
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+    try std.testing.expectEqual(@as(usize, 2), analysis.diagnostics.actual_text_replacements);
+    try std.testing.expectEqual(@as(usize, 120 * 1024 + 1), analysis.text.len);
+}
+
+test "reader optional frame pressure preserves both selected replacements and backing OOM" {
+    const a = std.testing.allocator;
+    const sample = try buildMetadataFramePressureTestPdfAlloc(a);
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 256 * 1024, .max_working_set_bytes = 256 * 1024 });
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const plain = try reader.extractPlainTextAlloc();
+        defer a.free(plain);
+        try std.testing.expectEqual(@as(usize, 120 * 1024 + 1), analysis.text.len);
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        try std.testing.expectEqual(@as(usize, 2), analysis.diagnostics.actual_text_replacements);
+    }
+    for ([_]bool{ false, true }) |inject_oom| {
+        var live = DecodeBudgetAllocator.init(a, 0, 256 * 1024);
+        var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 256 * 1024, 1024 * 1024);
+        {
+            var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+            defer cache.deinit();
+            const raw = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+            const resources = try cache.resources(&reader, &raw);
+            const entries = (try cache.sourceEntries(&reader, cache.propertySource(&resources).?)).?;
+            const first = try cache.entryProperty(&reader, &entries[0]);
+            try std.testing.expectEqual(@as(usize, 60 * 1024), first.actual_text.?.string.len);
+            try std.testing.expect(cache.frames.frame != null);
+            if (inject_oom) {
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                live.backing = failing.allocator();
+                defer live.backing = a;
+                try std.testing.expectError(error.OutOfMemory, cache.entryProperty(&reader, &entries[1]));
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expect(cache.frames.frame != null);
+                try std.testing.expect(entries[1].parsed == null);
+                try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+                live.backing = a;
+            }
+            const second = try cache.entryProperty(&reader, &entries[1]);
+            try std.testing.expectEqual(@as(usize, 60 * 1024), second.actual_text.?.string.len);
+            try std.testing.expect(cache.frames.frame == null);
+            try std.testing.expectEqual(@as(usize, 1), cache.frames.loads);
+        }
+        try std.testing.expectEqual(@as(usize, 0), live.live_bytes);
+        try std.testing.expect(retained.reclaimer == null and live.reclaimer == null);
+    }
+}
+
+test "reader optional frame pressure preserves ownership through every allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildMetadataFramePressureTestPdfAlloc(a);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseMetadataFramePressureAllocations, .{sample});
+}
+
+test "reader pins source frames while selected dictionaries are parsed" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 80 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const resources = try std.fmt.allocPrint(a, "<< /Properties << /Tag << /ActualText ({s}) /Private ({s}) >> >> >>", .{ padding, padding[0 .. 40 * 1024] });
+    defer a.free(resources);
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resources}, .flate = false });
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 256 * 1024, .max_working_set_bytes = 256 * 1024 });
+    defer reader.deinit();
+    var live = DecodeBudgetAllocator.init(a, 0, 256 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 256 * 1024, 1024 * 1024);
+    var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+    defer cache.deinit();
+    const raw = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+    const root = try cache.resources(&reader, &raw);
+    const entries = (try cache.sourceEntries(&reader, cache.propertySource(&root).?)).?;
+    const filler = try cache.allocator().alloc(u8, 80 * 1024);
+    defer cache.allocator().free(filler);
+    const selected = try cache.entryProperty(&reader, &entries[0]);
+    try std.testing.expect(selected.invalid);
+    try std.testing.expect(cache.frames.frame != null);
+    try std.testing.expectEqual(@as(usize, 0), cache.frames.pins);
+}
+
+test "reader indirect object stream lengths preserve cancellation and retry semantics" {
+    const a = std.testing.allocator;
+    var resource: std.ArrayList(u8) = .empty;
+    defer resource.deinit(a);
+    try resource.appendSlice(a, "<< /Font << /F1 5 0 R >> >> %");
+    for (0..4096) |_| try resource.appendSlice(a, "xendstreamx");
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resource.items}, .flate = false, .indirect_length = true });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        active: bool = true,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.active and self.calls >= 3;
+        }
+    };
+    var probe = Probe{};
+    reader.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.cancelled });
+    var live = DecodeBudgetAllocator.init(a, 0, 128 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 128 * 1024, 512 * 1024);
+    var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+    defer cache.deinit();
+    const raw = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+    try std.testing.expectError(error.Canceled, cache.resolve(&reader, &raw, .required_resources));
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), cache.objects.count());
+    try std.testing.expect(2 * 1024 * 1024 * 1024 - cache.scan_control.remaining_work < 16 * 1024);
+    probe.active = false;
+    const value = try cache.resolve(&reader, &raw, .required_resources);
+    try std.testing.expectEqual(@as(u32, 5), value.get("Font").?.get("F1").?.obj_ref.id);
+}
+
+test "reader ordinary object reads cancel stream searches before allocating payloads" {
+    const a = std.testing.allocator;
+    var resource: std.ArrayList(u8) = .empty;
+    defer resource.deinit(a);
+    try resource.appendSlice(a, "<< /Font << /F1 5 0 R >> >> %");
+    for (0..4096) |_| try resource.appendSlice(a, "xendstreamx");
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resource.items}, .flate = false, .indirect_length = true });
+    defer a.free(sample);
+    var tracked = DecodeBudgetAllocator.init(a, 0, 256 * 1024);
+    var reader = try Reader.init(tracked.allocator(), sample);
+    defer reader.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        active: bool = true,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.active and self.calls >= 3;
+        }
+    };
+    var probe = Probe{};
+    reader.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.cancelled });
+    const growth = tracked.cumulative_growth_bytes;
+    try std.testing.expectError(error.Canceled, reader.readIndirectObject(.{ .id = 7, .gen = 0 }));
+    try std.testing.expect(tracked.cumulative_growth_bytes - growth < 16 * 1024);
+    probe.active = false;
+    var object = try reader.readIndirectObject(.{ .id = 7, .gen = 0 });
+    defer object.deinit(tracked.allocator());
+    try std.testing.expectEqual(@as(u32, 5), object.get("Font").?.get("F1").?.obj_ref.id);
 }

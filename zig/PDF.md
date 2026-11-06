@@ -1961,10 +1961,17 @@ index per page. Both count against the retained/live byte allowance; codec
 scratch has a separate per-decode cumulative allowance. Decoded frames and
 projected object graphs move between accounting ledgers without copying or
 double-charging the shared backing allocator. Required reads evict unrelated
-frames; retained-budget pressure may also evict a frame before adopting a
-selected value.
+frames. Allocation pressure reclaims an unrelated optional frame before
+rejecting live-byte growth, including while parsing a selected value. Active
+source frames are pinned until their parser returns. Reclamation does not
+refund cumulative work or recover backing-allocator failures.
 Metadata scanning polls cancellation throughout tokens, strings, whitespace,
-comments, and skipped compound values. A page-local work allowance of 16 times
+comments, and skipped compound values. Stream-boundary searches for indirect
+lengths use bounded chunks with marker overlap, and numeric lookahead propagates
+cancellation and work exhaustion rather than treating them as end-of-input.
+Ordinary object reads also poll the Reader cancellation probe when no shared
+metadata work allowance is active.
+A page-local work allowance of 16 times
 the working-set byte limit (at least 1 MiB, at most 2 GiB) charges scanned bytes,
 token traversal, and property-index comparisons independently of allocations.
 Exhaustion is sticky; optional failures are memoized while cancellation and

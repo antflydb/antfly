@@ -542,10 +542,11 @@ pub const Scanner = struct {
             self.pos += direct_length;
             break :blk direct_length;
         } else blk: {
-            const data_end = findEndStreamDataEnd(self.bytes, self.pos) orelse {
+            const data_end = (try findEndStreamDataEnd(self.bytes, self.pos, self.control)) orelse {
                 return error.MissingEndStream;
             };
             self.pos = data_end;
+            if (self.control != null) self.last_checked_pos = self.pos;
             break :blk data_end - data_start;
         };
 
@@ -714,18 +715,24 @@ pub const Scanner = struct {
                 const number = (try numberToken(word)) orelse return error.UnexpectedKeyword;
                 if (number != .integer or number.integer < 0 or number.integer > std.math.maxInt(u32)) return;
                 const end = self.pos;
-                const generation = self.skipWord() catch {
-                    self.pos = end;
-                    return;
+                const generation = self.skipWord() catch |err| switch (err) {
+                    error.UnexpectedEof => {
+                        self.pos = end;
+                        return;
+                    },
+                    else => return err,
                 };
                 const gen = try numberToken(generation);
                 if (gen == null or gen.? != .integer or gen.?.integer < 0 or gen.?.integer > std.math.maxInt(u16)) {
                     self.pos = end;
                     return;
                 }
-                const suffix = self.skipWord() catch {
-                    self.pos = end;
-                    return;
+                const suffix = self.skipWord() catch |err| switch (err) {
+                    error.UnexpectedEof => {
+                        self.pos = end;
+                        return;
+                    },
+                    else => return err,
                 };
                 if (!std.mem.eql(u8, suffix, "R")) self.pos = end;
             },
@@ -976,11 +983,19 @@ fn streamLength(entries: []const DictEntry) ?usize {
     return null;
 }
 
-fn findEndStreamDataEnd(bytes: []const u8, start: usize) ?usize {
+fn findEndStreamDataEnd(bytes: []const u8, start: usize, control: ?*ScanControl) !?usize {
     var search = start;
     while (search < bytes.len) {
-        const maybe_idx = std.mem.indexOf(u8, bytes[search..], "endstream") orelse return null;
+        // Include marker overlap while bounding each cancellation/work interval.
+        const window_end = if (control != null) search + @min(bytes.len - search, 4096) else bytes.len;
+        const scan_end = window_end + @min(bytes.len - window_end, "endstream".len - 1);
+        const maybe_idx = std.mem.indexOf(u8, bytes[search..scan_end], "endstream") orelse {
+            if (control) |active| try active.spend(window_end - search);
+            search = window_end;
+            continue;
+        };
         const kw_pos = search + maybe_idx;
+        if (control) |active| try active.spend(maybe_idx + "endstream".len);
         if (kw_pos > start and !isSpace(bytes[kw_pos - 1])) {
             search = kw_pos + "endstream".len;
             continue;
@@ -1619,5 +1634,109 @@ test "scanner polls cancellation and bounds work throughout long tokens and skip
         scanner.control = &control;
         defer scanner.deinit();
         try std.testing.expectError(error.PdfMetadataWorkLimit, scanner.readObjectProjected(.property));
+    }
+}
+
+test "scanner numeric lookahead propagates cancellation and work exhaustion" {
+    const a = std.testing.allocator;
+    const padding: [2048]u8 = @splat('X');
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    // Exercise both generation and R-suffix lookahead at every nearby poll
+    // boundary, including the two prefixes that previously swallowed Canceled.
+    for ([_][]const u8{ "0", "0 1 R" }) |number| {
+        for (1980..2020) |len| {
+            const input = try std.fmt.allocPrint(a, "<< /Padding ({s}) /ActualText (Label) /Private {s} >>", .{ padding[0..len], number });
+            defer a.free(input);
+            var probe = Probe{};
+            var control = ScanControl{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+            var scanner = Scanner.init(a, input);
+            scanner.control = &control;
+            defer scanner.deinit();
+            if (scanner.readObjectProjected(.property)) |result| {
+                var object = result;
+                defer object.deinit(a);
+                try std.testing.expect(probe.calls < 2);
+            } else |err| try std.testing.expectEqual(error.Canceled, err);
+        }
+        for (1..128) |limit| {
+            const input = try std.fmt.allocPrint(a, "<< /Private {s} >>", .{number});
+            defer a.free(input);
+            var control = ScanControl{ .remaining_work = limit };
+            var scanner = Scanner.init(a, input);
+            scanner.control = &control;
+            defer scanner.deinit();
+            if (scanner.readObjectProjected(.property)) |result| {
+                var object = result;
+                object.deinit(a);
+            } else |err| try std.testing.expectEqual(error.PdfMetadataWorkLimit, err);
+        }
+    }
+}
+
+test "scanner stream boundary search polls cancellation and bounds work" {
+    const a = std.testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(a);
+    try input.appendSlice(a, "<< /Type /ObjStm /N 1 /First 4 /Length 9 0 R >>\nstream\n");
+    for (0..8192) |_| try input.appendSlice(a, "xendstreamx");
+    try input.appendSlice(a, "\nendstream");
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    var probe = Probe{};
+    var control = ScanControl{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+    var scanner = Scanner.init(a, input.items);
+    scanner.control = &control;
+    defer scanner.deinit();
+    try std.testing.expectError(error.Canceled, scanner.readObject());
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expect(scanner.pos < input.items.len / 2);
+    try std.testing.expect(std.math.maxInt(usize) - control.remaining_work < 16 * 1024);
+    var limited = ScanControl{ .remaining_work = 1024 };
+    var bounded = Scanner.init(a, input.items);
+    bounded.control = &limited;
+    defer bounded.deinit();
+    try std.testing.expectError(error.PdfMetadataWorkLimit, bounded.readObject());
+    try std.testing.expect(bounded.pos < input.items.len / 2);
+}
+
+test "scanner controlled stream searches preserve markers across chunk boundaries" {
+    const a = std.testing.allocator;
+    for (0..9) |offset| {
+        const padding = try a.alloc(u8, 4096 - offset);
+        defer a.free(padding);
+        @memset(padding, 'X');
+        for ([_][]const u8{ "\n", "\r", "\r\n" }) |newline| {
+            const input = try std.fmt.allocPrint(a, "<< /Length 9 0 R >>\nstream\n{s}{s}endstream", .{ padding, newline });
+            defer a.free(input);
+            for ([_]bool{ false, true }) |controlled| {
+                var control = ScanControl{};
+                var scanner = Scanner.init(a, input);
+                scanner.control = if (controlled) &control else null;
+                defer scanner.deinit();
+                var object = try scanner.readObject();
+                defer object.deinit(a);
+                try std.testing.expectEqual(padding.len, object.stream.data_length);
+                try std.testing.expectEqualStrings(padding, input[object.stream.data_offset..][0..object.stream.data_length]);
+            }
+        }
+    }
+    // Unterminated payloads must consume bounded chunks, including a final
+    // partial marker, rather than retrying the same bytes or allocating.
+    for ([_][]const u8{ "", "X", "endstrea", "xendstreamx", " endstreamx", "xendstream " }) |input| {
+        var control = ScanControl{};
+        try std.testing.expectEqual(@as(?usize, null), try findEndStreamDataEnd(input, 0, &control));
     }
 }
