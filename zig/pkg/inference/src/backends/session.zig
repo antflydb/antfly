@@ -9759,11 +9759,20 @@ test "fresh host output and retained floor preflight classifies impossible split
     session.run_admission.?.limits = .{ .combined_limit_bytes = combined - 1 };
     try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(raw_floor, rows, width));
     session.run_admission.?.limits = .{};
-    controller.configureSharedLimits(.{ .host_limit_bytes = combined - 1 });
-    try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(raw_floor, rows, width));
-    controller.configureSharedLimits(.{ .unified_limit_bytes = combined - 1 });
-    try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(raw_floor, rows, width));
-    controller.configureSharedLimits(.{});
+    // Shared limits are immutable while a controller owns leases. Configure
+    // each independent shared policy before exercising its intrinsic bound.
+    for ([_]memory.SharedAdmissionLimits{
+        .{ .host_limit_bytes = combined - 1 },
+        .{ .unified_limit_bytes = combined - 1 },
+    }) |limits| {
+        var shared_controller: memory.AdmissionController = .{};
+        defer shared_controller.deinit();
+        shared_controller.configureSharedLimits(limits);
+        var shared_session = session;
+        shared_session.run_admission.?.controller = &shared_controller;
+        try std.testing.expectError(error.ResourceLimitExceeded, shared_session.validateHostPreprocessWithOutput(raw_floor, rows, width));
+        try std.testing.expectEqual(memory.AdmissionAmounts{}, shared_controller.snapshot());
+    }
     session.run_admission.?.limits = .{ .host_limit_bytes = combined, .combined_limit_bytes = combined };
     try session.validateHostPreprocessWithOutput(raw_floor, rows, width);
     // The lower bound fits intrinsically; this real peer still makes the
