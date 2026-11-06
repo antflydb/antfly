@@ -2873,11 +2873,41 @@ pub const Store = struct {
         }
     };
 
-    /// Enqueue `plan` and return a ticket resolved once its group is durable.
-    /// `plan.context` must stay valid until `Ticket.wait` returns: the group
-    /// leader (this caller, or another thread already draining the queue)
-    /// calls `plan.apply` before the ticket can become done.
-    pub fn stage(self: *Store, plan: MutationPlan) !Ticket {
+    /// A request enqueued onto the group-commit queue, not yet drained.
+    /// `drive()` must be called exactly once (immediately, before anything
+    /// else observes `become_leader`) to either run the coordinator (this
+    /// caller became leader of a newly-formed queue) or do nothing (this
+    /// caller's request joins a queue someone else is already draining).
+    /// Splitting `stage` into `enqueue`/`drive` exists so a caller holding
+    /// some other resource across "this request is now queued" -- e.g.
+    /// `Txn.commit`'s writer slot -- can release it between the two, so
+    /// that resource is never held across the leader's own fsync (WS2).
+    pub const Staged = struct {
+        store: *Store,
+        request: *MutationRequest,
+        become_leader: bool,
+
+        /// Drains the queue if this caller is its leader; otherwise a no-op
+        /// (another thread, leader of the queue this request joined, will
+        /// drain it instead). Must be called before `ticket().wait()`.
+        pub fn drive(self: Staged) void {
+            // The leader drains the queue inline on its own stack, like
+            // storage/wal.zig's driveAppendCoordinator: at most one group is
+            // ever being applied at a time, and whatever stages while that
+            // group's `commitTransactionWithDurability` runs (including its
+            // fsync) forms the next group, bounding flight to the applying
+            // group plus the one accumulating behind it.
+            if (self.become_leader) self.store.driveMutationCoordinator();
+        }
+
+        pub fn ticket(self: Staged) Ticket {
+            return .{ .store = self.store, .request = self.request };
+        }
+    };
+
+    /// Enqueue `plan` without driving the coordinator. `plan.context` must
+    /// stay valid until the returned `Staged.ticket().wait()` returns.
+    pub fn enqueue(self: *Store, plan: MutationPlan) !Staged {
         if (self.read_only) return error.ReadOnly;
         const io = self.file.runtime();
         const request = try self.allocator.create(MutationRequest);
@@ -2898,15 +2928,20 @@ pub const Store = struct {
         if (become_leader) self.commit_draining = true;
         self.commit_mutex.unlock(io);
 
-        // The leader drains the queue inline on its own stack, like
-        // storage/wal.zig's driveAppendCoordinator: at most one group is
-        // ever being applied at a time, and whatever stages while that
-        // group's `commitTransactionWithDurability` runs (including its
-        // fsync) forms the next group, bounding flight to the applying
-        // group plus the one accumulating behind it.
-        if (become_leader) self.driveMutationCoordinator();
+        return .{ .store = self, .request = request, .become_leader = become_leader };
+    }
 
-        return .{ .store = self, .request = request };
+    /// Enqueue `plan` and return a ticket resolved once its group is durable.
+    /// `plan.context` must stay valid until `Ticket.wait` returns: the group
+    /// leader (this caller, or another thread already draining the queue)
+    /// calls `plan.apply` before the ticket can become done. Equivalent to
+    /// `enqueue` immediately followed by `drive`; callers that need to
+    /// release some other resource in between (see `Staged`) call those
+    /// two directly instead.
+    pub fn stage(self: *Store, plan: MutationPlan) !Ticket {
+        const staged = try self.enqueue(plan);
+        staged.drive();
+        return staged.ticket();
     }
 
     /// The durable (post-fsync) commit sequence. Blocks only as long as a
@@ -3154,9 +3189,25 @@ pub const Store = struct {
         defer {
             self.writer_mutex.unlock(io);
             if (self.writer_admission) |admission| admission.leave(admission.ptr);
-            // Decide first, then only wake a loop that is actually running;
-            // see the matching comment in submitScopedMutation's defer.
-            self.startMaintenance();
+            // Opportunistic, not blocking (WS2): `Txn.commit` releases the
+            // writer slot right after staging, specifically so the next
+            // writer can open and stage into the same group while this
+            // one's commit -- fsync included -- is still running. A
+            // blocking `startMaintenance()` here would reach for
+            // `self.mutex` (`PublicationMutex`, a spin lock), which that
+            // very in-flight group's leader holds for its whole
+            // `applyMutationGroup` call; spinning on it here would burn a
+            // core and delay this slot's release for as long as that
+            // commit's fsync takes, undoing the early release. Skip this
+            // turn when contended, like the cold-start kick in
+            // `retireReadGeneration`: the group's own leader runs
+            // `startMaintenance()` again once it finishes (see
+            // `driveMutationCoordinator`), so nothing is lost, only
+            // deferred to a call that is not on this latency-sensitive path.
+            if (!self.maintenance_started.load(.acquire) and self.mutex.tryLock()) {
+                self.startMaintenanceAssumeLocked();
+                self.mutex.unlock();
+            }
             if (self.maintenance_started.load(.acquire)) self.maintenance_wake.set(io);
         }
         std.debug.assert(self.writer_active);
@@ -3577,18 +3628,26 @@ pub const Txn = struct {
         }
         const wal_trace_scope = wal_trace.scope(.primary_commit);
         defer wal_trace_scope.end();
-        // Stage, then release the writer slot before waiting on durability
-        // (WS2): the slot only serializes who may stage the next write, not
-        // who must wait for this one's fsync. Releasing it here lets the next
-        // writer open and stage into the same group while this one's commit
-        // (and the fsync it may share with other stagers) is still running.
-        const ticket = try store.stage(.{ .context = &context, .apply = Commit.apply, .estimated_bytes = estimated_bytes });
+        // Enqueue, then release the writer slot, and only then drive the
+        // coordinator (WS2): the slot only serializes who may stage the
+        // next write, not who must wait for this one's fsync. If staging
+        // and driving were one call (`store.stage`), a caller that becomes
+        // its queue's leader would not return from it until its own group
+        // -- fsync included -- had already committed, holding the slot
+        // across that durability wait exactly like the pre-WS2 code. Doing
+        // these in three explicit steps releases the slot while the request
+        // is merely queued, before this thread (if it is the leader) ever
+        // drives the coordinator, so the next writer can open and stage
+        // into the same group while this one's commit is still running
+        // regardless of whether this one ends up leading that commit.
+        const staged = try store.enqueue(.{ .context = &context, .apply = Commit.apply, .estimated_bytes = estimated_bytes });
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             store.releaseWriterSlot();
             self.writer_reserved = false;
         }
-        try ticket.wait();
+        staged.drive();
+        try staged.ticket().wait();
 
         self.freePending();
         self.freeOwnedReads();
@@ -6286,6 +6345,17 @@ test "lite a member failing its own apply rolls back alone inside a shared group
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+/// Bounded wait for a test Gate's `started` flag, used instead of an
+/// unbounded `yieldNow` spin so a stuck production path fails the test with
+/// `error.TestUnexpectedResult` instead of hanging the test process forever.
+fn waitForGateStartedForTest(io: std.Io, started: *std.atomic.Value(bool)) !void {
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(10));
+    while (!started.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        @import("antfly_platform").time.yieldNow();
+    }
+}
+
 test "lite a group fsync failure sends OutcomeUnknown to every member" {
     // WS2: when the shared commit itself fails (not an individual member's
     // apply), durability is unknown for the whole group -- including a
@@ -6334,6 +6404,355 @@ test "lite a group fsync failure sends OutcomeUnknown to every member" {
     store.driveMutationCoordinator();
     try std.testing.expectError(error.OutcomeUnknown, first.result);
     try std.testing.expectError(error.OutcomeUnknown, second.result);
+}
+
+test "lite group commit publishes visibility only after the durable checkpoint" {
+    // WS2: staging into the group-commit queue must never let a reader see
+    // a member's writes before the whole group's fsync (and therefore
+    // notifyPublication / ReaderCoordinator.published) has actually run.
+    // `Txn.openReadWithPrefix` only takes `self.mutex` the first time it
+    // initializes `read_generation`; every later read just re-pins whatever
+    // `read_generation.checkpoint` currently is, which `observeReadCheckpoint`
+    // only ever advances from `notifyPublication`, itself fired strictly
+    // after the fsync inside `publishCheckpoint`. So a read opened while a
+    // commit's fsync is gated must not block (no `self.mutex` contention)
+    // and must still see the pre-commit value, never a torn or early one.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Gate = struct {
+        var armed: std.atomic.Value(bool) = .init(false);
+        var started: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.swap(false, .acq_rel)) {
+                started.store(true, .release);
+                while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const Worker = struct {
+        store: *Store,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var write = self.store.beginWrite() catch |err| {
+                self.result = err;
+                return;
+            };
+            write.put("doc", "after") catch |err| {
+                self.result = err;
+                write.abort();
+                return;
+            };
+            self.result = write.commit();
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "group-commit-durability-visibility.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Gate.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io });
+    defer store.close();
+    {
+        var write = try store.beginWrite();
+        try write.put("doc", "before");
+        try write.commit();
+    }
+    // Establish `read_generation` up front (so the concurrent read below
+    // takes the cheap, non-mutex re-pin path and cannot simply block behind
+    // the writer's `self.mutex` instead of actually racing it), and keep
+    // this read open across the whole test as the MVCC-snapshot witness.
+    var warm = try store.beginRead();
+    defer warm.abort();
+    try std.testing.expectEqualStrings("before", try warm.get("doc"));
+    var worker = Worker{ .store = &store };
+    Gate.started.store(false, .release);
+    Gate.proceed.store(false, .release);
+    Gate.armed.store(true, .release);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer {
+        Gate.proceed.store(true, .release);
+        if (!joined) thread.join();
+        Gate.armed.store(false, .release);
+    }
+    try waitForGateStartedForTest(store.file.runtime(), &Gate.started);
+    // The commit is staged, applied, and paused inside its own fsync: not
+    // durable yet. A fresh read must see the pre-commit value.
+    {
+        var mid = try store.beginRead();
+        defer mid.abort();
+        try std.testing.expectEqualStrings("before", try mid.get("doc"));
+    }
+    Gate.proceed.store(true, .release);
+    thread.join();
+    joined = true;
+    try worker.result;
+    // Now durable: a fresh read sees the new value, and the Txn pinned
+    // before the commit (classic MVCC snapshot isolation, unaffected by
+    // where the new visibility boundary landed) still sees the old one.
+    try std.testing.expectEqualStrings("before", try warm.get("doc"));
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    try std.testing.expectEqualStrings("after", try fresh.get("doc"));
+}
+
+test "lite writer slot is free for the next writer while a commit's fsync is in flight" {
+    // WS2: Txn.commit stages, releases the writer slot, then waits on the
+    // ticket -- the slot only serializes who may stage next, not who must
+    // wait for a shared fsync. Prove it concretely: while writer A's commit
+    // is paused inside its own (gated) fsync, a brand new writer B must be
+    // able to reserve the slot, stage its own write, and commit -- all
+    // before A's fsync is ever allowed to proceed.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Gate = struct {
+        var armed: std.atomic.Value(bool) = .init(false);
+        var started: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.swap(false, .acq_rel)) {
+                started.store(true, .release);
+                while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const Worker = struct {
+        store: *Store,
+        key: []const u8,
+        value: []const u8,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var write = self.store.beginWrite() catch |err| {
+                self.result = err;
+                return;
+            };
+            write.put(self.key, self.value) catch |err| {
+                self.result = err;
+                write.abort();
+                return;
+            };
+            self.result = write.commit();
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "writer-slot-not-held-across-durability.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Gate.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io });
+    defer store.close();
+
+    var worker = Worker{ .store = &store, .key = "a", .value = "1" };
+    Gate.started.store(false, .release);
+    Gate.proceed.store(false, .release);
+    Gate.armed.store(true, .release);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer {
+        Gate.proceed.store(true, .release);
+        if (!joined) thread.join();
+        Gate.armed.store(false, .release);
+    }
+    try waitForGateStartedForTest(store.file.runtime(), &Gate.started);
+    // A's commit has staged and is paused inside its (shared) fsync, not
+    // yet durable. The writer *slot* itself (reserveWriterSlot/
+    // releaseWriterSlot) never touches `self.mutex`, so proving it is free
+    // is safe directly on this thread: a direct (non-yielding) reservation
+    // attempt fails with FileBusy only while the slot is held, so this
+    // succeeding proves it was released before the wait on A's ticket, not
+    // after. Done before spawning B below, so there is no window where
+    // this reserve/release could race B's own reservation and fail it.
+    try store.reserveWriterSlot();
+    store.releaseWriterSlot();
+    // Stronger still: actually open, stage, and commit a second writer's
+    // transaction while A's fsync is still gated. Opening a write
+    // transaction needs `self.mutex` too (to snapshot the active checkpoint
+    // and pin a read generation), and A -- gated inside
+    // `applyMutationGroup` -- holds that same mutex for its whole call,
+    // fsync included, so B must run on its own thread: doing this on this
+    // thread would block on A's mutex until the gate is released, which
+    // this very thread is about to do, deadlocking the test rather than
+    // proving anything.
+    var worker_b = Worker{ .store = &store, .key = "b", .value = "2" };
+    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{&worker_b});
+    var joined_b = false;
+    defer if (!joined_b) thread_b.join();
+
+    Gate.proceed.store(true, .release);
+    thread.join();
+    joined = true;
+    try worker.result;
+    thread_b.join();
+    joined_b = true;
+    try worker_b.result;
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("1", try read.get("a"));
+    try std.testing.expectEqualStrings("2", try read.get("b"));
+}
+
+fn queuedMutationCountForTest(store: *Store) usize {
+    const io = store.file.runtime();
+    store.commit_mutex.lockUncancelable(io);
+    defer store.commit_mutex.unlock(io);
+    var n: usize = 0;
+    var current = store.commit_head;
+    while (current) |item| {
+        n += 1;
+        current = item.next;
+    }
+    return n;
+}
+
+test "lite group commit pipelines at most two groups: one syncing, one accumulating" {
+    // WS2: a single leader drains the queue in a while(true) loop, applying
+    // and fsyncing one batch at a time; whatever stages while that batch is
+    // mid-fsync can only ever be lumped into exactly one next batch (there
+    // is no second leader to split it further), so at most two groups are
+    // ever "in flight": the one actively syncing and the one accumulating
+    // behind it. Prove it by gating group G's fsync, staging three more
+    // commits behind it, and checking they land as exactly one additional
+    // native commit (G+1) rather than three -- and that the group closed
+    // and started syncing immediately, with no artificial batching delay.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Gate = struct {
+        var armed: std.atomic.Value(bool) = .init(false);
+        var started: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.swap(false, .acq_rel)) {
+                started.store(true, .release);
+                while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const LeaderWorker = struct {
+        store: *Store,
+        key: []const u8,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var write = self.store.beginWrite() catch |err| {
+                self.result = err;
+                return;
+            };
+            write.put(self.key, "landed") catch |err| {
+                self.result = err;
+                write.abort();
+                return;
+            };
+            self.result = write.commit();
+        }
+    };
+    // `Txn.beginWrite` itself briefly needs `self.mutex`, to snapshot the
+    // active checkpoint and pin a read generation -- and that very mutex is
+    // what G's `applyMutationGroup` holds for its whole call, fsync
+    // included, so a brand new `Txn` cannot even open while G is gated (it
+    // would just block on `self.mutex` until G's entire commit finishes,
+    // defeating the point of this test). `store.stage`'s own enqueue step
+    // needs only the queue's `commit_mutex`, with no such overlap, so drive
+    // H/I/J through it directly instead -- exactly how a caller that is not
+    // routing through a document `Txn` (an index publish, say) already
+    // does, and so a path that is genuinely contended behind G's fsync
+    // only by the queue itself, not by `self.mutex` too.
+    const Context = struct {
+        key: []const u8,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try file.putDocument(self.key, "landed");
+        }
+    };
+    const FollowerWorker = struct {
+        store: *Store,
+        context: Context,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = self.store.submitMutation(&self.context, Context.apply);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "group-commit-pipelining.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Gate.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io });
+    defer store.close();
+
+    const commit_before = store.file.activeCheckpoint().commit_sequence;
+    var worker_g = LeaderWorker{ .store = &store, .key = "g" };
+    Gate.started.store(false, .release);
+    Gate.proceed.store(false, .release);
+    Gate.armed.store(true, .release);
+    const thread_g = try std.Thread.spawn(.{}, LeaderWorker.run, .{&worker_g});
+    var joined_g = false;
+    defer {
+        Gate.proceed.store(true, .release);
+        if (!joined_g) thread_g.join();
+        Gate.armed.store(false, .release);
+    }
+    try waitForGateStartedForTest(store.file.runtime(), &Gate.started);
+    // Group G closed and is already mid-fsync -- it never waited around for
+    // more members. Now stage three more behind it.
+    var worker_h = FollowerWorker{ .store = &store, .context = .{ .key = "h" } };
+    var worker_i = FollowerWorker{ .store = &store, .context = .{ .key = "i" } };
+    var worker_j = FollowerWorker{ .store = &store, .context = .{ .key = "j" } };
+    const thread_h = try std.Thread.spawn(.{}, FollowerWorker.run, .{&worker_h});
+    var joined_h = false;
+    defer if (!joined_h) thread_h.join();
+    const thread_i = try std.Thread.spawn(.{}, FollowerWorker.run, .{&worker_i});
+    var joined_i = false;
+    defer if (!joined_i) thread_i.join();
+    const thread_j = try std.Thread.spawn(.{}, FollowerWorker.run, .{&worker_j});
+    var joined_j = false;
+    defer if (!joined_j) thread_j.join();
+
+    const io2 = store.file.runtime();
+    const deadline = std.Io.Clock.awake.now(io2).addDuration(.fromSeconds(5));
+    while (queuedMutationCountForTest(&store) < 3) {
+        if (std.Io.Clock.awake.now(io2).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        @import("antfly_platform").time.yieldNow();
+    }
+    // All three of H, I, J are staged (one bounded group's worth,
+    // accumulating) while G is still syncing. Nothing beyond these two
+    // groups can exist yet: the queue holds exactly H/I/J, and G is the
+    // only one applying.
+    try std.testing.expectEqual(@as(usize, 3), queuedMutationCountForTest(&store));
+
+    Gate.proceed.store(true, .release);
+    thread_g.join();
+    joined_g = true;
+    try worker_g.result;
+    thread_h.join();
+    joined_h = true;
+    try worker_h.result;
+    thread_i.join();
+    joined_i = true;
+    try worker_i.result;
+    thread_j.join();
+    joined_j = true;
+    try worker_j.result;
+
+    // Exactly two native commits total: G alone, then H+I+J folded into one
+    // more -- not four separate fsyncs.
+    try std.testing.expectEqual(commit_before + 2, store.file.activeCheckpoint().commit_sequence);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("landed", try read.get("g"));
+    try std.testing.expectEqualStrings("landed", try read.get("h"));
+    try std.testing.expectEqualStrings("landed", try read.get("i"));
+    try std.testing.expectEqualStrings("landed", try read.get("j"));
 }
 
 test "lite publication mutex reserves queued owners before a writer can reacquire" {
