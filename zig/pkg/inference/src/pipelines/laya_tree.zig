@@ -312,6 +312,7 @@ pub fn ranges(a: std.mem.Allocator, row: Row, first: usize) ![]u32 {
         i = end;
     }
     const out = try a.alloc(u32, (row.ids.len - first) * 6);
+    errdefer a.free(out);
     @memset(out, 0);
     // Trees are contiguous: a tree runs from its root segment's first token
     // to the next root segment's first token.

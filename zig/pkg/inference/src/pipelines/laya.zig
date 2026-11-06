@@ -905,6 +905,23 @@ fn expectLayaBankTestResult(expected: Result, actual: Result) !void {
         try std.testing.expectEqual(want.act_probability, got.act_probability);
     }
 }
+// Fixture callbacks may outlive the Model during final current-B retirement.
+// Keep the real gate borrowed through synchronous close, then end that borrow
+// BEFORE sealing B runs pure physical-death/quota callbacks without a Model.
+fn closeLayaProbeFixture(session: Session, probe: anytype) void {
+    if (probe.gate) |gate| {
+        if (gate.tryLock()) gate.unlock() else probe.violation = true;
+    }
+    var sink = @import("../execution/retirement_sink.zig").Ref.create() catch @panic("Laya fixture close sink");
+    defer sink.release();
+    var guard = sink.enter() catch @panic("Laya fixture close guard");
+    defer guard.finish();
+    var epoch = guard.retainEpoch() catch @panic("Laya fixture close epoch");
+    defer epoch.release();
+    session.closeWithBoundary(&epoch);
+    probe.gate = null;
+}
+
 fn layaOriginalPermitBankPipelineCase(a: std.mem.Allocator, path: []const u8, tok: Tokenizer, cfg: model.Config, tasks: []const Task, reference: Result, bank_bytes: usize, extra: usize, accepted: bool) !void {
     const Memory = @import("../runtime/tier/memory.zig");
     const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
@@ -939,7 +956,7 @@ fn layaOriginalPermitBankPipelineCase(a: std.mem.Allocator, path: []const u8, to
     policy.limits.host_limit_bytes = try std.math.add(usize, old_peak.host_scratch_bytes, extra);
     session.run_admission = policy;
     const Probe = struct {
-        gate: *std.atomic.Mutex,
+        gate: ?*std.atomic.Mutex,
         bank_bytes: usize,
         calls: usize = 0,
         releases: usize = 0,
@@ -948,7 +965,9 @@ fn layaOriginalPermitBankPipelineCase(a: std.mem.Allocator, path: []const u8, to
         cancel_on_bank: bool = false,
         cancel: bool = false,
         fn observe(self: *@This()) void {
-            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
         }
         fn reserve(raw: *anyopaque, amounts: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -974,6 +993,11 @@ fn layaOriginalPermitBankPipelineCase(a: std.mem.Allocator, path: []const u8, to
         }
     };
     var probe = Probe{ .gate = session.execution_gate.?, .bank_bytes = bank_bytes };
+    // Covers ordinary error/cancel/OOM unwind after the callback is installed.
+    defer if (live) {
+        closeLayaProbeFixture(session, &probe);
+        live = false;
+    };
     try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
     const control = Control{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
     for (0..2) |_| {
@@ -1014,7 +1038,7 @@ fn layaOriginalPermitBankPipelineCase(a: std.mem.Allocator, path: []const u8, to
         try std.testing.expectEqual(probe.calls, probe.releases);
         try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
     }
-    session.close();
+    closeLayaProbeFixture(session, &probe);
     live = false;
     try std.testing.expect(!probe.violation);
 }
@@ -1060,7 +1084,8 @@ fn layaOutputOwnerLifetimeCase(comptime packed_mode: bool, comptime outcome: enu
     const Memory = @import("../runtime/tier/memory.zig");
     const factory = @import("../architectures/session_factory.zig");
     var session = try factory.createNativeSession(a, path);
-    defer session.close();
+    var live = true;
+    defer if (live) session.close();
     try session.installOwnedExecutionGate(a);
     var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
     session.cohort_scheduler = &scheduler;
@@ -1086,7 +1111,7 @@ fn layaOutputOwnerLifetimeCase(comptime packed_mode: bool, comptime outcome: enu
         };
     }
     const Probe = struct {
-        gate: *std.atomic.Mutex,
+        gate: ?*std.atomic.Mutex,
         probability_bytes: usize,
         calls: usize = 0,
         releases: usize = 0,
@@ -1098,7 +1123,9 @@ fn layaOutputOwnerLifetimeCase(comptime packed_mode: bool, comptime outcome: enu
         cancel: bool = false,
         violation: bool = false,
         fn outside(self: *@This()) void {
-            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
         }
         fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1173,6 +1200,11 @@ fn layaOutputOwnerLifetimeCase(comptime packed_mode: bool, comptime outcome: enu
         }
     };
     var probe = Probe{ .gate = session.execution_gate.?, .probability_bytes = tasks[0].question.labels.len * @sizeOf(f32) };
+    // Covers ordinary error/cancel/OOM unwind after the callback is installed.
+    defer if (live) {
+        closeLayaProbeFixture(session, &probe);
+        live = false;
+    };
     try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
     const result_allocator = probe.resultAllocator();
     const attempted = executeWithScratchLimit(result_allocator, probe.scratchAllocator(), session, tok, cfg, tasks, .{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check }, null, null);
@@ -1286,7 +1318,7 @@ fn packedLayaTaskBankCase(refine: bool, deny_first: bool) !void {
     architecture.setLayaTrunkCachePrecision(session, .f32);
     architecture.setLayaTrunkCacheLimit(session, 1 << 20, 1);
     const Probe = struct {
-        gate: *std.atomic.Mutex,
+        gate: ?*std.atomic.Mutex,
         bank_bytes: usize,
         supplement_bytes: usize,
         cold_supplement_bytes: usize,
@@ -1307,7 +1339,9 @@ fn packedLayaTaskBankCase(refine: bool, deny_first: bool) !void {
         failed_bank: bool = false,
         violation: bool = false,
         fn outside(self: *@This()) void {
-            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
         }
         fn reserve(raw_ctx: *anyopaque, amounts: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
@@ -1379,6 +1413,11 @@ fn packedLayaTaskBankCase(refine: bool, deny_first: bool) !void {
         }
     };
     var probe = Probe{ .gate = session.execution_gate.?, .bank_bytes = geometry.bytes, .supplement_bytes = warm_supplement, .cold_supplement_bytes = cold_supplement, .deny_cold_once = deny_first, .check_matrix_outside = !deny_first };
+    // Covers ordinary error/cancel/OOM unwind after the callback is installed.
+    defer if (session_live) {
+        closeLayaProbeFixture(session, &probe);
+        session_live = false;
+    };
     try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
     const control = Control{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
     const first = try executeWithScratchLimit(a, probe.allocator(), session, tok, cfg, &tasks, control, null, null);
@@ -1535,7 +1574,7 @@ fn packedLayaTaskBankCase(refine: bool, deny_first: bool) !void {
         try packedLayaRotationCapacityCase(session, cfg, pending_rows[0], a, true);
         try std.testing.expect(!probe.violation and scheduler.head == null);
     }
-    session.close();
+    closeLayaProbeFixture(session, &probe);
     session_live = false;
     try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
     try std.testing.expectEqual(probe.calls - probe.denials, probe.releases);
@@ -1768,7 +1807,7 @@ test "actual full-row Laya no-cache optional bank denial uses empty capability w
     architecture.setLayaTrunkCachePrecision(session, .f32);
     architecture.setLayaTrunkCacheLimit(session, 1 << 20, 1);
     const Probe = struct {
-        gate: *std.atomic.Mutex,
+        gate: ?*std.atomic.Mutex,
         bank_bytes: usize,
         reservations: usize = 0,
         denials: usize = 0,
@@ -1777,7 +1816,9 @@ test "actual full-row Laya no-cache optional bank denial uses empty capability w
         kv_calls: usize = 0,
         violation: bool = false,
         fn outside(self: *@This()) void {
-            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+            if (self.gate) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
         }
         fn reserve(raw_ctx: *anyopaque, amounts: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
@@ -1802,6 +1843,11 @@ test "actual full-row Laya no-cache optional bank denial uses empty capability w
         }
     };
     var probe = Probe{ .gate = session.execution_gate.?, .bank_bytes = geometry.bytes };
+    // Covers ordinary error/cancel/OOM unwind after the callback is installed.
+    defer if (live) {
+        closeLayaProbeFixture(session, &probe);
+        live = false;
+    };
     try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
     for (0..2) |iteration| {
         const result = try executeWithScratchLimit(a, a, session, tok, cfg, &tasks, .{ .native_call_policy = .in_process }, null, null);
@@ -1814,7 +1860,7 @@ test "actual full-row Laya no-cache optional bank denial uses empty capability w
         try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
         try std.testing.expect(!probe.violation and scheduler.head == null);
     }
-    session.close();
+    closeLayaProbeFixture(session, &probe);
     live = false;
     try std.testing.expectEqual(probe.reservations, probe.releases);
     try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());

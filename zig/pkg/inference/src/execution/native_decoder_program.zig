@@ -1139,6 +1139,34 @@ fn nativeAuthoredDecodeFormatSteps(config: gpt.Config, steps: usize, reset_step:
     try std.testing.expect(eligible(config));
     const program = if (packed_singles) try TestModel.requirePackedProgram(a, &context) else (try Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
     defer program.destroyWithCleanup(.{ .outside_execution = true });
+    const q6_mode = mode == .q6_singles or mode == .q6_rows or mode == .q6_mixed;
+    var expected_assigned_dispatches: u64 = 0;
+    var selected_q6_singles: usize = 0;
+    for (program.steps) |step| switch (step) {
+        .single => |node| if (program.selected.pool.kernels[node]) |kernel| {
+            expected_assigned_dispatches += 1;
+            if (q6_mode and kernel.descriptor.operation == .linear) {
+                const fact = try Native.NativeCompute.authoredResidentSourceQuery(&backend, program.graph.parameterName(program.graph.node(kernel.inputs[1])));
+                if (fact.quantized) |quantized| {
+                    if (quantized.kind == .Q6_K) selected_q6_singles += 1;
+                }
+            }
+        },
+        .pair => |index| {
+            expected_assigned_dispatches += 1;
+            if (q6_mode) for (program.pairs[index].weights) |weight_node| {
+                const fact = try Native.NativeCompute.authoredResidentSourceQuery(&backend, program.graph.parameterName(program.graph.node(weight_node)));
+                if (fact.quantized) |quantized| try std.testing.expect(quantized.kind != .Q6_K);
+            };
+        },
+    };
+    if (q6_mode) {
+        // Original o/down singles plus the untied head (or packed tied row)
+        // are Q6; original gate/up pair remains dense or Q4/Q5 as authored.
+        const q6_head = !config.weight_tying or mode == .q6_rows or mode == .q6_mixed;
+        try std.testing.expectEqual(@as(usize, config.num_hidden_layers) * 2 + @intFromBool(q6_head), selected_q6_singles);
+    }
+
     if (packed_singles and config.hidden_size == 512) {
         var pack_kernels: usize = 0;
         for (program.selected.pool.kernels) |kernel| if (kernel) |selected| {
@@ -1277,6 +1305,13 @@ fn nativeAuthoredDecodeFormatSteps(config: gpt.Config, steps: usize, reset_step:
             compute.allocator = original_compute_allocator;
             program.selected.pool.allocator = original_pool_allocator;
         }
+        const assigned_before = call.frame.?.stats.dispatches;
+        var q6_activation_before: u64 = 0;
+        if (bank_scope.attached and q6_mode and config.hidden_size == 768) {
+            for (bank_scope.native_dispatches.records[0..bank_scope.native_dispatches.count]) |record| {
+                if (record.phase == .successful_return and std.mem.eql(u8, record.family, "q6_k_q8k_activation")) q6_activation_before += record.events;
+            }
+        }
         const quant_before = Native.nativeQuantDispatchStats();
         try call.run(&backend, config, &actual_context, .{ .outside_execution = true });
         if (bank_scope.attached) {
@@ -1289,12 +1324,28 @@ fn nativeAuthoredDecodeFormatSteps(config: gpt.Config, steps: usize, reset_step:
                 try std.testing.expect(bank.frame_allocations > 0 and bank.frame_requested_allocation_bytes > 0);
             } else try std.testing.expect(bank.frame_reuse_accesses > 0);
         }
-        if (packed_singles and config.hidden_size == 512) {
+        if (packed_singles and config.hidden_size == 512 and (mode == .q4q5 or mode == .mixed or mode == .q6_mixed)) {
             const quant_after = Native.nativeQuantDispatchStats();
             try std.testing.expect(quant_after.q4_q5_k_q8k_activation > quant_before.q4_q5_k_q8k_activation);
             if (packed_pairs) try std.testing.expectEqual(@as(u64, config.num_hidden_layers), quant_after.q4_q5_k_q8k_activation_pair - quant_before.q4_q5_k_q8k_activation_pair);
         }
-        if (mode != .q4q5) {
+        if (q6_mode) {
+            // Q6's prepared-row path has no NativeQuantDispatchStats Q8
+            // counter. Every selected Q6 single is in this complete schedule;
+            // actual Frame successful-return counts prove it executed once.
+            try std.testing.expectEqual(expected_assigned_dispatches, call.frame.?.stats.dispatches - assigned_before);
+            const quant_after = Native.nativeQuantDispatchStats();
+            try std.testing.expectEqual(quant_before.q8_0_direct, quant_after.q8_0_direct);
+            try std.testing.expectEqual(quant_before.q8_0_pair, quant_after.q8_0_pair);
+            if (bank_scope.attached and config.hidden_size == 768) {
+                var q6_activation_after: u64 = 0;
+                for (bank_scope.native_dispatches.records[0..bank_scope.native_dispatches.count]) |record| {
+                    if (record.phase == .successful_return and std.mem.eql(u8, record.family, "q6_k_q8k_activation")) q6_activation_after += record.events;
+                }
+                try std.testing.expectEqual(@as(u64, selected_q6_singles), q6_activation_after - q6_activation_before);
+            }
+        }
+        if (mode == .q8 or mode == .mixed) {
             const quant_after = Native.nativeQuantDispatchStats();
             try std.testing.expect(quant_after.q8_0_direct > quant_before.q8_0_direct);
             try std.testing.expectEqual(@as(u64, config.num_hidden_layers), quant_after.q8_0_pair - quant_before.q8_0_pair);
