@@ -311,8 +311,15 @@ pub fn isEncoderDecoderModel(model_dir: []const u8) bool {
 pub const EncoderDecoderPaths = struct { encoder: []const u8, decoder: []const u8 };
 
 pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const u8) !EncoderDecoderPaths {
-    const encoder_path = try findModelFile(allocator, model_dir, encoder_candidates);
-    const decoder_path = findModelFile(allocator, model_dir, decoder_candidates) catch |err| {
+    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null);
+    defer artifacts.deinit();
+    return findEncoderDecoderPathsWithArtifacts(allocator, model_dir, &artifacts);
+}
+
+/// Reuse one acquisition's checksum proofs across selection and construction.
+pub fn findEncoderDecoderPathsWithArtifacts(allocator: std.mem.Allocator, model_dir: []const u8, artifacts: *@import("../registry/published_artifacts.zig").PublishedArtifacts) !EncoderDecoderPaths {
+    const encoder_path = try findPublishedModelFile(allocator, artifacts, encoder_candidates);
+    const decoder_path = findPublishedModelFile(allocator, artifacts, decoder_candidates) catch |err| {
         if (encoder_path) |path| allocator.free(path);
         return err;
     };
@@ -327,6 +334,21 @@ pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const 
     defer manifest.deinit();
 
     return nativeFlorenceEncoderDecoderPaths(allocator, model_dir, manifest);
+}
+
+fn findPublishedModelFile(a: std.mem.Allocator, artifacts: *@import("../registry/published_artifacts.zig").PublishedArtifacts, candidates: []const []const u8) !?[]const u8 {
+    for ([_][]const u8{ "", "onnx" }) |directory| {
+        for (candidates) |name| {
+            const relative = if (directory.len == 0) try a.dupe(u8, name) else try std.fs.path.join(a, &.{ directory, name });
+            defer a.free(relative);
+            if (try artifacts.resolve(relative)) |path| {
+                errdefer a.free(path);
+                try artifacts.verifyFile(relative);
+                return path;
+            }
+        }
+    }
+    return null;
 }
 
 /// The Florence fallback of `findEncoderDecoderPaths`, against a manifest the caller
@@ -390,6 +412,10 @@ pub fn loadDecoderConfigFile(allocator: std.mem.Allocator, path: []const u8) !De
     const data = try c_file.readFile(allocator, path);
     defer allocator.free(data);
 
+    return parseDecoderConfig(data);
+}
+
+pub fn parseDecoderConfig(data: []const u8) !DecoderConfig {
     var config = DecoderConfig{};
     const hidden_width = jsonGetInt(data, "d_model") orelse jsonGetInt(data, "hidden_size");
     if (hidden_width) |value| {

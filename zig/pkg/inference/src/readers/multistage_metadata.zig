@@ -61,10 +61,9 @@ pub fn isMultiStageModelDir(allocator: std.mem.Allocator, model_dir: []const u8)
 }
 
 pub fn loadFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !MultiStageMetadata {
-    const path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{model_dir});
-    defer allocator.free(path);
-
-    const bytes = try c_file.readFileMax(allocator, path, max_metadata_bytes);
+    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null);
+    defer artifacts.deinit();
+    const bytes = try artifacts.read("antfly_metadata.json", max_metadata_bytes);
     defer allocator.free(bytes);
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| switch (err) {
