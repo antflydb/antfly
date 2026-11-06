@@ -152,6 +152,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("ops/cuda/lighton_attention.zig");
     _ = server;
     _ = @import("documents/sources.zig");
     _ = @import("extractors/gliner_span_long_executor.zig");

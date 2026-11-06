@@ -133,6 +133,111 @@ kernel comparison but do not qualify the A100 serving deployment or its containe
 libraries. Require the paired released runtime/operator and an A100 canary before
 changing the live shared reader pool.
 
+### Fresh HTTP parity baseline (2026-11-01)
+
+The follow-up starts from merged main `1004ca0325`. The two engines use the
+same HTTP client, original hash-verified checkpoint bytes, two hash-verified
+private pages, image-only greedy decoding and 2,048 output tokens. Each shape
+has one excluded warm-up and two measured rounds; warm-up output still
+participates in exact correctness. The serial cohort contains two pages; the
+concurrent cohort contains two copies of each page and four overlapping
+requests. These different cohort sizes must not be compared as serial speedup.
+
+| Model and serving shape | Native median seconds | vLLM HTTP median seconds | Exact output agreement |
+| --- | ---: | ---: | --- |
+| 4B, two serial pages | 51.688 | 57.159 | No: dense page differs |
+| 4B, four concurrent pages | 40.787 | 32.846 | No: dense page differs |
+| 0.8B, two serial pages | 12.588 | 10.571 | Yes |
+| 0.8B, four concurrent pages | 10.138 | 6.994 | Yes |
+
+Both engines are internally stable between serial and concurrent shapes in
+these new HTTP captures. This differs from the older in-process evidence below;
+no result was normalized to hide that difference. The 4B native serial latency
+is lower, while its exact-output and concurrent-throughput gates fail. The 0.8B
+outputs match exactly, while both throughput gates fail. This baseline does not
+establish overall parity.
+
+The [hash-only evidence receipt](reader-parity-2026-11-01.json) records the
+upstream tree, imported source snapshot, binary/configuration/capture hashes,
+verified checkpoint provenance, engine versions and GPU identity. Model bytes
+were verified before each server started; every server released the GPU before
+the next capture. Startup used locally cached artifacts and is separate from
+warm serving time. No A100 or production-container qualification is implied.
+
+A wider four-token graph experiment did not improve full-model throughput:
+4B concurrent median was 41.014 seconds and 0.8B was 10.096 seconds. Both
+captured/replayed four-step graphs with no trace-capacity denials, so absent
+activation does not explain the result. The change was removed. Its lifecycle
+check passes with the public client's canonical status normalization: an
+8-second request gets `504 INFERENCE_TIMEOUT`, its peer completes with the
+expected hash, all 36 readiness probes pass, and recovery/unload/reload succeed.
+The initial lifecycle harness rejected the API's valid `complete` spelling;
+that assertion was corrected and rerun separately. Graph depth remains two.
+
+Independent attention/graph oracle tests pass 72 cases across depths 3, 4 and 8,
+both model geometries and 2–128 rows, including complete KV contents, unused
+slots, reset/replay, positions/progress and canaries. Maximum absolute error is
+`3.52e-6`, below the unchanged `2e-5` F32 tolerance. These kernel/metadata checks
+are separate from full-model graph ownership and do not establish a wider graph
+serving default.
+
+### Workload-based grouped attention candidate
+
+The old dispatch used row count alone. The new candidate estimates useful CTA
+work from active KV chunks and KV heads, selecting grouping only when that work
+can populate four waves of the device's reported SM count. It excludes empty
+future-reservation chunks. Unknown device capacity and unsupported geometry
+retain ordinary split attention; no GPU model-name allowlist is involved.
+The selected kernels retain their existing supported GQA geometry and artifact
+requirements. Precision, graph depth and resource ceilings are unchanged.
+
+The [synthetic timing receipt](attention-dispatch-2026-11-01.json) covers 42
+cases across one to 32 rows, both model geometries and 256–8,192-token contexts.
+All outputs pass an independent FP64 oracle (maximum absolute error `4.79e-7`),
+read-only input checks, shuffled physical page tables, NaN-masked unused slots,
+and output/scratch canaries. CUDA graph replay and timing
+events share one explicit stream. Each trial executes 100 complete
+attention/combine operations; five device-time trials exclude Python dispatch
+and CPU oracle work. All 27 cases selected by the new heuristic were faster in
+this exploratory matrix; the smallest measured reduction was approximately 16%.
+The GPU was checked idle before the run, but that benchmark revision did not
+continuously monitor ownership. These timings require a rerun with the hardened
+benchmark and do not establish a qualified full-model gain or A100 performance.
+
+Reproduce using the CUDA qualification Python environment:
+
+```bash
+python zig/pkg/inference/scripts/lightonocr3/benchmark_cuda_attention_dispatch.py \
+  --artifact zig/pkg/inference/src/ops/cuda/lighton_attention.ptx \
+  --output attention-dispatch.json
+```
+
+The final CUDA ReleaseFast candidate builds successfully, and all five frozen
+runtime file hashes match the reviewed source at `8203cf3c44`. Its 4B completion,
+timeout isolation, peer completion, all 36 readiness probes, recovery and
+unload/reload checks pass. Counters observe 256 grouped host submissions on 48
+SMs. However, the continuous monitor detects another GPU process during capture
+and rejects the timing receipt. No full-model performance gain is claimed, and
+the final 0.8B run remains pending. The PR stays draft until an exclusive GPU
+window permits rerunning both models and the baseline control. This session's
+qualification servers and queued waiter were stopped; other sessions were left
+untouched.
+
+The synthetic benchmark now continuously monitors GPU ownership, poisons each
+implementation's output/scratch before execution, and replaces a stale output
+receipt with an incomplete marker before a rerun. Its stronger checks are
+awaiting GPU revalidation in that exclusive window. Local syntax/lint and
+26 Python qualification tests pass.
+
+The existing BF16-vision diagnostic remains separate: 0.8B takes 8.214 seconds for four
+requests and still matches exactly. The 4B diagnostic with a 1,024-row prefill
+chunk starts at 36.356 seconds but its two measured cohorts take
+51.133/51.313 seconds. Admission logs show `domain_scratch` pressure near the
+8 GiB ceiling, and observed width narrows to two or three rows. This
+configuration is not a four-row serving recommendation and was not promoted.
+Both diagnostics preserve the same 34 GiB device ceiling; no budget was raised
+to hide admission pressure. Their serial performance is unmeasured here.
+
 ### Current large-page investigation
 
 The concurrent throughput target is not met yet. The isolated DGX Spark tests
