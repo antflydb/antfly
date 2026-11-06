@@ -3155,13 +3155,15 @@ pub const Store = struct {
     }
 
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try self.beginBatch();
+        var txn = try self.beginBatch();
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn beginBatchWithOptionsYielding(self: *Store, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try self.beginBatchYielding();
+        var txn = try self.beginBatchYielding();
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn lastReplaySequence(self: *Store, fallback_last: u64) u64 {
@@ -3276,8 +3278,9 @@ const RuntimeStore = struct {
     }
 
     pub fn beginBatchWithOptions(self: *RuntimeStore, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
+        var txn = try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn lastReplaySequence(self: *RuntimeStore, fallback_last: u64) u64 {
@@ -3355,6 +3358,12 @@ pub const Txn = struct {
     read_generation: ?*ReadGeneration = null,
     read_pin: ?*ReadPin = null,
     checkpoint: native.CheckpointSlot = .{},
+    /// Set by beginBatchWithOptions() from BatchOptions.durability ==
+    /// .ride_along. commit() reads this to pick commitWithDurability's
+    /// argument, so callers that go through the generic backend_adapter
+    /// Store interface (a bare `try txn.commit()`, no durability
+    /// parameter available there) still get ride-along semantics.
+    ride_along: bool = false,
 
     pub fn decodedResultsNamespace(self: *const Txn) []const u8 {
         return self.prefix;
@@ -3483,7 +3492,7 @@ pub const Txn = struct {
     }
 
     pub fn commit(self: *Txn) !void {
-        return self.commitWithDurability(true);
+        return self.commitWithDurability(!self.ride_along);
     }
 
     /// WS7/WS5: `durable = false` submits through Store.commitRideAlong

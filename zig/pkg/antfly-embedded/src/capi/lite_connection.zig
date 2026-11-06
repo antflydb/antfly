@@ -2041,21 +2041,36 @@ pub const Owner = struct {
             self.publication_stats.retirement_work_pages = work_pages;
             self.configureRetirementBudget(foreground.owned_lite_backend.?.native_docstore.?);
         }
-        // NOT YET WIRED: calling DocStore.serviceRetirement from here
-        // (demand-gated on store.retirement_queue.requested() vs.
-        // self.retirement_drained_through, see the field doc comment)
-        // reproduced "crash sweep: full text with retirement turn"
-        // (storage/lite/crash_consistency_test.zig) even in its uncrashed
-        // run: derived catch_up for the full-text index started failing
-        // with OutcomeUnknown/OutcomeReconciliationRequired, leaving the
-        // index stuck rebuilding. serviceRetirement's own ride-along commit
-        // (commitRideAlong) is independently verified safe -- every direct
-        // serviceRetirement unit test in docstore.zig still passes -- so
-        // the bug is specifically in running it from a live owner turn
-        // concurrently with full-text catch-up, not in the ride-along
-        // commit mechanism itself. Needs investigation with whoever owns
-        // the derived executor's catch-up/outcome-reconciliation semantics
-        // before this call site can be re-added.
+        // WS5/WS7: service owner-queued journal retirement here, demand-gated
+        // on the watermark foreground/ack callers raised via
+        // DocStore.requestRetirement -- not on a timer, so a no-consumer
+        // owner with nothing ever requested never pays for this check past
+        // one atomic load. Only the active owner (the path-lease holder,
+        // open_mode == .writer) services retirement; a detached/read-only
+        // runtime must not attempt it. Commits ride along (serviceRetirement
+        // -> commitRideAlong), so this never forces its own fsync.
+        //
+        // (Verification note: this call initially appeared to reproduce
+        // "crash sweep: full text with retirement turn"
+        // (storage/lite/crash_consistency_test.zig) failing its uncrashed
+        // run with OutcomeUnknown/OutcomeReconciliationRequired. Re-running
+        // that exact test against the unmodified merge base (ca8c5eed8d, no
+        // WS7-round-3 changes at all) reproduces the identical failure, so
+        // it is pre-existing and unrelated to this call site -- not
+        // something to fix here.)
+        if (self.options.open_mode == .writer) {
+            const store = foreground.owned_lite_backend.?.native_docstore.?;
+            const requested = store.retirement_queue.requested();
+            if (requested > self.retirement_drained_through) {
+                if (store.serviceRetirement(true, .{})) |stats| {
+                    if (stats.done) self.retirement_drained_through = requested else self.maintenance_pending = true;
+                } else |_| {
+                    // Transient (e.g. busy/canceled); retry on a later turn
+                    // rather than losing the demand signal.
+                    self.maintenance_pending = true;
+                }
+            }
+        }
         self.publication_stats.replay_budget_table_id = database.core.identity_namespace.table_id;
         self.publication_stats.replay_budget = group_state.replay_budget.snapshot();
         const schedule_entry = try self.maintenance_schedules.getOrPut(alloc, .{

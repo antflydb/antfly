@@ -323,35 +323,37 @@ pub fn contributeProgress(alloc: Allocator, store: anytype, updates: []const Pro
 }
 
 /// Same record, same one-commit-per-publication contract as
-/// `contributeProgress`, but committed with `defer_commit_flush = true`.
+/// `contributeProgress`, but committed with `defer_commit_flush = true` and
+/// `durability = .ride_along`.
 ///
-/// IMPORTANT: as of this writing `defer_commit_flush` only defers the
-/// in-memory table's flush to an immutable/on-disk run (a write-
-/// amplification knob); it does not defer this backend's WAL fsync. A
-/// deferred progress commit is therefore exactly as durable as an ordinary
-/// one today — this call's only present effect is letting a burst of
-/// background progress commits avoid forcing extra memtable flushes. An
-/// earlier version of this change also tried to make `defer_commit_flush`
-/// skip the WAL fsync itself; that broke "lsm backend simulation post-commit
-/// wal checkpoint fault is acknowledged and replayable" in
-/// lsm_backend_sim_test.zig, which asserts that an existing
+/// `defer_commit_flush` only defers the in-memory table's flush to an
+/// immutable/on-disk run (a write-amplification knob); it does not defer
+/// durability on its own. An earlier version of this change tried to make
+/// `defer_commit_flush` also skip the WAL fsync; that broke "lsm backend
+/// simulation post-commit wal checkpoint fault is acknowledged and
+/// replayable" in lsm_backend_sim_test.zig, which asserts that an existing
 /// `defer_commit_flush = true` bulk-ingest commit survives a crash+reopen —
 /// proof that every other caller of this flag (TTL cleanup, bulk ingest,
-/// hbc_adapter) already depends on it never weakening WAL durability. Making
-/// a background progress commit's fsync actually ride along on a later
-/// commit would need a new, separate signal threaded through
-/// `Backend.appendWalForMutable`/`appendWalForState` down to the
-/// `wal_sync_on_commit` decision in `appendWalWithPreparation` — a change to
-/// the core commit path shared by every LSM-backed write in the system, not
-/// attempted here.
+/// hbc_adapter) already depends on it never weakening WAL durability.
+///
+/// `durability = .ride_along` is the real, separate signal for that: on
+/// Lite, `Store.beginBatchWithOptions` threads it onto the returned `Txn`,
+/// so this commit calls `commitTransactionWithDurability(false)` through
+/// `Store.commitRideAlong` (the interim implementation of what WS2's
+/// `Store.stageRideAlong` ticketed group-commit queue replaces once it
+/// lands) instead of forcing its own fsync; it becomes durable for free on
+/// the next durable commit's checkpoint, or this owner's own idle-flush/
+/// close barrier. The hosted LSM backend does not yet consult
+/// `durability` at all, so there `.ride_along` is exactly as durable as
+/// `.durable` today — no hosted behavior change.
 ///
 /// This is nonetheless the one seam background/catch-up flush passes call
-/// through today, so that a real fsync-eliding mechanism — WS2's
-/// `stageRideAlong`, or the WAL-sync signal above — has exactly one call
-/// site to take over, instead of every background call site needing to
-/// change again later.
+/// through, so hosted's real fsync-eliding mechanism (the WAL-sync signal
+/// described above, or folding into the same `durability` enum) has
+/// exactly one call site to take over, instead of every background call
+/// site needing to change again later.
 pub fn contributeProgressDeferred(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite) !void {
-    return contributeProgressWithOptions(alloc, store, updates, status_writes, .{ .defer_commit_flush = true });
+    return contributeProgressWithOptions(alloc, store, updates, status_writes, .{ .defer_commit_flush = true, .durability = .ride_along });
 }
 
 fn contributeProgressWithOptions(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite, options: backend_erased.types.BatchOptions) !void {
