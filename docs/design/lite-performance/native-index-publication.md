@@ -346,3 +346,8 @@ owner applies a 100 ms retry delay, so persistent pressure cannot cause a
 zero-delay worker loop. Progress no longer depends on a later write or an idle
 poll rediscovering the debt. The regression checks both explicit scheduling and
 the bounded delay before verifying the smaller retry.
+
+Exact-commit Debug validation for this stage is recorded in
+[owned-native-publication-debug.json](owned-native-publication-debug.json).
+It qualifies the listed correctness and ownership checks; foreground integration
+and final end-to-end performance qualification are still pending.
