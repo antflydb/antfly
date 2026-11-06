@@ -184,11 +184,9 @@ pub const ArtifactDeviceAdmission = struct {
             if (!compiled_artifact.pjrtBindingIsInputIds(binding)) largest_input = @max(largest_input, try artifactShapeBytes(shape, 4));
         }
         var largest_output: usize = 0;
-        var logical_outputs: usize = 0;
         const whole_model = std.mem.eql(u8, artifact.kind, "pjrt_executable");
         for (artifact.pjrt_output_shapes, artifact.pjrt_output_node_ids) |shape, node_id| {
             const bytes = try artifactShapeBytes(shape, 4);
-            logical_outputs = try std.math.add(usize, logical_outputs, bytes);
             var retained_kv = false;
             for (artifact.pjrt_output_bindings) |binding| if (binding.node_id == node_id and compiled_artifact.pjrtBindingIsKvCache(binding)) {
                 retained_kv = true;
@@ -197,7 +195,7 @@ pub const ArtifactDeviceAdmission = struct {
             // downloads logits. Partition comparison may download any output.
             if (!whole_model or !retained_kv) largest_output = @max(largest_output, bytes);
         }
-        if (largest_output != 0) largest_output = try std.math.add(usize, largest_output, stats.outputs -| logical_outputs);
+        // Readback requests dense row-major data; native padding stays on device.
         const transfers = @max(largest_input, try std.math.mul(usize, largest_output, 2));
         required.host_scratch_bytes = try std.math.add(usize, required.host_scratch_bytes, transfers);
         return required;
@@ -400,9 +398,12 @@ pub const Package = struct {
         const lifetime = try context.manager.retainResourceLifetime();
         errdefer lifetime.deinit();
         const first = try ArtifactDeviceAdmission.plan(artifacts[0]);
+        const retained_metadata = try std.math.add(usize, metadata_bytes, try std.math.add(usize, @sizeOf(@This()), try std.math.mul(usize, artifacts.len, @sizeOf(usize))));
+        const execution = try planExecution(artifacts, retained_metadata, context.runtime_capacity);
+        var device = try ArtifactDeviceAdmission.initAmounts(context, execution.cpu, execution.amounts, execution.external_code);
+        errdefer device.deinit();
         const sizes = try a.alloc(usize, artifacts.len);
         errdefer a.free(sizes);
-        const execution = try planExecution(artifacts, metadata_bytes, context.runtime_capacity);
         var encoded: usize = 0;
         var largest_encoded: usize = 0;
         const c_file = @import("../util/c_file.zig");
@@ -411,8 +412,6 @@ pub const Package = struct {
             encoded = try std.math.add(usize, encoded, sizes[i]);
             largest_encoded = @max(largest_encoded, sizes[i]);
         }
-        var device = try ArtifactDeviceAdmission.initAmounts(context, execution.cpu, execution.amounts, execution.external_code);
-        errdefer device.deinit();
         const peak = try std.math.add(usize, try std.math.add(usize, encoded, largest_encoded), 64 * 1024);
         var staging = try context.manager.acquireRunResourceAmounts(.cpu, ArtifactDeviceAdmission.limitsFor(context, true), .{ .host_weight_bytes = peak });
         errdefer staging.release();
@@ -422,7 +421,7 @@ pub const Package = struct {
         try staging.retain(.{ .host_weight_bytes = try std.math.add(usize, encoded, largest_encoded) });
         const owner = try a.create(@This());
         errdefer a.destroy(owner);
-        owner.* = .{ .allocator = a, .lifetime = lifetime, .prefill_bytes = prefill, .encoded_sizes = sizes, .encoded_total = encoded, .metadata_bytes = metadata_bytes, .runtime_capacity = context.runtime_capacity, .available_runtimes = .init(context.runtime_capacity), .staging = staging, .device = device, .client = try @import("pjrt").pjrt.Client.initWithMemoryPolicy(plugin, if (device.cpu) .cpu else .{ .cuda = .{ .capacity_bytes = device.pool_bytes, .device_bytes = device.device_bytes } }) };
+        owner.* = .{ .allocator = a, .lifetime = lifetime, .prefill_bytes = prefill, .encoded_sizes = sizes, .encoded_total = encoded, .metadata_bytes = retained_metadata, .runtime_capacity = context.runtime_capacity, .available_runtimes = .init(context.runtime_capacity), .staging = staging, .device = device, .client = try @import("pjrt").pjrt.Client.initWithMemoryPolicy(plugin, if (device.cpu) .cpu else .{ .cuda = .{ .capacity_bytes = device.pool_bytes, .device_bytes = device.device_bytes } }) };
         errdefer owner.client.deinit();
         const cpu = try owner.client.isCpu();
         if (cpu != device.cpu or (!cpu and !std.ascii.eqlIgnoreCase(try owner.client.platformName(), "cuda"))) return error.InvalidArtifact;

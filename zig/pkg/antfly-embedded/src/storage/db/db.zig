@@ -10192,10 +10192,48 @@ pub const DB = struct {
 
         manifest_owned = false;
         state_owned = false;
-        var result = try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, manifest, state);
+        var result = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_name, manifest, state);
         errdefer result.deinit(alloc);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
+    }
+
+    /// Builds the inspection entry for one stored asset value. Only document
+    /// extraction stores a structured manifest at its asset key; every other
+    /// asset producer (copy, generator, reader, transcriber, extractor, ...)
+    /// stores its output there directly, as `_artifacts` exposes it. Takes
+    /// ownership of `value` and `state`, freeing both on error. The caller
+    /// holds the apply lock shared.
+    fn documentArtifactInspectionAlloc(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        value: []u8,
+        state: ?[]u8,
+    ) !types.DocumentArtifactManifest {
+        const content_type = (self.producedAssetContentTypeAlloc(alloc, artifact_name) catch |err| {
+            alloc.free(value);
+            if (state) |bytes| alloc.free(bytes);
+            return err;
+        }) orelse return documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, value, state);
+        return producedAssetManifestAlloc(alloc, doc_key, artifact_name, value, state, content_type);
+    }
+
+    /// Returns the configured content type when `artifact_name` is an asset
+    /// enrichment whose producer writes its output directly, or null when the
+    /// value should be read as a document-artifact manifest (document
+    /// extraction, or no readable enrichment config).
+    fn producedAssetContentTypeAlloc(self: *DB, alloc: Allocator, artifact_name: []const u8) !?[]u8 {
+        var cfg = (try self.core.getEnrichment(alloc, .asset, artifact_name)) orelse return null;
+        defer cfg.deinit(alloc);
+        var producer = asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        defer producer.deinit(alloc);
+        if (producer.type == .document_extraction) return null;
+        return try alloc.dupe(u8, cfg.content_type);
     }
 
     pub fn listDocumentArtifactManifests(
@@ -10234,14 +10272,15 @@ pub const DB = struct {
                 error.NotFound => null,
                 else => return err,
             };
-            errdefer if (state) |value| alloc.free(value);
-
-            const manifest_json = try alloc.dupe(u8, row.value);
-            errdefer alloc.free(manifest_json);
-            try artifacts.append(
-                alloc,
-                try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state),
-            );
+            const manifest_json = alloc.dupe(u8, row.value) catch |err| {
+                if (state) |value| alloc.free(value);
+                return err;
+            };
+            // Ownership of manifest_json and state moves into the inspection,
+            // which frees both itself when it fails.
+            var artifact = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state);
+            errdefer artifact.deinit(alloc);
+            try artifacts.append(alloc, artifact);
         }
 
         var result: types.DocumentArtifactManifestList = .{
@@ -50642,6 +50681,47 @@ const documentArtifactChildRangesFromJsonAlloc = document_child_range_manifest.d
 const documentArtifactChildRangesFromManifestJsonAlloc = document_child_range_manifest.documentArtifactChildRangesFromManifestJsonAlloc;
 const freeDocumentArtifactChildRanges = document_child_range_manifest.freeDocumentArtifactChildRanges;
 
+/// Inspection entry for an asset whose producer stores its output directly
+/// rather than a document-artifact manifest. Only identity, content type and
+/// fingerprint are summarized; the stored output is the raw `manifest_json`
+/// detail. The producer state is a binary digest of the source and producer
+/// config, so it is reported hex-encoded as `source_fingerprint` instead of as
+/// `state_json`. Takes ownership of `content`, `state` and `content_type`,
+/// freeing them on error.
+fn producedAssetManifestAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    content: []u8,
+    state: ?[]u8,
+    content_type: []u8,
+) !types.DocumentArtifactManifest {
+    errdefer alloc.free(content);
+    errdefer alloc.free(content_type);
+    defer if (state) |bytes| alloc.free(bytes);
+
+    const source_fingerprint: []u8 = if (state) |bytes| try std.fmt.allocPrint(alloc, "{x}", .{bytes}) else "";
+    errdefer if (source_fingerprint.len > 0) alloc.free(source_fingerprint);
+    const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, .{
+        .document_id = @constCast(doc_key),
+        .name = @constCast(artifact_name),
+        .kind = .asset,
+    });
+    errdefer alloc.free(artifact_id);
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    const owned_artifact_name = try alloc.dupe(u8, artifact_name);
+
+    return .{
+        .document_id = owned_doc_key,
+        .artifact_name = owned_artifact_name,
+        .artifact_id = artifact_id,
+        .manifest_json = content,
+        .source_fingerprint = source_fingerprint,
+        .content_type = content_type,
+    };
+}
+
 fn documentArtifactManifestFromJsonAlloc(
     alloc: Allocator,
     doc_key: []const u8,
@@ -87265,6 +87345,88 @@ test "db public extraction budget rejection publishes a failure manifest" {
     try std.testing.expectEqualStrings("failed", manifest.merge_status);
     try std.testing.expectEqualStrings("DocumentExtractionWorkingSetTooLarge", manifest.last_error_code.?);
     try std.testing.expectEqual(@as(usize, 0), manifest.unit_count);
+}
+
+test "db artifact manifest list frees an unparseable asset value once" {
+    // An asset value read as a document-artifact manifest (no enrichment
+    // config names a direct-output producer) that does not parse must fail
+    // the request with the parse error. The parser owns and frees the value
+    // and its state row when it rejects them; the list must not free them
+    // again.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "summary");
+    defer alloc.free(asset_key);
+    try db.core.store.put(asset_key, "generated summary text");
+    const state_key = try assetStateKeyAlloc(alloc, "doc", "summary");
+    defer alloc.free(state_key);
+    try db.core.store.put(state_key, "{\"generation\":1}");
+
+    try std.testing.expectError(error.SyntaxError, db.listDocumentArtifactManifests(alloc, "doc"));
+    try std.testing.expectError(error.SyntaxError, db.getDocumentArtifactManifest(alloc, "doc", "summary"));
+}
+
+test "db artifact manifest list reports malformed document extraction manifests" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "units");
+    defer alloc.free(asset_key);
+    try db.core.store.put(asset_key, "truncated {");
+
+    try std.testing.expectError(error.SyntaxError, db.listDocumentArtifactManifests(alloc, "doc"));
+    try std.testing.expectError(error.SyntaxError, db.getDocumentArtifactManifest(alloc, "doc", "units"));
+}
+
+test "db artifact manifest list and get inspect generator asset output" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello\"}" }}, .sync_level = .enrichments });
+    try std.testing.expectEqual(@as(usize, 1), fake.generator_calls);
+
+    var list = try db.listDocumentArtifactManifests(alloc, "doc");
+    defer list.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), list.artifacts.len);
+    const listed = list.artifacts[0];
+    try std.testing.expectEqualStrings("summary", listed.artifact_name);
+    try std.testing.expect(std.mem.startsWith(u8, listed.artifact_id, "af1:asset:"));
+    try std.testing.expectEqualStrings("text/plain", listed.content_type);
+    try std.testing.expectEqualStrings("generator:hello", listed.manifest_json);
+    try std.testing.expectEqual(@as(usize, 64), listed.source_fingerprint.len);
+    try std.testing.expect(listed.state_json == null);
+
+    var single = (try db.getDocumentArtifactManifest(alloc, "doc", "summary")) orelse return error.TestUnexpectedResult;
+    defer single.deinit(alloc);
+    try std.testing.expectEqualStrings(listed.artifact_id, single.artifact_id);
+    try std.testing.expectEqualStrings("generator:hello", single.manifest_json);
+    try std.testing.expectEqualStrings(listed.source_fingerprint, single.source_fingerprint);
 }
 
 test "db public artifact reprocess accepts durable work despite unrelated provider retries" {

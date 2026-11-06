@@ -947,7 +947,7 @@ const onnx_subdirs = [_][]const u8{ "", "onnx" };
 fn ignoreNonResourceMetadataError(result: anytype) !void {
     const metadata_result: anyerror!void = result;
     metadata_result catch |err| switch (err) {
-        error.OutOfMemory => return err,
+        error.OutOfMemory, error.ChecksumMismatch, error.InvalidManagedDownload => return err,
         error.InvalidGlinerBoundaryConfig,
         error.UnsupportedGlinerArchitecture,
         error.UnsupportedGlinerBoundaryVersion,
@@ -1093,7 +1093,10 @@ const ArtifactCatalog = struct {
     fn readOptionalUnchecked(self: *const ArtifactCatalog, name: []const u8) !?[]u8 {
         if (self.receipt != null) {
             const artifact = self.find(name) orelse return null;
-            return try c_file.readFile(self.allocator, artifact.canonical_path);
+            const bytes = try c_file.readFile(self.allocator, artifact.canonical_path);
+            errdefer self.allocator.free(bytes);
+            try managed_receipt.verifyArtifactBytes(artifact, bytes);
+            return bytes;
         }
         return c_file.readFileFromDir(self.allocator, self.model_dir_path, name) catch |err| switch (err) {
             error.FileNotFound => return null,

@@ -29,6 +29,7 @@ pub const PjrtError = error{
     NoDevices,
     UnsupportedPjrtFeature,
     InvalidMemoryStats,
+    OutputCountMismatch,
 };
 
 /// Compiler-reported single-device execution footprint. Keep inputs and
@@ -114,8 +115,8 @@ fn awaitAndDestroyEvent(api: *const c.Api, event: *c.PjrtEvent) PjrtError!void {
         .extension_start = null,
         .event = event,
     };
+    defer destroyEvent(api, event);
     try checkError(api, api.eventAwait(&await_args));
-    destroyEvent(api, event);
 }
 
 /// OpenXLA runtime flags can override Client_Create's allocator and fraction,
@@ -179,8 +180,80 @@ pub const Buffer = struct {
         return args.on_device_size_in_bytes;
     }
 
+    /// Logical dimensions are independent of device padding and tiling.
+    pub fn matchesFloat32Shape(self: *const Buffer, expected: []const i64) !bool {
+        if (!self.api.hasBufferShape()) return error.UnsupportedPjrtFeature;
+        var kind = std.mem.zeroes(c.BufferElementTypeArgs);
+        kind.struct_size = @sizeOf(@TypeOf(kind));
+        kind.buffer = self.handle;
+        try checkError(self.api, self.api.bufferElementType(&kind));
+        if (kind.buffer_type != .float32) return false;
+        var dims = std.mem.zeroes(c.BufferDimensionsArgs);
+        dims.struct_size = @sizeOf(@TypeOf(dims));
+        dims.buffer = self.handle;
+        try checkError(self.api, self.api.bufferDimensions(&dims));
+        if (dims.num_dims != expected.len) return false;
+        if (expected.len != 0) {
+            for ((dims.dims orelse return error.PjrtApiError)[0..expected.len], expected) |actual, wanted| {
+                if (actual < 0 or (wanted >= 0 and actual != wanted)) return false;
+            }
+        }
+        return true;
+    }
+
     pub fn toFloat32(self: *const Buffer, allocator: std.mem.Allocator) ![]f32 {
-        const size = try self.onDeviceSizeInBytes();
+        return self.downloadFloat32(allocator, allocator, null);
+    }
+
+    pub fn toFloat32WithShape(self: *const Buffer, allocator: std.mem.Allocator, expected: []const i64) ![]f32 {
+        return self.downloadFloat32(allocator, allocator, expected);
+    }
+
+    pub fn toFloat32WithShapeAndScratch(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: []const i64) ![]f32 {
+        return self.downloadFloat32(allocator, scratch, expected);
+    }
+
+    fn downloadFloat32(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]f32 {
+        if (!self.api.hasBufferReadback()) return error.UnsupportedPjrtFeature;
+        var kind = c.BufferElementTypeArgs{ .struct_size = @sizeOf(c.BufferElementTypeArgs), .extension_start = null, .buffer = self.handle, .buffer_type = .invalid };
+        try checkError(self.api, self.api.bufferElementType(&kind));
+        if (kind.buffer_type != .float32) return error.PjrtApiError;
+        var dims = std.mem.zeroes(c.BufferDimensionsArgs);
+        dims.struct_size = @sizeOf(@TypeOf(dims));
+        dims.buffer = self.handle;
+        try checkError(self.api, self.api.bufferDimensions(&dims));
+        if (expected) |shape| {
+            if (dims.num_dims != shape.len) return error.PjrtApiError;
+            if (shape.len != 0 and !std.mem.eql(i64, (dims.dims orelse return error.PjrtApiError)[0..shape.len], shape)) return error.PjrtApiError;
+        }
+        var elements: usize = 1;
+        if (dims.num_dims != 0) {
+            for ((dims.dims orelse return error.PjrtApiError)[0..dims.num_dims]) |dim| {
+                const n = std.math.cast(usize, dim) orelse return error.PjrtApiError;
+                elements = try std.math.mul(usize, elements, n);
+            }
+        }
+        // Ask for dense row-major host data, regardless of native layout.
+        var inline_order: [8]i64 = undefined;
+        const order = if (dims.num_dims <= inline_order.len) inline_order[0..dims.num_dims] else try scratch.alloc(i64, dims.num_dims);
+        defer if (dims.num_dims > inline_order.len) scratch.free(order);
+        for (order, 0..) |*dim, i| dim.* = @intCast(order.len - i - 1);
+        var layout = std.mem.zeroes(c.BufferMemoryLayout);
+        layout.struct_size = @sizeOf(@TypeOf(layout));
+        layout.layout_type = 0; // PJRT_Buffer_MemoryLayout_Type_Tiled
+        layout.layout.tiled = std.mem.zeroes(c.BufferMemoryLayoutTiled);
+        layout.layout.tiled.struct_size = @sizeOf(c.BufferMemoryLayoutTiled);
+        layout.layout.tiled.minor_to_major = order.ptr;
+        layout.layout.tiled.minor_to_major_size = order.len;
+        var query = c.BufferToHostBufferArgs{ .struct_size = @sizeOf(c.BufferToHostBufferArgs), .extension_start = null, .src = self.handle, .host_layout = &layout, .dst = null, .dst_size = 0, .event = null };
+        const query_error = self.api.bufferToHostBuffer(&query);
+        if (query_error != null) {
+            if (query.event) |event| awaitAndDestroyEvent(self.api, event) catch {};
+            try checkError(self.api, query_error);
+        }
+        if (query.event) |event| try awaitAndDestroyEvent(self.api, event);
+        const size = query.dst_size;
+        if (size != try std.math.mul(usize, elements, @sizeOf(f32))) return error.PjrtApiError;
         const num_floats = size / @sizeOf(f32);
         const result = try allocator.alloc(f32, num_floats);
         errdefer allocator.free(result);
@@ -189,12 +262,16 @@ pub const Buffer = struct {
             .struct_size = @sizeOf(c.BufferToHostBufferArgs),
             .extension_start = null,
             .src = self.handle,
-            .host_layout = null,
+            .host_layout = &layout,
             .dst = @ptrCast(result.ptr),
             .dst_size = size,
             .event = null,
         };
-        try checkError(self.api, self.api.bufferToHostBuffer(&args));
+        const args_error = self.api.bufferToHostBuffer(&args);
+        if (args_error != null) {
+            if (args.event) |event| awaitAndDestroyEvent(self.api, event) catch {};
+            try checkError(self.api, args_error);
+        }
 
         if (args.event) |event| {
             try awaitAndDestroyEvent(self.api, event);
@@ -231,6 +308,32 @@ pub const LoadedExecutable = struct {
         args.loaded_executable = self.handle;
         try checkError(self.api, self.api.loadedExecutableGetExecutable(&args));
         return .{ .api = self.api, .handle = args.executable orelse return error.PjrtApiError };
+    }
+
+    /// Native executable metadata is authoritative; sidecar shapes must match
+    /// before any execution or retained-state allocation can occur.
+    pub fn validateOutputShapes(self: *const LoadedExecutable, expected: []const []const i64) !void {
+        if (!self.api.hasOutputShapes()) return error.UnsupportedPjrtFeature;
+        var owned = try self.executable();
+        defer owned.deinit();
+        var types = std.mem.zeroes(c.ExecutableOutputElementTypesArgs);
+        types.struct_size = @sizeOf(@TypeOf(types));
+        types.executable = owned.handle;
+        try checkError(self.api, self.api.executableOutputTypes(&types));
+        var dims = std.mem.zeroes(c.ExecutableOutputDimensionsArgs);
+        dims.struct_size = @sizeOf(@TypeOf(dims));
+        dims.executable = owned.handle;
+        try checkError(self.api, self.api.executableOutputDimensions(&dims));
+        if (types.num_output_types != expected.len or dims.num_outputs != expected.len) return error.OutputCountMismatch;
+        var offset: usize = 0;
+        for (expected, 0..) |shape, i| {
+            if ((types.output_types orelse return error.PjrtApiError)[i] != .float32) return error.PjrtApiError;
+            const rank = (dims.dim_sizes orelse return error.PjrtApiError)[i];
+            if (rank != shape.len) return error.PjrtApiError;
+            const end = try std.math.add(usize, offset, rank);
+            if (rank != 0 and !std.mem.eql(i64, (dims.dims orelse return error.PjrtApiError)[offset..end], shape)) return error.PjrtApiError;
+            offset = end;
+        }
     }
 
     pub fn compiledMemoryStats(self: *const LoadedExecutable) PjrtError!CompiledMemoryStats {
@@ -310,13 +413,30 @@ pub const LoadedExecutable = struct {
         defer allocator.free(output_ptrs);
         @memset(output_ptrs, null);
         var output_list_ptrs = [1][*]?*c.PjrtBuffer{output_ptrs.ptr};
+        const results = try allocator.alloc(Buffer, num_outputs);
+        errdefer allocator.free(results);
+        errdefer for (output_ptrs) |maybe_buffer| {
+            if (maybe_buffer) |handle| {
+                var buffer = Buffer{ .api = self.api, .handle = handle };
+                buffer.deinit();
+            }
+        };
 
         // Completion event slot
         var events: [1]?*c.PjrtEvent = .{null};
+        defer if (events[0]) |event| destroyEvent(self.api, event);
+
+        // Inputs remain owned by the caller, including retained KV needed if
+        // readback fails. Native may-alias executables must not donate them.
+        const non_donatable = try allocator.alloc(i64, inputs.len);
+        defer allocator.free(non_donatable);
+        for (non_donatable, 0..) |*index, i| index.* = @intCast(i);
 
         // Execute options (zeroed = defaults)
         var options: c.ExecuteOptions = std.mem.zeroes(c.ExecuteOptions);
         options.struct_size = @sizeOf(c.ExecuteOptions);
+        options.non_donatable_input_indices = non_donatable.ptr;
+        options.num_non_donatable_input_indices = non_donatable.len;
 
         var args = c.LoadedExecutableExecuteArgs{
             .struct_size = @sizeOf(c.LoadedExecutableExecuteArgs),
@@ -335,13 +455,13 @@ pub const LoadedExecutable = struct {
 
         // Wait for completion
         if (events[0]) |event| {
+            events[0] = null;
             try awaitAndDestroyEvent(self.api, event);
         }
 
         // Wrap output buffers
-        const results = try allocator.alloc(Buffer, num_outputs);
         for (0..num_outputs) |i| {
-            results[i] = .{ .api = self.api, .handle = output_ptrs[i].? };
+            results[i] = .{ .api = self.api, .handle = output_ptrs[i] orelse return error.PjrtApiError };
         }
         return results;
     }
@@ -519,12 +639,7 @@ pub const Client = struct {
         };
         try checkError(self.api, self.api.clientCompile(&args));
 
-        return .{
-            .api = self.api,
-            .handle = args.executable orelse return PjrtError.PjrtApiError,
-            .device = self.device,
-            .num_outputs = num_outputs,
-        };
+        return self.validateLoadedOutputs(args.executable orelse return PjrtError.PjrtApiError, self.device, num_outputs);
     }
 
     /// Compile an HLO program targeting a specific device.
@@ -560,12 +675,7 @@ pub const Client = struct {
         };
         try checkError(self.api, self.api.clientCompile(&args));
 
-        return .{
-            .api = self.api,
-            .handle = args.executable orelse return PjrtError.PjrtApiError,
-            .device = target_device,
-            .num_outputs = num_outputs,
-        };
+        return self.validateLoadedOutputs(args.executable orelse return PjrtError.PjrtApiError, target_device, num_outputs);
     }
 
     /// Load a plugin-native serialized executable without compiling HLO.
@@ -588,12 +698,19 @@ pub const Client = struct {
         };
         try checkError(self.api, self.api.executableDeserializeAndLoad(&args));
 
-        return .{
-            .api = self.api,
-            .handle = args.loaded_executable orelse return PjrtError.PjrtApiError,
-            .device = self.device,
-            .num_outputs = num_outputs,
-        };
+        return self.validateLoadedOutputs(args.loaded_executable orelse return PjrtError.PjrtApiError, self.device, num_outputs);
+    }
+
+    fn validateLoadedOutputs(self: *const Client, handle: *c.PjrtLoadedExecutable, device: *c.PjrtDevice, num_outputs: usize) PjrtError!LoadedExecutable {
+        var loaded = LoadedExecutable{ .api = self.api, .handle = handle, .device = device, .num_outputs = num_outputs };
+        errdefer loaded.deinit();
+        if (!self.api.hasOutputCount()) return error.UnsupportedPjrtFeature;
+        var owned = try loaded.executable();
+        defer owned.deinit();
+        var count = c.ExecutableNumOutputsArgs{ .struct_size = @sizeOf(c.ExecutableNumOutputsArgs), .extension_start = null, .executable = owned.handle, .num_outputs = 0 };
+        try checkError(self.api, self.api.executableNumOutputs(&count));
+        if (count.num_outputs != num_outputs) return error.OutputCountMismatch;
+        return loaded;
     }
 
     /// Upload f32 data from host to device, returning a Buffer handle.
@@ -602,34 +719,7 @@ pub const Client = struct {
         data: []const f32,
         dims: []const i64,
     ) PjrtError!Buffer {
-        var args = c.ClientBufferFromHostBufferArgs{
-            .struct_size = @sizeOf(c.ClientBufferFromHostBufferArgs),
-            .extension_start = null,
-            .client = self.handle,
-            .data = @ptrCast(data.ptr),
-            .buffer_type = .float32,
-            .dims = dims.ptr,
-            .num_dims = dims.len,
-            .byte_strides = null,
-            .num_byte_strides = 0,
-            .host_buffer_semantics = .immutable_only_during_call,
-            .device = self.device,
-            .memory = null,
-            .device_layout = null,
-            .done_with_host_buffer = null,
-            .buffer = null,
-        };
-        try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
-
-        // Wait for host→device transfer to complete so caller can free data
-        if (args.done_with_host_buffer) |event| {
-            try awaitAndDestroyEvent(self.api, event);
-        }
-
-        return .{
-            .api = self.api,
-            .handle = args.buffer orelse return PjrtError.PjrtApiError,
-        };
+        return self.uploadBuffer(@ptrCast(data.ptr), .float32, dims, self.device);
     }
 
     /// Upload i64 data from host to device, returning a Buffer handle.
@@ -638,33 +728,7 @@ pub const Client = struct {
         data: []const i64,
         dims: []const i64,
     ) PjrtError!Buffer {
-        var args = c.ClientBufferFromHostBufferArgs{
-            .struct_size = @sizeOf(c.ClientBufferFromHostBufferArgs),
-            .extension_start = null,
-            .client = self.handle,
-            .data = @ptrCast(data.ptr),
-            .buffer_type = .int64,
-            .dims = dims.ptr,
-            .num_dims = dims.len,
-            .byte_strides = null,
-            .num_byte_strides = 0,
-            .host_buffer_semantics = .immutable_only_during_call,
-            .device = self.device,
-            .memory = null,
-            .device_layout = null,
-            .done_with_host_buffer = null,
-            .buffer = null,
-        };
-        try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
-
-        if (args.done_with_host_buffer) |event| {
-            try awaitAndDestroyEvent(self.api, event);
-        }
-
-        return .{
-            .api = self.api,
-            .handle = args.buffer orelse return PjrtError.PjrtApiError,
-        };
+        return self.uploadBuffer(@ptrCast(data.ptr), .int64, dims, self.device);
     }
 
     /// Initialize PJRT client by searching for the plugin in standard locations.
@@ -688,33 +752,33 @@ pub const Client = struct {
         dims: []const i64,
         target_device: *c.PjrtDevice,
     ) PjrtError!Buffer {
-        var args = c.ClientBufferFromHostBufferArgs{
-            .struct_size = @sizeOf(c.ClientBufferFromHostBufferArgs),
-            .extension_start = null,
-            .client = self.handle,
-            .data = @ptrCast(data.ptr),
-            .buffer_type = .float32,
-            .dims = dims.ptr,
-            .num_dims = dims.len,
-            .byte_strides = null,
-            .num_byte_strides = 0,
-            .host_buffer_semantics = .immutable_only_during_call,
-            .device = target_device,
-            .memory = null,
-            .device_layout = null,
-            .done_with_host_buffer = null,
-            .buffer = null,
-        };
-        try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
+        return self.uploadBuffer(@ptrCast(data.ptr), .float32, dims, target_device);
+    }
 
+    /// Acquire output ownership after a successful native call. Completion
+    /// can fail after a valid buffer has been returned, and callers cannot
+    /// release a buffer that this helper never returns to them.
+    fn uploadBuffer(self: *const Client, data: *const anyopaque, kind: c.BufferType, dims: []const i64, device: *c.PjrtDevice) PjrtError!Buffer {
+        var args = std.mem.zeroes(c.ClientBufferFromHostBufferArgs);
+        args.struct_size = @sizeOf(@TypeOf(args));
+        args.client = self.handle;
+        args.data = data;
+        args.buffer_type = kind;
+        args.dims = dims.ptr;
+        args.num_dims = dims.len;
+        args.host_buffer_semantics = .immutable_only_during_call;
+        args.device = device;
+        try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
+        defer if (args.done_with_host_buffer) |event| destroyEvent(self.api, event);
+        errdefer if (args.buffer) |handle| {
+            var buffer = Buffer{ .api = self.api, .handle = handle };
+            buffer.deinit();
+        };
         if (args.done_with_host_buffer) |event| {
+            args.done_with_host_buffer = null;
             try awaitAndDestroyEvent(self.api, event);
         }
-
-        return .{
-            .api = self.api,
-            .handle = args.buffer orelse return PjrtError.PjrtApiError,
-        };
+        return .{ .api = self.api, .handle = args.buffer orelse return error.PjrtApiError };
     }
 };
 
@@ -950,7 +1014,7 @@ test "compiled memory statistics honor API extent and reject unknown sizes" {
     };
     var api = std.mem.zeroes(c.Api);
     api.struct_size = @sizeOf(c.Api);
-    api._fns[41] = @ptrCast(&Fake.destroy);
+    api._fns[40] = @ptrCast(&Fake.destroy);
     api._fns[51] = @ptrCast(&Fake.get);
     api._fns[96] = @ptrCast(&Fake.stats);
     const executable = LoadedExecutable{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .num_outputs = 1 };
@@ -1050,7 +1114,7 @@ test "serialize releases both caller-owned PJRT handles on allocation failure" {
     };
     var api = std.mem.zeroes(c.Api);
     api.struct_size = @sizeOf(c.Api);
-    api._fns[41] = @ptrCast(&Fake.destroy);
+    api._fns[40] = @ptrCast(&Fake.destroy);
     api._fns[51] = @ptrCast(&Fake.get);
     api._fns[49] = @ptrCast(&Fake.serialize);
     api._fns[56] = @ptrCast(&Fake.deserialize);
@@ -1058,7 +1122,7 @@ test "serialize releases both caller-owned PJRT handles on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fake.scenario, .{executable});
     try std.testing.expectEqual(@as(usize, 0), Fake.owned);
     try std.testing.expectEqual(@as(usize, 0), Fake.serialized);
-    api._fns[41] = null;
+    api._fns[40] = null;
     try std.testing.expectError(error.UnsupportedPjrtFeature, executable.serialize(std.testing.allocator));
 }
 
@@ -1093,4 +1157,266 @@ test "bounded CUDA clients reject allocator environment overrides before plugin 
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "false", 1));
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[2], "0", 1));
     try validateBoundedCudaEnvironment();
+}
+
+test "execution owns all native outputs and completion events across host allocation failures" {
+    const Fake = struct {
+        var live_buffers: usize = 0;
+        var live_events: usize = 0;
+        var missing_output: bool = false;
+        fn execute(args: *c.LoadedExecutableExecuteArgs) callconv(.c) ?*c.PjrtError {
+            const lists: [*][*]?*c.PjrtBuffer = @ptrCast(@alignCast(args.output_lists.?));
+            lists[0][0] = @ptrFromInt(1);
+            live_buffers += 1;
+            if (!missing_output) {
+                lists[0][1] = @ptrFromInt(2);
+                live_buffers += 1;
+            }
+            args.device_complete_events.?[0] = @ptrFromInt(1);
+            live_events += 1;
+            return null;
+        }
+        fn destroyBuffer(_: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+            live_buffers -= 1;
+            return null;
+        }
+        fn destroyEvent_(_: *c.EventDestroyArgs) callconv(.c) ?*c.PjrtError {
+            live_events -= 1;
+            return null;
+        }
+        fn awaitEvent(_: *c.EventAwaitArgs) callconv(.c) ?*c.PjrtError {
+            return null;
+        }
+        fn scenario(a: std.mem.Allocator, executable: LoadedExecutable) !void {
+            defer std.debug.assert(live_buffers == 0 and live_events == 0);
+            const outputs = try executable.execute(&.{}, a);
+            defer a.free(outputs);
+            defer for (outputs) |*buffer| buffer.deinit();
+            try std.testing.expectEqual(@as(usize, 2), outputs.len);
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[55] = @ptrCast(&Fake.execute);
+    api._fns[58] = @ptrCast(&Fake.destroyBuffer);
+    api._fns[5] = @ptrCast(&Fake.destroyEvent_);
+    api._fns[8] = @ptrCast(&Fake.awaitEvent);
+    const executable = LoadedExecutable{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .num_outputs = 2 };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fake.scenario, .{executable});
+    Fake.missing_output = true;
+    defer Fake.missing_output = false;
+    try std.testing.expectError(error.PjrtApiError, Fake.scenario(std.testing.allocator, executable));
+}
+
+test "compile and deserialize reject native output arity with balanced ownership" {
+    const Fake = struct {
+        var loaded_destroyed: usize = 0;
+        var executable_destroyed: usize = 0;
+        fn compile(args: *c.ClientCompileArgs) callconv(.c) ?*c.PjrtError {
+            args.executable = @ptrFromInt(1);
+            return null;
+        }
+        fn deserialize(args: *c.ExecutableDeserializeAndLoadArgs) callconv(.c) ?*c.PjrtError {
+            args.loaded_executable = @ptrFromInt(1);
+            return null;
+        }
+        fn get(args: *c.LoadedExecutableGetExecutableArgs) callconv(.c) ?*c.PjrtError {
+            args.executable = @ptrFromInt(2);
+            return null;
+        }
+        fn count(args: *c.ExecutableNumOutputsArgs) callconv(.c) ?*c.PjrtError {
+            args.num_outputs = 3;
+            return null;
+        }
+        fn destroyLoaded(_: *c.LoadedExecutableDestroyArgs) callconv(.c) ?*c.PjrtError {
+            loaded_destroyed += 1;
+            return null;
+        }
+        fn destroyExecutable(_: *c.ExecutableDestroyArgs) callconv(.c) ?*c.PjrtError {
+            executable_destroyed += 1;
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[c.Api.FN_CLIENT_COMPILE] = @ptrCast(&Fake.compile);
+    api._fns[c.Api.FN_EXEC_DESERIALIZE_AND_LOAD] = @ptrCast(&Fake.deserialize);
+    api._fns[c.Api.FN_EXEC_SERIALIZE] = @ptrCast(&Fake.compile);
+    api._fns[c.Api.FN_LOADED_EXEC_GET_EXECUTABLE] = @ptrCast(&Fake.get);
+    api._fns[c.Api.FN_EXEC_NUM_OUTPUTS] = @ptrCast(&Fake.count);
+    api._fns[c.Api.FN_LOADED_EXEC_DESTROY] = @ptrCast(&Fake.destroyLoaded);
+    api._fns[c.Api.FN_EXEC_DESTROY] = @ptrCast(&Fake.destroyExecutable);
+    const client = Client{ .lib = undefined, .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1) };
+    Fake.loaded_destroyed = 0;
+    Fake.executable_destroyed = 0;
+    try std.testing.expectError(error.OutputCountMismatch, client.compile("hlo", 2));
+    try std.testing.expectError(error.OutputCountMismatch, client.compileForDevice("hlo", 2, @ptrFromInt(1)));
+    try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable("serialized", 2));
+    try std.testing.expectEqual(@as(usize, 3), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 3), Fake.executable_destroyed);
+}
+
+test "float32 downloads use logical host bytes and reject invalid type size and shape" {
+    const Fake = struct {
+        var kind: c.BufferType = .float32;
+        var size: usize = 8;
+        var transfers: usize = 0;
+        var events_destroyed: usize = 0;
+        var events_awaited: usize = 0;
+        const dims = [_]i64{2};
+        fn elementType(args: *c.BufferElementTypeArgs) callconv(.c) ?*c.PjrtError {
+            args.buffer_type = kind;
+            return null;
+        }
+        fn dimensions(args: *c.BufferDimensionsArgs) callconv(.c) ?*c.PjrtError {
+            args.dims = &dims;
+            args.num_dims = 1;
+            return null;
+        }
+        fn awaitEvent(_: *c.EventAwaitArgs) callconv(.c) ?*c.PjrtError {
+            events_awaited += 1;
+            return null;
+        }
+        fn destroyEvent_(_: *c.EventDestroyArgs) callconv(.c) ?*c.PjrtError {
+            events_destroyed += 1;
+            return null;
+        }
+        fn download(args: *c.BufferToHostBufferArgs) callconv(.c) ?*c.PjrtError {
+            args.event = @ptrFromInt(1);
+            if (args.dst == null) {
+                args.dst_size = size;
+            } else {
+                transfers += 1;
+                std.debug.assert(args.dst_size == 8);
+                @memcpy(@as([*]u8, @ptrCast(args.dst.?))[0..8], std.mem.sliceAsBytes(&[_]f32{ 0, 1 }));
+            }
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[c.Api.FN_BUFFER_ELEMENT_TYPE] = @ptrCast(&Fake.elementType);
+    api._fns[c.Api.FN_BUFFER_DIMENSIONS] = @ptrCast(&Fake.dimensions);
+    api._fns[c.Api.FN_BUFFER_TO_HOST] = @ptrCast(&Fake.download);
+    api._fns[c.Api.FN_EVENT_AWAIT] = @ptrCast(&Fake.awaitEvent);
+    api._fns[c.Api.FN_EVENT_DESTROY] = @ptrCast(&Fake.destroyEvent_);
+    // No device-size callback: physical padding must never control host size.
+    const buffer = Buffer{ .api = &api, .handle = @ptrFromInt(1) };
+    Fake.kind = .float32;
+    Fake.size = 8;
+    Fake.transfers = 0;
+    Fake.events_destroyed = 0;
+    Fake.events_awaited = 0;
+    const values = try buffer.toFloat32WithShape(std.testing.allocator, &.{2});
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, values);
+    try std.testing.expectError(error.PjrtApiError, buffer.toFloat32WithShape(std.testing.allocator, &.{ 1, 2 }));
+    var failure = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, buffer.toFloat32(failure.allocator()));
+    Fake.size = 6;
+    try std.testing.expectError(error.PjrtApiError, buffer.toFloat32(std.testing.allocator));
+    Fake.size = 4;
+    try std.testing.expectError(error.PjrtApiError, buffer.toFloat32(std.testing.allocator));
+    Fake.kind = .int64;
+    try std.testing.expectError(error.PjrtApiError, buffer.toFloat32(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), Fake.transfers);
+    try std.testing.expectEqual(@as(usize, 5), Fake.events_destroyed);
+    try std.testing.expectEqual(Fake.events_destroyed, Fake.events_awaited);
+    api.struct_size = @offsetOf(c.Api, "_fns") + c.Api.FN_BUFFER_TO_HOST * @sizeOf(?*const anyopaque);
+    try std.testing.expectError(error.UnsupportedPjrtFeature, buffer.toFloat32(std.testing.allocator));
+}
+
+test "native output metadata rejects sidecar dimensions and types before execution" {
+    const Fake = struct {
+        var destroyed: usize = 0;
+        var kind = [_]c.BufferType{.float32};
+        const dims = [_]i64{2};
+        const ranks = [_]usize{1};
+        fn get(args: *c.LoadedExecutableGetExecutableArgs) callconv(.c) ?*c.PjrtError {
+            args.executable = @ptrFromInt(2);
+            return null;
+        }
+        fn destroy(_: *c.ExecutableDestroyArgs) callconv(.c) ?*c.PjrtError {
+            destroyed += 1;
+            return null;
+        }
+        fn types(args: *c.ExecutableOutputElementTypesArgs) callconv(.c) ?*c.PjrtError {
+            args.output_types = &kind;
+            args.num_output_types = 1;
+            return null;
+        }
+        fn dimensions(args: *c.ExecutableOutputDimensionsArgs) callconv(.c) ?*c.PjrtError {
+            args.num_outputs = 1;
+            args.dims = &dims;
+            args.dim_sizes = &ranks;
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[c.Api.FN_LOADED_EXEC_GET_EXECUTABLE] = @ptrCast(&Fake.get);
+    api._fns[c.Api.FN_EXEC_DESTROY] = @ptrCast(&Fake.destroy);
+    api._fns[c.Api.FN_EXEC_OUTPUT_TYPES] = @ptrCast(&Fake.types);
+    api._fns[c.Api.FN_EXEC_OUTPUT_DIMENSIONS] = @ptrCast(&Fake.dimensions);
+    const executable = LoadedExecutable{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .num_outputs = 1 };
+    Fake.destroyed = 0;
+    Fake.kind[0] = .float32;
+    try executable.validateOutputShapes(&.{&.{2}});
+    try std.testing.expectError(error.PjrtApiError, executable.validateOutputShapes(&.{&.{ 1, 2 }}));
+    try std.testing.expectError(error.PjrtApiError, executable.validateOutputShapes(&.{&.{1}}));
+    Fake.kind[0] = .int64;
+    try std.testing.expectError(error.PjrtApiError, executable.validateOutputShapes(&.{&.{2}}));
+    try std.testing.expectEqual(@as(usize, 4), Fake.destroyed);
+    api.struct_size = @offsetOf(c.Api, "_fns") + c.Api.FN_EXEC_OUTPUT_DIMENSIONS * @sizeOf(?*const anyopaque);
+    try std.testing.expectError(error.UnsupportedPjrtFeature, executable.validateOutputShapes(&.{&.{2}}));
+    try std.testing.expectEqual(@as(usize, 4), Fake.destroyed);
+}
+
+test "row major readback canonicalizes native layout and KV shape ignores padding" {
+    const Fake = struct {
+        const dims = [_]i64{ 2, 2 };
+        var kind: c.BufferType = .float32;
+        fn elementType(args: *c.BufferElementTypeArgs) callconv(.c) ?*c.PjrtError {
+            args.buffer_type = kind;
+            return null;
+        }
+        fn dimensions(args: *c.BufferDimensionsArgs) callconv(.c) ?*c.PjrtError {
+            args.dims = &dims;
+            args.num_dims = dims.len;
+            return null;
+        }
+        fn download(args: *c.BufferToHostBufferArgs) callconv(.c) ?*c.PjrtError {
+            const layout = args.host_layout.?;
+            std.debug.assert(layout.layout_type == 0);
+            std.debug.assert(layout.layout.tiled.num_tiles == 0);
+            std.debug.assert(std.mem.eql(i64, layout.layout.tiled.minor_to_major.?[0..2], &.{ 1, 0 }));
+            if (args.dst == null) {
+                args.dst_size = 16;
+                return null;
+            }
+            // Native column-major storage would be [10,20,0,1]. The requested
+            // host layout must expose logical rows [10,0],[20,1] instead.
+            @memcpy(@as([*]u8, @ptrCast(args.dst.?))[0..16], std.mem.sliceAsBytes(&[_]f32{ 10, 0, 20, 1 }));
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[c.Api.FN_BUFFER_ELEMENT_TYPE] = @ptrCast(&Fake.elementType);
+    api._fns[c.Api.FN_BUFFER_DIMENSIONS] = @ptrCast(&Fake.dimensions);
+    api._fns[c.Api.FN_BUFFER_TO_HOST] = @ptrCast(&Fake.download);
+    // No physical-size callback: padding cannot decide logical compatibility.
+    const buffer = Buffer{ .api = &api, .handle = @ptrFromInt(1) };
+    Fake.kind = .float32;
+    try std.testing.expect(try buffer.matchesFloat32Shape(&.{ 2, 2 }));
+    try std.testing.expect(!try buffer.matchesFloat32Shape(&.{4}));
+    try std.testing.expect(try buffer.matchesFloat32Shape(&.{ -1, 2 }));
+    try std.testing.expect(!try buffer.matchesFloat32Shape(&.{ -1, 3 }));
+    Fake.kind = .int64;
+    try std.testing.expect(!try buffer.matchesFloat32Shape(&.{ 2, 2 }));
+    Fake.kind = .float32;
+    const values = try buffer.toFloat32WithShape(std.testing.allocator, &.{ 2, 2 });
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 0, 20, 1 }, values);
+    try std.testing.expect(values[2] > values[3]);
 }
