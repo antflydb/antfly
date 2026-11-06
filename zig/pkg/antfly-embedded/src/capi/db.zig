@@ -3881,15 +3881,21 @@ pub fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer)
         return @call(.auto, @extern(*const @TypeOf(antfly_lite_compact_json), .{ .name = "antfly_lite_compact_json" }), .{ handle_ptr, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    var guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
+    if (guard.handle.owned_lite_backend == null)
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": operation requires a file-backed Lite database");
+    runMaintenanceAdmitted(&guard, handle_ptr, .write, prepareLiteCompact) catch |err| {
+        if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+        return capi.mapError(err);
+    };
+    // Resumption can refresh the runtime; acquire its backend only afterward.
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
-        prepareLiteCompact(handle) catch |err| return capi.mapError(err);
         const report = LiteCompactReport{
             .compacted = true,
             .vacuum = backend.vacuum() catch |err| return capi.mapError(err),
@@ -5489,15 +5495,38 @@ pub fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) callconv(.c) capi.Error
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_run_until_idle), .{ .name = "antfly_db_run_until_idle" }), .{handle_ptr});
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    var guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    const handle = guard.handle;
-    @import("entity_sink.zig").runUntilIdle(handle) catch |err| return capi.mapError(err);
+    runUntilIdleAdmitted(&guard, handle_ptr) catch |err| {
+        if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+        return capi.mapError(err);
+    };
     return .ok;
+}
+
+/// Retry only a refused replay-state borrow. Never wait for detached replay
+/// while holding its publication gate. All borrowed runtime state is unwound
+/// before suspension; resumption may select a different current runtime.
+fn runUntilIdleAdmitted(guard: *HandleGuard, handle_ptr: ?*anyopaque) !void {
+    return runMaintenanceAdmitted(guard, handle_ptr, .maintain, @import("entity_sink.zig").runUntilIdle);
+}
+
+fn runMaintenanceAdmitted(guard: *HandleGuard, handle_ptr: ?*anyopaque, comptime access: HandleAccess, comptime operation: anytype) !void {
+    while (true) {
+        operation(guard.handle) catch |err| {
+            if (err != error.ReplayServiceBusy or guard.connection == null) return err;
+            guard.suspendQuery();
+            try handleLockIo().sleep(.fromMilliseconds(1), .awake);
+            if (!guard.resumeAccess(handle_ptr, access)) return error.InvalidArgument;
+            if (guard.entry_error != null) return error.AdmissionFailed;
+            continue;
+        };
+        return;
+    }
 }
 
 /// A root Lite connection drains every namespace. Report that same scope,
@@ -5599,19 +5628,21 @@ pub fn antfly_db_run_until_idle_json(
         return @call(.auto, @extern(*const @TypeOf(antfly_db_run_until_idle_json), .{ .name = "antfly_db_run_until_idle_json" }), .{ handle_ptr, out_buf_ptr });
     capi.clearLastError();
     const out_buf = resetOutBuffer(out_buf_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": output buffer pointer must not be null");
-    const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    var guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
         return capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
-    const handle = guard.handle;
-    @import("entity_sink.zig").runUntilIdle(handle) catch |err| {
-        writeRunUntilIdleNoProgressDiagnosticIfAny(handle.database(), out_buf, err);
-        if (out_buf.len == 0) out_buf.* = pendingWorkStatsJson(handle) catch .{};
+    runUntilIdleAdmitted(&guard, handle_ptr) catch |err| {
+        if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+        if (guard.suspended_query_root == null) {
+            writeRunUntilIdleNoProgressDiagnosticIfAny(guard.handle.database(), out_buf, err);
+            if (out_buf.len == 0) out_buf.* = pendingWorkStatsJson(guard.handle) catch .{};
+        }
         return capi.mapError(err);
     };
-    out_buf.* = pendingWorkStatsJson(handle) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    out_buf.* = pendingWorkStatsJson(guard.handle) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
 
@@ -10464,6 +10495,65 @@ comptime {
 }
 
 pub const antfly_sources = @import("../source_owner_storage.zig");
+
+test "capi native explicit drain releases writer admission for detached replay state" {
+    try testExplicitDrainAdmissionHandoff(false);
+}
+
+test "capi native explicit compaction releases writer admission for detached replay state" {
+    try testExplicitDrainAdmissionHandoff(true);
+}
+
+fn testExplicitDrainAdmissionHandoff(comptime compact: bool) !void {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var directory = try TestDirectory.init("explicit-drain-admission-handoff");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(handleLockIo(), directory.path());
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/db.aflite", .{directory.path()}, 0);
+    defer std.testing.allocator.free(path);
+    var id: ?*anyopaque = null;
+    const options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .flags = capi.open_flag_no_sync };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &id));
+    defer antfly_db_close(id);
+    var guard = enterHandle(id, if (compact) .write else .maintain) orelse return error.TestUnexpectedResult;
+    defer guard.leave();
+    try std.testing.expectEqual(@as(?capi.ErrorCode, null), guard.entry_error);
+    const connection = guard.connection.?;
+    const state = try connection.owner.groupSourceState(guard.handle.database());
+    // Model a detached slice that already owns this namespace continuation
+    // and must enter the writer gate before it can finish publication.
+    try std.testing.expect(state.replay_service_mutex.tryLock());
+    const Publisher = struct {
+        gate: *@TypeOf(connection.gate.*),
+        state: *db_mod.DB.GroupSourceMaintenanceState,
+        admitted: bool = false,
+        fn run(self: *@This()) void {
+            defer self.state.replay_service_mutex.unlock();
+            const io = handleLockIo();
+            const deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
+            while (std.Io.Clock.awake.now(io).nanoseconds < deadline) {
+                if (self.gate.mutex.tryLock()) {
+                    self.admitted = true;
+                    self.gate.mutex.unlock(io);
+                    return;
+                }
+                io.sleep(.fromMilliseconds(1), .awake) catch return;
+            }
+        }
+    };
+    var publisher: Publisher = .{ .gate = connection.gate, .state = state };
+    const thread = std.Thread.spawn(.{}, Publisher.run, .{&publisher}) catch |err| {
+        state.replay_service_mutex.unlock();
+        return err;
+    };
+    var joined = false;
+    defer if (!joined) thread.join();
+    if (compact) try runMaintenanceAdmitted(&guard, id, .write, prepareLiteCompact) else try runUntilIdleAdmitted(&guard, id);
+    thread.join();
+    joined = true;
+    try std.testing.expect(publisher.admitted);
+    try std.testing.expect(guard.connection_gate_held);
+}
 
 test "issue1015 concurrent Lite handles sustain primary writes and full-text catch-up" {
     const alloc = std.testing.allocator;

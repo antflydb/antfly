@@ -34712,10 +34712,11 @@ pub const DB = struct {
     fn runBackgroundTurnWithState(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase, state: *GroupSourceMaintenanceState) !bool {
         const split_retirement = phase == .replay or phase == .retirement;
         if (split_retirement) {
-            while (!state.replay_service_mutex.tryLock()) {
-                try ensureSnapshotActive(cancellation);
-                platform_time.yieldNow();
-            }
+            // A foreground drain already owns file admission. Detached
+            // replay may own this state while waiting to publish through that
+            // same admission. Refuse without borrowing anything so the C API
+            // can release admission, yield, and refresh before retrying.
+            if (!state.replay_service_mutex.tryLock()) return error.ReplayServiceBusy;
         }
         defer if (split_retirement) state.replay_service_mutex.unlock();
         const old_retirement = self.core.store.deferred_replay_retirement;

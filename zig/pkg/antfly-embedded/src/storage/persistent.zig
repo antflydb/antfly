@@ -6840,8 +6840,8 @@ test "persistent modeled full-text compaction publish faults stay green" {
         pi.abandonAfterCrash();
 
         // The first writable owner sees the durable retirement marker, but its
-        // initial unlink fails. The next ordinary segment publication must
-        // retry from live-owner state rather than requiring another restart.
+        // initial unlink fails. After its backoff expires, an ordinary segment
+        // publication must retry from live state without requiring a restart.
         try device_model.injectDeleteFailureForPathContains("1.seg");
         pi = try PersistentIndex.open(alloc, opts);
         try expectPersistentTextCompactionView(alloc, &pi, 1, 0, 1, 1);
@@ -6853,6 +6853,12 @@ test "persistent modeled full-text compaction publish faults stay green" {
             _ = try txn.get(.meta, &retired_key);
         }
 
+        // Advance the fault fixture to the retry boundary without a wall-clock
+        // sleep. Production retries preserve their bounded failure backoff.
+        const deleter = pi.retired_segment_file_deleter.?;
+        platform_sync.lockYielding(&deleter.delete_mu);
+        for (deleter.retry_entries.items) |*entry| entry.next_attempt_ns = 0;
+        deleter.delete_mu.unlock();
         const followup = try buildSimpleSegment(alloc, "doc:followup", "followup");
         defer alloc.free(followup);
         try pi.indexSegment(followup);

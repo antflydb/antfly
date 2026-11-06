@@ -93,3 +93,9 @@ The local regression previously retained 13,282 bytes of a 13,425-byte consumer
 allowance after two output publications, with producer progress still zero. The
 next output could not fit while the producer held the drain. Interleaved service
 now finishes that fixture and verifies physical reclamation between outputs.
+
+Explicit drains and compaction must not wait for a detached replay continuation
+while holding its writer publication gate. A refused continuation borrow unwinds
+all runtime-local work, releases admission, and yields before reacquiring and
+refreshing the foreground runtime. Durable progress remains authoritative across
+that handoff; callers never replay a document mutation to resolve this wait.
