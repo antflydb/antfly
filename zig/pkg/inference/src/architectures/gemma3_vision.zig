@@ -91,10 +91,12 @@ fn checkActualEncoder(cb_value: ComputeBackend, _: ComputeBackend) !void {
     try std.testing.expectEqualSlices(f32, held, debug.projected_tokens);
 }
 fn checkMissingProjection(cb: ComputeBackend, _: ComputeBackend) !void {
-    try std.testing.expectError(error.MissingWeight, encodeProjectedImageTokens(&cb, std.testing.allocator, Fixture.config(), &Fixture.pixels, 1));
+    const missing = if (cb.kind() == .cuda) error.WeightNotFound else error.MissingWeight;
+    try std.testing.expectError(missing, encodeProjectedImageTokens(&cb, std.testing.allocator, Fixture.config(), &Fixture.pixels, 1));
 }
 fn checkMissingSecondNorm(cb: ComputeBackend, _: ComputeBackend) !void {
-    try std.testing.expectError(error.MissingWeight, encodeProjectedImageTokens(&cb, std.testing.allocator, Fixture.config(), &Fixture.pixels, 1));
+    const missing = if (cb.kind() == .cuda) error.WeightNotFound else error.MissingWeight;
+    try std.testing.expectError(missing, encodeProjectedImageTokens(&cb, std.testing.allocator, Fixture.config(), &Fixture.pixels, 1));
 }
 fn checkActualEncoderOom(a: std.mem.Allocator, debug: bool) !void {
     const native = @import("../ops/native_compute.zig");
@@ -156,4 +158,16 @@ test "Native patch encoder projector nonzero attention and MLP agree with indepe
 }
 test "Metal patch encoder projector nonzero attention and MLP agree with independent scalar golden" {
     try @import("../ops/media_residency_test.zig").onMetal(Fixture.populateNonzero, checkNonzeroEncoder);
+}
+
+test "CUDA patch encoder projector preserves independent oracle host pooling and retained debug outputs" {
+    try @import("../ops/media_residency_test.zig").onCuda(Fixture.populate, checkActualEncoder);
+}
+test "CUDA patch encoder projector nonzero attention and MLP agree with independent scalar golden" {
+    try @import("../ops/media_residency_test.zig").onCuda(Fixture.populateNonzero, checkNonzeroEncoder);
+}
+test "CUDA patch encoder projector owns late weight failure after hidden export and residual creation" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onCuda(Fixture.noProjection, checkMissingProjection);
+    try helper.onCuda(Fixture.noSecondNorm, checkMissingSecondNorm);
 }

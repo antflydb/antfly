@@ -120,7 +120,7 @@ pub fn encode(
     defer if (soft_norm != soft_norm_w) cb.free(soft_norm);
     const normed = try cb.rmsNorm(merged_ct, soft_norm, vision_hidden, 1e-6);
     defer cb.free(normed);
-    const normed_data = if (capture_debug) try cb.toFloat32(normed, allocator) else &.{};
+    const normed_data: []f32 = if (capture_debug) try cb.toFloat32(normed, allocator) else &.{};
     errdefer allocator.free(normed_data);
 
     const proj_w_ct = try weights.projection(vision_hidden, cfg.text_hidden);

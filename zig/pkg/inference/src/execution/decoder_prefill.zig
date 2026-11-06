@@ -2129,3 +2129,8 @@ test "Metal prompt replacement materializes a real foreign source before its des
     };
     try helper.onMetal(helper.noWeights, Fixture.run);
 }
+
+test "CUDA streaming prompt replacement preserves rows scale held outputs and no intermediate export" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onCuda(helper.noWeights, checkPromptReplacementRows);
+}
