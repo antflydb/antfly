@@ -6367,7 +6367,7 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
         (if (@import("sql.zig").statementMayMutate(value.compiled.statement)) .mutation else .read_only)
     else |_|
         .read_only;
-    const guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
+    var guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
     defer guard.leaveAccess();
     if (guard.entry_error) |code| {
         return capi.ensureError(code, @src().fn_name);
@@ -6378,8 +6378,12 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
     defer receipt_scope.end();
     // Managed owners require Raft routing and credentials supplied by API SQL.
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return capi.recordError(.unsupported, @src().fn_name ++ ": storage owner binding is already configured");
+    // WS3: thread this call's own `HandleGuard` into the single-table SQL
+    // mutate path (see `sql.zig`'s `Adapter.writer_lane_hook`) so a write
+    // issued through `antfly_db_sql_json` releases the connection-level locks
+    // across its durability wait too, like every other capi write export.
     const result = if (prepared) |*value|
-        executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf)
+        executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf, writerLaneHookFromGuard(&guard))
     else |err|
         embeddedSqlPreparationFailure(handle, request_json.bytes(), err);
     result catch |err| {
@@ -6452,10 +6456,20 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     var budget = EmbeddedSqlBudget{ .backing = handle.alloc, .limit = @import("sql.zig").runtime.resource_limits.preparation_bytes };
     var prepared = PreparedEmbeddedSql.init(&budget, request_json) catch |err| return embeddedSqlPreparationFailure(handle, request_json, err);
     defer prepared.deinit();
-    return executePreparedEmbeddedSql(handle, table_name, request_json, &budget, &prepared, out_buf);
+    // No `HandleGuard` in scope at this table-scoped entry point (unlike
+    // `antfly_db_sql_json`): keep pre-WS3 behavior rather than fabricate one.
+    return executePreparedEmbeddedSql(handle, table_name, request_json, &budget, &prepared, out_buf, null);
 }
 
-fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, budget: *EmbeddedSqlBudget, prepared: *PreparedEmbeddedSql, out_buf: *capi.Buffer) !void {
+fn executePreparedEmbeddedSql(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: []const u8,
+    budget: *EmbeddedSqlBudget,
+    prepared: *PreparedEmbeddedSql,
+    out_buf: *capi.Buffer,
+    writer_lane_hook: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
+) !void {
     const session = try @import("sql_session.zig").requestSession(handle, request_json);
     errdefer if (session) |value| {
         if (value.active) value.failed = true;
@@ -6500,7 +6514,7 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false), .writer_lane_hook = writer_lane_hook };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation or err == error.SqlUntranslatableCharacter) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });

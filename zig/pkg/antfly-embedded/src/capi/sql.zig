@@ -127,13 +127,23 @@ pub fn Adapter(comptime native: type) type {
         table_name: []const u8,
         read_only: bool = false,
         outcome_transaction_id: ?types.TxnId = null,
+        /// WS3: threads the capi writer lane's `HandleGuard.
+        /// releaseWriterLaneBeforeWait` hook (see `capi/db.zig`'s
+        /// `writerLaneHookFromGuard`/`trackedBatchWithWriterLaneHook`) through
+        /// to the single-table `mutate` commit path below, so a SQL write's
+        /// connection-level locks (the path gate's lease and the per-connection
+        /// call-serializing mutex) drop across its durability wait too, instead
+        /// of being held for the whole fsync like every write export other than
+        /// SQL already avoids. `null` for callers with no `HandleGuard` in scope
+        /// (e.g. `executeEmbeddedSql`'s table-scoped path).
+        writer_lane_hook: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook = null,
 
         pub fn backend(self: *Self) catalog.Backend {
             return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
-            if (self.handle) |handle| return .{ .transaction = self.transaction, .handle = handle, .db = try @import("tables.zig").get(handle, name), .table_name = name, .read_only = self.read_only };
+            if (self.handle) |handle| return .{ .transaction = self.transaction, .handle = handle, .db = try @import("tables.zig").get(handle, name), .table_name = name, .read_only = self.read_only, .writer_lane_hook = self.writer_lane_hook };
             if (!std.mem.eql(u8, name, self.table_name)) return error.UndefinedTable;
             return self.*;
         }
@@ -1149,7 +1159,12 @@ pub fn Adapter(comptime native: type) type {
             var primary_committed = false;
             // Named tables commit to their own database, which holds the marker.
             const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
-            @import("db.zig").trackedBatch(self.db, request, &primary_committed, receipt_table) catch |err| {
+            // WS3: thread the writer-lane hook through so a SQL write's
+            // connection-level locks release before this ticket's durability
+            // wait, exactly like the direct `antfly_db_batch`/`antfly_db_batch_json`
+            // writer exports already do (see the field comment on
+            // `writer_lane_hook` above).
+            @import("db.zig").trackedBatchWithWriterLaneHook(self.db, request, &primary_committed, receipt_table, self.writer_lane_hook) catch |err| {
                 // A confirmed primary write wins: later uncertainty in derived
                 // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;
