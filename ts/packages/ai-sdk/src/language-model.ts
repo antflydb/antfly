@@ -8,8 +8,15 @@ import type {
   LanguageModelV4Usage,
   SharedV4Warning,
 } from "@ai-sdk/provider";
-import type { GenerateRequest, InferenceClient } from "@antfly/sdk";
-import { toInferenceMessages, toInferenceToolChoice, toInferenceTools } from "./prompt.js";
+import type { AntflyClient, GenerateRequest, InferenceClient } from "@antfly/sdk";
+import { resolveCatalogResource } from "./asset/catalog.js";
+import { decodeAssetReference } from "./asset/reference.js";
+import {
+  type ResolveAssetReference,
+  toInferenceMessages,
+  toInferenceToolChoice,
+  toInferenceTools,
+} from "./prompt.js";
 import { toContent, toFinishReason, toUsage } from "./response.js";
 
 export interface AntflyChatLanguageModelOptions {
@@ -17,6 +24,11 @@ export interface AntflyChatLanguageModelOptions {
   modelId: string;
   /** Provider ID reported on the model, for AI SDK logging/telemetry only. */
   providerId?: string;
+  /**
+   * Required to accept file parts carrying `providerReference: { antfly: <id> }`
+   * (antfly#1505's typed `source` asset flow). Without it, such a part throws.
+   */
+  client?: AntflyClient;
 }
 
 /**
@@ -43,16 +55,21 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
   readonly supportedUrls: Record<string, RegExp[]> = {};
 
   private readonly inference: InferenceClient;
+  private readonly resolveSource: ResolveAssetReference | undefined;
 
   constructor(options: AntflyChatLanguageModelOptions) {
     this.inference = options.inference;
     this.modelId = options.modelId;
     this.provider = options.providerId ?? "antfly";
+    const client = options.client;
+    this.resolveSource = client
+      ? (id: string) => resolveCatalogResource(client, decodeAssetReference(id))
+      : undefined;
   }
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     const warnings: SharedV4Warning[] = [];
-    const request = this.buildRequest(options, warnings);
+    const request = await this.buildRequest(options, warnings);
     const response = await this.inference.generate(request, { signal: options.abortSignal });
     return {
       content: toContent(response),
@@ -69,7 +86,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
 
   async doStream(options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
     const warnings: SharedV4Warning[] = [];
-    const request = this.buildRequest(options, warnings);
+    const request = await this.buildRequest(options, warnings);
     const parts = this.streamParts(request, warnings, options.abortSignal);
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
@@ -88,10 +105,10 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     };
   }
 
-  private buildRequest(
+  private async buildRequest(
     options: LanguageModelV4CallOptions,
     warnings: SharedV4Warning[]
-  ): Omit<GenerateRequest, "stream"> {
+  ): Promise<Omit<GenerateRequest, "stream">> {
     if (options.stopSequences?.length) {
       warnings.push({
         type: "unsupported",
@@ -110,7 +127,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     const tools = toInferenceTools(options.tools, warnings);
     return {
       model: this.modelId,
-      messages: toInferenceMessages(options.prompt, warnings),
+      messages: await toInferenceMessages(options.prompt, warnings, this.resolveSource),
       max_tokens: options.maxOutputTokens,
       temperature: options.temperature,
       top_p: options.topP,

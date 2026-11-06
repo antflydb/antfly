@@ -48,7 +48,7 @@ export function createAntfly(options: AntflyProviderOptions): AntflyProvider {
     inference,
     specificationVersion: "v4",
     languageModel: (modelId: string) =>
-      new AntflyChatLanguageModel({ inference, modelId, providerId: "antfly" }),
+      new AntflyChatLanguageModel({ inference, client, modelId, providerId: "antfly" }),
     embeddingModel: (modelId: string) =>
       new AntflyEmbeddingModel({ inference, modelId, providerId: "antfly" }),
     rerankingModel: (modelId: string) =>

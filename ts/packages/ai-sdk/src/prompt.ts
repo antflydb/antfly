@@ -9,41 +9,53 @@ import type {
 } from "@ai-sdk/provider";
 import { UnsupportedFunctionalityError } from "@ai-sdk/provider";
 import type { ContentPart, GenerateRequest, InferenceChatMessage } from "@antfly/sdk";
+import type { CatalogResource } from "./asset/catalog.js";
+import { antflyAssetReferenceFrom } from "./asset/reference.js";
 
 /** Not exported by `@antfly/sdk`; derived from the request schema it already exposes. */
 type InferenceTool = NonNullable<GenerateRequest["tools"]>[number];
 type InferenceToolChoice = NonNullable<GenerateRequest["tool_choice"]>;
+
+/** Resolves an `{ antfly: <id> }` provider reference to its catalog `content.resource`. */
+export type ResolveAssetReference = (id: string) => Promise<CatalogResource>;
 
 /**
  * Converts the AI SDK's provider-neutral prompt into the OpenAI-compatible
  * message array that `/ai/v1/generate` (aliased at `/ai/v1/chat/completions`)
  * expects. Antfly has no file-upload API for chat, so every file part is
  * inlined: images become `image_url` parts (URL or `data:` URI), and every
- * other media type becomes a base64 `media` part. A `url`-typed file part
- * for non-image media is rejected rather than silently fetched, because the
- * asset/source-reference flow (#1505) is explicitly out of scope here.
+ * other media type becomes a base64 `media` part. A file part carrying
+ * `providerReference: { antfly: <id> }` becomes the typed `source` content
+ * part (antfly#1505's proposed asset flow): the gateway fetches and inlines
+ * it server-side, so the source companion's capability URL never appears in
+ * this request body. That requires `resolveSource`, supplied by
+ * `AntflyChatLanguageModel` when it was constructed with a `client`.
  */
-export function toInferenceMessages(
+export async function toInferenceMessages(
   prompt: LanguageModelV4Prompt,
-  warnings: SharedV4Warning[]
-): InferenceChatMessage[] {
-  return prompt.map((message) => toInferenceMessage(message, warnings));
+  warnings: SharedV4Warning[],
+  resolveSource?: ResolveAssetReference
+): Promise<InferenceChatMessage[]> {
+  return Promise.all(prompt.map((message) => toInferenceMessage(message, warnings, resolveSource)));
 }
 
-function toInferenceMessage(
+async function toInferenceMessage(
   message: LanguageModelV4Message,
-  warnings: SharedV4Warning[]
-): InferenceChatMessage {
+  warnings: SharedV4Warning[],
+  resolveSource: ResolveAssetReference | undefined
+): Promise<InferenceChatMessage> {
   switch (message.role) {
     case "system":
       return { role: "system", content: message.content };
     case "user":
       return {
         role: "user",
-        content: message.content.map((part) =>
-          part.type === "text"
-            ? ({ type: "text", text: part.text } satisfies ContentPart)
-            : fileToContentPart(part)
+        content: await Promise.all(
+          message.content.map((part) =>
+            part.type === "text"
+              ? ({ type: "text", text: part.text } satisfies ContentPart as ContentPart)
+              : fileToContentPart(part, resolveSource)
+          )
         ),
       };
     case "assistant": {
@@ -120,9 +132,24 @@ function toInferenceMessage(
   }
 }
 
-function fileToContentPart(
-  part: Extract<LanguageModelV4Message, { role: "user" }>["content"][number] & { type: "file" }
-): ContentPart {
+async function fileToContentPart(
+  part: Extract<LanguageModelV4Message, { role: "user" }>["content"][number] & { type: "file" },
+  resolveSource: ResolveAssetReference | undefined
+): Promise<ContentPart> {
+  if (part.data.type === "reference") {
+    const reference = antflyAssetReferenceFrom(part.data.reference);
+    if (reference) {
+      if (!resolveSource) {
+        throw new UnsupportedFunctionalityError({
+          functionality: "providerReference file parts",
+          message:
+            "This file part carries providerReference.antfly, but the model was constructed without a client to resolve it. Pass `client` to AntflyChatLanguageModel / createAntfly().",
+        });
+      }
+      const resource = await resolveSource(part.data.reference.antfly as string);
+      return { type: "source", source: resource };
+    }
+  }
   const topLevel = part.mediaType.split("/")[0];
   if (topLevel === "image") {
     if (part.data.type === "url") {
@@ -141,7 +168,7 @@ function fileToContentPart(
     throw new UnsupportedFunctionalityError({
       functionality: "remote URL file parts for non-image media",
       message:
-        "Antfly's AI SDK adapter does not fetch remote media on the client's behalf (the asset/source-reference flow is out of scope for this package). Pass audio/video as inline bytes instead.",
+        "Antfly's AI SDK adapter does not fetch remote media on the client's behalf. Pass audio/video as inline bytes, or as a providerReference.antfly asset reference.",
     });
   }
   throw new UnsupportedFunctionalityError({
