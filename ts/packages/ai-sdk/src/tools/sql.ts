@@ -70,7 +70,8 @@ function looksReadOnly(statement: string): boolean {
   const code = sqlCode(statement).trim().replace(/;\s*$/, "");
   if (code.includes(";")) return false;
   const words = code.toLowerCase().match(/[a-z_][a-z0-9_]*/g) ?? [];
-  if (!words.length || !READ_ONLY_LEADING_KEYWORDS.has(words[0])) return false;
+  const first = words[0];
+  if (first === undefined || !READ_ONLY_LEADING_KEYWORDS.has(first)) return false;
   return !words.some((word) => MUTATING_KEYWORDS.has(word));
 }
 
