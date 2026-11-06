@@ -1327,6 +1327,30 @@ pub const HostOutputProducer = struct {
         return .{ .amounts = lease.amounts, .controller = owner.domain.controller(), .domain = owner.domain.owner };
     }
 
+    pub const RawF32Producer = enum { host_tensor, resident_tensor };
+
+    /// Exact overlap of an existing F32 result packet and requested raw rows.
+    /// Geometry is a declaration, never a payload/quota receipt. A resident
+    /// producer retains its backend wrapper/CT array during final readback;
+    /// a host producer retains one rank-two Tensor packet instead.
+    pub fn rawF32CopyHostBytes(rows: usize, physical_width: usize, width: usize, producer: RawF32Producer, admitted: bool) !usize {
+        if (rows == 0 or width == 0 or width > physical_width) return error.InvalidHostOutputGeometry;
+        var bytes = try rawAllocationBytes(try mulBytes(try mulBytes(rows, physical_width), @sizeOf(f32)), .of(f32), admitted);
+        bytes = try addBytes(bytes, try rawAllocationBytes(2 * @sizeOf(i64), .of(i64), admitted));
+        switch (producer) {
+            .host_tensor => bytes = try addBytes(bytes, try rawAllocationBytes(@sizeOf(Tensor), .of(Tensor), admitted)),
+            .resident_tensor => {
+                bytes = try addBytes(bytes, try rawAllocationBytes(@sizeOf(ops.ComputeBackend), .of(ops.ComputeBackend), admitted));
+                bytes = try addBytes(bytes, try rawAllocationBytes(@sizeOf(ops.CT), .of(ops.CT), admitted));
+            },
+        }
+        bytes = try addBytes(bytes, try rawAllocationBytes(try mulBytes(rows, @sizeOf([]f32)), .of([]f32), admitted));
+        return addBytes(bytes, try mulBytes(rows, try rawAllocationBytes(try mulBytes(width, @sizeOf(f32)), .of(f32), admitted)));
+    }
+    fn rawAllocationBytes(bytes: usize, alignment: std.mem.Alignment, admitted: bool) !usize {
+        return if (admitted) @import("admitted_allocator.zig").AdmittedAllocator.allocationHostBytes(bytes, alignment) else bytes;
+    }
+
     pub fn requiredBytes(count: usize, width: usize) !usize {
         if (count == 0 or width == 0 or width > std.math.maxInt(i64)) return error.InvalidHostOutputGeometry;
         const row_bytes = try addBytes(try mulBytes(width, @sizeOf(f32)), @sizeOf(i64));
@@ -1373,6 +1397,14 @@ pub const HostOutputProducer = struct {
         const owner = self.owner orelse return error.HostOutputProducerConsumed;
         if (index >= owner.rows.len or !owner.rows[index].live or owner.rows[index].filled or values.len != owner.tensors[index].elementCount()) return error.InvalidHostOutputGeometry;
         @memcpy(owner.tensors[index].asFloat32Mut(), values);
+        owner.rows[index].filled = true;
+    }
+    /// The exclusive producer lends a row only to this synchronous fill. A
+    /// failed fill cannot publish partial bytes or retain a mutable row claim.
+    pub fn fillRow(self: *HostOutputProducer, index: usize, width: usize, context: anytype, comptime fill: anytype) !void {
+        const owner = self.owner orelse return error.HostOutputProducerConsumed;
+        if (index >= owner.rows.len or !owner.rows[index].live or owner.rows[index].filled or width != owner.tensors[index].elementCount()) return error.InvalidHostOutputGeometry;
+        try fill(context, owner.tensors[index].asFloat32Mut());
         owner.rows[index].filled = true;
     }
     pub fn publish(self: *HostOutputProducer) !OwnedHostVectors {
@@ -3758,12 +3790,20 @@ pub const PreparedSource = struct {
         self.host_remaining_charges = charges;
         self.host_output_producer = producer; // last infallible ownership moves
     }
+    /// Synchronous final-host consumption keeps this Source and its actual
+    /// consumer epoch alive. A borrowed sink cannot escape Source cleanup.
+    pub fn validateHostOutputConsumption(self: *const PreparedSource) !void {
+        if (!self.executed or (self.phase != .executing and self.phase != .released)) return error.SourceInvocationNotExecuted;
+    }
+    pub fn hostOutputSink(self: *PreparedSource) !*HostOutputProducer {
+        try self.validateHostOutputConsumption();
+        return if (self.host_output_producer) |*value| value else error.MissingHostOutputEscrow;
+    }
     /// Copy only the final public vectors to cold, independently reclaiming
     /// backing. All source-dependent pooling/projection has already completed.
     /// The numerical source is consumed regardless of an export error.
     pub fn publishHostOutputs(self: *PreparedSource, rows: []const []const f32) !OwnedHostVectors {
-        if (!self.executed or (self.phase != .executing and self.phase != .released)) return error.SourceInvocationNotExecuted;
-        const producer = if (self.host_output_producer) |*value| value else return error.MissingHostOutputEscrow;
+        const producer = try self.hostOutputSink();
         const owner = producer.owner orelse return error.HostOutputProducerConsumed;
         if (rows.len != owner.rows.len) return error.InvalidHostOutputGeometry;
         for (rows, 0..) |values, index| try producer.writeRow(index, values);
@@ -9573,4 +9613,105 @@ test "Native panel Source callback rejects copied backend descriptor before opaq
     try std.testing.expectError(error.ForeignNativeWeightModel, PreparedSource.nativeCachePreparation(@ptrFromInt(32), &cb, .{ .panels = .{ .in_dim = 64 } }));
     cb.vtable = &Native.vtable_impl;
     try std.testing.expectError(error.ForeignNativeWeightModel, PreparedSource.nativeCachePreparation(@ptrFromInt(32), &cb, .{ .panels = .{ .in_dim = 64 } }));
+}
+
+test "host output synchronous row fill commits only complete validated rows" {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var lease = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 65536 }, false);
+    defer lease.release();
+    var producer = try HostOutputProducer.prepareWithAllocator(std.testing.allocator, &lease, &pin, 2, 2);
+    defer {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+        producer.finishOutsideExecution();
+    }
+    const Fill = struct {
+        calls: *usize,
+        fail: bool,
+        fn run(self: @This(), row: []f32) !void {
+            self.calls.* += 1;
+            @memcpy(row, &[_]f32{ 0.6, 0.8 });
+            if (self.fail) return error.InvalidTestVector;
+        }
+    };
+    var calls: usize = 0;
+    try std.testing.expectError(error.InvalidHostOutputGeometry, producer.fillRow(2, 2, Fill{ .calls = &calls, .fail = false }, Fill.run));
+    try std.testing.expectError(error.InvalidHostOutputGeometry, producer.fillRow(0, 1, Fill{ .calls = &calls, .fail = false }, Fill.run));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    try std.testing.expectError(error.InvalidTestVector, producer.fillRow(0, 2, Fill{ .calls = &calls, .fail = true }, Fill.run));
+    try std.testing.expectError(error.IncompleteHostOutputs, producer.publish());
+    try producer.fillRow(0, 2, Fill{ .calls = &calls, .fail = false }, Fill.run);
+    try std.testing.expectError(error.InvalidHostOutputGeometry, producer.fillRow(0, 2, Fill{ .calls = &calls, .fail = false }, Fill.run));
+    try std.testing.expectEqual(@as(usize, 2), calls);
+    try producer.writeRow(1, &.{ 3, 4 });
+    var vectors = try producer.publish();
+    defer vectors.deinitOutsideExecution();
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, vectors.values(0));
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, vectors.values(1));
+    var unstarted: PreparedSource = .{};
+    try std.testing.expectError(error.SourceInvocationNotExecuted, unstarted.hostOutputSink());
+}
+
+fn actualRawF32PacketBytes(producer: HostOutputProducer.RawF32Producer) !void {
+    const a = std.testing.allocator;
+    const admitted_mod = @import("admitted_allocator.zig");
+    const Provider = struct {
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 1024 * 1024 }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var provider = Provider{};
+    var admitted = admitted_mod.AdmittedAllocator{ .backing = a, .admission_context = &provider, .admit = Provider.acquire };
+    defer admitted.deinit();
+    const alloc = admitted.allocator();
+    const values = try alloc.alloc(f32, 8);
+    var owns_values = true;
+    defer if (owns_values) alloc.free(values);
+    var tensor: ?Tensor = null;
+    defer if (tensor) |*value| value.deinit();
+    var packet: ?[]Tensor = null;
+    defer if (packet) |items| alloc.free(items);
+    var backend: ?*ops.ComputeBackend = null;
+    defer if (backend) |owner| alloc.destroy(owner);
+    var handles: ?[]ops.CT = null;
+    defer if (handles) |items| alloc.free(items);
+    var shape: ?[]i64 = null;
+    defer if (shape) |items| alloc.free(items);
+    switch (producer) {
+        .host_tensor => {
+            tensor = try Tensor.initFloat32Owned(alloc, "embedding", &.{ 2, 4 }, values);
+            owns_values = false;
+            packet = try alloc.alloc(Tensor, 1);
+            packet.?[0] = tensor.?;
+        },
+        .resident_tensor => {
+            // These are the actual allocator-domain metadata constructors.
+            // Device tensor owners live in their independent backend allocator.
+            backend = try alloc.create(ops.ComputeBackend);
+            handles = try alloc.alloc(ops.CT, 1);
+            shape = try alloc.dupe(i64, &.{ 2, 4 });
+        },
+    }
+    const rows = try alloc.alloc([]f32, 2);
+    defer alloc.free(rows);
+    var initialized: usize = 0;
+    defer for (rows[0..initialized]) |row| alloc.free(row);
+    for (rows) |*row| {
+        row.* = try alloc.alloc(f32, 2);
+        initialized += 1;
+    }
+    try std.testing.expectEqual(try HostOutputProducer.rawF32CopyHostBytes(2, 4, 2, producer, true), admitted.live_bytes);
+    try std.testing.expect(admitted.metadata_bytes > 0);
+    try std.testing.expect(admitted.reserved_bytes >= admitted.live_bytes + admitted.metadata_bytes);
+}
+
+test "raw F32 producer overlap declaration matches actual host and resident allocator constructors" {
+    try actualRawF32PacketBytes(.host_tensor);
+    try actualRawF32PacketBytes(.resident_tensor);
+    try std.testing.expectError(error.ResourceLimitExceeded, HostOutputProducer.rawF32CopyHostBytes(2, std.math.maxInt(usize), 1, .host_tensor, true));
 }

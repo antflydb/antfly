@@ -22,6 +22,22 @@ const Tensor = tensors.Tensor;
 const max_inputs = 8;
 const Role = enum { ids, mask, types, positions, bias };
 
+/// Exact I32 token/mask staging, I64 conversion and owning rank-two inputs
+/// used when a direct text packet is built after Source preparation. The input
+/// Plan then aliases its canonical I64 IDs/mask; callers that already own the
+/// packet omit this declaration rather than charging it a second time.
+pub fn copiedTokenPacketHostBytes(batch: usize, sequence: usize, admitted: bool) !usize {
+    const total = std.math.mul(usize, batch, sequence) catch return error.ResourceLimitExceeded;
+    const i32_bytes = try packetAllocationBytes(std.math.mul(usize, total, @sizeOf(i32)) catch return error.ResourceLimitExceeded, .of(i32), admitted);
+    const i64_bytes = try packetAllocationBytes(std.math.mul(usize, total, @sizeOf(i64)) catch return error.ResourceLimitExceeded, .of(i64), admitted);
+    const shape = try packetAllocationBytes(2 * @sizeOf(i64), .of(i64), admitted);
+    const staging = std.math.add(usize, std.math.mul(usize, 2, i32_bytes) catch return error.ResourceLimitExceeded, std.math.mul(usize, 4, i64_bytes) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    return std.math.add(usize, staging, std.math.mul(usize, 2, shape) catch return error.ResourceLimitExceeded) catch error.ResourceLimitExceeded;
+}
+fn packetAllocationBytes(bytes: usize, alignment: std.mem.Alignment, admitted: bool) !usize {
+    return if (admitted) @import("../backends/admitted_allocator.zig").AdmittedAllocator.allocationHostBytes(bytes, alignment) else bytes;
+}
+
 pub const Options = struct { attention_heads: u32 = 0, token_type_ids: ?[]const i64 = null };
 const Spec = struct {
     name: []const u8,
@@ -259,4 +275,36 @@ test "declared text inputs support broadcast bias and reject lossy token convers
     defer wide.deinit();
     const narrow = try Plan.init(&.{.{ .name = "input_ids", .dtype = .i32, .shape = &.{ 2, 3 } }}, &shape, .{});
     try std.testing.expectError(error.TextIntegerOutOfRange, narrow.materialize(a, wide, mask, .{}));
+}
+
+test "copied token packet declaration matches live staged arrays and owning integer inputs" {
+    const admitted_mod = @import("../backends/admitted_allocator.zig");
+    const memory = @import("../runtime/tier/memory.zig");
+    const Provider = struct {
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 1024 * 1024 }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var provider = Provider{};
+    var admitted = admitted_mod.AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &provider, .admit = Provider.acquire };
+    defer admitted.deinit();
+    const a = admitted.allocator();
+    const ids_i32 = try a.alloc(i32, 6);
+    defer a.free(ids_i32);
+    const mask_i32 = try a.alloc(i32, 6);
+    defer a.free(mask_i32);
+    const ids_i64 = try a.alloc(i64, 6);
+    defer a.free(ids_i64);
+    const mask_i64 = try a.alloc(i64, 6);
+    defer a.free(mask_i64);
+    @memset(ids_i64, 1);
+    @memset(mask_i64, 1);
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 2, 3 }, ids_i64);
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, mask_i64);
+    defer mask.deinit();
+    try std.testing.expectEqual(try copiedTokenPacketHostBytes(2, 3, true), admitted.live_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, copiedTokenPacketHostBytes(2, std.math.maxInt(usize), true));
 }

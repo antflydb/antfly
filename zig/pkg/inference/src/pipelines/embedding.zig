@@ -572,9 +572,9 @@ pub const EmbeddingPipeline = struct {
     /// Tokenize once, retain real lengths, and execute bounded length buckets.
     /// The outer Gemma2 owner accounts all tokenizer/packing storage physically.
     fn embedGemma2Texts(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
-        return self.embedGemma2TextsWithTaskOutput(texts, null);
+        return (try self.embedGemma2TextsWithTaskOutput(texts, null)).requireRows();
     }
-    fn embedGemma2TextsWithTaskOutput(self: *EmbeddingPipeline, texts: []const []const u8, task_output: ?*GemmaTaskHostOutput) ![][]f32 {
+    fn embedGemma2TextsWithTaskOutput(self: *EmbeddingPipeline, texts: []const []const u8, task_output: ?*GemmaTaskHostOutput) !TextOutput {
         const a = self.allocator;
         const max_len = textSequenceLengthForInputs(self.textEncodingSession().inputInfo(), self.config.max_length);
         const encoded = try a.alloc(EncodeResult, texts.len);
@@ -601,10 +601,12 @@ pub const EmbeddingPipeline = struct {
                 return if (rows[lhs] == rows[rhs]) lhs < rhs else rows[lhs] < rows[rhs];
             }
         }.less);
-        const vectors = try a.alloc([]f32, texts.len);
-        errdefer a.free(vectors);
+        const vectors: ?[][]f32 = if (task_output == null) try a.alloc([]f32, texts.len) else null;
+        errdefer if (vectors) |rows| a.free(rows);
         var cursor: usize = 0;
-        errdefer for (order[0..cursor]) |i| a.free(vectors[i]);
+        errdefer if (vectors) |rows| {
+            for (order[0..cursor]) |i| a.free(rows[i]);
+        };
         while (cursor < order.len) {
             var sorted_lengths: [4]usize = undefined;
             const candidates = @min(@as(usize, 4), order.len - cursor);
@@ -633,22 +635,33 @@ pub const EmbeddingPipeline = struct {
                     }
                 }
                 var denied_before_dispatch = false;
-                const result = self.embedTokenizedResult(ids, mask, count, seq, false, .{}, task_output, &denied_before_dispatch) catch |err| {
+                var cohort_task: ?GemmaTaskHostOutput = if (task_output) |task| task.* else null;
+                if (cohort_task) |*task| task.order = order[cursor..][0..count];
+                const result = self.embedTokenizedResult(ids, mask, count, seq, false, .{}, if (cohort_task) |*task| task else null, &denied_before_dispatch) catch |err| {
                     if (denied_before_dispatch and count > 1 and (err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable)) {
                         count = (count + 1) / 2;
                         continue;
                     }
                     return err;
                 };
-                defer a.free(result);
-                for (order[cursor..][0..count], result) |i, vector| vectors[i] = vector;
+                switch (result) {
+                    .rows => |rows| {
+                        defer a.free(rows);
+                        if (vectors == null or rows.len != count) {
+                            for (rows) |row| a.free(row);
+                            return error.UnexpectedOutputShape;
+                        }
+                        for (order[cursor..][0..count], rows) |i, vector| vectors.?[i] = vector;
+                    },
+                    .task_committed => |written| if (vectors != null or written != count) return error.UnexpectedOutputShape,
+                }
                 if (self.trace) |trace| trace.shape(sorted_lengths[0..count], count, seq);
                 if (self.batch_observation) |observation| observation.record(count);
                 cursor += count;
                 break;
             }
         }
-        return vectors;
+        return if (vectors) |rows| .{ .rows = rows } else .{ .task_committed = texts.len };
     }
 
     fn embedUnscoped(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
@@ -856,7 +869,9 @@ pub const EmbeddingPipeline = struct {
             source.leaveExecution();
             self.execution_gate_held = false;
         }
-        const embeddings = try self.embedPreparedTextInputs(&inputs, mask_i32, prepared.input_ids, 1, prepared.sequence, permit, &projection_shell, .{ .boundary = source.epoch() }, &projection_execution, .{ .prepared = &source }, null);
+        var prepared_rows = try self.embedPreparedTextInputs(&inputs, mask_i32, prepared.input_ids, 1, prepared.sequence, permit, &projection_shell, .{ .boundary = source.epoch() }, &projection_execution, .{ .prepared = &source }, null);
+        defer prepared_rows.deinit(allocator);
+        const embeddings = try prepared_rows.materialize(self);
         defer allocator.free(embeddings);
         if (embeddings.len != 1) {
             for (embeddings) |embedding| allocator.free(embedding);
@@ -947,6 +962,7 @@ pub const EmbeddingPipeline = struct {
         while (cursor < texts.len) {
             if (self.execution_control) |control| try control.check();
             const count = if (windowed) @min(@as(usize, 4), texts.len - cursor) else texts.len;
+            task_output.row_base = cursor;
             // SAME original public window boundary, allocator and length-bucket
             // body. Do not sort or compact across another raw window's rows.
             {
@@ -961,16 +977,19 @@ pub const EmbeddingPipeline = struct {
                 scoped.allocator = bounded.allocator();
                 scoped.gemma_workspace = &admitted;
                 scoped.last_input_tokens = 0;
-                const vectors = (if (self.session.backend() == .cuda)
+                const result = (if (self.session.backend() == .cuda)
                     scoped.embedWithBatchPlanWithTaskOutput(texts[cursor..][0..count], .{ .batch_size = 1, .pad_final_batch = false }, &task_output)
                 else
                     scoped.embedGemma2TextsWithTaskOutput(texts[cursor..][0..count], &task_output)) catch |err| {
                     return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else if (err == error.OutOfMemory) admitted.admission_error orelse err else err;
                 };
-                defer freeEmbeddingSlices(scoped.allocator, vectors);
-                if (vectors.len != count) return error.UnexpectedOutputShape;
-                const output = if (producer) |*value| value else return error.MissingHostOutputEscrow;
-                for (vectors, 0..) |row, index| try output.writeRow(cursor + index, row);
+                switch (result) {
+                    .task_committed => |written| if (written != count) return error.UnexpectedOutputShape,
+                    .rows => |rows| {
+                        freeEmbeddingSlices(scoped.allocator, rows);
+                        return error.UnexpectedOutputShape;
+                    },
+                }
                 tokens +|= scoped.last_input_tokens;
                 self.last_resident_backend_timing = scoped.last_resident_backend_timing;
             }
@@ -1537,7 +1556,7 @@ pub const EmbeddingPipeline = struct {
     /// the final encoded row. This keeps fixed-batch compatibility from
     /// multiplying tokenizer and prefix-allocation work on short tail batches.
     fn embedDirect(self: *EmbeddingPipeline, texts: []const []const u8, execution_batch: usize) ![][]f32 {
-        return self.embedDirectResult(texts, execution_batch, false, .{}, null);
+        return (try self.embedDirectResult(texts, execution_batch, false, .{}, null)).requireRows();
     }
 
     fn embedDirectResult(
@@ -1547,7 +1566,7 @@ pub const EmbeddingPipeline = struct {
         comptime owned: bool,
         consumer_cleanup: CleanupContext,
         task_output: ?*GemmaTaskHostOutput,
-    ) anyerror!(if (owned) session_mod.OwnedHostVectors else [][]f32) {
+    ) anyerror!(if (owned) session_mod.OwnedHostVectors else TextOutput) {
         if (self.execution_control) |control| try control.check();
         try self.validateQwenWorkspaceAdmission();
         if (texts.len == 0 or execution_batch < texts.len) return error.InvalidInputShape;
@@ -1640,7 +1659,7 @@ pub const EmbeddingPipeline = struct {
                 .input_bytes = text_plan.input_bytes,
                 .host_preprocess_bytes = text_plan.temporary_bytes,
                 .output_bytes = if (owned) try session_mod.PreparedSource.hostOutputRequestBytes(texts.len, output_width) else null,
-            }, task_geometry, owned) catch |err| {
+            }, task_geometry, owned, true) catch |err| {
                 if (err == error.WorkspaceReceiptChangedBeforeExecution and source.canRetryBeforeExecution()) continue;
                 return err;
             };
@@ -1708,7 +1727,7 @@ pub const EmbeddingPipeline = struct {
                 self.execution_gate_held = false;
             }
             var pre_entry_refusal = false;
-            const vectors = self.embedPreparedTextInputs(
+            var vectors = self.embedPreparedTextInputs(
                 input_set.slice(),
                 all_mask,
                 ids_i64,
@@ -1724,24 +1743,23 @@ pub const EmbeddingPipeline = struct {
                 if (err == error.WorkspaceReceiptChangedBeforeExecution and pre_entry_refusal) continue;
                 return err;
             };
+            defer vectors.deinit(alloc);
+            if (vectors.count() != execution_batch) return error.UnexpectedOutputShape;
+            // Final host bytes go straight into the independently funded bank
+            // while their Tensor allocator and the actual Source B are live.
+            const result = try self.finishPreparedTextRows(&vectors, &source, texts.len, task_output, owned);
             for (all_mask[0 .. texts.len * effective_len]) |valid| if (valid != 0) {
                 self.last_input_tokens +|= 1;
             };
             if (self.batch_observation) |observation| observation.record(texts.len);
-            if (owned) {
-                defer freeEmbeddingSlices(alloc, vectors);
-                if (vectors.len != execution_batch) return error.UnexpectedOutputShape;
-                // Preserve padded execution shape; only real caller rows escape.
-                return source.publishHostOutputs(vectors[0..texts.len]);
-            }
-            return vectors;
+            return result;
         }
         return error.ResourceTemporarilyUnavailable;
     }
 
     /// Benchmark-facing encoder contract without tokenization or model load.
     pub fn embedTokenized(self: *EmbeddingPipeline, input_ids: []const i64, attention_mask: []const i64, batch: usize, seq_len: usize) ![][]f32 {
-        return self.embedTokenizedResult(input_ids, attention_mask, batch, seq_len, false, .{}, null, null);
+        return (try self.embedTokenizedResult(input_ids, attention_mask, batch, seq_len, false, .{}, null, null)).requireRows();
     }
 
     /// One exact tokenized cohort, with original-run-funded final backing.
@@ -1770,10 +1788,124 @@ pub const EmbeddingPipeline = struct {
         return @import("../execution/architecture_session.zig").pooledEmbeddingOutputWidth(final_session) orelse error.UnsupportedOwnedOutputGeometry;
     }
 
+    const TextOutput = union(enum) {
+        rows: [][]f32,
+        task_committed: usize,
+        fn requireRows(self: @This()) ![][]f32 {
+            return switch (self) {
+                .rows => |rows| rows,
+                .task_committed => error.UnexpectedTaskOutput,
+            };
+        }
+    };
+    const PreparedTextRows = union(enum) {
+        rows: [][]f32,
+        host_final: struct { tensors: []Tensor, batch: usize, physical_width: usize, width: usize, encoder_start: u128 },
+        consumed,
+        fn count(self: @This()) usize {
+            return switch (self) {
+                .rows => |rows| rows.len,
+                .host_final => |host| host.batch,
+                .consumed => 0,
+            };
+        }
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .rows => |rows| freeEmbeddingSlices(allocator, rows),
+                .host_final => |host| {
+                    for (host.tensors) |*tensor| tensor.deinit();
+                    allocator.free(host.tensors);
+                },
+                .consumed => {},
+            }
+            self.* = .consumed;
+        }
+        fn materialize(self: *@This(), pipeline: *EmbeddingPipeline) ![][]f32 {
+            return switch (self.*) {
+                .rows => |rows| blk: {
+                    self.* = .consumed;
+                    break :blk rows;
+                },
+                .host_final => |host| blk: {
+                    const started = if (pipeline.trace != null) embedding_trace.now() else 0;
+                    defer if (pipeline.trace) |trace| {
+                        trace.execute_pool_normalize_ns += embedding_trace.now() -| started;
+                    };
+                    const rows = try pipeline.copyPooledTextRows(host.tensors[0].asFloat32(), host.batch, host.physical_width, host.width);
+                    self.recordSuccess(pipeline);
+                    break :blk rows;
+                },
+                .consumed => error.TextOutputConsumed,
+            };
+        }
+        fn recordSuccess(self: *const @This(), pipeline: *EmbeddingPipeline) void {
+            switch (self.*) {
+                .host_final => |host| {
+                    pipeline.last_resident_backend_timing = null;
+                    if (pipeline.session.invocation_diagnostics) |binding| if (binding.stable_backend) |backend| {
+                        pipeline.last_resident_backend_timing = @import("../execution/metadata_sample.zig").snapshot(&backend);
+                    };
+                    logEmbedTiming("text.encoder.pool_normalize.host_final", host.batch, host.encoder_start);
+                    pipeline.recordResidentProjection(.text, .success, "text.encoder.pool_normalize.host_final", host.batch, null);
+                },
+                else => {},
+            }
+        }
+        fn fill(self: *const @This(), pipeline: *EmbeddingPipeline, producer: *session_mod.HostOutputProducer, local: usize, destination: usize) !void {
+            switch (self.*) {
+                .rows => |rows| try producer.writeRow(destination, rows[local]),
+                .host_final => |host| {
+                    const Fill = struct {
+                        pipeline: *EmbeddingPipeline,
+                        values: []const f32,
+                        physical_width: usize,
+                        fn run(context: @This(), target: []f32) !void {
+                            try context.pipeline.copyPooledTextRow(context.values, target, context.physical_width);
+                        }
+                    };
+                    try producer.fillRow(destination, host.width, Fill{ .pipeline = pipeline, .values = host.tensors[0].asFloat32()[local * host.physical_width ..][0..host.physical_width], .physical_width = host.physical_width }, Fill.run);
+                },
+                .consumed => return error.TextOutputConsumed,
+            }
+        }
+    };
+
+    fn finishPreparedTextRows(self: *EmbeddingPipeline, rows: *PreparedTextRows, source: *session_mod.PreparedSource, count: usize, task: ?*GemmaTaskHostOutput, comptime owned: bool) !(if (owned) session_mod.OwnedHostVectors else TextOutput) {
+        if (rows.count() < count) return error.UnexpectedOutputShape;
+        try source.validateHostOutputConsumption();
+        const time_fill = std.meta.activeTag(rows.*) == .host_final and (owned or task != null);
+        const fill_started = if (time_fill and self.trace != null) embedding_trace.now() else 0;
+        defer if (time_fill) {
+            if (self.trace) |trace| trace.execute_pool_normalize_ns += embedding_trace.now() -| fill_started;
+        };
+        if (owned) {
+            const sink = try source.hostOutputSink();
+            for (0..count) |index| try rows.fill(self, sink, index, index);
+            const outputs = try sink.publish();
+            rows.recordSuccess(self);
+            return outputs;
+        } else {
+            if (task) |output| {
+                const sink = if (output.producer.*) |*value| value else return error.MissingHostOutputEscrow;
+                for (0..count) |index| {
+                    const relative = if (output.order) |order| if (index < order.len) order[index] else return error.InvalidHostOutputGeometry else index;
+                    const destination = try std.math.add(usize, output.row_base, relative);
+                    if (destination >= output.rows) return error.InvalidHostOutputGeometry;
+                    try rows.fill(self, sink, index, destination);
+                }
+                rows.recordSuccess(self);
+                return .{ .task_committed = count };
+            }
+            return .{ .rows = try rows.materialize(self) };
+        }
+    }
+
     const GemmaTaskHostOutput = struct {
         producer: *?session_mod.HostOutputProducer,
         rows: usize,
         width: usize,
+        row_base: usize = 0,
+        order: ?[]const usize = null,
     };
 
     fn embedTokenizedResult(
@@ -1786,7 +1918,7 @@ pub const EmbeddingPipeline = struct {
         consumer_cleanup: CleanupContext,
         task_output: ?*GemmaTaskHostOutput,
         denied_before_dispatch: ?*bool,
-    ) anyerror!(if (owned) session_mod.OwnedHostVectors else [][]f32) {
+    ) anyerror!(if (owned) session_mod.OwnedHostVectors else TextOutput) {
         var dispatch_started = false;
         if (denied_before_dispatch) |flag| flag.* = false;
         errdefer if (denied_before_dispatch) |flag| {
@@ -1876,7 +2008,7 @@ pub const EmbeddingPipeline = struct {
                     try @import("embedding_gemma2.zig").textEncoderWorkspace(if (compact_policy) active_rows else total)
                 else
                     0,
-            }, task_geometry, owned) catch |err| {
+            }, task_geometry, owned, false) catch |err| {
                 if (err == error.WorkspaceReceiptChangedBeforeExecution and source.canRetryBeforeExecution()) continue;
                 return err;
             };
@@ -1912,17 +2044,13 @@ pub const EmbeddingPipeline = struct {
                 self.execution_gate_held = false;
             }
             var pre_entry_refusal = false;
-            const vectors = self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, active_permit, &projection_shell, .{ .boundary = source.epoch() }, &projection_execution, .{ .prepared = &source }, &pre_entry_refusal) catch |err| {
+            var vectors = self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, active_permit, &projection_shell, .{ .boundary = source.epoch() }, &projection_execution, .{ .prepared = &source }, &pre_entry_refusal) catch |err| {
                 if (err == error.WorkspaceReceiptChangedBeforeExecution and pre_entry_refusal) continue;
                 return err;
             };
-            if (owned) {
-                // Reclaim every temporary row BEFORE source cleanup retires its
-                // original run. The returned backing is independently owned.
-                defer freeEmbeddingSlices(alloc, vectors);
-                return source.publishHostOutputs(vectors);
-            }
-            return vectors;
+            defer vectors.deinit(alloc);
+            if (vectors.count() != batch) return error.UnexpectedOutputShape;
+            return self.finishPreparedTextRows(&vectors, &source, batch, task_output, owned);
         }
         return error.ResourceTemporarilyUnavailable;
     }
@@ -1953,15 +2081,15 @@ pub const EmbeddingPipeline = struct {
         return if (residentQwen3EmbeddingEligible(session, cfg, self.config)) .resident_transient else .host;
     }
 
-    fn prepareTextSourceWithTaskOutput(self: *EmbeddingPipeline, source: *session_mod.PreparedSource, session: session_mod.Session, shapes: session_mod.ShapeInputs, request: session_mod.RunRequest, task_output: ?session_mod.RunPermit.HostOutputGeometry, comptime owned: bool) !void {
+    fn prepareTextSourceWithTaskOutput(self: *EmbeddingPipeline, source: *session_mod.PreparedSource, session: session_mod.Session, shapes: session_mod.ShapeInputs, request: session_mod.RunRequest, task_output: ?session_mod.RunPermit.HostOutputGeometry, comptime owned: bool, comptime input_packet_pending: bool) !void {
         // Metal prepayment is for the SAME direct preparedTexts constructor
         // below. Other raw resident/projection modes preserve their original
         // owner/dispatch contract; Native's existing prepaid routes are intact.
         const direct_metal = session.backend() == .metal and self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and self.text_projection == null;
-        const direct_cuda_owned = (owned or task_output != null) and session.backend() == .cuda and self.gemmaOwnedTextEligible();
+        const direct_cuda_host = session.backend() == .cuda and self.gemmaOwnedTextEligible();
         // Only the original protected HOST class becomes allocator capacity;
         // backend scratch/KV/weights and final-bank credit stay independent.
-        const workspace = if ((session.backend() == .native or direct_metal or direct_cuda_owned) and !session.preparesInvocation()) self.gemma_workspace else null;
+        const workspace = if ((session.backend() == .native or direct_metal or direct_cuda_host) and !session.preparesInvocation()) self.gemma_workspace else null;
         const cfg = session_factory.getEmbeddingGemma2Config(session);
         if (workspace != null and cfg == null) return error.InvalidAdmissionLeaseReduction;
         if (cfg) |gemma| {
@@ -1973,6 +2101,13 @@ pub const EmbeddingPipeline = struct {
                     // independent of the additionally declared task bank.
                     const rows = try std.math.mul(usize, request.batch, width);
                     planned.output_bytes = @max(planned.output_bytes orelse 0, try std.math.mul(usize, rows, @sizeOf(f32)));
+                    if (!owned and task_output == null and direct_cuda_host) {
+                        const admitted = workspace != null;
+                        const producer: session_mod.HostOutputProducer.RawF32Producer = if (session.model_contract.normalized_text_host_output_width != null) .host_tensor else .resident_tensor;
+                        var future = try session_mod.HostOutputProducer.rawF32CopyHostBytes(request.batch, width, self.config.embedding_gemma2_dimensions, producer, admitted);
+                        if (input_packet_pending) future = try std.math.add(usize, future, try text_inputs.copiedTokenPacketHostBytes(request.batch, request.sequence, admitted));
+                        try @import("../backends/admitted_allocator.zig").AdmittedAllocator.declareRunHostAllocations(session, &planned, future, admitted);
+                    }
                 }
             }
             if (workspace != null and session.backend() == .native) {
@@ -2024,7 +2159,7 @@ pub const EmbeddingPipeline = struct {
         projection_execution: *?session_mod.RunPermit,
         source_cohort: ?TextSourceCohort,
         pre_entry_refusal: ?*bool,
-    ) ![][]f32 {
+    ) !PreparedTextRows {
         if (self.usesResidentTextOutputs() and cleanup.boundary == null) return error.MissingCurrentCleanupEpoch;
         const alloc = self.allocator;
         var own_projection_shell: ?@import("../execution/resource_retirement.zig").PreparedCharge = null;
@@ -2125,7 +2260,7 @@ pub const EmbeddingPipeline = struct {
                 };
                 self.last_resident_backend_timing = managed.backend.debugTimingSnapshot();
                 self.recordResidentProjection(.text, .success, "text.embeddinggemma2.pool_normalize.resident", batch, null);
-                return embeddings;
+                return .{ .rows = embeddings };
             }
         }
 
@@ -2142,17 +2277,18 @@ pub const EmbeddingPipeline = struct {
                 projection_execution,
                 source_cohort,
             )) |resident_embeddings| {
-                return resident_embeddings;
+                return .{ .rows = resident_embeddings };
             }
         } else if (self.residentTextEncoderEnabled()) {
+            if (try self.tryEmbedTextHostFinal(inputs, batch, run_permit)) |host| return host;
             if (try self.tryEmbedTextResidentEncoder(inputs, all_mask, batch, effective_len, run_permit, cleanup)) |resident_embeddings| {
-                return resident_embeddings;
+                return .{ .rows = resident_embeddings };
             }
         } else if (try self.tryEmbedTextResidentQwen3(all_mask, ids_i64, batch, effective_len, cleanup, if (source_cohort) |selected| switch (selected) {
             .prepared => |owner| try owner.existingWorkspaceReceipt(),
             .legacy => null,
         } else null, pre_entry_refusal)) |resident_embeddings| {
-            return resident_embeddings;
+            return .{ .rows = resident_embeddings };
         }
 
         // Run inference
@@ -2175,7 +2311,7 @@ pub const EmbeddingPipeline = struct {
             } else try run_permit.attachHostOutputs(outputs, alloc);
             if (source_cohort == null or std.meta.activeTag(source_cohort.?) == .legacy) run_permit.deinitWithCleanup(cleanup);
         }
-        return self.finishTextHostOutputs(outputs, all_mask, batch, effective_len);
+        return .{ .rows = try self.finishTextHostOutputs(outputs, all_mask, batch, effective_len) };
     }
 
     /// Host rows are already owned by this allocator. Preserve full-width
@@ -2262,49 +2398,53 @@ pub const EmbeddingPipeline = struct {
         texts: []const []const u8,
         plan: TextSessionBatchPlan,
     ) anyerror![][]f32 {
-        return self.embedWithBatchPlanWithTaskOutput(texts, plan, null);
+        return (try self.embedWithBatchPlanWithTaskOutput(texts, plan, null)).requireRows();
     }
     fn embedWithBatchPlanWithTaskOutput(
         self: *EmbeddingPipeline,
         texts: []const []const u8,
         plan: TextSessionBatchPlan,
         task_output: ?*GemmaTaskHostOutput,
-    ) anyerror![][]f32 {
+    ) anyerror!TextOutput {
         if (plan.batch_size == 0) return error.InvalidInputShape;
-        const embeddings = try self.allocator.alloc([]f32, texts.len);
+        const embeddings: ?[][]f32 = if (task_output == null) try self.allocator.alloc([]f32, texts.len) else null;
         var initialized: usize = 0;
-        errdefer {
-            for (embeddings[0..initialized]) |embedding| self.allocator.free(embedding);
-            self.allocator.free(embeddings);
-        }
+        errdefer if (embeddings) |rows| {
+            for (rows[0..initialized]) |embedding| self.allocator.free(embedding);
+            self.allocator.free(rows);
+        };
 
         var offset: usize = 0;
         while (offset < texts.len) {
             if (self.execution_control) |control| try control.check();
             const real_count = @min(plan.batch_size, texts.len - offset);
             if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
-            const batch_embeddings = try self.embedDirectResult(
+            var cohort_task: ?GemmaTaskHostOutput = if (task_output) |task| task.* else null;
+            if (cohort_task) |*task| task.row_base = try std.math.add(usize, task.row_base, offset);
+            const batch_result = try self.embedDirectResult(
                 texts[offset .. offset + real_count],
                 plan.batch_size,
                 false,
                 .{},
-                task_output,
+                if (cohort_task) |*task| task else null,
             );
-            if (batch_embeddings.len != plan.batch_size) {
-                freeEmbeddingSlices(self.allocator, batch_embeddings);
-                return error.UnexpectedOutputShape;
+            switch (batch_result) {
+                .rows => |batch_embeddings| {
+                    if (embeddings == null or batch_embeddings.len != plan.batch_size) {
+                        freeEmbeddingSlices(self.allocator, batch_embeddings);
+                        return error.UnexpectedOutputShape;
+                    }
+                    for (batch_embeddings[0..real_count], 0..) |embedding, index| embeddings.?[offset + index] = embedding;
+                    for (batch_embeddings[real_count..]) |embedding| self.allocator.free(embedding);
+                    self.allocator.free(batch_embeddings);
+                },
+                .task_committed => |written| if (embeddings != null or written != real_count) return error.UnexpectedOutputShape,
             }
-
-            for (batch_embeddings[0..real_count], 0..) |embedding, index| {
-                embeddings[offset + index] = embedding;
-            }
-            for (batch_embeddings[real_count..]) |embedding| self.allocator.free(embedding);
-            self.allocator.free(batch_embeddings);
             initialized += real_count;
             offset += real_count;
         }
 
-        return embeddings;
+        return if (embeddings) |rows| .{ .rows = rows } else .{ .task_committed = texts.len };
     }
 
     fn activeTokenLength(mask: []const i32) usize {
@@ -4216,6 +4356,36 @@ pub const EmbeddingPipeline = struct {
         return embeddings;
     }
 
+    /// Owns the original public host Tensor packet until its synchronous
+    /// consumer finishes under the same Source B. No resident wrapper/replay.
+    fn tryEmbedTextHostFinal(self: *EmbeddingPipeline, inputs: []const Tensor, batch: usize, permit: *session_mod.RunPermit) !?PreparedTextRows {
+        if (self.config.pooling != .mean) return null;
+        const encoder_start = embedTimingStart(self.print_timing);
+        if (self.session.model_contract.normalized_text_host_output_width) |width| {
+            if (width == 0) return error.UnexpectedOutputShape;
+            const rows = std.math.cast(i64, batch) orelse return error.ShapeMismatch;
+            const columns = std.math.cast(i64, width) orelse return error.ShapeMismatch;
+            const bytes = try std.math.mul(usize, try std.math.mul(usize, batch, width), @sizeOf(f32));
+            const requested = if (self.text_projection == null and @import("../execution/architecture_session.zig").gemmaCudaOwnedTextWidth(self.session) != null)
+                self.config.embedding_gemma2_dimensions
+            else
+                null;
+            const output_width = requested orelse width;
+            if (output_width == 0 or output_width > width) return error.ShapeMismatch;
+            // This is the SAME admitted Source and original host producer;
+            // intermediate encoder work remains on its selected backend.
+            const outputs = try permit.runWithControl(inputs, self.allocator, self.execution_control);
+            errdefer {
+                for (outputs) |*output| output.deinit();
+                self.allocator.free(outputs);
+            }
+            if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 2) return error.UnexpectedOutputShape;
+            if (outputs[0].shape[0] != rows or outputs[0].shape[1] != columns or outputs[0].data.len != bytes) return error.ShapeMismatch;
+            return .{ .host_final = .{ .tensors = outputs, .batch = batch, .physical_width = width, .width = output_width, .encoder_start = encoder_start } };
+        }
+        return null;
+    }
+
     fn tryEmbedTextResidentEncoder(
         self: *EmbeddingPipeline,
         inputs: []const Tensor,
@@ -4227,33 +4397,6 @@ pub const EmbeddingPipeline = struct {
     ) !?[][]f32 {
         const encoder_start = embedTimingStart(self.print_timing);
         if (self.config.pooling == .mean) {
-            if (self.session.model_contract.normalized_text_host_output_width) |width| {
-                if (width == 0) return error.UnexpectedOutputShape;
-                const rows = std.math.cast(i64, batch) orelse return error.ShapeMismatch;
-                const columns = std.math.cast(i64, width) orelse return error.ShapeMismatch;
-                const bytes = try std.math.mul(usize, try std.math.mul(usize, batch, width), @sizeOf(f32));
-                // This is the SAME admitted Source and original host producer;
-                // intermediate encoder work remains on its selected backend.
-                const outputs = try permit.runWithControl(inputs, self.allocator, self.execution_control);
-                defer {
-                    for (outputs) |*output| output.deinit();
-                    self.allocator.free(outputs);
-                }
-                if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 2) return error.UnexpectedOutputShape;
-                if (outputs[0].shape[0] != rows or outputs[0].shape[1] != columns or outputs[0].data.len != bytes) return error.ShapeMismatch;
-                const requested = if (self.text_projection == null and @import("../execution/architecture_session.zig").gemmaCudaOwnedTextWidth(self.session) != null)
-                    self.config.embedding_gemma2_dimensions
-                else
-                    null;
-                const embeddings = try self.copyPooledTextRows(outputs[0].asFloat32(), batch, width, requested);
-                self.last_resident_backend_timing = null;
-                if (self.session.invocation_diagnostics) |binding| if (binding.stable_backend) |backend| {
-                    self.last_resident_backend_timing = @import("../execution/metadata_sample.zig").snapshot(&backend);
-                };
-                logEmbedTiming("text.encoder.pool_normalize.host_final", batch, encoder_start);
-                self.recordResidentProjection(.text, .success, "text.encoder.pool_normalize.host_final", batch, null);
-                return embeddings;
-            }
             if (try permit.runResidentTextEmbeddingWithControl(inputs, .{
                 .pooling = .mean,
                 .normalize = self.config.normalize,
@@ -4552,16 +4695,20 @@ pub const EmbeddingPipeline = struct {
 
         for (0..batch) |b| {
             const embedding = try self.allocator.alloc(f32, output_width);
-            @memcpy(embedding, data[b * proj_dim ..][0..output_width]);
-            // Default full-width output is byte-identical. Reduced Gemma
-            // dimensions use the existing host normalizer on the F32 prefix.
-            if (output_width != proj_dim and (self.config.normalize or self.config.resident_embedding_gemma2)) linalg.l2Normalize(embedding, output_width);
             embeddings[b] = embedding;
             initialized += 1;
-            if (self.config.resident_embedding_gemma2) try validateEmbeddingGemma2Vector(embedding);
+            try self.copyPooledTextRow(data[b * proj_dim ..][0..proj_dim], embedding, proj_dim);
         }
 
         return embeddings;
+    }
+
+    fn copyPooledTextRow(self: *EmbeddingPipeline, data: []const f32, target: []f32, physical_width: usize) !void {
+        @memcpy(target, data[0..target.len]);
+        // Keep the original F32 prefix then L2 order for both allocated raw
+        // rows and the final escrow. Full width is never normalized twice.
+        if (target.len != physical_width and (self.config.normalize or self.config.resident_embedding_gemma2)) linalg.l2Normalize(target, target.len);
+        if (self.config.resident_embedding_gemma2) try validateEmbeddingGemma2Vector(target);
     }
 
     fn extractVision3D(self: *EmbeddingPipeline, output: *const Tensor, batch: usize, normalize: bool) ![][]f32 {
@@ -9792,6 +9939,11 @@ test "declared normalized host text producer keeps original bytes rejects malfor
         }
         fn close(_: *anyopaque) void {}
         const table: session_mod.Session.VTable = .{ .run = run, .runWithControl = controlled, .runResidentTextEmbeddingWithControl = resident, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+        fn produce(pipeline: *EmbeddingPipeline, permit: *session_mod.RunPermit) !?[][]f32 {
+            var value = (try pipeline.tryEmbedTextHostFinal(&.{}, 2, permit)) orelse return pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, permit, .{});
+            defer value.deinit(pipeline.allocator);
+            return try value.materialize(pipeline);
+        }
         fn check(allocator: std.mem.Allocator) !void {
             var probe = @This(){};
             const session = session_mod.Session{ .ptr = &probe, .vtable = &table, .model_contract = .{ .normalized_text_host_output_width = 2 } };
@@ -9800,7 +9952,7 @@ test "declared normalized host text producer keeps original bytes rejects malfor
             var pipeline = EmbeddingPipeline.init(allocator, session, undefined, .{ .resident_text_encoder = true, .pooling = .mean, .normalize = true });
             pipeline.execution_control = .{ .native_call_policy = .in_process };
             pipeline.last_resident_backend_timing = .{};
-            const rows = (try pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{})) orelse return error.MissingFinalHostRows;
+            const rows = (try @This().produce(&pipeline, &permit)) orelse return error.MissingFinalHostRows;
             defer freeEmbeddingSlices(allocator, rows);
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@as([]const f32, &.{ 0.6, 0.8 })), std.mem.sliceAsBytes(rows[0]));
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@as([]const f32, &.{ 0.0, 0.99999 })), std.mem.sliceAsBytes(rows[1]));
@@ -9817,15 +9969,43 @@ test "declared normalized host text producer keeps original bytes rejects malfor
     defer permit.deinit();
     var pipeline = EmbeddingPipeline.init(std.testing.allocator, session, undefined, .{ .resident_text_encoder = true, .pooling = .mean, .normalize = false });
     pipeline.execution_control = .{ .native_call_policy = .in_process };
-    const rows = (try pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{})) orelse return error.MissingFinalHostRows;
+    const rows = (try Probe.produce(&pipeline, &permit)) orelse return error.MissingFinalHostRows;
     defer freeEmbeddingSlices(std.testing.allocator, rows);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@as([]const f32, &.{ 0.0, 0.99999 })), std.mem.sliceAsBytes(rows[1]));
+    // Compare the direct final bank with the original raw prefix/F32 math.
+    // The bank is real cold escrow; no numerical Source is fabricated here.
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    inline for (.{ false, true }) |normalize| {
+        pipeline.config.normalize = normalize;
+        var final_rows = (try pipeline.tryEmbedTextHostFinal(&.{}, 2, &permit)) orelse return error.MissingFinalHostRows;
+        defer final_rows.deinit(std.testing.allocator);
+        final_rows.host_final.width = 1;
+        const expected = try pipeline.copyPooledTextRows(final_rows.host_final.tensors[0].asFloat32(), 2, 2, 1);
+        defer freeEmbeddingSlices(std.testing.allocator, expected);
+        var lease = try domain.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 65536 }, false);
+        defer lease.release();
+        var producer = try session_mod.HostOutputProducer.prepare(&lease, &pin, 2, 1);
+        defer {
+            producer.abortWithCleanup(.{ .outside_execution = true }) catch unreachable;
+            producer.finishOutsideExecution();
+        }
+        try final_rows.fill(&pipeline, &producer, 0, 1);
+        try final_rows.fill(&pipeline, &producer, 1, 0);
+        var output = try producer.publish();
+        defer output.deinitOutsideExecution();
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected[0]), std.mem.sliceAsBytes(output.values(1)));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected[1]), std.mem.sliceAsBytes(output.values(0)));
+    }
     probe.mode = .malformed;
-    try std.testing.expectError(error.ShapeMismatch, pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{}));
+    try std.testing.expectError(error.ShapeMismatch, Probe.produce(&pipeline, &permit));
     probe.mode = .fail;
-    try std.testing.expectError(error.FinalHostProducerFailed, pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{}));
+    try std.testing.expectError(error.FinalHostProducerFailed, Probe.produce(&pipeline, &permit));
     try std.testing.expectEqual(@as(usize, 0), probe.residents);
     pipeline.session.model_contract.normalized_text_host_output_width = null;
-    try std.testing.expectError(error.UnexpectedFinalHostResidentWrap, pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{}));
+    try std.testing.expectError(error.UnexpectedFinalHostResidentWrap, Probe.produce(&pipeline, &permit));
     try std.testing.expectEqual(@as(usize, 1), probe.residents);
 }

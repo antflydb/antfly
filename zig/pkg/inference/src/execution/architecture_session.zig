@@ -6912,9 +6912,14 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
                     resident.outputDim(),
                     control,
                 ) else return error.CudaNotEnabled;
-                defer allocator.free(values);
+                var owns_values = true;
+                defer if (owns_values) allocator.free(values);
                 try validateEmbeddingGemma2Output(values, request.batch, resident.outputDim());
-                var tensor = try Tensor.initFloat32(allocator, "sentence_embedding", &.{ @intCast(request.batch), @intCast(resident.outputDim()) }, values);
+                // The synchronous producer already owns the final host F32
+                // backing. Transfer it without a second live vector copy;
+                // Source's protected output floor remains authoritative.
+                var tensor = try Tensor.initFloat32Owned(allocator, "sentence_embedding", &.{ @intCast(request.batch), @intCast(resident.outputDim()) }, values);
+                owns_values = false;
                 errdefer tensor.deinit();
                 const outputs = try allocator.alloc(Tensor, 1);
                 outputs[0] = tensor;

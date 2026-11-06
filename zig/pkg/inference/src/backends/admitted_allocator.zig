@@ -47,7 +47,25 @@ pub const AdmittedAllocator = struct {
     /// through this allocator and its existing prepaid RunScope node. This is
     /// disjoint from every original host/device/output requirement.
     pub fn constructionHostBytes(bytes: usize, alignment: std.mem.Alignment) !usize {
-        return try std.math.add(usize, try std.math.add(usize, bytes, allocationOverhead(alignment)), @sizeOf(Reservation));
+        return try std.math.add(usize, try allocationHostBytes(bytes, alignment), @sizeOf(Reservation));
+    }
+
+    /// Physical payload plus this allocator's real tracking header only.
+    /// RunScope/Reservation metadata is accounted once by its own owner.
+    pub fn allocationHostBytes(bytes: usize, alignment: std.mem.Alignment) !usize {
+        return std.math.add(usize, bytes, allocationOverhead(alignment)) catch error.ResourceLimitExceeded;
+    }
+
+    /// Declare exact future host allocations without acquiring or lending
+    /// quota. The existing Source cold path remains the sole admission owner.
+    /// A bound allocator's actual trim funds its current live bytes separately;
+    /// this Source must fund every future producer and its one RunScope node.
+    pub fn declareRunHostAllocations(session: sessions.Session, request: *sessions.RunRequest, future_bytes: usize, allocator_bound: bool) !void {
+        const admission = session.run_admission orelse return;
+        const required = std.math.add(usize, future_bytes, if (allocator_bound) @sizeOf(Reservation) else 0) catch return error.ResourceLimitExceeded;
+        const original = try admission.planRequest(request.*, session.outputInfo());
+        const extra = required -| original.protected.host_scratch_bytes;
+        request.host_preprocess_bytes = std.math.add(usize, request.host_preprocess_bytes, extra) catch return error.ResourceLimitExceeded;
     }
 
     const allocator_vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
@@ -269,12 +287,13 @@ pub const AdmittedAllocator = struct {
         if (amounts.host_scratch_bytes < @sizeOf(Reservation)) return .{ .permit = try admitTaskRequest(session, request, task_output) };
         if (task_output) |output| amounts.host_scratch_bytes = try std.math.add(usize, amounts.host_scratch_bytes, try output.freshBytes());
         try self.trim();
-        try admission.validateOwnedHostScratch(std.math.add(usize, self.reserved_bytes, amounts.host_scratch_bytes) catch return error.ResourceLimitExceeded);
-        if (task_output) |output| {
-            var owned = amounts;
-            owned.host_scratch_bytes = try std.math.add(usize, owned.host_scratch_bytes, self.reserved_bytes);
-            try output.validateHeld(session, owned);
-        }
+        // Use the ACTUAL post-trim owner, not a caller's preview or old chunk
+        // slack. Mandatory producers belong to this SAME six-class request;
+        // intrinsic combined denial must precede any controller acquisition.
+        var owned = amounts;
+        owned.host_scratch_bytes = std.math.add(usize, owned.host_scratch_bytes, self.reserved_bytes) catch return error.ResourceLimitExceeded;
+        try admission.validateOwnedRunAmounts(owned);
+        if (task_output) |output| try output.validateHeld(session, owned);
         var permit = try admitTaskRequest(session, request, task_output);
         errdefer permit.deinit();
         // The execution lease covers this node too. Allocate it now so cleanup

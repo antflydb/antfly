@@ -178,6 +178,10 @@ preparation API do not by themselves complete these remaining requirements:
   Producers that already return final normalized host rows declare that output
   contract explicitly; requested host vectors consume the original host ABI
   without uploading them solely to download them through a resident wrapper.
+  Owning consumers write prefixes and normalization directly into their cold
+  output bank. Compatibility row copies declare their exact packet, input and
+  allocator-header overlap before execution; admission checks the complete
+  request against the actual retained allocator owner after trimming.
   `execution/submission.zig` owns command scopes, preserving foreign batches,
   cancelling only owned unsubmitted work and avoiding replay after submission
   errors. Nine generic command callbacks live in `CommandSubmissionRegion`;
