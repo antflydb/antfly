@@ -321,6 +321,8 @@ pub const LoadedReader = union(enum) {
         control: ?InferenceExecutionControl,
     ) !LoadedReader {
         const io = if (control) |active| active.io orelse session_manager.io orelse std.Options.debug_io else session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_path);
+        defer publication_lease.deinit(io);
         if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
         var result = try loadSelectedReader(allocator, model_path, session_manager, model_manager, control);
         errdefer result.deinit();

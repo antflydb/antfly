@@ -569,10 +569,31 @@ test "validated managed receipt cleans up every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_dir});
 }
 
+/// Direct GGUF files belong to the nearest managed installation, including
+/// files reached through symlinks. Preserve the original path for unmanaged
+/// standalone files; callers still fence their own pathname separately.
+pub fn publicationRootAlloc(a: std.mem.Allocator, io: std.Io, model: []const u8) ![]u8 {
+    if (!std.mem.endsWith(u8, model, ".gguf")) return a.dupe(u8, model);
+    const canonical = try resolveRegularFilePath(a, io, model);
+    defer a.free(canonical);
+    var ancestor = std.fs.path.dirname(canonical);
+    while (ancestor) |root| : (ancestor = std.fs.path.dirname(root)) {
+        for ([_][]const u8{ complete_filename, in_progress_filename, plan_filename }) |name| {
+            const path = try managedPath(a, root, name);
+            defer a.free(path);
+            if (try pathPresent(std.Io.Dir.cwd(), io, path)) return a.dupe(u8, root);
+        }
+    }
+    return a.dupe(u8, model);
+}
+
 /// Cheap publication identity for resident sessions and load flights. Receipt
 /// validation still owns artifact integrity; this token binds its source and
 /// artifact manifest to the generation actually loaded, without hashing weights.
-pub fn publicationGeneration(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !?[32]u8 {
+pub fn publicationGeneration(allocator: std.mem.Allocator, io: std.Io, model: []const u8) !?[32]u8 {
+    const owned_root = if (std.mem.endsWith(u8, model, ".gguf")) try publicationRootAlloc(allocator, io, model) else null;
+    defer if (owned_root) |path| allocator.free(path);
+    const root = owned_root orelse model;
     const progress = try managedPath(allocator, root, in_progress_filename);
     defer allocator.free(progress);
     const plan = try managedPath(allocator, root, plan_filename);

@@ -49,6 +49,11 @@ one acquisition while the file identity remains unchanged, then recheck those
 identities before returning the reader. Lazy secondary sessions and GGUF
 projectors retain the owning primary runtime's publication; an update cannot
 combine new components with an older primary.
+Execution metadata and split encoder/decoder readers hold the same construction
+lease. Direct GGUF files and file aliases inherit their owning installation's
+receipt and publication boundary. VAD keeps a bounded cache of idle models;
+requests and streaming sessions retain their selected generation through eviction,
+and resident weights participate in the shared host memory budget.
 
 Traditional ML predictor pulls also resolve one snapshot before downloading,
 including explicit branches or commits:

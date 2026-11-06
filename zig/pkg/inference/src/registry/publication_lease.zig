@@ -59,6 +59,18 @@ pub const Lease = struct {
         if (try immutableSnapshot(a, io, model)) return .{};
         var lease = Lease{ .directory = try sharedParent(io, model), .allocator = a };
         errdefer lease.deinit(io);
+        if (std.mem.endsWith(u8, model, ".gguf")) {
+            const root = try @import("managed_receipt.zig").publicationRootAlloc(a, io, model);
+            defer a.free(root);
+            if (!std.mem.eql(u8, root, model) and !try immutableSnapshot(a, io, root)) {
+                const parent = try sharedParent(io, root);
+                lease.alias_directories.append(a, parent) catch |err| {
+                    file(parent).unlock(io);
+                    parent.close(io);
+                    return err;
+                };
+            }
+        }
         var current = try a.dupe(u8, model);
         defer a.free(current);
         var buffer: [std.fs.max_path_bytes]u8 = undefined;

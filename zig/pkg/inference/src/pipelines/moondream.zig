@@ -134,6 +134,8 @@ pub const Pipeline = struct {
         if (control) |active| try active.check();
 
         const runtime_io = io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, runtime_io, model_dir);
+        defer publication_lease.deinit(runtime_io);
         if (control) |active| try active.verifyModelSelection(allocator, runtime_io, model_dir);
         var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, runtime_io, model_dir, if (control) |active| if (active.model_selection) |selected| .{ .publication = selected.publication } else null else null);
         defer artifacts.deinit();

@@ -4293,6 +4293,68 @@ test "raw ModernBERT span listing selects only the qualified decision route" {
     try std.testing.expect(decideExecutionContract(manifest) == null);
 }
 
+// A small LRU bounds idle VAD residency. Active requests and streaming
+// sessions retain reference-counted owners independently of cache membership.
+const SileroWeightCache = struct {
+    const capacity = 8;
+    const Entry = struct { path: []u8, publication: ?[32]u8, owner: *silero_vad_mod.SharedWeights, used: u64 };
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    clock: u64 = 0,
+    fn count(self: *const SileroWeightCache) usize {
+        return self.entries.items.len;
+    }
+    fn get(self: *SileroWeightCache, path: []const u8, publication: ?[32]u8) ?*silero_vad_mod.SharedWeights {
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, path, entry.path) and std.meta.eql(publication, entry.publication)) {
+            self.clock +|= 1;
+            entry.used = self.clock;
+            entry.owner.retain();
+            return entry.owner;
+        };
+        return null;
+    }
+    // Adopt one cache reference only after every fallible allocation succeeds.
+    fn put(self: *SileroWeightCache, a: std.mem.Allocator, path: []const u8, publication: ?[32]u8, owner: *silero_vad_mod.SharedWeights) !void {
+        self.clock +|= 1;
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, path, entry.path)) {
+            entry.owner.release();
+            entry.* = .{ .path = entry.path, .publication = publication, .owner = owner, .used = self.clock };
+            return;
+        };
+        const owned_path = try a.dupe(u8, path);
+        errdefer a.free(owned_path);
+        const next = Entry{ .path = owned_path, .publication = publication, .owner = owner, .used = self.clock };
+        if (self.entries.items.len < capacity) return self.entries.append(a, next);
+        var oldest: usize = 0;
+        for (self.entries.items, 0..) |entry, i| if (entry.used < self.entries.items[oldest].used) {
+            oldest = i;
+        };
+        const prior = self.entries.items[oldest];
+        self.entries.items[oldest] = next;
+        a.free(prior.path);
+        prior.owner.release();
+    }
+    fn trimIdle(self: *SileroWeightCache, a: std.mem.Allocator) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.owner.refs.load(.acquire) != 1) {
+                i += 1;
+                continue;
+            }
+            _ = self.entries.swapRemove(i);
+            a.free(entry.path);
+            entry.owner.release();
+        }
+    }
+    fn deinit(self: *SileroWeightCache, a: std.mem.Allocator) void {
+        for (self.entries.items) |entry| {
+            a.free(entry.path);
+            entry.owner.release();
+        }
+        self.entries.deinit(a);
+    }
+};
+
 pub const Node = struct {
     /// Every executable/host/engine path acquires this before model loading.
     cuda_device_budget_owner: ?*@import("../ops/cuda/device_budget_owner.zig").Owner = null,
@@ -4321,10 +4383,11 @@ pub const Node = struct {
     inference_admission: inference_admission_mod.InferenceAdmission,
     /// Live streaming transcription sessions (voice API).
     transcription_sessions: transcription_sessions.Registry,
-    /// Silero VAD weights by resolved model directory. Loaded once and kept
-    /// for the node's lifetime; session configs point into this cache.
-    silero_weights: std.StringHashMapUnmanaged(*silero_vad_mod.Weights) = .empty,
-    silero_weights_lock: std.atomic.Mutex = .unlocked,
+    /// Bounded idle VAD residency by installation. Requests and streaming
+    /// sessions retain their own generation independently of eviction.
+    silero_weights: SileroWeightCache = .{},
+    silero_weights_lock: std.Io.Mutex = .init,
+    silero_load_lock: std.atomic.Mutex = .unlocked,
     speaker_models: @import("../pipelines/speaker_model_cache.zig").Cache = .{},
     /// Lazily allocates only while compatible native executor work is queued.
     /// Ownership is here, rather than the storage BackendRuntime, because Node
@@ -4615,14 +4678,8 @@ pub const Node = struct {
         self.media_index_cache.deinit();
         self.speaker_flights.deinit(self.allocator);
         self.speaker_revision_cache.deinit(self.allocator);
-        // Sessions hold only PCM buffers; drop them before any runtime teardown.
+        // Release session-owned PCM and VAD residency before runtime teardown.
         self.transcription_sessions.deinit();
-        var silero_it = self.silero_weights.iterator();
-        while (silero_it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
-        }
         self.silero_weights.deinit(self.allocator);
         self.speaker_models.deinit(self.allocator);
         // The refresher borrows Node, its allocator, and the models directory.
@@ -4936,10 +4993,8 @@ pub const Node = struct {
 
     fn loadBoundManifest(self: *Node, allocator: std.mem.Allocator, path: []const u8, comptime listing: bool, control: InferenceExecutionControl) !manifest_mod.ModelManifest {
         const publication = try self.model_manager.publicationForRequest(path, control);
-        var manifest = if (listing) try manifest_mod.loadListingFromDir(allocator, path) else try manifest_mod.loadFromDir(allocator, path);
-        errdefer manifest.deinit();
-        if (publication != null and !std.meta.eql(publication, manifest.managed_publication)) return error.ModelArtifactsChanging;
-        return manifest;
+        const io = control.io orelse self.model_manager.session_manager.io orelse std.Options.debug_io;
+        return manifest_mod.loadBoundFromDir(allocator, io, path, publication, listing);
     }
 
     fn embeddingManifestSelected(self: *Node, allocator: std.mem.Allocator, selected: ResolvedModel, supplied: ?InferenceExecutionControl) !manifest_mod.ModelManifest {
@@ -22992,6 +23047,7 @@ pub const Node = struct {
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("dictate");
         defer self.metrics.decActive();
+        defer if (vad_config.silero_owner) |owner| owner.release();
         if (try self.attachVadModel(ctx, &vad_config, body.vad)) |response| return response;
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
@@ -23283,26 +23339,53 @@ pub const Node = struct {
         ctx: *httpx.Context,
         model_name: []const u8,
         stage: *SileroModelStage,
-    ) !*const silero_vad_mod.Weights {
+    ) !*silero_vad_mod.SharedWeights {
         stage.* = .resolve;
+        const control = httpInferenceExecutionControl(self, ctx);
+        try control.check();
         const model_path_selection = try self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "classifiers");
         const model_path = model_path_selection.path;
         defer ctx.allocator.free(model_path);
-        const publication_hex = if (model_path_selection.publication) |value| std.fmt.bytesToHex(value, .lower) else @as([64]u8, @splat('-'));
-        const cache_key = try std.fmt.allocPrint(ctx.allocator, "{s}#{s}", .{ model_path, publication_hex });
-        defer ctx.allocator.free(cache_key);
         try model_path_selection.verify(ctx.allocator, ctx.io);
-        spinLock(&self.silero_weights_lock);
-        defer self.silero_weights_lock.unlock();
-        if (self.silero_weights.get(cache_key)) |weights| return weights;
+        {
+            try self.silero_weights_lock.lock(ctx.io);
+            defer self.silero_weights_lock.unlock(ctx.io);
+            if (self.silero_weights.get(model_path, model_path_selection.publication)) |owner| return owner;
+        }
+        // Serialize cold constructors while warm hits use only the short
+        // ownership lock. No disk IO or model parsing holds that lock.
+        try control.lockWithPoll(&self.silero_load_lock, 100 * std.time.ns_per_us);
+        defer self.silero_load_lock.unlock();
+        {
+            try self.silero_weights_lock.lock(ctx.io);
+            defer self.silero_weights_lock.unlock(ctx.io);
+            if (self.silero_weights.get(model_path, model_path_selection.publication)) |owner| return owner;
+        }
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(ctx.allocator, ctx.io, model_path);
+        defer publication_lease.deinit(ctx.io);
+        try model_path_selection.verify(ctx.allocator, ctx.io);
         stage.* = .load;
         var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(ctx.allocator, ctx.io, model_path, .{ .publication = model_path_selection.publication });
         defer artifacts.deinit();
         const candidates = [_][]const u8{ "onnx/model.onnx", "model.onnx", "silero_vad.onnx" };
         var loaded: ?silero_vad_mod.Weights = null;
+        var admission: ?runtime.tier.memory.AdmissionLease = null;
+        errdefer if (admission) |*lease| lease.release();
         for (candidates) |candidate| {
+            const path = (try artifacts.resolve(candidate)) orelse continue;
+            defer ctx.allocator.free(path);
+            const size = (try std.Io.Dir.cwd().statFile(ctx.io, path, .{})).size;
+            if (size > 64 * 1024 * 1024) return error.FileTooLarge;
+            const peak = @as(usize, @intCast(size)) * 4 + 8 * 1024 * 1024;
+            admission = self.model_manager.admitHostWeights(peak) catch |err| blk: {
+                if (err != error.ResourceTemporarilyUnavailable) return err;
+                try self.silero_weights_lock.lock(ctx.io);
+                self.silero_weights.trimIdle(self.allocator);
+                self.silero_weights_lock.unlock(ctx.io);
+                break :blk try self.model_manager.admitHostWeights(peak);
+            };
             const bytes = artifacts.read(candidate, 64 * 1024 * 1024) catch |err| switch (err) {
-                error.FileNotFound => continue,
+                error.FileNotFound => return error.ModelArtifactsChanging,
                 else => return err,
             };
             defer ctx.allocator.free(bytes);
@@ -23313,19 +23396,24 @@ pub const Node = struct {
         }
         var weights = loaded orelse return error.InvalidSileroModel;
         errdefer weights.deinit();
+        try control.check();
         try model_path_selection.verify(ctx.allocator, ctx.io);
-        const owned = try self.allocator.create(silero_vad_mod.Weights);
+        const owned = try self.allocator.create(silero_vad_mod.SharedWeights);
         errdefer self.allocator.destroy(owned);
-        owned.* = weights;
-        const key = try self.allocator.dupe(u8, cache_key);
-        errdefer self.allocator.free(key);
-        try self.silero_weights.put(self.allocator, key, owned);
+        try admission.?.retain(.{ .host_weight_bytes = silero_vad_mod.residentWeightBytes(&weights) });
+        owned.* = .{ .allocator = self.allocator, .weights = weights, .admission = admission };
+        try self.silero_weights_lock.lock(ctx.io);
+        defer self.silero_weights_lock.unlock(ctx.io);
+        try self.silero_weights.put(self.allocator, model_path, model_path_selection.publication, owned);
+        owned.retain(); // The request owns a reference separate from the cache.
         return owned;
     }
 
     fn sileroModelFailureResponse(ctx: *httpx.Context, stage: SileroModelStage, err: anyerror) !httpx.Response {
         if (err == error.OutOfMemory) return err;
         if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
+        if (err == error.MemoryBudgetExceeded) return inferenceFailureResponse(ctx, err);
+        if (isTransientInferenceCapacityError(err) or err == error.ResourceLimitExceeded or err == error.Canceled or err == error.Cancelled or err == error.Timeout) return modelLoadFailureResponse(ctx, err);
         return switch (stage) {
             .resolve => requestModelResolutionError(ctx, err),
             .load => ctx.status(400).json(.{
@@ -23343,8 +23431,10 @@ pub const Node = struct {
         const model_name = std.mem.trim(u8, raw, " \t\r\n");
         if (model_name.len == 0) return null;
         var stage: SileroModelStage = .resolve;
-        config.silero = self.sileroWeightsForModel(ctx, model_name, &stage) catch |err|
+        const owner = self.sileroWeightsForModel(ctx, model_name, &stage) catch |err|
             return try sileroModelFailureResponse(ctx, stage, err);
+        config.silero_owner = owner;
+        config.silero = &owner.weights;
         return null;
     }
 
@@ -23437,6 +23527,7 @@ pub const Node = struct {
         if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
         defer self.releaseSlotUnits(admission_units);
         self.metrics.incRequest("transcription.session.create");
+        defer if (streaming_with_prompt.vad.silero_owner) |owner| owner.release();
         if (try self.attachVadModel(ctx, &streaming_with_prompt.vad, body.vad)) |response| return response;
         defer self.metrics.decActive();
 
@@ -51064,10 +51155,18 @@ test "model selection VAD verifies the consumed receipt artifact before parsing"
     defer a.free(root);
     var node = try Node.init(a, .{ .models_dir = root });
     defer node.deinit();
-    var ctx: httpx.Context = undefined;
-    ctx.allocator = a;
-    ctx.io = io;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/dictate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
     var stage: Node.SileroModelStage = .resolve;
+    ctx.application_deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, node.sileroWeightsForModel(&ctx, "acme/vad", &stage));
+    ctx.application_deadline_ns = null;
+    var cancelled = std.atomic.Value(bool).init(true);
+    ctx.cancellation = &cancelled;
+    try std.testing.expectError(error.Cancelled, node.sileroWeightsForModel(&ctx, "acme/vad", &stage));
+    ctx.cancellation = null;
     try std.testing.expectError(error.ChecksumMismatch, node.sileroWeightsForModel(&ctx, "acme/vad:onnx@0123456789abcdef0123456789abcdef01234567", &stage));
     try std.testing.expectEqual(@as(usize, 0), node.silero_weights.count());
 }
@@ -51194,4 +51293,244 @@ test "model selection reader broker honors cancellation and deadline before cold
     };
     try std.testing.expectError(error.Cancelled, readers_mod.LoadedReader.acquireExecutionFence("/missing/model", &node.model_manager, .{ .check_fn = Check.cancelled }));
     try std.testing.expectError(error.Timeout, readers_mod.LoadedReader.acquireExecutionFence("/missing/model", &node.model_manager, .{ .check_fn = Check.timeout }));
+}
+
+test "model selection manifest construction fences replacement after receipt validation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var receipt_a: ?[]u8 = null;
+    defer if (receipt_a) |bytes| a.free(bytes);
+    for ([_][]const u8{ "model", ".next" }, [_]usize{ 8, 9 }, [_]u8{ 'a', 'b' }) |leaf, hidden, pin| {
+        try tmp.dir.createDirPath(io, leaf);
+        var dir = try tmp.dir.openDir(io, leaf, .{});
+        defer dir.close(io);
+        const config = try std.json.Stringify.valueAlloc(a, .{ .model_type = "bert", .hidden_size = hidden, .max_position_embeddings = @as(usize, 128) }, .{});
+        defer a.free(config);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+        try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "weights" });
+        const json = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "safetensors", .resolved_revision = @as([40]u8, @splat(pin)) }, .artifacts = .{ .{ .path = "config.json", .size = config.len }, .{ .path = "model.safetensors", .size = @as(u64, 7) } } }, .{});
+        defer a.free(json);
+        try dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data = json });
+        if (pin == 'a') receipt_a = try a.dupe(u8, json);
+    }
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "model" });
+    defer a.free(path);
+    const original = try @import("../registry/managed_receipt.zig").publicationGeneration(a, io, path);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    const Probe = struct {
+        root: []const u8,
+        dir: std.Io.Dir,
+        receipt: []const u8,
+        published: bool = false,
+        failure: ?anyerror = null,
+        writer_io: std.Io,
+        var try_lock: @FieldType(std.Io.VTable, "fileTryLock") = undefined;
+        fn lock(raw: ?*anyopaque, file: std.Io.File, mode: std.Io.File.Lock) std.Io.File.LockError!void {
+            if (!try try_lock(raw, file, mode)) return error.Canceled;
+        }
+        fn publish(self: *@This()) !void {
+            var publication = try @import("../registry/catalog_publication.zig").Publication.begin(std.testing.allocator, self.writer_io, self.root, "model");
+            defer publication.deinit();
+            try self.dir.rename("model", self.dir, ".old", std.testing.io);
+            try self.dir.rename(".next", self.dir, "model", std.testing.io);
+            try publication.finish();
+        }
+        fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(len, alignment, ret);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.published and bytes.len == self.receipt.len) {
+                self.published = true;
+                self.publish() catch |err| {
+                    self.failure = err;
+                };
+            }
+            std.testing.allocator.rawFree(bytes, alignment, ret);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+    };
+    var writer_table = io.vtable.*;
+    Probe.try_lock = writer_table.fileTryLock;
+    writer_table.fileLock = Probe.lock;
+    var probe = Probe{ .root = root, .dir = tmp.dir, .receipt = receipt_a.?, .writer_io = .{ .userdata = io.userdata, .vtable = &writer_table } };
+    var manifest = try node.manifestForSelection(probe.allocator(), .{ .path = path, .publication = original });
+    defer manifest.deinit();
+    try std.testing.expect(probe.published);
+    try std.testing.expectEqual(error.Canceled, probe.failure.?);
+    try std.testing.expectEqual(@as(usize, 8), manifest.hidden_size);
+    try std.testing.expectEqual(original, manifest.managed_publication);
+    try std.testing.expectEqual(original, try @import("../registry/managed_receipt.zig").publicationGeneration(a, io, path));
+}
+
+test "model selection direct GGUF files retain the installation publication fence" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/.antfly-download-complete.json", .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const model = try std.fs.path.join(a, &.{ root, "model" });
+    defer a.free(model);
+    const file = try std.fs.path.join(a, &.{ model, "model.gguf" });
+    defer a.free(file);
+    var manager = model_manager_mod.ModelManager.init(a, @import("../backends/backends.zig").SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    try std.testing.expect((try manager.publicationForRequest(model, null)) != null);
+    try std.testing.expectEqual(try manager.publicationForRequest(model, null), try manager.publicationForRequest(file, null));
+    const selected = try @import("../registry/model_selection.zig").fromDirectory(a, io, try a.dupe(u8, file));
+    defer a.free(selected.path);
+    try std.testing.expectEqual(try manager.publicationForRequest(model, null), selected.publication);
+    var listing = try manifest_mod.loadListingFromDir(a, file);
+    defer listing.deinit();
+    try std.testing.expectEqual(selected.publication, listing.managed_publication);
+    try tmp.dir.createDirPath(io, "aliases");
+    try tmp.dir.symLink(io, file, "aliases/direct.gguf", .{});
+    const alias = try std.fs.path.join(a, &.{ root, "aliases", "direct.gguf" });
+    defer a.free(alias);
+    var alias_listing = try manifest_mod.loadListingFromDir(a, alias);
+    defer alias_listing.deinit();
+    try std.testing.expectEqual(selected.publication, alias_listing.managed_publication);
+    try std.testing.expectEqual(selected.publication, try manager.publicationForRequest(alias, null));
+    var alias_lease = try @import("../registry/publication_lease.zig").Lease.shared(a, io, alias);
+    defer alias_lease.deinit(io);
+    var lease = try @import("../registry/publication_lease.zig").Lease.shared(a, io, file);
+    defer lease.deinit(io);
+    const writer_dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+    defer writer_dir.close(io);
+    const writer_file = std.Io.File{ .handle = writer_dir.handle, .flags = .{ .nonblocking = false } };
+    try std.testing.expect(!try writer_file.tryLock(io, .exclusive));
+    lease.deinit(io);
+    try std.testing.expect(!try writer_file.tryLock(io, .exclusive));
+    alias_lease.deinit(io);
+    try std.testing.expect(try writer_file.tryLock(io, .exclusive));
+    writer_file.unlock(io);
+}
+
+test "model selection split reader ignores unlisted ONNX graphs" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ml = @import("ml");
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const left = try builder.parameter("a", ml.graph.Shape.init(.f32, &.{4}));
+    const right = try builder.parameter("b", ml.graph.Shape.init(.f32, &.{4}));
+    const sum = try builder.add(left, right);
+    try graph.markOutput(sum);
+    const bytes = try @import("onnx_graph").exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_model.onnx", .data = bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "decoder_model.onnx", .data = bytes });
+    const config = "{\"model_type\":\"trocr\",\"hidden_size\":4}";
+    const tokenizer = "{\"model\":{\"type\":\"WordPiece\",\"vocab\":{\"[UNK]\":0,\"hello\":1},\"unk_token\":\"[UNK]\",\"continuing_subword_prefix\":\"##\"},\"pre_tokenizer\":{\"type\":\"Whitespace\"}}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    // Deliberately omit both executable graphs from the managed receipt.
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "reader", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.onnx", .size = bytes.len }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var sm = @import("../backends/backends.zig").SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = model_manager_mod.ModelManager.init(a, sm);
+    defer manager.deinit();
+    try std.testing.expectError(error.EncoderModelNotFound, @import("../pipelines/encoder_decoder.zig").findEncoderDecoderPaths(a, root));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const listed = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "reader", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.onnx", .size = bytes.len }, .{ .path = "encoder_model.onnx", .size = bytes.len, .sha256 = hex }, .{ .path = "decoder_model.onnx", .size = bytes.len, .sha256 = hex }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(listed);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data = listed });
+    const selected = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = try @import("../registry/managed_receipt.zig").publicationGeneration(a, io, root) };
+    var reader = try @import("../readers/vision_reader.zig").LoadedVisionReader.loadFromDirWithControl(a, root, &manager.session_manager, &manager, selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process }));
+    defer reader.deinit();
+    try std.testing.expect(reader.owns_sessions);
+    const invalid = try a.dupe(u8, listed);
+    defer a.free(invalid);
+    const hash_at = std.mem.indexOf(u8, invalid, &hex).?;
+    @memset(invalid[hash_at..][0..64], '0');
+    try tmp.dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data = invalid });
+    try std.testing.expectError(error.ChecksumMismatch, @import("../pipelines/encoder_decoder.zig").findEncoderDecoderPaths(a, root));
+}
+
+test "model selection VAD cache bounds residency and streaming retains retired generations" {
+    const a = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(a, @import("../backends/backends.zig").SessionManager.initWithIo(a, std.testing.io));
+    defer manager.deinit();
+    const Factory = struct {
+        fn make(m: *model_manager_mod.ModelManager) !*silero_vad_mod.SharedWeights {
+            const alloc = std.testing.allocator;
+            const owner = try alloc.create(silero_vad_mod.SharedWeights);
+            errdefer alloc.destroy(owner);
+            const values = try alloc.alloc(f32, 4);
+            errdefer alloc.free(values);
+            @memset(values, 0);
+            owner.* = .{ .allocator = alloc, .weights = .{ .allocator = alloc, .stft_basis = values, .encoder = @splat(.{ .weight = &.{}, .bias = &.{}, .in_channels = 0, .out_channels = 0, .stride = 1 }), .lstm_w = &.{}, .lstm_r = &.{}, .lstm_b = &.{}, .decoder_weight = &.{}, .decoder_bias = 0 } };
+            owner.admission = try m.admitHostWeights(silero_vad_mod.residentWeightBytes(&owner.weights));
+            return owner;
+        }
+    };
+    var cache: SileroWeightCache = .{};
+    defer cache.deinit(a);
+    const first = try Factory.make(&manager);
+    const bytes = silero_vad_mod.residentWeightBytes(&first.weights);
+    try cache.put(a, "model", @as([32]u8, @splat(1)), first);
+    const request = cache.get("model", @as([32]u8, @splat(1))).?;
+    var stream = try streaming_transcription.Session.init(a, .{ .vad = .{ .silero = &request.weights, .silero_owner = request } });
+    defer stream.deinit();
+    request.release();
+    try cache.put(a, "model", @as([32]u8, @splat(2)), try Factory.make(&manager));
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    try std.testing.expectEqual(bytes * 2, manager.currentAdmissionAmounts().host_weight_bytes);
+    cache.trimIdle(a);
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
+    try std.testing.expectEqual(@as(usize, 1), stream.config.vad.silero_owner.?.refs.load(.acquire));
+    try std.testing.expectEqual(bytes, manager.currentAdmissionAmounts().host_weight_bytes);
+    for (0..SileroWeightCache.capacity * 2) |i| {
+        const name = try std.fmt.allocPrint(a, "model-{d}", .{i});
+        defer a.free(name);
+        try cache.put(a, name, null, try Factory.make(&manager));
+    }
+    try std.testing.expectEqual(@as(usize, SileroWeightCache.capacity), cache.count());
+    try std.testing.expectEqual(bytes * (SileroWeightCache.capacity + 1), manager.currentAdmissionAmounts().host_weight_bytes);
+    const latest = cache.get("model-15", null).?;
+    defer latest.release();
+    cache.trimIdle(a);
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    // Failed insertion never adopts or drops a caller's reference.
+    const pending = try Factory.make(&manager);
+    defer pending.release();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, cache.put(failing.allocator(), "new", null, pending));
+    try std.testing.expectEqual(@as(usize, 1), pending.refs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+}
+
+test "model selection VAD admission failures retain retry semantics" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/dictate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try Node.sileroModelFailureResponse(&ctx, .load, error.ResourceTemporarilyUnavailable);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    var budget_response = try Node.sileroModelFailureResponse(&ctx, .load, error.MemoryBudgetExceeded);
+    defer budget_response.deinit();
+    try std.testing.expectEqual(@as(u16, 507), budget_response.status.code);
 }

@@ -5279,6 +5279,14 @@ pub const ModelManager = struct {
         };
     }
 
+    /// Auxiliary resident models share the physical host domain with primary
+    /// sessions. The constructor shrinks this lease to actual owned weights.
+    pub fn admitHostWeights(self: *ModelManager, peak_bytes: usize) !runtime.tier.memory.AdmissionLease {
+        try self.ensureResourceOwnerReady();
+        const domain = self.resource_domain.?;
+        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true);
+    }
+
     /// Exact admission ownership held by the live Hugging Face tokenizer
     /// caches. Cache growth is charged in independent quantum leases owned by
     /// ResourceDomain records, rather than by LoadedModel.tokenizer_resource_lease.
@@ -8877,6 +8885,8 @@ pub const ModelManager = struct {
     }
 
     pub fn loadChunkPlanningAssets(self: *ModelManager, model_dir: []const u8, io: std.Io, control: InferenceExecutionControl) !ChunkPlanningAssets {
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer publication_lease.deinit(io);
         const publication = try self.publicationForRequest(model_dir, control);
         try control.check();
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);

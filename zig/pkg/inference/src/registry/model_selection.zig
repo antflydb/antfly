@@ -64,7 +64,9 @@ pub const ResolvedModel = struct {
 /// Hub selectors instead obtain this proof from the receipt that verified them.
 /// On failure the caller retains ownership of owned_path.
 pub fn fromDirectory(allocator: std.mem.Allocator, io: std.Io, owned_path: []const u8) !ResolvedModel {
-    var validated = receipt.loadValidated(allocator, io, owned_path) catch |err| switch (err) {
+    const root = try receipt.publicationRootAlloc(allocator, io, owned_path);
+    defer allocator.free(root);
+    var validated = receipt.loadValidated(allocator, io, root) catch |err| switch (err) {
         error.NotDir => return .{ .path = owned_path, .publication = null },
         else => return err,
     };

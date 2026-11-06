@@ -560,11 +560,7 @@ const ReaderExtractor = struct {
 fn selectedManifest(ctx: Context, selected: selection_mod.ResolvedModel) !manifest_mod.ModelManifest {
     const control = selected.bind(ctx.execution_control orelse InferenceExecutionControl{ .request_owned = false });
     try control.verifyModelSelection(ctx.allocator, ctx.io, selected.path);
-    const publication = selected.publication;
-    var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, selected.path);
-    errdefer manifest.deinit();
-    if (publication != null and !std.meta.eql(publication, manifest.managed_publication)) return error.ModelArtifactsChanging;
-    return manifest;
+    return manifest_mod.loadBoundFromDir(ctx.allocator, ctx.io, selected.path, selected.publication, true);
 }
 
 fn tryResolveGlinerExtractor(ctx: Context, model_name: []const u8) !?Extractor {
