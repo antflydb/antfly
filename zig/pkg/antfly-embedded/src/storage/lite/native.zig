@@ -108,6 +108,75 @@ test "lite runtime metadata comparison skips leases and fences secrets and docum
     try std.testing.expect(!try captured.runtimeMetadataUnchanged(&writer));
 }
 
+test "bug2: an indexed-reclamation Lite file at a relative path creates no files outside its own directory" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    // `std.fs.path.dirname("bare.aflite")` is `null` -- exactly the shape
+    // reader_epochs.zig's `Namespace.open` falls back to "." for. Opening
+    // the DB with a cwd-relative, directory-component-free path (while the
+    // process cwd is pinned to a temp directory, as it would be for any
+    // relative "./mydb.aflite"-style open) must resolve `.aflite-readers-*`
+    // (and the "identity" marker inside it) next to the *.aflite file, not
+    // relative to whatever the cwd happens to be when Namespace.open runs.
+    const original_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(original_cwd);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_dir_len = try tmp.dir.realPath(io, &buf);
+    const tmp_dir_path = try a.dupe(u8, buf[0..tmp_dir_len]);
+    defer a.free(tmp_dir_path);
+
+    try std.process.setCurrentPath(io, tmp_dir_path);
+    var restored = false;
+    defer if (!restored) std.process.setCurrentPath(io, original_cwd) catch {};
+
+    std.debug.print("BUG2-DIAG: about to create, cwd should be tmp={s}\n", .{tmp_dir_path});
+    const bare_name = "bug2-repro.aflite";
+    {
+        var file = try NativeFile.createWithIo(a, io, bare_name, .{ .indexed_reclamation = true, .no_sync = true, .exclusive = true });
+        defer file.close();
+        try file.putDocument("doc", "value");
+    }
+    std.debug.print("BUG2-DIAG: create+put+close done\n", .{});
+
+    // The reader-epoch namespace directory must have landed inside the temp
+    // directory (next to the .aflite file), not vanished or ended up
+    // somewhere else: find it and confirm its "identity" marker is there.
+    var found_namespace_dir = false;
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, ".aflite-readers-")) continue;
+            found_namespace_dir = true;
+            var namespace_dir = try dir.openDir(io, entry.name, .{});
+            defer namespace_dir.close(io);
+            try namespace_dir.access(io, "identity", .{});
+        }
+    }
+    try std.testing.expect(found_namespace_dir);
+
+    try std.process.setCurrentPath(io, original_cwd);
+    restored = true;
+
+    // Nothing from opening a relative-path DB may have leaked into the
+    // original cwd: no bare "identity" file, and no stray reader-epoch
+    // namespace directory, sitting directly in it.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, "identity", .{}));
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".aflite-readers-"));
+        }
+    }
+}
+
 test "lite index checkpoint adoption discards physical page caches" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
