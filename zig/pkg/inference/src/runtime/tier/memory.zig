@@ -868,6 +868,39 @@ pub const AdmissionLease = struct {
     }
 };
 
+/// Unmaterialized host headroom shared by a sequence of small allocations.
+/// Policy accounting is separate: only actual allocations consume policy bytes.
+pub const LiveReservation = struct {
+    controller: *AdmissionController,
+    remaining: usize,
+    tracked: bool,
+
+    pub const Residency = struct {
+        controller: ?*AdmissionController = null,
+        epoch: u64 = 0,
+        bytes: usize = 0,
+
+        pub fn release(self: *@This()) void {
+            if (self.controller) |controller| controller.releaseSettledResidency(self.epoch, self.bytes);
+            self.* = .{};
+        }
+    };
+
+    /// Call only after physical allocation, without a fallible step between
+    /// allocation and transfer. Remaining credit stays pending in this epoch.
+    pub fn materialize(self: *@This(), bytes: usize) Residency {
+        std.debug.assert(bytes <= self.remaining);
+        self.remaining -= bytes;
+        if (!self.tracked) return .{};
+        return .{ .controller = self.controller, .epoch = self.controller.settleLiveReservation(bytes, bytes), .bytes = bytes };
+    }
+
+    pub fn release(self: *@This()) void {
+        if (self.tracked) self.controller.releaseLiveReservation(self.remaining);
+        self.remaining = 0;
+    }
+};
+
 pub const AdmissionController = struct {
     mutex: std.atomic.Mutex = .unlocked,
     /// Serializes reservations against one sampled live-memory capacity. While
@@ -1347,6 +1380,11 @@ pub const AdmissionController = struct {
                 &self.admitted_by_backend[index],
                 amounts_by_backend[index],
             );
+    }
+
+    /// Reserve physical capacity once, then materialize it in bounded pieces.
+    pub fn reserveLiveCapacity(self: *AdmissionController, bytes: usize) !LiveReservation {
+        return .{ .controller = self, .remaining = bytes, .tracked = try self.tryReserveLiveCapacity(bytes) != 0 };
     }
 
     fn tryReserveLiveCapacity(
@@ -4839,4 +4877,34 @@ test "generation budget preserves managed prefill shape and external KV ownershi
     var tight = RunBudget.init(.{ .scratch_limit_bytes = expected.scratch_bytes - 1 });
     try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationPrefill(&tight, &.{component}, 200, 8, 32));
     try std.testing.expectEqual(@as(usize, 0), tight.scratchTotalBytes());
+}
+
+test "managed PJRT metadata residency cannot refund a newer pressure epoch" {
+    var controller = AdmissionController{};
+    defer controller.deinit();
+    const info = SystemMemoryInfo{ .total_bytes = gib(64), .available_bytes = gib(20) };
+    const anchor = try controller.tryReserveLiveCapacityWithInfo(mib(1), info);
+    var reservation = try controller.reserveLiveCapacity(64 * 1024);
+    var first = reservation.materialize(1024);
+    var second = reservation.materialize(1024);
+    first.release();
+    reservation.release();
+    try std.testing.expectEqual(anchor, controller.live_pending_bytes);
+    const epoch = controller.live_epoch;
+    controller.releaseLiveReservation(anchor);
+    const next = try controller.tryReserveLiveCapacityWithInfo(mib(1), info);
+    defer controller.releaseLiveReservation(next);
+    try std.testing.expect(controller.live_epoch != epoch);
+    const capacity = controller.live_capacity_bytes;
+    second.release();
+    second.release();
+    try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+    // An unavailable physical probe preserves the controller's existing
+    // fail-open contract without manufacturing pending reservations to refund.
+    var untracked = LiveReservation{ .controller = &controller, .remaining = 1024, .tracked = false };
+    var resident = untracked.materialize(512);
+    untracked.release();
+    resident.release();
+    try std.testing.expectEqual(next, controller.live_pending_bytes);
+    try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
 }

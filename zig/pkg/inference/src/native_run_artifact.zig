@@ -435,8 +435,36 @@ fn runArtifactPromptWithContext(
     load_policy: ?model_manager_mod.ModelLoadPolicy,
     prepared: ?*ArtifactContext,
 ) !RunResult {
+    var effective = load_policy orelse model_manager_mod.ModelLoadPolicy{};
+    var resources: ?model_manager_mod.ModelManager.SharedResources = null;
+    if (prepared == null and effective.resources == null) {
+        resources = try model_manager_mod.ModelManager.SharedResources.init(allocator, effective.limits);
+        effective.resources = &resources.?;
+    }
+    defer if (resources) |*owned| owned.deinit();
+    var bootstrap = model_manager_mod.ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, io));
+    defer bootstrap.deinit();
+    if (prepared == null) try effective.configure(&bootstrap);
+    const admission = if (prepared) |context| context.admissionContext() else pjrt_admission.Context{ .allocator = allocator, .manager = &bootstrap, .policy = effective };
+    const budget = try @import("graph/pjrt_metadata.zig").Budget.create(allocator, &admission);
+    defer budget.destroy();
+    return runArtifactPromptWithMetadata(allocator, io, artifact_or_manifest_path, prompt, compare_host, no_chat_template, raw_prompt, effective, prepared, budget.allocator()) catch |err| return budget.translate(err);
+}
+
+fn runArtifactPromptWithMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    artifact_or_manifest_path: []const u8,
+    prompt: []const u8,
+    compare_host: bool,
+    no_chat_template: bool,
+    raw_prompt: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
+    prepared: ?*ArtifactContext,
+    metadata: std.mem.Allocator,
+) !RunResult {
     if (compiled_artifact.isPackageManifestPath(artifact_or_manifest_path)) {
-        var package = try compiled_artifact.readPackageManifest(allocator, io, artifact_or_manifest_path);
+        var package = try compiled_artifact.readPackageManifest(metadata, io, artifact_or_manifest_path);
         defer package.deinit();
         try compiled_artifact.validatePackageManifest(package.value, package.value.backend, package.value.model_dir, package.value.kind, if (std.mem.eql(u8, package.value.backend, "xla")) package.value.pjrt_parameter_mode else null);
         var owned_context = if (prepared == null) try ArtifactContext.init(allocator, io, package.value.model_dir, load_policy) else null;
@@ -444,7 +472,7 @@ fn runArtifactPromptWithContext(
         const context = prepared orelse &owned_context.?;
         if (!std.mem.eql(u8, context.model_dir, package.value.model_dir)) return error.ArtifactModelMismatch;
         const manifest_path = try resolvePackagePrefillManifestPath(
-            allocator,
+            metadata,
             io,
             artifact_or_manifest_path,
             prompt,
@@ -452,10 +480,11 @@ fn runArtifactPromptWithContext(
             raw_prompt,
             context,
         );
-        defer allocator.free(manifest_path);
+        defer metadata.free(manifest_path);
 
-        var parsed = try compiled_artifact.readManifest(allocator, io, manifest_path);
+        var parsed = try compiled_artifact.readManifest(metadata, io, manifest_path);
         defer parsed.deinit();
+        @import("graph/pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
         return runParsedArtifactPrompt(
             allocator,
             io,
@@ -470,11 +499,12 @@ fn runArtifactPromptWithContext(
         );
     }
 
-    const manifest_path = try compiled_artifact.resolveManifestPath(allocator, artifact_or_manifest_path);
-    defer allocator.free(manifest_path);
+    const manifest_path = try compiled_artifact.resolveManifestPath(metadata, artifact_or_manifest_path);
+    defer metadata.free(manifest_path);
 
-    var parsed = try compiled_artifact.readManifest(allocator, io, manifest_path);
+    var parsed = try compiled_artifact.readManifest(metadata, io, manifest_path);
     defer parsed.deinit();
+    @import("graph/pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
     return runParsedArtifactPrompt(
         allocator,
         io,
@@ -502,6 +532,24 @@ pub fn tryRunMatchingArtifact(
 ) !?RunResult {
     var context = try ArtifactContext.init(allocator, io, model_dir, load_policy);
     defer context.deinit();
+    const budget = try @import("graph/pjrt_metadata.zig").Budget.create(allocator, &context.admissionContext());
+    defer budget.destroy();
+    return tryRunMatchingArtifactWithMetadata(allocator, io, search_dir, backend, model_dir, prompt, no_chat_template, raw_prompt, load_policy, &context, budget.allocator()) catch |err| return budget.translate(err);
+}
+
+fn tryRunMatchingArtifactWithMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    search_dir: []const u8,
+    backend: []const u8,
+    model_dir: []const u8,
+    prompt: []const u8,
+    no_chat_template: bool,
+    raw_prompt: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
+    context: *ArtifactContext,
+    metadata: std.mem.Allocator,
+) !?RunResult {
     const model_manifest = &context.manifest;
     const assets = &context.assets;
 
@@ -530,7 +578,7 @@ pub fn tryRunMatchingArtifact(
     }
 
     if (try compiled_artifact.findManagedPjrtPackage(
-        allocator,
+        metadata,
         io,
         search_dir,
         backend,
@@ -539,7 +587,8 @@ pub fn tryRunMatchingArtifact(
         prompt_tokens,
         "paged_prefill",
     )) |package_manifest_path| {
-        defer allocator.free(package_manifest_path);
+        defer metadata.free(package_manifest_path);
+        @import("graph/pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
         return try runArtifactPromptWithContext(
             allocator,
             io,
@@ -549,12 +598,12 @@ pub fn tryRunMatchingArtifact(
             no_chat_template,
             raw_prompt,
             load_policy,
-            &context,
+            context,
         );
     }
 
     var found = (try findMatchingFullModelArtifact(
-        allocator,
+        metadata,
         io,
         search_dir,
         backend,
@@ -569,15 +618,16 @@ pub fn tryRunMatchingArtifact(
         );
         return null;
     };
-    defer found.deinit(allocator);
+    defer found.deinit(metadata);
 
-    var parsed = try compiled_artifact.readManifest(allocator, io, found.manifest_path);
+    var parsed = try compiled_artifact.readManifest(metadata, io, found.manifest_path);
     defer parsed.deinit();
 
     const artifact = parsed.value;
     if (artifact.seq_len != prompt_tokens or artifact.query_seq_len != prompt_tokens) {
         return null;
     }
+    @import("graph/pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
     return try runArtifactPromptWithContext(
         allocator,
         io,
@@ -587,7 +637,7 @@ pub fn tryRunMatchingArtifact(
         no_chat_template,
         raw_prompt,
         load_policy,
-        &context,
+        context,
     );
 }
 
@@ -1252,7 +1302,7 @@ fn runPjrtHloArtifactFull(
     var client = try prepared.createClient(plugin_path);
     defer client.deinit();
 
-    var model_executor_ctx = try graph_mod.pjrt_artifact_executor.createModelExecutorFromArtifactBytes(
+    var model_executor_ctx = try graph_mod.pjrt_artifact_executor.createModelExecutorFromAdmittedArtifactBytes(
         allocator,
         io,
         artifact,
@@ -1260,6 +1310,7 @@ fn runPjrtHloArtifactFull(
         &entry.graph,
         &cb,
         &client,
+        &context.admissionContext(),
     );
     var model_executor = model_executor_ctx.modelExecutor();
     defer model_executor.deinit();
@@ -2609,6 +2660,8 @@ fn preparedArtifactScenario(a: std.mem.Allocator, root: []const u8, artifact: co
         try std.testing.expect(staged.host_weight_bytes >= before.host_weight_bytes + 2 * prepared.encoded_bytes);
         var client = try prepared.createClient(plugin);
         defer client.deinit();
+        try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable(prepared.bytes, 0));
+        try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable(prepared.bytes, 2));
         var executable = try client.deserializeExecutable(prepared.bytes, 1);
         defer executable.deinit();
         const stats = try executable.compiledMemoryStats();
@@ -2746,8 +2799,10 @@ fn admittedPjrtPackageScenario(a: std.mem.Allocator, root: []const u8, prefill: 
         try std.testing.expect(!prefill_runtime.capabilities().supports_decode);
         try std.testing.expectError(error.UnsupportedDecode, prefill_runtime.decode(a, .{ .token_id = 0, .position = 16 }));
     }
+    const before_runtime = context.manager.currentAdmissionAmounts().host_weight_bytes;
     var retained_runtime = try owned.createRuntime(a);
     defer retained_runtime.deinit();
+    const runtime_metadata = context.manager.currentAdmissionAmounts().host_weight_bytes - before_runtime;
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, owned.createRuntime(a));
     owned.deinit();
     owns_executor = false;
@@ -2756,7 +2811,7 @@ fn admittedPjrtPackageScenario(a: std.mem.Allocator, root: []const u8, prefill: 
     try std.testing.expectEqual(@as(usize, 1), executor.decode_variants.len);
     // Code is retained twice, argument buffers are shared across phases, and
     // both provider-owned serialized representations remain charged.
-    try std.testing.expectEqual(before.host_weight_bytes + 2 * 64 + 4096 + 2 * "fixture executable".len + executor.artifact_owner.?.metadata_bytes, context.manager.currentAdmissionAmounts().host_weight_bytes);
+    try std.testing.expectEqual(before.host_weight_bytes + 2 * 64 + 4096 + 2 * "fixture executable".len + executor.artifact_owner.?.metadata_bytes + executor.metadata_budget.?.live_bytes + runtime_metadata, context.manager.currentAdmissionAmounts().host_weight_bytes);
 }
 
 test "run-artifact admitted PJRT packages share phase memory and refund every failed allocation" {
@@ -2786,7 +2841,9 @@ test "run-artifact admitted PJRT packages share phase memory and refund every fa
     var outputs = [_]u32{0};
     artifact.pjrt_input_shapes = &shapes;
     artifact.pjrt_input_bindings = &bindings;
-    artifact.pjrt_output_shapes = &shapes;
+    var output_shape = [_]i64{2};
+    var output_shapes = [_][]i64{&output_shape};
+    artifact.pjrt_output_shapes = &output_shapes;
     artifact.pjrt_output_node_ids = &outputs;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("fixture executable", &digest, .{});
@@ -2849,6 +2906,10 @@ test "run-artifact reserves host upload and comparison staging outside compiler 
     artifact.pjrt_output_node_ids = &outputs;
     const output = try ArtifactDeviceAdmission.plannedAmounts(artifact);
     try std.testing.expectEqual(64 * mib, output.host_scratch_bytes);
+    artifact.pjrt_memory_plan.?.memory.outputs = 64 * mib;
+    const padded = try ArtifactDeviceAdmission.plannedAmounts(artifact);
+    try std.testing.expectEqual(output.host_scratch_bytes, padded.host_scratch_bytes);
+    try std.testing.expect(padded.backend_scratch_bytes > output.backend_scratch_bytes);
 }
 
 test "run-artifact selection skips HLO packages and unprofiled standalone executables" {
@@ -2935,6 +2996,8 @@ test "run-artifact managed decode runtime survives executor graph and manager te
             artifact.attention_mode = "paged_decode";
             artifact.pjrt_input_bindings = &decode_inputs;
             artifact.pjrt_input_shapes = &decode_shapes;
+            output_bindings[1].name = "decode.present.0.key";
+            output_bindings[2].name = "decode.present.0.value";
         }
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -2988,6 +3051,7 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     package.artifacts = &package_entries;
     try compiled_artifact.writePackageManifest(a, std.testing.io, package_path, package);
     try managedPrefillReuseScenario(a, prefill, plugin, count);
+    try managedKvPhaseLivenessScenario(a, prefill, decode, plugin, count);
     const closed_clients_before = count(2);
     const executions_before = count(10);
     const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromPackageManifestPath(a, std.testing.io, package_path, 16, 16, "paged_prefill", &graph, &backend, &context, plugin);
@@ -2995,8 +3059,12 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     var executor_live = true;
     defer if (executor_live) owned.deinit();
     var failing_runtime_allocator = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, owned.createRuntime(failing_runtime_allocator.allocator()));
+    var allocation_free_runtime = try owned.createRuntime(failing_runtime_allocator.allocator());
+    allocation_free_runtime.deinit();
+    try std.testing.expect(!failing_runtime_allocator.has_induced_failure);
+    const before_runtime = manager.currentAdmissionAmounts().host_weight_bytes;
     var run = try owned.createRuntime(a);
+    const runtime_metadata = manager.currentAdmissionAmounts().host_weight_bytes - before_runtime;
     var runtime_live = true;
     defer if (runtime_live) run.deinit();
     const ids: [16]i64 = @splat(1);
@@ -3004,7 +3072,7 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     defer first.deinit(a);
     try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, try first.hostLogits(a));
     {
-        const admitted_before = manager.currentAdmissionAmounts();
+        var admitted_before = manager.currentAdmissionAmounts();
         try std.testing.expectEqual(@as(usize, 48), admitted_before.host_kv_bytes);
         var other = try owned.createRuntime(a);
         var other_live = true;
@@ -3018,6 +3086,7 @@ test "run-artifact managed decode runtime survives executor graph and manager te
         defer third_output.deinit(a);
         try std.testing.expectEqual(@as(usize, 6), count(8) - count(9));
         try std.testing.expect((count(8) - count(9)) * 4 <= admitted_before.host_kv_bytes);
+        admitted_before.host_weight_bytes += 2 * runtime_metadata;
         try std.testing.expectEqualDeep(admitted_before, manager.currentAdmissionAmounts());
         other.deinit();
         other_live = false;
@@ -3032,12 +3101,19 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     manager.deinit();
     manager_live = false;
     try std.testing.expectEqual(closed_clients_before, count(2));
+    // Both readback and logits-allocation failures must preserve the previous
+    // KV generation, so retrying the same decode receives prefill's value 1.
+    for (0..2) |fail_index| {
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, run.decode(failure.allocator(), .{ .token_id = 1, .position = 16 }));
+        try std.testing.expectEqual(@as(usize, 2), count(8) - count(9));
+    }
     var second = try run.decode(a, .{ .token_id = 1, .position = 16 });
     defer second.deinit(a);
     try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, try second.hostLogits(a));
     run.deinit();
     runtime_live = false;
-    try std.testing.expectEqual(executions_before + 4, count(10));
+    try std.testing.expectEqual(executions_before + 6, count(10));
     try std.testing.expectEqual(count(1), count(2));
     try std.testing.expectEqual(count(3), count(4));
     try std.testing.expectEqual(count(8), count(9));
@@ -3080,9 +3156,28 @@ fn managedPrefillReuseScenario(a: std.mem.Allocator, prefill: []const u8, plugin
     const parameter = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
     try graph.markOutput(parameter);
     var backend: ops.ComputeBackend = undefined;
+    try managedExecutorMetadataScenario(a, prefill, plugin, &graph, &backend);
+
+    // Native logits have shape [2]. A plausible sidecar [1, 1] used to
+    // truncate logits silently; reject it before publishing a runtime.
+    {
+        var parsed = try compiled_artifact.readManifest(a, std.testing.io, prefill);
+        defer parsed.deinit();
+        var bad_shape = [_]i64{ 1, 1 };
+        const original_shape = parsed.value.pjrt_output_shapes[0];
+        parsed.value.pjrt_output_shapes[0] = &bad_shape;
+        defer parsed.value.pjrt_output_shapes[0] = original_shape;
+        const before = manager.currentAdmissionAmounts();
+        try std.testing.expectError(error.PjrtApiError, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(a, &.{parsed.value}, &graph, &backend, &context, plugin));
+        try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+        try std.testing.expectEqual(count(3), count(4));
+        try std.testing.expectEqual(count(5), count(6));
+    }
+
     const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{}, &graph, &backend, &context, plugin);
     var owned = executor.modelExecutor();
     defer owned.deinit();
+    try platform.allocator.checkAllAllocationFailures(a, managedPrefillFailureScenario, .{ &owned, count });
     var run = try owned.createRuntime(a);
     defer run.deinit();
     const admitted = manager.currentAdmissionAmounts();
@@ -3101,4 +3196,199 @@ fn managedPrefillReuseScenario(a: std.mem.Allocator, prefill: []const u8, plugin
     defer retry.deinit(a);
     try std.testing.expectEqual(@as(usize, 8), count(12));
     try std.testing.expectEqualDeep(admitted, manager.currentAdmissionAmounts());
+    {
+        var large_manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer large_manager.deinit();
+        try policy.configure(&large_manager);
+        const large_context = pjrt_admission.Context{ .allocator = a, .manager = &large_manager, .policy = policy, .decode_steps_limit = 0 };
+        var large_graph = ml.graph.Graph.init(a);
+        defer large_graph.deinit();
+        var large_builder = ml.graph.Builder.init(&large_graph);
+        const token = try large_builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
+        try large_graph.markOutput(token);
+        for (0..10000) |_| _ = try large_builder.parameter("unused", ml.graph.Shape.init(.f32, &.{1}));
+        const large_executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{}, &large_graph, &backend, &large_context, plugin);
+        var large_owned = large_executor.modelExecutor();
+        defer large_owned.deinit();
+        var large_run = try large_owned.createRuntime(a);
+        defer large_run.deinit();
+        var quota = platform.allocator.reclamation.Quota.init(a, 2 * 1024 * 1024);
+        defer quota.deinit();
+        const before_run = large_manager.currentAdmissionAmounts();
+        var result = try large_run.prefill(quota.allocator(), .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        defer result.deinit(quota.allocator());
+        // The graph-sized values table belongs to the admitted runtime slot.
+        // Caller allocations contain only planned transfer/logits storage.
+        try std.testing.expect(quota.peak_bytes <= before_run.host_scratch_bytes);
+        try std.testing.expect(large_executor.metadata_budget.?.live_bytes >= large_graph.nodeCount() * @sizeOf(?@import("graph/backend_contracts.zig").CT));
+        try std.testing.expectEqualDeep(before_run, large_manager.currentAdmissionAmounts());
+    }
+}
+
+fn managedPrefillFailureScenario(a: std.mem.Allocator, owned: *model_runtime.ModelExecutor, count: *const fn (usize) callconv(.c) usize) !void {
+    const live = count(8) - count(9);
+    defer std.debug.assert(count(8) - count(9) == live);
+    var run = try owned.createRuntime(a);
+    defer run.deinit();
+    const ids: [16]i64 = @splat(1);
+    var output = try run.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+    defer output.deinit(a);
+}
+
+test "run-artifact admits bootstrap package and sidecar JSON before model lookup" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    const padding = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(padding);
+    @memset(padding, ' ');
+    // Valid JSON padding would previously be read and parsed before any model
+    // manager or invocation ledger existed. A denied read must win over the
+    // missing model/manifest fields, with every bootstrap allocation refunded.
+    @memcpy(padding[0..2], "{}");
+    for ([_][]const u8{ "artifact.inference.json", "artifact.antfly-inference-package.json" }) |name| {
+        const path = try std.fs.path.join(a, &.{ directory, name });
+        defer a.free(path);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = padding });
+        const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1024 * 1024, .combined_limit_bytes = 1024 * 1024 } };
+        try std.testing.expectError(error.ResourceLimitExceeded, runArtifactPrompt(a, io, path, "a", false, true, true, policy));
+    }
+}
+
+fn managedExecutorMetadataScenario(a: std.mem.Allocator, prefill: []const u8, plugin: [:0]const u8, graph: *const ml.graph.Graph, backend: *const ops.ComputeBackend) !void {
+    var parsed = try compiled_artifact.readManifest(a, std.testing.io, prefill);
+    defer parsed.deinit();
+    const large_name = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(large_name);
+    @memset(large_name, 'k');
+    for (parsed.value.pjrt_output_bindings) |*binding| {
+        if (std.mem.eql(u8, binding.kind, compiled_artifact.pjrt_binding_present_key)) {
+            binding.name = large_name;
+            break;
+        }
+    }
+    var quota = platform.allocator.reclamation.Quota.init(a, 64 * 1024 * 1024);
+    defer quota.deinit();
+    {
+        var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer manager.deinit();
+        const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 8 * 1024 * 1024 } };
+        try policy.configure(&manager);
+        const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .decode_steps_limit = 0 };
+        const before = manager.currentAdmissionAmounts();
+        try std.testing.expectError(error.ResourceLimitExceeded, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(quota.allocator(), &.{parsed.value}, graph, backend, &context, plugin));
+        try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+        try std.testing.expectEqual(@as(usize, 0), quota.live_bytes);
+        try std.testing.expect(quota.peak_bytes < large_name.len);
+    }
+    // With enough capacity, every retained executor allocation remains charged
+    // after loading and after the manager and source metadata have gone away.
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 24 * 1024 * 1024 } };
+    try policy.configure(&manager);
+    const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .decode_steps_limit = 0 };
+    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(quota.allocator(), &.{parsed.value}, graph, backend, &context, plugin);
+    var owned = executor.modelExecutor();
+    defer owned.deinit();
+    try std.testing.expect(quota.live_bytes > large_name.len);
+    try std.testing.expect(manager.currentAdmissionAmounts().hostTotalBytes() >= quota.live_bytes);
+    try std.testing.expect(executor.metadata_budget.?.capacity == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, graph_mod.pjrt_artifact_executor.createModelExecutorFromAdmittedArtifactBytes(quota.allocator(), std.testing.io, parsed.value, "fixture paged prefill", graph, backend, &executor.artifact_owner.?.client, &context));
+    for (parsed.value.pjrt_output_bindings) |*binding| {
+        if (std.mem.eql(u8, binding.kind, compiled_artifact.pjrt_binding_present_key)) binding.name = "explicit.present.key";
+    }
+    {
+        const explicit = try graph_mod.pjrt_artifact_executor.createModelExecutorFromAdmittedArtifactBytes(quota.allocator(), std.testing.io, parsed.value, "fixture paged prefill", graph, backend, &executor.artifact_owner.?.client, &context);
+        var explicit_owner = explicit.modelExecutor();
+        defer explicit_owner.deinit();
+        var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var explicit_run = try explicit_owner.createRuntime(no_allocations.allocator());
+        defer explicit_run.deinit();
+        try std.testing.expect(!no_allocations.has_induced_failure);
+        const ids: [16]i64 = @splat(1);
+        var output = try explicit_run.prefill(quota.allocator(), .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        defer output.deinit(quota.allocator());
+        try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, try output.hostLogits(quota.allocator()));
+    }
+    manager.deinit();
+    manager_live = false;
+    var run = try owned.createRuntime(quota.allocator());
+    defer run.deinit();
+    const controller = &executor.metadata_budget.?.lifetime.domain.admission;
+    const admitted = controller.snapshot();
+    const retained = quota.live_bytes;
+    try std.testing.expect(admitted.hostTotalBytes() >= retained);
+    const ids: [16]i64 = @splat(1);
+    for (0..3) |_| {
+        var output = try run.prefill(quota.allocator(), .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        output.deinit(quota.allocator());
+        try std.testing.expectEqual(retained, quota.live_bytes);
+        try std.testing.expectEqualDeep(admitted, controller.snapshot());
+    }
+    // An admitted immutable name is shared, not copied for each forward pass.
+    try std.testing.expect(quota.peak_bytes < 24 * 1024 * 1024);
+}
+
+fn managedKvPhaseLivenessScenario(a: std.mem.Allocator, prefill: []const u8, decode: []const u8, plugin: [:0]const u8, count: *const fn (usize) callconv(.c) usize) !void {
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .kv_limit_bytes = 16 } };
+    try policy.configure(&manager);
+    const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .runtime_capacity = 1, .decode_steps_limit = 2 };
+    var first = try compiled_artifact.readManifest(a, std.testing.io, prefill);
+    defer first.deinit();
+    var next = try compiled_artifact.readManifest(a, std.testing.io, decode);
+    defer next.deinit();
+    var last = try compiled_artifact.readManifest(a, std.testing.io, decode);
+    defer last.deinit();
+    last.value.seq_len = 18;
+    for (first.value.pjrt_output_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.name = if (std.mem.eql(u8, b.kind, compiled_artifact.pjrt_binding_present_key)) "a" else "b";
+    };
+    for (next.value.pjrt_input_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.kind = compiled_artifact.pjrt_binding_past_key;
+        b.name = "a";
+    };
+    for (next.value.pjrt_output_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.name = if (std.mem.eql(u8, b.kind, compiled_artifact.pjrt_binding_present_key)) "c" else "d";
+    };
+    for (last.value.pjrt_input_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.name = if (std.mem.eql(u8, b.kind, compiled_artifact.pjrt_binding_past_key)) "c" else "d";
+    };
+    for (last.value.pjrt_output_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.name = if (std.mem.eql(u8, b.kind, compiled_artifact.pjrt_binding_present_key)) "e" else "f";
+    };
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const id = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
+    try graph.markOutput(id);
+    var backend: ops.ComputeBackend = undefined;
+    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(a, &.{ first.value, next.value, last.value }, &graph, &backend, &context, plugin);
+    var owned = executor.modelExecutor();
+    defer owned.deinit();
+    var run = try owned.createRuntime(a);
+    defer run.deinit();
+    const ids: [16]i64 = @splat(1);
+    var output = try run.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+    output.deinit(a);
+    var out1 = try run.decode(a, .{ .token_id = 1, .position = 16 });
+    out1.deinit(a);
+    var out2 = try run.decode(a, .{ .token_id = 1, .position = 17 });
+    out2.deinit(a);
+    const admitted = manager.currentAdmissionAmounts().host_kv_bytes;
+    try std.testing.expectEqual(@as(usize, 16), admitted);
+    try std.testing.expectEqual(@as(usize, 8), count(11));
+    try std.testing.expect(count(12) <= admitted);
+    try std.testing.expectEqual(@as(usize, 2), executor.retained_capacity);
 }
