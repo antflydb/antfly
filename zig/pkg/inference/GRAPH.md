@@ -386,6 +386,103 @@ Offline artifacts are currently exact shape buckets. A different prompt can use 
 
 For PJRT whole-graph artifacts, `run-artifact --compare-host` compares artifact outputs against traced native graph captures for the same rendered prompt shape. The compare summary includes top-1 agreement plus last-logit and graph-output diffs, so a "sensible output" smoke test can be upgraded into an exact-shape correctness check.
 
+### Artifact memory admission
+
+Offline generation, draft models, tokenizer assets, and artifact execution share
+one invocation ledger. Explicit host, backend, combined, KV, and scratch caps
+apply across its CPU and GPU work. A request exceeding a cap rejects before
+provider construction; temporary occupancy remains retryable.
+
+PJRT execution requires a load-only executable exported with a versioned
+`pjrt_memory_plan`. Export records compiler residency/workspace statistics and
+SHA-256 identities for both executable bytes and the provider library. Re-export
+legacy executables after upgrading, and re-export when changing the provider.
+HLO export and `--validate` inspection remain available; managed execution of
+HLO or unprofiled executables returns `UnsupportedPjrtFeature` because compiling
+unknown native code cannot be admitted from encoded file size.
+
+The loader admits host serialized staging, host upload/download conversions,
+and the compiler footprint before initializing PJRT or creating a client. It reads
+executable bytes once, verifies
+both identities, deserializes the same buffer, and checks loaded statistics
+against the profile without increasing its lease. Staging allows an input copy
+and a provider copy; the input is freed after load, and the provider copy stays
+charged until client destruction. Profiles describe provider-reported compiled
+memory, not an OS isolation boundary for arbitrary third-party plugin code.
+
+This loader supports CPU and CUDA profiles. CUDA uses the first visible device, checks
+its physical capacity before client creation, and configures a bounded BFC pool
+with default-pool preallocation and extra transfer staging disabled. A separate
+2 MiB collective pool is explicitly charged; zero would select OpenXLA's
+unbounded automatic collective capacity. Code residency remains outside the
+allocator capacity. Both pools' alignment/fragmentation headroom is charged.
+Unified CUDA devices
+share the host envelope. Other providers must supply an admission contract before
+this loader can execute their artifacts.
+
+CLI generation uses one artifact execution path for both single-token and
+multi-token requests. It encodes the prompt once, preserving BOS and thinking
+options, and uses the same admission layer for prefill and every loaded decode
+variant. Resident code is summed, while arguments and KV/scratch
+share their largest phase envelope. Inputs load one at a time, each verified
+before deserialization; serialized staging is bounded by retained provider
+copies plus the largest input. The executor owns the client and leases until
+all runtimes and executable handles close. Cached runtimes retain their executor,
+client, graph metadata, and accounting domain across graph-cache eviction.
+Unsupported HLO or unprofiled caches
+are skipped during automatic lookup so they cannot mask a profiled executable.
+
+Managed CLI generation loads only the contiguous decode variants needed by the
+requested token count. Its prefill keeps the exact prompt shape, including under
+memory pressure; admission does not reduce it to a different artifact bucket.
+The native graph keeps KV page geometry without allocating duplicate CPU KV
+storage: the managed executable owns and admits that storage.
+
+Managed requests select complete contiguous prefill/decode chains before
+constructing the provider. Mode preference applies only among compatible chains
+that cover the requested token count, so incomplete embedded packages cannot
+hide complete input-parameter packages or standalone chains. Selection caches
+request-relevant sidecar metadata, checks executable availability without reading
+its bytes, and passes the parsed manifests directly to the admitted loader.
+The loader still verifies executable/provider identity and loaded statistics;
+identity or deserialization failures do not trigger another candidate.
+
+A prefill-only executable never doubles as a decode executable,
+even for a one-token prompt. Standalone lookup prefers profiled embedded
+parameters, then profiled external inputs, and rejects duplicate matches within
+the selected mode.
+
+Managed packages reserve `Context.runtime_capacity` independent execution slots
+(default one) before client construction. Each slot includes its own arguments,
+KV, scratch, and host transfer envelope; code, graph metadata, and serialized
+provider copies are charged once. Runtime creation borrows a slot atomically and
+returns temporary-unavailability when all slots are occupied. Destruction frees
+retained KV before returning the slot; failed runtime allocation returns it too.
+PJRT prefill starts a fresh sequence and releases prior retained KV inside the
+runtime before allocating replacement outputs. This bound holds for direct
+runtime reuse, including an allocation failure followed by retry.
+Capacity cannot grow beyond CUDA's already admitted fixed pool. Callers needing
+concurrent runtimes set the capacity when loading the executor, allowing full
+workspace concurrency without duplicating immutable executable residency.
+
+Managed CLI XLA generation defaults to whole-model load-only execution. Inline
+compilation, explicit partitioned generation, and speculative/multimodal XLA
+routes have no bounded compiler contract and return an unsupported-feature error;
+compile executable artifacts explicitly first. The `run-artifact` command still
+supports profiled partition executables. A missing matching executable reports
+`PjrtLoadOnlyArtifactsRequired` instead of falling back to unadmitted compilation.
+
+Bounded CUDA clients reject nonempty `XLA_FLAGS`, enabled
+`XLA_PJRT_GPU_HOST_MEMORY_PREALLOCATE`, and enabled `TF_FORCE_UNIFIED_MEMORY`
+before provider initialization. These process-wide policies can override the
+allocator capacity or preallocate host memory independently of Client_Create.
+CPU profiles are unaffected by these CUDA restrictions.
+
+Full recomputation reserves no host KV. Native paged partition materialization
+owns one host cache. Whole-model tracing retains page geometry without CPU KV
+storage; `--compare-host` acquires one reference cache and frees it before PJRT
+execution.
+
 ### Debug Artifacts
 
 Node-level artifacts are now part of the correctness workflow:

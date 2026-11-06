@@ -4281,6 +4281,8 @@ pub const NativeGenerationPipeline = struct {
     /// Optional PJRT client for TPU/CPU partition execution. Type-erased
     /// pointer to pjrt.Client; cast back in attachPjrtExecutors.
     pjrt_client: ?*anyopaque = null,
+    pjrt_admission: ?*const @import("../graph/pjrt_admission.zig").Context = null,
+    pjrt_plugin_path: ?[:0]const u8 = null,
 
     const prefetch_drain_budget_per_step: usize = 4;
     const default_mtp_zero_match_fallback_rounds: usize = 16;
