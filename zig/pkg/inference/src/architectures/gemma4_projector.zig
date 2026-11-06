@@ -7489,7 +7489,7 @@ test "gemma4 video CUDA projects resident frames and matches native patch projec
         guarded_vtable.toFloat32 = rejectGemma4VisionReadback;
         const guarded = ComputeBackend{ .ptr = cb.ptr, .vtable = &guarded_vtable };
         const before = cb.trainingRuntimeStats();
-        var video = try encodeProjectedVideoResident(&guarded, a, projector, @embedFile("../testdata/video/closed.mp4"));
+        var video = try encodeProjectedVideoResident(&guarded, a, projector, @embedFile("../testdata/video/closed.mp4"), false);
         defer video.deinit();
         try std.testing.expectEqual(before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
         try std.testing.expect(video.stats.selected_frames > 0);
