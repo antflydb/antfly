@@ -388,7 +388,7 @@ test "gemma4 video decodes HEVC in MP4 at FFmpeg's timestamps" {
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const bytes = @embedFile("../testdata/video/codecs/hevc-hvc1.mp4");
-    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
     const timestamps = try embedding_video.selectedPresentationUs(a, bytes, .{}, sampling, &pool);
     defer a.free(timestamps);
     try std.testing.expect(timestamps.len != 0);
