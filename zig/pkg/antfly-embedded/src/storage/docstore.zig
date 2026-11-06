@@ -590,6 +590,7 @@ pub const DocStore = struct {
         .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
         .begin_batch = beginWriteBatch,
+        .begin_batch_with_options = beginWriteBatchWithOptions,
     });
 
     pub const Txn = struct {
