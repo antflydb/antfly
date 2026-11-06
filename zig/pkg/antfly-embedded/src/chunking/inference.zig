@@ -304,9 +304,10 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     const boundary = if (resolved_outputs) |value| try value.value.boundary() else null;
     const model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else if (cfg.model.len > 0) cfg.model else "fixed";
     const capability_task: inference_work.Operation = if (boundary) |value| if (value.kind == .transcribe) .transcribe else .embed else if (cfg.embedding != null) .embed else .chunk;
-    // The node default credential accompanies only the node default
-    // endpoint; discovery and the chunk call authenticate identically.
-    const authorization = try execution.defaultAuthorizationAlloc(alloc, explicit_endpoint, endpoint_raw);
+    // The node default credential accompanies only the node default endpoint
+    // (chunkers carry no credential of their own); discovery and the chunk
+    // call authenticate identically.
+    const authorization = try execution.defaultAuthorizationAlloc(alloc, endpoint_raw);
     defer if (authorization) |value| alloc.free(value);
     var routing_header_storage: [2][2][]const u8 = undefined;
     var routing_header_count: usize = 0;

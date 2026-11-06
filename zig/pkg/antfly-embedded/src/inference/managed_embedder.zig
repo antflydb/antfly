@@ -3109,7 +3109,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer embedder_cfg.deinit(alloc);
             if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
             _ = parseEmbedderProvider(embedder_cfg) catch return error.UnsupportedCreateTableRequest;
-            break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_url, options.inference_api_key);
+            break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, semantic_producer_json, options.inference_api_url, options.inference_api_key);
         } else null;
         defer if (embedder_json) |raw| alloc.free(raw);
         if (embedder_json == null and !artifact_backed) return error.InvalidCreateTableRequest;
@@ -3184,7 +3184,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer embedder_cfg.deinit(alloc);
         _ = try parseEmbedderProvider(embedder_cfg);
         if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
-        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_url, options.inference_api_key);
+        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, semantic_producer_json, options.inference_api_url, options.inference_api_key);
     } else null;
     defer if (embedder_json) |raw| alloc.free(raw);
     if (!external and embedder_json == null and chunker_json == null and !artifact_backed) return error.InvalidCreateTableRequest;
@@ -7184,22 +7184,10 @@ fn resolveAntflyInferenceBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_
     return try normalizeAntflyInferenceBaseUrl(alloc, raw);
 }
 
-/// Whether `endpoint` is the node default inference endpoint, compared after
-/// the same `/ai/v1` normalization requests use. An empty endpoint (linked
-/// in-process execution) or an absent default never matches.
+/// The node default credential is scoped by the effective endpoint; see
+/// `execution_context.isDefaultEndpoint`.
 fn sameAntflyInferenceEndpoint(endpoint: []const u8, default_endpoint: ?[]const u8) bool {
-    const configured_default = default_endpoint orelse return false;
-    const requested = canonicalAntflyInferenceEndpoint(endpoint);
-    const node_default = canonicalAntflyInferenceEndpoint(configured_default);
-    return requested.len > 0 and node_default.len > 0 and std.ascii.eqlIgnoreCase(requested, node_default);
-}
-
-fn canonicalAntflyInferenceEndpoint(raw: []const u8) []const u8 {
-    var canonical = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \t\r\n"), "/");
-    if (std.mem.endsWith(u8, canonical, "/ai/v1")) {
-        canonical = std.mem.trimEnd(u8, canonical[0 .. canonical.len - "/ai/v1".len], "/");
-    }
-    return canonical;
+    return execution_context.isDefaultEndpoint(endpoint, default_endpoint);
 }
 
 test "node default inference endpoint matching ignores the api suffix only" {
@@ -7208,6 +7196,15 @@ test "node default inference endpoint matching ignores the api suffix only" {
     try std.testing.expect(!sameAntflyInferenceEndpoint("http://third-party:8080/ai/v1", "http://shared:8080/ai/v1"));
     try std.testing.expect(!sameAntflyInferenceEndpoint("", "http://shared:8080"));
     try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080", null));
+}
+
+fn effectiveEndpointIsDefault(alloc: std.mem.Allocator, cfg: embeddings_types.Config, semantic_producer_json: ?[]const u8, inference_api_url: ?[]const u8) !bool {
+    const producer = semantic_producer_json orelse
+        return cfg.url.len == 0 or sameAntflyInferenceEndpoint(cfg.url, inference_api_url);
+    var identity = std.json.parseFromSlice(std.json.Value, alloc, producer, .{}) catch
+        return error.InvalidEmbeddingArtifactProducer;
+    defer identity.deinit();
+    return sameAntflyInferenceEndpoint(try semanticIdentityStringField(identity.value, "endpoint"), inference_api_url);
 }
 
 fn configuredDefaultAntflyInferenceURL(options: InitOptions) ?[]const u8 {
@@ -8182,6 +8179,7 @@ fn stringifyManagedEmbedderConfigAlloc(
     alloc: std.mem.Allocator,
     cfg: embeddings_types.Config,
     raw_value: std.json.Value,
+    semantic_producer_json: ?[]const u8,
     inference_api_url: ?[]const u8,
     inference_api_key: ?[]const u8,
 ) ![]u8 {
@@ -8190,10 +8188,14 @@ fn stringifyManagedEmbedderConfigAlloc(
 
     const requests_per_minute = configObjectU32(raw_value, "requests_per_minute");
     const burst = configObjectU32(raw_value, "burst");
-    // The node credential belongs to the node endpoint: an embedder that names
-    // its own (possibly third-party) URL never inherits it.
+    // The node credential belongs to the node endpoint. Scope it by the
+    // effective endpoint this index executes against: its durable
+    // semantic_producer identity when present (an older index stays pinned to
+    // the endpoint it was created with), otherwise its own URL. An index that
+    // names another (possibly third-party) endpoint, or is pinned to a former
+    // default, never inherits the current key.
     const default_inference_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)) and
-        (cfg.url.len == 0 or sameAntflyInferenceEndpoint(cfg.url, inference_api_url)))
+        try effectiveEndpointIsDefault(alloc, cfg, semantic_producer_json, inference_api_url))
         inference_api_key
     else
         null;

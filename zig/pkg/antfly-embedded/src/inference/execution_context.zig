@@ -58,6 +58,25 @@ pub const Progress = execution_control.Progress;
 pub const ProgressSink = execution_control.ProgressSink;
 pub const RequestContext = execution_control.RequestContext;
 
+/// Whether `endpoint` is `default_endpoint`, compared after the `/ai/v1`
+/// normalization every Antfly inference client applies. Empty values never
+/// match. The node default credential is scoped by this comparison against
+/// the effective endpoint a request executes against.
+pub fn isDefaultEndpoint(endpoint: []const u8, default_endpoint: ?[]const u8) bool {
+    const configured = default_endpoint orelse return false;
+    const requested = canonicalEndpoint(endpoint);
+    const node_default = canonicalEndpoint(configured);
+    return requested.len > 0 and node_default.len > 0 and std.ascii.eqlIgnoreCase(requested, node_default);
+}
+
+fn canonicalEndpoint(raw: []const u8) []const u8 {
+    var canonical = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \t\r\n"), "/");
+    if (std.mem.endsWith(u8, canonical, "/ai/v1")) {
+        canonical = std.mem.trimEnd(u8, canonical[0 .. canonical.len - "/ai/v1".len], "/");
+    }
+    return canonical;
+}
+
 /// Node-level credential paired with `ExecutionEnvironment.default_endpoint`.
 /// `reference` is normally an unresolved `${secret:...}` reference; it is
 /// resolved per request so stored-secret rotation reaches running workers and
@@ -95,8 +114,7 @@ pub const ExecutionEnvironment = struct {
     /// retain it beyond their durable provider owner. Standalone invocations
     /// may create a call-scoped compatibility client when it is absent.
     http_client: ?*httpx.Client = null,
-    /// Credential for `default_endpoint` only. Explicit per-model URLs never
-    /// receive it; see `defaultAuthorizationAlloc`.
+    /// Credential for `default_endpoint` only; see `defaultAuthorizationAlloc`.
     default_credential: ?DefaultCredential = null,
 
     pub fn resolveAntflyEndpoint(
@@ -114,18 +132,16 @@ pub const ExecutionEnvironment = struct {
         return null;
     }
 
-    /// Owned `Authorization` value for a request that resolved to
-    /// `default_endpoint` (no explicit endpoint). Null otherwise, so a
-    /// third-party per-model URL is never sent the node credential.
+    /// Owned `Authorization` value for a request whose effective endpoint is
+    /// `default_endpoint` (inherited, or named explicitly). Null otherwise, so
+    /// a third-party per-model URL is never sent the node credential.
     pub fn defaultAuthorizationAlloc(
         self: ExecutionEnvironment,
         alloc: std.mem.Allocator,
-        explicit_endpoint: ?[]const u8,
         resolved_endpoint: ?[]const u8,
     ) !?[]u8 {
-        if (explicit_endpoint) |endpoint| if (std.mem.trim(u8, endpoint, " \t\r\n").len > 0) return null;
         const resolved = resolved_endpoint orelse return null;
-        if (std.mem.trim(u8, resolved, " \t\r\n").len == 0) return null;
+        if (!isDefaultEndpoint(resolved, self.default_endpoint)) return null;
         const credential = self.default_credential orelse return null;
         const token = (try credential.resolve(credential.resolver, alloc, credential.reference)) orelse return null;
         defer alloc.free(token);
@@ -205,14 +221,18 @@ test "default credential authorizes only the default endpoint" {
         .default_endpoint = "http://shared/ai/v1",
         .default_credential = .{ .reference = "${secret:node.key}", .resolve = Resolver.resolve },
     };
-    const authorization = (try context.defaultAuthorizationAlloc(alloc, null, "http://shared/ai/v1")).?;
+    const authorization = (try context.defaultAuthorizationAlloc(alloc, "http://shared/ai/v1")).?;
     defer alloc.free(authorization);
     try std.testing.expectEqualStrings("Bearer node-token", authorization);
-    // An explicit (possibly third-party) endpoint never receives it.
-    try std.testing.expect(try context.defaultAuthorizationAlloc(alloc, "http://third-party/ai/v1", "http://third-party/ai/v1") == null);
+    // Naming the default endpoint explicitly is still the default endpoint.
+    const explicit = (try context.defaultAuthorizationAlloc(alloc, "http://shared/")).?;
+    defer alloc.free(explicit);
+    try std.testing.expectEqualStrings("Bearer node-token", explicit);
+    // Another (possibly third-party) endpoint never receives it.
+    try std.testing.expect(try context.defaultAuthorizationAlloc(alloc, "http://third-party/ai/v1") == null);
     // Linked/in-process execution has no remote endpoint.
-    try std.testing.expect(try context.defaultAuthorizationAlloc(alloc, null, null) == null);
-    try std.testing.expect(try (Context{ .default_endpoint = "http://shared" }).defaultAuthorizationAlloc(alloc, null, "http://shared") == null);
+    try std.testing.expect(try context.defaultAuthorizationAlloc(alloc, null) == null);
+    try std.testing.expect(try (Context{ .default_endpoint = "http://shared" }).defaultAuthorizationAlloc(alloc, "http://shared") == null);
 }
 
 test "routing context appends trusted table header" {

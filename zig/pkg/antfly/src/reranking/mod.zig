@@ -482,9 +482,9 @@ pub fn rerankContentWithOptions(
             }
             const endpoint = resolved_endpoint orelse cfg.defaultedUrl();
             // The node default credential belongs to the node default
-            // endpoint only: an explicit reranker URL never receives it.
+            // endpoint only: any other reranker URL never receives it.
             var auth_cfg = cfg;
-            if (auth_cfg.api_key == null and explicit_endpoint == null and resolved_endpoint != null)
+            if (auth_cfg.api_key == null and execution_context.isDefaultEndpoint(endpoint, options.execution.default_endpoint))
                 auth_cfg.api_key = options.inference_api_key;
             var auth = try RequestAuthentication.init(alloc, auth_cfg, options.secret_store);
             defer auth.deinit(alloc);

@@ -659,17 +659,17 @@ pub const Runtime = struct {
     }
 
     /// The node default credential travels only with the node default
-    /// endpoint: a producer that names its own URL never receives it.
-    fn defaultInferenceCredentialReference(self: *const Runtime, explicit_url: ?[]const u8, routed_url: ?[]const u8) ?[]const u8 {
-        if (explicit_url) |url| if (std.mem.trim(u8, url, " \t\r\n").len > 0) return null;
+    /// endpoint: a producer whose effective URL is any other endpoint never
+    /// receives it.
+    fn defaultInferenceCredentialReference(self: *const Runtime, routed_url: ?[]const u8) ?[]const u8 {
         const routed = routed_url orelse return null;
-        if (std.mem.trim(u8, routed, " \t\r\n").len == 0) return null;
+        if (!execution_context.isDefaultEndpoint(routed, self.inference_api_url)) return null;
         return self.inference_api_key;
     }
 
     /// Resolve the default credential for one request. Caller owns the token.
-    fn resolveDefaultInferenceCredential(self: *const Runtime, alloc: Allocator, explicit_url: ?[]const u8, routed_url: ?[]const u8) !?[]u8 {
-        const reference = self.defaultInferenceCredentialReference(explicit_url, routed_url) orelse return null;
+    fn resolveDefaultInferenceCredential(self: *const Runtime, alloc: Allocator, routed_url: ?[]const u8) !?[]u8 {
+        const reference = self.defaultInferenceCredentialReference(routed_url) orelse return null;
         var secret = (try common_secrets.SecretValue.initConfig(alloc, reference)) orelse return null;
         defer secret.deinit(alloc);
         return try secret.resolveOwned(alloc, self.secret_store);
@@ -697,7 +697,7 @@ pub const Runtime = struct {
         cfg.url = try alloc.dupe(u8, endpoint);
         // The generation backend resolves this reference through the secret
         // store per request; the routed config is request-scoped.
-        if (cfg.api_key == null) if (self.defaultInferenceCredentialReference(null, endpoint)) |reference| {
+        if (cfg.api_key == null) if (self.defaultInferenceCredentialReference(endpoint)) |reference| {
             cfg.api_key = try alloc.dupe(u8, reference);
         };
     }
@@ -720,7 +720,7 @@ pub const Runtime = struct {
         // `extracting` sends `api_key` verbatim, so resolve the default
         // reference for this request-scoped config only.
         if (cfg.api_key == null and cfg.bearer_token == null)
-            cfg.api_key = try self.resolveDefaultInferenceCredential(alloc, null, endpoint);
+            cfg.api_key = try self.resolveDefaultInferenceCredential(alloc, endpoint);
     }
 
     pub fn producer(self: *Runtime) asset_producer.Producer {
@@ -1641,7 +1641,7 @@ pub const Runtime = struct {
         if (cfg.provider != .antfly or isLocalReaderProvider(cfg.provider, cfg.resolvedUrl()))
             return .{ .config = cfg };
         const reference = cfg.bearer_token orelse cfg.api_key orelse
-            self.defaultInferenceCredentialReference(raw.resolvedUrl(), cfg.resolvedUrl());
+            self.defaultInferenceCredentialReference(cfg.resolvedUrl());
         var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, reference, "ANTFLY_INFERENCE_API_KEY");
         defer secret.deinit(alloc);
         const credential = try secret.resolveOwned(alloc, self.secret_store);
@@ -1809,7 +1809,7 @@ pub const Runtime = struct {
         // Planning may see a config that was not routed yet; discovery must
         // still authenticate exactly like the routed invocation.
         const default_token = if (cfg.bearer_token == null and cfg.api_key == null)
-            try self.resolveDefaultInferenceCredential(alloc, cfg.resolvedUrl(), remote_endpoint)
+            try self.resolveDefaultInferenceCredential(alloc, remote_endpoint)
         else
             null;
         defer if (default_token) |token| alloc.free(token);
@@ -3959,14 +3959,13 @@ pub const Runtime = struct {
         });
         defer cfg_parsed.deinit();
         cfg_parsed.value.framed_attachments = false;
-        const explicit_transcriber_url = cfg_parsed.value.resolvedUrl();
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
         // `transcribing` sends `api_key` verbatim: resolve the node default
         // credential for this request only when it routed to the default endpoint.
         const default_transcriber_credential = if (cfg_parsed.value.provider == .antfly and
             cfg_parsed.value.api_key == null and cfg_parsed.value.bearer_token == null)
-            try self.resolveDefaultInferenceCredential(alloc, explicit_transcriber_url, cfg_parsed.value.resolvedUrl())
+            try self.resolveDefaultInferenceCredential(alloc, cfg_parsed.value.resolvedUrl())
         else
             null;
         defer if (default_transcriber_credential) |token| alloc.free(token);
@@ -6876,10 +6875,10 @@ test "asset producer runtime sends the default inference credential only to the 
     try std.testing.expectEqualStrings(runtime.inference_api_url.?, routed.url);
     try std.testing.expectEqualStrings("node-default-key", routed.api_key.?);
 
-    // An explicit (third-party) URL never inherits the node credential.
-    try std.testing.expect(runtime.defaultInferenceCredentialReference("http://third.example/ai/v1", "http://third.example/ai/v1") == null);
-    try std.testing.expect(runtime.defaultInferenceCredentialReference(null, null) == null);
-    const token = (try runtime.resolveDefaultInferenceCredential(alloc, null, runtime.inference_api_url)).?;
+    // Any other (third-party) URL never inherits the node credential.
+    try std.testing.expect(runtime.defaultInferenceCredentialReference("http://third.example/ai/v1") == null);
+    try std.testing.expect(runtime.defaultInferenceCredentialReference(null) == null);
+    const token = (try runtime.resolveDefaultInferenceCredential(alloc, runtime.inference_api_url)).?;
     defer alloc.free(token);
     try std.testing.expectEqualStrings("node-default-key", token);
 
