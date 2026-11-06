@@ -5101,7 +5101,7 @@ pub const DB = struct {
         self.core.artifact_cleanup_maybe.store(true, .release);
         self.local_execution.native_query_reuse_epoch_ready = false;
         self.relational_column_maintenance.waiting_until_ns.store(0, .release);
-        self.local_source_completion_audit_pending = true;
+        self.local_source_completion_audit_generation = null;
     }
 
     pub fn cancelVectorMigration(self: *DB, job_id: []const u8) !void {
