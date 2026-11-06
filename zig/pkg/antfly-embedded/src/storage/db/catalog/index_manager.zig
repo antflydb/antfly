@@ -20487,7 +20487,7 @@ pub const IndexManager = struct {
         }
         const options = try self.textProjectionOptionsForSchema(a, entry.runtime_schema == null and !textIndexSelectsAnyField(entry));
         const source = try mapper.buildTextProjectionSourceBatchWithOptions(a, filtered.items, options);
-        const with_ordinals = try self.textProjectionSourceDocsWithOrdinals(a, store, source.docs);
+        const with_ordinals = try self.textProjectionSourceDocsWithOrdinals(a, store, entry, source.docs);
         var observed: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
         var projected_ends: std.ArrayListUnmanaged(usize) = .empty;
         var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(a, entry.text_analysis, entry.runtime_schema, &observed, entry.selected_field);

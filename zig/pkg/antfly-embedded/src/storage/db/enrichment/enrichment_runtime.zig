@@ -15415,7 +15415,7 @@ fn flushPrimedPrivacyRoots(runtime: *EnrichmentRuntime, roots: []const enrichmen
     }
 }
 
-fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_worker.PendingDocumentGroup, plans: *std.ArrayListUnmanaged(RequestPlanCacheEntry), guard: ForegroundCatchUpGuard) !bool {
+fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_worker.PendingDocumentGroup, plans: *RequestPlanCache, guard: ForegroundCatchUpGuard) !bool {
     var roots: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest) = .empty;
     defer roots.deinit(runtime.alloc);
     var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
@@ -15455,23 +15455,24 @@ test "privacy independent roots preserve the bounded asset replay lane" {
     // storage or publish during the dependency-priming pass.
     var runtime: EnrichmentRuntime = undefined;
     runtime.alloc = a;
-    var plans: std.ArrayListUnmanaged(RequestPlanCacheEntry) = .empty;
+    var plans: RequestPlanCache = .empty;
+    defer plans.deinit(a);
     var pending: std.ArrayListUnmanaged(enrichment_worker.PendingDocumentGroup) = .empty;
     for (0..237) |index| {
         const key = try std.fmt.allocPrint(a, "doc-{d}", .{index});
         const requests = try a.alloc(enrichment_types.GeneratedEnrichmentRequest, 1);
         requests[0] = .{ .kind = .asset, .index_name = "", .artifact_name = "_privacy_document", .doc_key = key, .source_field = "__antfly_privacy_source" };
-        try plans.append(a, .{ .doc_key = key, .requests = requests });
+        try plans.put(a, key, requests);
         try pending.append(a, .{ .sequence = @intCast(index + 1), .doc_key = key });
     }
     try std.testing.expect(!try primePrivacyRoots(&runtime, pending.items, &plans, .{}));
-    var consumer = plans.items[0].requests[0];
+    var consumer = plans.get(pending.items[0].doc_key).?[0];
     consumer.upstream_artifact_name = "_privacy_document";
-    try std.testing.expect(assetHasConsumer(plans.items[0].requests[0], &.{consumer}));
+    try std.testing.expect(assetHasConsumer(plans.get(pending.items[0].doc_key).?[0], &.{consumer}));
     consumer.upstream_artifact_name = "";
     consumer.kind = .chunk_text;
     consumer.input_kind = .materialized_chunks;
-    try std.testing.expect(assetHasConsumer(plans.items[0].requests[0], &.{consumer}));
+    try std.testing.expect(assetHasConsumer(plans.get(pending.items[0].doc_key).?[0], &.{consumer}));
 }
 
 fn runGeneratedCatchUpQuanta(
