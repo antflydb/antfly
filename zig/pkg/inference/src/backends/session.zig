@@ -1567,6 +1567,11 @@ pub const ModelContract = struct {
     resolved: bool = false,
     padding: enum { declared, batch_max } = .declared,
     resident_text_embeddings: bool = false,
+    /// The original public host run already returns final normalized F32
+    /// rows [batch, width]. Select that ABI for final host vectors instead of
+    /// uploading its result only to download it again through a resident view.
+    /// Scalar metadata is copied by wrappers; no backend/storage owner escapes.
+    normalized_text_host_output_width: ?usize = null,
     /// Geometry for declared additive attention masks, resolved by the model owner.
     text_attention_heads: u32 = 0,
 };

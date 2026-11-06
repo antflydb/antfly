@@ -87,6 +87,50 @@ pub const HiddenSource = enum {
     }
 };
 
+/// Owns one resident token across physical steps. The backend and optional lane
+/// are borrowed from their real owners, never from a temporary Runtime adapter.
+/// Moving a token empties the source; cancellation cannot prevent retirement.
+pub const DeviceToken = struct {
+    backend: *const ComputeBackend,
+    access: ?@import("../execution_control.zig").ExecutionAccess = null,
+    tensor: ?ops.CT = null,
+
+    pub fn clear(self: *DeviceToken) void {
+        const tensor = self.take() orelse return;
+        var scope = if (self.access) |access| access.acquireReleaseScope() else null;
+        defer if (scope) |*owned| owned.deinit();
+        self.backend.free(tensor);
+    }
+
+    pub fn take(self: *DeviceToken) ?ops.CT {
+        const tensor = self.tensor;
+        self.tensor = null;
+        return tensor;
+    }
+
+    /// Transfers a newly owned handle, retiring the previous step's handle.
+    pub fn replace(self: *DeviceToken, tensor: ?ops.CT) void {
+        self.clear();
+        self.tensor = tensor;
+    }
+
+    pub fn resolve(self: *const DeviceToken, allocator: std.mem.Allocator) !usize {
+        const tensor = self.tensor orelse return error.MissingDeviceToken;
+        var scope = if (self.access) |access| try access.acquireScope() else null;
+        defer if (scope) |*owned| owned.deinit();
+        return gpt_arch.resolveGreedyDeviceTokenTensor(self.backend, allocator, tensor);
+    }
+
+    pub fn seed(self: *DeviceToken, token: usize) !void {
+        if (self.tensor != null) return error.DeviceTokenAlreadyOwned;
+        var scope = if (self.access) |access| try access.acquireScope() else null;
+        defer if (scope) |*owned| owned.deinit();
+        const data = [_]i32{@intCast(token)};
+        const tensor = try self.backend.fromInt32Shape(&data, &.{1});
+        self.tensor = tensor;
+    }
+};
+
 pub const DeviceTokenOutcome = struct { token: usize, token_tensor: ?ops.CT = null };
 pub const DeviceStepEvents = struct { handoff_attempts: usize = 0, handoff_hits: usize = 0, handoff_fallbacks: usize = 0 };
 pub const DeviceStepRequest = struct {
@@ -152,6 +196,23 @@ pub const HeadPreparationTrace = struct {
     weight_us: u64 = 0,
 };
 
+/// Task semantics are resolved before this physical dispatch. Scheduling,
+/// cached-prefill reuse and token acceptance remain with their task owner.
+pub const EagerStepRequest = struct {
+    token_history: []const i64,
+    sequence_length: usize,
+    generated_tokens: usize,
+    has_prefill_logits: bool,
+    compiled_sampling: ?graph_mod.model_runtime.SamplingConfig = null,
+    compiled_sampling_eligible: bool = false,
+    compiled_greedy_eligible: bool = false,
+    prefetch_drain_budget: usize = 4,
+};
+
+/// A token is a completed selection; logits are owned by the caller's runtime
+/// allocator and retain the ordinary task sampler/grammar path.
+pub const EagerStepResult = union(enum) { token: usize, logits: []f32 };
+
 pub const Runtime = struct {
     fn classifyDeviceStep(result: DeviceStepResult) @import("invocation_observation.zig").ResultClassification {
         return .{ .unsupported = result == .declined };
@@ -188,22 +249,6 @@ pub const Runtime = struct {
         if (request.grammar_active) return .grammar_blocked;
         if (request.mode == .tensor and !deviceTokenHandoffEnabled()) return .handoff_disabled;
         return .eligible;
-    }
-
-    /// Integer input placement and cleanup belong to the physical decoder.
-    /// A supplied access is the caller's exact model-lane capability. Cleanup
-    /// uses its noncancellable path even when the request was cancelled.
-    pub fn createDeviceToken(self: *Runtime, token: usize, access: ?@import("../execution_control.zig").ExecutionAccess) !?ops.CT {
-        var execution_scope = if (access) |lane| try lane.acquireScope() else null;
-        defer if (execution_scope) |*scope| scope.deinit();
-        const data = [_]i32{@intCast(token)};
-        return self.context.cb.fromInt32Shape(&data, &.{1});
-    }
-
-    pub fn destroyDeviceToken(self: *Runtime, tensor: ops.CT, access: ?@import("../execution_control.zig").ExecutionAccess) void {
-        var execution_scope = if (access) |lane| lane.acquireReleaseScope() else null;
-        defer if (execution_scope) |*scope| scope.deinit();
-        self.context.cb.free(tensor);
     }
 
     pub fn forwardDeviceStep(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
@@ -778,6 +823,33 @@ pub const Runtime = struct {
         if (!NativeDecodeState.requiresDeepSeekV4CompressedCache(self.context.gpt_config.*)) return;
         if (self.graph_cache != null or self.context.compiled_partition_backend != null)
             return error.DeepSeekV4CompressedGraphModeNotSupported;
+    }
+
+    /// Resolve eager query geometry from the actual state, then retain the
+    /// original sampled-compiled, greedy-compiled and logits dispatch order.
+    /// This borrows the caller's existing numerical lane; no state advances or
+    /// fallback replay are added, and existing forward observations stay scoped
+    /// to the actual selected callback.
+    pub fn eagerStep(self: *Runtime, state: *NativeDecodeState, request: EagerStepRequest) !EagerStepResult {
+        self.context.cb.drainPrefetchBudget(request.prefetch_drain_budget);
+        var physical = BorrowedDecodeStateRuntime.init(state);
+        const query_rows = if (physical.kvView() != null and (request.generated_tokens > 0 or !request.has_prefill_logits)) 1 else request.sequence_length;
+        const decode = physical.makeDecodeContext(request.sequence_length, query_rows);
+        const input_ids = if (query_rows == request.sequence_length)
+            request.token_history[0..request.sequence_length]
+        else
+            request.token_history[request.sequence_length - query_rows .. request.sequence_length];
+        debugGenerationStage(
+            "standardDecode iter={d} requesting logits query_seq_len={d} input_len={d}",
+            .{ request.generated_tokens, query_rows, input_ids.len },
+        );
+        if (request.compiled_sampling) |sampling| {
+            if (try self.forwardCompiledSampled(input_ids, request.sequence_length, &decode, sampling, request.token_history[0..request.sequence_length], request.compiled_sampling_eligible)) |token| return .{ .token = token };
+        }
+        if (request.compiled_greedy_eligible) {
+            if (try self.forwardCompiledGreedy(input_ids, 1, request.sequence_length, &decode)) |token| return .{ .token = token };
+        }
+        return .{ .logits = try self.forwardLastLogits(input_ids, 1, request.sequence_length, &decode) };
     }
 
     pub fn forwardLastLogits(
@@ -1979,7 +2051,7 @@ fn checkDevicePlacementOwner(cb: ComputeBackend, _: ComputeBackend) !void {
     const cfg = @import("testing/decoder.zig").config();
     var state = NativeDecodeState.initContiguous(a);
     defer state.deinit();
-    var physical = Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } };
+    const physical = Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } };
     const route = physical.deviceRoute(&state, .{ .mode = .scalar, .generated_tokens = 0, .pure_greedy = true, .grammar_active = false });
     try std.testing.expectEqual(if (cb.kind() == .native) DeviceRoute.backend_not_device else DeviceRoute.first_token_blocked, route);
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
@@ -1997,21 +2069,45 @@ fn checkDevicePlacementOwner(cb: ComputeBackend, _: ComputeBackend) !void {
     };
     var cancel = Cancel{};
     const access = ctl.ExecutionAccess{ .mutex = &mutex, .gate = &lane, .control = .{ .ptr = &cancel, .check_fn = Cancel.check } };
+    var owner = DeviceToken{ .backend = &cb, .access = access };
+    defer owner.clear();
     cancel.cancelled = true;
-    try std.testing.expectError(error.Cancelled, physical.createDeviceToken(1, access));
+    try std.testing.expectError(error.Cancelled, owner.seed(1));
     try @import("testing/decoder.zig").checkUnlocked(&mutex, &lane);
     cancel.cancelled = false;
-    const token = (try physical.createDeviceToken(1, access)) orelse return error.MissingDeviceTokenPlacement;
-    var live = true;
-    defer if (live) physical.destroyDeviceToken(token, access);
+    try owner.seed(1);
+    try std.testing.expectError(error.DeviceTokenAlreadyOwned, owner.seed(2));
+    const token = owner.tensor.?;
+    try std.testing.expectEqual(@as(usize, 1), try owner.resolve(a));
     try @import("testing/decoder.zig").checkUnlocked(&mutex, &lane);
     try std.testing.expectEqual(@import("../backends/tensor.zig").DType.i32, try cb.tensorDType(token));
     const shape = try cb.tensorShape(token, a);
     defer a.free(shape);
     try std.testing.expectEqualSlices(i64, &.{1}, shape);
     cancel.cancelled = true;
-    physical.destroyDeviceToken(token, access);
-    live = false;
+    try std.testing.expectError(error.Cancelled, owner.resolve(a));
+    owner.clear();
+    try @import("testing/decoder.zig").checkUnlocked(&mutex, &lane);
+    var current = DeviceToken{ .backend = &cb, .access = access };
+    defer current.clear();
+    var next = DeviceToken{ .backend = &cb, .access = access };
+    defer next.clear();
+    try std.testing.expectError(error.Cancelled, next.seed(2));
+    try std.testing.expect(next.tensor == null);
+    cancel.cancelled = false;
+    try current.seed(2);
+    try next.seed(3);
+    const moved = next.tensor.?;
+    // Handoff retires the prior input even after cancellation. The transferred
+    // handle stays live until its receiving slot is cleared, exactly once.
+    cancel.cancelled = true;
+    current.replace(next.take());
+    try std.testing.expect(next.tensor == null);
+    try std.testing.expectEqual(moved, current.tensor.?);
+    try std.testing.expectEqual(@import("../backends/tensor.zig").DType.i32, try cb.tensorDType(current.tensor.?));
+    current.clear();
+    current.clear();
+    try std.testing.expect(current.tensor == null);
     try @import("testing/decoder.zig").checkUnlocked(&mutex, &lane);
     try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
 }
@@ -2034,15 +2130,18 @@ test "physical token placement actual Native allocation faults leave no physical
             var compute = native.NativeCompute.init(a, &weights, null);
             defer compute.deinit();
             const cb = compute.computeBackend();
-            const cfg = @import("testing/decoder.zig").config();
-            var physical = Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } };
             const ctl = @import("../execution_control.zig");
             var mutex: std.atomic.Mutex = .unlocked;
             var lane: ctl.ExecutionLane = .{};
             const access = ctl.ExecutionAccess{ .mutex = &mutex, .gate = &lane };
             defer @import("testing/decoder.zig").checkUnlocked(&mutex, &lane) catch @panic("leaked physical token lane");
-            const token = (try physical.createDeviceToken(1, access)) orelse return error.MissingDeviceTokenPlacement;
-            defer physical.destroyDeviceToken(token, access);
+            var current = DeviceToken{ .backend = &cb, .access = access };
+            defer current.clear();
+            var next = DeviceToken{ .backend = &cb, .access = access };
+            defer next.clear();
+            try current.seed(2);
+            try next.seed(3);
+            current.replace(next.take());
         }
     };
     try Case.run(std.testing.allocator);
@@ -2160,4 +2259,56 @@ test "physical decoder Native head rows preserve borrowed source selected slice 
 
 test "physical decoder Metal head rows preserve borrowed source selected slice and one-time prepared tail transfer" {
     try @import("../ops/media_residency_test.zig").onMetal(populateDeviceStepWeights, checkPhysicalHeadRows);
+}
+
+fn checkActualEagerStep(backend_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const backend = &backend_value;
+    const config = @import("../models/gpt.zig").Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    const ids = [_]i64{ 0, 1 };
+    const kv = @import("../runtime/root.zig").kv;
+    for ([_]bool{ false, true }) |paged| {
+        var manager = kv.manager.KvManager.init(a);
+        defer manager.deinit();
+        const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
+        var state = if (paged) NativeDecodeState.initPaged(a, &manager, pool, null) else NativeDecodeState.initContiguous(a);
+        defer state.deinit();
+        try state.notePrefill(ids.len);
+        for ([_]bool{ false, true }) |has_prefill| {
+            const query_rows: usize = if (paged and !has_prefill) 1 else ids.len;
+            var borrowed = BorrowedDecodeStateRuntime.init(&state);
+            const decode = borrowed.makeDecodeContext(ids.len, query_rows);
+            const expected = try gpt_arch.forward(backend, a, config, ids[ids.len - query_rows ..], 1, ids.len, &decode);
+            defer a.free(expected);
+            const before = state.total_tokens;
+            var numerical = Runtime{ .context = .{ .allocator = a, .cb = backend, .gpt_config = &config, .weight_semantics = .traced_decoder } };
+            const actual = try numerical.eagerStep(&state, .{
+                .token_history = &ids,
+                .sequence_length = ids.len,
+                .generated_tokens = if (has_prefill) 0 else 1,
+                .has_prefill_logits = has_prefill,
+                // Both compiled variants must cleanly decline on this actual
+                // uncompiled model and preserve the original logits path.
+                .compiled_sampling = if (has_prefill) .{ .temperature = 0.7 } else null,
+                .compiled_sampling_eligible = has_prefill,
+                .compiled_greedy_eligible = !has_prefill,
+            });
+            const logits = switch (actual) {
+                .token => return error.UnexpectedEagerToken,
+                .logits => |values| values,
+            };
+            defer a.free(logits);
+            try std.testing.expectEqualSlices(f32, expected[(query_rows - 1) * config.vocab_size ..], logits);
+            try std.testing.expectEqual(before, state.total_tokens);
+        }
+    }
+}
+
+test "physical decoder Native eager step keeps actual KV query geometry compiled declines and task state" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("../ops/media_residency_test.zig").onNative(populateDeviceStepWeights, checkActualEagerStep);
+}
+
+test "physical decoder Metal eager step keeps actual KV query geometry compiled declines and task state" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateDeviceStepWeights, checkActualEagerStep);
 }

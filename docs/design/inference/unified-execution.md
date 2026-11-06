@@ -103,23 +103,23 @@ preparation API do not by themselves complete these remaining requirements:
   input groups share one checked remapping helper: removed nodes contribute no
   binding, surviving inputs retain their backend owners, and invalid mappings
   fail before allocation. Production and diagnostic Laya training share it.
-- Assigned outputs/workspace cover admitted native/CUDA descriptors, while Metal
-  consumes its existing physical allocation plan. Prepared CUDA graphs with full
-  assigned-kernel coverage can capture the plan's stable output, workspace,
-  mutable-input and F32-literal banks. Binding roles, exact context identity,
-  immutable-handle ownership and copy/launch costs gate admission. Backend
-  predicates exclude packed/reduced and vendor-workspace routes whose complete
-  temporary ownership is not yet in that plan, preserving their tuned dispatch.
-  F32 literals share one immutable allocation across frames; explicit literal
-  overrides use ordinary execution without mutating captured storage. Dense
-  metadata reshapes preserve backing storage and output shapes. Recording and
-  instantiation failures fall back before compute submission; submission errors
-  propagate.
-  Captures own their address leases; published outputs and foreign captures
-  prevent reuse of mutable frame storage. Cancellation/side-channel requests and unsupported
-  graphs retain ordinary execution, with explicit replay decisions in diagnostics.
-  Model-specific decode capture retains its learned arena as a compatibility
-  path. Universal physical planning and retirement of that fallback remain open.
+- Assigned outputs and workspace cover admitted Native/CUDA descriptors and
+  Metal's physical frame routes. Exact backend services attest each complete
+  program's input, literal, alias, kernel and workspace ownership before replacing
+  compatibility admission estimates. Unsupported regions and private temporary
+  owners retain their existing envelopes. CUDA prepared projections declare
+  supported reduced/packed conversions and vendor workspace; these declarations
+  preserve their tuned launches rather than replacing them with generic math.
+  Eligible CUDA frames capture stable output, workspace, mutable-input and
+  immutable-literal banks. Binding roles, exact context identity, immutable
+  handle ownership and copy/launch costs gate admission. Explicit literal
+  overrides use ordinary execution without mutating captured storage. Recording
+  and instantiation failures fall back before compute submission; submission
+  errors propagate. Captures retain address leases; published outputs and foreign
+  captures prevent mutable frame reuse. Cancellation and unsupported signatures
+  retain ordinary execution with explicit replay decisions in diagnostics.
+  Learned decoder/audio arenas remain compatibility owners where their complete
+  temporary recipes have not migrated; capture alone grants no ownership credit.
 - `model_definition.zig` owns artifact loading. Native and PJRT sessions share
   one failure-atomic host preparation path for normalization, resident/lazy
   weights and prefetch ownership. CUDA reuses its admitted manifest snapshot
@@ -136,8 +136,7 @@ preparation API do not by themselves complete these remaining requirements:
   Construction peaks remain leased until preparation succeeds; component load
   ordering and immediate cancellation checkpoints retain their existing rules.
   `compute_context.zig`, prepared executables and model candidates separate
-  further responsibilities. Architecture constructors/preparation internals and
-  remaining generation physical choices still need responsibility migration. Optional specialized hooks now use typed
+  further responsibilities. Optional specialized hooks use typed
   operation regions (decoder, replay, relative/window attention, encoder,
   projection, vision/audio, speculative verification and token selection).
   Historical public method names are compatibility adapters; new implementations
@@ -176,6 +175,9 @@ preparation API do not by themselves complete these remaining requirements:
   historical Nomic request/method/native symbols remain compatibility bindings.
   Single-row means reuse that program to normalize other pooling results.
   No new Metal shader is needed. Prepared normalized heads skip empty batches.
+  Producers that already return final normalized host rows declare that output
+  contract explicitly; requested host vectors consume the original host ABI
+  without uploading them solely to download them through a resident wrapper.
   `execution/submission.zig` owns command scopes, preserving foreign batches,
   cancelling only owned unsubmitted work and avoiding replay after submission
   errors. Nine generic command callbacks live in `CommandSubmissionRegion`;
@@ -203,16 +205,19 @@ preparation API do not by themselves complete these remaining requirements:
   epoch calls it directly; a separate task adapter publishes completed results
   while retaining the scheduler turn and lane. A shared execution-access record
   preserves FIFO/phase priority and cancellation-independent cleanup.
-  `execution/decoder_forward.zig` owns nineteen logits/hidden-state and compiled
-  token dispatch methods behind a borrowed runtime context, without task or
-  tokenizer dependencies. Generation supplies request eligibility and publishes
+  `execution/decoder_forward.zig` owns logits/hidden-state and compiled token
+  dispatch behind a borrowed runtime context, without task or tokenizer
+  dependencies. It derives eager query geometry from live decode state and
+  selects compiled token or logits execution. Resident token slots own handoff,
+  readback and cancellation-independent retirement across ordinary and pending
+  decode. Generation supplies semantic eligibility, schedules turns and publishes
   results. Native whole-model execution shares the last-logits implementation;
   retained hidden outputs point to the real backend, never the temporary adapter.
   `execution/decoder_storage.zig` owns pool geometry, metadata-only CUDA request
   pools, checkpoint geometry, route capacity and lazy reservation policy. Native,
   Metal and generation reuse it while explicitly preserving architectural versus
-  compact stored-layer layouts and host-mirror choices. Remaining direct device
-  token/eager choices and resident task transitions still need migration.
+  compact stored-layer layouts and host-mirror choices. Remaining specialized
+  task transitions and compatibility arenas retain their explicit owners.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU
@@ -220,11 +225,15 @@ preparation API do not by themselves complete these remaining requirements:
   four transitions; held earlier outputs detect frame overwrites. Immutable
   matrix packing is warmed before strict readback checks. This matrix validates
   format equivalence; it does not benchmark packed quantized serving kernels.
-- Execution diagnostics include per-invocation context counter deltas and
-  specialization decisions, alongside dispatch/transfer/reuse statistics and
-  explicitly scoped memory gauges. Unmeasured values are null, and lifetime
-  high-water memory is not presented as an invocation peak. Complete Metal
-  launch/synchronization and persistent/transient peak accounting remains open.
+- Execution diagnostics publish one owned report for actual invocation or
+  pending-phase observations: transfers and bytes, accepted dispatch/submission
+  and wait units, specialization decisions, selected Native bodies and workers,
+  known fallback producers, and registered host/device allocation owners. Batch
+  participants and pending outcomes survive model retirement. Registered owner
+  intervals can include concurrent activity; lifetime peaks are labelled as such.
+  Unobserved fallback reasons and opaque vendor/private allocation domains remain
+  unavailable. These scoped observations do not claim a whole-backend census or
+  an exclusive invocation memory peak.
 
 The issue checklist records implementation and evidence separately from remaining
 migration. Compatibility paths stay until their replacements satisfy correctness,

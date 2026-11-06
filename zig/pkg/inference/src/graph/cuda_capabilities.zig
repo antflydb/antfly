@@ -174,6 +174,11 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
             const rc = attrs.rhs_contracting[0];
             if (attrs.num_batch > 0) {
                 _ = primitive_plans.planBatchedDotGeneral(lhs.dims[0..lhs.rank()], rhs.dims[0..rhs.rank()], attrs.lhs_contracting[0..1], attrs.rhs_contracting[0..1], attrs.lhs_batch[0..attrs.num_batch], attrs.rhs_batch[0..attrs.num_batch]) catch return reject(.unsupported_op);
+            } else if (lhs.rank() == 2 and lc == 0) {
+                // The original primitive already contracts a transposed LHS
+                // directly; retain its matrix flags instead of a CPU transfer.
+                const plan = primitive_plans.planDenseDotGeneral(lhs.dims[0..lhs.rank()], rhs.dims[0..rhs.rank()], attrs.lhs_contracting[0..1], attrs.rhs_contracting[0..1], &.{}, &.{}) catch return reject(.unsupported_op);
+                if (node.output_shape.rank() != 2 or node.output_shape.dim(0) != plan.m or node.output_shape.dim(1) != plan.n) return reject(.unsupported_op);
             } else if (lhs.rank() < 2 or rhs.rank() != 2 or lc != lhs.rank() - 1 or rc > 1 or lhs.dim(lc) != rhs.dim(rc)) return reject(.unsupported_op);
         },
         .fused_linear, .fused_linear_no_bias => |attrs| {
@@ -307,5 +312,32 @@ test "CUDA grouped projections lower their combined matrix without admitting mal
         };
         try std.testing.expect(!decide(.{ .graph = &graph, .node_id = id, .op = graph.node(id).op }).can_execute);
         try std.testing.expect(descriptor.lower(&graph, id) == null);
+    }
+}
+
+test "CUDA graph legality admits exact transposed LHS matrix layouts without admitting strided or malformed inputs" {
+    const a = std.testing.allocator;
+    inline for (.{ false, true }) |rhs_transposed| {
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.graph.Builder.init(&graph);
+        const lhs = try builder.parameter("lhs", ml.graph.Shape.init(.f32, &.{ 5, 3 }));
+        const rhs_shape = if (rhs_transposed) [_]i64{ 4, 5 } else [_]i64{ 5, 4 };
+        const rhs = try builder.parameter("rhs", ml.graph.Shape.init(.f32, &rhs_shape));
+        const product = try builder.matmul2DLayout(lhs, rhs, true, rhs_transposed);
+        var query = partition.CapabilityQuery{ .graph = &graph, .node_id = product, .op = graph.node(product).op };
+        try std.testing.expect(decide(query).can_execute);
+        graph.nodeMut(product).output_shape = ml.graph.Shape.init(.f32, &.{ 4, 3 });
+        try std.testing.expect(!decide(query).can_execute);
+        graph.nodeMut(product).output_shape = ml.graph.Shape.init(.f32, &.{ 3, 4 });
+        query.op.dot_general.rhs_contracting[0] = 2;
+        try std.testing.expect(!decide(query).can_execute);
+        query.op = graph.node(product).op;
+        var descriptors = [_]?contracts.TensorDesc{ contracts.TensorDesc.view(graph.node(lhs).output_shape, lhs, contracts.TensorStrides.init(&.{ 1, 5 }), .cuda, 0), null, null };
+        query.tensor_descs = &descriptors;
+        try std.testing.expectEqual(partition.CapabilityReason.wrong_storage, decide(query).reason);
+        query.tensor_descs = null;
+        graph.nodeMut(rhs).output_shape.dtype = .bf16;
+        try std.testing.expect(!decide(query).can_execute);
     }
 }

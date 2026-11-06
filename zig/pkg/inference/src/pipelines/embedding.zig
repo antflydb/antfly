@@ -4227,6 +4227,33 @@ pub const EmbeddingPipeline = struct {
     ) !?[][]f32 {
         const encoder_start = embedTimingStart(self.print_timing);
         if (self.config.pooling == .mean) {
+            if (self.session.model_contract.normalized_text_host_output_width) |width| {
+                if (width == 0) return error.UnexpectedOutputShape;
+                const rows = std.math.cast(i64, batch) orelse return error.ShapeMismatch;
+                const columns = std.math.cast(i64, width) orelse return error.ShapeMismatch;
+                const bytes = try std.math.mul(usize, try std.math.mul(usize, batch, width), @sizeOf(f32));
+                // This is the SAME admitted Source and original host producer;
+                // intermediate encoder work remains on its selected backend.
+                const outputs = try permit.runWithControl(inputs, self.allocator, self.execution_control);
+                defer {
+                    for (outputs) |*output| output.deinit();
+                    self.allocator.free(outputs);
+                }
+                if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 2) return error.UnexpectedOutputShape;
+                if (outputs[0].shape[0] != rows or outputs[0].shape[1] != columns or outputs[0].data.len != bytes) return error.ShapeMismatch;
+                const requested = if (self.text_projection == null and @import("../execution/architecture_session.zig").gemmaCudaOwnedTextWidth(self.session) != null)
+                    self.config.embedding_gemma2_dimensions
+                else
+                    null;
+                const embeddings = try self.copyPooledTextRows(outputs[0].asFloat32(), batch, width, requested);
+                self.last_resident_backend_timing = null;
+                if (self.session.invocation_diagnostics) |binding| if (binding.stable_backend) |backend| {
+                    self.last_resident_backend_timing = @import("../execution/metadata_sample.zig").snapshot(&backend);
+                };
+                logEmbedTiming("text.encoder.pool_normalize.host_final", batch, encoder_start);
+                self.recordResidentProjection(.text, .success, "text.encoder.pool_normalize.host_final", batch, null);
+                return embeddings;
+            }
             if (try permit.runResidentTextEmbeddingWithControl(inputs, .{
                 .pooling = .mean,
                 .normalize = self.config.normalize,
@@ -4508,8 +4535,14 @@ pub const EmbeddingPipeline = struct {
 
         const data = try outputs.backend.toFloat32(resident_output, self.allocator);
         defer self.allocator.free(data);
-        if (data.len != batch * proj_dim) return error.ShapeMismatch;
+        return self.copyPooledTextRows(data, batch, proj_dim, requested_width);
+    }
 
+    /// Both original resident readback and declared final-host output share the
+    /// same F32 copy/prefix-normalization order. Full width is never renormalized.
+    fn copyPooledTextRows(self: *EmbeddingPipeline, data: []const f32, batch: usize, proj_dim: usize, requested_width: ?usize) ![][]f32 {
+        const output_width = requested_width orelse proj_dim;
+        if (output_width == 0 or output_width > proj_dim or data.len != try std.math.mul(usize, batch, proj_dim)) return error.ShapeMismatch;
         const embeddings = try self.allocator.alloc([]f32, batch);
         var initialized: usize = 0;
         errdefer {
@@ -8630,9 +8663,11 @@ test "Gemma public text original source task escrow preserves four-row windows c
             var other_pooling = pipeline;
             other_pooling.config.pooling = .cls;
             try std.testing.expect(!other_pooling.canEmbedOwned());
-            var invalid_width = pipeline;
-            invalid_width.config.embedding_gemma2_dimensions = 129;
-            try std.testing.expect(!invalid_width.canEmbedOwned());
+            for ([_]usize{ 0, 769 }) |width| {
+                var invalid_width = pipeline;
+                invalid_width.config.embedding_gemma2_dimensions = width;
+                try std.testing.expect(!invalid_width.canEmbedOwned());
+            }
         }
         var owned_trace: embedding_trace.Trace = .{ .allocator = a, .io = std.testing.io, .directory = "", .id = 0, .started_ns = 0, .path = "", .model = "", .inputs = &texts, .task_type = "CLUSTERING", .instruction = null };
         pipeline.trace = &owned_trace;
@@ -8656,7 +8691,11 @@ test "Gemma public text original source task escrow preserves four-row windows c
         try std.testing.expectEqual(@as(usize, texts.len), owned.len());
         var raw_trace: embedding_trace.Trace = .{ .allocator = a, .io = std.testing.io, .directory = "", .id = 0, .started_ns = 0, .path = "", .model = "", .inputs = &texts, .task_type = "CLUSTERING", .instruction = null };
         pipeline.trace = &raw_trace;
-        const raw = try pipeline.embed(&texts);
+        // Freeze the original resident wrapping route as the independent
+        // control; only the candidate consumes the new final-host descriptor.
+        var original_pipeline = pipeline;
+        original_pipeline.session.model_contract.normalized_text_host_output_width = null;
+        const raw = try original_pipeline.embed(&texts);
         defer freeEmbeddingSlices(a, raw);
         try std.testing.expect(owned_trace.shape_count > 0);
         try std.testing.expectEqual(owned_trace.shape_count, raw_trace.shape_count);
@@ -8672,7 +8711,9 @@ test "Gemma public text original source task escrow preserves four-row windows c
             var no_normalize = pipeline;
             no_normalize.trace = null;
             no_normalize.config.normalize = false;
-            const original = try no_normalize.embed(texts[0..1]);
+            var original_false = no_normalize;
+            original_false.session.model_contract.normalized_text_host_output_width = null;
+            const original = try original_false.embed(texts[0..1]);
             defer freeEmbeddingSlices(a, original);
             try std.testing.expectEqual(@as(usize, 768), original[0].len);
             no_normalize.config.embedding_gemma2_dimensions = 128;
@@ -8712,7 +8753,7 @@ test "Gemma public text original source task escrow preserves four-row windows c
                     if (platform.time.monotonicNs() >= denied_deadline) return error.GemmaCudaUnnormalizedDeniedBankDidNotRetire;
                     std.Thread.yield() catch {};
                 }
-                for ([_]usize{ 128, 256, 512, 768 }) |width| {
+                for ([_]usize{ 128, 129, 256, 512, 768 }) |width| {
                     no_normalize.config.embedding_gemma2_dimensions = width;
                     try std.testing.expect(no_normalize.canEmbedOwned());
                     try std.testing.expectEqual(width, try no_normalize.ownedTextOutputWidth());
@@ -8737,7 +8778,7 @@ test "Gemma public text original source task escrow preserves four-row windows c
         }
         if (kind == .cuda) {
             const full_tokens = pipeline.last_input_tokens;
-            for ([_]usize{ 128, 256, 512 }) |width| {
+            for ([_]usize{ 128, 129, 256, 512 }) |width| {
                 var reduced = pipeline;
                 reduced.trace = null;
                 reduced.config.embedding_gemma2_dimensions = width;
@@ -8745,9 +8786,11 @@ test "Gemma public text original source task escrow preserves four-row windows c
                 var reduced_owned = try reduced.embedOwned(&texts, .{ .outside_execution = true });
                 defer reduced_owned.deinitOutsideExecution();
                 try std.testing.expectEqual(full_tokens, reduced.last_input_tokens);
-                const reduced_raw = try reduced.embed(&texts);
+                var original_reduced = reduced;
+                original_reduced.session.model_contract.normalized_text_host_output_width = null;
+                const reduced_raw = try original_reduced.embed(&texts);
                 defer freeEmbeddingSlices(a, reduced_raw);
-                try std.testing.expectEqual(full_tokens, reduced.last_input_tokens);
+                try std.testing.expectEqual(full_tokens, original_reduced.last_input_tokens);
                 for (raw, reduced_raw, 0..) |full, row, index| {
                     var expected: [768]f32 = undefined;
                     @memcpy(expected[0..width], full[0..width]);
@@ -9712,4 +9755,77 @@ test "Native Gemma fresh public Session and normalize false Source prepare cache
         try std.testing.expect((entry == 6 or probe.calls != 0) and !probe.violation);
         try std.testing.expect(!lane.owned and scheduler.head == null);
     }
+}
+
+test "declared normalized host text producer keeps original bytes rejects malformed rows and never wraps a resident result" {
+    const Probe = struct {
+        hosts: usize = 0,
+        residents: usize = 0,
+        mode: enum { normal, malformed, fail } = .normal,
+        fn run(raw: *anyopaque, _: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.hosts += 1;
+            if (self.mode == .fail) return error.FinalHostProducerFailed;
+            const values = try allocator.alloc(Tensor, 1);
+            errdefer allocator.free(values);
+            // Deliberately not exactly unit length: a second L2 would change
+            // these bits, exposing accidental re-normalization at full width.
+            values[0] = if (self.mode == .malformed)
+                try Tensor.initFloat32(allocator, "pooled", &.{ 2, 1 }, &.{ 0.6, 0.8 })
+            else
+                try Tensor.initFloat32(allocator, "pooled", &.{ 2, 2 }, &.{ 0.6, 0.8, 0.0, 0.99999 });
+            return values;
+        }
+        fn controlled(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, _: InferenceExecutionControl) ![]Tensor {
+            return run(raw, inputs, allocator);
+        }
+        fn resident(raw: *anyopaque, _: []const Tensor, _: session_mod.ResidentTextEmbeddingRequest, _: std.mem.Allocator, _: InferenceExecutionControl) !?session_mod.ResidentOutputs {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.residents += 1;
+            return error.UnexpectedFinalHostResidentWrap;
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "pooled", .dtype = .f32, .shape = &.{ 2, 2 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const table: session_mod.Session.VTable = .{ .run = run, .runWithControl = controlled, .runResidentTextEmbeddingWithControl = resident, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+        fn check(allocator: std.mem.Allocator) !void {
+            var probe = @This(){};
+            const session = session_mod.Session{ .ptr = &probe, .vtable = &table, .model_contract = .{ .normalized_text_host_output_width = 2 } };
+            var permit = session_mod.RunPermit{ .session = session, .lease = null };
+            defer permit.deinit();
+            var pipeline = EmbeddingPipeline.init(allocator, session, undefined, .{ .resident_text_encoder = true, .pooling = .mean, .normalize = true });
+            pipeline.execution_control = .{ .native_call_policy = .in_process };
+            pipeline.last_resident_backend_timing = .{};
+            const rows = (try pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{})) orelse return error.MissingFinalHostRows;
+            defer freeEmbeddingSlices(allocator, rows);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@as([]const f32, &.{ 0.6, 0.8 })), std.mem.sliceAsBytes(rows[0]));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@as([]const f32, &.{ 0.0, 0.99999 })), std.mem.sliceAsBytes(rows[1]));
+            try std.testing.expectEqual(@as(usize, 1), probe.hosts);
+            try std.testing.expectEqual(@as(usize, 0), probe.residents);
+            try std.testing.expect(pipeline.last_resident_backend_timing == null);
+        }
+    };
+    try Probe.check(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.check, .{});
+    var probe = Probe{};
+    const session = session_mod.Session{ .ptr = &probe, .vtable = &Probe.table, .model_contract = .{ .normalized_text_host_output_width = 2 } };
+    var permit = session_mod.RunPermit{ .session = session, .lease = null };
+    defer permit.deinit();
+    var pipeline = EmbeddingPipeline.init(std.testing.allocator, session, undefined, .{ .resident_text_encoder = true, .pooling = .mean, .normalize = false });
+    pipeline.execution_control = .{ .native_call_policy = .in_process };
+    const rows = (try pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{})) orelse return error.MissingFinalHostRows;
+    defer freeEmbeddingSlices(std.testing.allocator, rows);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@as([]const f32, &.{ 0.0, 0.99999 })), std.mem.sliceAsBytes(rows[1]));
+    probe.mode = .malformed;
+    try std.testing.expectError(error.ShapeMismatch, pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{}));
+    probe.mode = .fail;
+    try std.testing.expectError(error.FinalHostProducerFailed, pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{}));
+    try std.testing.expectEqual(@as(usize, 0), probe.residents);
+    pipeline.session.model_contract.normalized_text_host_output_width = null;
+    try std.testing.expectError(error.UnexpectedFinalHostResidentWrap, pipeline.tryEmbedTextResidentEncoder(&.{}, &.{}, 2, 1, &permit, .{}));
+    try std.testing.expectEqual(@as(usize, 1), probe.residents);
 }

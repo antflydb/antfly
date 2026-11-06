@@ -4091,28 +4091,19 @@ fn archRunResidentTextEmbeddingImpl(
     if (self.arch_config == .embedding_gemma2 and self.backend_type == .cuda) {
         const cfg = self.arch_config.embedding_gemma2.resident orelse return error.UnsupportedEmbeddingGemma2Config;
         const encoder_request = try parseEmbeddingGemma2Inputs(inputs, cfg);
-        const embedding = switch (self.backend_type) {
-            .cuda => if (comptime build_options.enable_cuda) try self.backend_data.cuda.compute.runEmbeddingGemma2(
-                allocator,
-                cfg,
-                switch (encoder_request.input) {
-                    .token_ids => |values| .{ .token_ids = values },
-                    .input_embeddings => |values| .{ .input_embeddings = values },
-                },
-                encoder_request.attention_mask,
-                encoder_request.batch,
-                encoder_request.sequence,
-                cfg.outputDim(),
-                control,
-            ) else return error.CudaNotEnabled,
-            .native => blk: {
-                var reference_cb = try makeComputeBackend(self, allocator, null);
-                defer reference_cb.deinit();
-                reference_cb.execution_control = control;
-                break :blk try embedding_gemma2_reference.forwardReference(&reference_cb, allocator, cfg, encoder_request, cfg.outputDim());
+        const embedding = if (comptime build_options.enable_cuda) try self.backend_data.cuda.compute.runEmbeddingGemma2(
+            allocator,
+            cfg,
+            switch (encoder_request.input) {
+                .token_ids => |values| .{ .token_ids = values },
+                .input_embeddings => |values| .{ .input_embeddings = values },
             },
-            else => return null,
-        };
+            encoder_request.attention_mask,
+            encoder_request.batch,
+            encoder_request.sequence,
+            cfg.outputDim(),
+            control,
+        ) else return error.CudaNotEnabled;
         defer allocator.free(embedding);
         try validateEmbeddingGemma2Output(embedding, encoder_request.batch, cfg.outputDim());
         const cb = try allocator.create(ops.ComputeBackend);
@@ -6196,6 +6187,10 @@ fn archSessionHandle(impl: *ArchSession) Session {
             .task = impl.task,
             .decoder_config = if (impl.arch_config == .gpt) &impl.arch_config.gpt else null,
             .padding = if (encoder or impl.arch_config == .deberta or impl.arch_config == .gliner) .batch_max else .declared,
+            .normalized_text_host_output_width = if (impl.backend_type == .cuda and impl.arch_config == .embedding_gemma2 and impl.task == .generic)
+                (if (impl.arch_config.embedding_gemma2.resident) |cfg| cfg.outputDim() else null)
+            else
+                null,
             .resident_text_embeddings = (encoder and (impl.backend_type == .metal or impl.backend_type == .cuda)) or
                 (impl.arch_config == .embedding_gemma2 and impl.backend_type == .native),
         },

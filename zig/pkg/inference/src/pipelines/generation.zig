@@ -5204,8 +5204,8 @@ pub const NativeGenerationPipeline = struct {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var tokens_generated = initial_tokens_generated;
         var finish_reason: []const u8 = "length";
-        var device_token_tensor: ?ops.CT = null;
-        defer if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
+        var device_token = self.deviceTokenOwner();
+        defer device_token.clear();
         debugGenerationStage(
             "standardDecode enter seq_len={d} max_tokens={d} prefill_cached={}",
             .{ seq_len.*, max_tokens, prefill_last_logits.* != null },
@@ -5251,11 +5251,11 @@ pub const NativeGenerationPipeline = struct {
             defer if (direct_decode_turn_acquired) {
                 self.scheduler.?.finishTurn(self.scheduler_lease.?, .decode);
             };
-            var next_device_token_tensor: ?ops.CT = null;
-            errdefer if (next_device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
+            var next_device_token = self.deviceTokenOwner();
+            defer next_device_token.clear();
             debugGenerationStage(
                 "standardDecode iter={d} seq_len={d} device_token_handoff={}",
-                .{ tokens_generated, seq_len.*, device_token_tensor != null },
+                .{ tokens_generated, seq_len.*, device_token.tensor != null },
             );
             if (tokens_generated > 0 and self.pipelinedGreedyEligible(config, token_table, json_grammar, gbnf_grammar, decode_state)) {
                 if (try self.runPipelinedGreedyTail(
@@ -5332,11 +5332,11 @@ pub const NativeGenerationPipeline = struct {
                             token_table,
                             json_grammar,
                             gbnf_grammar,
-                            device_token_tensor,
+                            device_token.tensor,
                         );
                     };
                     if (direct_token) |token| {
-                        next_device_token_tensor = token.token_tensor;
+                        next_device_token.replace(token.token_tensor);
                         break :blk .{ .token = token.token, .grammar_complete = false };
                     }
                     const fallback_query_seq_len = if (decode_runtime.kvView() != null and
@@ -5377,42 +5377,35 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
 
-                    self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-                    const query_seq_len = if (decode_runtime.kvView() != null and (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
-                    const decode_context = decode_runtime.makeDecodeContext(seq_len.*, query_seq_len);
-                    const input_ids = if (query_seq_len == seq_len.*)
-                        token_ids[0..seq_len.*]
-                    else
-                        token_ids[seq_len.* - query_seq_len .. seq_len.*];
-                    debugGenerationStage(
-                        "standardDecode iter={d} requesting logits query_seq_len={d} input_len={d}",
-                        .{ tokens_generated, query_seq_len, input_ids.len },
-                    );
-
-                    if (try self.forwardSampledCompiledModelToken(
-                        input_ids,
-                        seq_len.*,
-                        &decode_context,
-                        config,
-                        token_ids[0..seq_len.*],
-                        token_table != null or json_grammar.* != null or gbnf_grammar != null,
-                    )) |token| {
-                        break :blk .{ .token = token, .grammar_complete = false };
+                    const pure_greedy = isPureGreedyConfig(config);
+                    const selected_kv = config.kv_cache_mode == .select_v1;
+                    const has_grammar = token_table != null or json_grammar.* != null or gbnf_grammar != null;
+                    const sampled_compiled = !selected_kv and !pure_greedy;
+                    var numerical = self.physicalDecoder();
+                    switch (try numerical.eagerStep(decode_state, .{
+                        .token_history = token_ids[0..seq_len.*],
+                        .sequence_length = seq_len.*,
+                        .generated_tokens = tokens_generated,
+                        .has_prefill_logits = prefill_last_logits.* != null,
+                        .compiled_sampling = if (sampled_compiled) .{
+                            .temperature = config.temperature,
+                            .top_p = config.top_p,
+                            .top_k = config.top_k,
+                            .min_p = config.min_p,
+                            .repetition_penalty = config.repetition_penalty,
+                            .frequency_penalty = config.frequency_penalty,
+                            .presence_penalty = config.presence_penalty,
+                        } else null,
+                        .compiled_sampling_eligible = sampled_compiled and compiledSampleRequestEligible(config, has_grammar, self.gpt_config.suppressTokenIds().len != 0),
+                        .compiled_greedy_eligible = !selected_kv and pure_greedy and !has_grammar and config.grammar == null,
+                        .prefetch_drain_budget = prefetch_drain_budget_per_step,
+                    })) {
+                        .token => |token| break :blk .{ .token = token, .grammar_complete = false },
+                        .logits => |logits| {
+                            owns_last_logits = true;
+                            break :logits_blk logits;
+                        },
                     }
-
-                    if (try self.forwardGreedyCompiledModelToken(
-                        input_ids,
-                        1,
-                        seq_len.*,
-                        &decode_context,
-                        config,
-                        token_table != null or json_grammar.* != null or gbnf_grammar != null,
-                    )) |token| {
-                        break :blk .{ .token = token, .grammar_complete = false };
-                    }
-
-                    owns_last_logits = true;
-                    break :logits_blk try self.forwardLastLogits(input_ids, 1, seq_len.*, &decode_context);
                 };
 
                 defer if (owns_last_logits) allocator.free(@constCast(last_logits));
@@ -5438,21 +5431,15 @@ pub const NativeGenerationPipeline = struct {
 
             // Check EOS
             if (self.shouldStopOnEos(config, next_token)) {
-                if (next_device_token_tensor) |tensor| {
-                    self.freeDeviceTokenTensor(tensor);
-                    next_device_token_tensor = null;
-                }
                 finish_reason = "stop";
                 break;
             }
 
-            if (next_device_token_tensor == null and self.shouldSeedDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
-                next_device_token_tensor = try self.makeDeviceTokenTensor(next_token);
-                if (next_device_token_tensor != null) decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
+            if (next_device_token.tensor == null and self.shouldSeedDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
+                try next_device_token.seed(next_token);
+                decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
             }
-            if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
-            device_token_tensor = next_device_token_tensor;
-            next_device_token_tensor = null;
+            device_token.replace(next_device_token.take());
 
             token_ids[seq_len.*] = @intCast(next_token);
             seq_len.* += 1;
@@ -5653,10 +5640,10 @@ pub const NativeGenerationPipeline = struct {
 
         var tokens_generated: usize = 0;
         var finish_reason: []const u8 = "length";
-        var input_device_token_tensor: ?ops.CT = null;
-        var candidate_token_tensor: ?ops.CT = null;
-        defer if (input_device_token_tensor) |tensor| self.cb.free(tensor);
-        defer if (candidate_token_tensor) |tensor| self.cb.free(tensor);
+        var input_token = self.deviceTokenOwner();
+        var candidate_token = self.deviceTokenOwner();
+        defer input_token.clear();
+        defer candidate_token.clear();
 
         debugGenerationStage(
             "standardDecode pending-token-readback enter seq_len={d} max_tokens={d}",
@@ -5665,7 +5652,7 @@ pub const NativeGenerationPipeline = struct {
 
         while (tokens_generated < max_tokens) {
             if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
-            if (candidate_token_tensor == null) {
+            if (candidate_token.tensor == null) {
                 if (tokens_generated == 0) {
                     if (prefill_greedy_token.*) |token| {
                         prefill_greedy_token.* = null;
@@ -5674,8 +5661,8 @@ pub const NativeGenerationPipeline = struct {
                             break;
                         }
                         if (self.shouldSeedDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
-                            input_device_token_tensor = try self.makeDeviceTokenTensor(token);
-                            if (input_device_token_tensor != null) decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
+                            try input_token.seed(token);
+                            decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
                         }
                         token_ids[seq_len.*] = @intCast(token);
                         seq_len.* += 1;
@@ -5711,8 +5698,8 @@ pub const NativeGenerationPipeline = struct {
                             break;
                         }
                         if (self.shouldSeedDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
-                            input_device_token_tensor = try self.makeDeviceTokenTensor(token);
-                            if (input_device_token_tensor != null) decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
+                            try input_token.seed(token);
+                            decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
                         }
                         token_ids[seq_len.*] = @intCast(token);
                         seq_len.* += 1;
@@ -5739,7 +5726,7 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
 
-                if (input_device_token_tensor) |input_tensor| {
+                if (input_token.tensor) |input_tensor| {
                     if (try self.forwardGreedyDeviceDecodeTokenTensor(
                         seq_len.*,
                         tokens_generated,
@@ -5750,9 +5737,8 @@ pub const NativeGenerationPipeline = struct {
                         gbnf_grammar,
                         input_tensor,
                     )) |candidate| {
-                        candidate_token_tensor = candidate;
-                        self.cb.free(input_tensor);
-                        input_device_token_tensor = null;
+                        candidate_token.replace(candidate);
+                        input_token.clear();
                         continue;
                     }
 
@@ -5768,20 +5754,18 @@ pub const NativeGenerationPipeline = struct {
                         gbnf_grammar,
                         input_tensor,
                     )) |resolved| {
-                        var next_device_token_tensor = resolved.token_tensor;
-                        errdefer if (next_device_token_tensor) |tensor| self.cb.free(tensor);
+                        var next_token = self.deviceTokenOwner();
+                        next_token.replace(resolved.token_tensor);
+                        defer next_token.clear();
                         if (self.shouldStopOnEos(config, resolved.token)) {
-                            if (next_device_token_tensor) |tensor| self.cb.free(tensor);
                             finish_reason = "stop";
                             break;
                         }
-                        if (next_device_token_tensor == null and self.shouldSeedDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
-                            next_device_token_tensor = try self.makeDeviceTokenTensor(resolved.token);
-                            if (next_device_token_tensor != null) decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
+                        if (next_token.tensor == null and self.shouldSeedDeviceTokenHandoff(tokens_generated, decode_state, config, token_table, json_grammar, gbnf_grammar)) {
+                            try next_token.seed(resolved.token);
+                            decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
                         }
-                        self.cb.free(input_tensor);
-                        input_device_token_tensor = next_device_token_tensor;
-                        next_device_token_tensor = null;
+                        input_token.replace(next_token.take());
                         token_ids[seq_len.*] = @intCast(resolved.token);
                         seq_len.* += 1;
                         tokens_generated += 1;
@@ -5806,9 +5790,9 @@ pub const NativeGenerationPipeline = struct {
                 break;
             }
 
-            const candidate = candidate_token_tensor.?;
+            const candidate = candidate_token.tensor.?;
             if (tokens_generated + 1 >= max_tokens) {
-                const token = try gpt_arch.resolveGreedyDeviceTokenTensor(&self.cb, allocator, candidate);
+                const token = try candidate_token.resolve(allocator);
                 if (self.shouldStopOnEos(config, token)) {
                     finish_reason = "stop";
                     break;
@@ -5830,13 +5814,12 @@ pub const NativeGenerationPipeline = struct {
                     finish_reason = "stop";
                     break;
                 }
-                input_device_token_tensor = candidate;
-                candidate_token_tensor = null;
+                input_token.replace(candidate_token.take());
                 continue;
             }
 
             var pending = (try pending_step.Readback.begin(self.pendingStepContext(decode_state), candidate)) orelse {
-                const token = try gpt_arch.resolveGreedyDeviceTokenTensor(&self.cb, allocator, candidate);
+                const token = try candidate_token.resolve(allocator);
                 if (self.shouldStopOnEos(config, token)) {
                     finish_reason = "stop";
                     break;
@@ -5858,8 +5841,7 @@ pub const NativeGenerationPipeline = struct {
                     finish_reason = "stop";
                     break;
                 }
-                input_device_token_tensor = candidate;
-                candidate_token_tensor = null;
+                input_token.replace(candidate_token.take());
                 continue;
             };
             defer pending.deinit();
@@ -5887,8 +5869,7 @@ pub const NativeGenerationPipeline = struct {
             const token = try pending.resolve();
             if (self.shouldStopOnEos(config, token)) {
                 pending.discardLookahead();
-                self.cb.free(candidate);
-                candidate_token_tensor = null;
+                candidate_token.clear();
                 seq_len.* -= 1;
                 appended_placeholder = false;
                 try pending.rollback();
@@ -5912,18 +5893,15 @@ pub const NativeGenerationPipeline = struct {
                 emitted_text,
             )) {
                 pending.discardLookahead();
-                self.cb.free(candidate);
-                candidate_token_tensor = null;
+                candidate_token.clear();
                 finish_reason = "stop";
                 break;
             }
 
             if (pending.takeLookahead()) |next| {
-                self.cb.free(candidate);
-                candidate_token_tensor = next;
+                candidate_token.replace(next);
             } else {
-                input_device_token_tensor = candidate;
-                candidate_token_tensor = null;
+                input_token.replace(candidate_token.take());
             }
         }
 
@@ -6073,14 +6051,8 @@ pub const NativeGenerationPipeline = struct {
         return false;
     }
 
-    fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
-        var numerical = self.physicalDecoder();
-        return numerical.createDeviceToken(token_id, if (self.execution_lock) |mutex| self.executionAccess(mutex) else null);
-    }
-
-    fn freeDeviceTokenTensor(self: *NativeGenerationPipeline, tensor: ops.CT) void {
-        var numerical = self.physicalDecoder();
-        numerical.destroyDeviceToken(tensor, if (self.execution_lock) |mutex| self.executionAccess(mutex) else null);
+    fn deviceTokenOwner(self: *NativeGenerationPipeline) decoder_forward.DeviceToken {
+        return .{ .backend = &self.cb, .access = if (self.execution_lock) |mutex| self.executionAccess(mutex) else null };
     }
 
     fn forwardLastLogits(
@@ -6092,44 +6064,6 @@ pub const NativeGenerationPipeline = struct {
     ) ![]f32 {
         var decoder = self.physicalDecoder();
         return decoder.forwardLastLogits(input_ids, batch, seq_len, decode_context);
-    }
-
-    fn forwardGreedyCompiledModelToken(
-        self: *NativeGenerationPipeline,
-        input_ids: []const i64,
-        batch: usize,
-        seq_len: usize,
-        decode_context: *const gpt_arch.DecodeContext,
-        config: GenerationConfig,
-        has_grammar: bool,
-    ) !?usize {
-        if (config.kv_cache_mode == .select_v1) return null;
-        if (!isPureGreedyConfig(config)) return null;
-        if (has_grammar or config.grammar != null) return null;
-        var decoder = self.physicalDecoder();
-        return decoder.forwardCompiledGreedy(input_ids, batch, seq_len, decode_context);
-    }
-
-    fn forwardSampledCompiledModelToken(
-        self: *NativeGenerationPipeline,
-        input_ids: []const i64,
-        seq_len: usize,
-        decode_context: *const gpt_arch.DecodeContext,
-        config: GenerationConfig,
-        token_history: []const i64,
-        has_grammar: bool,
-    ) !?usize {
-        if (config.kv_cache_mode == .select_v1 or isPureGreedyConfig(config)) return null;
-        var decoder = self.physicalDecoder();
-        return decoder.forwardCompiledSampled(input_ids, seq_len, decode_context, .{
-            .temperature = config.temperature,
-            .top_p = config.top_p,
-            .top_k = config.top_k,
-            .min_p = config.min_p,
-            .repetition_penalty = config.repetition_penalty,
-            .frequency_penalty = config.frequency_penalty,
-            .presence_penalty = config.presence_penalty,
-        }, token_history, compiledSampleRequestEligible(config, has_grammar, self.gpt_config.suppressTokenIds().len != 0));
     }
 
     fn prepareCompiledGenerationRuntime(
