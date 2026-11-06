@@ -48,14 +48,33 @@ zig build lite-write-amplification -- --test-filter "lite write amplification re
 The harness lives at
 `zig/pkg/antfly-embedded/src/storage/lite/write_amplification_bench_test.zig`.
 For N (default 128) single-document updates of 1 KiB changing text, it
-measures three modes:
+measures four modes:
 
 - **primary-only**: the default `full_text_index_v0` index is deleted first;
   updates use `sync_level: "write"`.
 - **indexed**: the default `full_text_index_v0` index is kept; updates use
   `sync_level: "full_index"`, which blocks until full-text is visible.
-- **indexed, 8 writers**: the same as indexed, but 8 OS threads each submit
-  `128 / 8` updates concurrently against one database.
+- **primary-only, 8 writers** and **indexed, 8 writers**: the same as the
+  matching single-writer mode, but 8 real OS threads each submit `128 / 8`
+  updates concurrently against one database, through the same
+  `insertOne`/`antfly_db_batch_json` path the single-writer modes use. Every
+  round is synchronized by a spin barrier (`Barrier` in the harness file) so
+  all 8 threads arrive at Lite's single-writer admission queue at
+  (as close to) the same moment as the OS scheduler allows on every one of
+  the `128 / 8` rounds — real, deterministic contention, rather than
+  leaving it to chance (see "Known limitations" below for what this
+  currently shows).
+
+Besides `calling_thread_syncs_per_update`/`background_syncs_per_update`,
+each mode also reports `fsyncs_per_write_overall` (every durable sync,
+calling-thread and background combined, per update),
+`durable_commits_per_write` (every durable commit per update),
+`mean_primary_group_size` (how many logical updates, on average, one
+durable primary-commit transaction covered — the group-commit metric: 1.0
+means no grouping at all) and an `indicative_writes_per_second_debug` wall-
+clock rate. That last field is the one number in the report that *is*
+sensitive to build mode, machine load and scheduling; everything else is
+an operation count and is not.
 
 It opens Lite through the same public Zig embedding seam the Go/Python/
 Rust/TS SDKs reach via the C ABI (`capi.openLiteHandleWithRuntime`), with a
@@ -134,12 +153,23 @@ consumers, but that path is not what `lite-write-amplification` builds).
   connection-pool layer entirely (it opens through the lower-level
   `capi.openLiteHandleWithRuntime` seam). They would read nonzero through
   the full `antfly_lite_create`/`antfly_lite_open` C ABI path.
-- The 8-writer mode's per-stage totals currently come out numerically
-  identical to the single-writer indexed case, because both run the same
-  total update count (128). This harness counts operations, not latency; it
-  does not by itself demonstrate a contention cost between 1 and 8 writers.
-  Use the SQLite comparison (below) or `scripts/bench/lite_contention.py`
-  for throughput/latency under contention.
+- The 8-writer modes' `mean_primary_group_size` currently reads 1.0
+  (primary-only) and 0.5 (indexed, matching its baseline 2-commits-per-
+  update structure), identical to the matching single-writer mode, even
+  with the barrier forcing all 8 threads to arrive together on every
+  round. This is not a harness bug: per
+  `lite-single-commit-write-path.md`'s "throughput falls as writers are
+  added" note, the writer slot, the DB apply lock and the per-call
+  cross-process path lease are all held across the fsync, so the existing
+  group-commit queue in `submitScopedMutation` cannot yet bundle
+  concurrent foreground writers' commits regardless of how they arrive.
+  The harness now measures this honestly instead of masking it with
+  accidental non-contention; `mean_primary_group_size` will read above 1.0
+  once that slot-held-across-fsync limitation is fixed, and the ceiling
+  gate protects against the 8-writer modes regressing in the meantime.
+  This harness counts operations, not latency; use the SQLite comparison
+  (below) or `scripts/bench/lite_contention.py` for throughput/latency
+  under contention.
 
 ### Reading the JSON report
 
@@ -153,9 +183,14 @@ The report test prints a JSON object between
     "updates": 128,
     "calling_thread_syncs_per_update": 3.0,
     "background_syncs_per_update": 12.84,
+    "fsyncs_per_write_overall": 15.84,
+    "durable_commits_per_write": 5.27,
+    "mean_primary_group_size": 1.0,
+    "indicative_writes_per_second_debug": 10.8,
     "stages": { "primary_commit": { "sync_calling_thread": 384, ... }, ... },
     "background_ops": { "source_turn": 0, ... }
   },
+  "primary_only_8_writers": { ... },
   "indexed": { ... },
   "indexed_8_writers": { ... }
 }
@@ -173,7 +208,10 @@ at `write-amplification-baseline.json` wraps this same shape with
 `zig build lite-write-amplification` also compiles and runs
 `test "lite write amplification ceilings"`, which asserts calling-thread
 syncs/update stay under the measured baseline plus 25% slack (3.75 for
-primary-only, ~83.75 for indexed). These ceilings are intentionally loose —
+primary-only, ~83.75 for indexed), and applies the same two ceilings to the
+matching primary-only/indexed 8-writer modes so a regression specific to
+the concurrent path is still caught even though it cannot yet show a gain
+(see "Known limitations" above). These ceilings are intentionally loose —
 **TODO(write-amplification)**: tighten them once the publication-shape work
 in `lite-single-commit-write-path.md` lands, so this becomes a real
 regression gate rather than a check against a large regression only.
