@@ -43315,7 +43315,7 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
         // RMS auxiliary mirrors depend on live environment/provider readiness.
         // Preserve their per-invocation policy checks even with dense inputs.
         if (request.descriptor.operation == .norm and request.descriptor.operation.norm.kind == .rms) {
-            var selected = (try @import("../../execution/assigned_kernel_route.zig").prepare(.{ .ptr = self, .vtable = table }, request, rmsCudaRouteSupported)) orelse return null;
+            var selected = (try @import("../../execution/assigned_kernel_route.zig").prepare(.{ .ptr = self, .vtable = table }, request, rmsNormCudaRouteSupported)) orelse return null;
             // This canonical producer writes dense F32 into its assigned slot
             // and attaches only its declared mirrors. Its model gamma remains
             // live invocation-validated; it grants no source payload credit.
@@ -43363,8 +43363,16 @@ fn primitiveCudaDotRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel
     return self.training_blas == null and !self.resident_training_cache and self.kernels.primitive_batched_dot_f32 != null;
 }
 
-fn rmsCudaRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
-    return descriptor.operation == .norm and descriptor.operation.norm.kind == .rms and directCudaRouteSupported(ctx, descriptor);
+/// This private family identity attests only assigned F32 RMSNorm and its
+/// declared output mirror. Gamma/plane/provider policy stays invocation-live;
+/// a broad dynamic Direct implementation cannot acquire this ownership proof.
+fn rmsNormCudaRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    if (descriptor.operation != .norm or descriptor.operation.norm.kind != .rms or descriptor.input_count != 2 or
+        descriptor.operation.norm.dim == 0 or !descriptor.output_shape.eq(descriptor.input_shapes[0]) or
+        !directCudaRouteSupported(ctx, descriptor)) return false;
+    const count = descriptor.output_shape.numElements() orelse return false;
+    const gamma = descriptor.input_shapes[1].numElements() orelse return false;
+    return count > 0 and @mod(count, descriptor.operation.norm.dim) == 0 and gamma == descriptor.operation.norm.dim;
 }
 
 fn directCudaRouteSupported(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
@@ -48277,11 +48285,23 @@ fn ownedPayloadRoute(ctx: *anyopaque, owned: *const @import("../../execution/ker
         // does not imply hidden output or temporary ownership for this family.
         return owned.output_plane_metadata == .assigned_dense and required.workspace.byte_size == 0 and required.workspace.host_byte_size == 0 and required.probe_workspace.byte_size == 0 and required.probe_workspace.host_byte_size == 0 and required.auxiliaries.count == 0;
     }
-    if (direct.belongsToProgram(owned, backend, rmsCudaRouteSupported)) {
-        // The actual RMS producer keeps live gamma/auxiliary-policy validation.
-        // Its assigned primary and declared mirror are independently checked by
-        // device coverage; invocation validation does not imply hidden storage.
-        return owned.output_plane_metadata == .assigned_dense and required.workspace.byte_size == 0 and required.workspace.host_byte_size == 0 and required.probe_workspace.byte_size == 0 and required.probe_workspace.host_byte_size == 0;
+    if (direct.belongsToProgram(owned, backend, rmsNormCudaRouteSupported)) {
+        // This exact authored RMSNorm writes only its assigned primary and
+        // zero or one same-element BF16 output mirror. Shared coverage still
+        // proves every actual auxiliary allocation; Direct.matches rechecks
+        // live gamma, policy and exact auxiliary recipe on each invocation.
+        if (owned.validation_scope != .invocation or owned.output_plane_metadata != .assigned_dense or
+            required.primary_bytes == 0 or required.profile != @backingInt(std.meta.Tag(ops.kernel_descriptor.Operation).norm) or
+            required.workspace.byte_size != 0 or required.workspace.host_byte_size != 0 or
+            required.probe_workspace.byte_size != 0 or required.probe_workspace.host_byte_size != 0 or required.probe_output != .none or
+            required.auxiliaries.count > 1) return false;
+        if (required.auxiliaries.count == 0) return true;
+        const mirror = required.auxiliaries.items()[0];
+        if (mirror.role != .bf16_mirror or mirror.shape.dtype != .bf16) return false;
+        const count = mirror.shape.numElements() orelse return false;
+        if (count <= 0) return false;
+        const primary_bytes = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
+        return primary_bytes == required.primary_bytes;
     }
     if (owned.validation_scope != .prepared_program) return false;
     return direct.belongsTo(owned, backend);
@@ -48621,6 +48641,8 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         try std.testing.expect(plane_selection.planes_witnessed[program.id_map[normalized]]);
         const norm_route = plane_selection.routes[program.id_map[normalized]] orelse return error.MissingRmsMirrorRoute;
         try std.testing.expect(norm_route.validation_scope == .invocation and norm_route.output_plane_metadata == .assigned_dense);
+        try std.testing.expect(ownedPayloadRoute(compute, &norm_route));
+        try std.testing.expectEqual(@as(u8, 1), norm_route.requirements.auxiliaries.count);
         const planes = plane_selection.planes[program.id_map[normalized]][0..plane_selection.plane_counts[program.id_map[normalized]]];
         const planned_input = @import("../../execution/kernel_route.zig").Binding{ .planned = .{ .logical = program.graph.node(program.id_map[normalized]).output_shape, .planes = planes } };
         try std.testing.expect(PreparedCudaProjection.plannedMirror(compute, planned_input, program.graph.node(program.id_map[normalized]).output_shape) != null);
@@ -54609,5 +54631,73 @@ test "CUDA planned mirror alignment is canonical allocator metadata and rejects 
             else => unreachable,
         }
         try std.testing.expect(PreparedCudaProjection.plannedMirror(&compute, input, logical) == null);
+    }
+}
+
+test "CUDA RMSNorm ownership attests only its exact live Direct family and bounded assigned output resources" {
+    const a = std.testing.allocator;
+    const Shape = @import("ml").graph.Shape;
+    const route = @import("../../execution/kernel_route.zig");
+    const direct = @import("../../execution/assigned_kernel_route.zig");
+    var compute: CudaCompute = undefined;
+    initPreparedCudaMetadataFixture(&compute);
+    const cb = compute.computeBackend();
+    const logical = Shape.init(.f32, &.{ 3, 64 });
+    const gamma = Shape.init(.f32, &.{64});
+    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .norm = .{ .kind = .rms, .dim = 64, .eps = 1e-6 } }, .input_count = 2, .input_shapes = .{ logical, gamma, undefined }, .output_shape = logical };
+    const bindings = [_]route.Binding{ .{ .imported_host = .{ .logical = logical, .target = .cuda } }, .{ .imported_host = .{ .logical = gamma, .target = .cuda } } };
+    const slot = route.OutputSlot{ .node = 2, .allocation = 0, .epoch = 7, .logical = logical, .writable_bytes = 3 * 64 * 4 };
+    const request = route.Prepare{ .allocator = a, .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .descriptor = &descriptor, .inputs = &bindings, .inputs_witnessed = .{ true, true, false }, .output = slot };
+    var selected = (try prepareKernelRouteOp(&compute, request)) orelse return error.MissingRmsNormDirectRoute;
+    defer selected.deinit();
+    try std.testing.expect(selected.validation_scope == .invocation and selected.output_plane_metadata == .assigned_dense);
+    try std.testing.expectEqual(@as(u8, 0), selected.requirements.auxiliaries.count); // no loaded mirror kernel in metadata-only fixture
+    try std.testing.expect(ownedPayloadRoute(&compute, &selected));
+    try selected.validate(.{ .inputs = &bindings, .output = slot });
+    var changed_bindings = bindings;
+    changed_bindings[1].imported_host.logical.dtype = .bf16;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(.{ .inputs = &changed_bindings, .output = slot }));
+    var layer = descriptor;
+    layer.operation.norm.kind = .layer;
+    try std.testing.expect(!rmsNormCudaRouteSupported(&compute, &layer));
+    var unary = descriptor;
+    unary.operation = .{ .unary = .abs };
+    try std.testing.expect(!rmsNormCudaRouteSupported(&compute, &unary));
+    var malformed = descriptor;
+    malformed.operation.norm.dim = 0;
+    try std.testing.expect(!rmsNormCudaRouteSupported(&compute, &malformed));
+    malformed = descriptor;
+    malformed.input_shapes[1] = Shape.init(.f32, &.{63});
+    try std.testing.expect(!rmsNormCudaRouteSupported(&compute, &malformed));
+    // Even the same RMS descriptor in the OLD broad dynamic family has no
+    // private-family attestation. Do not certify every invocation Direct.
+    var broad = (try direct.prepare(cb, request, directCudaRouteSupported)) orelse return error.MissingBroadDirectRoute;
+    defer broad.deinit();
+    broad.output_plane_metadata = .assigned_dense;
+    try std.testing.expect(!ownedPayloadRoute(&compute, &broad));
+    for (0..9) |change| {
+        var altered = selected;
+        switch (change) {
+            0 => altered.output_plane_metadata = .input_dependent,
+            1 => altered.requirements.primary_bytes = 0,
+            2 => altered.requirements.workspace.byte_size = 4,
+            3 => altered.requirements.probe_output = .assigned_unpublished,
+            4 => altered.requirements.auxiliaries.count = 2,
+            5 => {
+                altered.requirements.auxiliaries.count = 1;
+                altered.requirements.auxiliaries.entries[0] = .{ .role = .mean, .shape = Shape.init(.bf16, &.{ 3, 64 }) };
+            },
+            6 => {
+                altered.requirements.auxiliaries.count = 1;
+                altered.requirements.auxiliaries.entries[0] = .{ .role = .bf16_mirror, .shape = logical };
+            },
+            7 => altered.validation_scope = .prepared_program,
+            8 => {
+                altered.requirements.auxiliaries.count = 1;
+                altered.requirements.auxiliaries.entries[0] = .{ .role = .bf16_mirror, .shape = Shape.init(.bf16, &.{ 3, 63 }) };
+            },
+            else => unreachable,
+        }
+        try std.testing.expect(!ownedPayloadRoute(&compute, &altered));
     }
 }

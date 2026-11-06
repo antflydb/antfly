@@ -36,6 +36,7 @@ const projector_format_mod = @import("projector_format.zig");
 
 const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
+const prompt_rows = @import("../execution/decoder_prefill.zig");
 
 const default_spatial_merge_size: usize = @intCast(
     projector_format_mod.gemma4_spatial_merge_size,
@@ -50,6 +51,10 @@ pub const ProjectedImages = struct {
     hidden_size: usize,
     batches_executed: usize = 0,
     max_batch_executed: usize = 0,
+
+    pub fn promptRows(self: *const ProjectedImages) prompt_rows.ProjectedInputRows {
+        return .{ .rows_per_item = self.tokens_per_image, .width = self.hidden_size, .source = .{ .host = self.embeddings } };
+    }
 
     pub fn deinit(self: *ProjectedImages) void {
         self.allocator.free(self.embeddings);
@@ -71,12 +76,69 @@ pub const ResidentProjectedImages = struct {
     max_batch_executed: usize,
     output_ownership: OutputOwnership = .unknown,
 
+    pub fn promptRows(self: *const ResidentProjectedImages) prompt_rows.ProjectedInputRows {
+        return .{ .rows_per_item = self.tokens_per_image, .width = self.hidden_size, .source = .{ .resident = self.embeddings } };
+    }
+
     pub fn deinit(self: *ResidentProjectedImages) void {
         self.backend.free(self.embeddings);
         self.allocator.free(self.tokens_per_image);
     }
 };
 const ResidentImage = struct { embeddings: CT, tokens: usize };
+
+/// Own one projected still-image input across prompt expansion/assembly.
+/// Resident math starts at the original early phase. A host request is only
+/// prepared after video prompt expansion; this retains original failure and
+/// allocation order rather than executing a producer merely to query a shape.
+pub const PromptImageInput = struct {
+    backend: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    projector: *ProjectorStore,
+    images: []const []const u8,
+    data: union(enum) { empty, host_pending, host: ProjectedImages, resident: ResidentProjectedImages },
+
+    pub fn begin(backend: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, images: []const []const u8) !PromptImageInput {
+        const placement = prompt_rows.PromptEmbeddingRows.projectionPlacement(backend, images.len, 8, platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GENERATION_IMAGE_HOST", false));
+        return .{ .backend = backend, .allocator = allocator, .projector = projector, .images = images, .data = switch (placement) {
+            .none => .empty,
+            .host => .host_pending,
+            .resident => .{ .resident = try encodeProjectedImagesResident(backend, allocator, projector, images) },
+        } };
+    }
+
+    pub fn prepareHost(self: *PromptImageInput) !void {
+        if (self.data == .host_pending) self.data = .{ .host = try encodeProjectedImages(self.backend, self.allocator, self.projector, self.images) };
+    }
+
+    pub fn rows(self: *const PromptImageInput) !?prompt_rows.ProjectedInputRows {
+        return switch (self.data) {
+            .empty => null,
+            .host_pending => error.ProjectedInputNotPrepared,
+            .host => |*value| value.promptRows(),
+            .resident => |*value| value.promptRows(),
+        };
+    }
+
+    /// Register at the original later host-projection phase, before video
+    /// prompt retirement. The single owner remains safe if a prior error skips
+    /// that phase; deinit below then consumes whatever was actually prepared.
+    pub fn releaseHost(self: *PromptImageInput) void {
+        if (self.data == .host) {
+            self.data.host.deinit();
+            self.data = .empty;
+        }
+    }
+
+    pub fn deinit(self: *PromptImageInput) void {
+        switch (self.data) {
+            .host => |*value| value.deinit(),
+            .resident => |*value| value.deinit(),
+            .empty, .host_pending => {},
+        }
+        self.data = .empty;
+    }
+};
 
 pub const ProjectedAudio = struct {
     allocator: std.mem.Allocator,
@@ -9719,4 +9781,62 @@ test "video cold qualification preserves original row limit and independent wide
         try std.testing.expect(selected.bytes <= Cache.arena_limit);
         try std.testing.expect(batch * sequence <= Cache.graph_rows_limit);
     }
+}
+
+fn checkPromptImageInputOwnership(a: std.mem.Allocator) !void {
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const expected = [_]f32{ 1, 2, 3, 4 };
+    // Adoption/destruction operate on actual allocated producer payloads. No
+    // producer is invoked, so the unused borrowed projector is never accessed.
+    inline for (.{ false, true }) |resident| {
+        var input = PromptImageInput{ .backend = &cb, .allocator = a, .projector = undefined, .images = &.{}, .data = .empty };
+        defer input.deinit();
+        var counts: ?[]usize = try a.dupe(usize, &.{2});
+        defer if (counts) |value| a.free(value);
+        if (resident) {
+            var tensor: ?CT = try cb.fromFloat32Shape(&expected, &.{ 2, 2 });
+            defer if (tensor) |value| cb.free(value);
+            input.data = .{ .resident = .{ .allocator = a, .backend = &cb, .embeddings = tensor.?, .tokens_per_image = counts.?, .hidden_size = 2, .batches_executed = 1, .max_batch_executed = 1 } };
+            tensor = null;
+        } else {
+            var values: ?[]f32 = try a.dupe(f32, &expected);
+            defer if (values) |value| a.free(value);
+            input.data = .{ .host = .{ .allocator = a, .embeddings = values.?, .tokens_per_image = counts.?, .hidden_size = 2 } };
+            values = null;
+        }
+        counts = null;
+        const rows = (try input.rows()).?;
+        try std.testing.expectEqualSlices(usize, &.{2}, rows.rows_per_item);
+        try std.testing.expectEqual(@as(usize, 2), rows.width);
+        if (resident) {
+            try std.testing.expect(rows.source == .resident);
+            // The host-phase cleanup does not shorten resident payload life.
+            input.releaseHost();
+            const values = try cb.toFloat32((try input.rows()).?.source.resident, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &expected, values);
+        } else {
+            try std.testing.expect(rows.source == .host);
+            try std.testing.expectEqualSlices(f32, &expected, rows.source.host);
+            input.releaseHost();
+            input.releaseHost();
+            try std.testing.expect((try input.rows()) == null);
+        }
+        input.deinit();
+        try std.testing.expect((try input.rows()) == null);
+    }
+    var pending = PromptImageInput{ .backend = &cb, .allocator = a, .projector = undefined, .images = &.{}, .data = .host_pending };
+    defer pending.deinit();
+    try std.testing.expectError(error.ProjectedInputNotPrepared, pending.rows());
+    pending.deinit();
+    try std.testing.expect((try pending.rows()) == null);
+}
+
+test "typed prompt image input preserves actual host resident phase lifetimes and allocation failure ownership" {
+    try checkPromptImageInputOwnership(std.testing.allocator);
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, checkPromptImageInputOwnership, .{});
 }

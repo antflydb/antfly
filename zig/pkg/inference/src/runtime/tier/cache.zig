@@ -2318,3 +2318,35 @@ test "cache admission snapshot identifies actual shared binding only within a he
     first.noteRelease(.backend, 8);
     try first.flushReleasedOutsideExecution();
 }
+
+test "two tier mandatory fresh sum distinguishes shared impossibility from actual peer contention" {
+    const metadata = @sizeOf(BindingMetadata) + 2 * (try retirement.PreparedCharge.requestedMetadataBytes(0)) + 2 * @sizeOf(AdmissionCredit);
+    for (0..3) |index| {
+        const owner = try domain.Domain.create();
+        defer owner.release();
+        const pin = owner.pin();
+        defer pin.release();
+        const controller = pin.controller();
+        controller.configureSharedLimits(switch (index) {
+            0 => .{ .host_limit_bytes = metadata + 15 },
+            1 => .{ .unified_limit_bytes = metadata + 16 + 32 - 1 },
+            else => .{},
+        });
+        var peer: ?memory.AdmissionLease = null;
+        defer if (peer) |*lease| lease.release();
+        if (index == 2) peer = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 1 }, false);
+        const before = controller.snapshot();
+        var cache = SharedCache.init(.{ .backend_limit_bytes = 16 });
+        defer cache.deinitAdmission();
+        try cache.configureManagedAdmissionOutsideExecution(controller, .gpu, .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 32 }, .{});
+        try cache.installRetirementDomainOutsideExecution(&pin);
+        var growth = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
+        defer growth.finishOutsideExecution();
+        if (index == 2) {
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, growth.fundOutsideExecution(&pin));
+        } else try std.testing.expectError(error.MemoryBudgetExceeded, growth.fundOutsideExecution(&pin));
+        try std.testing.expectEqualDeep(before, controller.snapshot());
+        try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
+        try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+    }
+}

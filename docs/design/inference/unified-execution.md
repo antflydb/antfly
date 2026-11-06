@@ -227,7 +227,10 @@ preparation API do not by themselves complete these remaining requirements:
   producer allocator; proposal acceptance and prefix selection remain task
   policy. Resident token slots own handoff,
   readback and cancellation-independent retirement across ordinary and pending
-  decode. Generation supplies semantic eligibility, schedules turns and publishes
+  decode. A bounded acceptance cursor owns reserved-prefix accounting and KV
+  advancement for published burst tokens. Ordinary and scheduled prefill share
+  runtime post-chunk donor maintenance before publishing their cursor.
+  Generation supplies semantic eligibility, schedules turns and publishes
   results. Native whole-model execution shares the last-logits implementation;
   retained hidden outputs point to the real backend, never the temporary adapter.
   `execution/decoder_storage.zig` owns pool geometry, metadata-only CUDA request
@@ -281,6 +284,13 @@ preparation API do not by themselves complete these remaining requirements:
   sequence-pooling owner. Tasks supply pooling, prefix width, normalization and
   finite-output requirements; the execution owner preserves full-width resident
   normalization before export and the original prefix-copy order.
+  Projected image inputs own a typed host/resident row source; the model producer
+  resolves placement while preserving early resident projection, later host
+  preparation and video priority. Prompt tasks consume borrowed row views through
+  the same numerical composer. Incremental-input cleanup qualifies actual session
+  pairs and supervision in its execution owner. Florence's full-prefix and
+  incremental decoder paths share architecture bindings and ordered vocabulary
+  head selection; tasks retain suppression construction, EOS and publication.
 - Metal installs synchronous assigned pair/QKV regions for complete F32
   projection heads through the production partition executor. Row-one regions
   use the existing source ownership. One semantic descriptor recognizes independent
