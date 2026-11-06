@@ -3203,6 +3203,7 @@ const MetadataObjectStreamCache = struct {
         // One frame and index, charged to the same live/cumulative allowance
         // as retained metadata. Locators remain valid after eviction.
         self.deinit();
+        self.beginAllocation();
         const a = self.budget.?.allocator();
         var scratch = DecodeBudgetAllocator.initWithCumulativeLimit(self.budget.?.backing, 0, self.budget.?.max_live_bytes, self.budget.?.max_live_bytes *| 4);
         defer std.debug.assert(scratch.live_bytes == 0);
@@ -5258,6 +5259,10 @@ const StructureResolverContext = struct {
         var local_scan = metadataScanControl(self.reader);
         reader.metadata_scan = self.scan orelse &local_scan;
         reader.metadata_frames = self.frames;
+        reader.metadata_frame_fallback = switch (projection) {
+            .resources, .required_resources, .resource_container, .resource_fields, .resource_entries => true,
+            else => false,
+        };
         var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
         defer encrypted_streams.deinit(alloc);
         reader.encrypted_streams = &encrypted_streams;
@@ -5295,6 +5300,10 @@ pub const Reader = struct {
     object_depth_limit: usize = std.math.maxInt(usize),
     metadata_scan: ?*syntax.ScanControl = null,
     metadata_frames: ?*MetadataObjectStreamCache = null,
+    // Required reads can share optional decoded frames without making frame
+    // retention a prerequisite for successfully reading a selected object.
+    metadata_frame_fallback: bool = false,
+    resource_names: ?*const std.StringHashMapUnmanaged(void) = null,
     structure_cache: ?*StructureMetadataCache = null,
     alloc: Allocator,
     bytes: []const u8,
@@ -5766,6 +5775,7 @@ pub const Reader = struct {
         var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[entry.offset..], entry.offset);
         scanner.max_object_depth = self.object_depth_limit;
         scanner.source_ref = ptr;
+        scanner.resource_names = self.resource_names;
         scanner.stream_length_resolver = .{ .context = self, .resolve = resolveStreamLengthReference };
         var scan_control: syntax.ScanControl = undefined;
         scanner.control = self.scannerControl(&scan_control);
@@ -5797,6 +5807,7 @@ pub const Reader = struct {
         var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[location.start..location.end], location.start);
         scanner.max_object_depth = self.object_depth_limit;
         scanner.source_ref = location.reference;
+        scanner.resource_names = self.resource_names;
         scanner.stream_length_resolver = .{ .context = self, .resolve = resolveStreamLengthReference };
         var scan_control: syntax.ScanControl = undefined;
         scanner.control = self.scannerControl(&scan_control);
@@ -6319,6 +6330,15 @@ pub const Reader = struct {
         var resource_budget = DecodeBudgetAllocator.initWithCumulativeLimit(resource_live_budget.allocator(), 0, self.decode_limits.max_working_set_bytes, self.decode_limits.max_working_set_bytes *| 4);
         var text_resources = TextResourceCache{ .budget = &resource_budget, .live_budget = &resource_live_budget };
         defer text_resources.deinit();
+        text_resources.prepareScan(self);
+        const previous_frames = self.metadata_frames;
+        const previous_fallback = self.metadata_frame_fallback;
+        self.metadata_frames = &text_resources.frames;
+        self.metadata_frame_fallback = true;
+        defer {
+            self.metadata_frames = previous_frames;
+            self.metadata_frame_fallback = previous_fallback;
+        }
         const resources = try text_resources.pageResources(self, &page);
         const fonts = try self.collectFontsFromResourcesAlloc(&resources, decoded_content);
         defer {
@@ -7452,12 +7472,20 @@ pub const Reader = struct {
         const first = std.math.cast(usize, first_i) orelse return error.InvalidObjectStream;
         const count = std.math.cast(usize, count_i) orelse return error.InvalidObjectStream;
         if (obj_index >= count) return error.ObjectNotFound;
-        const keep_frame = switch (projection) {
+        const keep_frame = self.metadata_frame_fallback or switch (projection) {
             .resource_properties, .container_properties, .property_table, .property => true,
             else => location != null,
         };
-        if (keep_frame) if (self.metadata_frames) |cache| {
-            const frame = try cache.load(self, obj_stream_id, &obj_stream, first, count);
+        if (keep_frame) if (self.metadata_frames) |cache| retain: {
+            const frame = cache.load(self, obj_stream_id, &obj_stream, first, count) catch |err| {
+                const quota = err == error.PdfDecodeWorkingSetTooLarge or err == error.DecodedStreamTooLarge or
+                    (err == error.OutOfMemory and (cache.budget.?.limit_exceeded or if (cache.live_budget) |live| live.limit_exceeded else false));
+                if (!self.metadata_frame_fallback or !quota) return err;
+                // Retention is optional for required resource reads. A genuine
+                // backing OOM or cancellation never takes this retry path.
+                cache.beginAllocation();
+                break :retain;
+            };
             cache.pins += 1;
             defer cache.pins -= 1;
             return self.parseCompressedObject(frame.bytes, frame.first, frame.entries[obj_index], ptr, projection, location);
@@ -7509,6 +7537,7 @@ pub const Reader = struct {
         if (start >= end or end > bytes.len) return error.InvalidObjectOffset;
         var scanner = syntax.Scanner.initWithOffset(self.alloc, bytes[start..end], start);
         scanner.source_ref = ptr;
+        scanner.resource_names = self.resource_names;
         var scan_control: syntax.ScanControl = undefined;
         scanner.control = self.scannerControl(&scan_control);
         scanner.allow_stream = false;
@@ -7537,10 +7566,16 @@ pub const Reader = struct {
     // scanned once and never allocated, even in indirect/compressed tables.
     fn resourceTable(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
         return switch (obj.*) {
-            .obj_ref => |ptr| try self.readIndirectObjectProjected(ptr, .resource_table),
-            .deferred => |location| try self.readDeferredObjectProjected(location, .resource_table),
+            .obj_ref => |ptr| try self.readIndirectObjectProjected(ptr, .resource_entries),
+            .deferred => |location| try self.readDeferredObjectProjected(location, .resource_entries),
             else => try obj.clone(self.alloc),
         };
+    }
+
+    fn selectedResourceTable(self: *const Reader, obj: *const syntax.Object, references: *const ReferencedResourceNames) !syntax.Object {
+        var reader = self.*;
+        reader.resource_names = &references.names;
+        return reader.resourceTable(obj);
     }
 
     // Color-space consumers use N, Alternate and Range, never ICC payloads.
@@ -9243,7 +9278,7 @@ pub const Reader = struct {
         var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageFont, 0);
-        var resolved_fonts = try self.resourceTable(fonts_obj);
+        var resolved_fonts = try self.selectedResourceTable(fonts_obj, &references);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
 
@@ -9298,7 +9333,7 @@ pub const Reader = struct {
         var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageFont, 0);
-        var resolved_fonts = try self.resourceTable(fonts_obj);
+        var resolved_fonts = try self.selectedResourceTable(fonts_obj, &references);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
 
@@ -9605,7 +9640,7 @@ pub const Reader = struct {
         var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"gs"}, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageExtGState, 0);
-        var resolved_ext = try self.resourceTable(ext_obj);
+        var resolved_ext = try self.selectedResourceTable(ext_obj, &references);
         defer resolved_ext.deinit(self.alloc);
         if (resolved_ext != .dict) return try self.alloc.alloc(PageExtGState, 0);
 
@@ -10103,7 +10138,7 @@ pub const Reader = struct {
         var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageForm, 0);
-        var resolved_xobjects = try self.resourceTable(xobject_obj);
+        var resolved_xobjects = try self.selectedResourceTable(xobject_obj, &references);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
 
@@ -38871,5 +38906,166 @@ test "reader resource entry views decrypt selected strings exactly once" {
             rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
         }
         try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedResourceTable, .{ sample, compressed });
+    }
+}
+
+fn buildLargeUnusedResourceTableTestPdfAlloc(a: Allocator) ![]u8 {
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    for (0..4096) |i| try table.print(a, "/Unused{d} 5 0 R ", .{i});
+    const form = try std.fmt.allocPrint(a, "<< /Subtype /Form /Resources << /Font << {s} >> /XObject << {s} >> /ExtGState << {s} >> >> /Length 3 >>\nstream\nq Q\nendstream", .{ table.items, table.items, table.items });
+    defer a.free(form);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "null", "null" },
+        .extra = &.{form},
+        .resources = "<< /Font << /F1 5 0 R >> /XObject << /Fm 9 0 R >> >>",
+        .content = "BT /F1 10 Tf (Hello) Tj ET /Fm Do",
+    });
+}
+
+test "reader unused large resource tables preserve native text within metadata limits" {
+    const a = std.testing.allocator;
+    const sample = try buildLargeUnusedResourceTableTestPdfAlloc(a);
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const text = try reader.extractPlainTextAlloc();
+        defer a.free(text);
+        try std.testing.expectEqualStrings("Hello\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, text);
+    }
+}
+
+fn buildSharedInlineFontContainerTestPdfAlloc(a: Allocator, count: usize, padding_bytes: usize) ![]u8 {
+    var resources: std.ArrayList(u8) = .empty;
+    defer resources.deinit(a);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(a);
+    try resources.appendSlice(a, "<< /Font << ");
+    try content.appendSlice(a, "BT 10 100 Td ");
+    for (0..count) |i| {
+        try resources.print(a, "/F{d} << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> ", .{i});
+        try content.print(a, "/F{d} 2 Tf (Hello) Tj ", .{i});
+    }
+    try resources.appendSlice(a, ">> /Private (");
+    try resources.appendNTimes(a, 'X', padding_bytes);
+    try resources.appendSlice(a, ") >>");
+    try content.appendSlice(a, "ET");
+    return buildObjectStreamFixtureAlloc(a, .{ .objects = &.{resources.items}, .content = content.items });
+}
+
+const LargeAllocationCounter = struct {
+    backing: Allocator,
+    large: usize = 0,
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const result = self.backing.rawAlloc(len, alignment, ret) orelse return null;
+        if (len >= 256 * 1024) self.large += 1;
+        return result;
+    }
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.backing.rawResize(memory, alignment, len, ret)) return false;
+        if (len >= 256 * 1024 and memory.len < 256 * 1024) self.large += 1;
+        return true;
+    }
+    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const result = self.backing.rawRemap(memory, alignment, len, ret) orelse return null;
+        if (len >= 256 * 1024 and memory.len < 256 * 1024) self.large += 1;
+        return result;
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.backing.rawFree(memory, alignment, ret);
+    }
+};
+
+test "reader native collectors share decoded containers across selected inline entries" {
+    const a = std.testing.allocator;
+    const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 64, 1024 * 1024);
+    defer a.free(sample);
+    var counter = LargeAllocationCounter{ .backing = a };
+    const counted = counter.allocator();
+    var reader = try Reader.init(counted, sample);
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        const before = counter.large;
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(counted);
+        try std.testing.expectEqual(@as(usize, 321), analysis.text.len);
+        // Decoding once and building the selected fonts takes only a handful
+        // of large allocations. A per-entry inflate needs at least 64.
+        try std.testing.expect(counter.large - before < 16);
+        try std.testing.expect(reader.metadata_frames == null);
+        try std.testing.expect(!reader.metadata_frame_fallback);
+    }
+}
+
+test "reader required resources tolerate frame retention quotas and preserve backing OOM" {
+    const a = std.testing.allocator;
+    const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 16, 4096);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var budget = DecodeBudgetAllocator.init(a, 0, 32);
+    var frames = MetadataObjectStreamCache{ .budget = &budget };
+    defer frames.deinit();
+    reader.metadata_frames = &frames;
+    reader.metadata_frame_fallback = true;
+    var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+    defer resources.deinit(a);
+    try std.testing.expect(resources.get("Font").?.* == .deferred);
+    try std.testing.expect(frames.frame == null);
+    try std.testing.expect(!budget.limit_exceeded);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    budget = DecodeBudgetAllocator.init(failing.allocator(), 0, 64 * 1024);
+    try std.testing.expectError(error.OutOfMemory, reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(frames.frame == null);
+}
+
+fn exerciseNativeSharedContainerAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqual(@as(usize, 46), analysis.text.len);
+    try std.testing.expect(reader.metadata_frames == null);
+}
+
+test "reader shared required frames preserve native ownership through allocation failures" {
+    const a = std.testing.allocator;
+    const sample = try buildSharedInlineFontContainerTestPdfAlloc(a, 9, 2048);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNativeSharedContainerAllocations, .{sample});
+}
+
+test "reader demanded large font tables retain only the selected escaped name" {
+    const a = std.testing.allocator;
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    for (0..4096) |i| try table.print(a, "/Unused{d} << /Private (unused definition) >> ", .{i});
+    const paint = "BT /F1 2 Tf 10 100 Td (World) Tj ET";
+    const correct_form = try std.fmt.allocPrint(a, "<< /Subtype /Form /Resources << /Font << {s} /F#31 5 0 R >> >> /Length {d} >>\nstream\n{s}\nendstream", .{ table.items, paint.len, paint });
+    defer a.free(correct_form);
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ "null", "null" }, .extra = &.{correct_form}, .resources = "<< /Font << /F1 5 0 R >> /XObject << /Fm 9 0 R >> >>", .content = "BT /F1 2 Tf 10 50 Td (Hello) Tj ET /Fm Do" });
+    defer a.free(sample);
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Hello") != null);
+        try std.testing.expect(std.mem.indexOf(u8, analysis.text, "World") != null);
     }
 }

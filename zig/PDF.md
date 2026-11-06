@@ -1960,8 +1960,11 @@ Metadata resolution shares one decoded object-stream frame and validated offset
 index per page. Both count against the retained/live byte allowance; codec
 scratch has a separate per-decode cumulative allowance. Decoded frames and
 projected object graphs move between accounting ledgers without copying or
-double-charging the shared backing allocator. Required reads evict unrelated
-frames. Allocation pressure reclaims an unrelated optional frame before
+double-charging the shared backing allocator. Native required-resource collectors
+share this frame cache, including inline entries reached through deferred source
+spans. Retention quota failures fall back to an uncached required read; genuine
+backing OOM, cancellation, and required decoder limits still propagate. Optional
+property reads retain their separate quota/fallback policy. Allocation pressure reclaims an unrelated optional frame before
 rejecting live-byte growth, including while parsing a selected value. Active
 source frames are pinned until their parser returns. Reclamation does not
 refund cumulative work or recover backing-allocator failures.
@@ -1985,10 +1988,15 @@ Dictionary order does not affect classification: unused fields are skipped,
 while allocating Form-only fields stay as source offsets until classification
 is complete, including an optional late Subtype2 PS. Form resource dictionaries
 are traversed once into at most five required fields. Required resource tables
-index names and scalar references in that pass, retaining source spans for
-compound entries. Unused inline font, XObject, graphics-state and color-space
-definitions are never materialized; their payloads and intervening comments
-are scanned once. Indirect tables use the same projection when selected.
+retain a bounded index of at most eight short names, with source spans for
+compound entries. Larger tables and long names fall back to a single source
+span; unselected tables cannot grow retained metadata merely through entry
+count. When content selects a large table, font, XObject, and graphics-state
+collectors retain only referenced entries, including escaped PDF names. Common
+indexed tables consume opaque values and comments once; large-table fallback
+trades a later bounded scan for constant initial index storage. Color-space
+resolution retains entry views for alias/default-space lookup without copying
+unused definitions. Indirect tables use the same projections.
 Properties retain their separate optional-metadata limits and lazy lookup.
 Collectors resolve entries only after determining which names the content uses.
 Source views preserve their owning object's identity so encrypted nested values

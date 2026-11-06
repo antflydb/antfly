@@ -237,6 +237,7 @@ pub const Projection = enum {
     appearance_header,
     structure_metadata,
     resource_table,
+    resource_entries,
     resource_fields,
     name,
     resources,
@@ -266,7 +267,7 @@ pub const Projection = enum {
             // Normal appearances can also be state dictionaries. Preserve their
             // names/references while leaving unrelated compound fields as views.
             .appearance_header => if (std.mem.eql(u8, key, "Subtype") or std.mem.eql(u8, key, "BBox") or std.mem.eql(u8, key, "Matrix")) .{ .keep = true } else .{ .keep = true, .view = true },
-            .resource_table => .{ .keep = true, .view = true },
+            .resource_table, .resource_entries => .{ .keep = true, .view = true },
             .text_xobject => blk: {
                 if (std.mem.eql(u8, key, "Subtype") or std.mem.eql(u8, key, "Subtype2") or std.mem.eql(u8, key, "Type")) break :blk .{ .keep = true, .child = .name };
                 if (std.mem.eql(u8, key, "StructParent")) break :blk .{ .keep = true, .skip = true };
@@ -311,6 +312,7 @@ pub const Scanner = struct {
     max_object_depth: usize = std.math.maxInt(usize),
     object_depth: usize = 0,
     source_ref: ?ObjRef = null,
+    resource_names: ?*const std.StringHashMapUnmanaged(void) = null,
     allow_stream: bool = true,
     control: ?*ScanControl = null,
     last_checked_pos: usize = 0,
@@ -420,7 +422,7 @@ pub const Scanner = struct {
                                 self.alloc.destroy(boxed);
                             }
                             const prior_source_ref = self.source_ref;
-                            if ((projection == .text_xobject or projection == .resource_table or projection == .resource_fields) and self.source_ref == null)
+                            if ((projection == .text_xobject or projection == .resource_table or projection == .resource_entries or projection == .resource_fields) and self.source_ref == null)
                                 self.source_ref = .{ .id = @intCast(value), .gen = @intCast(tok2.integer) };
                             defer self.source_ref = prior_source_ref;
                             boxed.* = try self.readObjectProjected(projection);
@@ -508,7 +510,139 @@ pub const Scanner = struct {
         return self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], "<<");
     }
 
+    // Common tables keep a tiny reusable index. Large tables retain only their
+    // source span until a collector knows the selected names. In particular,
+    // ignored XObjects and unused tables never allocate an unbounded index.
+    fn readResourceTable(self: *Scanner, bounded: bool) !Object {
+        const table_start = self.pos - 2;
+        var entries = std.ArrayList(DictEntry).empty;
+        defer entries.deinit(self.alloc);
+        errdefer for (entries.items) |*entry| entry.deinit(self.alloc);
+        while (true) {
+            try self.skipSpaceAndComments();
+            if (self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], ">>")) {
+                self.pos += 2;
+                return .{ .dict = try entries.toOwnedSlice(self.alloc) };
+            }
+            if (self.peekByte() != '/') return error.UnexpectedDictKey;
+            const key_start = self.pos;
+            try self.skipObject(self.object_depth);
+            const key_end = self.pos;
+            if (bounded and (entries.items.len >= 8 or key_end - key_start > 128)) {
+                try self.skipObject(self.object_depth);
+                while (true) {
+                    try self.skipSpaceAndComments();
+                    if (self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], ">>")) {
+                        self.pos += 2;
+                        break;
+                    }
+                    if (self.peekByte() != '/') return error.UnexpectedDictKey;
+                    try self.skipObject(self.object_depth);
+                    try self.skipObject(self.object_depth);
+                }
+                for (entries.items) |*entry| entry.deinit(self.alloc);
+                entries.clearRetainingCapacity();
+                return .{ .deferred = .{ .reference = self.source_ref.?, .start = self.base_offset + table_start, .end = self.base_offset + self.pos } };
+            }
+            if (!bounded) if (self.resource_names) |names| {
+                var failure: ?anyerror = null;
+                const selected = names.containsAdapted(self.bytes[key_start + 1 .. key_end], ResourceNameContext{ .control = self.control, .failure = &failure });
+                if (failure) |err| return err;
+                if (!selected) {
+                    try self.skipObject(self.object_depth);
+                    continue;
+                }
+            };
+            var key_scanner = Scanner.init(self.alloc, self.bytes[key_start..key_end]);
+            key_scanner.control = self.control;
+            defer key_scanner.deinit();
+            var key = try key_scanner.readObject();
+            defer key.deinit(self.alloc);
+            if (key != .name) return error.UnexpectedDictKey;
+            try self.skipSpaceAndComments();
+            const value_start = self.pos;
+            const first = self.peekByte() orelse return error.UnexpectedEof;
+            try self.skipObject(self.object_depth);
+            var value: Object = if (first == '<' or first == '[' or first == '(' or first == '/')
+                .{ .deferred = .{ .reference = self.source_ref.?, .start = self.base_offset + value_start, .end = self.base_offset + self.pos } }
+            else blk: {
+                // Parse only this scalar, so numeric lookahead cannot allocate
+                // the next (possibly enormous and unselected) dictionary key.
+                var scalar = Scanner.init(self.alloc, self.bytes[value_start..self.pos]);
+                scalar.control = self.control;
+                scalar.max_object_depth = self.max_object_depth;
+                scalar.object_depth = self.object_depth;
+                defer scalar.deinit();
+                break :blk try scalar.readObject();
+            };
+            errdefer value.deinit(self.alloc);
+            try entries.append(self.alloc, .{ .key = key.name, .value = value });
+            key = .null;
+        }
+    }
+
+    // Hash decoded PDF names without allocating unselected keys. The adapted
+    // context has exactly StringHashMap's hash/equality semantics after #xx
+    // decoding, including long names and escaped bytes.
+    const ResourceNameContext = struct {
+        control: ?*ScanControl = null,
+        failure: ?*?anyerror = null,
+        fn spend(self: @This(), work: usize) bool {
+            if (self.control) |control| control.spend(work) catch |err| {
+                self.failure.?.* = err;
+                return false;
+            };
+            return true;
+        }
+        fn next(raw: []const u8, offset: *usize, literal_until: *usize) ?u8 {
+            if (offset.* == raw.len) return null;
+            const byte = raw[offset.*];
+            offset.* += 1;
+            if (byte == '#' and offset.* > literal_until.* and offset.* + 1 < raw.len) {
+                if (unhex(raw[offset.*])) |hi| if (unhex(raw[offset.* + 1])) |lo| {
+                    offset.* += 2;
+                    return hi << 4 | lo;
+                };
+                // Match readName's literal recovery for malformed escapes.
+                literal_until.* = offset.* + 2;
+            }
+            return byte;
+        }
+        pub fn hash(self: @This(), raw: []const u8) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            var offset: usize = 0;
+            var literal_until: usize = 0;
+            var buffer: [64]u8 = undefined;
+            var count: usize = 0;
+            while (next(raw, &offset, &literal_until)) |byte| {
+                buffer[count] = byte;
+                count += 1;
+                if (count == buffer.len) {
+                    if (!self.spend(buffer.len)) return 0;
+                    hasher.update(&buffer);
+                    count = 0;
+                }
+            }
+            if (!self.spend(count)) return 0;
+            hasher.update(buffer[0..count]);
+            return hasher.final();
+        }
+        pub fn eql(self: @This(), raw: []const u8, name: []const u8) bool {
+            var offset: usize = 0;
+            var i: usize = 0;
+            var literal_until: usize = 0;
+            while (next(raw, &offset, &literal_until)) |byte| {
+                if (i % 4096 == 0 and !self.spend(@min(4096, name.len -| i))) return false;
+                if (i == name.len or name[i] != byte) return false;
+                i += 1;
+            }
+            return i == name.len;
+        }
+    };
+
     fn readDictOrStream(self: *Scanner, projection: Projection) anyerror!Object {
+        if ((projection == .resource_table or projection == .resource_entries) and self.source_ref != null)
+            return self.readResourceTable(projection == .resource_table);
         var entries = std.ArrayList(DictEntry).empty;
         var header_only = false;
         var subtype_seen = false;
@@ -2226,4 +2360,56 @@ test "scanner color profile headers never resolve lengths or inspect payload bou
     const a = std.testing.allocator;
     const input = "8 0 obj << /Length 99 0 R /N 3 /Alternate /DeviceRGB /Range [0 1 0 1 0 1] /Metadata (ignored) >>\nstream\nno payload terminator";
     try std.testing.checkAllAllocationFailures(a, exerciseColorProfileHeader, .{input});
+}
+
+fn exerciseSelectedResourceEntries(a: Allocator, input: []const u8) !void {
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(a);
+    try names.put(a, "F1", {});
+    try names.put(a, "Bad#x#41", {});
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    scanner.source_ref = .{ .id = 8, .gen = 0 };
+    scanner.resource_names = &names;
+    var table = try scanner.readObjectProjected(.resource_entries);
+    defer table.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), table.dict.len);
+    try std.testing.expect(table.get("F1").?.* == .deferred);
+    try std.testing.expectEqual(@as(u32, 5), table.get("Bad#x#41").?.obj_ref.id);
+}
+
+test "scanner resource indexes stay bounded across large tables and subtype orders" {
+    const a = std.testing.allocator;
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    for (0..4096) |i| try table.print(a, "/F{d} 5 0 R ", .{i});
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "", .after = "/Subtype /Image" },
+        .{ .before = "/Subtype /Form", .after = "/Subtype2 /PS" },
+        .{ .before = "/Subtype2 /PS", .after = "/Subtype /Form" },
+        .{ .before = "/Subtype /Image", .after = "" },
+    }) |order| {
+        const input = try std.fmt.allocPrint(a, "8 0 obj << {s} /Resources << /Font << {s} >> /XObject << {s} >> /ExtGState << {s} >> /ColorSpace << {s} >> >> {s} /Length 99 0 R >>\nstream\nignored", .{ order.before, table.items, table.items, table.items, table.items, order.after });
+        defer a.free(input);
+        var buffer: [8192]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+        var scanner = Scanner.init(fixed.allocator(), input);
+        defer scanner.deinit();
+        var object = try scanner.readObjectProjected(.text_xobject);
+        defer object.deinit(fixed.allocator());
+        try std.testing.expect(object.obj_def.value.* == .stream_header);
+    }
+}
+
+test "scanner demanded resource tables select decoded names without allocating unused keys" {
+    const a = std.testing.allocator;
+    const huge_key = try a.alloc(u8, 128 * 1024);
+    defer a.free(huge_key);
+    @memset(huge_key, 'X');
+    const input = try std.fmt.allocPrint(a, "<< /Unused 1 /{s} << /Private ({s}) >> /F#31 << /Subtype /Type1 >> /Bad#x#41 5 0 R >>", .{ huge_key, huge_key });
+    defer a.free(input);
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    try exerciseSelectedResourceEntries(fixed.allocator(), input);
+    try std.testing.checkAllAllocationFailures(a, exerciseSelectedResourceEntries, .{"<< /Unused 1 /F#31 << /Subtype /Type1 >> /Bad#x#41 5 0 R >>"});
 }
