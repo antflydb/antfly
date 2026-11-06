@@ -6963,9 +6963,10 @@ test "lite a group fsync failure sends OutcomeUnknown to every member" {
     var second_ctx = Context{ .label = "two" };
     var second = MutationRequest{ .context = &second_ctx, .apply = Context.apply };
     var first = MutationRequest{ .context = &first_ctx, .apply = Context.apply, .next = &second };
-    // The second sync barrier fails while the checkpoint slot is being
-    // published, which leaves the whole group's durability unknown.
-    Fault.remaining = 2;
+    // A small durable group now costs exactly one `syncData` (WS1's single-
+    // fsync commit): that one barrier failing leaves the whole group's
+    // durability unknown.
+    Fault.remaining = 1;
     defer Fault.remaining = 0;
     // Seed the queue directly and drive the real coordinator (rather than
     // calling applyMutationGroup directly) so this exercises the exact
@@ -7651,11 +7652,14 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = Fault.sync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    // A durable commit now costs 2 syncs, not 3: the on-disk
-    // active_checkpoint hint byte is no longer written/synced per commit
-    // (selectActiveCheckpoint already recovers the newest valid slot from
-    // its own commit_sequence). So there are only two barriers to fail.
-    for (1..3) |barrier| {
+    // A small durable commit now costs exactly one `syncData` (WS1's
+    // single-fsync commit): the manifest page and the slot are written
+    // together, with the one barrier inside `publishCheckpoint` covering
+    // both. There is only one barrier left to fail, and it always leaves
+    // durability unknown -- `checkpoint_publication_uncertain` is set
+    // before that write, so any failure past it (including the sync
+    // itself) surfaces as `OutcomeUnknown`, never a plain I/O error.
+    for (1..2) |barrier| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp, "group-sync-failure.aflite");
@@ -7669,15 +7673,10 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
             Fault.remaining = barrier;
             defer Fault.remaining = 0;
             var context: u8 = 0;
-            // The first barrier precedes checkpoint publication, so nothing
-            // committed. The second barrier fails while the checkpoint slot
-            // is being published, which leaves the commit's durability
-            // unknown.
-            const expected: anyerror = if (barrier == 1) error.InputOutput else error.OutcomeUnknown;
-            try std.testing.expectError(expected, store.submitMutation(&context, Fault.apply));
+            try std.testing.expectError(error.OutcomeUnknown, store.submitMutation(&context, Fault.apply));
             try std.testing.expectEqual(@as(usize, 0), Fault.remaining);
             // Later mutations never run until the outcome is reconciled.
-            if (barrier > 1) try std.testing.expectError(error.OutcomeReconciliationRequired, store.submitMutation(&context, Fault.apply));
+            try std.testing.expectError(error.OutcomeReconciliationRequired, store.submitMutation(&context, Fault.apply));
         }
         var reopened = try Store.open(alloc, path, true);
         defer reopened.close();

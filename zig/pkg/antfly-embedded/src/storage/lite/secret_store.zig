@@ -594,12 +594,14 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = SyncFault.fileSync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    // A durable commit now costs 2 syncs, not 3 (the on-disk
-    // active_checkpoint hint byte is no longer written/synced per commit),
-    // so there are only two sync points per removing/non-removing scenario.
-    for (1..5) |scenario| {
-        const fail_sync = (scenario - 1) % 2 + 1;
-        const removing = scenario > 2;
+    // A small durable commit now costs exactly one `syncData` (WS1's
+    // single-fsync commit): the manifest page and the slot are written
+    // together, so there is only one sync point left to fail, and it
+    // always leaves durability unknown -- `checkpoint_publication_uncertain`
+    // is set before that write, so failing it is never a plain, cleanly
+    // rolled-back I/O error.
+    for (1..3) |scenario| {
+        const removing = scenario > 1;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp);
@@ -614,22 +616,16 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
             var other = try Store.init(alloc, &docs, "scope", provider.provider());
             defer other.deinit();
             _ = try store.nativeStore().?.writer.put("scope", "key", "before", .absent);
-            SyncFault.remaining = fail_sync;
+            SyncFault.remaining = 1;
             defer SyncFault.remaining = 0;
             const writer = store.nativeStore().?.writer;
             const mutation = if (removing) writer.removeOverride("scope", "key", .{ .exact = 1 }) else writer.put("scope", "key", "after", .{ .exact = 1 });
-            try std.testing.expectError(if (fail_sync == 1) error.InputOutput else error.OutcomeUnknown, mutation);
+            try std.testing.expectError(error.OutcomeUnknown, mutation);
             try std.testing.expectEqual(@as(usize, 0), SyncFault.remaining);
-            if (fail_sync == 1) {
-                try expectValue(&other, "key", "before", 1);
-                try std.testing.expect(!docs.secret_store_uncertain);
-                try std.testing.expect((try docs.checkWithCancel(null)).valid);
-            } else {
-                try std.testing.expectError(error.OutcomeUnknown, other.source().resolve(alloc, "scope", "key", .{}));
-                try std.testing.expectError(error.OutcomeUnknown, other.source().listMetadata(alloc, "scope", .{}));
-                try std.testing.expectError(error.OutcomeUnknown, other.source().refresh("scope"));
-                try std.testing.expectError(error.OutcomeUnknown, other.nativeStore().?.writer.removeOverride("scope", "key", .any));
-            }
+            try std.testing.expectError(error.OutcomeUnknown, other.source().resolve(alloc, "scope", "key", .{}));
+            try std.testing.expectError(error.OutcomeUnknown, other.source().listMetadata(alloc, "scope", .{}));
+            try std.testing.expectError(error.OutcomeUnknown, other.source().refresh("scope"));
+            try std.testing.expectError(error.OutcomeUnknown, other.nativeStore().?.writer.removeOverride("scope", "key", .any));
         }
         var docs = try docstore.Store.open(alloc, path, false);
         defer docs.close();

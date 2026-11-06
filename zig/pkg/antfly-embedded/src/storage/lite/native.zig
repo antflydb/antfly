@@ -3631,7 +3631,25 @@ const PageAllocator = struct {
             self.next_free_index += 1;
             return page_id;
         }
+        return self.allocateFresh();
+    }
 
+    /// Like `allocate`, but never satisfies the request from a reused free
+    /// page -- always the next monotonically increasing id. The manifest
+    /// reservation in `flushTransactionWrites` needs this: a reused page can
+    /// still be the live target of a root this very flush never touched
+    /// (carried forward unchanged from `self.activeCheckpoint()`, such as
+    /// another catalog root's secondary-index pointer written earlier in
+    /// the same flush, or in an earlier commit within this since-last-
+    /// durable window) because the free-map ledger has no way to know a
+    /// commit later turned out to be `.unchanged` and silently discarded its
+    /// own reservation/free-map-root allocation without ever adopting it
+    /// into `self.header` -- on reload, that page still looks free, and
+    /// handing it to a *different* live root, or to this reservation, while
+    /// something else still legitimately points at it is a real corruption,
+    /// not just a tracking gap. A fresh id is never referenced by anything
+    /// yet, so it cannot collide with a live root under any of this.
+    fn allocateFresh(self: *PageAllocator) !u64 {
         const page_id = self.next_page_id;
         if (self.file.max_file_bytes) |limit| {
             if (page_id >= limit / self.file.header.page_size) {
@@ -5323,6 +5341,18 @@ pub const NativeFile = struct {
             var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = .{ .reader_epoch_namespace = try @import("reader_epochs.zig").namespaceForPublicationWithDurability(allocator, io, create_target, no_sync) }, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
             defer staged.invalidateLedger();
             defer staged.page_cache.deinit(allocator);
+            // `staged` never goes through `close()` (it shares `file`/`path`/
+            // `io_impl` with the real `result` built below, so closing it
+            // here would close the file out from under that later value).
+            // Its commits during `initializeIndexedAllocator` still run the
+            // ordinary transaction path, so with manifest commits enabled
+            // they accumulate into `staged.manifest_builder` exactly like
+            // any other writer -- a non-durable intermediate commit, or a
+            // durable one that stayed presynced, can leave entries behind
+            // with no later durable publish on this same value to reset
+            // them. Free that tracking state explicitly; it is never
+            // referenced again once `initialized_header` is captured below.
+            defer staged.manifest_builder.deinit(allocator);
             try staged.initializeIndexedAllocator();
             initialized_header = staged.header;
         }
@@ -10038,6 +10068,14 @@ pub const NativeFile = struct {
             .page_cache_enabled = .init(false),
             .max_file_bytes = self.vacuum_workspace_limit,
         };
+        // `writer` targets a disposable vacuum/copy workspace file, never
+        // goes through `beginTransaction`/`commitTransaction`/`close()`, and
+        // is abandoned once this function returns. Its page writes still run
+        // through the ordinary `PageWriteBatch.flushCount` hook, so with
+        // manifest commits enabled they accumulate into `writer.manifest_builder`
+        // like any tracked writer's would; nothing else ever frees that
+        // state for a value that never calls `close()`.
+        defer writer.manifest_builder.deinit(self.allocator);
         var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page.*, .ledger = if (tracking) |target| target.ledger else null, .can_reuse = false };
         defer pages.deinit();
         var builder = ExtentAppender{ .file = &writer, .pages = &pages, .tail = undefined, .batch = .{ .file = &writer } };
@@ -10133,6 +10171,9 @@ pub const NativeFile = struct {
         const io = self.runtimeIo();
         var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false), .max_file_bytes = self.vacuum_workspace_limit };
         writer.header.indexed_reclamation = self.header.indexed_reclamation or self.vacuum_target_indexed;
+        // See `copyExternalValue`'s matching comment: `writer` never closes,
+        // so its manifest tracking state must be freed explicitly.
+        defer writer.manifest_builder.deinit(self.allocator);
         var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page_id.*, .pack_records = true };
         defer pages.deinit();
         var key_index = DocumentIndexBulkBuilder{ .owner = &writer, .file = compact_file, .next_page_id = &pages.next_page_id, .pages = &pages };
@@ -10178,6 +10219,9 @@ pub const NativeFile = struct {
         const io = self.runtimeIo();
         var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false), .max_file_bytes = self.vacuum_workspace_limit };
         writer.header.indexed_reclamation = self.header.indexed_reclamation or self.vacuum_target_indexed;
+        // See `copyExternalValue`'s matching comment: `writer` never closes,
+        // so its manifest tracking state must be freed explicitly.
+        defer writer.manifest_builder.deinit(self.allocator);
         var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page_id.*, .pack_records = true };
         defer pages.deinit();
         var document_index = DocumentIndexBulkBuilder{
@@ -10440,6 +10484,9 @@ pub const NativeFile = struct {
         const indexed = self.header.indexed_reclamation or self.vacuum_target_indexed;
         if (document_count > 0 and !indexed) {
             var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = self.header, .page_cache_enabled = .init(false), .max_file_bytes = self.vacuum_workspace_limit };
+            // See `copyExternalValue`'s matching comment: `writer` never
+            // closes, so its manifest tracking state must be freed explicitly.
+            defer writer.manifest_builder.deinit(self.allocator);
             var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page_id, .pack_records = true };
             defer pages.deinit();
             namespace_directory_root_page = (try writer.writeNamespaceIndex(&pages, previous, .{ .history = 0 }, &namespace_directory)).page;
@@ -10482,6 +10529,9 @@ pub const NativeFile = struct {
             // normal commit. Ownership follows immutable DAG edges and records.
             var writer = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(""), .file = compact_file, .header = compact_header, .page_cache_enabled = .init(false), .max_file_bytes = self.vacuum_workspace_limit };
             writer.allocator_cancel_token = cancel;
+            // See `copyExternalValue`'s matching comment: `writer` never
+            // closes, so its manifest tracking state must be freed explicitly.
+            defer writer.manifest_builder.deinit(self.allocator);
             const state = try self.allocator.create(allocator_v4.State);
             state.* = allocator_v4.State.init(self.allocator);
             writer.ledger = state;
@@ -10506,6 +10556,13 @@ pub const NativeFile = struct {
             var projection = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = true, .page_cache_enabled = .init(false) };
             defer projection.invalidateLedger();
             defer projection.page_cache.deinit(self.allocator);
+            // `projection` never calls `close()` either. A successful
+            // `commitTransaction` below already resets `manifest_builder`
+            // (see `publishCheckpoint`), making this a no-op on that path;
+            // on the `errdefer projection.abortTransaction()` path just below,
+            // nothing else ever frees whatever this transaction's own
+            // flush(es) tracked.
+            defer projection.manifest_builder.deinit(self.allocator);
             try projection.beginTransaction();
             errdefer projection.abortTransaction();
             var records = try LiveRecordCursor.init(self, .documents);
@@ -11333,6 +11390,28 @@ pub const NativeFile = struct {
         try batch.flush();
     }
 
+    /// A non-durable (`changed == false`) commit attempt never adopts its own
+    /// `next.page_count` into `self.header` -- `publishCheckpoint` is only
+    /// reached for a commit that durably publishes. But `self.manifest_builder
+    /// .reserved_page`, once set, deliberately survives across every commit
+    /// in the since-last-durable window regardless of whether each one
+    /// durably publishes (that is the "only reserve once per window" design
+    /// in `flushTransactionWrites`). If an earlier attempt's reservation is
+    /// still pending because every attempt since has been a no-op, a brand
+    /// new `PageAllocator` built from the *same*, never-advanced
+    /// `checkpoint.page_count` would otherwise start handing out that exact
+    /// page id again -- to `next.free_map_root_page`, to a catalog edit, to
+    /// anything -- stepping on a page `tryBuildCommitManifest` is still
+    /// going to claim once a real commit finally lands. Starting past it
+    /// makes that impossible without needing to know whether this specific
+    /// checkpoint's `page_count` is durable or merely an abandoned attempt's
+    /// in-memory echo.
+    fn manifestSafeNextPageId(self: *const NativeFile, page_count: u64) u64 {
+        if (!manifest_commits_enabled) return page_count;
+        const reserved = self.manifest_builder.reserved_page orelse return page_count;
+        return @max(page_count, reserved + 1);
+    }
+
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
         return self.pageAllocatorFromFreeMapWithProof(checkpoint, !self.artifact_lease_transaction);
     }
@@ -11364,7 +11443,7 @@ pub const NativeFile = struct {
             };
             _ = try self.drainRetirement(state, checkpoint, self.retirement_work_pages);
             const can_reuse = self.free_pages_verified and (lock != null or (coordinated and self.reader_window_lock != null));
-            return .{ .file = self, .free_pages = &.{}, .next_page_id = checkpoint.page_count, .ledger = state, .can_reuse = can_reuse, .reuse_retry_enabled = self.free_pages_verified and !can_reuse, .coordinated_reader_window = coordinated, .data_lock_file = if (lock) |held| held.file else null };
+            return .{ .file = self, .free_pages = &.{}, .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count), .ledger = state, .can_reuse = can_reuse, .reuse_retry_enabled = self.free_pages_verified and !can_reuse, .coordinated_reader_window = coordinated, .data_lock_file = if (lock) |held| held.file else null };
         }
         var free_pages = try self.readFreePagesAlloc(checkpoint);
         errdefer self.allocator.free(free_pages);
@@ -11390,7 +11469,7 @@ pub const NativeFile = struct {
             .file = self,
             .free_pages = free_pages,
             .append_only = !self.free_pages_verified,
-            .next_page_id = checkpoint.page_count,
+            .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count),
             .data_lock_file = data_lock_file,
         };
     }
@@ -12128,7 +12207,15 @@ pub const NativeFile = struct {
         if (self.allow_manifest_reservation and !self.no_sync and
             !self.manifest_builder.overflowed and self.manifest_builder.reserved_page == null)
         {
-            self.manifest_builder.reserved_page = try writes.pages.allocate();
+            // Always a fresh id, never a reused free page -- see
+            // `PageAllocator.allocateFresh`'s doc comment. A reused page
+            // can still be the live target of some other root this flush
+            // never touched, and this reservation may itself end up
+            // abandoned (this attempt might turn out `changed == false`,
+            // which never adopts `next` into `self.header` at all) without
+            // ever un-reserving it, so it must never risk a page anything
+            // else still legitimately references.
+            self.manifest_builder.reserved_page = try writes.pages.allocateFresh();
         }
         try self.persistAllocator(&writes.pages, &next);
         if (manifest_commits_enabled) try self.manifest_builder.noteReused(self.allocator, &writes.pages.reused);
@@ -12150,7 +12237,27 @@ pub const NativeFile = struct {
                 std.debug.assert(self.manifest_builder.entries.contains(page_id));
             }
             var reused_it = writes.pages.reused.keyIterator();
-            while (reused_it.next()) |page| std.debug.assert(self.manifest_builder.entries.contains(page.*));
+            while (reused_it.next()) |page| {
+                // The manifest reservation (`flushTransactionWrites` above,
+                // "Reserve a page for a possible commit manifest") calls the
+                // same `PageAllocator.allocate()` every other page goes
+                // through, so it can just as easily be satisfied from the
+                // free list as from a fresh `next_page_id` bump -- nothing
+                // steers it toward an append. When it is a reuse, the
+                // reserved page lands in `writes.pages.reused` like any
+                // other reused page, but by design (see `reserved_page`'s
+                // doc comment) nothing writes through the tracked hook to
+                // it during this flush: `tryBuildCommitManifest` writes it
+                // directly, afterward, as either the real manifest page or
+                // (every early-return path's `defer`) a filler page. Both
+                // `encodeManifestPayloadAlloc` and `verifyManifest` already
+                // treat the reserved page as a deliberate gap with no
+                // `entries` record, independent of whether it came from
+                // reuse or append. Skip it here exactly like the page_id
+                // loop above already does.
+                if (page.* == self.manifest_builder.reserved_page) continue;
+                std.debug.assert(self.manifest_builder.entries.contains(page.*));
+            }
         }
         try self.publishCheckpoint(next, false);
         self.transaction_writes = null;
@@ -12346,6 +12453,16 @@ pub const NativeFile = struct {
         self.header = previous;
         self.transaction_header = null;
         self.discardTransactionTail();
+        // See the matching comment in `commitTransactionWithDurability`'s
+        // `errdefer`: an abort truncates this transaction's own pages away,
+        // so any manifest tracking for them (and a `reserved_page` claimed
+        // during one of its flushes) must not survive to be mistaken for a
+        // later commit's own fresh reservation. Safe to drop unconditionally
+        // -- the next durable commit just falls back to presynced.
+        if (manifest_commits_enabled) {
+            self.manifest_builder.deinit(self.allocator);
+            self.manifest_builder = .{};
+        }
         self.namespace_directory_cache_root = std.math.maxInt(u64);
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.namespace_directory_cache = .empty;
@@ -12393,7 +12510,27 @@ pub const NativeFile = struct {
         self.header = previous;
         self.transaction_header = null;
         errdefer {
-            if (!self.checkpoint_publication_uncertain) self.discardTransactionTail();
+            if (!self.checkpoint_publication_uncertain) {
+                self.discardTransactionTail();
+                // A clean (not `OutcomeUnknown`) failure past this point --
+                // most likely `tryBuildCommitManifest`'s own manifest-page
+                // write, or `sealAllocatorCheckpoint` above -- means this
+                // attempt's pages are truncated away by the call just above,
+                // but whatever `manifest_builder` tracked for them (and any
+                // `reserved_page` claimed for this attempt) is not. Carrying
+                // that forward would let a retried commit mistake a stale,
+                // now-reused-or-gone page id for its own fresh reservation.
+                // Resetting here is always safe, even though it also drops
+                // legitimate entries from earlier non-durable commits in the
+                // same since-last-durable window: the next durable commit
+                // just falls back to the presynced two-sync path instead of
+                // risking an under- or over-complete manifest, exactly like
+                // an ordinary `overflowed` latch.
+                if (manifest_commits_enabled) {
+                    self.manifest_builder.deinit(self.allocator);
+                    self.manifest_builder = .{};
+                }
+            }
             self.namespace_directory_cache_root = std.math.maxInt(u64);
             deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
             self.namespace_directory_cache = .empty;
@@ -12454,7 +12591,7 @@ pub const NativeFile = struct {
     /// this same flag, so inert while it is false) is exactly the tool to
     /// rerun once someone picks this back up -- it already reproduces
     /// against `make zig-test`-level traffic, not just a synthetic repro.
-    const manifest_commits_enabled = false;
+    const manifest_commits_enabled = true;
 
     /// Builds and writes a `.commit_manifest` page covering every page this
     /// commit's `PageWriteBatch` touched (documents, catalog/index pages,
@@ -14562,19 +14699,239 @@ test "lite native recovery falls back past a torn higher-sequence slot" {
     try std.testing.expect((try file.check()).valid);
 }
 
-// Three tests against the now-correctly-scoped manifest window lived here:
-// a small commit taking the manifest path with an oversized one falling
-// back to presynced; a deferred commit not leaving flushTransactionWrites'
-// page reservation unwritten; and a durable commit's manifest catching a
-// torn page from an *earlier* non-durable commit in the same
-// since-last-durable window (recovery correctly reverts to the checkpoint
-// from before any of them). All three passed. They were removed because
-// manifest_commits_enabled is false again (see its doc comment for why:
-// a reused-but-never-written page surfaced by the debug cross-check
-// against real DB-layer traffic, not yet root-caused) and with it off
-// `allow_manifest_reservation` never fires, so none of the three would
-// exercise anything. Restore them -- the commit history has the exact
-// text -- alongside re-enabling the flag.
+// WS1(b) required tests, restored (and extended) now that
+// manifest_commits_enabled is true. Bare `file.putDocument`/
+// `putDocumentBatch` calls with no open transaction never reach
+// commitTransactionWithDurability at all -- indexed_reclamation files
+// route them through putIndexedDocumentBatch's own hand-rolled
+// publishCheckpoint(next, false) (always presynced, pre-dating and
+// independent of this feature; see "lite native durable commit costs
+// two syncs after dropping the active_checkpoint hint" above, which
+// still correctly asserts 2 there). Every test below wraps its writes
+// in an explicit beginTransaction/commitTransaction pair so `putDocument`
+// takes the staged-transaction path instead and actually exercises
+// flushTransactionWrites/tryBuildCommitManifest.
+
+test "lite native small durable commit builds a manifest and costs one sync" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-small-commit.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+
+    const before = file.test_sync_calls.load(.monotonic);
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "durable");
+        try file.commitTransaction();
+    }
+    try std.testing.expectEqual(@as(u64, 1), file.test_sync_calls.load(.monotonic) - before);
+
+    const slot = file.activeCheckpoint();
+    try std.testing.expect(!slot.presynced);
+    try std.testing.expect(slot.manifest_page != 0);
+    try std.testing.expect((try file.check()).valid);
+    const value = (try file.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("durable", value);
+}
+
+test "lite native oversized commit falls back to presynced with two syncs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-oversized-commit.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+
+    // One value spanning more than max_single_sync_pages value-chain pages,
+    // all written inside one transaction: tryBuildCommitManifest must give
+    // up (too many entries to list) and fall back to the historical
+    // presync-then-slot-sync order.
+    const large = try allocator.alloc(u8, (max_single_sync_pages + 64) * 4000);
+    defer allocator.free(large);
+    @memset(large, 'v');
+
+    const before = file.test_sync_calls.load(.monotonic);
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("big", large);
+        try file.commitTransaction();
+    }
+    try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+
+    const slot = file.activeCheckpoint();
+    try std.testing.expect(slot.presynced);
+    try std.testing.expectEqual(@as(u64, 0), slot.manifest_page);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native manifest catches a torn page from an earlier non-durable commit in the same window" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-window-torn-page.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "stable");
+        try file.commitTransaction();
+    }
+    const stable_sequence = file.activeCheckpoint().commit_sequence;
+
+    // A non-durable commit inside the same since-last-durable window: it
+    // still writes real pages through the ordinary tracked hook, and
+    // manifest_builder keeps tracking them even though this attempt never
+    // calls tryBuildCommitManifest/publishCheckpoint's real branch. A large
+    // value forces an external value chain: unlike the tiny document/index
+    // structure pages (which the next commit's own unrelated edit to "doc"
+    // can easily revisit and overwrite, erasing the tear before
+    // verification ever runs), a value chain is immutable once written and
+    // belongs only to this document -- nothing else has any reason to
+    // reuse or rewrite it in this short a window.
+    const non_durable_value = try allocator.alloc(u8, 20 * 4000);
+    defer allocator.free(non_durable_value);
+    @memset(non_durable_value, 'n');
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("non-durable-marker", non_durable_value);
+        try file.commitTransactionWithDurability(false);
+    }
+    try std.testing.expect(file.manifest_builder.entries.count() > 0);
+
+    // Tear every page this non-durable commit touched -- the handful of
+    // small structural pages (free map, catalog, index) may well get
+    // rewritten and "repaired" by the next commit's own edit to "doc"
+    // below, but the bulk of these entries are the value chain's own pages
+    // and none of them are.
+    {
+        var it = file.manifest_builder.entries.keyIterator();
+        while (it.next()) |page_id| {
+            // verifyManifest compares the page's *stored* CRC field against
+            // the CRC the manifest recorded at write time; it does not
+            // recompute a fresh CRC from the current payload (full
+            // structural re-verification is the slot's own, separate
+            // check). Corrupting the CRC field itself (not a payload byte)
+            // is what that comparison actually catches.
+            const damaged = page_id.* * @as(u64, file.header.page_size) + page_crc_offset;
+            try file.file.writePositionalAll(file.runtimeIo(), "X", damaged);
+        }
+    }
+
+    // The eventual durable commit's manifest must cover that torn page,
+    // so its slot fails verification on reopen and recovery falls all the
+    // way back to the checkpoint from before either of these two commits.
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "durable-after");
+        try file.commitTransaction();
+    }
+    file.close();
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(stable_sequence, report.commit_sequence);
+
+    var reopened = try NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(stable_sequence, reopened.activeCheckpoint().commit_sequence);
+    const recovered = (try reopened.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings("stable", recovered);
+}
+
+// WS1(b) required test: "when the slot is durable but its pages were
+// dropped, the manifest check fails and recovery falls back."
+test "lite native recovery falls back and truncates when a manifest-listed page is dropped" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-dropped-page.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "stable");
+        try file.commitTransaction();
+    }
+    const stable_sequence = file.activeCheckpoint().commit_sequence;
+    const stable_page_count = file.activeCheckpoint().page_count;
+
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "newest");
+        try file.commitTransaction();
+    }
+    const newest = file.activeCheckpoint();
+    try std.testing.expect(!newest.presynced);
+    try std.testing.expect(newest.manifest_page != 0);
+
+    // Corrupt every page this commit wrote (everything from the previous
+    // frontier up to the new one), except the manifest page itself and the
+    // slot: both of their own CRCs stay intact, so only verifyManifest's
+    // per-entry CRC check over the data pages it lists can catch this.
+    var candidate = stable_page_count;
+    while (candidate < newest.page_count) : (candidate += 1) {
+        if (candidate == newest.manifest_page) continue;
+        // See the matching comment in the earlier window test: corrupt the
+        // stored CRC field itself, which is what verifyManifest compares,
+        // not a payload byte (a full structural re-check is the slot's own
+        // separate, different concern).
+        const damaged = candidate * @as(u64, file.header.page_size) + page_crc_offset;
+        try file.file.writePositionalAll(file.runtimeIo(), "X", damaged);
+    }
+    file.close();
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(stable_sequence, report.commit_sequence);
+    try std.testing.expectEqual(stable_page_count, report.page_count);
+
+    var reopened = try NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(stable_sequence, reopened.activeCheckpoint().commit_sequence);
+    const recovered = (try reopened.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings("stable", recovered);
+}
+
+// WS1(b) required test: "a v8 build refuses a v7 file" (design doc §3.1).
+test "lite native indexed open refuses a pre-v8 format version" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-pre-v8-indexed.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+        file.close();
+    }
+    {
+        var raw_version: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw_version, indexed_format_version - 1, .little);
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.writePositionalAll(std.testing.io, &raw_version, version_offset);
+    }
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(allocator, path, true));
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(allocator, path, false));
+}
 
 test "lite native create writes inspectable aflite file" {
     const allocator = std.testing.allocator;
@@ -20127,6 +20484,26 @@ test "lite sorted editor releases ownership on every allocation failure" {
             const saved = f.allocator;
             f.allocator = allocator;
             defer f.allocator = saved;
+            // This editor never goes through `beginTransaction`/
+            // `commitTransaction` (the comment below: "the direct editor
+            // never publishes"), so nothing ever resets
+            // `f.manifest_builder` the way a durable commit would -- yet
+            // its writes still run through the ordinary
+            // `PageWriteBatch.flushCount` hook and accumulate into it like
+            // any tracked writer's would. Left alone, that state would grow
+            // on every one of `checkAllAllocationFailures`'s repeated calls
+            // to this same closure (same `f`, never durably published
+            // between them), making a supposedly side-effect-free retry
+            // visibly heavier each time -- and because each call's growth
+            // happens under that call's own temporary `allocator`, letting
+            // it survive past `defer f.allocator = saved` above would also
+            // leave it holding memory from an allocator instance this
+            // function no longer owns. Reset it before the swap unwinds,
+            // with the same allocator that grew it this call.
+            defer if (NativeFile.manifest_commits_enabled) {
+                f.manifest_builder.deinit(allocator);
+                f.manifest_builder = .{};
+            };
             var pages = try f.pageAllocatorFromFreeMap(f.activeCheckpoint());
             defer pages.deinit();
             var editor = IndexEditor.init(f, f.activeCheckpoint(), f.activeCheckpoint().document_index_root_page);
