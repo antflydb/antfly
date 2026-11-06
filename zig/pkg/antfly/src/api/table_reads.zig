@@ -564,6 +564,7 @@ const ControlProvisionedTableReadCache = struct {
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
 };
@@ -580,6 +581,7 @@ const PhysicalProvisionedTableReadCache = struct {
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -776,6 +778,7 @@ const PhysicalProvisionedTableReadCache = struct {
             .decision_registry = self.decision_registry,
             .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
+            .inference_api_key = self.inference_api_key,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
             .remote_content = self.remote_content,
@@ -3317,6 +3320,7 @@ pub const ProvisionedTableReadSource = struct {
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -3507,6 +3511,7 @@ pub const ProvisionedTableReadSource = struct {
         hosted.decision_registry = self.decision_registry;
         hosted.provider_runtime = self.provider_runtime;
         hosted.inference_api_url = self.inference_api_url;
+        hosted.inference_api_key = self.inference_api_key;
         hosted.secret_store = self.secret_store;
         hosted.remote_content = self.remote_content;
         hosted.graph_read_barrier = self.graph_read_barrier;
@@ -3570,6 +3575,17 @@ pub const ProvisionedTableReadSource = struct {
     ) *ProvisionedTableReadSource {
         self.inference_api_url = inference_api_url;
         if (self.cache) |cache| cache.inference_api_url = inference_api_url;
+        return self;
+    }
+
+    /// Unresolved node credential for the default inference endpoint. Query
+    /// post-processing (reranking) sends it only to that endpoint.
+    pub fn withInferenceAPIKey(
+        self: *ProvisionedTableReadSource,
+        inference_api_key: ?[]const u8,
+    ) *ProvisionedTableReadSource {
+        self.inference_api_key = inference_api_key;
+        if (self.cache) |cache| cache.inference_api_key = inference_api_key;
         return self;
     }
 
@@ -4275,6 +4291,7 @@ pub const ProvisionedTableReadSource = struct {
             .decision_registry = self.decision_registry,
             .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
+            .inference_api_key = self.inference_api_key,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
             .remote_content = self.remote_content,
@@ -6360,6 +6377,7 @@ pub const HostedProvisionedTableReadSource = struct {
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     inference_api_url: ?[]const u8 = null,
+    inference_api_key: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -6426,6 +6444,14 @@ pub const HostedProvisionedTableReadSource = struct {
         return self;
     }
 
+    pub fn withInferenceAPIKey(
+        self: *HostedProvisionedTableReadSource,
+        inference_api_key: ?[]const u8,
+    ) *HostedProvisionedTableReadSource {
+        self.inference_api_key = inference_api_key;
+        return self;
+    }
+
     pub fn withRerankerRuntime(self: *HostedProvisionedTableReadSource, runtime: *reranking_runtime.Runtime) *HostedProvisionedTableReadSource {
         self.reranker_runtime = runtime;
         self.provider_runtime = &runtime.providers;
@@ -6464,6 +6490,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .decision_registry = self.decision_registry,
             .provider_runtime = self.provider_runtime,
             .inference_api_url = self.inference_api_url,
+            .inference_api_key = self.inference_api_key,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
             .remote_content = self.remote_content,
