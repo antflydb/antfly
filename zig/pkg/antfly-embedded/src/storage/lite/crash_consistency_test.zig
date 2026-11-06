@@ -898,6 +898,41 @@ test "crash sweep exhaustive: full text synchronous visibility" {
     try reportFailures(&report);
 }
 
+// Regression test for a bug-1 finding: `SimIo.vtFileSync` used to capture a
+// full durable-rollback snapshot (an O(file-size) read, done while holding
+// `SimIo.mutex` for the whole call) on *every* sync, even in a run with no
+// crash plan configured at all -- including every scenario's discovery
+// pass, which can never call `applyPowerLoss` and so never needed that
+// snapshot. That gratuitous, lock-amplified overhead ran on every thread's
+// every sync, including a full-text index's background derived-worker
+// catch-up (spawned via `io.concurrent(...)` by `.full_text` sync-level
+// writes), serializing and slowing it far more than the real `std.Io` ever
+// would. In this repo's build that reproducibly got the "full text
+// synchronous visibility" scenario's discovery pass stuck: its post-write
+// reopen saw `error.IndexRebuilding` forever (never recovered even after 50
+// rounds of `runUntilIdle`/`forceCompactTextIndexes`/
+// `drainScheduledTextMerges`), while the identical scenario run against the
+// real, unwrapped `std.Io` (no `SimIo` at all) always passed immediately --
+// proving the bug lived in the shim, not the engine. Run several times
+// (the race was intermittent) to guard against the overhead regressing.
+test "crash sweep: full text sync visibility discovery is not flaky under the shim" {
+    var attempt: usize = 0;
+    while (attempt < 10) : (attempt += 1) {
+        // `quick_sample = 0` runs only the discovery pass (no crash-replay
+        // barriers), which is where the bug manifested and all this test
+        // needs to exercise.
+        var report = try runCrashSweep(std.testing.allocator, .{
+            .name = "full-text-sync-visible",
+            .run = runFullTextSyncVisible,
+            .via_db = true,
+            .search_index = "body_text",
+            .search_field = "body",
+        }, .{ .quick_sample = 0 });
+        defer report.deinit();
+        try reportFailures(&report);
+    }
+}
+
 fn reportFailures(report: *const SweepReport) !void {
     if (report.ok()) return;
     for (report.failures.items) |f| {

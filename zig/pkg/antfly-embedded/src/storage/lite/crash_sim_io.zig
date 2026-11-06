@@ -299,8 +299,14 @@ pub const SimIo = struct {
         try self.durable.put(self.allocator, owned, null);
     }
 
-    fn captureDurableSnapshot(self: *SimIo, file: File, path: []const u8) !void {
-        if (self.directories.contains(path)) return;
+    /// Reads the full current contents of `file`, with `self.mutex` *not*
+    /// held: this is the potentially large, potentially slow real I/O that
+    /// must never run while blocking every other thread's unrelated vtable
+    /// calls (see the long comment in `vtFileSync`). Returns `null` if
+    /// `file` turns out to be a directory (nothing byte-level to capture);
+    /// the caller commits the result -- including the directory case --
+    /// via `commitDurableSnapshot`, under the lock.
+    fn readDurableSnapshot(self: *SimIo, file: File) !?[]u8 {
         const len = try self.real.vtable.fileLength(self.real.userdata, file);
         const bytes = try self.allocator.alloc(u8, len);
         errdefer self.allocator.free(bytes);
@@ -309,22 +315,31 @@ pub const SimIo = struct {
             const got = self.real.vtable.fileReadPositional(self.real.userdata, file, &.{bytes[filled..]}, filled) catch |err| switch (err) {
                 // A directory fsync'd by opening it as a read-only file hits
                 // this on the first read attempt; it is not a real fault.
-                // There is nothing byte-level to snapshot, so forget this
-                // path ever looked like a regular, syncable file.
+                // There is nothing byte-level to snapshot.
                 error.IsDir => {
                     self.allocator.free(bytes);
-                    try self.markDirectory(path);
-                    return;
+                    return null;
                 },
                 else => return err,
             };
             if (got == 0) break;
             filled += got;
         }
+        return bytes[0..filled];
+    }
+
+    /// Commits a snapshot captured by `readDurableSnapshot` into
+    /// `self.durable` (or, for `null`, records `path` as a directory).
+    /// Caller must hold `self.mutex` and, on error, still owns `captured`.
+    fn commitDurableSnapshot(self: *SimIo, path: []const u8, captured: ?[]u8) !void {
+        const bytes = captured orelse {
+            try self.markDirectory(path);
+            return;
+        };
         const gop = try self.durable.getOrPut(self.allocator, path);
         if (!gop.found_existing) gop.key_ptr.* = try self.allocator.dupe(u8, path);
         if (gop.value_ptr.*) |old| self.allocator.free(old);
-        gop.value_ptr.* = bytes[0..filled];
+        gop.value_ptr.* = bytes;
     }
 
     fn markDirectory(self: *SimIo, path: []const u8) !void {
@@ -426,19 +441,61 @@ fn vtFileClose(userdata: ?*anyopaque, files: []const File) void {
 
 fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
     const self = selfFrom(userdata);
+
     self.mutex.lock();
-    defer self.mutex.unlock();
-
-    const path = self.allocator.dupe(u8, self.pathOf(file.handle)) catch return error.InputOutput;
+    const path = self.allocator.dupe(u8, self.pathOf(file.handle)) catch {
+        self.mutex.unlock();
+        return error.InputOutput;
+    };
+    const my_sequence = self.next_sequence;
+    const crash_before = self.recordBarrier(.file_sync, path, null) catch {
+        self.mutex.unlock();
+        self.allocator.free(path);
+        return error.InputOutput;
+    };
+    // Only a run with a crash plan can ever call `applyPowerLoss` (a no-op
+    // when `!self.crashed`, which requires `crash_plan != null`), so a run
+    // with none configured -- most importantly every scenario's discovery
+    // pass, which exists purely to enumerate barriers and prove the
+    // scenario well-formed uncrashed -- has no use for a durable snapshot
+    // at all. `crash_plan` is set once, single-threaded, before any
+    // concurrent activity begins, so caching it here (still under the lock,
+    // alongside the barrier bookkeeping above) is safe.
+    const needs_snapshot = self.crash_plan != null and !self.directories.contains(path);
+    self.mutex.unlock();
     defer self.allocator.free(path);
-
-    const crash_before = self.recordBarrier(.file_sync, path, null) catch return error.InputOutput;
     if (crash_before) return error.InputOutput;
 
     try self.real.vtable.fileSync(self.real.userdata, file);
-    self.captureDurableSnapshot(file, path) catch return error.InputOutput;
 
-    if (self.maybeArmAfter(self.next_sequence - 1)) return error.InputOutput;
+    // The expensive part -- an O(file-size) read, to capture the byte image
+    // a crash-configured run might later need to roll back to via
+    // `applyPowerLoss` -- must run with `self.mutex` released. Every other
+    // overridden vtable entry, from every thread (a db_mod.DB's own
+    // background derived-worker tasks spawned via `io.concurrent(...)`
+    // included), takes this same lock for its own bookkeeping; holding it
+    // across a potentially large read serializes and stalls *unrelated*
+    // file opens/closes/syncs/renames far more than the real, unwrapped
+    // `io` ever would -- a direct violation of this file's own contract
+    // ("the scenario under test sees completely ordinary behavior until
+    // the configured crash point"). Doing this inline under the lock was
+    // reproducibly responsible for spurious `IndexRebuilding`-forever
+    // failures in the full-text sync-visibility scenario that never occur
+    // against the real `std.Io` (see crash_consistency_test.zig's "crash
+    // sweep: full text synchronous visibility" test).
+    if (needs_snapshot) {
+        const captured = self.readDurableSnapshot(file) catch return error.InputOutput;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.commitDurableSnapshot(path, captured) catch {
+            if (captured) |bytes| self.allocator.free(bytes);
+            return error.InputOutput;
+        };
+    }
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (self.maybeArmAfter(my_sequence)) return error.InputOutput;
 }
 
 fn vtDirRename(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, new_dir: Dir, new_sub_path: []const u8) Dir.RenameError!void {
