@@ -1042,8 +1042,7 @@ test "video CUDA kernels follow the portable HDR policy and quarter turns" {
     const pitch = 16;
     // MSB-aligned 10-bit samples across the code range, luma then interleaved chroma.
     var surface: [pitch * height * 3 / 2]u8 = undefined;
-    const samples = std.mem.bytesAsSlice(u16, @as([]align(1) u8, &surface));
-    for (samples, 0..) |*sample, i| sample.* = @intCast(@as(u32, 64 + (i * 61) % 877) << 6);
+    for (0..surface.len / 2) |i| std.mem.writeInt(u16, surface[i * 2 ..][0..2], @intCast((64 + (i * 61) % 877) << 6), .little);
     var buffer = try @import("buffer.zig").DeviceBuffer.alloc(&compute.ctx, surface.len);
     defer buffer.free(&compute.ctx);
     try buffer.copyFromHost(&compute.ctx, &surface);
