@@ -104,10 +104,13 @@ pub const LoadedMultiStageReader = struct {
         control: ?InferenceExecutionControl,
     ) !LoadedMultiStageReader {
         if (control) |active| try active.check();
+        const runtime_io = session_manager.io orelse return error.MissingIoRuntime;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, runtime_io, model_path);
+        defer publication_lease.deinit(runtime_io);
+        if (control) |active| try active.check();
         var metadata = try metadata_mod.loadFromDir(allocator, model_path);
         defer metadata.deinit();
         if (!metadata_mod.isMultiStage(&metadata)) return error.InvalidMetadata;
-        const runtime_io = session_manager.io orelse return error.MissingIoRuntime;
         var asset_resolver = try AssetResolver.init(
             allocator,
             runtime_io,

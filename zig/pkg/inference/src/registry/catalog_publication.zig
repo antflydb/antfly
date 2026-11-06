@@ -97,6 +97,7 @@ pub const Publication = struct {
     finished: bool = false,
 
     pub fn begin(a: std.mem.Allocator, io: std.Io, root: []const u8, relative_destination: []const u8) !Publication {
+        try @import("publication_lease.zig").Lease.assertMutable(a, io, root);
         const lock_path = try std.fs.path.join(a, &.{ root, ".antfly-catalog.lock" });
         defer a.free(lock_path);
         const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive });
@@ -198,4 +199,20 @@ test "model selection failed journal recovery retains the namespace fence" {
     // Repairing a journal must never follow an escaping parent symlink.
     try tmp.dir.writeFile(io, .{ .sub_path = "store/" ++ filename, .data = "{\"version\":1,\"destination\":\"escape/model\"}" });
     try std.testing.expectError(error.ModelArtifactsChanging, Publication.begin(a, io, root, "unrelated"));
+}
+
+test "model selection immutable snapshots reject publication before creating a journal" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "COMPLETE", .data = "CATALOG.json SHA256SUMS" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try std.testing.expectError(error.ReadOnlyFileSystem, Publication.begin(a, io, root, "fixture"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, filename, .{}));
+    const destination = try std.fs.path.join(a, &.{ root, "fixture" });
+    defer a.free(destination);
+    try std.testing.expectError(error.ReadOnlyFileSystem, download.ManagedModelTransaction.begin(a, io, destination));
+    try std.testing.expectEqual(.snapshot, (try read(a, io, root)).kind);
 }

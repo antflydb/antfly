@@ -621,8 +621,11 @@ fn readTextsForExtraction(
 
         const selected = if (platform.env.getenv("TERMITE_EXTRACT_DEFAULT_READER_MODEL")) |override|
             try resolveNamedModelSelection(ctx, override, "readers")
-        else
-            try selection_mod.fromDirectory(ctx.allocator, ctx.io, try ctx.allocator.dupe(u8, model_path));
+        else selected: {
+            const owned_path = try ctx.allocator.dupe(u8, model_path);
+            errdefer ctx.allocator.free(owned_path);
+            break :selected try selection_mod.fromDirectory(ctx.allocator, ctx.io, owned_path);
+        };
         defer ctx.allocator.free(selected.path);
         var selected_ctx = ctx;
         selected_ctx.execution_control = selected.bind(ctx.execution_control orelse InferenceExecutionControl{ .request_owned = false });
@@ -1849,4 +1852,29 @@ test "model selection direct extraction verifies receipt pins" {
     try std.testing.expectEqualStrings(expected, selected);
     try std.testing.expectError(error.ModelNotFound, resolveNamedModelPath(ctx, "acme/demo:gguf:Q8_0", "extractors"));
     try std.testing.expectError(error.ModelNotFound, resolveNamedModelPath(ctx, "acme/demo:gguf:Q4_0@ffffffffffffffffffffffffffffffffffffffff", "extractors"));
+}
+
+test "model selection failed image reader validation releases the owned path" {
+    var tracked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 16 });
+    defer std.debug.assert(tracked.deinit() == 0);
+    const a = tracked.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "reader");
+    try tmp.dir.writeFile(io, .{ .sub_path = "reader/.antfly-download-complete.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(io, "reader", a);
+    defer a.free(root);
+    const Discovery = struct {
+        path: []const u8,
+        fn discover(raw: *anyopaque, alloc: std.mem.Allocator, _: std.Io, _: []const u8, _: *const FailedReaderPathSet) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return alloc.dupe(u8, self.path);
+        }
+    };
+    var discovery = Discovery{ .path = root };
+    var resolver = ReaderResolver.init(a);
+    defer resolver.deinit();
+    const ctx: Context = .{ .allocator = a, .io = io, .models_dir = root, .session_manager = undefined, .model_manager = undefined, .reader_resolver = &resolver, .reader_discovery_override = .{ .context = &discovery, .discoverFn = Discovery.discover } };
+    try std.testing.expectError(error.InvalidManagedDownload, readTextsForExtraction(ctx, "acme/extractor", &.{"image"}, .{}));
 }

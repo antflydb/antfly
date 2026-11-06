@@ -1455,13 +1455,16 @@ fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destinati
 }
 
 /// Recover only published directory renames. The catalog lock owns this
-/// operation; it never touches private staging or takes another model lock.
+/// operation; it never touches private staging. A parent-directory lease also
+/// excludes pathname-based readers while recovery restores a prior generation.
 /// This lets an unrelated pull repair a killed publisher without lock inversion.
 pub fn recoverManagedPublication(allocator: std.mem.Allocator, io: std.Io, destination: []const u8) !void {
     const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
     defer allocator.free(backup);
     const cwd = std.Io.Dir.cwd();
     if (!try pathExists(cwd, io, backup)) return;
+    var lease = try @import("publication_lease.zig").Lease.exclusive(allocator, io, destination);
+    defer lease.deinit(io);
     const destination_exists = try pathExists(cwd, io, destination);
     var current = if (destination_exists) managed_receipt.loadValidated(allocator, io, destination) catch |err| switch (@as(anyerror, err)) {
         error.InvalidManagedDownload, error.IncompleteManagedDownload, error.InvalidModelArtifactPath, error.InvalidModelArtifactKind, error.ModelArtifactOutsideRoot, error.FileNotFound, error.NotDir, error.IsDir, error.SymLinkLoop, error.StreamTooLong => null,
@@ -1500,6 +1503,7 @@ pub const ManagedModelTransaction = struct {
         io: std.Io,
         destination: []const u8,
     ) !ManagedModelTransaction {
+        try @import("publication_lease.zig").Lease.assertMutable(allocator, io, destination);
         const owned_destination = try allocator.dupe(u8, destination);
         errdefer allocator.free(owned_destination);
         const staging = try managedSiblingPath(allocator, destination, managed_download_staging_suffix);
@@ -1525,6 +1529,8 @@ pub const ManagedModelTransaction = struct {
     }
 
     pub fn commit(self: *ManagedModelTransaction, io: std.Io) !void {
+        var lease = try @import("publication_lease.zig").Lease.exclusive(self.allocator, io, self.destination);
+        defer lease.deinit(io);
         if (self.committed) return error.ManagedDownloadAlreadyCommitted;
         if (managedDownloadState(self.allocator, io, self.staging) != .complete) {
             return error.IncompleteManagedDownload;
@@ -4521,6 +4527,21 @@ test "managed staging artifact replacement updates the publication receipt" {
     try std.testing.expect(managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q4_K_M"));
 }
 
+// Make contention deterministic in publication tests: a writer that would
+// block returns cancellation, allowing the test to inspect the untouched tree.
+const NonblockingPublicationTestIo = struct {
+    var original: @FieldType(std.Io.VTable, "fileTryLock") = undefined;
+    fn lock(raw: ?*anyopaque, file: std.Io.File, mode: std.Io.File.Lock) std.Io.File.LockError!void {
+        if (!try original(raw, file, mode)) return error.Canceled;
+    }
+    fn wrap(io: std.Io, table: *std.Io.VTable) std.Io {
+        table.* = io.vtable.*;
+        original = table.fileTryLock;
+        table.fileLock = lock;
+        return .{ .userdata = io.userdata, .vtable = table };
+    }
+};
+
 test "managed model transaction reuses artifacts and publishes completed repair" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -4565,6 +4586,17 @@ test "managed model transaction reuses artifacts and publishes completed repair"
         "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7},{\"path\":\"nested/mmproj-model-Q8_0.gguf\",\"size\":9}]}",
     );
     try completeManagedDownload(allocator, io, transaction.staging);
+    var reader_lease = try @import("publication_lease.zig").Lease.shared(allocator, io, dest_dir);
+    defer reader_lease.deinit(io);
+    var table: std.Io.VTable = undefined;
+    const contended_io = NonblockingPublicationTestIo.wrap(io, &table);
+    try std.testing.expectError(error.Canceled, transaction.commit(contended_io));
+    // Construction still sees the old complete tree, not the staged projector.
+    const published_projector = try std.fs.path.join(allocator, &.{ dest_dir, "nested/mmproj-model-Q8_0.gguf" });
+    defer allocator.free(published_projector);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, published_projector, .{}));
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    reader_lease.deinit(io);
     try transaction.commit(io);
 
     try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
@@ -4680,6 +4712,14 @@ test "managed model transaction recovers interrupted directory publication" {
     defer allocator.free(partial_path);
     try cwd.writeFile(io, .{ .sub_path = partial_path, .data = "partial" });
 
+    var reader_lease = try @import("publication_lease.zig").Lease.shared(allocator, io, dest_dir);
+    defer reader_lease.deinit(io);
+    var table: std.Io.VTable = undefined;
+    const contended_io = NonblockingPublicationTestIo.wrap(io, &table);
+    try std.testing.expectError(error.Canceled, recoverManagedPublication(allocator, contended_io, dest_dir));
+    try cwd.access(io, backup_path, .{});
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, dest_dir, .{}));
+    reader_lease.deinit(io);
     var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
     defer transaction.deinit(io);
     try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));

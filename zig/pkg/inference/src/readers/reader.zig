@@ -380,9 +380,10 @@ pub const LoadedReader = union(enum) {
     pub fn acquireExecutionFence(
         model_path: []const u8,
         model_manager: *model_manager_mod.ModelManager,
+        control: InferenceExecutionControl,
     ) !?ExecutionFence {
-        var handle = model_manager.acquireFromDir(model_path) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+        var handle = model_manager.acquireFromDirWithControl(model_path, control) catch |err| switch (err) {
+            error.OutOfMemory, error.ModelArtifactsChanging, error.IncompleteManagedDownload, error.ModelInventoryChanged, error.Canceled, error.Cancelled, error.Timeout => return err,
             // The direct typed loader remains responsible for reporting model
             // layout and publication failures. Broker eligibility is optional.
             else => return null,

@@ -3203,7 +3203,7 @@ const transient_capacity_retry_after_seconds = "1";
 const transient_capacity_retry_after_ms = 1000;
 
 fn isModelPublicationError(err: anyerror) bool {
-    return err == error.ModelArtifactsChanging or err == error.IncompleteManagedDownload;
+    return err == error.ModelArtifactsChanging or err == error.IncompleteManagedDownload or err == error.ModelInventoryChanged;
 }
 
 fn isTransientInferenceCapacityError(err: anyerror) bool {
@@ -3247,6 +3247,7 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
         error.Timeout => ctx.status(504).json(.{
@@ -3276,9 +3277,6 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .message = "model resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
             .retryable = false,
         }),
-        error.ModelArtifactsChanging,
-        error.IncompleteManagedDownload,
-        => modelArtifactsChangingResponse(ctx),
         error.ProcessIsolationRequired => ctx.status(503).json(.{
             .@"error" = "PROCESS_ISOLATION_REQUIRED",
             .message = "this backend requires the supervised inference process; configure inference.api_url instead of embedding it in the database process",
@@ -3895,6 +3893,11 @@ fn requestModelResolutionErrorKind(err: anyerror) RequestModelResolutionErrorKin
 }
 
 fn batchModelResolutionError(err: anyerror) api.GenerateBatchError {
+    if (isModelPublicationError(err)) return .{
+        .code = "MODEL_ARTIFACTS_CHANGING",
+        .message = "model artifacts are being published; retry with a consistent generation",
+        .retryable = true,
+    };
     return switch (requestModelResolutionErrorKind(err)) {
         .invalid => .{
             .code = "INVALID_REQUEST",
@@ -10261,6 +10264,7 @@ pub const Node = struct {
             max_tokens,
             broker_deadline,
             cancellation,
+            execution_control,
         )) |broker_batch| return broker_batch;
 
         // Direct batches acquire their full execution lease here. Singleton
@@ -10295,6 +10299,7 @@ pub const Node = struct {
         max_tokens: ?usize,
         broker_deadline: ?std.Io.Clock.Timestamp,
         cancellation: ExecutorCancellation,
+        execution_control: InferenceExecutionControl,
     ) !?readers_api.BatchResult {
         for (request.images) |image| try validateEncodedImageMime(image.mime_type, image.bytes);
 
@@ -10305,6 +10310,7 @@ pub const Node = struct {
         const acquired_fence = try readers_mod.LoadedReader.acquireExecutionFence(
             model_path,
             &self.model_manager,
+            execution_control,
         ) orelse return null;
         var broker_fence = acquired_fence;
         defer broker_fence.deinit();
@@ -10525,6 +10531,7 @@ pub const Node = struct {
             max_tokens,
             broker_deadline,
             cancellation,
+            execution_control,
         )) |broker_batch| return broker_batch;
 
         try self.acquireAdmissionUnits(required_units);
@@ -10575,6 +10582,7 @@ pub const Node = struct {
         max_tokens: ?usize,
         broker_deadline: ?std.Io.Clock.Timestamp,
         cancellation: ExecutorCancellation,
+        execution_control: InferenceExecutionControl,
     ) !?readers_api.BatchResult {
         // Eligibility comes from the immutable loaded generation. A
         // provisional filesystem manifest would duplicate request-hot-path
@@ -10582,6 +10590,7 @@ pub const Node = struct {
         const acquired_fence = try readers_mod.LoadedReader.acquireExecutionFence(
             model_path,
             &self.model_manager,
+            execution_control,
         ) orelse return null;
         var broker_fence = acquired_fence;
         defer broker_fence.deinit();
@@ -35121,7 +35130,17 @@ test "embedding and execution publication races retain the retry contract" {
     defer request.deinit();
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
-    for ([_]anyerror{ error.ModelArtifactsChanging, error.IncompleteManagedDownload }) |cause| {
+    for ([_]anyerror{ error.ModelArtifactsChanging, error.IncompleteManagedDownload, error.ModelInventoryChanged }) |cause| {
+        var resolution = try Node.requestModelResolutionError(&ctx, cause);
+        defer resolution.deinit();
+        try std.testing.expectEqual(@as(u16, 503), resolution.status.code);
+        try std.testing.expectEqualStrings("1", resolution.header("Retry-After").?);
+        var load = try modelLoadFailureResponse(&ctx, cause);
+        defer load.deinit();
+        try std.testing.expectEqual(@as(u16, 503), load.status.code);
+        const batch = batchModelResolutionError(cause);
+        try std.testing.expectEqualStrings("MODEL_ARTIFACTS_CHANGING", batch.code);
+        try std.testing.expect(batch.retryable);
         var strict = try embedDenseInputFailureResponse(&ctx, cause);
         defer strict.deinit();
         try std.testing.expectEqual(@as(u16, 503), strict.status.code);
@@ -50864,6 +50883,7 @@ test "model selection pins survive receipt rollback before acquisition" {
     try installModelSelectionFixture(tmp.dir, "models/generators/acme/model", "gguf:Q4_0", old_pin);
     const bound = node.bindModelSelection(selected, null);
     try std.testing.expectError(error.ModelArtifactsChanging, node.model_manager.acquireFromDirWithControl(selected.path, bound));
+    try std.testing.expectError(error.ModelArtifactsChanging, readers_mod.LoadedReader.acquireExecutionFence(selected.path, &node.model_manager, bound));
     try std.testing.expectError(error.ModelArtifactsChanging, node.model_manager.acquireLoadedModelWithControl(selected.path, bound));
     try std.testing.expectError(error.ModelArtifactsChanging, node.manifestForSelection(a, selected));
     try std.testing.expectError(error.ModelArtifactsChanging, node.model_manager.acquireCompositeRuntime(selected.path, &.{}, .whisper_metadata, bound));
@@ -51140,4 +51160,20 @@ test "model selection active catalog publication reports a retryable HTTP error"
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
+}
+
+test "model selection reader broker honors cancellation and deadline before cold acquisition" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .models_dir = "/missing" });
+    defer node.deinit();
+    const Check = struct {
+        fn cancelled(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+        fn timeout(_: ?*anyopaque) !void {
+            return error.Timeout;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, readers_mod.LoadedReader.acquireExecutionFence("/missing/model", &node.model_manager, .{ .check_fn = Check.cancelled }));
+    try std.testing.expectError(error.Timeout, readers_mod.LoadedReader.acquireExecutionFence("/missing/model", &node.model_manager, .{ .check_fn = Check.timeout }));
 }

@@ -7578,6 +7578,9 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !*CompositeAssets {
         if (control) |active| try active.check();
+        const publication_io = if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, publication_io, model_dir);
+        defer publication_lease.deinit(publication_io);
         const publication = try self.publicationForRequest(model_dir, control);
         var sidecars = try self.resolveWhisperSidecars(model_dir);
         defer sidecars.deinit();
@@ -8694,6 +8697,9 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !ModelHandle {
         if (control) |active| try active.update(.loading_model, 0, 4);
+        const publication_io = if (control) |active| active.io orelse sm.io orelse std.Options.debug_io else sm.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, publication_io, model_dir);
+        defer publication_lease.deinit(publication_io);
 
         const managed_publication = try self.publicationForRequest(model_dir, control);
         // Load manifest

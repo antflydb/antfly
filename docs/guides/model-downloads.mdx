@@ -35,7 +35,10 @@ Legacy stores without a publication token retain conservative directory checks; 
 also have bounded discovery and missing-selector refreshes.
 
 Read-only GCS snapshots use their `COMPLETE` marker as the catalog generation.
-Keep published snapshot prefixes immutable and publish a new prefix for changes.
+Pull refuses to modify a completed snapshot. Publish a new prefix for changes.
+For mutable installations, use managed pull rather than editing published files
+in place; publication coordinates with model construction to keep reopened
+components in the same generation.
 Direct readers and VAD consume only receipt-listed artifacts and verify available
 checksums against the bytes read or mapped; stale sibling files do not supply a
 missing model component. Multistage readers reuse checksum verification within

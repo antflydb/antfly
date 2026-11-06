@@ -62,6 +62,7 @@ pub const ResolvedModel = struct {
 
 /// Adopt an existing directory selected by legacy/default lookup. Constrained
 /// Hub selectors instead obtain this proof from the receipt that verified them.
+/// On failure the caller retains ownership of owned_path.
 pub fn fromDirectory(allocator: std.mem.Allocator, io: std.Io, owned_path: []const u8) !ResolvedModel {
     var validated = receipt.loadValidated(allocator, io, owned_path) catch |err| switch (err) {
         error.NotDir => return .{ .path = owned_path, .publication = null },
