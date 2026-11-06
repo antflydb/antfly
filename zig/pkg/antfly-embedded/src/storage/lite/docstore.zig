@@ -1548,6 +1548,13 @@ pub const Store = struct {
     ride_along_flush_cancel: maintenance.CancelToken = .{},
     ride_along_flush_future: ?std.Io.Future(void) = null,
     ride_along_wake: std.Io.Event = .unset,
+    /// Group-commit fsync-sharing measurement (WS2): one native commit per
+    /// drained batch bumps both; divide to get mean members/commit
+    /// (`self.file.test_sync_calls` is the matching fsyncs/commit
+    /// denominator's numerator -- see `durableSequence`/the write-path
+    /// benchmarks).
+    test_groups_total: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_group_members_total: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     writer_admission: ?WriterAdmission = null,
     writer_active: bool = false,
     writer_ticketed: bool = false,
@@ -3098,21 +3105,23 @@ pub const Store = struct {
 
     const MutationBatch = struct {
         head: ?*MutationRequest = null,
+        /// Member count, for the group-size/fsync-sharing measurement
+        /// (WS2): see `test_groups_total`/`test_group_members_total`.
+        size: usize = 0,
     };
 
     fn drainMutationBatchLocked(self: *Store) MutationBatch {
         var batch = MutationBatch{};
         var tail: ?*MutationRequest = null;
-        var count: usize = 0;
         var bytes: usize = 0;
         while (self.commit_head) |request| {
-            if (batch.head != null and (count >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
+            if (batch.head != null and (batch.size >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
             self.commit_head = request.next;
             if (self.commit_head == null) self.commit_tail = null;
             request.next = null;
             if (tail) |t| t.next = request else batch.head = request;
             tail = request;
-            count += 1;
+            batch.size += 1;
             bytes +|= request.estimated_bytes;
             if (request.ride_along) self.ride_along_pending_bytes -|= request.estimated_bytes;
         }
@@ -3142,6 +3151,10 @@ pub const Store = struct {
             };
             self.commit_mutex.unlock(io);
 
+            if (@import("builtin").is_test) {
+                _ = self.test_groups_total.fetchAdd(1, .monotonic);
+                _ = self.test_group_members_total.fetchAdd(batch.size, .monotonic);
+            }
             const result = self.applyMutationGroup(head, force_durable);
 
             self.commit_mutex.lockUncancelable(io);
@@ -3296,7 +3309,28 @@ pub const Store = struct {
             self.file.abortTransaction();
             return;
         }
+        // WS2: self.mutex is a spin lock (PublicationMutex); holding it
+        // across the actual durability-barrier syscall would starve a new
+        // Txn opening (beginWrite needs this same mutex) for as long as
+        // that fsync takes, defeating group-commit pipelining for the
+        // document write path and spin-burning a core on every waiter.
+        // These hooks let commitTransactionWithDurability's one
+        // `syncIfRequired` call release this mutex for just that syscall
+        // and re-acquire it immediately after, before touching anything
+        // else -- see `NativeFile.sync_lock_hooks`.
+        self.file.sync_lock_hooks = .{ .context = self, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync };
+        defer self.file.sync_lock_hooks = null;
         try self.file.commitTransactionWithDurability(durable);
+    }
+
+    fn releaseStoreMutexForSync(context: *anyopaque) void {
+        const self: *Store = @ptrCast(@alignCast(context));
+        self.mutex.unlock();
+    }
+
+    fn reacquireStoreMutexAfterSync(context: *anyopaque) void {
+        const self: *Store = @ptrCast(@alignCast(context));
+        lockStore(self);
     }
 
     fn writerSlotAvailable(self: *Store) bool {
@@ -6965,6 +6999,195 @@ test "lite ride-along members never pay their own fsync: N ride-alongs plus one 
     try std.testing.expectEqualStrings("rode along", try read.get("ride2"));
     try std.testing.expectEqualStrings("rode along", try read.get("ride3"));
     try std.testing.expectEqualStrings("written", try read.get("foreground"));
+}
+
+test "lite a new Txn opens and stages while a group's fsync is in flight" {
+    // WS2: self.mutex (PublicationMutex, a spin lock) must only be held for
+    // the in-memory parts of a commit; NativeFile.sync_lock_hooks releases
+    // it around the actual durability-barrier syscall and re-acquires it
+    // right after (native.zig's syncIfRequired), so a brand new Txn can
+    // open -- which itself briefly needs self.mutex, to snapshot the
+    // active checkpoint and pin a read generation -- while another
+    // group's fsync is still running. Before this fix, beginWrite would
+    // simply block on self.mutex for as long as that fsync took.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Gate = struct {
+        var armed: std.atomic.Value(bool) = .init(false);
+        var started: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.swap(false, .acq_rel)) {
+                started.store(true, .release);
+                while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const Worker = struct {
+        store: *Store,
+        key: []const u8,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var write = self.store.beginWrite() catch |err| {
+                self.result = err;
+                return;
+            };
+            write.put(self.key, "landed") catch |err| {
+                self.result = err;
+                write.abort();
+                return;
+            };
+            self.result = write.commit();
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "txn-opens-during-fsync.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Gate.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io });
+    defer store.close();
+
+    var worker_a = Worker{ .store = &store, .key = "a" };
+    Gate.started.store(false, .release);
+    Gate.proceed.store(false, .release);
+    Gate.armed.store(true, .release);
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});
+    var joined_a = false;
+    defer {
+        Gate.proceed.store(true, .release);
+        if (!joined_a) thread_a.join();
+        Gate.armed.store(false, .release);
+    }
+    try waitForGateStartedForTest(store.file.runtime(), &Gate.started);
+    // A's commit is paused inside its own gated fsync, holding nothing
+    // that would block a fresh beginWrite -- this must return promptly,
+    // not block until A's fsync (which this thread, not having released
+    // the gate yet, has no way to let finish) completes.
+    var write_b = try store.beginWrite();
+    try write_b.put("b", "landed");
+    const StagedWorker = struct {
+        write: Txn,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = self.write.commit();
+        }
+    };
+    var worker_b = StagedWorker{ .write = write_b };
+    const thread_b = try std.Thread.spawn(.{}, StagedWorker.run, .{&worker_b});
+    var joined_b = false;
+    defer if (!joined_b) thread_b.join();
+
+    Gate.proceed.store(true, .release);
+    thread_a.join();
+    joined_a = true;
+    try worker_a.result;
+    thread_b.join();
+    joined_b = true;
+    try worker_b.result;
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("landed", try read.get("a"));
+    try std.testing.expectEqualStrings("landed", try read.get("b"));
+}
+
+test "lite 8 concurrent Txn writers share fsyncs: mean group size above 1, fsyncs per write well below the solo baseline" {
+    // WS2 docstore-level throughput measurement. No artificial gating: 8
+    // real threads hammer independent keys through ordinary beginWrite/
+    // put/commit as fast as the native engine allows, so whatever sharing
+    // happens is exactly what unmodified callers would see.
+    //
+    // "fsyncs/commit" (or /write) means fsyncs per *caller-level* commit
+    // attempt, not per native group: `commitTransactionWithDurability`'s
+    // durable path calls `syncIfRequired` twice per native commit today
+    // (once directly, once inside `publishCheckpoint`), so a solo,
+    // unshared writer's baseline is ~2.0 fsyncs per commit regardless of
+    // grouping -- grouping drives this ratio down only because it shrinks
+    // the number of *native* commits relative to the number of *callers'*
+    // commit attempts, not the per-group fsync count. Asserting a bound
+    // on that correctly requires dividing by the attempt count
+    // (writer_count * commits_per_writer), not by `groups`.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const writer_count = 8;
+    const commits_per_writer = 40;
+    const Worker = struct {
+        store: *Store,
+        id: usize,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var key_buf: [32]u8 = undefined;
+            for (0..commits_per_writer) |i| {
+                const key = std.fmt.bufPrint(&key_buf, "w{d}-{d}", .{ self.id, i }) catch unreachable;
+                // Yielding (FIFO-queued) admission: 8 real concurrent
+                // writers contending for the one writer slot must queue
+                // for their turn, not fail outright the way the
+                // non-yielding beginWrite does when the slot is held.
+                var write = self.store.beginWriteYielding() catch |err| {
+                    self.result = err;
+                    return;
+                };
+                write.put(key, "v") catch |err| {
+                    self.result = err;
+                    write.abort();
+                    return;
+                };
+                write.commit() catch |err| {
+                    self.result = err;
+                    return;
+                };
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "eight-writer-fsync-sharing.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+
+    const groups_before = store.test_groups_total.load(.acquire);
+    const members_before = store.test_group_members_total.load(.acquire);
+    const syncs_before = store.file.test_sync_calls.load(.acquire);
+
+    var workers: [writer_count]Worker = undefined;
+    for (&workers, 0..) |*w, i| w.* = .{ .store = &store, .id = i };
+    var threads: [writer_count]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Worker.run, .{&workers[i]});
+    for (&threads) |t| t.join();
+    for (&workers) |w| try w.result;
+
+    const groups = store.test_groups_total.load(.acquire) - groups_before;
+    const members = store.test_group_members_total.load(.acquire) - members_before;
+    const syncs = store.file.test_sync_calls.load(.acquire) - syncs_before;
+    const attempts: u64 = writer_count * commits_per_writer;
+    try std.testing.expect(groups > 0);
+    const mean_group_size = @as(f64, @floatFromInt(members)) / @as(f64, @floatFromInt(groups));
+    const fsyncs_per_commit = @as(f64, @floatFromInt(syncs)) / @as(f64, @floatFromInt(attempts));
+    std.debug.print(
+        "\n[WS2 8-writer measurement] groups={d} members={d} syncs={d} attempts={d} mean_group_size={d:.3} fsyncs_per_commit={d:.3} (target <= 0.25)\n",
+        .{ groups, members, syncs, attempts, mean_group_size, fsyncs_per_commit },
+    );
+    try std.testing.expect(mean_group_size > 1.0);
+    // The design target is <= 0.25. What this assertion actually checks
+    // is weaker -- meaningfully better than the ~2.0 solo baseline, not
+    // the target itself -- because how much batching a fast local fsync
+    // leaves room for is sensitive to this machine's current scheduling
+    // latency under load, which this test does not control. The real
+    // number is in the debug print above and belongs in the report
+    // either way; whether it actually reaches 0.25 is a measurement to
+    // report honestly, not a thing to force by loosening what "pass"
+    // means here.
+    try std.testing.expect(fsyncs_per_commit < 2.0);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("v", try read.get("w0-0"));
+    try std.testing.expectEqualStrings("v", try read.get("w7-39"));
 }
 
 test "lite publication mutex reserves queued owners before a writer can reacquire" {

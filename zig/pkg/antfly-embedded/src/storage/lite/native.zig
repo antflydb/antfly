@@ -3729,6 +3729,13 @@ pub const OwnedDocument = struct {
     value: []u8,
 };
 
+/// See `NativeFile.sync_lock_hooks`.
+pub const SyncLockHooks = struct {
+    context: *anyopaque,
+    release: *const fn (context: *anyopaque) void,
+    reacquire: *const fn (context: *anyopaque) void,
+};
+
 /// Opaque identities never repeat after recovery-slot rollback. Allocator and
 /// reader-lease publications retain them; authored roots receive fresh IDs.
 pub const LogicalGenerations = struct {
@@ -4875,6 +4882,16 @@ pub const NativeFile = struct {
     // An error after slot publication may leave disk ahead of header. Do not
     // elide a subsequent write based on the old in-memory checkpoint then.
     checkpoint_publication_uncertain: bool = false,
+    /// Optional hooks a caller installs (and clears) around exactly one
+    /// `commitTransactionWithDurability`/`sync` call, to release an outer
+    /// lock for the actual durability-barrier syscall and re-acquire it
+    /// immediately after (WS2): everything `syncIfRequired` does before and
+    /// after this pair -- the preceding page/slot writes, and the
+    /// checkpoint-slot publication that follows once it returns -- still
+    /// runs under that lock, since those touch state other lock holders
+    /// read. `context` is opaque here on purpose: NativeFile has no
+    /// business knowing what kind of lock a caller above it uses.
+    sync_lock_hooks: ?SyncLockHooks = null,
     /// Owner admission budget. Reuse remains permitted at the file-size cap.
     /// Null means unlimited; the owner subtracts retired/workspace capacity.
     max_file_bytes: ?u64 = null,
@@ -12069,6 +12086,14 @@ pub const NativeFile = struct {
 
     fn syncIfRequired(self: *NativeFile) !void {
         if (!self.no_sync and self.transaction_header == null) {
+            // WS2: release the caller's lock (if any) for exactly the
+            // durability-barrier syscall -- the one part of a commit slow
+            // enough to be worth not blocking a concurrent reader/writer
+            // for -- and re-acquire it before returning, so every other
+            // NativeFile field this function or its caller touches, before
+            // and after, stays under that lock. See `sync_lock_hooks`.
+            if (self.sync_lock_hooks) |hooks| hooks.release(hooks.context);
+            defer if (self.sync_lock_hooks) |hooks| hooks.reacquire(hooks.context);
             if (self.durability_policy) |policy|
                 try antfly_platform.filesystem.syncData(self.file.handle, policy)
             else
