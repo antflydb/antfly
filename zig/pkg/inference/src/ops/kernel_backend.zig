@@ -75,6 +75,9 @@ pub const VTable = struct {
     hostInputViewExclusive: ?*const fn (*anyopaque, CT) bool = null,
     hostInputRequirements: ?*const fn (*anyopaque, @import("ml").graph.Shape) anyerror!?@import("../execution/host_ingress.zig").Requirements = null,
     createHostInput: ?*const fn (*anyopaque, @import("../execution/host_ingress.zig").Create) anyerror!?@import("../execution/host_ingress.zig").Upload = null,
+    /// Exact optional host staging and synchronous initialization, before literal
+    /// publication. Null retains the original compatibility workspace floor.
+    physicalLiteralInitializer: ?*const fn (*anyopaque, usize) anyerror!?physical_storage.LiteralInitializer = null,
     copyPhysicalInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
     createPhysicalReplay: ?*const fn (ctx: *anyopaque) anyerror!?physical_storage.Replay = null,
     physicalReplayTensorSupported: ?*const fn (ctx: *anyopaque, tensor: CT) bool = null,

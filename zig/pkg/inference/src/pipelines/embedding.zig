@@ -457,7 +457,7 @@ pub const EmbeddingPipeline = struct {
             if (self.execution_control) |control| try control.check();
             const real_count = @min(plan.batch_size, texts.len - offset);
             if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
-            var cohort = try self.embedDirectResult(texts[offset..][0..real_count], plan.batch_size, true, consumer_cleanup);
+            var cohort = try self.embedDirectResult(texts[offset..][0..real_count], plan.batch_size, true, consumer_cleanup, null);
             defer cohort.deinitWithCleanup(consumer_cleanup) catch platform.inference_process_supervisor.restartWorker();
             if (cohort.len() != real_count) return error.UnexpectedOutputShape;
             try output.appendMove(&cohort);
@@ -469,7 +469,7 @@ pub const EmbeddingPipeline = struct {
     /// Joining original container roots replaces a temporary pointer-array
     /// allocation; arithmetic schedules for every selected cohort are unchanged.
     fn embedAdaptiveOwned(self: *EmbeddingPipeline, texts: []const []const u8, consumer_cleanup: CleanupContext) anyerror!session_mod.OwnedHostVectors {
-        return self.embedDirectResult(texts, texts.len, true, consumer_cleanup) catch |err| {
+        return self.embedDirectResult(texts, texts.len, true, consumer_cleanup, null) catch |err| {
             if (err != error.ResourceLimitExceeded or texts.len <= 1) return err;
             const midpoint = (texts.len + 1) / 2;
             var left = try self.embedAdaptiveOwned(texts[0..midpoint], consumer_cleanup);
@@ -908,10 +908,18 @@ pub const EmbeddingPipeline = struct {
         return result;
     }
     fn gemmaOwnedTextEligible(self: *const EmbeddingPipeline) bool {
-        return self.usesGemmaWorkspaceLaneProtocol() and !self.config.resident_embedding_gemma2 and
+        const selected = switch (self.session.backend()) {
+            .native, .metal => true,
+            .cuda => if (@import("../execution/architecture_session.zig").gemmaCudaOwnedTextWidth(self.session)) |width| self.config.embedding_gemma2_dimensions <= width else false,
+            else => false,
+        };
+        return selected and self.usesGemmaWorkspaceLaneProtocol() and !self.config.resident_embedding_gemma2 and
             @import("../architectures/embedding_gemma2.zig").validDimension(self.config.embedding_gemma2_dimensions) and
-            self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and
-            self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal);
+            // Canonical CUDA already returns its original normalized 768-F32
+            // head for either pipeline option. normalize=false only suppresses
+            // the later prefix L2; it changes no encoder/source/kernel path.
+            self.residentTextEncoderEnabled() and (self.config.normalize or self.session.backend() == .cuda) and self.config.pooling == .mean and
+            self.text_projection == null;
     }
     fn embedGemma2TextsOwned(self: *EmbeddingPipeline, texts: []const []const u8) !session_mod.OwnedHostVectors {
         if (!self.gemmaOwnedTextEligible() or self.execution_gate_held or self.execution_lane_held) return error.UnsupportedOwnedEmbeddingEntry;
@@ -946,7 +954,10 @@ pub const EmbeddingPipeline = struct {
                 scoped.allocator = bounded.allocator();
                 scoped.gemma_workspace = &admitted;
                 scoped.last_input_tokens = 0;
-                const vectors = scoped.embedGemma2TextsWithTaskOutput(texts[cursor..][0..count], &task_output) catch |err| {
+                const vectors = (if (self.session.backend() == .cuda)
+                    scoped.embedWithBatchPlanWithTaskOutput(texts[cursor..][0..count], .{ .batch_size = 1, .pad_final_batch = false }, &task_output)
+                else
+                    scoped.embedGemma2TextsWithTaskOutput(texts[cursor..][0..count], &task_output)) catch |err| {
                     return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else if (err == error.OutOfMemory) admitted.admission_error orelse err else err;
                 };
                 defer freeEmbeddingSlices(scoped.allocator, vectors);
@@ -1519,7 +1530,7 @@ pub const EmbeddingPipeline = struct {
     /// the final encoded row. This keeps fixed-batch compatibility from
     /// multiplying tokenizer and prefix-allocation work on short tail batches.
     fn embedDirect(self: *EmbeddingPipeline, texts: []const []const u8, execution_batch: usize) ![][]f32 {
-        return self.embedDirectResult(texts, execution_batch, false, .{});
+        return self.embedDirectResult(texts, execution_batch, false, .{}, null);
     }
 
     fn embedDirectResult(
@@ -1528,6 +1539,7 @@ pub const EmbeddingPipeline = struct {
         execution_batch: usize,
         comptime owned: bool,
         consumer_cleanup: CleanupContext,
+        task_output: ?*GemmaTaskHostOutput,
     ) anyerror!(if (owned) session_mod.OwnedHostVectors else [][]f32) {
         if (self.execution_control) |control| try control.check();
         try self.validateQwenWorkspaceAdmission();
@@ -1611,16 +1623,21 @@ pub const EmbeddingPipeline = struct {
             var projection_execution: ?session_mod.RunPermit = null;
             defer if (projection_execution) |*permit| permit.deinitWithCleanup(.{ .boundary = source.epoch() });
             const signature = text_plan.signature();
-            self.prepareTextSource(&source, text_session, .{ .host_shapes = signature.slice() }, .{
+            const task_geometry: ?session_mod.RunPermit.HostOutputGeometry = if (task_output) |task|
+                .{ .rows = task.rows, .width = task.width, .held = if (task.producer.*) |*producer| try producer.heldAdmission() else null }
+            else
+                null;
+            self.prepareTextSourceWithTaskOutput(&source, text_session, .{ .host_shapes = signature.slice() }, .{
                 .batch = batch,
                 .sequence = effective_len,
                 .input_bytes = text_plan.input_bytes,
                 .host_preprocess_bytes = text_plan.temporary_bytes,
                 .output_bytes = if (owned) try session_mod.PreparedSource.hostOutputRequestBytes(texts.len, output_width) else null,
-            }) catch |err| {
+            }, task_geometry, owned) catch |err| {
                 if (err == error.WorkspaceReceiptChangedBeforeExecution and source.canRetryBeforeExecution()) continue;
                 return err;
             };
+            if (task_geometry != null and task_geometry.?.held == null) task_output.?.producer.* = try source.takeTaskHostOutputBeforeExecution();
             if (owned) {
                 try source.prepareHostOutputsBeforeExecution(texts.len, output_width);
                 typed_source_ready = true;
@@ -1739,6 +1756,7 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn ownedTextOutputWidth(self: *const EmbeddingPipeline) !usize {
+        if (self.session.backend() == .cuda and self.gemmaOwnedTextEligible()) return self.config.embedding_gemma2_dimensions;
         if (self.text_projection == null and self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and session_factory.getEmbeddingGemma2Config(self.session) != null)
             return self.config.embedding_gemma2_dimensions;
         const final_session = self.text_projection orelse self.textEncodingSession();
@@ -1851,7 +1869,7 @@ pub const EmbeddingPipeline = struct {
                     try @import("embedding_gemma2.zig").textEncoderWorkspace(if (compact_policy) active_rows else total)
                 else
                     0,
-            }, task_geometry) catch |err| {
+            }, task_geometry, owned) catch |err| {
                 if (err == error.WorkspaceReceiptChangedBeforeExecution and source.canRetryBeforeExecution()) continue;
                 return err;
             };
@@ -1928,19 +1946,28 @@ pub const EmbeddingPipeline = struct {
         return if (residentQwen3EmbeddingEligible(session, cfg, self.config)) .resident_transient else .host;
     }
 
-    fn prepareTextSource(self: *EmbeddingPipeline, source: *session_mod.PreparedSource, session: session_mod.Session, shapes: session_mod.ShapeInputs, request: session_mod.RunRequest) !void {
-        return self.prepareTextSourceWithTaskOutput(source, session, shapes, request, null);
-    }
-    fn prepareTextSourceWithTaskOutput(self: *EmbeddingPipeline, source: *session_mod.PreparedSource, session: session_mod.Session, shapes: session_mod.ShapeInputs, request: session_mod.RunRequest, task_output: ?session_mod.RunPermit.HostOutputGeometry) !void {
+    fn prepareTextSourceWithTaskOutput(self: *EmbeddingPipeline, source: *session_mod.PreparedSource, session: session_mod.Session, shapes: session_mod.ShapeInputs, request: session_mod.RunRequest, task_output: ?session_mod.RunPermit.HostOutputGeometry, comptime owned: bool) !void {
         // Metal prepayment is for the SAME direct preparedTexts constructor
         // below. Other raw resident/projection modes preserve their original
         // owner/dispatch contract; Native's existing prepaid routes are intact.
         const direct_metal = session.backend() == .metal and self.residentTextEncoderEnabled() and self.config.normalize and self.config.pooling == .mean and self.text_projection == null;
-        const workspace = if ((session.backend() == .native or direct_metal) and !session.preparesInvocation()) self.gemma_workspace else null;
+        const direct_cuda_owned = (owned or task_output != null) and session.backend() == .cuda and self.gemmaOwnedTextEligible();
+        // Only the original protected HOST class becomes allocator capacity;
+        // backend scratch/KV/weights and final-bank credit stay independent.
+        const workspace = if ((session.backend() == .native or direct_metal or direct_cuda_owned) and !session.preparesInvocation()) self.gemma_workspace else null;
         const cfg = session_factory.getEmbeddingGemma2Config(session);
         if (workspace != null and cfg == null) return error.InvalidAdmissionLeaseReduction;
         if (cfg) |gemma| {
             var planned = request;
+            if (session.backend() == .cuda and self.residentTextEncoderEnabled() and self.config.pooling == .mean and self.text_projection == null) {
+                if (@import("../execution/architecture_session.zig").gemmaCudaOwnedTextWidth(session)) |width| {
+                    if (!@import("../architectures/embedding_gemma2.zig").validDimension(self.config.embedding_gemma2_dimensions) or self.config.embedding_gemma2_dimensions > width) return error.InvalidEmbeddingDimensions;
+                    // Original full-width encoder/F32 readback demand remains
+                    // independent of the additionally declared task bank.
+                    const rows = try std.math.mul(usize, request.batch, width);
+                    planned.output_bytes = @max(planned.output_bytes orelse 0, try std.math.mul(usize, rows, @sizeOf(f32)));
+                }
+            }
             if (workspace != null and session.backend() == .native) {
                 // Preserve the Native prepaid encoder floor independently of
                 // the final pooled/export backing and original input bytes.
@@ -2122,6 +2149,24 @@ pub const EmbeddingPipeline = struct {
         return self.finishTextHostOutputs(outputs, all_mask, batch, effective_len);
     }
 
+    /// Host rows are already owned by this allocator. Preserve full-width
+    /// values, including each backend's original source normalization policy.
+    /// A reduced prefix gets only the pipeline/model normalization it requests.
+    fn finishGemmaTextDimensions(self: *EmbeddingPipeline, rows: [][]f32) !void {
+        if (self.text_projection != null) return;
+        const cfg = session_factory.getEmbeddingGemma2Config(self.session) orelse return;
+        const width = self.config.embedding_gemma2_dimensions;
+        if (!@import("../architectures/embedding_gemma2.zig").validDimension(width) or width > cfg.embedding_dim) return error.InvalidEmbeddingDimensions;
+        for (rows) |*row| {
+            if (row.len == width) continue; // Already selected/truncated: never normalize twice.
+            if (row.len < width) return error.UnexpectedOutputShape;
+            const prefix = try self.allocator.dupe(f32, row.*[0..width]);
+            if (self.config.normalize or self.config.resident_embedding_gemma2) linalg.l2Normalize(prefix, width);
+            self.allocator.free(row.*);
+            row.* = prefix;
+        }
+    }
+
     fn finishTextHostOutputs(self: *EmbeddingPipeline, outputs: []Tensor, all_mask: []const i32, batch: usize, effective_len: usize) ![][]f32 {
         const alloc = self.allocator;
         if (outputs.len == 0) return error.NoOutputTensors;
@@ -2163,6 +2208,7 @@ pub const EmbeddingPipeline = struct {
             try self.projectEmbeddings(embeddings, proj);
         }
 
+        try self.finishGemmaTextDimensions(embeddings);
         if (self.config.resident_embedding_gemma2)
             for (embeddings) |embedding| try validateEmbeddingGemma2Vector(embedding);
 
@@ -2187,6 +2233,14 @@ pub const EmbeddingPipeline = struct {
         texts: []const []const u8,
         plan: TextSessionBatchPlan,
     ) anyerror![][]f32 {
+        return self.embedWithBatchPlanWithTaskOutput(texts, plan, null);
+    }
+    fn embedWithBatchPlanWithTaskOutput(
+        self: *EmbeddingPipeline,
+        texts: []const []const u8,
+        plan: TextSessionBatchPlan,
+        task_output: ?*GemmaTaskHostOutput,
+    ) anyerror![][]f32 {
         if (plan.batch_size == 0) return error.InvalidInputShape;
         const embeddings = try self.allocator.alloc([]f32, texts.len);
         var initialized: usize = 0;
@@ -2200,9 +2254,12 @@ pub const EmbeddingPipeline = struct {
             if (self.execution_control) |control| try control.check();
             const real_count = @min(plan.batch_size, texts.len - offset);
             if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
-            const batch_embeddings = try self.embedDirect(
+            const batch_embeddings = try self.embedDirectResult(
                 texts[offset .. offset + real_count],
                 plan.batch_size,
+                false,
+                .{},
+                task_output,
             );
             if (batch_embeddings.len != plan.batch_size) {
                 freeEmbeddingSlices(self.allocator, batch_embeddings);
@@ -4148,7 +4205,11 @@ pub const EmbeddingPipeline = struct {
                 var ready_outputs = ready_output_value;
                 defer ready_outputs.deinitWithBoundary(cleanup.boundary);
                 if (ready_outputs.outputs.len == 0) return error.NoOutputTensors;
-                const embeddings = try self.resident2DToEmbeddingsWithNormalization(&ready_outputs, batch, false);
+                const gemma_width: ?usize = if (self.session.backend() == .cuda and self.text_projection == null and @import("../execution/architecture_session.zig").gemmaCudaOwnedTextWidth(self.session) != null)
+                    self.config.embedding_gemma2_dimensions
+                else
+                    null;
+                const embeddings = try self.resident2DToEmbeddingsWithWidth(&ready_outputs, batch, false, gemma_width);
                 self.last_resident_backend_timing = @import("../execution/metadata_sample.zig").snapshot(ready_outputs.backend);
                 logEmbedTiming("text.encoder.pool_normalize.resident", batch, encoder_start);
                 self.recordResidentProjection(.text, .success, "text.encoder.pool_normalize.resident", batch, null);
@@ -4182,6 +4243,8 @@ pub const EmbeddingPipeline = struct {
             },
             else => return err,
         };
+        errdefer freeEmbeddingSlices(self.allocator, embeddings);
+        try self.finishGemmaTextDimensions(embeddings);
         self.last_resident_backend_timing = @import("../execution/metadata_sample.zig").snapshot(encoder_outputs.backend);
         self.recordResidentProjection(.text, .success, "text.encoder.resident", batch, null);
         return embeddings;
@@ -4386,7 +4449,10 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         normalize: bool,
     ) ![][]f32 {
-        return @import("../execution/backend_operation.zig").callOpaque(outputs.backend.*, outputs.backend.operationToken(), resident2DToEmbeddingsWithNormalizationImpl, .{ self, outputs, batch, normalize });
+        return self.resident2DToEmbeddingsWithWidth(outputs, batch, normalize, null);
+    }
+    fn resident2DToEmbeddingsWithWidth(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, batch: usize, normalize: bool, width: ?usize) ![][]f32 {
+        return @import("../execution/backend_operation.zig").callOpaque(outputs.backend.*, outputs.backend.operationToken(), resident2DToEmbeddingsWithNormalizationImpl, .{ self, outputs, batch, normalize, width });
     }
 
     fn resident2DToEmbeddingsWithNormalizationImpl(
@@ -4394,6 +4460,7 @@ pub const EmbeddingPipeline = struct {
         outputs: *session_mod.ResidentOutputs,
         batch: usize,
         normalize: bool,
+        requested_width: ?usize,
     ) ![][]f32 {
         if (outputs.outputs.len == 0) return error.NoOutputTensors;
         const shape = try outputs.backend.tensorShape(outputs.outputs[0], self.allocator);
@@ -4402,6 +4469,8 @@ pub const EmbeddingPipeline = struct {
 
         const proj_dim: usize = @intCast(shape[shape.len - 1]);
         if (proj_dim == 0) return error.ShapeMismatch;
+        const output_width = requested_width orelse proj_dim;
+        if (output_width == 0 or output_width > proj_dim) return error.ShapeMismatch;
         const resident_output = if (normalize)
             try resident_ops.l2NormalizeLastDim(self.allocator, outputs.backend, outputs.outputs[0], shape)
         else
@@ -4420,8 +4489,11 @@ pub const EmbeddingPipeline = struct {
         }
 
         for (0..batch) |b| {
-            const embedding = try self.allocator.alloc(f32, proj_dim);
-            @memcpy(embedding, data[b * proj_dim ..][0..proj_dim]);
+            const embedding = try self.allocator.alloc(f32, output_width);
+            @memcpy(embedding, data[b * proj_dim ..][0..output_width]);
+            // Default full-width output is byte-identical. Reduced Gemma
+            // dimensions use the existing host normalizer on the F32 prefix.
+            if (output_width != proj_dim and (self.config.normalize or self.config.resident_embedding_gemma2)) linalg.l2Normalize(embedding, output_width);
             embeddings[b] = embedding;
             initialized += 1;
             if (self.config.resident_embedding_gemma2) try validateEmbeddingGemma2Vector(embedding);
@@ -8470,9 +8542,10 @@ test "Gemma public text original source task escrow preserves four-row windows c
         "A red bus.",
     };
     const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
-    for ([_]backends.BackendType{ .native, .metal }) |kind| {
+    for ([_]backends.BackendType{ .native, .metal, .cuda }) |kind| {
         if (kind == .native and !build_options.enable_native) continue;
         if (kind == .metal and !build_options.enable_metal) continue;
+        if (kind == .cuda and !build_options.enable_cuda) continue;
         var lane: Lane = .{};
         var probe: Probe = .{ .lane = &lane };
         const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
@@ -8482,6 +8555,10 @@ test "Gemma public text original source task escrow preserves four-row windows c
         var session = switch (kind) {
             .native => try session_factory.createNativeSession(a, model_path),
             .metal => try session_factory.createMetalSession(a, model_path),
+            .cuda => session_factory.createCudaSession(a, model_path) catch |err| switch (err) {
+                error.CudaUnavailable, error.NoCudaDevices => continue,
+                else => return err,
+            },
             else => unreachable,
         };
         var live = true;
@@ -8503,12 +8580,31 @@ test "Gemma public text original source task escrow preserves four-row windows c
         pipeline.execution_lock = session.execution_gate;
         pipeline.execution_lane = &lane;
         try std.testing.expect(pipeline.gemmaOwnedTextEligible() and pipeline.canEmbedOwned());
+        if (kind == .cuda) {
+            // A provider/config hint cannot authorize a foreign output callback.
+            var foreign_table = session.vtable.*;
+            var foreign = pipeline;
+            foreign.session.vtable = &foreign_table;
+            try std.testing.expect(!foreign.canEmbedOwned());
+            var projected = pipeline;
+            projected.text_projection = session;
+            try std.testing.expect(!projected.canEmbedOwned());
+            var other_pooling = pipeline;
+            other_pooling.config.pooling = .cls;
+            try std.testing.expect(!other_pooling.canEmbedOwned());
+            var invalid_width = pipeline;
+            invalid_width.config.embedding_gemma2_dimensions = 129;
+            try std.testing.expect(!invalid_width.canEmbedOwned());
+        }
         var owned_trace: embedding_trace.Trace = .{ .allocator = a, .io = std.testing.io, .directory = "", .id = 0, .started_ns = 0, .path = "", .model = "", .inputs = &texts, .task_type = "CLUSTERING", .instruction = null };
         pipeline.trace = &owned_trace;
         // FIRST forward is actual public text owned with the same real lane;
         // no tokenized/reference warmup or alternate encoder is introduced.
         var owned = try pipeline.embedOwned(&texts, .{ .outside_execution = true });
         defer owned.deinitOutsideExecution();
+        var no_normalize_held: ?session_mod.OwnedHostVectors = null;
+        defer if (no_normalize_held) |*value| value.deinitOutsideExecution();
+        var no_normalize_expected: [128]f32 = undefined;
         try std.testing.expectEqual(@as(usize, texts.len), owned.len());
         var raw_trace: embedding_trace.Trace = .{ .allocator = a, .io = std.testing.io, .directory = "", .id = 0, .started_ns = 0, .path = "", .model = "", .inputs = &texts, .task_type = "CLUSTERING", .instruction = null };
         pipeline.trace = &raw_trace;
@@ -8519,28 +8615,127 @@ test "Gemma public text original source task escrow preserves four-row windows c
         try std.testing.expectEqualDeep(owned_trace.shapes[0..owned_trace.shape_count], raw_trace.shapes[0..raw_trace.shape_count]);
         for (raw, 0..) |row, index| {
             try std.testing.expectEqual(@as(usize, 768), row.len);
-            for (row, owned.values(index)) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
+            if (kind == .cuda) {
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(row), std.mem.sliceAsBytes(owned.values(index)));
+            } else for (row, owned.values(index)) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
         }
         for (owned.values(1), owned.values(6)) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
+        {
+            var no_normalize = pipeline;
+            no_normalize.trace = null;
+            no_normalize.config.normalize = false;
+            const original = try no_normalize.embed(texts[0..1]);
+            defer freeEmbeddingSlices(a, original);
+            try std.testing.expectEqual(@as(usize, 768), original[0].len);
+            no_normalize.config.embedding_gemma2_dimensions = 128;
+            const prefix = try no_normalize.embed(texts[0..1]);
+            defer freeEmbeddingSlices(a, prefix);
+            try std.testing.expectEqual(@as(usize, 128), prefix[0].len);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(original[0][0..128]), std.mem.sliceAsBytes(prefix[0]));
+            if (kind == .cuda) {
+                const Observation = @import("batch_execution.zig").Observation;
+                const before_false = domain.controller.snapshot();
+                var no_sources: Observation = .{};
+                var foreign_table = session.vtable.*;
+                var missing = no_normalize;
+                missing.session.vtable = &foreign_table;
+                missing.batch_observation = &no_sources;
+                try std.testing.expect(!missing.canEmbedOwned());
+                try std.testing.expectError(error.UnsupportedOwnedEmbeddingEntry, missing.embedOwned(texts[0..1], .{ .outside_execution = true }));
+                try std.testing.expectEqual(@as(usize, 0), no_sources.serial_items);
+                try std.testing.expectEqualDeep(before_false, domain.controller.snapshot());
+                // Genuine canonical table, but no retained Model proof. The
+                // receiver must refuse before any source/opaque owner access.
+                missing = no_normalize;
+                missing.session.model_lifetime = null;
+                missing.batch_observation = &no_sources;
+                try std.testing.expect(!missing.canEmbedOwned());
+                try std.testing.expectError(error.UnsupportedOwnedEmbeddingEntry, missing.embedOwned(texts[0..1], .{ .outside_execution = true }));
+                try std.testing.expectEqual(@as(usize, 0), no_sources.serial_items);
+                try std.testing.expectEqualDeep(before_false, domain.controller.snapshot());
+                var bank_below = no_normalize;
+                bank_below.batch_observation = &no_sources;
+                bank_below.session.run_admission.?.limits.host_limit_bytes = (try session_mod.HostOutputProducer.requiredBytes(1, 128)) - 1;
+                try std.testing.expectError(error.ResourceLimitExceeded, bank_below.embedOwned(texts[0..1], .{ .outside_execution = true }));
+                try std.testing.expectEqual(@as(usize, 0), no_sources.serial_items);
+                const denied_deadline = platform.time.monotonicNs() + 2 * std.time.ns_per_s;
+                while (!std.meta.eql(before_false, domain.controller.snapshot())) {
+                    _ = @import("../execution/resource_retirement.zig").poll();
+                    if (platform.time.monotonicNs() >= denied_deadline) return error.GemmaCudaUnnormalizedDeniedBankDidNotRetire;
+                    std.Thread.yield() catch {};
+                }
+                for ([_]usize{ 128, 256, 512, 768 }) |width| {
+                    no_normalize.config.embedding_gemma2_dimensions = width;
+                    try std.testing.expect(no_normalize.canEmbedOwned());
+                    try std.testing.expectEqual(width, try no_normalize.ownedTextOutputWidth());
+                    var actual = try no_normalize.embedOwned(texts[0..1], .{ .outside_execution = true });
+                    var actual_live = true;
+                    defer if (actual_live) actual.deinitOutsideExecution();
+                    const direct = try no_normalize.embed(texts[0..1]);
+                    defer freeEmbeddingSlices(a, direct);
+                    try std.testing.expectEqual(@as(usize, 1), actual.len());
+                    try std.testing.expectEqual(width, actual.values(0).len);
+                    // Independent original full-width source prefix, with NO
+                    // additional L2 for the false option; exact F32 bytes.
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(original[0][0..width]), std.mem.sliceAsBytes(actual.values(0)));
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(direct[0]), std.mem.sliceAsBytes(actual.values(0)));
+                    if (width == 128) {
+                        @memcpy(&no_normalize_expected, actual.values(0));
+                        no_normalize_held = actual;
+                        actual_live = false;
+                    }
+                }
+            } else try std.testing.expect(!no_normalize.canEmbedOwned());
+        }
+        if (kind == .cuda) {
+            const full_tokens = pipeline.last_input_tokens;
+            for ([_]usize{ 128, 256, 512 }) |width| {
+                var reduced = pipeline;
+                reduced.trace = null;
+                reduced.config.embedding_gemma2_dimensions = width;
+                try std.testing.expect(reduced.canEmbedOwned());
+                var reduced_owned = try reduced.embedOwned(&texts, .{ .outside_execution = true });
+                defer reduced_owned.deinitOutsideExecution();
+                try std.testing.expectEqual(full_tokens, reduced.last_input_tokens);
+                const reduced_raw = try reduced.embed(&texts);
+                defer freeEmbeddingSlices(a, reduced_raw);
+                try std.testing.expectEqual(full_tokens, reduced.last_input_tokens);
+                for (raw, reduced_raw, 0..) |full, row, index| {
+                    var expected: [768]f32 = undefined;
+                    @memcpy(expected[0..width], full[0..width]);
+                    linalg.l2Normalize(expected[0..width], width);
+                    try std.testing.expectEqual(width, row.len);
+                    try std.testing.expectEqual(width, reduced_owned.values(index).len);
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected[0..width]), std.mem.sliceAsBytes(row));
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(row), std.mem.sliceAsBytes(reduced_owned.values(index)));
+                }
+            }
+        }
         try std.testing.expect(!probe.violation.load(.acquire) and !lane.owned and scheduler.head == null);
         var cancel_trace: embedding_trace.Trace = .{ .allocator = a, .io = std.testing.io, .directory = "", .id = 0, .started_ns = 0, .path = "", .model = "", .inputs = &texts, .task_type = "CLUSTERING", .instruction = null };
+        const Observation = @import("batch_execution.zig").Observation;
+        var committed_cancel: Observation = .{};
         const CancelAfterCommittedCohort = struct {
             trace: *embedding_trace.Trace,
+            forwards: ?*Observation = null,
             fn check(cancel_context: ?*anyopaque) !void {
                 const self: *@This() = @ptrCast(@alignCast(cancel_context.?));
-                if (self.trace.shape_count != 0) return error.Cancelled;
+                if (self.forwards) |forwards| {
+                    if (forwards.serial_items != 0) return error.Cancelled;
+                } else if (self.trace.shape_count != 0) return error.Cancelled;
             }
         };
-        var cancel_probe: CancelAfterCommittedCohort = .{ .trace = &cancel_trace };
+        var cancel_probe: CancelAfterCommittedCohort = .{ .trace = &cancel_trace, .forwards = if (kind == .cuda) &committed_cancel else null };
         var cancel_control = control;
         cancel_control.ptr = &cancel_probe;
         cancel_control.check_fn = CancelAfterCommittedCohort.check;
         var cancelled = pipeline;
         cancelled.execution_control = cancel_control;
         cancelled.trace = &cancel_trace;
+        if (kind == .cuda) cancelled.batch_observation = &committed_cancel;
         const before_cancel = domain.controller.snapshot();
         try std.testing.expectError(error.Cancelled, cancelled.embedOwned(&texts, .{ .outside_execution = true }));
-        try std.testing.expect(cancel_trace.shape_count > 0); // a real original cohort committed
+        if (kind == .cuda) try std.testing.expectEqual(@as(usize, 1), committed_cancel.serial_items) else try std.testing.expect(cancel_trace.shape_count > 0);
         const cancel_deadline = platform.time.monotonicNs() + 2 * std.time.ns_per_s;
         while (!std.meta.eql(before_cancel, domain.controller.snapshot())) {
             _ = @import("../execution/resource_retirement.zig").poll();
@@ -8548,6 +8743,75 @@ test "Gemma public text original source task escrow preserves four-row windows c
             std.Thread.yield() catch {};
         }
         try std.testing.expect(!lane.owned and scheduler.head == null and !probe.violation.load(.acquire));
+        if (kind == .cuda) {
+            var false_committed: Observation = .{};
+            var false_probe: CancelAfterCommittedCohort = .{ .trace = &cancel_trace, .forwards = &false_committed };
+            var false_control = control;
+            false_control.ptr = &false_probe;
+            false_control.check_fn = CancelAfterCommittedCohort.check;
+            var false_cancelled = pipeline;
+            false_cancelled.config.normalize = false;
+            false_cancelled.config.embedding_gemma2_dimensions = 128;
+            false_cancelled.trace = null;
+            false_cancelled.execution_control = false_control;
+            false_cancelled.batch_observation = &false_committed;
+            try std.testing.expectError(error.Cancelled, false_cancelled.embedOwned(&texts, .{ .outside_execution = true }));
+            try std.testing.expectEqual(@as(usize, 1), false_committed.serial_items);
+            const false_deadline = platform.time.monotonicNs() + 2 * std.time.ns_per_s;
+            while (!std.meta.eql(before_cancel, domain.controller.snapshot())) {
+                _ = @import("../execution/resource_retirement.zig").poll();
+                if (platform.time.monotonicNs() >= false_deadline) return error.GemmaCudaUnnormalizedCancelledBankDidNotRetire;
+                std.Thread.yield() catch {};
+            }
+            try std.testing.expect(!lane.owned and scheduler.head == null and !probe.violation.load(.acquire));
+            // Fault after an actual first Source completed, not after merely
+            // tokenizing. Existing final owners must unwind without replay.
+            var committed_oom: Observation = .{};
+            const AllocationFailureAfterSource = struct {
+                forwards: *Observation,
+                fn check(raw_context: ?*anyopaque) !void {
+                    const fault: *@This() = @ptrCast(@alignCast(raw_context.?));
+                    if (fault.forwards.serial_items != 0) return error.OutOfMemory;
+                }
+            };
+            var fault: AllocationFailureAfterSource = .{ .forwards = &committed_oom };
+            var oom_control = control;
+            oom_control.ptr = &fault;
+            oom_control.check_fn = AllocationFailureAfterSource.check;
+            var failing = pipeline;
+            failing.trace = null;
+            failing.batch_observation = &committed_oom;
+            failing.execution_control = oom_control;
+            const before_oom = domain.controller.snapshot();
+            try std.testing.expectError(error.OutOfMemory, failing.embedOwned(&texts, .{ .outside_execution = true }));
+            try std.testing.expectEqual(@as(usize, 1), committed_oom.serial_items);
+            const oom_deadline = platform.time.monotonicNs() + 2 * std.time.ns_per_s;
+            while (!std.meta.eql(before_oom, domain.controller.snapshot())) {
+                _ = @import("../execution/resource_retirement.zig").poll();
+                if (platform.time.monotonicNs() >= oom_deadline) return error.GemmaCudaFailedHostBankDidNotRetire;
+                std.Thread.yield() catch {};
+            }
+            try std.testing.expect(!lane.owned and scheduler.head == null and !probe.violation.load(.acquire));
+            // Same actual post-Source failure path for the newly admitted
+            // false option. This is explicit control fault injection, not an
+            // exhaustive GPU allocator failure claim.
+            committed_oom = .{};
+            failing.config.normalize = false;
+            failing.config.embedding_gemma2_dimensions = 128;
+            try std.testing.expectError(error.OutOfMemory, failing.embedOwned(&texts, .{ .outside_execution = true }));
+            try std.testing.expectEqual(@as(usize, 1), committed_oom.serial_items);
+            const false_oom_deadline = platform.time.monotonicNs() + 2 * std.time.ns_per_s;
+            while (!std.meta.eql(before_oom, domain.controller.snapshot())) {
+                _ = @import("../execution/resource_retirement.zig").poll();
+                if (platform.time.monotonicNs() >= false_oom_deadline) return error.GemmaCudaUnnormalizedFailedBankDidNotRetire;
+                std.Thread.yield() catch {};
+            }
+            try std.testing.expect(!lane.owned and scheduler.head == null and !probe.violation.load(.acquire));
+            var bank_below = pipeline;
+            bank_below.trace = null;
+            bank_below.session.run_admission.?.limits.host_limit_bytes = (try session_mod.HostOutputProducer.requiredBytes(texts.len, 768)) - 1;
+            try std.testing.expectError(error.ResourceLimitExceeded, bank_below.embedOwned(&texts, .{ .outside_execution = true }));
+        }
         var denied = pipeline;
         denied.trace = null;
         denied.session.run_admission.?.limits = .{ .host_limit_bytes = 1, .backend_limit_bytes = 1, .combined_limit_bytes = 1 };
@@ -8555,7 +8819,7 @@ test "Gemma public text original source task escrow preserves four-row windows c
         probe.model_gate = null;
         Probe.close(session);
         live = false;
-        const required = try session_mod.HostOutputProducer.requiredBytes(texts.len, 768);
+        const required = try std.math.add(usize, try session_mod.HostOutputProducer.requiredBytes(texts.len, 768), if (no_normalize_held != null) try session_mod.HostOutputProducer.requiredBytes(1, 128) else 0);
         const deadline = platform.time.monotonicNs() + 2 * std.time.ns_per_s;
         while (!std.meta.eql(domain.controller.snapshot(), memory_admission.AdmissionAmounts{ .host_scratch_bytes = required })) {
             _ = @import("../execution/resource_retirement.zig").poll();
@@ -8573,6 +8837,11 @@ test "Gemma public text original source task escrow preserves four-row windows c
         var foreign_held = true;
         defer if (foreign_held) foreign_lane.release();
         try owned.deinitWithCleanup(.{ .boundary = &epoch });
+        if (no_normalize_held) |*value| {
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&no_normalize_expected), std.mem.sliceAsBytes(value.values(0)));
+            try value.deinitWithCleanup(.{ .boundary = &epoch });
+            no_normalize_held = null;
+        }
         _ = @import("../execution/resource_retirement.zig").poll();
         try std.testing.expectEqual(required, domain.controller.snapshot().host_scratch_bytes);
         foreign_lane.release();
@@ -9109,4 +9378,245 @@ test "read pool microbatch CUDA admission marks only pre-dispatch cohort refusal
     try std.testing.expectError(error.ResourceLimitExceeded, Probe.admit(&pipeline, 1));
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "Native Gemma fresh public Session and normalize false Source prepare caches outside real Model and lane" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    if (@import("../backends/native.zig").useBlas()) return error.SkipZigTest;
+    const model_path = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const tokenizer_path = try std.fs.path.join(a, &.{ model_path, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tokenizer.deinitSelf();
+    const Lane = @import("../execution_control.zig").ExecutionLane;
+    const Probe = struct {
+        model: ?*std.atomic.Mutex = null,
+        lane: *Lane,
+        violation: bool = false,
+        calls: usize = 0,
+        arms: usize = 0,
+        disarms: usize = 0,
+        fail_arm: bool = false,
+        cancel_preflight: bool = false,
+        cancel_after_reserve: bool = false,
+        cancel_at_calls: usize = 0,
+        cancel_source: ?*session_mod.PreparedSource = null,
+        cancellations: usize = 0,
+        fn arm(raw: *anyopaque, _: @import("../execution_control.zig").MonitorControl) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.arms += 1;
+            if (self.fail_arm) return error.TestGuardArmFailed;
+            return @intCast(self.arms);
+        }
+        fn disarm(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.disarms += 1;
+        }
+        fn guarded(self: *@This()) InferenceExecutionControl {
+            return .{ .ptr = self, .check_fn = @This().control, .hard_cancellation = .{ .ptr = self, .arm_fn = @This().arm, .disarm_fn = @This().disarm } };
+        }
+        fn control(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancel_preflight or (self.cancel_after_reserve and self.calls >= self.cancel_at_calls)) return error.Cancelled;
+            if (self.cancel_source) |source| if (source.native_weight_paused) {
+                self.cancellations += 1;
+                return error.Cancelled;
+            };
+        }
+        fn check(self: *@This()) void {
+            if (self.model) |gate| {
+                if (gate.tryLock()) gate.unlock() else self.violation = true;
+            }
+            if (self.lane.mutex.tryLock()) {
+                if (self.lane.owned) self.violation = true;
+                self.lane.mutex.unlock();
+            } else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn close(session: session_mod.Session) void {
+            var sink = @import("../execution/retirement_sink.zig").Ref.create() catch @panic("Native Source close sink");
+            defer sink.release();
+            var guard = sink.enter() catch @panic("Native Source close guard");
+            defer guard.finish();
+            var epoch = guard.retainEpoch() catch @panic("Native Source close epoch");
+            defer epoch.release();
+            session.closeWithBoundary(&epoch);
+        }
+    };
+    const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+    const texts = [_][]const u8{"A red bus on a quiet street."};
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 2, 100 });
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 2 }, &.{ 1, 1 });
+    defer mask.deinit();
+    const inputs = [_]Tensor{ ids, mask };
+    // Each entry has its OWN new managed provider and independent raw model.
+    // No staged/owned call primes the cache before any entry being witnessed.
+    for (0..8) |entry| {
+        const raw = try session_factory.createNativeSession(a, model_path);
+        defer raw.close();
+        session_factory.attachIo(raw, std.testing.io);
+        var lane: Lane = .{};
+        var probe: Probe = .{ .lane = &lane };
+        const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+        defer domain.release();
+        try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+        defer domain.controller.configureResourceBudget(null) catch @panic("Native Source live budget");
+        var session = try session_factory.createNativeSession(a, model_path);
+        var live = true;
+        defer if (live) {
+            probe.model = null;
+            Probe.close(session);
+        };
+        session_factory.attachIo(session, std.testing.io);
+        try session.installOwnedExecutionGate(a);
+        var scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{};
+        session.cohort_scheduler = &scheduler;
+        session.model_lifetime.?.admission_domain = domain.pin();
+        const GiB: usize = 1024 * 1024 * 1024;
+        session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 8 * GiB, .backend_limit_bytes = GiB }, .static_workspace_bytes = 0, .check_live_memory = false };
+        try @import("../execution/architecture_session.zig").configureSharedCacheAdmissionForSession(session, a, &domain.controller, .cpu, session.run_admission.?.limits, .{});
+        probe.model = session.execution_gate;
+        if (entry == 1) {
+            var raw_pipeline = EmbeddingPipeline.init(a, raw, tokenizer.tokenizer(), .{ .normalize = false, .resident_text_encoder = true, .max_length = 128, .embedding_gemma2_dimensions = 768 });
+            raw_pipeline.execution_control = control;
+            const expected = try raw_pipeline.embed(&texts);
+            defer freeEmbeddingSlices(a, expected);
+            var pipeline = EmbeddingPipeline.init(a, session, tokenizer.tokenizer(), raw_pipeline.config);
+            pipeline.execution_control = control;
+            pipeline.execution_lock = session.execution_gate;
+            pipeline.execution_lane = &lane;
+            const actual = try pipeline.embed(&texts); // FIRST actual managed inference
+            defer freeEmbeddingSlices(a, actual);
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |x, y| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(x), std.mem.sliceAsBytes(y));
+        } else if (entry == 0 or entry == 3) {
+            const expected = if (entry == 0) try raw.runWithControl(&inputs, a, control) else try raw.run(&inputs, a);
+            defer {
+                for (expected) |*value| value.deinit();
+                a.free(expected);
+            }
+            const actual = if (entry == 0) try session.runWithControl(&inputs, a, probe.guarded()) else try session.run(&inputs, a); // FIRST, no Stage loan
+            defer {
+                for (actual) |*value| value.deinit();
+                a.free(actual);
+            }
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |x, y| {
+                try std.testing.expectEqualSlices(i64, x.shape, y.shape);
+                try std.testing.expectEqualSlices(u8, x.data, y.data);
+            }
+            if (entry == 0) {
+                try std.testing.expectEqual(@as(usize, 1), probe.arms);
+                try std.testing.expectEqual(@as(usize, 1), probe.disarms);
+            }
+        } else if (entry == 6 or entry == 7) {
+            const before = probe.calls;
+            if (entry == 6) {
+                try std.testing.expectError(error.ProcessIsolationRequired, session.runWithControl(&inputs, a, .{}));
+                try std.testing.expectEqual(before, probe.calls);
+                probe.fail_arm = true;
+                try std.testing.expectError(error.TestGuardArmFailed, session.runWithControl(&inputs, a, probe.guarded()));
+                try std.testing.expectEqual(before, probe.calls);
+                try std.testing.expectEqual(@as(usize, 1), probe.arms);
+                try std.testing.expectEqual(@as(usize, 0), probe.disarms);
+                probe.fail_arm = false;
+                probe.cancel_preflight = true;
+                try std.testing.expectError(error.Cancelled, session.runWithControl(&inputs, a, probe.guarded()));
+                try std.testing.expectEqual(before, probe.calls);
+                try std.testing.expectEqual(@as(usize, 1), probe.arms); // check before arm
+            } else {
+                probe.cancel_after_reserve = true;
+                probe.cancel_at_calls = before + 1;
+                const attempted = session.runWithControl(&inputs, a, probe.guarded());
+                defer if (attempted) |values| {
+                    for (values) |*value| value.deinit();
+                    a.free(values);
+                } else |_| {};
+                try std.testing.expectError(error.Cancelled, attempted);
+                try std.testing.expect(probe.calls > before);
+                try std.testing.expectEqual(@as(usize, 1), probe.arms);
+                try std.testing.expectEqual(@as(usize, 1), probe.disarms);
+            }
+        } else if (entry == 5) {
+            var source: session_mod.PreparedSource = .{};
+            defer source.deinitOutsideExecution();
+            try source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &inputs }, try session.planRun(&inputs, null), null, .resident_transient, a, control);
+            const data = @import("../execution/architecture_session.zig").nativePanelPreparationModelData(session) orelse return error.ExpectedNativePanelReceiver;
+            const original_allocator = data.allocator;
+            var failing = std.testing.FailingAllocator.init(original_allocator, .{ .fail_index = 0 });
+            data.allocator = failing.allocator(); // actual cold cache staging only
+            defer data.allocator = original_allocator;
+            try source.bindExecutionLaneBeforeExecution(&lane, false);
+            try source.enter();
+            const attempted = source.runHost(&inputs);
+            defer if (attempted) |values| {
+                for (values) |*value| value.deinit();
+                a.free(values);
+            } else |_| {};
+            try std.testing.expectError(error.OutOfMemory, attempted);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(source.native_control == null);
+            source.deinitOutsideExecution();
+        } else if (entry == 4) {
+            var source: session_mod.PreparedSource = .{};
+            defer source.deinitOutsideExecution();
+            const cancelling: InferenceExecutionControl = .{ .ptr = &probe, .check_fn = Probe.control, .native_call_policy = .in_process };
+            try source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &inputs }, try session.planRun(&inputs, null), null, .resident_transient, a, cancelling);
+            probe.cancel_source = &source;
+            defer probe.cancel_source = null;
+            try source.bindExecutionLaneBeforeExecution(&lane, false);
+            try source.enter();
+            const attempted = source.runHost(&inputs);
+            defer if (attempted) |values| {
+                for (values) |*value| value.deinit();
+                a.free(values);
+            } else |_| {};
+            try std.testing.expectError(error.Cancelled, attempted);
+            try std.testing.expectEqual(@as(usize, 1), probe.cancellations);
+            try std.testing.expect(source.native_control == null);
+            if (source.permit) |permit| try std.testing.expect(permit.native_weights == null);
+            source.deinitOutsideExecution(); // restored Model/lane must now unwind
+        } else {
+            var expected = (try raw.runResident(&inputs, a)) orelse return error.ExpectedOriginalResidentOutput;
+            defer expected.deinit();
+            const expected_values = try expected.backend.toFloat32(expected.outputs[0], a);
+            defer a.free(expected_values);
+            var source: session_mod.PreparedSource = .{};
+            defer source.deinitOutsideExecution();
+            try source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &inputs }, try session.planRun(&inputs, null), null, .resident_consumer, a, null);
+            try source.bindExecutionLaneBeforeExecution(&lane, false);
+            try source.enter();
+            var actual = (try source.runResident(.{ .host = &inputs })) orelse return error.ExpectedSourceResidentOutput;
+            defer actual.deinit();
+            try std.testing.expect(actual.backend.call_context == null and actual.backend.embedding_stage == null);
+            try std.testing.expect(actual.backend.native_weight_cache == null);
+            try std.testing.expect(try source.handoffResident(&actual));
+            source.deinitOutsideExecution();
+            probe.model = null;
+            Probe.close(session);
+            live = false; // actual outputs retain their original model/backend
+            const actual_values = try actual.backend.toFloat32(actual.outputs[0], a);
+            defer a.free(actual_values);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_values), std.mem.sliceAsBytes(actual_values));
+        }
+        try std.testing.expect((entry == 6 or probe.calls != 0) and !probe.violation);
+        try std.testing.expect(!lane.owned and scheduler.head == null);
+    }
 }

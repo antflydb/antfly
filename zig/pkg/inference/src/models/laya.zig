@@ -472,8 +472,32 @@ pub fn visitTensorInventory(visitor: anytype, cfg: Config, encoder: anytype) !vo
 /// This is a MAX over the same reachable checkpoint roles, never a layer sum.
 /// Actual receiver/storage attestation remains the caller's responsibility.
 pub const MatrixScratchGeometry = @import("../ops/kernel_descriptor.zig").NativeMatrixScratchGeometry;
-pub fn unpackedMatrixScratchGeometry(cfg: Config, encoder: anytype, batch: usize, sequence: usize) !?MatrixScratchGeometry {
-    if (cfg.packing.enabled() or cfg.weight_quantization != .q8_0 or batch == 0 or sequence == 0 or sequence > cfg.max_len or encoder.lora_rank != 0 or encoder.checkpoint_layout != .huggingface_fused_qkv_no_bias or encoder.hidden_size < 64 or encoder.hidden_size % 64 != 0 or encoder.num_hidden_layers == 0) return null;
+pub const MatrixScratchWork = struct {
+    encoder: bool,
+    head: bool,
+};
+
+/// SAME checkpoint inventory; only actual positive-work transformer phases
+/// contribute a Q8 dequantization matrix. Scorer/action/pointer are F32.
+pub fn visitMatrixScratchRoles(visitor: anytype, cfg: Config, encoder: anytype, work: MatrixScratchWork) !void {
+    const Selected = struct {
+        target: @TypeOf(visitor),
+        work: MatrixScratchWork,
+        pub fn tensor(self: *@This(), name: []const u8, shape: []const i64) !void {
+            if (!quantizedLinear(name)) return;
+            if (std.mem.startsWith(u8, name, "encoder.layers.") and !self.work.encoder) return;
+            if (std.mem.startsWith(u8, name, "head.layers.") and !self.work.head) return;
+            try self.target.tensor(name, shape);
+        }
+    };
+    var selected = Selected{ .target = visitor, .work = work };
+    try visitTensorInventory(&selected, cfg, encoder);
+}
+
+/// Byte geometry follows selected original matrix layouts, independent of row
+/// count. The caller proves positive work before declaring or using this MAX.
+pub fn selectedMatrixScratchGeometry(cfg: Config, encoder: anytype, work: MatrixScratchWork) !?MatrixScratchGeometry {
+    if (cfg.weight_quantization != .q8_0 or encoder.lora_rank != 0 or encoder.checkpoint_layout != .huggingface_fused_qkv_no_bias or encoder.hidden_size < 64 or encoder.hidden_size % 64 != 0 or encoder.num_hidden_layers == 0 or (!work.encoder and !work.head)) return null;
     const Count = struct {
         value: MatrixScratchGeometry = .{},
         pub fn tensor(self: *@This(), name: []const u8, shape: []const i64) !void {
@@ -488,8 +512,13 @@ pub fn unpackedMatrixScratchGeometry(cfg: Config, encoder: anytype, batch: usize
         }
     };
     var count = Count{};
-    try visitTensorInventory(&count, cfg, encoder);
+    try visitMatrixScratchRoles(&count, cfg, encoder, work);
     return if (count.value.bytes == 0) null else count.value;
+}
+
+pub fn unpackedMatrixScratchGeometry(cfg: Config, encoder: anytype, batch: usize, sequence: usize) !?MatrixScratchGeometry {
+    if (cfg.packing.enabled() or batch == 0 or sequence == 0 or sequence > cfg.max_len) return null;
+    return selectedMatrixScratchGeometry(cfg, encoder, .{ .encoder = true, .head = true });
 }
 
 test "laya unpacked matrix MAX uses actual checkpoint roles and positive work" {
@@ -528,4 +557,26 @@ test "laya weight quantization covers encoder and head linears only" {
     const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"weight_quantization\":\"q4\"}", .{});
     defer bad.deinit();
     try std.testing.expectError(error.InvalidLayaConfig, Config.parse(bad.value));
+}
+
+test "laya selected packed MAX includes positive branch and head roles but no zero-work phase" {
+    const encoder = @import("../architectures/modern_bert_config.zig").Config{
+        .hidden_size = 64,
+        .intermediate_size = 192,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .checkpoint_layout = .huggingface_fused_qkv_no_bias,
+    };
+    const cfg = Config{ .weight_quantization = .q8_0, .head_layers = 2, .packing = .{ .mode = .question } };
+    const both = (try selectedMatrixScratchGeometry(cfg, encoder, .{ .encoder = true, .head = true })).?;
+    const encoder_only = (try selectedMatrixScratchGeometry(cfg, encoder, .{ .encoder = true, .head = false })).?;
+    const head_only = (try selectedMatrixScratchGeometry(cfg, encoder, .{ .encoder = false, .head = true })).?;
+    try std.testing.expectEqual(@as(usize, 16), both.matrix_roles);
+    try std.testing.expectEqual(@as(usize, 8), encoder_only.matrix_roles);
+    try std.testing.expectEqual(@as(usize, 8), head_only.matrix_roles);
+    try std.testing.expectEqual(@max(encoder_only.bytes, head_only.bytes), both.bytes);
+    try std.testing.expectEqual(@as(?MatrixScratchGeometry, null), try selectedMatrixScratchGeometry(cfg, encoder, .{ .encoder = false, .head = false }));
+    // Packed is no longer blanket-declined by the positive-work helper. Actual
+    // seven-input validation and cache/full branch selection belong to adapter.
+    try std.testing.expectEqual(@as(?MatrixScratchGeometry, null), try unpackedMatrixScratchGeometry(cfg, encoder, 1, 32));
 }

@@ -2823,9 +2823,7 @@ pub fn setLayaTrunkCachePrecision(session: Session, precision: @import("../archi
     if (session.vtable != &arch_vtable) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const cache = layaTrunkCache(self) orelse return;
-    platform.sync.lockYielding(&cache.mutex);
-    defer cache.mutex.unlock();
-    cache.precision = precision;
+    cache.setPrecision(precision);
 }
 
 /// Replace a session's trunk cache budget (0 disables it) and minimum
@@ -2834,10 +2832,7 @@ pub fn setLayaTrunkCacheLimit(session: Session, limit_bytes: usize, min_tokens: 
     if (session.vtable != &arch_vtable) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const cache = layaTrunkCache(self) orelse return;
-    platform.sync.lockYielding(&cache.mutex);
-    defer cache.mutex.unlock();
-    cache.limit_bytes = limit_bytes;
-    cache.min_tokens = min_tokens;
+    cache.setLimit(limit_bytes, min_tokens);
 }
 
 /// Attach a runtime Io to a Session created by this factory so its
@@ -2911,6 +2906,24 @@ pub fn gemmaWorkspaceLanePolicy(session: Session) ?bool {
     return owner.arch_config == .embedding_gemma2;
 }
 
+/// Exact resident callback/config geometry for the generic public CUDA text
+/// entry. Forwarded/custom host callbacks retain their original raw contract;
+/// a provider/config hint alone cannot authorize an owned result envelope.
+pub fn gemmaCudaOwnedTextWidth(session: Session) ?usize {
+    if (session.vtable != &arch_vtable) return null;
+    const model = session.model_lifetime orelse return null;
+    if (model.destroy_fn != archClose or model.quiesce_fn != archQuiesce or model.owner != session.ptr) return null;
+    const provider = session.compute_backend_provider orelse return null;
+    if (provider.ptr != session.ptr or provider.services != &archComputeServices) return null;
+    const actual: *const ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (&actual.model_lifetime != model) return null;
+    if (actual.backend_type != .cuda or actual.arch_config != .embedding_gemma2 or actual.task == .classifier or actual.task == .extractor) return null;
+    const config = actual.arch_config.embedding_gemma2.resident orelse return null;
+    config.validate() catch return null;
+    if (!config.isOfficialTextTopology()) return null;
+    return config.outputDim();
+}
+
 /// Source's synchronous weight-operation protocol is independent of encoder
 /// names. The exclusions are actual different producer/worker ownership:
 /// expert workers, an explicitly installed graph runtime and Gemma's distinct
@@ -2935,6 +2948,40 @@ pub fn nativeWeightPreparationCandidate(session: Session) bool {
         else => true,
     };
 }
+/// Actual published owner facts govern raw compatibility. Public wrapper
+/// policy removal cannot unbind a Model/cache which still owns admission.
+pub fn validateNativePanelPreparationReceiver(session: Session) !void {
+    if (comptime !build_options.enable_native) return;
+    if (session.vtable != &arch_vtable) return;
+    const model = session.model_lifetime orelse return error.MissingNativePanelOwner;
+    if (model.owner != session.ptr or model.destroy_fn != archClose) return error.ForeignNativeWeightModel;
+    if (session.compute_backend_provider) |provider| if (provider.services != &archComputeServices or provider.ptr != session.ptr) return error.ForeignNativeWeightModel;
+    const actual: *ArchSession = @ptrCast(@alignCast(model.owner));
+    if (&actual.model_lifetime != model) return error.ForeignNativeWeightModel;
+    if (actual.backend_type != .native or actual.arch_config != .embedding_gemma2) return;
+    const cache_binding = if (actual.backend_data.native.tier_cache) |*cache| cache.admission else null;
+    const raw = session.run_admission == null and model.model_lease == null and model.resource_pin == null and model.admission_domain == null and cache_binding == null;
+    if (raw) return;
+    const policy = session.run_admission orelse return error.MissingNativePanelAdmission;
+    const domain = model.admission_domain orelse return error.MissingCacheRetirementDomain;
+    if (policy.controller != domain.controller() or policy.backend_class != .cpu) return error.ForeignAdmissionDomain;
+    if (cache_binding) |binding| if (binding.controller != policy.controller or binding.backend_class != policy.backend_class) return error.ForeignAdmissionDomain;
+    if (session.execution_gate != &model.execution_gate) return error.ExecutionCohortGateChanged;
+}
+
+pub fn nativePanelPreparationModelData(session: Session) ?*native_mod.WeightStore {
+    if (comptime !build_options.enable_native) return null;
+    if (session.vtable != &arch_vtable or session.run_admission == null) return null;
+    const provider = session.compute_backend_provider orelse return null;
+    const model = session.model_lifetime orelse return null;
+    if (provider.services != &archComputeServices or provider.ptr != session.ptr or model.owner != provider.ptr or model.destroy_fn != archClose or session.execution_gate != &model.execution_gate) return null;
+    const owner: *ArchSession = @ptrCast(@alignCast(provider.ptr));
+    if (&owner.model_lifetime != model or owner.backend_type != .native or owner.arch_config != .embedding_gemma2 or owner.graph_runtime_strategy != null) return null;
+    const domain = model.admission_domain orelse return null;
+    if (domain.controller() != session.run_admission.?.controller) return null;
+    return &owner.backend_data.native;
+}
+
 /// Exact published owner/gate certification before the Native ctx is exposed.
 /// Neither copied callback tables nor public model strings prove this identity.
 pub fn nativeWeightPreparationModelData(session: Session) ?*native_mod.WeightStore {
@@ -2962,6 +3009,14 @@ pub fn nativeMatrixScratchCandidate(session: Session, inputs: @import("prepared_
         .host => |values| values,
         else => return null,
     };
+    if (host.len == @import("../architectures/laya_packed.zig").input_count and laya.packing.enabled()) {
+        const row = @import("../architectures/laya_packed.zig").metadataView(cfg, host) catch return null;
+        // Full and cached branch callers both have positive encoder rows and
+        // head questions. A hot trunk has zero new FILL rows, not zero branch
+        // math; all selected serial phases reuse this SAME MAX span.
+        if (row.ids.len == 0 or row.questions() == 0) return null;
+        return @import("../models/laya.zig").selectedMatrixScratchGeometry(laya, cfg, .{ .encoder = true, .head = true });
+    }
     if (host.len != 4 or host[0].shape.len != 2 or host[0].shape[0] <= 0 or host[0].shape[1] <= 0) return null;
     const bi = parseBertRunInputs(host[0..2]) catch return null;
     const kinds = validateI64Matrix(host[2], .{ bi.batch, 1 }) catch return null;
@@ -2997,7 +3052,10 @@ pub fn nativeMatrixScratchMatches(session: Session, geometry: ops.kernel_descrip
     const laya = cfg.laya orelse return false;
     // Matrix demand is row independent; positive execution was established
     // from actual input shapes before the bank was declared.
-    const current = (try @import("../models/laya.zig").unpackedMatrixScratchGeometry(laya, cfg, 1, 1)) orelse return false;
+    const current = (try if (laya.packing.enabled())
+        @import("../models/laya.zig").selectedMatrixScratchGeometry(laya, cfg, .{ .encoder = true, .head = true })
+    else
+        @import("../models/laya.zig").unpackedMatrixScratchGeometry(laya, cfg, 1, 1)) orelse return false;
     if (!std.meta.eql(current, geometry)) return false;
     const Census = struct {
         owner: *ArchSession,
@@ -3025,6 +3083,132 @@ pub fn nativeMatrixScratchMatches(session: Session, geometry: ops.kernel_descrip
     var census = Census{ .owner = owner, .data = data };
     try @import("../models/laya.zig").visitTensorInventory(&census, laya, cfg);
     return census.supported;
+}
+
+/// Model interpretation remains in this registered adapter. Generic Source
+/// sees the same cold-work object/requirements and original permit ownership;
+/// no Laya geometry/layout type is introduced into Native backend APIs.
+pub const NativeMatrixScratchReceiver = @import("../architectures/laya_packed.zig").Prepared;
+pub const NativeMatrixScratchCall = struct {
+    owner: *ArchSession,
+    workload: ?@import("../architectures/laya_packed.zig").ColdCall,
+    expected_geometry: ?ops.kernel_descriptor.NativeMatrixScratchGeometry = null,
+    pub fn declineAdditionalWorkspace(self: *@This()) !void {
+        if (self.workload) |*call| try call.declineAdditionalWorkspace();
+    }
+    pub fn physicalRequirements(self: *const @This()) []const @import("prepared_storage_admission.zig").Requirement {
+        return if (self.workload) |*call| call.physicalRequirements() else &.{};
+    }
+    pub fn ownedAmounts(self: *@This(), controller: *runtime.tier.memory.AdmissionController) !runtime.tier.memory.AdmissionAmounts {
+        return if (self.workload) |*call| try call.cache.ownedAmountsCold(&call.snapshot_value, controller) else .{};
+    }
+    pub fn prepareOutsideExecution(self: *@This(), capability: @import("storage_admission.zig").Capability, domain: @import("../runtime/tier/admission_domain.zig").Pin, current: @import("cleanup_context.zig").Context) !void {
+        if (self.workload) |*call| try call.prepareOutsideExecution(capability, domain, current);
+    }
+    pub fn finishOutsideExecution(self: *@This(), current: @import("cleanup_context.zig").Context) !void {
+        if (self.workload) |*call| try call.finishOutsideExecution(current);
+        self.workload = null;
+    }
+    pub fn receiverAtFinalAddress(self: *@This()) !?*@import("../architectures/laya_packed.zig").Prepared {
+        return if (self.workload) |*call| try call.receiverAtFinalAddress() else null;
+    }
+};
+
+pub fn nativePackedSourceInputs(session: Session, inputs: []const Tensor) bool {
+    if (inputs.len != @import("../architectures/laya_packed.zig").input_count or nativeWeightPreparationModelData(session) == null) return false;
+    const owner: *const ArchSession = @ptrCast(@alignCast(session.ptr));
+    return owner.arch_config == .modern_bert and owner.arch_config.modern_bert.laya != null and owner.arch_config.modern_bert.laya.?.packing.enabled();
+}
+pub fn nativeMatrixScratchCallMatches(session: Session, call: *NativeMatrixScratchCall, geometry: ops.kernel_descriptor.NativeMatrixScratchGeometry) !bool {
+    if (session.vtable != &arch_vtable or nativeWeightPreparationModelData(session) == null or session.ptr != @as(*anyopaque, @ptrCast(call.owner))) return false;
+    if (!try nativePackedMatrixReady(session, geometry)) return false;
+    if (call.workload) |*workload| {
+        if (call.owner.laya_trunk_cache != workload.cache or !std.meta.eql(call.owner.arch_config.modern_bert, workload.config)) return false;
+        try workload.validateBeforeExecution();
+    }
+    return true;
+}
+
+pub fn prepareNativeMatrixCreditsOutsideExecution(session: Session, domain: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+    const data = nativeWeightPreparationModelData(session) orelse return error.ForeignNativeWeightModel;
+    if (data.tier_cache) |*cache| {
+        for (0..8) |_| {
+            if (!cache.rawCreditsNeedPreparation()) break;
+            var upgrade = cache.prepareCreditUpgradesOutsideExecution(domain) catch |err| {
+                if (err == error.PreparedCacheGrowthChanged) continue;
+                return err;
+            };
+            defer upgrade.finishOutsideExecution();
+            upgrade.installLocked(cache) catch |err| {
+                if (err == error.PreparedCacheGrowthChanged) continue;
+                return err;
+            };
+            break;
+        }
+        if (cache.rawCreditsNeedPreparation()) return error.ResourceTemporarilyUnavailable;
+        try cache.flushReleasedOutsideExecution();
+    }
+}
+
+/// Caller owns the actual Model metadata gate. Complete resident inventory and
+/// the accepted Q8 MAX prove no selected weight operation needs a cold slice
+/// while a pending trunk fill owns the numerical Model. Unknown/lazy/scratch
+/// variants decline before the original task permit moves.
+pub fn nativePackedMatrixReady(session: Session, geometry: ops.kernel_descriptor.NativeMatrixScratchGeometry) !bool {
+    if (!try nativeMatrixScratchMatches(session, geometry)) return false;
+    const data = nativeWeightPreparationModelData(session) orelse return false;
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (owner.arch_config != .modern_bert) return false;
+    const cfg = owner.arch_config.modern_bert;
+    const laya = cfg.laya orelse return false;
+    if (!laya.packing.enabled()) return false;
+    if (data.tier_cache) |*cache| if (cache.rawCreditsNeedPreparation() or cache.releasedCreditPending()) return false;
+    const Census = struct {
+        owner: *ArchSession,
+        data: *native_mod.WeightStore,
+        supported: bool = true,
+        pub fn tensor(self: *@This(), name: []const u8, shape: []const i64) !void {
+            var buffer: [256]u8 = undefined;
+            const key = try normalizeWeightKey(.safetensors, self.owner.arch_config, name, &buffer);
+            const loaded = self.data.resident_weights.getPtr(key) orelse {
+                self.supported = false;
+                return;
+            };
+            const actual = if (loaded.quantized_storage) |*value| value.shape else loaded.tensor.shape;
+            if (!std.mem.eql(i64, actual, shape)) self.supported = false;
+            if (@import("../models/laya.zig").quantizedLinear(name)) {
+                const storage = if (loaded.quantized_storage) |*value| value else {
+                    self.supported = false;
+                    return;
+                };
+                if (storage.tensor_type != .known or storage.tensor_type.known != .Q8_0) self.supported = false;
+            } else if (loaded.quantized_storage != null or loaded.tensor.dtype != .f32) self.supported = false;
+        }
+    };
+    if (data.prefetch_initialized) data.prefetch.lock();
+    defer if (data.prefetch_initialized) data.prefetch.unlock();
+    @import("antfly_platform").sync.lockYielding(&data.quantized_prepare_lock);
+    defer data.quantized_prepare_lock.unlock();
+    var census = Census{ .owner = owner, .data = data };
+    try @import("../models/laya.zig").visitTensorInventory(&census, laya, cfg);
+    return census.supported;
+}
+
+/// No Model/lane/FIFO is held. Actual managed loading has already created and
+/// configured this Cache before publication; raw constructor-only sessions keep
+/// their original route instead of allocating a cache under numerical Model.
+pub fn collectNativeMatrixScratchCallOutsideExecution(session: Session, inputs: []const Tensor, allocator: std.mem.Allocator, current: @import("cleanup_context.zig").Context) !?NativeMatrixScratchCall {
+    if (session.vtable != &arch_vtable or nativeWeightPreparationModelData(session) == null) return null;
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (owner.arch_config != .modern_bert) return null;
+    const laya = owner.arch_config.modern_bert.laya orelse return null;
+    if (!laya.packing.enabled()) return null;
+    const cache = owner.laya_trunk_cache orelse return null;
+    if (!cache.supportsColdOwnership()) return null;
+    // Concrete cold caller already released Model/FIFO/lane. Settle only
+    // detached pure owners before new credit; never lend still-live bytes.
+    try cache.drainRetiredOutsideExecution(.{ .outside_execution = true });
+    return .{ .owner = owner, .workload = try @import("../architectures/laya_packed.zig").ColdCall.collectOutsideExecution(allocator, owner.arch_config.modern_bert, inputs, cache, current) };
 }
 
 pub fn validateNativeWeightPreparationReceiver(session: Session) !void {
@@ -3755,6 +3939,14 @@ test "GLiNER decision head declarations compile" {
 }
 
 fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
+    return archRunResidentImpl(ptr, inputs, allocator, null);
+}
+
+fn eagerResidentRunWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, context: *const @import("invocation_context.zig").Context) !?ResidentOutputs {
+    return archRunResidentImpl(ptr, inputs, allocator, context);
+}
+
+fn archRunResidentImpl(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, context: ?*const @import("invocation_context.zig").Context) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.task == .classifier or self.task == .extractor) return null;
     if (self.arch_config == .clip or self.arch_config == .clap) return archRunMediaResident(self, inputs, allocator, null);
@@ -3769,8 +3961,21 @@ fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.A
     const cb = try allocator.create(ops.ComputeBackend);
     errdefer allocator.destroy(cb);
     cb.* = try makeComputeBackend(self, allocator, null);
-    errdefer cb.deinit();
+    errdefer if (context) |active| cb.deinitWithCleanup(active.cleanup) else cb.deinit();
 
+    var current_context = if (context) |value| @as(?@import("invocation_context.zig").Context, value.*) else null;
+    // This is the actual stored header, not a sanitized copy alongside it.
+    // Errors also clear before the earlier backend destruction defer.
+    defer if (current_context != null) {
+        cb.* = cb.withoutSynchronousBorrows();
+    };
+    if (current_context) |*active| {
+        if (self.backend_type != .native or self.arch_config != .embedding_gemma2 or active.native_weights == null or active.cleanup.boundary == null or active.recurrent_state != null or active.workspace_uses != null) return error.ForeignNativeWeightModel;
+        if (try active.cleanup.boundary.?.isSealed()) return error.RetirementEpochSealed;
+        if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl) return error.ForeignNativeWeightModel;
+        cb.call_context = active;
+        try @import("../ops/native_compute.zig").NativeCompute.configurePanelPreparationPolicy(cb, true);
+    }
     const hidden = switch (self.arch_config) {
         .bert => |cfg| try bert_arch.forwardCt(
             cb,
@@ -5343,9 +5548,15 @@ pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: Loa
     const replaced = existing: {
         if (data.prefetch_initialized) data.prefetch.lock();
         defer if (data.prefetch_initialized) data.prefetch.unlock();
+        platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+        defer data.embeddinggemma2_f32_cache_lock.unlock();
+        if (data.canonical_panel_source_readers != 0) return error.NativeResidentWeightInUse;
         if (data.resident_weights.getPtr(name)) |slot| {
+            if (slot.source_version == std.math.maxInt(u64)) return error.NativeWeightSourceVersionExhausted;
+            var incoming = weight;
+            incoming.source_version = slot.source_version + 1;
             retired = slot.*;
-            slot.* = weight;
+            slot.* = incoming;
             break :existing true;
         }
         break :existing false;
@@ -5361,13 +5572,21 @@ pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: Loa
         const committed = commit: {
             if (data.prefetch_initialized) data.prefetch.lock();
             defer if (data.prefetch_initialized) data.prefetch.unlock();
+            platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+            defer data.embeddinggemma2_f32_cache_lock.unlock();
+            if (data.canonical_panel_source_readers != 0) return error.NativeResidentWeightInUse;
             if (data.resident_weights.getPtr(name)) |slot| {
+                if (slot.source_version == std.math.maxInt(u64)) return error.NativeWeightSourceVersionExhausted;
+                var incoming = weight;
+                incoming.source_version = slot.source_version + 1;
                 retired = slot.*;
-                slot.* = weight;
+                slot.* = incoming;
                 break :commit true;
             }
             if (data.resident_weights.available != 0) {
-                data.resident_weights.putAssumeCapacityNoClobber(owned_key, weight);
+                var incoming = weight;
+                incoming.source_version = 0; // new actual slot, never caller authority
+                data.resident_weights.putAssumeCapacityNoClobber(owned_key, incoming);
                 key_owned = false;
                 break :commit true;
             }
@@ -5375,7 +5594,9 @@ pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: Loa
             if (staged.available < needed) break :commit false;
             var entries = data.resident_weights.iterator();
             while (entries.next()) |entry| staged.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
-            staged.putAssumeCapacityNoClobber(owned_key, weight);
+            var incoming = weight;
+            incoming.source_version = 0;
+            staged.putAssumeCapacityNoClobber(owned_key, incoming);
             key_owned = false;
             old_map = data.resident_weights;
             data.resident_weights = staged;
@@ -6070,7 +6291,11 @@ pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
     if (session.vtable != &arch_vtable) return 0;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     return switch (self.backend_type) {
-        .native => native_mod.reclaimOneHostCacheEntryDeferringCredit(&self.backend_data.native),
+        .native => native: {
+            const weight_bytes = native_mod.reclaimOneHostCacheEntryDeferringCredit(&self.backend_data.native);
+            if (weight_bytes != 0) break :native weight_bytes; // original priority
+            break :native if (self.laya_trunk_cache) |cache| cache.reclaimOneDeferringPhysical() else 0;
+        },
         .pjrt => native_mod.reclaimOneHostCacheEntryDeferringCredit(&self.backend_data.pjrt.native),
         .metal, .cuda, .wasm => 0,
     };
@@ -6082,6 +6307,7 @@ pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
 pub fn hostCacheCreditSettlementPendingForSession(session: Session) bool {
     if (session.vtable != &arch_vtable) return false;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type == .native) if (self.laya_trunk_cache) |cache| if (cache.retirementPending()) return true;
     const data: ?*native_mod.WeightStore = switch (self.backend_type) {
         .native => &self.backend_data.native,
         .pjrt => &self.backend_data.pjrt.native,
@@ -6098,13 +6324,19 @@ pub fn flushHostCacheReleasesOutsideExecutionForSession(session: Session) !bool 
         .pjrt => &self.backend_data.pjrt.native,
         else => null,
     };
+    var released = false;
     if (data) |actual| if (actual.tier_cache) |*cache| {
         const before = cache.admissionAmounts();
         cache.flushReleasedOutsideExecution() catch {};
         const after = cache.admissionAmounts();
-        return after.host_weight_bytes < before.host_weight_bytes or after.backend_weight_bytes < before.backend_weight_bytes;
+        released = after.host_weight_bytes < before.host_weight_bytes or after.backend_weight_bytes < before.backend_weight_bytes;
     };
-    return false;
+    if (self.backend_type == .native) if (self.laya_trunk_cache) |cache| {
+        const pending = cache.retirementPending();
+        try cache.drainRetiredOutsideExecution(.{ .outside_execution = true });
+        released = released or pending;
+    };
+    return released;
 }
 
 pub fn memoryBudgetExceededDetail(
@@ -6432,6 +6664,7 @@ pub fn metalWorkspaceCreatorsOutsideExecution(session: Session, control: ?Infere
 }
 
 const eager_host_services = @import("../backends/session.zig").EagerHostRunServices{
+    .run_resident = eagerResidentRunWithContext,
     .accepts = acceptsEagerHostTable,
     .recurrent_layout = eagerHostRecurrentLayout,
     .run = eagerHostRunWithContext,
@@ -6558,6 +6791,7 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
         cb.call_context = active;
         if (self.backend_type == .native) {
             if (active.native_weights == null or active.cleanup.boundary == null or active.recurrent_state != null or active.workspace_uses != null) return error.ForeignNativeWeightModel;
+            if (self.arch_config == .embedding_gemma2) try @import("../ops/native_compute.zig").NativeCompute.configurePanelPreparationPolicy(&cb, true);
         } else if (comptime build_options.enable_cuda) {
             const budget = active.recurrent_state orelse return error.UnpreparedRecurrentStateBudget;
             try cuda_compute_mod.CudaCompute.validateTemporaryRecurrentBackend(&cb, budget);
@@ -6664,7 +6898,14 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
         },
         .modern_bert => |cfg| {
             if (cfg.laya) |laya| {
-                if (laya.packing.enabled()) return @import("../architectures/laya_packed.zig").run(&cb, allocator, cfg, inputs, layaTrunkCache(self));
+                if (laya.packing.enabled()) {
+                    const cache = layaTrunkCache(self);
+                    if (self.backend_type == .native) if (cb.call_context) |receiving_context| if (receiving_context.native_weights) |loan| {
+                        if (try @import("../backends/session.zig").PreparedSource.borrowNativeMatrixScratchCall(loan, &cb, &self.backend_data.native)) |call|
+                            return @import("../architectures/laya_packed.zig").runWithPrepared(&cb, allocator, cfg, inputs, cache, call);
+                    };
+                    return @import("../architectures/laya_packed.zig").run(&cb, allocator, cfg, inputs, cache);
+                }
                 if (inputs.len != 4) return error.InvalidLayaInputs;
                 const bi = try parseBertRunInputs(inputs[0..2]);
                 const kinds = try validateI64Matrix(inputs[2], .{ bi.batch, 1 });
@@ -8028,7 +8269,7 @@ fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig")
     if (self.video_coefficient_device_permit) |*permit| permit.deinit();
     if (self.generation_workspace) |*workspace| workspace.borrowed.deinit();
     if (self.laya_trunk_cache) |cache| {
-        cache.deinit();
+        cache.deinitWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         self.allocator.destroy(cache);
         self.laya_trunk_cache = null;
     }
@@ -11253,6 +11494,7 @@ pub const StagedExecution = struct {
     owns_unstaged_provider: bool = false,
     composition_request: ?@import("../backends/session.zig").RunRequest = null,
     hook: @import("../ops/ops.zig").EmbeddingStageControl = undefined,
+    native_weight_hook: ops.NativeWeightCacheControl = undefined,
     pub const Phase = struct {
         owner: ?*StagedExecution,
         owned: ?RunPermit,
@@ -11322,7 +11564,7 @@ pub const StagedExecution = struct {
             self.gate = published;
         }
         if (self.permit.session.ptr != self.session.ptr or self.permit.session.vtable != self.session.vtable or self.permit.execution_yielded or self.permit.prepared != null or self.permit.physical_storage != null or self.permit.dispatch_cleanup_epoch != null) return error.InvalidStageAdmissionOwner;
-        self.cleanup_owner = if ((self.session.backend() == .metal or self.session.backend() == .cuda)) try @import("cleanup_owner.zig").Owner.beginResident(self.session) else .{};
+        self.cleanup_owner = if ((self.session.backend() == .metal or self.session.backend() == .cuda)) try @import("cleanup_owner.zig").Owner.beginResident(self.session) else if (nativePanelPreparationModelData(self.session) != null) try @import("cleanup_owner.zig").Owner.beginAdmitted(self.session) else .{};
         self.model_retention = if (self.session.model_lifetime) |model| model.retain() else null;
         self.cold_prepared = true;
     }
@@ -11735,13 +11977,23 @@ pub const StagedExecution = struct {
     fn current(self: *StagedExecution) @import("cleanup_context.zig").Context {
         return .{ .boundary = self.cleanup_owner.epoch(), .operation = if (self.cold_prepared and self.cb.kind() == .metal) self.cb.operationToken() else null };
     }
+    /// Original public raw API contract: the caller synchronously owns its
+    /// private canonical Session and advertises no managed quota or gate. This
+    /// licenses the legacy numerical route, never a cache/scheduling callback.
+    fn legacyRawCudaStage(self: *const StagedExecution) bool {
+        if (self.session.vtable != &arch_vtable or self.gate != null or self.session.execution_gate != null or self.session.run_admission != null or self.permit.lease != null or self.permit.resource_pin != null) return false;
+        const model = self.model_retention orelse return false;
+        if (self.session.model_lifetime != model) return false;
+        return model.model_lease == null and model.resource_pin == null and model.admission_domain == null;
+    }
     fn cudaStageCompute(self: *StagedExecution) !(if (build_options.enable_cuda) *cuda_compute_mod.CudaCompute else void) {
         if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
-        if (!self.cold_prepared or !self.active or self.managed == null or self.gate == null or self.session.vtable != &arch_vtable) return error.UnsupportedEmbeddingStage;
+        if (!self.cold_prepared or !self.active or self.managed == null or self.session.vtable != &arch_vtable) return error.UnsupportedEmbeddingStage;
         const model = self.model_retention orelse return error.MissingModelLifetime;
         if (model.destroy_fn != archClose or model.quiesce_fn != archQuiesce) return error.UnsupportedEmbeddingStage;
         const actual: *ArchSession = @ptrCast(@alignCast(model.owner));
         if (self.session.ptr != @as(*anyopaque, @ptrCast(actual)) or &actual.model_lifetime != model or actual.backend_type != .cuda or actual.arch_config != .embedding_gemma2) return error.UnsupportedEmbeddingStage;
+        if (self.gate == null and !self.legacyRawCudaStage()) return error.UnsupportedEmbeddingStage;
         const compute = actual.backend_data.cuda.compute;
         try cuda_compute_mod.CudaCompute.validateEmbeddingStage(self.cb, compute);
         return compute;
@@ -11754,6 +12006,16 @@ pub const StagedExecution = struct {
         } else return error.CudaNotEnabled;
     }
     fn attach(self: *StagedExecution) !void {
+        if (self.cb.kind() == .native) {
+            if (nativePanelPreparationModelData(self.session) != null) {
+                if (!self.cold_prepared or self.managed == null or !self.active or self.gate == null) return error.UnsupportedEmbeddingStage;
+                const b = self.epoch() orelse return error.MissingCurrentCleanupEpoch;
+                if (try b.isSealed()) return error.RetirementEpochSealed;
+                self.native_weight_hook = .{ .ptr = self, .prepare = nativeWeightCache };
+                self.cb.native_weight_cache = &self.native_weight_hook;
+            }
+            return; // Native never advertises scheduler/escape/media hooks.
+        }
         if (self.cb.kind() == .cuda) {
             if (comptime build_options.enable_cuda) {
                 const compute = try self.cudaStageCompute();
@@ -11776,6 +12038,34 @@ pub const StagedExecution = struct {
         self.hook = .{ .ptr = self, .pause_fn = if (schedule) pause else noScheduledYield, .resume_fn = if (schedule) acquire else noScheduledYield, .yield_ready_fn = if (schedule) yieldReady else noScheduledYield, .cleanup_fn = if (schedule) cleanup else noScheduledCleanup, .workspace_fn = if (schedule and self.video_phases) workspace else null, .copy_fn = if (schedule and self.timings != null) copied else null, .image_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) imageCache else null else null, .vision_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) visionCache else null else null, .cache_inputs_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheInputs else null else null, .cache_handoff_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheHandoff else null else null, .audio_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) audioCache else null else null, .video_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoCache else null else null, .video_consumer_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoConsumer else null else null };
         self.cb.embedding_stage = &self.hook;
     }
+    fn nativeWeightCache(raw: *anyopaque, cb: *const ComputeBackend, request: ops.NativeWeightCachePreparation) !ops.EmbeddingCacheScope {
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        if (!self.cold_prepared or !self.active or self.managed == null or cb != self.cb or self.gate == null) return error.UnsupportedEmbeddingStage;
+        const loan = cb.native_weight_cache orelse return error.UnsupportedEmbeddingStage;
+        if (loan.ptr != raw or loan.prepare != nativeWeightCache) return error.UnsupportedEmbeddingStage;
+        try validateNativePanelPreparationReceiver(self.session);
+        const data = nativePanelPreparationModelData(self.session) orelse return error.UnsupportedEmbeddingStage;
+        const model = self.model_retention orelse return error.MissingModelLifetime;
+        if (model != self.session.model_lifetime.?) return error.UnsupportedEmbeddingStage;
+        const supplied = self.current();
+        if (!try NativeCompute.beginWeightCacheOperation(cb, data, request, supplied)) return .{};
+        errdefer NativeCompute.abortWeightCacheOperation(cb, data);
+        if (try NativeCompute.weightCacheOperationNeedsPreparation(cb, data, request)) {
+            const policy = self.session.run_admission.?;
+            var pin = model.retainAdmissionDomain(policy.controller) orelse return error.MissingCacheRetirementDomain;
+            defer pin.release();
+            if (!try self.suspendForQuota()) return error.UnsupportedEmbeddingStage;
+            var restored = false;
+            defer if (!restored) self.restoreAfterQuotaForCleanup();
+            try self.control.check();
+            try NativeCompute.prepareWeightCacheOperationOutsideExecution(cb, data, request, &pin);
+            try self.restoreAfterQuota();
+            restored = true;
+            try self.control.check();
+        }
+        return NativeCompute.receiveWeightCacheOperation(cb, data, request, self.current());
+    }
+
     fn noScheduledYield(raw: *anyopaque) anyerror!void {
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
         try self.control.check();
@@ -11834,7 +12124,7 @@ pub const StagedExecution = struct {
                     if (self.cache_scope) |scope| if (!scope.bound) try scope.prepare();
                 }
             } else return error.CudaNotEnabled;
-        } else try @import("../ops/metal_compute.zig").MetalCompute.embeddingStageLeaseWithCleanup(self.cb, true, .{ .boundary = self.cleanup_owner.epoch() });
+        } else if (self.cb.kind() == .metal) try @import("../ops/metal_compute.zig").MetalCompute.embeddingStageLeaseWithCleanup(self.cb, true, .{ .boundary = self.cleanup_owner.epoch() }) else if (self.cb.kind() != .native) return error.UnsupportedStageProvider;
         if (self.timings) |t| t.stage_rebind_ns += mediaNow() - acquired_at;
         self.active = true;
         if (self.timings) |t| t.stage_acquisitions += 1;
@@ -12010,6 +12300,9 @@ pub const StagedExecution = struct {
             if (self.managed) |*managed| {
                 if (!self.active) cleanup(self);
                 if (self.cb.embedding_stage == &self.hook) self.cb.embedding_stage = null;
+                if (self.cb.native_weight_cache) |loan| {
+                    if (loan.ptr == @as(*anyopaque, @ptrCast(self)) and loan.prepare == nativeWeightCache) self.cb.native_weight_cache = null;
+                }
                 if (self.cb.kind() == .cuda) {
                     if (comptime build_options.enable_cuda) {
                         const compute = self.cudaStageCompute() catch platform.inference_process_supervisor.restartWorker();
@@ -12043,11 +12336,14 @@ pub const StagedExecution = struct {
         if (!self.cold_prepared or !self.active) return error.EmbeddingStageNotPrepared;
         try self.requireCudaPolicy();
         const original_compute = try self.cudaStageCompute();
-        if (!try cuda_compute_mod.CudaCompute.keepEmbeddingStageInput(self.cb, original_compute, input)) return error.CudaStageInputRequiresHandoff;
+        const raw = self.legacyRawCudaStage();
+        if (!raw and !try cuda_compute_mod.CudaCompute.keepEmbeddingStageInput(self.cb, original_compute, input)) return error.CudaStageInputRequiresHandoff;
         if (record_media_batch and batch > 1) (try self.cudaStageCompute()).embedding_gemma2_media_batches += 1;
         const caches = &self.reusable_cache_phase;
-        try caches.initEncoderInto(self, config, batch, sequence, mask);
-        defer caches.close();
+        // Raw public callers retain their original cache policy/constructors;
+        // no prepared funding, managed loan or pause hook is installed for it.
+        if (!raw) try caches.initEncoderInto(self, config, batch, sequence, mask);
+        defer if (!raw) caches.close();
         const compute = try self.cudaStageCompute();
         return compute.runEmbeddingGemma2(allocator, config, .{ .resident_embeddings = input }, mask, batch, sequence, dimensions, self.control);
     }
@@ -12662,6 +12958,7 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                 session: Session,
                 lane: *@import("../execution_control.zig").ExecutionLane,
                 calls: usize = 0,
+                reentry_enabled: bool = true,
                 failure: ?anyerror = null,
                 change_policy: bool = false,
                 deny_first: bool = false,
@@ -12676,6 +12973,7 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                         self.lane.mutex.unlock();
                     } else if (self.failure == null) self.failure = error.StageSupplierUnderActualNumericalLane;
                     self.calls += 1;
+                    if (!self.reentry_enabled) return;
                     self.reenter() catch |err| {
                         if (self.failure == null) {
                             self.failure = err;
@@ -12733,6 +13031,10 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                 }
             };
             var probe = Probe{ .session = session, .lane = &numerical_lane };
+            // Final Model destruction may release deferred pure charges after
+            // the embedded Session dies. Keep lane checks, but never resurrect
+            // that borrowed Session from a final-death external callback.
+            defer probe.reentry_enabled = false;
             try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
             var base = @import("../backends/session.zig").RunPermit{ .session = session, .lease = null };
             var base_open = true;
@@ -12902,7 +13204,30 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
             defer phase.deinit();
             try std.testing.expect(probe.calls > before);
             try std.testing.expect(stage.active);
-            try std.testing.expect((cb.embedding_stage != null) == scheduling);
+            // Cache custody is always present under this real CUDA owner.
+            // Optional scheduling selects its yield callbacks, not authority.
+            try std.testing.expect(cb.embedding_stage == &stage.hook);
+            {
+                // Metadata-only borrowed copy, never a second cleanup owner.
+                // Removing advertised gates cannot turn this real admitted
+                // request into the legacy raw/unadmitted exception.
+                const callbacks_before = probe.calls;
+                const allocations_before = compute.ctx.device_allocations.snapshot();
+                const amounts_before = domain.controller.snapshot();
+                const epoch_before = stage.epoch().?.*;
+                var missing_gate = stage;
+                missing_gate.gate = null;
+                missing_gate.session.execution_gate = null;
+                try std.testing.expect(missing_gate.session.run_admission != null);
+                try std.testing.expect(!missing_gate.legacyRawCudaStage());
+                try std.testing.expectError(error.UnsupportedEmbeddingStage, missing_gate.cudaStageCompute());
+                try std.testing.expect(stage.active and stage.waiter.acquired and numerical_lane.owned);
+                try std.testing.expect(cb.embedding_stage == &stage.hook);
+                try std.testing.expectEqual(callbacks_before, probe.calls);
+                try std.testing.expectEqualDeep(allocations_before, compute.ctx.device_allocations.snapshot());
+                try std.testing.expectEqualDeep(amounts_before, domain.controller.snapshot());
+                try std.testing.expect(stage.epoch().?.record == epoch_before.record and stage.epoch().?.nonce == epoch_before.nonce);
+            }
             const held = probe.calls;
             phase.deinit();
             try std.testing.expectEqual(held, probe.calls); // Ticket cannot refund in lane.
@@ -12940,7 +13265,16 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                 try std.testing.expectError(error.Cancelled, StagedExecution.acquire(&stage));
                 stage.control.check_fn = null;
                 try std.testing.expect(stage.active and stage.waiter.acquired);
-                try std.testing.expect(cb.embedding_stage == null);
+                try std.testing.expect(cb.embedding_stage == &stage.hook);
+                const callbacks_before = probe.calls;
+                const hook = cb.embedding_stage.?;
+                try hook.pause_fn(hook.ptr);
+                try hook.resume_fn(hook.ptr);
+                try hook.yield_ready_fn.?(hook.ptr);
+                try std.testing.expect(stage.active and stage.waiter.acquired);
+                try std.testing.expect(numerical_lane.owned);
+                try std.testing.expect(cb.embedding_stage == hook);
+                try std.testing.expectEqual(callbacks_before, probe.calls);
                 // A REAL detached carrier owns the pending SDK interval. Failed
                 // reentry must release the actual model turn, not just a flag.
                 const required = try cuda_compute_mod.CudaCompute.cacheRetirementRequirements(cb, compute, .all);
@@ -15272,6 +15606,21 @@ test "native authored Source exact additive cap current B host ownership and can
 }
 
 fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
+    return nativeAuthoredSourceStorageCase(cfg, false);
+}
+fn nativeAuthoredSourceStorageCase(cfg: gpt_arch.Config, packed_singles: bool) !void {
+    return nativeAuthoredSourceProjectionCase(cfg, packed_singles, false);
+}
+fn nativeAuthoredSourceProjectionCase(cfg: gpt_arch.Config, packed_singles: bool, packed_pairs: bool) !void {
+    return nativeAuthoredSourceMatrixCase(cfg, packed_singles, packed_pairs, false);
+}
+fn nativeAuthoredSourceMatrixCase(cfg: gpt_arch.Config, packed_singles: bool, packed_pairs: bool, packed_rows: bool) !void {
+    return nativeAuthoredSourceObservedCase(cfg, packed_singles, packed_pairs, packed_rows, false);
+}
+fn nativeAuthoredSourceObservedCase(cfg: gpt_arch.Config, packed_singles: bool, packed_pairs: bool, packed_rows: bool, observed: bool) !void {
+    return nativeAuthoredSourceFormatCase(cfg, packed_singles, packed_pairs, packed_rows, observed, .q4q5);
+}
+fn nativeAuthoredSourceFormatCase(cfg: gpt_arch.Config, packed_singles: bool, packed_pairs: bool, packed_rows: bool, observed: bool, mode: @import("native_decoder_program.zig").Testing.MatrixFixture) !void {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     const authored = @import("native_decoder_program.zig");
     const a = std.testing.allocator;
@@ -15281,6 +15630,7 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     var weights = if (cfg.fingerprint() == authored.Testing.config().fingerprint()) try authored.Testing.init(a) else try authored.Testing.expanded(a, cfg);
     var weights_owned = true;
     defer if (weights_owned) weights.data.deinitOwned();
+    if (mode != .q4q5) try weights.quantizeResidentFixture(a, mode) else if (packed_rows) try weights.quantizeAllMatrices(a) else if (packed_pairs) try weights.quantizeProjections(a) else if (packed_singles) try weights.quantizeSingles(a, cfg, false);
     const owner = try a.create(ArchSession);
     owner.* = .{ .allocator = a, .arch_config = .{ .gpt = cfg }, .backend_type = .native, .backend_data = .{ .native = weights.data } };
     owner.model_lifetime.prepareFinalResources() catch |err| {
@@ -15290,6 +15640,11 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     weights_owned = false;
     var session = archSessionHandle(owner);
     defer session.close();
+    var native_diagnostics = @import("diagnostics.zig").Diagnostics{};
+    if (observed) {
+        session.invocation_diagnostics = .{ .diagnostics = &native_diagnostics, .model_allocator = a };
+        try std.testing.expect(session.invocation_diagnostics.?.configure(true));
+    }
     session.model_lifetime.?.admission_domain = domain.pin();
     try session.installOwnedExecutionGate(a);
     var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
@@ -15298,8 +15653,9 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     var receiving = try getComputeBackendWithControl(session, a, .{ .native_call_policy = .in_process });
     defer receiving.deinit();
     const cb = &receiving.backend;
+    if (packed_singles) try authored.Testing.prepareSingles(cb, &owner.backend_data.native);
     var context = @import("../graph/execution.zig").Context{ .allocator = a, .cb = cb, .gpt_config = &cfg, .session = session };
-    const program = (try authored.Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
+    const program = if (packed_singles) try authored.Testing.requirePackedProgram(a, &context) else (try authored.Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
     var program_owned = true;
     defer if (program_owned) program.destroyWithCleanup(.{ .outside_execution = true });
     var manager = runtime.kv.manager.KvManager.init(a);
@@ -15345,6 +15701,20 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     try std.testing.expectError(error.NativeProgramCleanupChanged, call.runWithSource(&source, cb, &decode, .{ .boundary = foreign.epoch() }));
     try std.testing.expectEqual(@as(u64, 0), program.calls);
     try call.runWithSource(&source, cb, &decode, .{ .boundary = actual_b });
+    if (observed) {
+        const report = native_diagnostics.snapshot().?.report.?;
+        try std.testing.expect(report.authored_native_programs.?.count > 0);
+        try std.testing.expectEqual(@as(u64, 1), report.authored_native_programs.?.records[0].returns);
+        try std.testing.expect(report.native_definition_templates == null);
+        const bank = report.authored_native_program_bank orelse return error.MissingNativeProgramBank;
+        try std.testing.expectEqual(call.frame.?.stats.allocations, bank.frame_allocations);
+        try std.testing.expectEqual(call.frame.?.stats.allocated_bytes, bank.frame_requested_allocation_bytes);
+        try std.testing.expectEqual(call.frame.?.stats.reused_allocations, bank.frame_reuse_accesses);
+        try std.testing.expectEqualDeep(call.frame.?.pool.accounting.?.snapshot(), bank.owned_ledger.?);
+        try std.testing.expectEqualDeep(bank.owned_ledger.?.activation, report.program_activations.?);
+        try std.testing.expectEqualDeep(bank.owned_ledger.?.workspace, report.program_workspace.?);
+    } else try std.testing.expect(native_diagnostics.snapshot() == null);
+    const source_bank_copy = if (observed) native_diagnostics.snapshot().?.report.?.authored_native_program_bank else null;
     const pointer = call.output.?.ptr;
     const values = try call.takeOutput();
     var output = Tensor.initFloat32Owned(a, "logits", &.{ 1, @intCast(cfg.vocab_size) }, values) catch |err| {
@@ -15471,6 +15841,15 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     defer executor.deinit();
     var decoder = try executor.createRuntime(a);
     defer decoder.deinit();
+    if (observed) {
+        const before_templates = live.authoredDefinitionTemplateStatistics(decoder).?;
+        try std.testing.expect(before_templates.availability == .sampled);
+        try std.testing.expectEqual(@as(u64, 1), before_templates.stats.?.builds);
+        var peer_runtime = try executor.createRuntime(a);
+        defer peer_runtime.deinit();
+        const after_templates = live.authoredDefinitionTemplateStatistics(decoder).?;
+        try std.testing.expectEqual(before_templates.stats.?.hits + 1, after_templates.stats.?.hits);
+    }
     try std.testing.expectEqual(@as(u64, 0), live.authoredProgramStatistics(decoder).?.calls);
     var first = try decoder.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
     defer first.deinit(a);
@@ -15502,6 +15881,21 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
             }
         }
     }
+    if (observed) {
+        const snapshot = native_diagnostics.snapshot() orelse return error.MissingActualNativeReport;
+        const report = snapshot.report orelse return error.MissingActualNativeReport;
+        try std.testing.expect(report.authored_native_programs.?.count > 0);
+        const lifetime = report.native_definition_templates orelse return error.MissingDefinitionLifetimeStatistics;
+        try std.testing.expect(lifetime.availability == .sampled and lifetime.stats.?.builds == 1 and lifetime.stats.?.hits >= 1);
+        try std.testing.expectEqualStrings("retained_definition_lifetime_successful_constructor_publications", @tagName(lifetime.scope));
+        const bank = report.authored_native_program_bank orelse return error.MissingNativeProgramBank;
+        try std.testing.expect(bank.owned_ledger.?.total.requested_live_bytes > 0);
+        try std.testing.expect(bank.owned_ledger.?.total.requested_peak_bytes >= bank.owned_ledger.?.total.requested_live_bytes);
+        try std.testing.expectEqualDeep(bank.owned_ledger.?.activation, report.program_activations.?);
+        try std.testing.expectEqual(bank.frame_reuse_accesses, report.program_storage_reuse_hits.?);
+        try std.testing.expectEqualStrings("latest_entered_native_call_acquire_prepare_run", @tagName(report.program_storage_counter_scope));
+    }
+    const public_bank_copy = if (observed) native_diagnostics.snapshot().?.report.?.authored_native_program_bank else null;
     const before_reset = live.authoredProgramStatistics(decoder).?;
     try std.testing.expectEqual(@as(u64, if (cfg.family == .llama) 18 else 2), before_reset.calls);
     try std.testing.expect(before_reset.assigned_operations > 0 and before_reset.physical_frames == 1);
@@ -15515,6 +15909,16 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     defer fallback.deinit(a);
     try std.testing.expectEqual(@as(usize, cfg.vocab_size), (try fallback.hostLogits(a)).len);
     try std.testing.expectEqual(before_reset.calls + 1, live.authoredProgramStatistics(decoder).?.calls);
+    if (observed) {
+        const report = native_diagnostics.snapshot().?.report.?;
+        try std.testing.expectEqual(@as(u64, 1), report.authored_native_programs.?.fallback_unsupported_call);
+        try std.testing.expectEqual(@as(u8, 0), report.authored_native_programs.?.count);
+        try std.testing.expect(report.authored_native_program_bank == null);
+        try std.testing.expect(report.native_definition_templates != null);
+        // Subsequent reset/legacy publication cannot mutate a detached copy
+        // of the preceding real Runtime Call's sampled bank.
+        try std.testing.expect(public_bank_copy.?.owned_ledger.?.total.requested_live_bytes > 0);
+    }
     // Native host BF16 is not implemented by the original KvPool. The public
     // Runtime must retain that original refusal, without installing143.
     if (cfg.hidden_size == 8) {
@@ -15531,8 +15935,11 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     var changed = try program.beginCall(&.{2}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
     defer changed.close(.{ .outside_execution = true });
     try changed.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process });
-    const changed_name = "model.layers.0.self_attn.q_proj.weight";
+    // Packed Q/K/V has no dense tensor payload. Replace the real final-norm
+    // F32 source instead so this remains a same-topology pointer-change test.
+    const changed_name = if (packed_pairs) "model.norm.weight" else "model.layers.0.self_attn.q_proj.weight";
     const old_tensor = &owner.backend_data.native.resident_weights.getPtr(changed_name).?.tensor;
+    try std.testing.expect(old_tensor.dtype == .f32 and old_tensor.data.len > 0);
     var replacement = try Tensor.initFloat32(a, changed_name, old_tensor.shape, old_tensor.asFloat32());
     replaceBlasResidentWeight(session, changed_name, .{ .tensor = replacement }) catch |err| {
         replacement.deinit();
@@ -15558,6 +15965,12 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     session.leaveExecutionCohort(session.execution_gate, &retire_waiter);
     foreign.finishAfterUnlock();
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+    // The sampled Source ledger is an immutable value. Its producer's Frame
+    // and physical banks have actually died under the later B above.
+    if (source_bank_copy) |bank| {
+        try std.testing.expect(bank.owned_ledger.?.total.requested_live_bytes > 0);
+        try std.testing.expect(bank.owned_ledger.?.total.requested_peak_bytes >= bank.owned_ledger.?.total.requested_live_bytes);
+    }
 }
 
 test "native authored larger layered public Runtime and Source retain exact admission and original parity" {
@@ -17313,4 +17726,377 @@ fn nativeDefinitionRuntimes148(a: std.mem.Allocator, expect_shared: bool) !void 
     var after_retirement = try fresh.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
     defer after_retirement.deinit(a);
     for (try after_retirement.hostLogits(a)) |value| try std.testing.expect(std.math.isFinite(value));
+}
+
+test "native authored mixed KBlock singles actual Source and public Runtime preserve caps current B page crossings cancellation and original parity" {
+    const cfg = try @import("native_decoder_program.zig").Testing.parsedLlamaConfig(std.testing.allocator, 256, 2, false);
+    try nativeAuthoredSourceStorageCase(cfg, true);
+}
+
+test "native authored all packed projection matrices actual Source public Runtime preserve joint pair admission B page crossings cancellation and original parity" {
+    const cfg = try @import("native_decoder_program.zig").Testing.parsedLlamaConfig(std.testing.allocator, 256, 2, false);
+    try nativeAuthoredSourceProjectionCase(cfg, true, true);
+}
+
+test "native authored natural paired activation pack actual Source and public Runtime preserve exact cap B and original parity" {
+    const cfg = try @import("native_decoder_program.zig").Testing.parsedLlamaPackedConfig(std.testing.allocator, 1);
+    try nativeAuthoredSourceProjectionCase(cfg, true, true);
+}
+
+test "native authored natural single activation pack actual Source and public Runtime preserve exact cap B and original parity" {
+    const cfg = try @import("native_decoder_program.zig").Testing.parsedLlamaPackedConfig(std.testing.allocator, 1);
+    try nativeAuthoredSourceStorageCase(cfg, true);
+}
+
+test "native authored complete packed embedding projection and tied head actual Source public Runtime exact cap B and original parity" {
+    const authored = @import("native_decoder_program.zig");
+    inline for (.{ false, true }) |tied| {
+        const cfg = try authored.Testing.parsedLlamaPackedConfigWithTying(std.testing.allocator, 1, tied);
+        try nativeAuthoredSourceMatrixCase(cfg, true, true, true);
+    }
+}
+
+test "Native actual Source and public Runtime report complete quantized Call and separate Definition constructor lifetime" {
+    const T = @import("native_decoder_program.zig").Testing;
+    try nativeAuthoredSourceObservedCase(T.config(), false, false, false, true);
+    const cfg = try T.parsedLlamaPackedConfigWithTying(std.testing.allocator, 2, true);
+    try nativeAuthoredSourceObservedCase(cfg, true, true, true, true);
+}
+
+test "Native full resident Q8 Source and public Runtime exact caps current B cancellation tied and mixed retain original parity" {
+    const T = @import("native_decoder_program.zig").Testing;
+    inline for (.{ .llama, .qwen3 }) |family| inline for (.{ false, true }) |tied| {
+        const cfg = try T.parsedQ8Config(std.testing.allocator, family, tied, 2);
+        try nativeAuthoredSourceFormatCase(cfg, true, true, true, false, .q8);
+    };
+    const cfg = try T.parsedQ8Config(std.testing.allocator, .llama, false, 2);
+    try nativeAuthoredSourceFormatCase(cfg, true, true, true, false, .mixed);
+}
+
+test "Native default large resident Q8 Runtime preserves original dispatcher fallback and owned constructor decline reason" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const T = @import("native_decoder_program.zig").Testing;
+    const Native = @import("../ops/native_compute.zig");
+    const a = std.testing.allocator;
+    const cfg = try T.parsedLlamaPackedConfig(a, 2);
+    if (!Native.Testing.q8NeedsTasks(1, cfg.hidden_size, cfg.intermediate_size)) return error.SkipZigTest;
+    var weights = try T.expanded(a, cfg);
+    var weights_owned = true;
+    defer if (weights_owned) weights.data.deinitOwned();
+    try weights.quantizeResidentFixture(a, .q8);
+    const owner = try a.create(ArchSession);
+    owner.* = .{ .allocator = a, .arch_config = .{ .gpt = cfg }, .backend_type = .native, .backend_data = .{ .native = weights.data } };
+    owner.model_lifetime.prepareFinalResources() catch |err| {
+        a.destroy(owner);
+        return err;
+    };
+    weights_owned = false;
+    var session = archSessionHandle(owner);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    var diagnostics = @import("diagnostics.zig").Diagnostics{};
+    session.invocation_diagnostics = .{ .diagnostics = &diagnostics, .model_allocator = a };
+    try std.testing.expect(session.invocation_diagnostics.?.configure(true));
+    var receiving = try getComputeBackendWithControl(session, a, .{ .native_call_policy = .in_process });
+    defer receiving.deinit();
+    const cb = &receiving.backend;
+    try T.prepareSingles(cb, &owner.backend_data.native);
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_layers_packed = @intCast(cfg.num_hidden_layers), .num_kv_heads = @intCast(cfg.effectiveKVHeads()), .head_dim = @intCast(cfg.headDim()) });
+    var reference = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer reference.deinit();
+    var logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&reference);
+    try logical.appendPrefillChunk(1);
+    const decode = logical.makeDecodeContext(1, 1);
+    const expected = try gpt_arch.forward(cb, a, cfg, &.{2}, 1, 1, &decode);
+    defer a.free(expected);
+    const live = @import("../graph/live_model_executor.zig");
+    var executor = try live.createModelExecutor(a, session, cfg, .f32, null);
+    defer executor.deinit();
+    var decoder = try executor.createRuntime(a);
+    defer decoder.deinit();
+    try std.testing.expect(live.authoredProgramStatistics(decoder) == null);
+    const construction = live.authoredProgramConstruction(decoder).?;
+    try std.testing.expect(construction.outcome == .declined);
+    try std.testing.expectEqualStrings("OwnedNativeIoTaskUnavailable", construction.error_name.?.view());
+    var result = try decoder.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+    defer result.deinit(a);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(try result.hostLogits(a)));
+    const report = diagnostics.snapshot().?.report.?;
+    try std.testing.expect(report.native_program_construction.?.outcome == .declined);
+    try std.testing.expectEqualStrings("OwnedNativeIoTaskUnavailable", report.native_program_construction.?.error_name.?.view());
+    try std.testing.expectEqual(@as(u64, 1), report.authored_native_programs.?.fallback_no_prepared_native_program);
+    try std.testing.expectEqual(@as(u8, 0), report.authored_native_programs.?.count);
+}
+
+test "generic CUDA Gemma owned text geometry rejects copied callback table before opaque owner access" {
+    var copied = arch_vtable;
+    const session: Session = .{ .ptr = @ptrFromInt(16), .vtable = &copied, .model_lifetime = @ptrFromInt(32) };
+    try std.testing.expect(gemmaCudaOwnedTextWidth(session) == null);
+}
+
+test "generic CUDA Gemma owned text geometry requires actual Model before canonical opaque receiver access" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const genuine = try mediaTextEntryFixtureSession(std.testing.allocator, false);
+    defer genuine.close();
+    // Real canonical table and genuine independently owned Model metadata,
+    // but neither describes this deliberately invalid receiver address.
+    var foreign = genuine;
+    foreign.ptr = @ptrFromInt(16);
+    try std.testing.expect(gemmaCudaOwnedTextWidth(foreign) == null);
+    var missing = foreign;
+    missing.model_lifetime = null;
+    try std.testing.expect(gemmaCudaOwnedTextWidth(missing) == null);
+}
+
+test "actual Native Source Q6_K singles row and tied head keep exact original floor cap and current B" {
+    const T = @import("native_decoder_program.zig").Testing;
+    for ([_]bool{ false, true }) |tied| {
+        const cfg = try T.parsedQ8Config(std.testing.allocator, .llama, tied, 2);
+        try nativeAuthoredSourceFormatCase(cfg, true, false, true, false, .q6_rows);
+        try nativeAuthoredSourceFormatCase(cfg, true, true, true, false, .q6_mixed);
+    }
+}
+
+test "actual Native Source Q6_K active packed-input and head banks preserve exact cap floor and current B" {
+    const T = @import("native_decoder_program.zig").Testing;
+    const cfg = try T.parsedQ6ActivationConfig(std.testing.allocator);
+    try nativeAuthoredSourceFormatCase(cfg, true, false, true, true, .q6_rows);
+}
+
+fn nativePanelActualStageCase(a: std.mem.Allocator, cancel_during_fund: bool) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    if (@import("../backends/native.zig").useBlas()) return error.SkipZigTest;
+    const names = [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" };
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const actual = try a.create(ArchSession);
+    actual.* = .{ .allocator = a, .arch_config = .{ .embedding_gemma2 = .{} }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = runtime.tier.cache.SharedCache.init(.{ .host_limit_bytes = 1 << 20 }) } } };
+    var session = archSessionHandle(actual);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    actual.model_lifetime.admission_domain = pin.retain();
+    const data = &actual.backend_data.native;
+    native_mod.initPrefetchQueue(data, a);
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 1 << 20 }, .{});
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    var raw: [2][64 * 64]u16 = .{ @splat(0x3f80), @splat(0x4000) };
+    for (names, 0..) |name, index| {
+        const key = try a.dupe(u8, name);
+        var moved = false;
+        defer if (!moved) a.free(key);
+        try data.resident_weights.put(a, key, .{ .tensor = .{ .data = std.mem.sliceAsBytes(&raw[index]), .shape = &.{ 64, 64 }, .dtype = .bf16, .name = key, .allocator = a, .owns_data = false, .owns_shape = false } });
+        moved = true;
+    }
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1 << 20 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    var missing = session;
+    missing.run_admission = null;
+    try std.testing.expectError(error.MissingNativePanelAdmission, validateNativePanelPreparationReceiver(missing));
+    var foreign_controller: runtime.tier.memory.AdmissionController = .{};
+    defer foreign_controller.deinit();
+    var foreign = session;
+    foreign.run_admission.?.controller = &foreign_controller;
+    try std.testing.expectError(error.ForeignAdmissionDomain, validateNativePanelPreparationReceiver(foreign));
+    var missing_owner = session;
+    missing_owner.model_lifetime = null;
+    missing_owner.ptr = @ptrFromInt(16);
+    try std.testing.expectError(error.MissingNativePanelOwner, validateNativePanelPreparationReceiver(missing_owner));
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    var lane: @import("../execution_control.zig").ExecutionLane = .{};
+    const Probe = struct {
+        data: *native_mod.WeightStore,
+        gate: *std.atomic.Mutex,
+        lane: *@import("../execution_control.zig").ExecutionLane,
+        armed: bool = false,
+        cancel_on_fund: bool,
+        cancelled: bool = false,
+        violation: bool = false,
+        calls: usize = 0,
+        panel_calls: usize = 0,
+        fn outside(self: *@This()) void {
+            if (!self.armed) return;
+            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+            if (self.lane.mutex.tryLock()) {
+                if (self.lane.owned) self.violation = true;
+                self.lane.mutex.unlock();
+            } else self.violation = true;
+            const handle = self.data.prefetch.lockHandle();
+            if (handle.mutex.tryLock()) handle.unlock() else self.violation = true;
+            if (self.data.embeddinggemma2_f32_cache_lock.tryLock()) self.data.embeddinggemma2_f32_cache_lock.unlock() else self.violation = true;
+        }
+        fn check(raw_ctx: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn reserve(raw_ctx: *anyopaque, amounts: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+            self.calls += 1;
+            if (amounts.host_weight_bytes != 0) {
+                self.panel_calls += 1;
+                if (self.cancel_on_fund) self.cancelled = true;
+            }
+            return self.calls;
+        }
+        fn retain(raw_ctx: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+        }
+        fn release(raw_ctx: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.outside();
+        }
+    };
+    var probe = Probe{ .data = data, .gate = session.execution_gate.?, .lane = &lane, .cancel_on_fund = cancel_during_fund };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    defer probe.armed = false;
+    var permit = try session.admit(.{});
+    defer permit.deinit();
+    var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+    var stage = StagedExecution{ .session = session, .gate = session.execution_gate, .execution_lane = &lane, .waiter = &waiter, .cb = undefined, .control = .{ .ptr = &probe, .check_fn = Probe.check, .native_call_policy = .in_process }, .permit = &permit, .idle_backend = 0, .active = false };
+    defer stage.deinit();
+    try stage.prepareBeforeExecution();
+    try stage.enterInitial(a, stage.control);
+    const cb = stage.backend();
+    try std.testing.expect(cb.embedding_stage == null and cb.native_weight_cache != null);
+    try std.testing.expect(data.canonical_panel_source_readers != 0);
+    var replacement_values: [64 * 64]f32 = @splat(3);
+    var replacement: ?@import("../backends/tensor.zig").Tensor = try @import("../backends/tensor.zig").Tensor.initFloat32(a, names[0], &.{ 64, 64 }, &replacement_values);
+    defer if (replacement) |*value| value.deinit();
+    var refused = false;
+    replaceBlasResidentWeight(session, names[0], .{ .tensor = replacement.? }) catch |err| {
+        try std.testing.expectEqual(error.NativeResidentWeightInUse, err);
+        refused = true;
+    };
+    if (!refused) {
+        replacement = null;
+        return error.TestExpectedResidentReaderRefusal;
+    }
+    var input: [128]f32 = @splat(1);
+    const x = try cb.fromFloat32Shape(&input, &.{ 2, 64 });
+    defer cb.free(x);
+    probe.armed = true;
+    if (cancel_during_fund) {
+        try std.testing.expectError(error.Cancelled, cb.linearPackedNamed(x, &names, &.{ 64, 64 }, 2, 64));
+        try std.testing.expect(stage.active and waiter.acquired and !probe.violation);
+        try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_canonical_panels.count());
+        probe.cancelled = false;
+        probe.cancel_on_fund = false;
+    }
+    const output = (try cb.linearPackedNamed(x, &names, &.{ 64, 64 }, 2, 64)).?;
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    for (0..2) |row| {
+        for (values[row * 128 ..][0..64]) |value| try std.testing.expectEqual(@as(f32, 64), value);
+        for (values[row * 128 + 64 ..][0..64]) |value| try std.testing.expectEqual(@as(f32, 128), value);
+    }
+    const calls = probe.calls;
+    const up = try cb.getWeight(names[1]);
+    defer cb.free(up);
+    const warm = try cb.linearNoBias(x, up, 2, 64, 64);
+    defer cb.free(warm);
+    const warm_values = try cb.toFloat32(warm, a);
+    defer a.free(warm_values);
+    for (warm_values) |value| try std.testing.expectEqual(@as(f32, 128), value);
+    const plan = ops.OperatorPlan{ .quant_matmul = @import("../graph/quant_matmul.zig").plan(.{ .rows = 2, .in_dim = 64, .out_dim = 64, .format = .q8_0 }) };
+    const planned = try cb.linearNoBiasWithPlan(x, up, 2, 64, 64, plan);
+    defer cb.free(planned);
+    const planned_values = try cb.toFloat32(planned, a);
+    defer a.free(planned_values);
+    try std.testing.expectEqualSlices(f32, warm_values, planned_values);
+    const assigned = try cb.fromFloat32Shape(&input, &.{ 2, 64 });
+    defer cb.free(assigned);
+    try cb.linearNoBiasInto(a, x, up, assigned, 2, 64, 64);
+    const assigned_values = try cb.toFloat32(assigned, a);
+    defer a.free(assigned_values);
+    try std.testing.expectEqualSlices(f32, warm_values, assigned_values);
+    try std.testing.expectEqual(calls, probe.calls); // warm operations never suspend/fund
+    try std.testing.expect(!probe.violation and stage.active and waiter.acquired);
+    try std.testing.expect(cb.embedding_stage == null and cb.native_weight_cache != null);
+    probe.armed = false; // ordinary original final teardown follows explicit owner order
+}
+
+test "actual managed Native panel Stage keeps scheduler and escape inert across packed single planned and Into cold warm operations" {
+    try nativePanelActualStageCase(std.testing.allocator, false);
+}
+
+test "actual managed Native panel Stage restores original Model and lane after cold cancellation without numerical retry" {
+    try nativePanelActualStageCase(std.testing.allocator, true);
+}
+
+test "actual managed Native panel Stage construction and cold operation unwind every allocation failure" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    if (@import("../backends/native.zig").useBlas()) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativePanelActualStageCase, .{false});
+}
+
+test "Native panel receiver uses actual Model binding when copied wrappers clear or change policy" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var actual = ArchSession{ .allocator = a, .arch_config = .{ .embedding_gemma2 = .{} }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty } } };
+    var session = archSessionHandle(&actual);
+    try validateNativePanelPreparationReceiver(session); // genuine unbound raw
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    actual.model_lifetime.admission_domain = domain.pin();
+    defer actual.model_lifetime.admission_domain.?.release();
+    try std.testing.expectError(error.MissingNativePanelAdmission, validateNativePanelPreparationReceiver(session));
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    session.execution_gate = &actual.model_lifetime.execution_gate;
+    try validateNativePanelPreparationReceiver(session);
+    var foreign: runtime.tier.memory.AdmissionController = .{};
+    defer foreign.deinit();
+    var copied = session;
+    copied.run_admission.?.controller = &foreign;
+    try std.testing.expectError(error.ForeignAdmissionDomain, validateNativePanelPreparationReceiver(copied));
+    copied = session;
+    copied.run_admission = null;
+    try std.testing.expectError(error.MissingNativePanelAdmission, validateNativePanelPreparationReceiver(copied));
+    copied.model_lifetime = null;
+    copied.ptr = @ptrFromInt(16);
+    try std.testing.expectError(error.MissingNativePanelOwner, validateNativePanelPreparationReceiver(copied));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "Native cache source versions bind exact maintained slots refuse live source claim and saturate before ownership move" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var actual = ArchSession{ .allocator = a, .arch_config = .{ .embedding_gemma2 = .{} }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = @import("../runtime/tier/cache.zig").SharedCache.init(.{ .host_limit_bytes = 4096 }) } } };
+    const data = &actual.backend_data.native;
+    defer data.resident_weights.deinit(a);
+    @import("../ops/native_compute.zig").initPrefetchQueue(data, a);
+    defer @import("../ops/native_compute.zig").deinitPrefetchQueue(data);
+    const session = archSessionHandle(&actual);
+    var raw = [_]u16{ 0x3f80, 0x4000 };
+    const name = "language_model.norm.weight";
+    const source = Tensor{ .allocator = a, .name = name, .dtype = .bf16, .shape = &.{2}, .data = std.mem.sliceAsBytes(&raw), .owns_data = false, .owns_shape = false };
+    try data.resident_weights.put(a, name, .{ .tensor = source });
+    var compute = NativeCompute.init(a, data, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    var owner = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const current = @import("cleanup_context.zig").Context{ .boundary = owner.epoch() };
+    try std.testing.expect(try NativeCompute.beginF32MirrorCacheOperation(&cb, data, current));
+    try std.testing.expectError(error.NativeResidentWeightInUse, replaceBlasResidentWeight(session, name, .{ .tensor = source, .source_version = 99 }));
+    try std.testing.expectEqual(@as(u64, 0), data.resident_weights.get(name).?.source_version);
+    NativeCompute.abortWeightCacheOperation(&cb, data);
+    try replaceBlasResidentWeight(session, name, .{ .tensor = source, .source_version = 99 });
+    try std.testing.expectEqual(@as(u64, 1), data.resident_weights.get(name).?.source_version);
+    const saved = data.resident_weights.get(name).?;
+    const other = "language_model.unrelated.weight";
+    try replaceBlasResidentWeight(session, other, .{ .tensor = source, .source_version = 99 });
+    defer a.free(data.resident_weights.getKey(other).?);
+    try std.testing.expectEqual(@as(u64, 0), data.resident_weights.get(other).?.source_version);
+    try std.testing.expectEqual(saved.source_version, data.resident_weights.get(name).?.source_version);
+    data.resident_weights.getPtr(name).?.source_version = std.math.maxInt(u64);
+    try std.testing.expectError(error.NativeWeightSourceVersionExhausted, replaceBlasResidentWeight(session, name, .{ .tensor = source }));
+    try std.testing.expectEqual(std.math.maxInt(u64), data.resident_weights.get(name).?.source_version);
+    try std.testing.expect(data.resident_weights.get(name).?.tensor.data.ptr == source.data.ptr);
 }

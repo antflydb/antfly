@@ -50016,7 +50016,29 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     defer workspace.borrowed.deinit();
     var model: model_manager_mod.LoadedModel = undefined;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
-    var ctx: Context = undefined;
+    model.native_generate_lock = .unlocked;
+    model.native_reader_execution_lane = .{};
+    model.native_reader_stream = .{};
+    // This metadata-only fixture still enters the real park/restore owner.
+    // Defaults initialize its admission window, pause, cohort and cleanup state;
+    // unused worker/KV numeric owners are never inspected with cb == null.
+    var ctx: Context = .{
+        .allocator = std.testing.allocator,
+        .model = &model,
+        .cfg = .{},
+        .budget = undefined,
+        .lane = try model.native_reader_execution_lane.acquire(.{}),
+        .coordinator = undefined,
+        .manager = undefined,
+        .execution_id = 1,
+        .vision_broker = undefined,
+        .prefill_broker = undefined,
+    };
+    try (InferenceExecutionControl{}).lock(model.nativeGenerationMutex());
+    defer {
+        model.unlockNativeGeneration();
+        ctx.lane.release();
+    }
     ctx.cb = null;
     ctx.features = .{};
     ctx.cfg = .{};

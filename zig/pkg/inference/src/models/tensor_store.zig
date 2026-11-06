@@ -233,6 +233,42 @@ pub const TensorStore = struct {
         return .{ .tensor_type = tensor.tensor_type, .raw_bytes = raw[offset..end], .shape = shape, .source_name = source_name, .mmap_backed = store.mmap_region != null };
     }
 
+    /// SAME immutable mapped branch as MMapReader.readTensor, with no shard
+    /// opening/allocation/Io. Caller serializes actual shard publication and
+    /// retains this canonical Model/store through every byte/shape borrow.
+    /// An owned/copy/custom source grants no mapped-parent authority.
+    pub fn nativeTypedMappedSource(self: TensorStore, ref: *const LazyTensorRef) !?@import("../backends/tensor.zig").Tensor {
+        if (ref.quantized or ref.packed_expert_index != null or ref.packed_expert_count != 0 or ref.fused_gate_up or ref.fused_gate_up_index != 0) return null;
+        // Both attested safetensor loadTensorRef implementations consume name,
+        // not the GGUF/composite source alias. No unsliced alias transform is
+        // accepted as a full mapped tensor by this exact branch.
+        if (ref.source_name) |source_name| if (!std.mem.eql(u8, source_name, ref.name)) return null;
+        const reader = if (self.vtable == &SafetensorsStore.vtable) blk: {
+            const store: *const SafetensorsStore = @ptrCast(@alignCast(self.ptr));
+            break :blk &store.source.reader;
+        } else if (self.vtable == &ShardedSafetensorsStore.vtable) blk: {
+            const store: *const ShardedSafetensorsStore = @ptrCast(@alignCast(self.ptr));
+            const shard = store.source.index.weight_map.get(ref.name) orelse return error.TensorNotFound;
+            break :blk store.source.readers.get(shard) orelse return error.NativeTypedShardNotOpened;
+        } else return null;
+        const meta = reader.header.tensors.get(ref.name) orelse return error.TensorNotFound;
+        if (meta.dtype != .f32 and meta.dtype != .bf16 and meta.dtype != .f16) return null;
+        if (reader.mmap_region == null) return null;
+        const start = try std.math.add(u64, reader.data_offset, meta.data_start);
+        const end = try std.math.add(u64, reader.data_offset, meta.data_end);
+        if (meta.data_start > meta.data_end or end > reader.file_bytes.len) return error.InvalidOffset;
+        var elements: usize = 1;
+        for (meta.shape) |axis| {
+            if (axis < 0) return error.InvalidShape;
+            elements = try std.math.mul(usize, elements, std.math.cast(usize, axis) orelse return error.InvalidShape);
+        }
+        const bytes = try std.math.mul(usize, elements, meta.dtype.byteSize());
+        if (end - start != bytes or bytes != ref.byte_len) return error.InvalidTensorSize;
+        const raw = reader.file_bytes[@intCast(start)..@intCast(end)];
+        if (@intFromPtr(raw.ptr) % meta.dtype.byteSize() != 0) return null;
+        return .{ .data = @constCast(raw), .dtype = meta.dtype, .shape = meta.shape, .name = ref.name, .allocator = reader.allocator, .owns_data = false, .owns_shape = false, .mmap_source_bytes = reader.file_bytes };
+    }
+
     pub const GlinerGgufSnapshot = struct {
         encoder: []const u8,
         head: []const u8,
@@ -1960,4 +1996,18 @@ test "Native canonical GGUF cold geometry is exact same immutable quantized sour
     try std.testing.expect((try forged.nativeQuantizedSource(&ref)) == null);
     ref.packed_expert_count = 2;
     try std.testing.expect((try store.nativeQuantizedSource(&ref)) == null);
+}
+
+test "Native typed mapped source rejects fused expert alias and copied-table recipes before opaque access" {
+    const canonical = TensorStore{ .ptr = @ptrFromInt(16), .vtable = &SafetensorsStore.vtable };
+    for ([_]LazyTensorRef{
+        .{ .name = "weight", .fused_gate_up = true },
+        .{ .name = "weight", .fused_gate_up_index = 1 },
+        .{ .name = "weight", .packed_expert_index = 0 },
+        .{ .name = "weight", .packed_expert_count = 2 },
+        .{ .name = "alias", .source_name = "actual" },
+    }) |ref| try std.testing.expect(try canonical.nativeTypedMappedSource(&ref) == null);
+    var copied = SafetensorsStore.vtable;
+    const foreign = TensorStore{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expect(try foreign.nativeTypedMappedSource(&.{ .name = "weight" }) == null);
 }

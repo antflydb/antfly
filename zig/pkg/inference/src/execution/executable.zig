@@ -2096,6 +2096,8 @@ test "prepared immutable literal banks reuse once and publish independent held o
         defer a.free(output);
         try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, output);
         try std.testing.expectEqual(@as(u64, 1), result.stats.graph_output_owned_copies);
+        try std.testing.expectEqual(@as(u64, 1), result.stats.planned_literal_output_copies);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.opaque_graph_output_copies);
         if (iteration > 1) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
         if (iteration == 0) {
             held = try cb.primReshape(result.outputs[0], &.{ 1, 4 });

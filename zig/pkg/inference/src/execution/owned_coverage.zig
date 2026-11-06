@@ -29,8 +29,41 @@ fn allocation(pool: *const physical.Pool, id: buffers.AllocationId, bytes: usize
     const item = (pool.plan.allocationById(id) orelse return false).*;
     return item.id == id and item.backend == .native and item.kind == kind and item.byte_size >= bytes;
 }
+/// Compressed primary payload is accepted only from the actual canonical
+/// Native tensor report (exact_dtype=false), never a declared resident plane.
+/// The separately pinned Model owns raw + every prepared KBlock/panel; this is
+/// representation validation, not new Frame storage or model-byte credit.
+fn packedPrimaryValid(plane: ownership.Plane, expected: ml.graph.Shape) bool {
+    const desc = plane.descriptor;
+    const actual = desc.shape;
+    if (desc.storage != .host_packed_quant or desc.quant_format == null or desc.resident_backend != .native or desc.view_source != null or desc.attention_storage != null or desc.attention_kv_format != null or desc.device_id != 0 or plane.writable != null) return false;
+    if (actual.dtype != .f32 or expected.dtype != .f32 or !actual.eq(expected) or actual.rank() != 2) return false;
+    const format = desc.quant_format.?;
+    switch (format) {
+        .q4_k, .q5_k, .q6_k, .q8_0 => {},
+        else => return false,
+    }
+    const geometry = @import("../graph/quant_matmul.zig").packedFormatDescriptor(format);
+    if (geometry.values_per_block == 0 or geometry.bytes_per_block == 0 or actual.dim(0) <= 0 or actual.dim(1) <= 0) return false;
+    const rows = std.math.cast(usize, actual.dim(0)) orelse return false;
+    const width = std.math.cast(usize, actual.dim(1)) orelse return false;
+    if (width % geometry.values_per_block != 0) return false;
+    const row_bytes = std.math.mul(usize, width / geometry.values_per_block, geometry.bytes_per_block) catch return false;
+    const bytes = std.math.mul(usize, rows, row_bytes) catch return false;
+    const dense = @import("../graph/backend_contracts.zig").TensorStrides.dense(actual);
+    if (!std.meta.eql(desc.strides, dense) or plane.logical_bytes != bytes or plane.readable_bytes != bytes or plane.layout_key != null) return false;
+    const backing = plane.backing orelse return false;
+    if (backing.kind != .host or backing.context != null) return false;
+    const address = std.math.add(usize, backing.base, plane.byte_offset) catch return false;
+    _ = std.math.add(usize, address, bytes) catch return false;
+    return true;
+}
 fn primaryValid(plane: ownership.Plane, expected: ml.graph.Shape, exact_dtype: bool) bool {
     if (plane.role != .primary or plane.backing == null or plane.descriptor.current_backend != .native or plane.logical_bytes == 0 or plane.readable_bytes < plane.logical_bytes) return false;
+    if (plane.descriptor.quant_format != null or plane.descriptor.storage == .host_packed_quant) {
+        if (exact_dtype) return false; // Pure declared resident planes gain no packed authority.
+        return packedPrimaryValid(plane, expected);
+    }
     const actual = plane.descriptor.shape;
     const count = actual.numElements() orelse return false;
     if (count <= 0) return false;
@@ -225,4 +258,68 @@ pub fn assess(pool: *const physical.Pool) Coverage {
         if (!slot.roles.graph_output) return .{ .compatibility = .output_publication };
     }
     return .{ .complete = result };
+}
+
+test "Native owned coverage actual packed primary requires exact format storage shape and compressed row bytes" {
+    const a = std.testing.allocator;
+    _ = a;
+    const contracts = @import("../graph/backend_contracts.zig");
+    const shape = ml.graph.Shape.init(.f32, &.{ 4, 512 });
+    inline for (.{ @import("../graph/quant_matmul.zig").Format.q4_k, .q5_k, .q6_k, .q8_0 }) |format| {
+        const geometry = @import("../graph/quant_matmul.zig").packedFormatDescriptor(format);
+        const bytes = 4 * (512 / geometry.values_per_block) * geometry.bytes_per_block;
+        var descriptor = contracts.TensorDesc.packedQuant(shape, format);
+        descriptor.current_backend = .native;
+        descriptor.resident_backend = .native;
+        var plane = ownership.Plane{ .descriptor = descriptor, .role = .primary, .backing = .{ .kind = .host, .base = 4096 }, .byte_offset = 0, .logical_bytes = bytes, .readable_bytes = bytes };
+        try std.testing.expect(primaryValid(plane, shape, false));
+        try std.testing.expect(!primaryValid(plane, shape, true));
+        plane.logical_bytes -= 1;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+        plane.logical_bytes = bytes + 1;
+        plane.readable_bytes = bytes + 1;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+        plane.logical_bytes = 4 * 512 * 4; // Never pad compressed metadata to an invented F32 extent.
+        plane.readable_bytes = plane.logical_bytes;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+        plane.logical_bytes = bytes;
+        plane.readable_bytes = bytes;
+        plane.descriptor.storage = .host_f32;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+        plane.descriptor.storage = .host_packed_quant;
+        plane.descriptor.quant_format = if (format == .q4_k) .q5_k else .q4_k;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+        plane.descriptor.quant_format = .q8_1;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+        plane.descriptor.quant_format = format;
+        plane.descriptor.shape = ml.graph.Shape.init(.f32, &.{ 4, 511 });
+        try std.testing.expect(!primaryValid(plane, plane.descriptor.shape, false));
+        plane.descriptor.shape = shape;
+        plane.descriptor.view_source = 3;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+        plane.descriptor.view_source = null;
+        plane.descriptor.strides.values[0] += 1;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+        plane.descriptor.strides = contracts.TensorStrides.dense(shape);
+        plane.descriptor.resident_backend = .metal;
+        try std.testing.expect(!primaryValid(plane, shape, false));
+    }
+}
+test "Native owned coverage dense primary retains original exact extent dtype and shape checks" {
+    const contracts = @import("../graph/backend_contracts.zig");
+    const shape = ml.graph.Shape.init(.f32, &.{ 4, 512 });
+    var descriptor = contracts.TensorDesc.init(shape, .host_f32);
+    descriptor.current_backend = .native;
+    var plane = ownership.Plane{ .descriptor = descriptor, .role = .primary, .backing = .{ .kind = .host, .base = 4096 }, .byte_offset = 0, .logical_bytes = 4 * 512 * 4, .readable_bytes = 4 * 512 * 4 };
+    try std.testing.expect(primaryValid(plane, shape, true));
+    plane.logical_bytes -= 4;
+    try std.testing.expect(!primaryValid(plane, shape, true));
+    plane.logical_bytes += 4;
+    plane.descriptor.shape.dtype = .bf16;
+    plane.logical_bytes /= 2;
+    plane.readable_bytes /= 2;
+    try std.testing.expect(!primaryValid(plane, shape, true));
+    try std.testing.expect(primaryValid(plane, shape, false));
+    plane.descriptor.shape = ml.graph.Shape.init(.bf16, &.{ 8, 256 });
+    try std.testing.expect(!primaryValid(plane, shape, false));
 }

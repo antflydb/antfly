@@ -674,19 +674,27 @@ pub const Runtime = struct {
     ) ![]f32 {
         const query_seq_len = decode_context.query_sequence_len;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
-        if (self.graph_cache == null) if (self.native_program) |program| if (program.supportsCall(input_ids, batch, decode_context)) {
-            const NativeCall = @import("native_decoder_program.zig").Call;
-            var selected: ?NativeCall = program.beginCall(input_ids, decode_context, null) catch |err| switch (err) {
-                error.UnsupportedAuthoredNativeCall, error.UnsupportedAuthoredPagedAttention, error.AuthoredPagedWriteRequiresExclusiveBlock => null,
-                else => return err,
-            };
-            if (selected) |*call| {
-                const current = @import("cleanup_context.zig").Context{ .boundary = self.context.cleanupEpoch(), .operation = if (self.context.cb.call_context) |invocation| invocation.cleanup.operation else null };
-                defer call.close(current);
-                try call.prepareInto(self.context.allocator, null, current);
-                try call.run(self.context.cb, self.context.gpt_config.*, decode_context, current);
-                return try call.takeOutput();
-            }
+        const observation = @import("runtime_observation.zig");
+        if (self.graph_cache == null) if (self.native_program) |program| {
+            if (program.supportsCall(input_ids, batch, decode_context)) {
+                const NativeCall = @import("native_decoder_program.zig").Call;
+                var selected: ?NativeCall = program.beginCall(input_ids, decode_context, null) catch |err| switch (err) {
+                    error.UnsupportedAuthoredNativeCall, error.UnsupportedAuthoredPagedAttention, error.AuthoredPagedWriteRequiresExclusiveBlock => declined: {
+                        observation.nativeProgramFallback(.begin_call_declined, err);
+                        break :declined null;
+                    },
+                    else => return err,
+                };
+                if (selected) |*call| {
+                    const current = @import("cleanup_context.zig").Context{ .boundary = self.context.cleanupEpoch(), .operation = if (self.context.cb.call_context) |invocation| invocation.cleanup.operation else null };
+                    defer call.close(current);
+                    try call.prepareInto(self.context.allocator, null, current);
+                    try call.run(self.context.cb, self.context.gpt_config.*, decode_context, current);
+                    return try call.takeOutput();
+                }
+            } else observation.nativeProgramFallback(.unsupported_call, null);
+        } else if (observation.kernelEnabled() and self.context.cb.kind() == .native) {
+            observation.nativeProgramFallback(.no_prepared_native_program, null);
         };
         if (self.graph_cache) |cache| {
             return self.graphForward(cache, input_ids, batch, seq_len, decode_context);
@@ -1914,4 +1922,31 @@ test "physical token placement actual Native allocation faults leave no physical
     };
     try Case.run(std.testing.allocator);
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "Native actual decoder without prepared Program records legacy attempt before unchanged missing weight failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Native = @import("../ops/native_compute.zig");
+    var store = Native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const cfg = @import("native_decoder_program.zig").Testing.config();
+    const decode = gpt_arch.DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
+    var original_error: ?anyerror = null;
+    if (gpt_arch.forward(&cb, a, cfg, &.{2}, 1, 1, &decode)) |values| {
+        a.free(values);
+        return error.ExpectedMissingWeight;
+    } else |err| original_error = err;
+    var diagnostics = @import("diagnostics.zig").Diagnostics{};
+    const binding = @import("invocation_observation.zig").Binding{ .diagnostics = &diagnostics };
+    try std.testing.expect(binding.configure(true));
+    var runtime = Runtime{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } };
+    try std.testing.expectError(original_error.?, @import("invocation_observation.zig").call(binding, Runtime.forwardLastLogits, .{ &runtime, @as([]const i64, &.{2}), @as(usize, 1), @as(usize, 1), &decode }));
+    const report = diagnostics.snapshot().?.report.?;
+    try std.testing.expect(report.native_definition_templates == null);
+    try std.testing.expectEqual(@as(u64, 1), report.authored_native_programs.?.fallback_no_prepared_native_program);
+    try std.testing.expectEqual(@as(u8, 0), report.authored_native_programs.?.count);
 }

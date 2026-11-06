@@ -28,6 +28,13 @@ pub const Request = struct {
     usage: Usage = .ordinary,
     admitted: bool = false,
 };
+/// Construction-only initializer for an unpublished Private literal. The caller
+/// owns both leases and the same construction epoch until this synchronous call
+/// returns. Ordinary published copies retain their read-only checks.
+pub const LiteralInitializer = struct {
+    staging: Request,
+    initialize: *const fn (*anyopaque, *Lease, *Lease, []const f32) anyerror!void,
+};
 /// One canonical allocation policy. KernelBackend.accepts must be checked
 /// before invoking any callback, including metadata-only reservation queries.
 pub const Policy = struct {
@@ -53,6 +60,7 @@ pub const Lease = struct {
     retirement_owner: ?*@import("../execution/backing_retirement.zig").BackingOwner = null,
     ledger: ?*accounting.Ledger = null,
     accounting_class: accounting.Class = .activation,
+    usage: Usage = .ordinary,
     backing_byte_size: ?usize = null,
     references: std.atomic.Value(usize) = .init(1),
     slot_authority: ?@import("../execution/slot_authority.zig").Slot = null,
@@ -144,7 +152,7 @@ pub const Lease = struct {
             if (actual > value.reservedBytes()) return error.PhysicalStorageExceededReservation;
             if (owned) |binding| binding.owner.measure(binding.construction_epoch, actual) else value.retainBytes(actual);
         }
-        self.* = .{ .admission = reserved.reservation, .retirement_owner = if (owned) |binding| binding.owner else null, .allocator = allocator, .backend = backend.withoutSynchronousBorrows(), .tensor = tensor, .byte_size = byte_size, .ledger = ledger, .accounting_class = class, .backing_byte_size = backing_bytes };
+        self.* = .{ .admission = reserved.reservation, .retirement_owner = if (owned) |binding| binding.owner else null, .allocator = allocator, .backend = backend.withoutSynchronousBorrows(), .tensor = tensor, .byte_size = byte_size, .ledger = ledger, .accounting_class = class, .usage = usage, .backing_byte_size = backing_bytes };
         if (ledger) |owner| owner.allocated(class, byte_size, backing_bytes);
         return self;
     }

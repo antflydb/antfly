@@ -34,6 +34,10 @@ pub const Report = struct {
     joined_native_workers: ?@import("runtime_observation.zig").NativeWorkers = null,
     native_quant_worker_callbacks: ?@import("runtime_observation.zig").NativeQuantWorkerCallbacks = null,
     native_attention_programs: ?@import("runtime_observation.zig").NativeAttentionPrograms = null,
+    native_definition_templates: ?@import("diagnostics.zig").NativeDefinitionTemplates = null,
+    native_program_construction: ?@import("diagnostics.zig").NativeProgramConstruction = null,
+    authored_native_programs: ?@import("runtime_observation.zig").NativePrograms = null,
+    authored_native_program_bank: ?@import("runtime_observation.zig").NativeProgramBank = null,
     native_activation_programs: ?@import("runtime_observation.zig").NativeActivationPrograms = null,
     owned_native_fallbacks: ?@import("runtime_observation.zig").NativeFallbacks = null,
     device_allocator_roots: ?@import("device_allocation_registry.zig").Summary = null,
@@ -67,11 +71,15 @@ pub const Report = struct {
     program_workspace: ?storage.Usage = null,
     program_host_workspace: ?storage.Usage = null,
     program_storage_reuse_hits: ?u64 = null,
+    program_storage_allocations: ?u64 = null,
+    program_storage_requested_allocation_bytes: ?u64 = null,
+    program_storage_counter_scope: enum { unavailable, corresponding_program_physical_frame_publication, latest_entered_native_call_acquire_prepare_run } = .unavailable,
     specialization_scope: enum { unavailable, corresponding_program_publication } = .unavailable,
     specializations: ?Specializations = null,
     actual_interpreter_fallback_dispatches: ?u64 = null,
     program_route_decision: ?[]const u8 = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
+    program_output_copies: ?ProgramOutputCopies = null,
     fallback_detail_scope: enum { invocation_errors_and_corresponding_program_only } = .invocation_errors_and_corresponding_program_only,
     unobserved_fallback_reasons: enum { unavailable } = .unavailable,
     whole_backend_residency_and_invocation_peak: enum { unavailable } = .unavailable,
@@ -85,6 +93,10 @@ pub const Report = struct {
         report.native_quant_worker_callbacks = value.runtime.native_quant_worker_callbacks;
         report.native_attention_programs = value.runtime.native_attention_programs;
         report.native_activation_programs = value.runtime.native_activation_programs;
+        report.authored_native_programs = value.runtime.authored_native_programs;
+        report.authored_native_program_bank = value.runtime.authored_native_program_bank;
+        report.native_definition_templates = value.native_definition_templates;
+        report.native_program_construction = value.native_program_construction;
         report.owned_native_fallbacks = value.runtime.owned_native_fallbacks;
         report.device_allocator_roots = value.runtime.device_allocator_roots;
         report.metal_buffer_interval = value.runtime.metal_buffer_interval;
@@ -124,8 +136,12 @@ pub const Report = struct {
         if (value.runtime.device_owners) |owners| report.retained_device_owner_count = owners.owners;
         if (value.execution) |program| {
             report.owned_program_fallbacks = ProgramFallbacks.init(program);
+            report.program_output_copies = .{ .total_owned = program.graph_output_owned_copies, .planned_literal = program.planned_literal_output_copies, .opaque_metal_graph_output = program.opaque_graph_output_copies };
             report.program_storage_scope = @tagName(value.execution_scope);
             report.program_storage_reuse_hits = program.physical_storage_reuses;
+            report.program_storage_allocations = program.physical_storage_allocations;
+            report.program_storage_requested_allocation_bytes = program.physical_storage_bytes;
+            report.program_storage_counter_scope = .corresponding_program_physical_frame_publication;
             report.actual_interpreter_fallback_dispatches = program.interpreter_fallbacks;
             report.program_route_decision = @tagName(program.physical_replay);
             if (program.planned_storage) |owned| {
@@ -139,12 +155,36 @@ pub const Report = struct {
                 report.transfers_scope = .last_program_only;
             }
         }
+        // An execution publication retains its original precedence. The
+        // Native sample remains separately visible if both producers exist.
+        if (value.execution == null) if (report.authored_native_program_bank) |bank| {
+            report.program_storage_reuse_hits = bank.frame_reuse_accesses;
+            report.program_storage_allocations = bank.frame_allocations;
+            report.program_storage_requested_allocation_bytes = bank.frame_requested_allocation_bytes;
+            report.program_storage_counter_scope = .latest_entered_native_call_acquire_prepare_run;
+            if (bank.owned_ledger) |owned| {
+                report.program_storage_scope = @tagName(bank.ledger_scope);
+                report.program_constants = owned.constant;
+                report.program_activations = owned.activation;
+                report.program_workspace = owned.workspace;
+                report.program_host_workspace = owned.host_workspace;
+            }
+        };
         if (value.specializations) |specializations| {
             report.specializations = specializations;
             report.specialization_scope = .corresponding_program_publication;
         }
         return report;
     }
+};
+
+/// Counts from the corresponding published program's two known output-copy
+/// producers. Unobserved backend/vendor/internal copies are outside this scope.
+pub const ProgramOutputCopies = struct {
+    scope: enum { corresponding_program_known_output_copy_producers_only } = .corresponding_program_known_output_copy_producers_only,
+    total_owned: u64,
+    planned_literal: u64,
+    opaque_metal_graph_output: u64,
 };
 
 /// Actual owned reason counters already produced by execution. Region/private
@@ -205,4 +245,49 @@ test "uniform video owned root values survive producer mutation without independ
     try std.testing.expectEqual(@as(u64, 50), retained.interval_peak_bytes[0]);
     try std.testing.expectEqual(.partial_metadata_failure, retained.coverage);
     try std.testing.expect(retained.interval_peak_bytes[0] != retained.interval_peak_bytes[1] + retained.interval_peak_bytes[2]);
+}
+
+test "uniform report separates planned literal publication from opaque Metal output copies" {
+    const std = @import("std");
+    var source = @import("diagnostics.zig").Diagnostics{};
+    source.configure(true);
+    source.publish(.{});
+    try std.testing.expect(source.snapshot().?.report.?.program_output_copies == null);
+    source.publish(.{ .execution = .{ .graph_output_owned_copies = 3, .planned_literal_output_copies = 2, .opaque_graph_output_copies = 1 } });
+    const retained = source.snapshot().?.report.?.program_output_copies.?;
+    source.configure(false);
+    try std.testing.expect(source.snapshot() == null);
+    try std.testing.expectEqual(@as(u64, 3), retained.total_owned);
+    try std.testing.expectEqual(@as(u64, 2), retained.planned_literal);
+    try std.testing.expectEqual(@as(u64, 1), retained.opaque_metal_graph_output);
+    try std.testing.expectEqual(retained.total_owned, retained.planned_literal + retained.opaque_metal_graph_output);
+}
+
+test "uniform Native Call bank report preserves unavailable classes and execution publication precedence" {
+    const std = @import("std");
+    var source = @import("diagnostics.zig").Diagnostics{};
+    source.configure(true);
+    const bank = @import("runtime_observation.zig").NativeProgramBank{
+        .frame_allocations = 2,
+        .frame_requested_allocation_bytes = 64,
+        .frame_reuse_accesses = 3,
+        .owned_ledger = null,
+    };
+    source.publish(.{ .runtime = .{ .authored_native_program_bank = bank } });
+    const unavailable = source.snapshot().?.report.?;
+    try std.testing.expect(unavailable.program_constants == null and unavailable.program_activations == null);
+    try std.testing.expect(unavailable.program_workspace == null and unavailable.program_host_workspace == null);
+    try std.testing.expectEqualStrings("unavailable", unavailable.program_storage_scope);
+    try std.testing.expectEqual(@as(u64, 64), unavailable.program_storage_requested_allocation_bytes.?);
+    source.publish(.{ .runtime = .{ .authored_native_program_bank = bank }, .execution = .{ .physical_storage_allocations = 7, .physical_storage_bytes = 128, .physical_storage_reuses = 9 } });
+    const simultaneous = source.snapshot().?.report.?;
+    try std.testing.expectEqual(@as(u64, 7), simultaneous.program_storage_allocations.?);
+    try std.testing.expectEqual(@as(u64, 128), simultaneous.program_storage_requested_allocation_bytes.?);
+    try std.testing.expectEqual(@as(u64, 9), simultaneous.program_storage_reuse_hits.?);
+    try std.testing.expectEqualDeep(bank, simultaneous.authored_native_program_bank.?);
+    const interval = (runtime.Snapshot{ .authored_native_program_bank = bank }).since(.{});
+    try std.testing.expectEqualDeep(bank, interval.authored_native_program_bank.?);
+    source.configure(false);
+    try std.testing.expect(source.snapshot() == null);
+    try std.testing.expectEqualDeep(bank, unavailable.authored_native_program_bank.?);
 }

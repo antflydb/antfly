@@ -456,6 +456,9 @@ test "dense Q8_0 quantization round-trips within one step of each block scale" {
 /// A loaded weight with optional quantization metadata.
 pub const LoadedWeight = struct {
     tensor: Tensor,
+    /// The maintained resident-slot replacement API alone advances this.
+    /// Immutable lazy checkpoint unload/reload retains its separate slot kind.
+    source_version: u64 = 0,
     quantized: bool = false,
     quantized_storage: ?QuantizedStorage = null,
 

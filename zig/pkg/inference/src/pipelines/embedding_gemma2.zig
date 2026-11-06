@@ -4974,11 +4974,14 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
     defer a.free(tokenizer_bytes);
     const hf = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer hf.deinitSelf();
-    const session = try factory.createCudaSession(a, model);
+    var session = try factory.createCudaSession(a, model);
     defer session.close();
+    // Actual staged cache custody requires this immutable model gate. Raw
+    // constructor sessions do not publish it implicitly; setup precedes use.
+    try session.installOwnedExecutionGate(a);
     // Test-only policy setup precedes all use; serving policies are immutable.
     {
-        var managed = try compute_provider.acquire(session, a, null, null);
+        var managed = try compute_provider.acquire(session, a, null, .{ .native_call_policy = .in_process });
         defer managed.deinit();
         const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
         compute.embedding_gemma2_policy.media_batch = true;
@@ -4995,24 +4998,54 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
         }
     };
     var errors: [4]?anyerror = @splat(null);
-    try std.testing.expectError(error.Cancelled, embedGroupCohort(a, session, hf.tokenizer(), &groups, .{}, null, .{ .check_fn = Abort.check }, &errors));
-    const actual = try embedGroupCohort(a, session, hf.tokenizer(), &groups, .{}, null, .{}, &errors);
+    try std.testing.expectError(error.Cancelled, embedGroupCohort(a, session, hf.tokenizer(), &groups, .{}, null, .{ .check_fn = Abort.check, .native_call_policy = .in_process }, &errors));
+    const actual = try embedGroupCohort(a, session, hf.tokenizer(), &groups, .{}, null, .{ .native_call_policy = .in_process }, &errors);
     defer {
         for (actual.vectors) |row| a.free(row);
         a.free(actual.vectors);
         a.free(actual.input_tokens);
     }
     {
-        var managed = try compute_provider.acquire(session, a, null, null);
+        var managed = try compute_provider.acquire(session, a, null, .{ .native_call_policy = .in_process });
         defer managed.deinit();
         const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(managed.backend.ptr));
         try std.testing.expect(compute.embedding_gemma2_media_batches > 0);
     }
+    // The same public factory also supports the original synchronous-exclusive
+    // raw library entry without publishing a gate or borrowing any quota.
+    const raw_session = try factory.createCudaSession(a, model);
+    defer raw_session.close();
+    try std.testing.expect(raw_session.execution_gate == null and raw_session.run_admission == null);
+    try std.testing.expect(raw_session.model_lifetime.?.model_lease == null and raw_session.model_lifetime.?.resource_pin == null and raw_session.model_lifetime.?.admission_domain == null);
+    {
+        var raw_backend = try compute_provider.acquire(raw_session, a, null, .{ .native_call_policy = .in_process });
+        defer raw_backend.deinit();
+        const raw_compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(raw_backend.backend.ptr));
+        raw_compute.embedding_gemma2_policy.media_batch = true;
+    }
+    var raw_errors: [4]?anyerror = @splat(null);
+    try std.testing.expectError(error.Cancelled, embedGroupCohort(a, raw_session, hf.tokenizer(), &groups, .{}, null, .{ .check_fn = Abort.check, .native_call_policy = .in_process }, &raw_errors));
+    const raw_actual = try embedGroupCohort(a, raw_session, hf.tokenizer(), &groups, .{}, null, .{ .native_call_policy = .in_process }, &raw_errors);
+    defer {
+        for (raw_actual.vectors) |row| a.free(row);
+        a.free(raw_actual.vectors);
+        a.free(raw_actual.input_tokens);
+    }
+    try std.testing.expect(raw_session.execution_gate == null and raw_session.run_admission == null);
+    for (raw_actual.vectors, actual.vectors, raw_actual.input_tokens, actual.input_tokens, raw_errors) |raw_vector, vector, raw_count, count, raw_error| {
+        try std.testing.expect(raw_error == null);
+        try std.testing.expectEqual(count, raw_count);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(vector), std.mem.sliceAsBytes(raw_vector));
+    }
     for (groups, actual.vectors, actual.input_tokens, errors) |group, vector, count, err| {
         try std.testing.expectEqual(@as(?anyerror, null), err);
-        const expected = try embed(a, session, hf.tokenizer(), group, .{}, null, null);
+        const expected = try embed(a, session, hf.tokenizer(), group, .{}, null, .{ .native_call_policy = .in_process });
         defer a.free(expected.vector);
         try std.testing.expectEqual(expected.input_tokens, count);
+        const raw_singleton = try embed(a, raw_session, hf.tokenizer(), group, .{}, null, .{ .native_call_policy = .in_process });
+        defer a.free(raw_singleton.vector);
+        try std.testing.expectEqual(expected.input_tokens, raw_singleton.input_tokens);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected.vector), std.mem.sliceAsBytes(raw_singleton.vector));
         var dot: f64 = 0;
         var x2: f64 = 0;
         var y2: f64 = 0;

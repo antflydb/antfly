@@ -1600,6 +1600,22 @@ pub const MetalPartitionExecutor = struct {
             const node = graph.node(id);
             if (node.output_shape.dtype != .f32) return false;
             if (node.op == .parameter) continue;
+            if (node.op == .constant) {
+                // The ORIGINAL executor materializes constants before beginFrame.
+                // Only the declared F32 Shared-stage/Private-bank constructor is
+                // eligible; no new kernel or legacy staging credit is implied.
+                const count = node.output_shape.numElements() orelse return false;
+                if (count <= 0 or count > std.math.maxInt(i32) or count != node.op.constant.data_len) return false;
+                const bytes = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
+                const functions = backend.vtable.kernels orelse return false;
+                if (!functions.accepts(backend.vtable)) return false;
+                const eligible = functions.physicalLiteralBindingSupported orelse return false;
+                if (!eligible(backend.ptr)) return false;
+                const query = functions.physicalLiteralInitializer orelse return false;
+                const initializer = (try query(backend.ptr, bytes)) orelse return false;
+                if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return false;
+                continue;
+            }
             // The existing fused families all require a linear, dot or norm.
             // Keep those families on their tuned owner path until its complete
             // ingress/output/scratch contract is declared; never disable them.
@@ -1619,7 +1635,7 @@ pub const MetalPartitionExecutor = struct {
         const plan = try self.runtimeRegionPlan(self.allocator, graph, nodes, graph.nodeCount(), reachable, last_use, null, &transient);
         if (!plan.matches(nodes, graph.nodeCount()) or plan.region_count != 0 or plan.covered_node_count != 0 or plan.elided_node_count != 0 or plan.pre_skipped_node_count != 0) return false;
         for (nodes, 0..) |id, position| {
-            if (!reachable[id] or graph.node(id).op == .parameter) continue;
+            if (!reachable[id] or graph.node(id).op == .parameter or graph.node(id).op == .constant) continue;
             if (plan.descriptorAt(position) == null and @import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
         }
         return true;
@@ -2769,7 +2785,7 @@ pub const MetalPartitionExecutor = struct {
             if (trace_progress) std.debug.print("metal_partition_progress: phase=sync_graph_outputs_begin partition={d}\n", .{partition_index});
             const graph_outputs_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
             if (!graphOutputOwnedCopyDisabled()) {
-                try copyPartitionGraphOutputsToOwnedStorage(cb, values, partition_view, rt_map, exec_ctx.stats);
+                try copyPartitionGraphOutputsToOwnedStorage(cb, values, partition_view, rt_map, options.physical_frame, exec_ctx.stats);
             }
             // syncPartitionGraphOutputs also materializes pending lazy
             // products; the TERMITE_DISABLE_OUTPUT_HOST_MIRROR_RESYNC
@@ -17169,6 +17185,7 @@ fn copyPartitionGraphOutputsToOwnedStorage(
     values: []?CT,
     view: buffer_plan_mod.PartitionBufferView,
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
+    physical_frame: ?*@import("../execution/physical_buffers.zig").Frame,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !void {
     if (comptime !build_options.enable_metal) return;
@@ -17178,9 +17195,32 @@ fn copyPartitionGraphOutputsToOwnedStorage(
         const index: usize = @intCast(slot_view.slot.node_id);
         if (index >= values.len) return error.InvalidBufferPlan;
         const ct = values[index] orelse continue;
-        const owned_ct = (try metal_compute_mod.MetalCompute.cloneOutputTensorOwned(cb, ct)) orelse continue;
+        // Constants have an explicitly declared independent publication bank.
+        // Consume it after the partition frame drains, before considering the
+        // legacy opaque output copy. Its lease carries the same current Frame.
+        var declared_publication = false;
+        const owned_ct = publication: {
+            if (physical_frame) |frame| {
+                if (try frame.publishLiteralOutput(cb, slot_view.slot.node_id, ct)) |published| {
+                    declared_publication = true;
+                    break :publication published;
+                }
+                if (frame.pool.completeOwnedPayload() != null) {
+                    if (frame.pool.literal_store) |store| {
+                        if (index < store.publications.len and store.publications[index] != null)
+                            return error.PreparedPhysicalLiteralChanged;
+                    }
+                }
+            }
+            break :publication (try metal_compute_mod.MetalCompute.cloneOutputTensorOwned(cb, ct)) orelse continue;
+        };
         values[index] = owned_ct;
-        if (stats) |s| s.graph_output_owned_copies += 1;
+        if (!declared_publication) {
+            if (stats) |stats_value| {
+                stats_value.graph_output_owned_copies += 1;
+                stats_value.opaque_graph_output_copies += 1;
+            }
+        }
         // Free the recyclable original unless the caller provided it
         // (runtime input) or another node's value slot still aliases the
         // same CT handle (metadata aliases share CTs across nodes).

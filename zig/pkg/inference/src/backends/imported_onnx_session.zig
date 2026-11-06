@@ -599,24 +599,13 @@ pub fn createSessionWithOptions(
 
     const immutable_facts = try immutableRouteBindings(allocator, self.static_runtime_inputs, self.input_node_ids, &self.cb);
     defer allocator.free(immutable_facts);
-    // Literal eligibility currently reads the real runtime frame state. Keep
-    // such compatibility constructors under their original operation too;
-    // reuse cached reachability, never infer absence from parameter count.
-    var context_sensitive_literals = false;
-    if (self.cb.kind() == .metal and self.static_runtime_inputs.len == 0) {
-        for (self.program.graph.nodes.items, 0..) |node, id| {
-            if (self.program.analysis.reachable[id] and node.op == .constant) {
-                context_sensitive_literals = true;
-                break;
-            }
-        }
-    }
-    // Empty-input, literal-free construction has no numerical/backend-owned values left to
-    // unwind. End its last numerical operation before cold executable metadata
-    // obtains the independent provider/index snapshot gate. A managed scope is
-    // never reinterpreted as metadata authority. Constructors with static SDK
-    // values keep the original scope through their fallible ownership transfer.
-    if (self.cb.kind() == .metal and self.static_runtime_inputs.len == 0 and !context_sensitive_literals and self.source_path == null and self.requested_strategy != .interpreter) {
+    // With no static SDK values left to transfer, executable construction
+    // owns only CPU graph metadata. Literal staging now describes immutable
+    // geometry; its live-frame gate belongs to proof and actual receiving.
+    // End the managed phase before independent metadata exclusion, exactly as
+    // for the existing literal-free constructor. Static model inputs keep the
+    // original operation and compatibility floor through ownership transfer.
+    if (self.cb.kind() == .metal and self.static_runtime_inputs.len == 0 and self.source_path == null and self.requested_strategy != .interpreter) {
         try construction_operation.finish();
         construction_active = false;
     }
@@ -6072,4 +6061,305 @@ test "empty Metal Imported construction ends numerical phase before owned Frame 
     const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Case.run, .{ path, shared });
     try std.testing.expectEqual(before.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+}
+
+test "complete Imported Metal constant chain admits Shared staging Private literals exact cold warm caps and held outputs" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    const rows = 8;
+    const width = 1024;
+    const payload = rows * width * @sizeOf(f32);
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const controller = &domain.controller;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ rows, width }));
+    const negative = try builder.neg(x);
+    const flat = try builder.reshape(negative, Shape.init(.f32, &.{rows * width}));
+    const absolute = try builder.absOp(flat);
+    const restored = try builder.reshape(absolute, Shape.init(.f32, &.{ rows, width }));
+    // ONNX keeps small authored constants in the graph; large initializers
+    // intentionally remain model parameters. Exercise that ACTUAL contract.
+    var literal_values: [rows]f32 = undefined;
+    @memset(&literal_values, 0.25);
+    const literal = try builder.tensorConst(&literal_values, Shape.init(.f32, &.{ rows, 1 }));
+    const expanded_literal = try graph.addNode(.{
+        .op = .{ .broadcast_in_dim = .{ .target_shape = Shape.init(.f32, &.{ rows, width }), .broadcast_axes = .{ 0, 1, 0, 0, 0, 0, 0, 0 }, .num_axes = 2 } },
+        .output_shape = Shape.init(.f32, &.{ rows, width }),
+        .inputs = .{ literal, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 1,
+    });
+    const shifted = try builder.add(restored, expanded_literal);
+    var out = try builder.add(shifted, x);
+    for (0..4) |_| out = try builder.add(out, x);
+    try graph.markOutput(try builder.reshape(out, Shape.init(.f32, &.{rows * width})));
+    try graph.markOutput(literal);
+    const encoded = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(encoded);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "complete-metal-literal.onnx", .data = encoded });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "complete-metal-literal.onnx" });
+    defer a.free(path);
+    var session = try createSessionWithOptions(a, path, .metal, .{ .graph_runtime_strategy = .partitioned });
+    var session_open = true;
+    defer if (session_open) session.close();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    const impl: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    const shared_supported = @import("../backends/metal_runtime.zig").antfly_metal_host_input_shared_supported(impl.shared_backend_ctx.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime);
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    var values: [rows * width]f32 = undefined;
+    for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5)) / 8;
+    var input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &values);
+    defer input.deinit();
+    session.run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1024 * 1024 * 1024, .static_workspace_kind = .estimate, .check_live_memory = false };
+    var proof = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)).?;
+    var proof_open = true;
+    defer if (proof_open) proof.deinit();
+    if (!shared_supported) {
+        // Real unsupported storage policy retains its original compatibility
+        // floor and output path; this branch is conditional on actual hardware.
+        try std.testing.expect(!proof.hasCompleteOwnedPayload());
+        try std.testing.expect(proof.requirement.owned_payload == null);
+        proof.deinit();
+        proof_open = false;
+        var fallback = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        defer fallback.deinit();
+        const actual = try fallback.backend.toFloat32(fallback.outputs[0], a);
+        defer a.free(actual);
+        for (actual, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(@abs(original) + 0.25 + 5 * original, value, 0.00001);
+        return;
+    }
+    if (!proof.hasCompleteOwnedPayload()) return error.MissingCompleteMetalLiteralPayload;
+    // Frames/banks belong to this exact selected variant, not the root Pool.
+    // Keep its existing owner alive while observing it; this takes no credit.
+    const selected_routes = proof.routes.?.retain();
+    var selected_routes_open = true;
+    defer if (selected_routes_open) selected_routes.releaseWithCleanup(.{ .outside_execution = true });
+    const selected_pool = selected_routes.pool;
+    const store = selected_pool.literal_store orelse return error.MissingMetalLiteralStore;
+    try std.testing.expect(store.literals.len > 0);
+    var stage_bytes: usize = 0;
+    for (store.literals) |item| {
+        try std.testing.expect(item.staging_bound > 0);
+        stage_bytes = try std.math.add(usize, stage_bytes, item.staging_bound);
+    }
+    {
+        const pool = proof.routes.?.pool;
+        const frame = (try pool.acquire()) orelse return error.MissingLiteralGuardFrame;
+        defer _ = frame.finish() catch @panic("literal guard frame cleanup");
+        const literal_node = store.literals[0].node;
+        const cb = impl.cb;
+        const functions = cb.vtable.kernels.?;
+        const physical_storage = @import("../ops/physical_storage.zig");
+        const copy_source = (try physical_storage.Lease.createAdmittedWithUsage(a, cb, 16, null, .activation, null, .host_input)).?;
+        defer copy_source.release();
+        const copy_destination = (try physical_storage.Lease.createTracked(a, cb, 16, null, .activation)).?;
+        defer copy_destination.release();
+        const source_view = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = copy_source, .shape = &.{4} })).?;
+        defer cb.free(source_view);
+        const destination_view = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = copy_destination, .shape = &.{4} })).?;
+        defer cb.free(destination_view);
+        try functions.writePhysicalFloat32.?(cb.ptr, source_view, &.{ 1, 2, 3, 4 });
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        var active = true;
+        defer if (active) cb.decoderRuntimeCancelFrame() catch @panic("literal active guard cancel");
+        const before_active = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+        try std.testing.expect(pool.completeOwnedPayload() != null);
+        try std.testing.expectError(error.PreparedPhysicalLiteralChanged, frame.materializeLiteral(&cb, literal_node));
+        try std.testing.expectEqual(before_active.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expect(store.owners[0].lease == null);
+        try functions.copyPhysicalInput.?(cb.ptr, destination_view, source_view);
+        try cb.decoderRuntimeSubmitFrame();
+        active = false;
+        var submitted = true;
+        defer if (submitted) cb.decoderRuntimeWaitSubmittedFrame() catch @panic("literal submitted guard wait");
+        try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame() and !cb.decoderRuntimeHasActiveFrame());
+        const before_submitted = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+        try std.testing.expect(pool.completeOwnedPayload() != null);
+        try std.testing.expectError(error.PreparedPhysicalLiteralChanged, frame.materializeLiteral(&cb, literal_node));
+        try std.testing.expectEqual(before_submitted.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expect(store.owners[0].lease == null);
+        try cb.decoderRuntimeWaitSubmittedFrame();
+        submitted = false;
+    }
+    const owned = proof.requirement.owned_payload.?;
+    try std.testing.expectEqual(.device, owned.accounting_class);
+    try std.testing.expect(owned.aliases >= 1 and owned.literals >= 1);
+    const physical = proof.requirement.physical;
+    try std.testing.expectEqual(@as(usize, 0), physical.host_scratch_bytes);
+    try std.testing.expect(physical.backend_scratch_bytes >= stage_bytes + 3 * payload);
+    try std.testing.expect(proof.routes.?.pool.hostIngressBackingKnown());
+    const request = try session.planRun(&.{input}, null);
+    const admission_plan = try session.run_admission.?.planRequest(request, session.outputInfo());
+    try std.testing.expect(admission_plan.protected.host_scratch_bytes >= 3 * payload);
+    const cap = try admission_plan.protected.merge(physical);
+    proof.deinit();
+    proof_open = false;
+    {
+        const Worker = struct {
+            session: Session,
+            input: *const Tensor,
+            allocator: std.mem.Allocator,
+            checks: std.atomic.Value(usize) = .init(0),
+            done: std.atomic.Value(bool) = .init(false),
+            failure: ?anyerror = null,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                _ = self.checks.fetchAdd(1, .acq_rel);
+            }
+            fn run(self: *@This()) void {
+                self.prepare() catch |err| {
+                    self.failure = err;
+                };
+                self.done.store(true, .release);
+            }
+            fn prepare(self: *@This()) !void {
+                const control = InferenceExecutionControl{ .ptr = self, .check_fn = check, .native_call_policy = .in_process, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s };
+                var permit = try self.session.admitInputsBeforeExecution(&.{self.input.*}, self.allocator, control);
+                defer permit.deinit();
+                if (!permit.prepared.?.hasCompleteOwnedPayload()) return error.MissingWarmMetalWitness;
+            }
+        };
+        var numerical = try @import("../execution/backend_operation.zig").enter(impl.cb, impl.executable.graph, null, .managed);
+        defer numerical.deinitChecked() catch unreachable;
+        const cache = impl.executable.runtime.physical_pool.?.variant_cache.?;
+        const builds = cache.stats.builds;
+        const misses = cache.stats.misses;
+        const count = impl.execution_count.load(.acquire);
+        const sdk = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+        // Generic admission may already own an unknown external lane: it is
+        // nonblocking and cannot allocate/build another semantic variant.
+        if (session.admitInputs(&.{input}, a, null)) |unexpected| {
+            var permit = unexpected;
+            permit.deinit();
+            return error.ExpectedBusyMetalMetadata;
+        } else |err| try std.testing.expectEqual(error.QueueFull, err);
+        try std.testing.expectEqual(builds, cache.stats.builds);
+        try std.testing.expectEqual(misses, cache.stats.misses);
+        var worker = Worker{ .session = session, .input = &input, .allocator = a };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) thread.join();
+        const deadline = @import("antfly_platform").time.monotonicNs() + 4 * std.time.ns_per_s;
+        while (worker.checks.load(.acquire) < 2 and !worker.done.load(.acquire)) {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+            std.Thread.yield() catch {};
+        }
+        try numerical.finish();
+        thread.join();
+        joined = true;
+        if (worker.failure) |err| return err;
+        try std.testing.expectEqual(builds, cache.stats.builds);
+        try std.testing.expectEqual(misses, cache.stats.misses);
+        try std.testing.expectEqual(count, impl.execution_count.load(.acquire));
+        try std.testing.expectEqual(sdk.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+    }
+    session.run_admission.?.limits = .{ .host_limit_bytes = cap.hostTotalBytes(), .backend_limit_bytes = cap.backendTotalBytes(), .combined_limit_bytes = try std.math.add(usize, cap.hostTotalBytes(), cap.backendTotalBytes()) };
+    const tensors = @import("../backends/metal_tensor.zig");
+    const before = tensors.memoryStatsSnapshot();
+    var below = session;
+    below.run_admission.?.limits.backend_limit_bytes -= 1;
+    if (below.admitInputs(&.{input}, a, null)) |unexpected| {
+        var permit = unexpected;
+        permit.deinit();
+        return error.ExpectedOneByteBelowMetalFrameDenial;
+    } else |err| try std.testing.expectEqual(error.ResourceLimitExceeded, err);
+    try std.testing.expectEqual(before.device_owned_buffers_created, tensors.memoryStatsSnapshot().device_owned_buffers_created);
+    var mandatory = session;
+    mandatory.run_admission.?.static_workspace_kind = .mandatory;
+    try std.testing.expectError(error.ResourceLimitExceeded, mandatory.admitInputs(&.{input}, a, null));
+    var private_policy = session;
+    private_policy.run_admission.?.opaque_workspace_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, private_policy.admitInputs(&.{input}, a, null));
+    var warm_creations: ?u64 = null;
+    for (0..4) |iteration| {
+        if (iteration > 0) {
+            var warm_proof = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)).?;
+            defer warm_proof.deinit();
+            try std.testing.expect(warm_proof.hasCompleteOwnedPayload());
+            try std.testing.expect(warm_proof.routes.? == selected_routes);
+            try std.testing.expect(warm_proof.requirement.physical.backend_scratch_bytes + stage_bytes <= physical.backend_scratch_bytes);
+        }
+        for (input.asFloat32Mut(), 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5 + @as(i32, @intCast(iteration)))) / 8;
+        var result = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        var result_open = true;
+        defer if (result_open) result.deinit();
+        const stats = session.executionDiagnostics().?.execution.?;
+        try std.testing.expect(stats.assigned_kernel_dispatches >= 3);
+        try std.testing.expectEqual(@as(u64, 0), stats.graph_plan_slots_reserved);
+        try std.testing.expectEqual(@as(u64, 1), stats.graph_output_owned_copies);
+        try std.testing.expectEqual(@as(u64, 1), stats.planned_literal_output_copies);
+        try std.testing.expectEqual(@as(u64, 0), stats.opaque_graph_output_copies);
+        // The independent declared literal output bank must actually be used;
+        // a matching legacy opaque copy does not discharge this requirement.
+        const ownership = @import("../execution/storage_ownership.zig");
+        const PrimaryIdentity = struct {
+            value: ?ownership.Identity = null,
+            fn visit(raw: *anyopaque, report: ownership.Report) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (report == .plane and report.plane.role == .primary) self.value = report.plane.backing;
+            }
+            fn visitor(self: *@This()) ownership.Visitor {
+                return .{ .context = self, .visit = visit };
+            }
+        };
+        try std.testing.expectEqual(@as(usize, 2), result.outputs.len);
+        var actual_publication: PrimaryIdentity = .{};
+        const query = result.backend.vtable.kernels.?.storageOwnership.?;
+        try std.testing.expectEqual(ownership.Coverage.complete, try query(result.backend.ptr, result.outputs[1], actual_publication.visitor()));
+        const actual_identity = actual_publication.value orelse return error.MissingPublishedLiteralIdentity;
+        try std.testing.expect(actual_identity.kind == .metal and actual_identity.base != 0);
+        var published_literal = false;
+        for (selected_pool.frames.items) |frame| {
+            if (frame.stats.output_copies == 0) continue;
+            for (store.publications) |maybe| {
+                if (maybe) |publication| {
+                    if (frame.storages[publication.allocation]) |bank| {
+                        var declared_bank: PrimaryIdentity = .{};
+                        try std.testing.expectEqual(ownership.Coverage.complete, try query(result.backend.ptr, bank.tensor, declared_bank.visitor()));
+                        if (declared_bank.value) |identity| {
+                            if (std.meta.eql(identity, actual_identity)) published_literal = true;
+                        }
+                    }
+                }
+            }
+        }
+        try std.testing.expect(published_literal);
+        try std.testing.expectEqual(@as(u64, 0), stats.physical_graph_captures);
+        const creations = tensors.memoryStatsSnapshot().device_owned_buffers_created;
+        if (warm_creations) |expected| try std.testing.expectEqual(expected, creations) else warm_creations = creations;
+        const actual = try result.backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(@abs(original) + 0.25 + 5 * original, value, 0.00001);
+        try std.testing.expectEqual(@as(usize, 2), result.outputs.len);
+        const literal_actual = try result.backend.toFloat32(result.outputs[1], a);
+        defer a.free(literal_actual);
+        try std.testing.expectEqualSlices(f32, &literal_values, literal_actual);
+        if (iteration == 3) {
+            if (session.admitInputs(&.{input}, a, null)) |unexpected| {
+                var permit = unexpected;
+                permit.deinit();
+                return error.ExpectedHeldMetalFramePressure;
+            } else |err| try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, err);
+            // Observation must not prolong the plan past the original final
+            // Model close/held-output SDK death and quota assertions below.
+            selected_routes.releaseWithCleanup(.{ .outside_execution = true });
+            selected_routes_open = false;
+            session.close();
+            session_open = false;
+            try std.testing.expect(controller.snapshot().backend_scratch_bytes > 0);
+            const retained = try result.backend.toFloat32(result.outputs[0], a);
+            defer a.free(retained);
+            try std.testing.expectEqualSlices(f32, actual, retained);
+        }
+        result.deinit();
+        result_open = false;
+    }
+    _ = @import("../execution/resource_retirement.zig").poll();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }

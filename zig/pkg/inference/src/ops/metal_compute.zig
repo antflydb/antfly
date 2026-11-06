@@ -11360,7 +11360,60 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn physicalLiteralBindingSupportedOp(ctx: *anyopaque) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
-        return !metal_runtime_mod.hasActiveFrame(runtime);
+        return !metal_runtime_mod.hasActiveFrame(runtime) and !metal_runtime_mod.hasSubmittedFrame(runtime);
+    }
+    fn physicalLiteralInitializerOp(ctx: *anyopaque, bytes: usize) anyerror!?ops.physical_storage.LiteralInitializer {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        // Describe immutable storage geometry, including during SDK-free
+        // executable construction. Live frame eligibility is a separate gate
+        // at proof, fresh receiving and the actual synchronous copy.
+        if (bytes == 0 or bytes % 4 != 0 or !metal_runtime.antfly_metal_host_input_shared_supported(runtime)) return null;
+        return .{ .staging = .{ .byte_size = bytes, .usage = .host_input }, .initialize = initializePhysicalLiteralOp };
+    }
+    fn initializePhysicalLiteralOp(ctx: *anyopaque, destination: *ops.physical_storage.Lease, stage: *ops.physical_storage.Lease, input: []const f32) anyerror!void {
+        const functions = destination.backend.vtable.kernels orelse return error.UnsupportedPhysicalLiteralInitialization;
+        if (!functions.accepts(destination.backend.vtable) or destination.backend.ptr != ctx or
+            destination.backend.vtable != stage.backend.vtable or stage.backend.ptr != ctx or
+            destination.usage != .ordinary or destination.accounting_class != .constant or
+            stage.usage != .host_input or stage.accounting_class != .activation or
+            destination.byte_size != stage.byte_size or destination.byte_size / 4 != input.len)
+            return error.InvalidPhysicalLiteralInitialization;
+        // Geometry alone never authorizes copying into a live frame.
+        if (!physicalLiteralBindingSupportedOp(ctx)) return error.UnsupportedPhysicalLiteralInitialization;
+        const descriptor = (try physicalLiteralInitializerOp(ctx, destination.byte_size)) orelse return error.UnsupportedPhysicalLiteralInitialization;
+        _ = descriptor;
+        if (destination.admission) |reserved| {
+            const staged = stage.admission orelse return error.InvalidPhysicalLiteralInitialization;
+            if (!reserved.identity.eql(staged.identity)) return error.InvalidPhysicalLiteralInitialization;
+        } else if (stage.admission != null) return error.InvalidPhysicalLiteralInitialization;
+        const compute: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = compute.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        const target = if (toBuf(destination.tensor).metal_tensor) |*tensor| tensor else return error.InvalidPhysicalLiteralInitialization;
+        const source = if (toBuf(stage.tensor).metal_tensor) |*tensor| tensor else return error.InvalidPhysicalLiteralInitialization;
+        const target_device = target.device orelse return error.InvalidPhysicalLiteralInitialization;
+        const source_device = source.device orelse return error.InvalidPhysicalLiteralInitialization;
+        const target_handle = target.deviceHandle() orelse return error.InvalidPhysicalLiteralInitialization;
+        const source_handle = source.deviceHandle() orelse return error.InvalidPhysicalLiteralInitialization;
+        if (target.dtype != .f32 or source.dtype != .f32 or target.elemCount() != input.len or source.elemCount() != input.len or
+            target.physicalLease() != null or source.physicalLease() != null or !stage.unique() or
+            target_device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or source_device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
+            target_device.ref.write_owner != null or source_device.ref.write_owner != null or
+            !target_device.ref.release_on_drop or !source_device.ref.release_on_drop or
+            target.deviceByteOffset() != 0 or source.deviceByteOffset() != 0 or
+            target.deviceByteLen() != destination.byte_size or source.deviceByteLen() != stage.byte_size or
+            target_device.ref.byte_len != destination.byte_size or source_device.ref.byte_len != stage.byte_size or
+            target_handle == source_handle or
+            !metal_runtime_mod.antfly_metal_buffer_is_shared(source_handle) or metal_runtime_mod.antfly_metal_buffer_is_shared(target_handle) or
+            metal_runtime_mod.antfly_metal_standalone_buffer_length(source_handle) != stage.byte_size or
+            metal_runtime_mod.antfly_metal_standalone_buffer_length(target_handle) != destination.byte_size)
+            return error.InvalidPhysicalLiteralInitialization;
+        // The exact .host_input producer creates mapped Shared storage. No SDK
+        // staging is born here; the ordinary Private destination is unchanged.
+        try source.uploadBytes(std.mem.sliceAsBytes(input));
+        // With no active frame, the existing blit commits and waits through its
+        // terminal status before returning, including a GPU-error return.
+        try source.copyInto(target);
     }
     fn writePhysicalFloat32Op(_: *anyopaque, output: CT, input: []const f32) anyerror!void {
         const target = toBuf(output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
@@ -39024,7 +39077,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return descriptor.operation == .slice and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -57551,4 +57604,58 @@ test "Metal unit RMS cache failed table publication frees SDK output and success
         defer hit.deinit();
         try std.testing.expectEqual(pointer, hit.deviceHandle().?);
     }
+}
+
+test "Metal literal construction staged metadata all OOM preserves exact owners and readonly copies" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    const initializer = (try backend.vtable.kernels.?.physicalLiteralInitializer.?(backend.ptr, 16)) orelse return error.SkipZigTest;
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, cb: ops.ComputeBackend, initialize: ops.physical_storage.LiteralInitializer) !void {
+            const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            const original_allocator = compute.allocator;
+            compute.allocator = allocator;
+            defer compute.allocator = original_allocator;
+            const destination = (try ops.physical_storage.Lease.createTracked(allocator, cb, 16, null, .constant)) orelse return error.MissingPhysicalLiteral;
+            defer destination.releaseWithCleanup(.{ .outside_execution = true });
+            const staging = (try ops.physical_storage.Lease.createAdmittedWithUsage(allocator, cb, 16, null, .activation, null, .host_input)) orelse return error.MissingLiteralStage;
+            defer staging.releaseWithCleanup(.{ .outside_execution = true });
+            const values = [_]f32{ -7, 0.25, 4, 13 };
+            // A shape mismatch must not partially initialize or consume either owner.
+            try std.testing.expectError(error.InvalidPhysicalLiteralInitialization, initialize.initialize(cb.ptr, destination, staging, values[0..3]));
+            // Metadata labels cannot turn a Private payload into Shared staging.
+            const mislabeled = (try ops.physical_storage.Lease.createTracked(allocator, cb, 16, null, .activation)) orelse return error.MissingInvalidLiteralStage;
+            defer mislabeled.releaseWithCleanup(.{ .outside_execution = true });
+            mislabeled.usage = .host_input;
+            try std.testing.expectError(error.InvalidPhysicalLiteralInitialization, initialize.initialize(cb.ptr, destination, mislabeled, &values));
+            // Borrowed views and forged endpoint metadata are refused before
+            // touching their bytes; restore every descriptor before teardown.
+            const source = &MetalCompute.toBuf(staging.tensor).metal_tensor.?;
+            const original_offset = source.device.?.byte_offset;
+            source.device.?.byte_offset = 4;
+            defer source.device.?.byte_offset = original_offset;
+            try std.testing.expectError(error.InvalidPhysicalLiteralInitialization, initialize.initialize(cb.ptr, destination, staging, &values));
+            source.device.?.byte_offset = original_offset;
+            const original_runtime = source.device.?.ref.runtime;
+            source.device.?.ref.runtime = @ptrFromInt(@alignOf(usize));
+            defer source.device.?.ref.runtime = original_runtime;
+            try std.testing.expectError(error.InvalidPhysicalLiteralInitialization, initialize.initialize(cb.ptr, destination, staging, &values));
+            source.device.?.ref.runtime = original_runtime;
+            var alias_destination = destination.*;
+            alias_destination.tensor = staging.tensor;
+            try std.testing.expectError(error.InvalidPhysicalLiteralInitialization, initialize.initialize(cb.ptr, &alias_destination, staging, &values));
+            try initialize.initialize(cb.ptr, destination, staging, &values);
+            const view = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = destination, .shape = &.{ 2, 2 } })) orelse return error.MissingPhysicalLiteralView;
+            defer cb.freeWithCleanup(view, .{ .outside_execution = true });
+            const actual = try cb.toFloat32(view, allocator);
+            defer allocator.free(actual);
+            try std.testing.expectEqualSlices(f32, &values, actual);
+            try std.testing.expectError(error.ReadOnlyPhysicalStorage, cb.vtable.kernels.?.copyPhysicalInput.?(cb.ptr, view, view));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ backend, initializer });
 }

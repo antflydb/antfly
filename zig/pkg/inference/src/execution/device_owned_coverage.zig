@@ -66,6 +66,17 @@ fn literal(pool: *const physical.Pool, slot: buffers.LogicalSlot, target: ops.Co
     const backend = pool.backends[value.backend_index];
     const owner = store.backends[value.backend_index];
     if (backend.ptr != target.ptr or backend.vtable != target.vtable or owner.ptr != backend.ptr or owner.vtable != backend.vtable or services(backend) == null or !allocation(pool, value.allocation, size, .constant_binding, false)) return null;
+    if (target.kind() == .metal) {
+        if (value.staging_bound == 0) return null;
+        const functions = target.vtable.kernels.?;
+        const eligible = functions.physicalLiteralBindingSupported orelse return null;
+        if (!eligible(target.ptr)) return null;
+        const query = functions.physicalLiteralInitializer orelse return null;
+        const initializer = (query(target.ptr, size) catch return null) orelse return null;
+        if (initializer.staging.byte_size != size or initializer.staging.usage != .host_input or initializer.staging.admitted) return null;
+        const bound = ops.physical_storage.reservationBytes(target, initializer.staging) catch return null;
+        if (bound != value.staging_bound) return null;
+    }
     return index;
 }
 fn publication(pool: *const physical.Pool, slot: buffers.LogicalSlot, index: usize) bool {
@@ -129,10 +140,9 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
                 }
             },
             .constant => {
-                // Metal's legacy Private literal upload owns transient staging
-                // not yet declared by this proof. Keep its compatibility floor.
-                if (target.kind() != .cuda) return .{ .compatibility = .literal };
                 const index = literal(pool, slot, target) orelse return .{ .compatibility = .literal };
+                if (target.kind() == .metal and pool.literal_store.?.literals[index].staging_bound == 0)
+                    return .{ .compatibility = .literal };
                 if (node.op != .constant or (slot.roles.graph_output and !publication(pool, slot, index))) return .{ .compatibility = .output_publication };
                 result.literals += 1;
             },

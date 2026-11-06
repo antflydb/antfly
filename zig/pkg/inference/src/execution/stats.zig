@@ -131,7 +131,13 @@ pub const ExecutionStats = struct {
     host_materialized_unattributed_outputs: u64 = 0,
     device_resident_parameter_outputs: u64 = 0,
     boundary_output_materializations: u64 = 0,
+    /// Existing total: declared literal publication copies plus actual legacy
+    /// owned output clones. Neither producer implies all vendor/internal copies.
     graph_output_owned_copies: u64 = 0,
+    /// Actual Frame.publishLiteralOutput copies into declared independent banks.
+    planned_literal_output_copies: u64 = 0,
+    /// Actual Metal legacy cloneOutputTensorOwned graph-output copies only.
+    opaque_graph_output_copies: u64 = 0,
     metal_frame_chunk_boundaries: u64 = 0,
     metal_frame_chunk_promoted_values: u64 = 0,
     metal_frame_chunk_swept_values: u64 = 0,

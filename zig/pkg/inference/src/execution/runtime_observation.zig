@@ -243,6 +243,8 @@ pub const KernelScope = struct {
     attention_programs: NativeAttentionPrograms = .{},
     activation_programs: NativeActivationPrograms = .{},
     native_fallbacks: NativeFallbacks = .{},
+    native_programs: NativePrograms = .{},
+    native_program_bank: ?NativeProgramBank = null,
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -846,4 +848,212 @@ pub fn nativeActivationPrograms(value: anytype) void {
             if (item.last_error) |err| found.?.last_error = FailureText.init(@errorName(err));
         }
     }
+}
+
+/// Whole authored Call units. Terminal math/worker units stay in their own
+/// existing records; static selected steps/pairs never claim actual launches.
+pub const NativeProgramRecord = struct {
+    identity: usize = 0,
+    selected_steps: usize = 0,
+    selected_pairs: usize = 0,
+    entries: u64 = 0,
+    returns: u64 = 0,
+    error_returns: u64 = 0,
+    not_entered: u64 = 0,
+    assigned_dispatches: u64 = 0,
+    last_error: FailureText = .{},
+};
+pub const NativePrograms = struct {
+    scope: enum { actual_authored_call_and_legacy_selection_values_in_invocation } = .actual_authored_call_and_legacy_selection_values_in_invocation,
+    grouping: enum { observed_numerical_address_and_selection_not_distinct_program_lifetime } = .observed_numerical_address_and_selection_not_distinct_program_lifetime,
+    coverage: enum { selected_program_and_observed_legacy_fallthrough_only_other_routes_unavailable } = .selected_program_and_observed_legacy_fallthrough_only_other_routes_unavailable,
+    records: [8]NativeProgramRecord = @splat(.{}),
+    count: u8 = 0,
+    unrecorded_calls: u64 = 0,
+    fallback_no_prepared_native_program: u64 = 0,
+    fallback_unsupported_call: u64 = 0,
+    fallback_begin_call_declined: u64 = 0,
+    last_begin_call_error: FailureText = .{},
+};
+/// One copied sample from the latest actually entered authored Call. Frame
+/// counters include its acquisition/cold preparation and run, before close.
+/// The optional ledger covers shared prepared-owner physical Leases; its
+/// peaks and birth/death counters are owner-lifetime values, never request
+/// peaks. Model weights, KV, Call host output, metadata and vendor heaps are
+/// outside this ledger. Unknown backing bytes stay null.
+pub const NativeProgramBank = struct {
+    scope: enum { latest_entered_call_acquire_prepare_run_before_close } = .latest_entered_call_acquire_prepare_run_before_close,
+    ledger_scope: enum { prepared_owner_lease_lifetime_sampled_before_call_close } = .prepared_owner_lease_lifetime_sampled_before_call_close,
+    coverage: enum { program_owned_leases_excluding_model_kv_host_output_metadata_vendor } = .program_owned_leases_excluding_model_kv_host_output_metadata_vendor,
+    frame_allocations: u64,
+    frame_requested_allocation_bytes: u64,
+    frame_reuse_accesses: u64,
+    owned_ledger: ?@import("storage_accounting.zig").Snapshot,
+};
+pub inline fn nativeProgramBank(value: NativeProgramBank) void {
+    if (active_kernels == null) return;
+    nativeProgramBankEnabled(value);
+}
+noinline fn nativeProgramBankEnabled(value: NativeProgramBank) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) scope.native_program_bank = value;
+}
+
+pub const NativeProgramEvent = struct {
+    identity: usize,
+    entered: bool,
+    returned: bool = false,
+    failure: ?anyerror = null,
+    selected_steps: usize,
+    selected_pairs: usize,
+    assigned_dispatches: u64,
+};
+pub inline fn nativeProgram(value: NativeProgramEvent) void {
+    if (active_kernels == null) return;
+    nativeProgramEnabled(value);
+}
+noinline fn nativeProgramEnabled(value: NativeProgramEvent) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const out = &scope.native_programs;
+        var found: ?*NativeProgramRecord = null;
+        for (out.records[0..out.count]) |*record| if (record.identity == value.identity and record.selected_steps == value.selected_steps and record.selected_pairs == value.selected_pairs) {
+            found = record;
+            break;
+        };
+        if (found == null) {
+            if (out.count == out.records.len) {
+                out.unrecorded_calls +|= 1;
+                continue;
+            }
+            found = &out.records[out.count];
+            out.count += 1;
+            found.?.* = .{ .identity = value.identity, .selected_steps = value.selected_steps, .selected_pairs = value.selected_pairs };
+        }
+        const record = found.?;
+        if (value.entered) record.entries +|= 1 else record.not_entered +|= 1;
+        if (value.returned) record.returns +|= 1;
+        if (value.failure) |err| {
+            if (value.entered) record.error_returns +|= 1;
+            record.last_error = FailureText.init(@errorName(err));
+        }
+        record.assigned_dispatches +|= value.assigned_dispatches;
+    }
+}
+
+test "Native authored Call records are bounded copied invocation values and disabled recording is inert" {
+    const a = @import("std").testing;
+    const previous = active_kernels;
+    try a.expect(previous == null);
+    nativeProgram(.{ .identity = 91, .entered = true, .returned = true, .selected_steps = 4, .selected_pairs = 1, .assigned_dispatches = 4 });
+    try a.expect(active_kernels == null);
+    var outer = KernelScope{};
+    outer.begin();
+    defer _ = outer.finish();
+    var inner = KernelScope{};
+    inner.begin();
+    nativeProgram(.{ .identity = 91, .entered = false, .failure = error.AuthoredResidentWeightChanged, .selected_steps = 4, .selected_pairs = 1, .assigned_dispatches = 0 });
+    nativeProgram(.{ .identity = 91, .entered = true, .failure = error.Cancelled, .selected_steps = 4, .selected_pairs = 1, .assigned_dispatches = 2 });
+    nativeProgram(.{ .identity = 91, .entered = true, .returned = true, .selected_steps = 4, .selected_pairs = 1, .assigned_dispatches = 4 });
+    const copy = inner.native_programs;
+    _ = inner.finish();
+    inner.native_programs = .{};
+    try a.expectEqual(@as(u8, 1), copy.count);
+    try a.expectEqual(@as(u64, 2), copy.records[0].entries);
+    try a.expectEqual(@as(u64, 1), copy.records[0].not_entered);
+    try a.expectEqual(@as(u64, 1), copy.records[0].error_returns);
+    try a.expectEqual(@as(u64, 1), copy.records[0].returns);
+    try a.expectEqual(@as(u64, 6), copy.records[0].assigned_dispatches);
+    try a.expectEqualDeep(copy, outer.native_programs);
+    for (0..12) |i| nativeProgram(.{ .identity = i + 100, .entered = true, .returned = true, .selected_steps = 1, .selected_pairs = 0, .assigned_dispatches = 1 });
+    try a.expectEqual(@as(u8, 8), outer.native_programs.count);
+    try a.expect(outer.native_programs.unrecorded_calls > 0);
+}
+
+pub const NativeProgramFallback = enum { no_prepared_native_program, unsupported_call, begin_call_declined };
+pub inline fn nativeProgramFallback(reason: NativeProgramFallback, failure: ?anyerror) void {
+    if (active_kernels == null) return;
+    nativeProgramFallbackEnabled(reason, failure);
+}
+noinline fn nativeProgramFallbackEnabled(reason: NativeProgramFallback, failure: ?anyerror) void {
+    var cursor = active_kernels;
+    while (cursor) |scope| : (cursor = scope.previous) {
+        const out = &scope.native_programs;
+        switch (reason) {
+            .no_prepared_native_program => out.fallback_no_prepared_native_program +|= 1,
+            .unsupported_call => out.fallback_unsupported_call +|= 1,
+            .begin_call_declined => {
+                out.fallback_begin_call_declined +|= 1;
+                if (failure) |err| out.last_begin_call_error = FailureText.init(@errorName(err));
+            },
+        }
+    }
+}
+
+test "Native legacy selection reasons stay factual copied and disabled without constructor attribution" {
+    const t = @import("std").testing;
+    try t.expect(!kernelEnabled());
+    nativeProgramFallback(.no_prepared_native_program, null);
+    var scope = KernelScope{};
+    scope.begin();
+    defer _ = scope.finish();
+    nativeProgramFallback(.no_prepared_native_program, null);
+    nativeProgramFallback(.unsupported_call, null);
+    nativeProgramFallback(.begin_call_declined, error.AuthoredPagedWriteRequiresExclusiveBlock);
+    const copied = scope.native_programs;
+    scope.native_programs = .{};
+    try t.expectEqual(@as(u64, 1), copied.fallback_no_prepared_native_program);
+    try t.expectEqual(@as(u64, 1), copied.fallback_unsupported_call);
+    try t.expectEqual(@as(u64, 1), copied.fallback_begin_call_declined);
+    try t.expectEqual(@as(u8, 0), copied.count);
+}
+
+test "Native Call address reuse never combines different selected static program metadata" {
+    const t = @import("std").testing;
+    var scope = KernelScope{};
+    scope.begin();
+    defer _ = scope.finish();
+    nativeProgram(.{ .identity = 91, .entered = true, .returned = true, .selected_steps = 4, .selected_pairs = 1, .assigned_dispatches = 4 });
+    nativeProgram(.{ .identity = 91, .entered = true, .returned = true, .selected_steps = 7, .selected_pairs = 2, .assigned_dispatches = 7 });
+    try t.expectEqual(@as(u8, 2), scope.native_programs.count);
+    try t.expectEqual(@as(usize, 4), scope.native_programs.records[0].selected_steps);
+    try t.expectEqual(@as(usize, 7), scope.native_programs.records[1].selected_steps);
+    for (scope.native_programs.records[0..2]) |record| try t.expectEqual(@as(u64, 1), record.returns);
+}
+
+test "Native Call bank observations copy optional lifetime gauges through nested scopes" {
+    const a = @import("std").testing;
+    const ledger = try @import("storage_accounting.zig").Ledger.create(a.allocator);
+    defer ledger.release();
+    ledger.allocated(.workspace, 32, null);
+    var live = true;
+    defer if (live) ledger.freed(.workspace, 32, null);
+    const sample = NativeProgramBank{ .frame_allocations = 1, .frame_requested_allocation_bytes = 32, .frame_reuse_accesses = 2, .owned_ledger = ledger.snapshot() };
+    nativeProgramBank(sample); // Disabled: no collector and no producer access.
+    var outer = KernelScope{};
+    outer.begin();
+    defer {
+        if (outer.attached) _ = outer.finish();
+    }
+    try a.expect(outer.native_program_bank == null);
+    var inner = KernelScope{};
+    inner.begin();
+    defer {
+        if (inner.attached) _ = inner.finish();
+    }
+    nativeProgramBank(sample);
+    _ = inner.finish();
+    ledger.freed(.workspace, 32, null);
+    live = false;
+    try a.expectEqualDeep(sample, inner.native_program_bank.?);
+    try a.expectEqualDeep(sample, outer.native_program_bank.?);
+    try a.expectEqual(@as(?u64, null), inner.native_program_bank.?.owned_ledger.?.workspace.backing_live_bytes);
+    try a.expectEqual(@as(?u64, null), inner.native_program_bank.?.owned_ledger.?.workspace.backing_peak_bytes);
+    try a.expectEqual(@as(u64, 32), inner.native_program_bank.?.owned_ledger.?.workspace.requested_live_bytes);
+    try a.expectEqual(@as(u64, 0), ledger.snapshot().workspace.requested_live_bytes);
+    _ = outer.finish();
+    var fresh = KernelScope{};
+    fresh.begin();
+    defer _ = fresh.finish();
+    try a.expect(fresh.native_program_bank == null);
 }

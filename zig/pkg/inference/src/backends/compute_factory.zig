@@ -197,6 +197,10 @@ pub fn beginRequestWithCleanup(session: @import("session.zig").Session, backend:
             return;
         }
     }
+    if (comptime build_options.enable_native) if (backend.vtable == &native.vtable_impl) {
+        try @import("../execution/architecture_session.zig").validateNativePanelPreparationReceiver(session);
+        try native.NativeCompute.configurePanelPreparationPolicy(backend, session.run_admission != null);
+    };
     // Invalidate request-local capture/budget state even when an early cache
     // hit will bypass normal KV-hook provisioning.
     try backend.beginRequest();

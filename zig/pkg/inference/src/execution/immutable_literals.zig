@@ -18,6 +18,7 @@ pub const Literal = struct {
     allocation: buffers.AllocationId,
     backend_index: usize,
     cold_bound: usize,
+    staging_bound: usize = 0,
     consumers: []const ml.graph.NodeId = &.{},
 };
 pub const Publication = struct { node: ml.graph.NodeId, literal: usize, allocation: buffers.AllocationId, shape: ml.graph.Shape };
@@ -73,7 +74,16 @@ pub const SharedLiteralStore = struct {
             const bytes = try std.math.mul(usize, attrs.data_len, @sizeOf(f32));
             const bound = try ops.physical_storage.reservationBytes(backends[backend], .{ .byte_size = bytes });
             if (bound < bytes) return error.InvalidPhysicalStorageReservation;
-            literals[index] = .{ .node = @intCast(node_id), .shape = node.output_shape, .data = graph.constantData(attrs.data_offset, attrs.data_len), .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes), .backend_index = backend, .cold_bound = bound };
+            var staging_bound: usize = 0;
+            if (backends[backend].kind() == .metal) {
+                const functions = backends[backend].vtable.kernels.?;
+                if (functions.physicalLiteralInitializer) |query| if (try query(backends[backend].ptr, bytes)) |initializer| {
+                    if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted)
+                        return error.InvalidPhysicalLiteralInitialization;
+                    staging_bound = try ops.physical_storage.reservationBytes(backends[backend], initializer.staging);
+                };
+            }
+            literals[index] = .{ .node = @intCast(node_id), .shape = node.output_shape, .data = graph.constantData(attrs.data_offset, attrs.data_len), .allocation = try plan.addConstantBinding(backends[backend].kind(), bytes), .backend_index = backend, .cold_bound = bound, .staging_bound = staging_bound };
             indices[node_id] = @intCast(index);
             index += 1;
         }
@@ -192,7 +202,7 @@ pub const SharedLiteralStore = struct {
         allocator.destroy(self);
     }
 
-    pub const AdmissionSpan = struct { backend: @import("../graph/backend_contracts.zig").BackendKind, bytes: usize };
+    pub const AdmissionSpan = struct { backend: @import("../graph/backend_contracts.zig").BackendKind, bytes: usize, staging_bytes: usize = 0 };
     /// Short metadata snapshot only. Caller holds the selected store's strong
     /// immutable claim; no SDK, allocator or admission callback runs locked.
     pub fn unadmittedSpan(self: *SharedLiteralStore, index: usize, identity: admission.Identity) !?AdmissionSpan {
@@ -212,7 +222,7 @@ pub const SharedLiteralStore = struct {
             if (bytes > literal.cold_bound) return error.InvalidPhysicalStorageReservation;
             return .{ .backend = self.backends[literal.backend_index].kind(), .bytes = bytes };
         }
-        return .{ .backend = self.backends[literal.backend_index].kind(), .bytes = literal.cold_bound };
+        return .{ .backend = self.backends[literal.backend_index].kind(), .bytes = literal.cold_bound, .staging_bytes = literal.staging_bound };
     }
 
     pub const ClaimTotals = struct {
@@ -316,7 +326,7 @@ pub const SharedLiteralStore = struct {
             const lease = owner.lease orelse continue;
             const bytes = lease.backing_byte_size orelse lease.byte_size;
             if (bytes > literal.cold_bound) return error.InvalidPhysicalStorageReservation;
-            const reduction = literal.cold_bound - bytes;
+            const reduction = try std.math.add(usize, literal.cold_bound - bytes, literal.staging_bound);
             const host = self.backends[literal.backend_index].kind() == .native;
             if (host) result.capacity_reduction.host_scratch_bytes = try std.math.add(usize, result.capacity_reduction.host_scratch_bytes, reduction) else result.capacity_reduction.backend_scratch_bytes = try std.math.add(usize, result.capacity_reduction.backend_scratch_bytes, reduction);
             if (lease.admission) |reserved| {
@@ -394,6 +404,19 @@ pub const SharedLiteralStore = struct {
             self.mutex.unlock();
             return result;
         }
+        // Refresh construction capability before any SDK allocation. An active
+        // frame or changed staging policy cannot silently use legacy staging.
+        const literal_bytes = try std.math.mul(usize, literal.data.len, @sizeOf(f32));
+        const initializer: ?ops.physical_storage.LiteralInitializer = if (literal.staging_bound != 0) blk: {
+            const binding_supported = functions.physicalLiteralBindingSupported orelse return error.UnsupportedPhysicalLiteralInitialization;
+            if (!binding_supported(cb.ptr)) return error.UnsupportedPhysicalLiteralInitialization;
+            const query = functions.physicalLiteralInitializer orelse return error.UnsupportedPhysicalLiteralInitialization;
+            const current = (try query(cb.ptr, literal_bytes)) orelse return error.UnsupportedPhysicalLiteralInitialization;
+            if (current.staging.byte_size != literal_bytes or current.staging.usage != .host_input or current.staging.admitted or
+                try ops.physical_storage.reservationBytes(cb, current.staging) != literal.staging_bound)
+                return error.InvalidPhysicalLiteralInitialization;
+            break :blk current;
+        } else null;
         if (self.completions[literal.backend_index] == null) {
             if (functions.createPhysicalCompletion) |make| self.completions[literal.backend_index] = try make(cb.ptr);
         }
@@ -406,7 +429,13 @@ pub const SharedLiteralStore = struct {
         const tensor = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = dimensions[0..literal.shape.rank()] })) orelse return error.UnsupportedPhysicalTensorView;
         errdefer if (!published) cb.freeWithCleanup(tensor, construction_cleanup);
         var failure: ?anyerror = null;
-        functions.writePhysicalFloat32.?(cb.ptr, tensor, literal.data) catch |err| {
+        if (initializer) |initialize| {
+            const stage = (try ops.physical_storage.Lease.createAdmittedWithUsage(self.allocator, cb, initialize.staging.byte_size, ledger, .activation, capability, .host_input)) orelse return error.PhysicalStorageAllocationDeclined;
+            defer stage.releaseWithCleanup(construction_cleanup);
+            initialize.initialize(cb.ptr, lease, stage, literal.data) catch |err| {
+                failure = err;
+            };
+        } else functions.writePhysicalFloat32.?(cb.ptr, tensor, literal.data) catch |err| {
             failure = err;
         };
         // Even a failed upload can have queued work. Record its attempted
@@ -949,4 +978,214 @@ test "Metal immutable literal failed prepared attachment quarantines reuse and a
     try preparedLiteralMetalAttachmentRollbackCase(false, true);
     try preparedLiteralMetalAttachmentRollbackCase(true, true);
     try preparedLiteralMetalAttachmentRollbackCase(false, false);
+}
+
+test "Metal literal Shared staging keeps Private bank immutable and warm credit excludes dead stage under actual epochs" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig");
+    const Sink = @import("retirement_sink.zig");
+    const Prepared = @import("prepared_storage_admission.zig").Prepared;
+    const domain = try Domain.Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const Source = struct {
+        pin: *const Domain.Pin,
+        run: Memory.AdmissionLease = undefined,
+        credit: Memory.AdmissionAmounts,
+        limit: usize,
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: accounting.Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.run, .{ .controller = self.pin.controller(), .backend_class = .gpu, .limits = .{ .backend_limit_bytes = self.limit }, .check_live_memory = false, .credit = &self.credit, .lifetime = admission.Lifetime.forAdmissionDomain(self.pin.*) }, kind, class, bytes);
+        }
+    };
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const functions = cb.vtable.kernels.?;
+    const query = functions.physicalLiteralInitializer orelse return error.MissingLiteralInitializer;
+    const initializer = (try query(cb.ptr, 16)) orelse return error.SkipZigTest;
+    const bound = try ops.physical_storage.reservationBytes(cb, .{ .byte_size = 16 });
+    const stage_bound = try ops.physical_storage.reservationBytes(cb, initializer.staging);
+    const total = try std.math.add(usize, bound, stage_bound);
+    try std.testing.expectError(error.ResourceLimitExceeded, pin.controller().tryAcquire(.gpu, .{ .backend_limit_bytes = total - 1 }, .{ .backend_scratch_bytes = total }, false));
+    var source = Source{ .pin = &pin, .credit = .{ .backend_scratch_bytes = total }, .limit = total };
+    source.run = try pin.controller().tryAcquire(.gpu, .{ .backend_limit_bytes = total }, .{ .backend_scratch_bytes = total }, false);
+    defer source.run.release();
+    const ordinary = admission.Capability{ .identity = .{ .controller = pin.controller(), .backend_class = .gpu }, .context = &source, .services = &.{ .reserve = Source.reserve } };
+    const prepared = (try Prepared.prepare(ordinary, &.{ .{ .backend = .metal, .class = .constant, .bytes = bound }, .{ .backend = .metal, .class = .activation, .bytes = stage_bound } })).?;
+    var prepared_live = true;
+    var prepared_bound = false;
+    defer if (prepared_live and !prepared_bound) prepared.abortBeforeExecution() catch @panic("literal preparation rollback");
+    var owners = [_]Owner{.{}};
+    const data = [_]f32{ -1, 2, 3.5, -4 };
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{ 2, 2 }), .data = &data, .allocation = 0, .backend_index = 0, .cold_bound = bound, .staging_bound = stage_bound }};
+    var backends = [_]ops.ComputeBackend{cb};
+    var completions = [_]?ops.physical_storage.Completion{null};
+    var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var held: ?CT = null;
+    defer {
+        var guard = sink.enter() catch @panic("literal error cleanup");
+        var epoch = guard.retainEpoch() catch @panic("literal error epoch");
+        for (completions) |maybe| if (maybe) |completion| {
+            completion.wait() catch @panic("literal completion");
+            completion.deinit();
+        };
+        if (held) |value| cb.freeWithBoundary(value, &epoch);
+        if (owners[0].value) |value| cb.freeWithBoundary(value, &epoch);
+        if (owners[0].lease) |lease| lease.releaseWithBoundary(&epoch);
+        if (prepared_live and prepared_bound) prepared.releaseAfterExecution(&epoch);
+        guard.finish();
+        epoch.release();
+    }
+    var guard_a = try sink.enter();
+    defer guard_a.finish();
+    var epoch_a = try guard_a.retainEpoch();
+    defer epoch_a.release();
+    try prepared.bindConstructionEpoch(&epoch_a);
+    prepared_bound = true;
+    const capability = Prepared.forDispatch(prepared, ordinary.identity);
+    const first = try store.value(0, capability, null);
+    try std.testing.expect(first.fresh and first.lease.usage == .ordinary and first.lease.retirement_owner != null);
+    held = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = first.lease, .shape = &.{4} })).?;
+    const actual = try cb.toFloat32(first.value, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &data, actual);
+    const counters = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    const warm = try store.value(0, capability, null);
+    try std.testing.expect(!warm.fresh and warm.lease == first.lease);
+    try std.testing.expectEqual(counters.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+    try std.testing.expectError(error.ReadOnlyPhysicalStorage, functions.copyPhysicalInput.?(cb.ptr, held.?, first.value));
+    var claim = try store.claimImmutable(capability.identity);
+    defer claim.release();
+    const totals = claim.totals;
+    try std.testing.expect(totals.capacity_reduction.backend_scratch_bytes >= stage_bound);
+    const physical = first.lease.backing_byte_size.?;
+    prepared.releaseAfterExecution(&epoch_a);
+    prepared_live = false;
+    guard_a.finish();
+    try std.testing.expectEqual(physical, pin.controller().snapshot().backend_scratch_bytes);
+    // A foreign live frame must not convert construction to asynchronous copy.
+    const refused_destination = (try ops.physical_storage.Lease.createTracked(a, cb, 16, null, .constant)).?;
+    defer refused_destination.release();
+    const refused_stage = (try ops.physical_storage.Lease.createAdmittedWithUsage(a, cb, 16, null, .activation, null, .host_input)).?;
+    defer refused_stage.release();
+    const before_foreign = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    try std.testing.expectError(error.InvalidPhysicalLiteralInitialization, initializer.initialize(cb.ptr, first.lease, refused_stage, &data));
+    try std.testing.expectEqual(before_foreign.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    var frame_live = true;
+    defer if (frame_live) cb.decoderRuntimeCancelFrame() catch @panic("literal frame cancel");
+    try std.testing.expect((try query(cb.ptr, 16)) != null);
+    try std.testing.expect(!functions.physicalLiteralBindingSupported.?(cb.ptr));
+    try std.testing.expectError(error.UnsupportedPhysicalLiteralInitialization, initializer.initialize(cb.ptr, refused_destination, refused_stage, &data));
+    try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
+    try cb.decoderRuntimeCancelFrame();
+    frame_live = false;
+    // A real submitted blit retains runtime bookkeeping after active ownership
+    // ends. Do not birth another transient Shared stage under that record.
+    const queued_destination = (try ops.physical_storage.Lease.createTracked(a, cb, 16, null, .activation)).?;
+    defer queued_destination.release();
+    const queued_output = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = queued_destination, .shape = &.{4} })).?;
+    defer cb.free(queued_output);
+    const queued_source = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = refused_stage, .shape = &.{4} })).?;
+    defer cb.free(queued_source);
+    try functions.writePhysicalFloat32.?(cb.ptr, queued_source, &data);
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    frame_live = true;
+    try functions.copyPhysicalInput.?(cb.ptr, queued_output, queued_source);
+    try cb.decoderRuntimeSubmitFrame();
+    frame_live = false;
+    var submitted_live = true;
+    defer if (submitted_live) cb.decoderRuntimeWaitSubmittedFrame() catch @panic("literal submitted wait");
+    try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame() and !cb.decoderRuntimeHasActiveFrame());
+    try std.testing.expect((try query(cb.ptr, 16)) != null);
+    try std.testing.expect(!functions.physicalLiteralBindingSupported.?(cb.ptr));
+    try std.testing.expectError(error.UnsupportedPhysicalLiteralInitialization, initializer.initialize(cb.ptr, refused_destination, refused_stage, &data));
+    try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame());
+    try cb.decoderRuntimeWaitSubmittedFrame();
+    submitted_live = false;
+    var guard_b = try sink.enter();
+    defer guard_b.finish();
+    var epoch_b = try guard_b.retainEpoch();
+    defer epoch_b.release();
+    cb.freeWithBoundary(owners[0].value.?, &epoch_b);
+    owners[0].value = null;
+    owners[0].lease.?.releaseWithBoundary(&epoch_b);
+    owners[0].lease = null;
+    guard_b.finish();
+    try std.testing.expectEqual(physical, pin.controller().snapshot().backend_scratch_bytes);
+    var guard_c = try sink.enter();
+    defer guard_c.finish();
+    var epoch_c = try guard_c.retainEpoch();
+    defer epoch_c.release();
+    cb.freeWithBoundary(held.?, &epoch_c);
+    held = null;
+    guard_c.finish();
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+}
+
+test "Metal literal completed copy error releases transient stage and quarantines Private publication without retry" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const canonical = context.computeBackend();
+    const Fault = struct {
+        var original: *const ops.ComputeBackend.VTable = undefined;
+        var calls: usize = 0;
+        fn query(raw: *anyopaque, bytes: usize) !?ops.physical_storage.LiteralInitializer {
+            var value = (try original.kernels.?.physicalLiteralInitializer.?(raw, bytes)) orelse return null;
+            value.initialize = initialize;
+            return value;
+        }
+        fn initialize(raw: *anyopaque, destination: *ops.physical_storage.Lease, stage: *ops.physical_storage.Lease, values: []const f32) !void {
+            calls += 1;
+            const actual = (try original.kernels.?.physicalLiteralInitializer.?(raw, destination.byte_size)).?;
+            try actual.initialize(raw, destination, stage, values);
+            // Fault AFTER the original owned blit has returned from its wait.
+            // This exercises failure custody; it does not simulate a GPU crash.
+            return error.InjectedCompletedLiteralCopyFailure;
+        }
+    };
+    Fault.original = canonical.vtable;
+    Fault.calls = 0;
+    var kernels = canonical.vtable.kernels.?.*;
+    kernels.physicalLiteralInitializer = Fault.query;
+    kernels.implementation_table = null;
+    kernels.acceptsImplementation = null;
+    var table = canonical.vtable.*;
+    table.kernels = &kernels;
+    const backend = ops.ComputeBackend{ .ptr = canonical.ptr, .vtable = &table };
+    const descriptor = (try Fault.query(backend.ptr, 16)) orelse return error.SkipZigTest;
+    var owners = [_]Owner{.{}};
+    const data = [_]f32{ 1, 3, 5, 7 };
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = &data, .allocation = 0, .backend_index = 0, .cold_bound = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = 16 }), .staging_bound = try ops.physical_storage.reservationBytes(backend, descriptor.staging) }};
+    var backends = [_]ops.ComputeBackend{backend};
+    var completions = [_]?ops.physical_storage.Completion{null};
+    var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };
+    defer {
+        for (completions) |maybe| if (maybe) |completion| {
+            completion.wait() catch @panic("failed literal completion");
+            completion.deinit();
+        };
+        if (owners[0].value) |value| backend.freeWithCleanup(value, .{ .outside_execution = true });
+        if (owners[0].lease) |lease| lease.releaseWithCleanup(.{ .outside_execution = true });
+    }
+    const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    try std.testing.expectError(error.InjectedCompletedLiteralCopyFailure, store.value(0, null, null));
+    try std.testing.expect(owners[0].lease != null and owners[0].value != null);
+    try std.testing.expectEqual(@as(usize, 1), Fault.calls);
+    const failed = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    try std.testing.expectEqual(before.device_owned_buffers_created + 2, failed.device_owned_buffers_created);
+    try std.testing.expectEqual(before.device_owned_buffers_released + 1, failed.device_owned_buffers_released);
+    try std.testing.expectError(error.InjectedCompletedLiteralCopyFailure, store.value(0, null, null));
+    try std.testing.expectEqual(@as(usize, 1), Fault.calls);
+    try std.testing.expectEqual(failed.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
 }

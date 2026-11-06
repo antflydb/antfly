@@ -88,7 +88,21 @@ pub const PendingInterval = struct {
 };
 pub const PublicationScope = enum { program_execution, session_numerical_dispatch, shared_batch_numerical_dispatch };
 
+/// Copied from the actual retaining Runtime Definition. These are cumulative
+/// successful constructor publications; NEVER this invocation's template hits.
+pub const NativeDefinitionTemplates = struct {
+    scope: enum { retained_definition_lifetime_successful_constructor_publications } = .retained_definition_lifetime_successful_constructor_publications,
+    availability: enum { sampled, busy } = .busy,
+    stats: ?Specializations = null,
+};
+pub const NativeProgramConstruction = struct {
+    scope: enum { retained_runtime_constructor_result } = .retained_runtime_constructor_result,
+    outcome: enum { not_attempted, declined, prepared },
+    error_name: ?Text = null,
+};
 pub const Snapshot = struct {
+    native_program_construction: ?NativeProgramConstruction = null,
+    native_definition_templates: ?NativeDefinitionTemplates = null,
     report: ?@import("invocation_report.zig").Report = null,
     specializations: ?Specializations = null,
     /// Legacy architecture execution has no program plan/counters.
@@ -196,6 +210,8 @@ fn observedRuntime(after: ops.RuntimeTelemetry, before: ?Start) ops.RuntimeTelem
             runtime.native_quant_worker_callbacks = kernels.quant_worker_callbacks;
             runtime.native_attention_programs = kernels.attention_programs;
             runtime.native_activation_programs = kernels.activation_programs;
+            runtime.authored_native_programs = kernels.native_programs;
+            runtime.authored_native_program_bank = kernels.native_program_bank;
             runtime.owned_native_fallbacks = kernels.native_fallbacks;
         }
         if (start.metal_buffers) |buffers| runtime.metal_buffer_interval = buffers.snapshot(@import("build_options").enable_metal);

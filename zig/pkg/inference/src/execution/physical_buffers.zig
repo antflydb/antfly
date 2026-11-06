@@ -541,7 +541,10 @@ pub const Pool = struct {
                     if (literal.allocation != index) continue;
                     if (self.selection != null and !self.literalEnabled(literal_index)) return error.InvalidImmutableStorageClaim;
                     const required = try store.unadmittedSpan(literal_index, identity);
-                    if (required) |value| try builder.append(.{ .backend = value.backend, .class = .constant, .bytes = value.bytes });
+                    if (required) |value| {
+                        try builder.append(.{ .backend = value.backend, .class = .constant, .bytes = value.bytes });
+                        if (value.staging_bytes != 0) try builder.append(.{ .backend = value.backend, .class = .activation, .bytes = value.staging_bytes });
+                    }
                     found = true;
                     break;
                 }
@@ -648,7 +651,12 @@ pub const Pool = struct {
         };
         for (self.transfers) |maybe| if (maybe) |transfer| try self.addStorageRequirement(seen, transfer.backend_index, transfer.allocation, &amounts);
         if (self.literal_store) |store| {
-            for (store.literals, 0..) |literal, literal_index| if (self.selection == null or self.literalEnabled(literal_index)) try self.addStorageRequirement(seen, literal.backend_index, literal.allocation, &amounts);
+            for (store.literals, 0..) |literal, literal_index| if (self.selection == null or self.literalEnabled(literal_index)) {
+                try self.addStorageRequirement(seen, literal.backend_index, literal.allocation, &amounts);
+                // Conservative additive cold prepayment, not concurrent SDK
+                // high-water: stages die sequentially, but actualB seals later.
+                amounts.backend_scratch_bytes = try std.math.add(usize, amounts.backend_scratch_bytes, literal.staging_bound);
+            };
             for (store.publications) |maybe| if (maybe) |publication| {
                 if (self.selection != null and !self.literalEnabled(publication.literal)) continue;
                 const literal = store.literals[publication.literal];
@@ -2289,7 +2297,13 @@ pub const Frame = struct {
         const owner = store.backends[literal.backend_index];
         if (cb.ptr != owner.ptr or cb.vtable != owner.vtable) return null;
         const functions = cb.vtable.kernels.?;
-        if (functions.physicalLiteralBindingSupported) |eligible| if (!eligible(cb.ptr)) return null;
+        if (functions.physicalLiteralBindingSupported) |eligible| if (!eligible(cb.ptr)) {
+            // The cached complete proof removed the compatibility workspace.
+            // A changed receiver must never fall through to an unplanned raw
+            // constant upload. Compatibility plans retain their original floor.
+            if (self.pool.completeOwnedPayload() != null) return error.PreparedPhysicalLiteralChanged;
+            return null;
+        };
         const value = try self.literalValue(index);
         const lease = self.storages[literal.allocation].?;
         var dimensions: [8]i32 = undefined;
@@ -2300,6 +2314,9 @@ pub const Frame = struct {
         const store = self.pool.literal_store orelse return null;
         if (node >= store.publications.len) return null;
         const publication = store.publications[node] orelse return null;
+        // A declaration is not permission to consume its bank. Compatibility
+        // selections may leave the literal disabled and retain their raw path.
+        if (!self.pool.literalEnabled(publication.literal)) return null;
         const literal = store.literals[publication.literal];
         const owner = store.backends[literal.backend_index];
         if (cb.ptr != owner.ptr or cb.vtable != owner.vtable) return null;
@@ -2579,6 +2596,45 @@ pub const Frame = struct {
     pub fn executeWithAttention(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: ?*const ops.AttentionContext) !?CT {
         return self.executeProgram(cb, values, id, rope_position, attention, false);
     }
+    /// Two adjacent original pair outputs, already described by the same
+    /// logical graph/Analysis. The private authored schedule selects this group;
+    /// neither member may also execute through the individual step loop.
+    pub fn executeNativeLinearPair(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, first: NodeId, second: NodeId, current: @import("cleanup_context.zig").Context) ![2]CT {
+        return self.nativeLinearPair(cb, values, first, second, current, true);
+    }
+    pub fn validateNativeLinearPair(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, first: NodeId, second: NodeId, current: @import("cleanup_context.zig").Context) !void {
+        _ = try self.nativeLinearPair(cb, values, first, second, current, false);
+    }
+    fn nativeLinearPair(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, first: NodeId, second: NodeId, current: @import("cleanup_context.zig").Context, launch: bool) ![2]CT {
+        if (self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.pool.backends[0].ptr != cb.ptr or self.pool.backends[0].vtable != cb.vtable or first == second) return error.UnpreparedNativeProgramViews;
+        const ids = [_]NodeId{ first, second };
+        var inputs: [2][3]CT = undefined;
+        var assigned: [2]route.AssignedOutput = undefined;
+        var invocations: [2]kernels.Invocation = undefined;
+        var results: [2]CT = undefined;
+        for (ids, 0..) |id, i| {
+            const kernel = if (self.pool.kernels[id]) |*value| value else return error.MissingPreparedKernelRoute;
+            if (kernel.descriptor.operation != .linear or kernel.descriptor.operation.linear.bias or kernel.descriptor.input_count != 2 or kernel.workspace_bytes != 0) return error.UnsupportedNativeProgramWorkspace;
+            for (kernel.auxiliaries) |item| if (item != null) return error.UnsupportedNativeProgramWorkspace;
+            if (self.assigned[id] != null) return error.UnsupportedNativeProgramWorkspace;
+            for (kernel.inputs[0..2], 0..) |node, position| inputs[i][position] = values[node] orelse return error.MissingValue;
+            const output_storage = self.storages[kernel.output_allocation] orelse return error.PreparedStorageUnavailable;
+            assigned[i] = try self.assignedOutput(id, output_storage);
+            results[i] = self.native_program_views[id] orelse return error.UnpreparedNativeProgramViews;
+            if (kernel.host_workspace_bytes > self.host_workspace.len) return error.MissingAssignedHostWorkspace;
+            invocations[i] = .{ .host_workspace = self.host_workspace[0..kernel.host_workspace_bytes], .descriptor = &kernel.descriptor, .operator_plan = if (kernel.operator_plan) |*plan| plan else null, .prepared_route = self.pool.preparedKernelRoute(id) orelse return error.MissingPreparedKernelRoute, .assigned_output = &assigned[i], .inputs = inputs[i][0..2], .output = results[i] };
+        }
+        if (launch) {
+            if (invocations[0].host_workspace.len != 0) {
+                if (!self.host_workspace_fresh) self.stats.reused_allocations += 1;
+                self.host_workspace_fresh = false;
+            }
+            try @import("../ops/native_compute.zig").NativeCompute.runAssignedLinearPair(cb, invocations[0], invocations[1], current);
+            self.stats.dispatches += 1;
+        } else try @import("../ops/native_compute.zig").NativeCompute.validateAssignedLinearPair(cb, invocations[0], invocations[1], current);
+        return results;
+    }
+
     pub fn executeNativeProgram(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: *const ops.AttentionContext) !CT {
         if (self.native_program_views.len == 0 or cb.kind() != .native) return error.UnpreparedNativeProgramViews;
         return (try self.executeProgram(cb, values, id, rope_position, attention, true)) orelse error.IncompleteNativeProgram;

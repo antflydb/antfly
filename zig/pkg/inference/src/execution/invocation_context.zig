@@ -20,6 +20,9 @@ pub const NativeWeights = struct {
     prepare_dense: ?*const fn (*anyopaque, *const @import("../ops/ops.zig").ComputeBackend, *const @import("../ops/ops.zig").NativeLinearPreparation) anyerror!?@import("../ops/ops.zig").NativeLinearPrepared = null,
     /// Synchronous copied operation geometry; no tensors/loan escape callback.
     prepare_projection: ?*const fn (*anyopaque, *const @import("../ops/ops.zig").ComputeBackend, *const @import("../ops/ops.zig").LinearTripleInvocation) anyerror!bool = null,
+    /// Exact copied request-local cache recipe; scope ends at the SAME
+    /// producer return. No callback/CT/creation epoch enters a cache owner.
+    prepare_cache: ?*const fn (*anyopaque, *const @import("../ops/ops.zig").ComputeBackend, @import("../ops/ops.zig").NativeWeightCachePreparation) anyerror!?@import("../ops/ops.zig").EmbeddingCacheScope = null,
     ptr: *anyopaque,
     access: *const fn (*anyopaque, *const @import("../ops/ops.zig").ComputeBackend, []const u8, Access) anyerror!?@import("../ops/ops.zig").CT,
 };

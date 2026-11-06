@@ -38,6 +38,8 @@ const RuntimeContext = struct {
     allocator: std.mem.Allocator,
     cb: ops.ComputeBackend,
     native_program: ?*@import("../execution/native_decoder_program.zig").Program = null,
+    native_program_attempted: bool = false,
+    native_program_decline: ?anyerror = null,
     definition: *session_decoder.Definition,
     kv_manager: runtime.kv.manager.KvManager,
     pool_id: runtime.kv.block.KvPoolId,
@@ -98,7 +100,11 @@ const RuntimeContext = struct {
         try ctx.decode_runtime.state.ensureQwen35LinearCache(gpt_config);
         if (cb.kind() == .native and kv_dtype == .f32) {
             const program_context = @import("execution.zig").Context{ .allocator = allocator, .cb = &ctx.cb, .gpt_config = &ctx.definition.configuration.value, .session = session };
-            ctx.native_program = try @import("../execution/native_decoder_program.zig").Program.tryCreateWithTemplate(allocator, &program_context, definition.nativeTemplateSlot(source));
+            ctx.native_program_attempted = true;
+            switch (try @import("../execution/native_decoder_program.zig").Program.prepareWithTemplate(allocator, &program_context, definition.nativeTemplateSlot(source))) {
+                .prepared => |value| ctx.native_program = value,
+                .declined => |reason| ctx.native_program_decline = reason,
+            }
         }
         return ctx;
     }
@@ -260,6 +266,28 @@ pub fn authoredProgramStatistics(model: model_runtime.ModelRuntime) ?@import("..
     return program.statistics();
 }
 
+/// Explicit nonblocking metadata query on the ACTUAL retaining Definition.
+/// A Program retains only Template, never a caller-owned TemplateSlot pointer.
+fn constructionSnapshot(context: *const RuntimeContext) @import("../execution/diagnostics.zig").NativeProgramConstruction {
+    return .{ .outcome = if (context.native_program != null) .prepared else if (context.native_program_attempted) .declined else .not_attempted, .error_name = if (context.native_program_decline) |err| @import("../execution/diagnostics.zig").Text.init(@errorName(err)) else null };
+}
+/// Explicit metadata query: actual retained Runtime constructor result, never
+/// a numerical invocation hit or a guessed reason for a coarse absence.
+pub fn authoredProgramConstruction(model: model_runtime.ModelRuntime) ?@import("../execution/diagnostics.zig").NativeProgramConstruction {
+    if (model.vtable != &runtime_vtable) return null;
+    const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
+    if (context.cb.kind() != .native) return null;
+    return constructionSnapshot(context);
+}
+
+pub fn authoredDefinitionTemplateStatistics(model: model_runtime.ModelRuntime) ?@import("../execution/diagnostics.zig").NativeDefinitionTemplates {
+    if (model.vtable != &runtime_vtable) return null;
+    const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
+    if (context.cb.kind() != .native) return null;
+    const value = context.definition.native_template.tryStatistics();
+    return .{ .availability = if (value != null) .sampled else .busy, .stats = value };
+}
+
 pub fn supportsSession(session: backends.Session) bool {
     return supportsBackend(session.backend());
 }
@@ -320,6 +348,7 @@ fn runtimePrefill(
             request.seq_len,
             request.query_seq_len,
             &decode_context,
+            .prefill,
         ),
     };
 }
@@ -334,7 +363,7 @@ fn runtimeDecode(
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
     try request.check();
     const input_ids = [_]i64{request.token_id};
-    return .{ .logits = try forwardLastLogits(runtime_ctx, allocator, input_ids[0..], step.seq_len, 1, &step.decode_context) };
+    return .{ .logits = try forwardLastLogits(runtime_ctx, allocator, input_ids[0..], step.seq_len, 1, &step.decode_context, .decode_step) };
 }
 
 fn runtimeDecodeSample(
@@ -390,7 +419,24 @@ fn forwardLastLogits(
     seq_len: usize,
     query_seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
+    operation: @import("../execution/diagnostics.zig").Operation,
 ) ![]f32 {
+    const selected = runtime_ctx.definition.session.invocation_diagnostics;
+    if (selected) |binding| if (binding.diagnostics.isEnabled()) {
+        var actual = binding.forBackend(runtime_ctx.cb);
+        actual.capture_programs = true;
+        actual.native_definition_templates = null;
+        actual.native_program_construction = null;
+        if (runtime_ctx.cb.kind() == .native) {
+            actual.native_program_construction = constructionSnapshot(runtime_ctx);
+            const value = runtime_ctx.definition.native_template.tryStatistics();
+            actual.native_definition_templates = .{ .availability = if (value != null) .sampled else .busy, .stats = value };
+        }
+        return @import("../execution/invocation_observation.zig").callOperation(actual, operation, forwardLastLogitsUnobserved, .{ runtime_ctx, allocator, input_ids, seq_len, query_seq_len, decode_context });
+    };
+    return forwardLastLogitsUnobserved(runtime_ctx, allocator, input_ids, seq_len, query_seq_len, decode_context);
+}
+fn forwardLastLogitsUnobserved(runtime_ctx: *RuntimeContext, allocator: std.mem.Allocator, input_ids: []const i64, seq_len: usize, query_seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
     std.debug.assert(query_seq_len == decode_context.query_sequence_len);
     var decoder = decoder_forward.Runtime{ .native_program = runtime_ctx.native_program, .context = .{
         .allocator = allocator,

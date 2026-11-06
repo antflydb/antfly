@@ -1780,6 +1780,28 @@ pub const EmbeddingCacheInputs = struct {
     previous: ?*EmbeddingCacheInputs = null,
     stage: ?*anyopaque = null,
 };
+/// Synchronous operation recipe. All CTs/names remain borrowed only until
+/// the returned scope closes; no cache owner stores this recipe or its caller.
+pub const NativePanelPreparation = struct {
+    operation: enum { linear, triple_no_bias } = .linear,
+    weights: [3]?CT = @splat(null),
+    names: []const []const u8 = &.{},
+    widths: []const usize = &.{},
+    in_dim: usize,
+    out_dim: usize = 0,
+};
+pub const NativeModelConstantPreparation = struct { key: []const u8, value: ?CT };
+pub const NativeWeightCachePreparation = union(enum) {
+    weight: []const u8,
+    acquire: []const u8,
+    embedding: []const u8,
+    panels: NativePanelPreparation,
+    constant: NativeModelConstantPreparation,
+};
+pub const NativeWeightCacheControl = struct {
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque, *const ComputeBackend, NativeWeightCachePreparation) anyerror!EmbeddingCacheScope,
+};
 pub const EmbeddingStageControl = struct {
     ptr: *anyopaque,
     pause_fn: *const fn (*anyopaque) anyerror!void,
@@ -1955,6 +1977,7 @@ pub const ComputeBackend = struct {
     /// on a local header by a typed owner; ptr/vtable/affinity remain unchanged.
     call_context: ?*const @import("../execution/invocation_context.zig").Context = null,
     embedding_stage: ?*const EmbeddingStageControl = null,
+    native_weight_cache: ?*const NativeWeightCacheControl = null,
     /// Cooperative GPU handles bind their request budget only while owning
     /// the model step mutex. The shared compute never retains an idle peer's
     /// pointer, and retiring one handle cannot unbind another active peer.
@@ -1985,6 +2008,7 @@ pub const ComputeBackend = struct {
         durable.execution_control = null;
         durable.call_context = null;
         durable.embedding_stage = null;
+        durable.native_weight_cache = null;
         durable.execution_budget = null;
         durable.execution_budget_bind = null;
         durable.execution_owner = 0;
@@ -3797,6 +3821,8 @@ pub const ComputeBackend = struct {
 
     pub fn getWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
+        var native_weight_scope = try self.prepareNativeWeightCache(.{ .weight = name });
+        defer native_weight_scope.close();
         if (self.call_context) |invocation| if (invocation.native_weights) |control| {
             if (try control.access(control.ptr, self, name, .get)) |value| return value;
         };
@@ -3805,6 +3831,8 @@ pub const ComputeBackend = struct {
 
     pub fn acquireWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
+        var native_weight_scope = try self.prepareNativeWeightCache(.{ .acquire = name });
+        defer native_weight_scope.close();
         if (self.call_context) |invocation| if (invocation.native_weights) |control| {
             if (try control.access(control.ptr, self, name, .acquire)) |value| return value;
         };
@@ -3813,6 +3841,8 @@ pub const ComputeBackend = struct {
 
     pub fn getEmbeddingWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
+        var native_weight_scope = try self.prepareNativeWeightCache(.{ .embedding = name });
+        defer native_weight_scope.close();
         if (self.call_context) |invocation| if (invocation.native_weights) |control| {
             if (try control.access(control.ptr, self, name, .embedding)) |value| return value;
         };
@@ -3960,6 +3990,24 @@ pub const ComputeBackend = struct {
         return result;
     }
 
+    fn prepareNativeWeightCache(self: *const ComputeBackend, request: NativeWeightCachePreparation) !EmbeddingCacheScope {
+        if (self.native_weight_cache) |loan| return loan.prepare(loan.ptr, self, request);
+        switch (request) {
+            .weight, .acquire, .embedding => return .{}, // actual Source access owns its getter loan
+            .panels, .constant => {
+                const services = self.vtable.cold_cleanup_services orelse return .{};
+                if (!services.accepts(self.vtable)) return .{};
+                const context = self.call_context orelse return .{};
+                const weights = context.native_weights orelse return .{};
+                const prepare = weights.prepare_cache orelse return .{};
+                return (try prepare(weights.ptr, self, request)) orelse .{};
+            },
+        }
+    }
+    fn prepareNativePanelCache(self: *const ComputeBackend, request: NativePanelPreparation) !EmbeddingCacheScope {
+        return self.prepareNativeWeightCache(.{ .panels = request });
+    }
+
     fn prepareNativeLinear(self: *const ComputeBackend, request: *const NativeLinearPreparation) !?NativeLinearPrepared {
         const services = self.vtable.cold_cleanup_services orelse return null;
         if (!services.accepts(self.vtable)) return null; // before any opaque loan callback
@@ -3971,6 +4019,8 @@ pub const ComputeBackend = struct {
 
     pub fn linear(self: *const ComputeBackend, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
         const request = NativeLinearPreparation{ .kind = .single_bias, .input = input, .weights = .{ weight, null, null }, .biases = .{ bias, null, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .weights = request.weights, .in_dim = request.in_dim, .out_dim = request.out_dim });
+        defer native_panel_scope.close();
         if (try self.prepareNativeLinear(&request)) |receipt| {
             const run = self.vtable.cold_cleanup_services.?.linear_prepared orelse return error.UnsupportedNativeWeightPreparation;
             return self.observeBackendEntry(.linear, run, .{ self, &request, &receipt, self.call_context.?.cleanup });
@@ -3988,6 +4038,8 @@ pub const ComputeBackend = struct {
         out_dim: usize,
         op_plan: ?OperatorPlan,
     ) !CT {
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .weights = .{ weight, null, null }, .in_dim = in_dim, .out_dim = out_dim });
+        defer native_panel_scope.close();
         if (op_plan) |plan| {
             if (self.vtable.linearPlanned) |op| {
                 return op(self.ptr, &.{
@@ -4006,6 +4058,8 @@ pub const ComputeBackend = struct {
 
     pub fn linearNoBias(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
         const request = NativeLinearPreparation{ .kind = .single_no_bias, .input = input, .weights = .{ weight, null, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .weights = request.weights, .in_dim = request.in_dim, .out_dim = request.out_dim });
+        defer native_panel_scope.close();
         if (try self.prepareNativeLinear(&request)) |receipt| {
             const run = self.vtable.cold_cleanup_services.?.linear_prepared orelse return error.UnsupportedNativeWeightPreparation;
             return self.observeBackendEntry(.linear_no_bias, run, .{ self, &request, &receipt, self.call_context.?.cleanup });
@@ -4015,6 +4069,8 @@ pub const ComputeBackend = struct {
 
     /// Writes to caller-owned storage, preserving it across recyclable frames.
     pub fn linearNoBiasInto(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, weight: CT, output: CT, rows: usize, in_dim: usize, out_dim: usize) !void {
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .weights = .{ weight, null, null }, .in_dim = in_dim, .out_dim = out_dim });
+        defer native_panel_scope.close();
         if (self.vtable.linearNoBiasInto) |apply| if (try apply(self.ptr, input, weight, output, rows, in_dim, out_dim)) return;
         const temporary = try self.linearNoBias(input, weight, rows, in_dim, out_dim);
         defer self.free(temporary);
@@ -4030,6 +4086,8 @@ pub const ComputeBackend = struct {
         out_dim: usize,
         op_plan: ?OperatorPlan,
     ) !CT {
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .weights = .{ weight, null, null }, .in_dim = in_dim, .out_dim = out_dim });
+        defer native_panel_scope.close();
         if (op_plan) |plan| {
             if (self.vtable.linearNoBiasPlanned) |op| {
                 return op(self.ptr, &.{
@@ -4076,6 +4134,8 @@ pub const ComputeBackend = struct {
         out_dim: usize,
     ) !CT {
         const request = NativeLinearPreparation{ .matrix_scratch_allowed = false, .kind = .single_bias, .input = input, .weights = .{ base_weight, null, null }, .biases = .{ bias, null, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .weights = request.weights, .in_dim = request.in_dim, .out_dim = request.out_dim });
+        defer native_panel_scope.close();
         if (try self.prepareNativeLinear(&request)) |receipt| {
             const run = self.vtable.cold_cleanup_services.?.linear_lora_prepared orelse return error.UnsupportedNativeWeightPreparation;
             return run(self, &request, &receipt, lora_a, lora_b, alpha, rank, self.call_context.?.cleanup);
@@ -4119,6 +4179,8 @@ pub const ComputeBackend = struct {
         out_dim: usize,
     ) !LinearNoBiasPairResult {
         const request = NativeLinearPreparation{ .kind = .pair_no_bias, .input = input, .weights = .{ weight_a, weight_b, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .weights = request.weights, .in_dim = request.in_dim, .out_dim = request.out_dim });
+        defer native_panel_scope.close();
         if (try self.prepareNativeLinear(&request)) |receipt| {
             const run = self.vtable.cold_cleanup_services.?.linear_pair_prepared orelse return error.UnsupportedNativeWeightPreparation;
             const pair = try run(self, &request, &receipt, self.call_context.?.cleanup);
@@ -4170,6 +4232,8 @@ pub const ComputeBackend = struct {
         out_dim: usize,
     ) !LinearPairResult {
         const request = NativeLinearPreparation{ .kind = .pair_bias, .input = input, .weights = .{ weight_a, weight_b, null }, .biases = .{ bias_a, bias_b, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .weights = request.weights, .in_dim = request.in_dim, .out_dim = request.out_dim });
+        defer native_panel_scope.close();
         if (try self.prepareNativeLinear(&request)) |receipt| {
             const run = self.vtable.cold_cleanup_services.?.linear_pair_prepared orelse return error.UnsupportedNativeWeightPreparation;
             return run(self, &request, &receipt, self.call_context.?.cleanup);
@@ -4268,11 +4332,16 @@ pub const ComputeBackend = struct {
     pub fn linearPackedNamed(self: *const ComputeBackend, input: CT, names: []const []const u8, widths: []const usize, rows: usize, in_dim: usize) !?CT {
         if (names.len < 2 or names.len > 3 or widths.len != names.len) return error.InvalidTensorShape;
         for (widths) |width| if (width == 0) return error.InvalidTensorShape;
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .names = names, .widths = widths, .in_dim = in_dim });
+        defer native_panel_scope.close();
         if (self.vtable.linearPackedNamed) |op| return op(self.ptr, input, names, widths, rows, in_dim);
         return null;
     }
 
     pub fn linearTripleNoBiasNamed(self: *const ComputeBackend, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) !LinearTripleResult {
+        const widths: [3]usize = @splat(out_dim);
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .operation = .triple_no_bias, .names = &names, .widths = &widths, .in_dim = in_dim, .out_dim = out_dim });
+        defer native_panel_scope.close();
         if (self.vtable.linearTripleNoBiasNamed) |op| return op(self.ptr, input, names, rows, in_dim, out_dim);
         const a = try self.getWeight(names[0]);
         defer self.free(a);
@@ -4284,6 +4353,8 @@ pub const ComputeBackend = struct {
     }
 
     pub fn linearTripleNoBias(self: *const ComputeBackend, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) !LinearTripleResult {
+        var native_panel_scope = try self.prepareNativePanelCache(.{ .operation = .triple_no_bias, .weights = .{ a, b, c }, .in_dim = in_dim, .out_dim = out_dim });
+        defer native_panel_scope.close();
         if (self.vtable.linearTripleNoBias) |op| return op(self.ptr, input, a, b, c, rows, in_dim, out_dim);
         const first = try self.linearNoBias(input, a, rows, in_dim, out_dim);
         errdefer self.free(first);
@@ -5725,6 +5796,8 @@ pub const ComputeBackend = struct {
     pub fn modelConstant(self: *const ComputeBackend, key: []const u8, value: ?CT) !?CT {
         const op = self.vtable.modelConstant orelse return null;
         try self.checkExecutionControl();
+        var cache_scope = try self.prepareNativeWeightCache(.{ .constant = .{ .key = key, .value = value } });
+        defer cache_scope.close();
         const result = try op(self.ptr, key, value);
         errdefer if (result) |tensor| self.free(tensor);
         // A completed immutable snapshot may remain cached on cancellation,
@@ -7553,4 +7626,144 @@ test "durable backend header strips all synchronous borrows without invoking hoo
     copy.bindExecutionBudget();
     copy.clearExecutionBudget();
     try std.testing.expectEqual(@as(usize, 0), Probe.calls);
+}
+
+test "durable backend header strips native panel preparation loan without callback" {
+    const Probe = struct {
+        var calls: usize = 0;
+        fn prepare(_: *anyopaque, _: *const ComputeBackend, _: NativeWeightCachePreparation) !EmbeddingCacheScope {
+            calls += 1;
+            return .{};
+        }
+    };
+    var marker: u8 = 0;
+    const loan = NativeWeightCacheControl{ .ptr = &marker, .prepare = Probe.prepare };
+    const source = ComputeBackend{ .ptr = &marker, .vtable = undefined, .native_weight_cache = &loan };
+    const durable = source.withoutSynchronousBorrows();
+    try std.testing.expect(durable.native_weight_cache == null and durable.embedding_stage == null);
+    try std.testing.expect(durable.ptr == source.ptr);
+    try std.testing.expectEqual(@as(usize, 0), Probe.calls);
+}
+
+// Scope/dispatch ownership test only. The live byte addresses are opaque mock
+// handles; no SDK/Native tensor or quota claim is made by this wrapper fixture.
+const ModelConstantScopeProbe163 = struct {
+    expected: ?CT = null,
+    result: u8 = 0,
+    events: [8]u8 = @splat(0),
+    count: usize = 0,
+    active: bool = false,
+    require_scope: bool = true,
+    prepare_error: bool = false,
+    operation_error: bool = false,
+    decline: bool = false,
+    cancelled: bool = false,
+    cancel_after_result: bool = false,
+    held_result: bool = false,
+    fn note(self: *@This(), event: u8) void {
+        self.events[self.count] = event;
+        self.count += 1;
+    }
+    fn prepare(raw: *anyopaque, _: *const ComputeBackend, request: NativeWeightCachePreparation) !EmbeddingCacheScope {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.note(1);
+        try std.testing.expect(request == .constant);
+        try std.testing.expectEqualStrings("audio_tower.prepared.scope163", request.constant.key);
+        try std.testing.expect(request.constant.value == self.expected);
+        if (self.prepare_error) return error.OutOfMemory;
+        try std.testing.expect(!self.active);
+        self.active = true;
+        return .{ .ptr = self, .close_fn = close };
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.active);
+        self.active = false;
+        self.note(4);
+    }
+    fn operation(raw: *anyopaque, key: []const u8, value: ?CT) !?CT {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try std.testing.expect(!self.require_scope or self.active);
+        try std.testing.expectEqualStrings("audio_tower.prepared.scope163", key);
+        try std.testing.expect(value == self.expected);
+        self.note(2);
+        if (self.operation_error) return error.InvalidTensorShape;
+        if (self.decline) return null;
+        self.held_result = true;
+        self.cancelled = self.cancel_after_result;
+        return @ptrCast(&self.result);
+    }
+    fn free(raw: *anyopaque, value: CT) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(value == @as(CT, @ptrCast(&self.result)) and self.held_result);
+        self.held_result = false;
+        self.note(3);
+    }
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.cancelled) return error.Cancelled;
+    }
+};
+
+test "Native modelConstant exact value lookup scope preserves failure cancellation and result ownership order" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const P = ModelConstantScopeProbe163;
+    // Fully initialized table, not an undefined partial backend mock. Only
+    // these two replaced mock leaves are reachable in the wrapper under test.
+    var table = @import("native_compute.zig").vtable_impl;
+    table.modelConstant = P.operation;
+    table.freeTensor = P.free;
+    table.cold_cleanup_services = null;
+    var source: u8 = 9;
+    for (0..6) |mode| {
+        var probe = P{ .expected = if (mode == 4) null else @as(CT, @ptrCast(&source)), .cancel_after_result = mode == 1, .prepare_error = mode == 2, .operation_error = mode == 3, .decline = mode == 4, .cancelled = mode == 5 };
+        const loan = NativeWeightCacheControl{ .ptr = &probe, .prepare = P.prepare };
+        const cb = ComputeBackend{ .ptr = &probe, .vtable = &table, .native_weight_cache = &loan, .execution_control = .{ .ptr = &probe, .check_fn = P.check } };
+        const attempted = cb.modelConstant("audio_tower.prepared.scope163", probe.expected);
+        switch (mode) {
+            0 => {
+                const result = (try attempted) orelse return error.ExpectedMockResult;
+                try std.testing.expect(probe.held_result and !probe.active);
+                cb.free(result);
+                try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4, 3 }, probe.events[0..probe.count]);
+            },
+            1 => {
+                try std.testing.expectError(error.Cancelled, attempted);
+                try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, probe.events[0..probe.count]);
+            },
+            2 => {
+                try std.testing.expectError(error.OutOfMemory, attempted);
+                try std.testing.expectEqualSlices(u8, &.{1}, probe.events[0..probe.count]);
+            },
+            3 => {
+                try std.testing.expectError(error.InvalidTensorShape, attempted);
+                try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4 }, probe.events[0..probe.count]);
+            },
+            4 => {
+                try std.testing.expect((try attempted) == null);
+                try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4 }, probe.events[0..probe.count]);
+            },
+            5 => {
+                try std.testing.expectError(error.Cancelled, attempted);
+                try std.testing.expectEqual(@as(usize, 0), probe.count);
+            },
+            else => unreachable,
+        }
+        try std.testing.expect(!probe.active and !probe.held_result);
+        try std.testing.expectEqual(@as(u8, 9), source);
+    }
+}
+
+test "modelConstant unadvertised raw callback retains original no preparation compatibility" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const P = ModelConstantScopeProbe163;
+    var table = @import("native_compute.zig").vtable_impl;
+    table.modelConstant = P.operation;
+    table.freeTensor = P.free;
+    table.cold_cleanup_services = null;
+    var probe = P{ .expected = null, .require_scope = false, .decline = true };
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &table };
+    try std.testing.expect((try cb.modelConstant("audio_tower.prepared.scope163", null)) == null);
+    try std.testing.expectEqualSlices(u8, &.{2}, probe.events[0..probe.count]);
+    try std.testing.expect(!probe.active);
 }

@@ -240,6 +240,7 @@ pub const Runtime = struct {
         stats.physical_replay_error = physical.capture_failure;
         stats.physical_graph_replays += physical.graph_replays;
         stats.graph_output_owned_copies += physical.output_copies;
+        stats.planned_literal_output_copies += physical.output_copies;
         stats.physical_input_copies += physical.input_copies;
         stats.physical_input_copy_bytes += physical.input_copy_bytes;
     }

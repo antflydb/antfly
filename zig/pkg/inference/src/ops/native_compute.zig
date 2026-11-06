@@ -78,8 +78,38 @@ const ResidencyTier = tier_planner.ResidencyTier;
 const PlacementPlan = tier_planner.PlacementPlan;
 const PrefetchQueue = prefetch_mod.Queue(*LazyWeightEntry);
 const run_memory = runtime.tier.memory;
+const NativeCacheSourceStamp = struct {
+    kind: enum { missing, resident, immutable_lazy } = .missing,
+    version: u64 = 0,
+};
+const NativeCacheSourceStamps = struct {
+    count: u2 = 0,
+    values: [3]NativeCacheSourceStamp = @splat(.{}),
+};
+fn nativeCacheSourceStampLocked(data: *const WeightStore, name: []const u8) NativeCacheSourceStamp {
+    if (data.resident_weights.get(name)) |weight| return .{ .kind = .resident, .version = weight.source_version };
+    if (data.lazy_weights.contains(name)) return .{ .kind = .immutable_lazy };
+    return .{};
+}
+fn nativeCacheSourceStampsLocked(data: *const WeightStore, names: []const []const u8) NativeCacheSourceStamps {
+    var result: NativeCacheSourceStamps = .{};
+    if (names.len == 0 or names.len > 3) return result;
+    for (names, 0..) |name, index| {
+        result.values[index] = nativeCacheSourceStampLocked(data, name);
+        if (result.values[index].kind == .missing) return .{};
+    }
+    result.count = @intCast(names.len);
+    return result;
+}
+fn nativeCacheStampsCurrentLocked(data: *const WeightStore, names: []const []const u8, stamps: NativeCacheSourceStamps) bool {
+    if (stamps.count == 0 or names.len != stamps.count) return false;
+    for (names, stamps.values[0..stamps.count]) |name, saved| if (!std.meta.eql(saved, nativeCacheSourceStampLocked(data, name))) return false;
+    return true;
+}
+
 const DenseDequantCacheEntry = struct {
     data: []f32,
+    source_stamps: NativeCacheSourceStamps = .{},
     bytes: usize,
     // Exact additional physical data+key storage, independent of the
     // original payload-only cache retention policy. Zero preserves raw owners.
@@ -841,7 +871,7 @@ pub const LazyWeightEntry = struct {
 };
 
 const PreparedPanelKey = struct { address: usize, n: usize, k: usize };
-const PreparedPanelEntry = struct { panels: linalg.prepared_gemm.Panels, class: embeddinggemma2_weight_cache.MetalClass };
+const PreparedPanelEntry = struct { panels: linalg.prepared_gemm.Panels, class: embeddinggemma2_weight_cache.MetalClass, prepared_physical_bytes: usize = 0, source_stamps: NativeCacheSourceStamps = .{} };
 
 pub const WeightStore = struct {
     scalar_bounds: @import("../models/embedding_gemma2_weight_cache.zig").ScalarBoundsCache = .{},
@@ -852,9 +882,12 @@ pub const WeightStore = struct {
     embeddinggemma2_panel_class_bytes: [3]usize = @splat(0),
     embeddinggemma2_dense_floor: ?[3]usize = null,
     embeddinggemma2_canonical_panels: std.StringHashMapUnmanaged(PreparedPanelEntry) = .empty,
+    canonical_panel_prepared_map_bytes: usize = 0,
+    canonical_panel_source_readers: usize = 0,
     embeddinggemma2_panels: std.AutoHashMapUnmanaged(PreparedPanelKey, PreparedPanelEntry) = .empty,
     embeddinggemma2_f32_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .empty,
     embeddinggemma2_f32_cache_bytes: usize = 0,
+    embeddinggemma2_f32_prepared_map_bytes: usize = 0,
     embeddinggemma2_constant_bytes: usize = 0,
     embeddinggemma2_constant_count: usize = 0,
     embeddinggemma2_f32_class_bytes: [3]usize = @splat(0),
@@ -970,6 +1003,7 @@ const WeightRetirement = struct {
     data: *WeightStore,
     attached_compute: ?*NativeCompute,
     cache_reader: bool = false,
+    panel_source_reader: bool = false,
     live_temporary_roots: std.atomic.Value(usize) = .init(0),
     references: std.atomic.Value(usize) = .init(1),
     mutex: std.atomic.Mutex = .unlocked,
@@ -981,10 +1015,16 @@ const WeightRetirement = struct {
     fn release(self: *WeightRetirement) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(self.attached_compute == null);
-        if (self.cache_reader) {
+        if (self.cache_reader or self.panel_source_reader) {
             platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
-            std.debug.assert(self.data.embeddinggemma2_f32_readers > 0);
-            self.data.embeddinggemma2_f32_readers -= 1;
+            if (self.cache_reader) {
+                std.debug.assert(self.data.embeddinggemma2_f32_readers > 0);
+                self.data.embeddinggemma2_f32_readers -= 1;
+            }
+            if (self.panel_source_reader) {
+                std.debug.assert(self.data.canonical_panel_source_readers != 0);
+                self.data.canonical_panel_source_readers -= 1;
+            }
             self.data.embeddinggemma2_f32_cache_lock.unlock();
         }
         const allocator = self.allocator;
@@ -997,6 +1037,7 @@ const WeightRetirement = struct {
 const WeightHandle = struct {
     allocator: std.mem.Allocator,
     name_len: usize,
+    source_stamp: NativeCacheSourceStamp = .{},
     references: usize = 1,
     cached: bool = true,
 
@@ -3992,9 +4033,23 @@ pub const QuantizedActivationPolicy = enum { automatic, strict_f32 };
 
 /// Immutable answer to an original trace lookup. Names are owned by the
 /// program; no backend, payload, allocator context or cleanup authority escapes.
+pub const AuthoredQuantizedFacts = struct {
+    kind: gguf_tensor_types.KnownTensorType,
+    raw_bytes: usize,
+    prepared_lengths: [@typeInfo(QuantizedStorage.PreparedQuantLayout).@"enum".field_names.len]usize,
+};
+/// Receiving-only physical equality witness. This MUST NOT enter Template.
+pub const AuthoredQuantizedIdentity = struct {
+    raw_pointer: usize,
+    raw_bytes: usize,
+    prepared_pointers: [@typeInfo(QuantizedStorage.PreparedQuantLayout).@"enum".field_names.len]usize,
+    prepared_lengths: [@typeInfo(QuantizedStorage.PreparedQuantLayout).@"enum".field_names.len]usize,
+    panel_epoch: u64,
+};
 pub const AuthoredSourceQuery = struct {
     name: []const u8,
     shape: ?@import("ml").graph.Shape,
+    quantized: ?AuthoredQuantizedFacts = null,
 };
 
 pub const NativeCompute = struct {
@@ -4019,6 +4074,12 @@ pub const NativeCompute = struct {
     /// Granted only to immutable EmbeddingGemma2 inference sessions. The
     /// WeightStore owns admitted mirrors; request contexts only borrow them.
     cache_embeddinggemma2_bf16_weights: bool = false,
+    // Synchronous operation loan only; no Stage/Source pointer is retained.
+    canonical_panel_receiving: bool = false,
+    mirror_cache_receiving: bool = false,
+    mirror_source_claim: bool = false,
+    canonical_panel_preparation_required: bool = false,
+    canonical_panel_source_reader: bool = false,
     embeddinggemma2_cache_reader: bool = false,
     weight_handles: std.StringHashMapUnmanaged(CT) = .empty,
     weight_retirement: ?*WeightRetirement = null,
@@ -4104,10 +4165,17 @@ pub const NativeCompute = struct {
         if (buf.weight_retirement == null) buf.weight_retirement = (try self.retirementOwner()).retain();
         buf.whole_named_weight = true;
         const owner = buf.weight_retirement.?;
-        if (self.embeddinggemma2_cache_reader and self.weight_retirement != null and owner == self.weight_retirement.?) {
-            std.debug.assert(!owner.cache_reader);
-            owner.cache_reader = true;
-            self.embeddinggemma2_cache_reader = false;
+        if (self.weight_retirement != null and owner == self.weight_retirement.?) {
+            if (self.embeddinggemma2_cache_reader) {
+                std.debug.assert(!owner.cache_reader);
+                owner.cache_reader = true;
+                self.embeddinggemma2_cache_reader = false;
+            }
+            if (self.canonical_panel_source_reader) {
+                std.debug.assert(!owner.panel_source_reader);
+                owner.panel_source_reader = true;
+                self.canonical_panel_source_reader = false;
+            }
         }
         return tensor;
     }
@@ -4142,6 +4210,83 @@ pub const NativeCompute = struct {
         return shape;
     }
 
+    /// Pure logical/physical topology for the one query transcript. Names are
+    /// borrowed only for this call; Template copies them. No preparation occurs.
+    pub fn authoredResidentSourceQuery(backend: *const ops.ComputeBackend, name: []const u8) !AuthoredSourceQuery {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        ResidentWeightPreparation.lock(self.data);
+        defer ResidentWeightPreparation.unlock(self.data);
+        return authoredResidentSourceQueryLocked(self.data, name);
+    }
+    fn authoredResidentSourceQueryLocked(data: *WeightStore, name: []const u8) !AuthoredSourceQuery {
+        const loaded = data.resident_weights.getPtr(name) orelse {
+            if (data.lazy_weights.contains(name)) return error.UnsupportedAuthoredWeight;
+            return error.WeightNotFound;
+        };
+        if (loaded.quantized_storage) |*storage| {
+            if (!loaded.quantized or loaded.tensor.data.len != 0 or quantizedRawBacking(storage) == null or (loaded.tensor.shape.len != 0 and !std.mem.eql(i64, loaded.tensor.shape, storage.shape)) or storage.shape.len != 2 or storage.shape[0] <= 0 or storage.shape[1] <= 0 or storage.packed_expert != null or storage.prepared_group_cache != null) return error.UnsupportedAuthoredWeight;
+            const kind = switch (storage.tensor_type) {
+                .known => |value| value,
+                else => return error.UnsupportedAuthoredWeight,
+            };
+            if (kind != .Q4_K and kind != .Q5_K and kind != .Q6_K and kind != .Q8_0) return error.UnsupportedAuthoredWeight;
+            const values_per_block: i64 = if (kind == .Q8_0) 32 else 256;
+            if (@mod(storage.shape[1], values_per_block) != 0) return error.UnsupportedAuthoredWeight;
+            // getWeight's original preparation must already be a metadata hit.
+            // This slice neither funds nor performs new resident block preparation.
+            if (preparedKBlockAdditionalBytes(storage) != 0 or storage.preparedBytes(.row_major_blocks) == null) return error.UnsupportedAuthoredWeight;
+            const expected = gguf_tensor_types.byteLen(storage.tensor_type, &.{ @intCast(storage.shape[0]), @intCast(storage.shape[1]) }) orelse return error.UnsupportedAuthoredWeight;
+            if (storage.raw_bytes.len != expected) return error.UnsupportedAuthoredWeight;
+            var lengths: [@typeInfo(QuantizedStorage.PreparedQuantLayout).@"enum".field_names.len]usize = @splat(0);
+            for (storage.prepared.entries, 0..) |entry, i| if (entry) |value| {
+                lengths[i] = value.bytes.len;
+            };
+            return .{ .name = name, .shape = @import("ml").graph.Shape.init(.f32, storage.shape), .quantized = .{ .kind = kind, .raw_bytes = storage.raw_bytes.len, .prepared_lengths = lengths } };
+        }
+        return .{ .name = name, .shape = try authoredResidentF32ShapeLocked(data, name) };
+    }
+
+    /// Actual whole-program cold ownership preflight. Generic route selection
+    /// still returns null for unsupported worker ownership as it always did;
+    /// only the authored constructor consumes this typed decline result.
+    pub fn validateResidentQuantizedTaskOwnership(backend: *const ops.ComputeBackend, weight: CT, descriptor: ops.kernel_descriptor.Descriptor) !void {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        if (descriptor.operation != .linear) return;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        const linear = descriptor.operation.linear;
+        if (linear.rows != 1 or linear.bias or self.quantized_activation_policy != .automatic or !nativeResidentDenseLinearRouteSupported(self, &descriptor)) return;
+        const q8 = metadata: {
+            ResidentWeightPreparation.lock(self.data);
+            defer ResidentWeightPreparation.unlock(self.data);
+            const storage = toBuf(weight).quantized_storage orelse break :metadata false;
+            if (!storage.tensor_type.eql(.{ .known = .Q8_0 })) break :metadata false;
+            if (namedResidentQuantizedStorageLocked(self, weight) == null) return error.UnsupportedAuthoredWeight;
+            if (shouldUseLayaDequantSgemm(toBuf(weight).name) or shouldUseQuantizedDequantSgemm(toBuf(weight).name, linear.rows, linear.out_dim, storage)) break :metadata false;
+            break :metadata true;
+        };
+        if (q8 and originalQ8NeedsTasks(self.io, linear.rows, linear.in_dim, linear.out_dim)) return error.OwnedNativeIoTaskUnavailable;
+    }
+
+    pub fn authoredQuantizedIdentity(backend: *const ops.ComputeBackend, name: []const u8, witness: CT) !AuthoredQuantizedIdentity {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        ResidentWeightPreparation.lock(self.data);
+        defer ResidentWeightPreparation.unlock(self.data);
+        return authoredQuantizedIdentityLocked(self, name, witness);
+    }
+    fn authoredQuantizedIdentityLocked(self: *NativeCompute, name: []const u8, witness: CT) !AuthoredQuantizedIdentity {
+        if (!std.mem.eql(u8, toBuf(witness).name, name)) return error.AuthoredResidentWeightChanged;
+        const storage = namedResidentQuantizedStorageLocked(self, witness) orelse return error.AuthoredResidentWeightChanged;
+        var pointers: [@typeInfo(QuantizedStorage.PreparedQuantLayout).@"enum".field_names.len]usize = @splat(0);
+        var lengths: [pointers.len]usize = @splat(0);
+        for (storage.prepared.entries, 0..) |entry, i| if (entry) |value| {
+            pointers[i] = @intFromPtr(value.bytes.ptr);
+            lengths[i] = value.bytes.len;
+        };
+        return .{ .raw_pointer = @intFromPtr(storage.raw_bytes.ptr), .raw_bytes = storage.raw_bytes.len, .prepared_pointers = pointers, .prepared_lengths = lengths, .panel_epoch = storage.panel16_epoch.load(.acquire) };
+    }
+
     /// One metadata exclusion window certifies the complete original query
     /// transcript, including absent optional weights. This does not pin model
     /// payload against concurrent mutation; actual Model/caller exclusion is
@@ -4150,23 +4295,28 @@ pub const NativeCompute = struct {
         if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
         const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
         const data = self.data;
-        if (data.prefetch_initialized) data.prefetch.lock();
-        defer if (data.prefetch_initialized) data.prefetch.unlock();
+        ResidentWeightPreparation.lock(data);
+        defer ResidentWeightPreparation.unlock(data);
         for (queries) |entry| {
-            // Compile-time projection: pure template facts or private receiving
-            // facts plus owning CT witness. No dynamic callback/context loan.
             const query: AuthoredSourceQuery = if (@TypeOf(entry) == AuthoredSourceQuery) entry else entry.fact;
-            const actual: ?@import("ml").graph.Shape = authoredResidentF32ShapeLocked(data, query.name) catch |err| switch (err) {
+            const actual: ?AuthoredSourceQuery = authoredResidentSourceQueryLocked(data, query.name) catch |err| switch (err) {
                 error.WeightNotFound => null,
                 error.UnsupportedAuthoredWeight => return error.AuthoredResidentTopologyChanged,
                 else => return err,
             };
             if (query.shape) |expected| {
-                if (actual == null or !expected.eq(actual.?)) return error.AuthoredResidentTopologyChanged;
-            } else if (actual != null) return error.AuthoredResidentTopologyChanged;
+                if (actual == null or !expected.eq(actual.?.shape.?) or !std.meta.eql(query.quantized, actual.?.quantized)) return error.AuthoredResidentTopologyChanged;
+            } else if (actual != null or query.quantized != null) return error.AuthoredResidentTopologyChanged;
             if (@TypeOf(entry) != AuthoredSourceQuery) {
                 if ((query.shape != null) != (entry.witness != null)) return error.AuthoredResidentTopologyChanged;
-                if (entry.witness) |witness| _ = try authoredResidentF32PlaneLocked(data, query.name, witness, actual.?);
+                if (entry.witness) |witness| {
+                    if (query.quantized != null) {
+                        const physical = try authoredQuantizedIdentityLocked(self, query.name, witness);
+                        if (@hasField(@TypeOf(entry), "physical")) {
+                            if (entry.physical == null or !std.meta.eql(physical, entry.physical.?)) return error.AuthoredResidentWeightChanged;
+                        } else return error.AuthoredResidentWeightChanged;
+                    } else _ = try authoredResidentF32PlaneLocked(data, query.name, witness, actual.?.shape.?);
+                }
             }
         }
     }
@@ -4191,6 +4341,34 @@ pub const NativeCompute = struct {
         descriptor.current_backend = .native;
         descriptor.resident_backend = .native;
         return .{ .descriptor = descriptor, .role = .primary, .backing = .{ .kind = .host, .base = @intFromPtr(source.tensor.data.ptr) }, .byte_offset = 0, .logical_bytes = source.tensor.data.len, .readable_bytes = source.tensor.data.len };
+    }
+
+    pub fn authoredLinearPairSupported(backend: *const ops.ComputeBackend, a: CT, b: CT, descriptor: *const ops.kernel_descriptor.Descriptor) !bool {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        const first = (try quantizedSingleRecipe(self, a, descriptor)) orelse return false;
+        const second = (try quantizedSingleRecipe(self, b, descriptor)) orelse return false;
+        // Q6 joint producers have different original pack/panel/task ownership.
+        // This slice admits genuine singles/rows only, never split pairs.
+        if (first.kind == .Q6_K or second.kind == .Q6_K) return false;
+        return first.kind == second.kind and first.q8_activation == second.q8_activation and !originalPairNeedsTasks(self, descriptor, first, second);
+    }
+
+    /// Joint physical launch only; the immutable authored schedule proves
+    /// original pair membership/liveness. Both real outputs are validated before
+    /// the SAME original pair dispatcher can write either one.
+    pub fn runAssignedLinearPair(backend: *const ops.ComputeBackend, first: ops.kernel_descriptor.Invocation, second: ops.kernel_descriptor.Invocation, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        if (current.boundary) |epoch| if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        if (current.operation != null) _ = try current.operationFor(backend);
+        return runAssignedLinearPairImpl(@ptrCast(@alignCast(backend.ptr)), first, second, current, true);
+    }
+
+    pub fn validateAssignedLinearPair(backend: *const ops.ComputeBackend, first: ops.kernel_descriptor.Invocation, second: ops.kernel_descriptor.Invocation, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        if (current.boundary) |epoch| if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        if (current.operation != null) _ = try current.operationFor(backend);
+        return runAssignedLinearPairImpl(@ptrCast(@alignCast(backend.ptr)), first, second, current, false);
     }
 
     pub fn validateAuthoredAttention(backend: *const ops.ComputeBackend, geometry: ops.kernel_descriptor.PagedAttention, attention: *const AttentionContext) !void {
@@ -4227,9 +4405,15 @@ pub const NativeCompute = struct {
         var handles = self.weight_handles.valueIterator();
         while (handles.next()) |tensor| try validateNativeTemporaryCleanup(tensor.*, current);
         deinitWeightHandles(self);
-        if (self.embeddinggemma2_cache_reader) {
+        self.releaseMirrorSourceClaim();
+        if (self.embeddinggemma2_cache_reader or self.canonical_panel_source_reader) {
             platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
-            self.data.embeddinggemma2_f32_readers -= 1;
+            if (self.embeddinggemma2_cache_reader) self.data.embeddinggemma2_f32_readers -= 1;
+            if (self.canonical_panel_source_reader) {
+                std.debug.assert(self.data.canonical_panel_source_readers != 0);
+                self.data.canonical_panel_source_readers -= 1;
+                self.canonical_panel_source_reader = false;
+            }
             self.data.embeddinggemma2_f32_cache_lock.unlock();
             self.embeddinggemma2_cache_reader = false;
         }
@@ -5263,6 +5447,1147 @@ pub const NativeCompute = struct {
         return true;
     }
 
+    pub fn beginWeightCacheOperation(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativeWeightCachePreparation, current: @import("../execution/cleanup_context.zig").Context) !bool {
+        return switch (request) {
+            .weight, .acquire, .embedding, .constant => beginF32MirrorCacheOperation(cb, expected_data, current),
+            .panels => if (native.useBlas()) beginF32MirrorCacheOperation(cb, expected_data, current) else beginPanelCacheOperation(cb, expected_data, current),
+        };
+    }
+    fn hasPreparedWeightResult(self: *NativeCompute, request: ops.NativeWeightCachePreparation) !bool {
+        if (request == .weight) if (self.weight_handles.get(request.weight)) |tensor| {
+            if (!std.meta.eql(toBuf(tensor).weight_handle.?.source_stamp, nativeCacheSourceStampLocked(self.data, request.weight))) return error.NativeWeightPreparationChanged;
+            return true;
+        };
+        const recipe = (try self.f32RecipeLocked(request)) orelse return false;
+        if (recipe.kind != .joined) return false;
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        const entry = self.data.embeddinggemma2_f32_cache.get(recipe.key()) orelse return false;
+        if (!f32EntrySourcesCurrentLocked(self.data, recipe.key(), &entry)) return false;
+        if (!f32RecipeEntryMatches(&recipe, &entry)) return error.InvalidTensorShape;
+        if (entry.prepared_physical_bytes == 0 or self.data.embeddinggemma2_f32_prepared_map_bytes != try DenseCacheCold.currentMapBytes(&self.data.embeddinggemma2_f32_cache)) return false;
+        try self.retainMirrorReader();
+        return true;
+    }
+    fn weightTargetUnloaded(self: *NativeCompute, name: []const u8) bool {
+        if (self.data.resident_weights.contains(name)) return false;
+        return if (self.data.lazy_weights.getPtr(name)) |entry| entry.loaded == null else false;
+    }
+    pub fn weightCacheOperationNeedsPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativeWeightCachePreparation) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        switch (request) {
+            .weight, .acquire, .embedding => |name| {
+                self.data.prefetch.lock();
+                const ready = self.hasPreparedWeightResult(request) catch |err| {
+                    self.data.prefetch.unlock();
+                    return err;
+                };
+                const unloaded = !ready and self.weightTargetUnloaded(name);
+                self.data.prefetch.unlock();
+                if (ready) return false;
+                return unloaded or try f32WeightCacheNeedsColdPreparation(cb, expected_data, request);
+            },
+            .panels => |panels| {
+                if (panels.operation == .triple_no_bias and panels.names.len != 0) {
+                    self.data.prefetch.lock();
+                    var unloaded = false;
+                    for (panels.names) |name| unloaded = unloaded or self.weightTargetUnloaded(name);
+                    self.data.prefetch.unlock();
+                    if (unloaded) return true; // original named triple getters need actual raw sources
+                }
+                return if (native.useBlas() or panels.in_dim < 64) try f32WeightCacheNeedsColdPreparation(cb, expected_data, request) else try panelCacheOperationNeedsPreparation(cb, expected_data, panels);
+            },
+            .constant => return f32WeightCacheNeedsColdPreparation(cb, expected_data, request),
+        }
+    }
+    pub fn prepareWeightCacheOperationOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativeWeightCachePreparation, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        switch (request) {
+            .weight, .acquire, .embedding => |name| {
+                self.data.prefetch.lock();
+                const ready = self.hasPreparedWeightResult(request) catch |err| {
+                    self.data.prefetch.unlock();
+                    return err;
+                };
+                const unloaded = !ready and self.weightTargetUnloaded(name);
+                self.data.prefetch.unlock();
+                if (ready) return;
+                if (unloaded) {
+                    if (!try prepareTypedWeightOutsideExecution(cb, expected_data, name, pin)) {
+                        // SAME existing exact quantized-GGUF cold producer;
+                        // transformed/custom sources fail here before raw get.
+                        try prepareLazyWeightOutsideExecution(cb, expected_data, name, request != .embedding, pin);
+                    }
+                }
+                try prepareF32WeightCacheOutsideExecution(cb, expected_data, request, pin);
+            },
+            .panels => |panels| {
+                if (panels.operation == .triple_no_bias) for (panels.names) |name| {
+                    self.data.prefetch.lock();
+                    const unloaded = self.weightTargetUnloaded(name);
+                    self.data.prefetch.unlock();
+                    if (unloaded and !try prepareTypedWeightOutsideExecution(cb, expected_data, name, pin)) try prepareLazyWeightOutsideExecution(cb, expected_data, name, true, pin);
+                };
+                if (native.useBlas() or panels.in_dim < 64) try prepareF32WeightCacheOutsideExecution(cb, expected_data, request, pin) else try preparePanelCacheOperationOutsideExecution(cb, expected_data, panels, pin);
+            },
+            .constant => try prepareF32WeightCacheOutsideExecution(cb, expected_data, request, pin),
+        }
+    }
+    pub fn receiveWeightCacheOperation(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativeWeightCachePreparation, current: @import("../execution/cleanup_context.zig").Context) !ops.EmbeddingCacheScope {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        switch (request) {
+            .weight, .acquire, .embedding => |name| {
+                self.data.prefetch.lock();
+                const ready = self.hasPreparedWeightResult(request) catch |err| {
+                    self.data.prefetch.unlock();
+                    return err;
+                };
+                const unloaded = !ready and self.weightTargetUnloaded(name);
+                self.data.prefetch.unlock();
+                if (unloaded) return error.UnsupportedNativeWeightPreparation;
+                return receiveF32MirrorCacheOperation(cb, expected_data, current);
+            },
+            .panels => |panels| return if (native.useBlas() or panels.in_dim < 64) receiveF32MirrorCacheOperation(cb, expected_data, current) else receivePanelCacheOperation(cb, expected_data, current),
+            .constant => return receiveF32MirrorCacheOperation(cb, expected_data, current),
+        }
+    }
+
+    /// Actual managed receiver, before any opaque ctx access. The existing
+    /// compute reader keeps every borrowed cache panel alive across the cold
+    /// window; lazy source CTs below separately retain their actual entry pins.
+    pub fn configurePanelPreparationPolicy(cb: *const ComputeBackend, managed: bool) !void {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.canonical_panel_receiving) return error.NativeWeightPreparationReentered;
+        // An actual bound cache is authority independent of public Session
+        // metadata. Refusal leaves the prior strict policy/reader unchanged.
+        if (!managed) if (self.data.tier_cache) |*cache| if (cache.admission != null) return error.MissingNativePanelAdmission;
+        self.canonical_panel_preparation_required = managed;
+        if (managed and self.cache_embeddinggemma2_bf16_weights and !native.useBlas()) {
+            if (!self.data.prefetch_initialized) return error.UnpreparedNativePanelCacheOperation;
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+            defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+            const held_by_retirement = if (self.weight_retirement) |owner| owner.panel_source_reader else false;
+            if (!self.canonical_panel_source_reader and !held_by_retirement) {
+                self.data.canonical_panel_source_readers = try std.math.add(usize, self.data.canonical_panel_source_readers, 1);
+                if (self.weight_retirement) |owner| owner.panel_source_reader = true else self.canonical_panel_source_reader = true;
+            }
+        }
+    }
+
+    pub fn beginPanelCacheOperation(cb: *const ComputeBackend, expected_data: *const anyopaque, current: @import("../execution/cleanup_context.zig").Context) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data or self.shared_operation_owner != null) return error.ForeignNativeWeightModel;
+        if (native.useBlas() or !self.cache_embeddinggemma2_bf16_weights or self.canonical_panel_receiving) return false;
+        if (!self.canonical_panel_source_reader and !(if (self.weight_retirement) |owner| owner.panel_source_reader else false)) return error.UnpreparedNativePanelCacheOperation;
+        return true;
+    }
+    pub fn panelCacheOperationNeedsPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativePanelPreparation) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        if (request.in_dim < 64) return false;
+        if (request.names.len != 0) return panelGroupMissing(self, request.names, request.in_dim);
+        for (request.weights) |maybe_weight| {
+            const weight = maybe_weight orelse continue;
+            const buf = toBuf(weight);
+            if (weightOrigin(buf) == null or weightData(self, buf) != self.data or buf.name.len == 0 or buf.view_strides != null) continue;
+            const shape = buf.logical_shape orelse continue;
+            if (shape.len != 2 or shape[0] < 64 or buf.quantized_storage != null) continue;
+            var storage: [3][256]u8 = undefined;
+            var names_buf: [3][]const u8 = undefined;
+            const names = if (embeddinggemma2_weight_cache.projectionGroup(buf.name)) |group| try group.names(&storage, &names_buf) else @as([]const []const u8, &.{buf.name});
+            if (try panelGroupMissing(self, names, request.in_dim)) return true;
+        }
+        return false;
+    }
+    fn panelGroupMissing(self: *NativeCompute, names: []const []const u8, k: usize) !bool {
+        if (names.len == 0 or names.len > 3) return false;
+        const class = embeddinggemma2_weight_cache.nativeClass(names[0]) orelse return false;
+        for (names) |name| if (embeddinggemma2_weight_cache.nativeClass(name) != class) return false;
+        var key_storage: [3 * 256 + 2]u8 = undefined;
+        const key = try canonicalPanelKey(&key_storage, names);
+        const data = self.data;
+        data.prefetch.lock();
+        defer data.prefetch.unlock();
+        platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+        defer data.embeddinggemma2_f32_cache_lock.unlock();
+        for (names) |name| if (!data.resident_weights.contains(name) and !data.lazy_weights.contains(name)) return false;
+        if (data.embeddinggemma2_canonical_panels.get(key)) |entry| {
+            if (entry.panels.k != k) return error.InvalidTensorShape;
+            if (!nativeCacheStampsCurrentLocked(data, names, entry.source_stamps)) return error.NativeWeightPreparationChanged;
+            try self.retainMirrorReader();
+            return false;
+        }
+        const used = data.embeddinggemma2_f32_class_bytes[@backingInt(class)];
+        const limit = embeddinggemma2_weight_cache.classLimit(class);
+        // Known loaded geometry can prove an original permanent policy decline
+        // without a yield. An unloaded shard still needs its actual cold load;
+        // no guessed shape/dtype or negative cache is used.
+        var n: usize = 0;
+        for (names) |name| {
+            const loaded = data.resident_weights.getPtr(name) orelse if (data.lazy_weights.getPtr(name)) |entry| (if (entry.loaded) |*value| value else return true) else return false;
+            const tensor = &loaded.tensor;
+            if (loaded.quantized_storage != null) return false;
+            if (tensor.shape.len != 2 or tensor.shape[0] <= 0 or tensor.shape[1] != k) return false;
+            if (tensor.dtype != .f32 and tensor.dtype != .bf16 and tensor.dtype != .f16) return false;
+            const rows: usize = @intCast(tensor.shape[0]);
+            if (tensor.data.len != try std.math.mul(usize, try std.math.mul(usize, rows, k), tensor.dtype.byteSize())) return error.InvalidTensorShape;
+            n = try std.math.add(usize, n, rows);
+        }
+        const bytes = try linalg.prepared_gemm.Panels.bytes(n, k);
+        if (used >= limit or data.embeddinggemma2_canonical_panels.count() >= embeddinggemma2_weight_cache.max_entries) return false;
+        return bytes <= limit - used;
+    }
+    pub fn receivePanelCacheOperation(cb: *const ComputeBackend, expected_data: *const anyopaque, current: @import("../execution/cleanup_context.zig").Context) !ops.EmbeddingCacheScope {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data or self.canonical_panel_receiving) return error.ForeignNativeWeightModel;
+        self.canonical_panel_receiving = true;
+        return .{ .ptr = self, .close_fn = closePanelCacheOperation };
+    }
+    fn closePanelCacheOperation(raw: *anyopaque) void {
+        const self: *NativeCompute = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.canonical_panel_receiving);
+        self.canonical_panel_receiving = false;
+    }
+
+    /// No Model/lane, cache/prefetch lock or pending numerical task is held.
+    /// Only the caller's synchronous recipe is borrowed; no late callback or
+    /// mutable provider pointer enters the cache ledger.
+    pub fn preparePanelCacheOperationOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativePanelPreparation, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data or self.canonical_panel_receiving or self.shared_operation_owner != null) return error.ForeignNativeWeightModel;
+        if (native.useBlas() or !self.cache_embeddinggemma2_bf16_weights) return error.NativeWeightPreparationChanged;
+        try NativeCompute.prepareResidentCreditUpgradesOutsideExecution(cb, expected_data, pin);
+        try NativeCompute.flushWeightReleasesOutsideExecution(cb, expected_data);
+        if (request.names.len != 0) {
+            if (request.names.len > 3) return;
+            _ = try prepareCanonicalPanelsOutside(self, cb, request.names, request.in_dim, pin);
+        } else for (request.weights) |maybe_weight| {
+            const weight = maybe_weight orelse continue;
+            const buf = toBuf(weight);
+            if (weightOrigin(buf) == null or weightData(self, buf) != self.data or buf.name.len == 0 or buf.view_strides != null) continue;
+            var storage: [3][256]u8 = undefined;
+            var names_buf: [3][]const u8 = undefined;
+            const names = if (embeddinggemma2_weight_cache.projectionGroup(buf.name)) |group| try group.names(&storage, &names_buf) else @as([]const []const u8, &.{buf.name});
+            _ = try prepareCanonicalPanelsOutside(self, cb, names, request.in_dim, pin);
+        }
+    }
+
+    fn prepareCanonicalPanelsOutside(self: *NativeCompute, cb: *const ComputeBackend, names: []const []const u8, k: usize, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !bool {
+        if (names.len == 0 or names.len > 3 or k < 64) return false;
+        const class = embeddinggemma2_weight_cache.nativeClass(names[0]) orelse return false;
+        for (names) |name| if (embeddinggemma2_weight_cache.nativeClass(name) != class) return false;
+        var key_storage: [3 * 256 + 2]u8 = undefined;
+        const key = try canonicalPanelKey(&key_storage, names);
+        const data = self.data;
+        // A reader was registered under the actual Model before suspension.
+        // Reclaim cannot remove a cache entry/map while this compute borrows it.
+        platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+        const ready = data.embeddinggemma2_canonical_panels.get(key);
+        if (ready != null) self.retainMirrorReader() catch |err| {
+            data.embeddinggemma2_f32_cache_lock.unlock();
+            return err;
+        };
+        data.embeddinggemma2_f32_cache_lock.unlock();
+        if (ready) |entry| {
+            if (entry.panels.k != k) return error.InvalidTensorShape;
+            return true;
+        }
+        var sources: [3]CanonicalPanelSource = undefined;
+        var count: usize = 0;
+        defer {
+            data.prefetch.lock();
+            for (sources[0..count]) |source| if (source.lazy) |entry| releaseLazyEntryPinLocked(data, entry);
+            data.prefetch.unlock();
+        }
+        var n: usize = 0;
+        for (names, 0..) |name, index| {
+            if (!try prepareTypedPanelLazyOutside(self, cb, name, pin)) return false;
+            const source = (try acquireCanonicalPanelSource(data, name, k)) orelse return false;
+            sources[index] = source;
+            count += 1;
+            n = try std.math.add(usize, n, source.rows);
+        }
+        var metadata_pin = try F32CacheReadPin.acquire(self);
+        defer metadata_pin.release();
+        const bytes = try linalg.prepared_gemm.Panels.bytes(n, k);
+        const Map = @FieldType(WeightStore, "embeddinggemma2_canonical_panels");
+        for (0..8) |_| {
+            try cb.checkExecutionControl();
+            data.prefetch.lock();
+            platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+            if (data.embeddinggemma2_canonical_panels.get(key)) |entry| {
+                metadata_pin.adoptLocked();
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                if (entry.panels.k != k) return error.InvalidTensorShape;
+                return true;
+            }
+            const cache = if (data.tier_cache) |*value| value else {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return false;
+            };
+            const used = data.embeddinggemma2_f32_class_bytes[@backingInt(class)];
+            const limit = embeddinggemma2_weight_cache.classLimit(class);
+            const old_count = data.embeddinggemma2_canonical_panels.count();
+            if (used > limit or bytes > limit - used or old_count >= embeddinggemma2_weight_cache.max_entries) {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return false;
+            }
+            const old_pointer = if (data.embeddinggemma2_canonical_panels.metadata) |value| @intFromPtr(value) else 0;
+            const capacity = data.embeddinggemma2_canonical_panels.capacity();
+            const replace_map = data.embeddinggemma2_canonical_panels.available == 0;
+            // Record the exact SAME stdlib metadata request, no layout guess.
+            const map_bytes = (if (replace_map) canonicalPanelMapBytes(old_count + 1) else @as(usize, 0)) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            const physical = std.math.add(usize, std.math.add(usize, bytes, key.len) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            }, map_bytes) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            var growth = cache.snapshotPhysicalOwnerGrowthLocked(bytes, physical) catch |err| {
+                cache.noteDenied(.host, bytes);
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                if (err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable) return false;
+                return err;
+            };
+            data.embeddinggemma2_f32_cache_lock.unlock();
+            data.prefetch.unlock();
+            defer growth.finishOutsideExecution();
+            try growth.validatePhysicalBacking();
+            growth.fundOutsideExecution(pin) catch |err| {
+                if (err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable) {
+                    data.prefetch.lock();
+                    cache.noteDenied(.host, bytes);
+                    data.prefetch.unlock();
+                    return false;
+                }
+                return err;
+            };
+            var staged_map: Map = .empty;
+            defer staged_map.deinit(data.allocator);
+            if (replace_map) try staged_map.ensureTotalCapacity(data.allocator, old_count + 1);
+            const owned_key = try data.allocator.dupe(u8, key);
+            var key_moved = false;
+            defer if (!key_moved) data.allocator.free(owned_key);
+            const values = try data.allocator.alloc(f32, bytes / @sizeOf(f32));
+            var values_moved = false;
+            defer if (!values_moved) data.allocator.free(values);
+            fillCanonicalPanelSources(sources[0..count], values, k);
+            try cb.checkExecutionControl();
+            var old_map: Map = .empty;
+            var old_map_bytes: usize = 0;
+            data.prefetch.lock();
+            platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+            const map = &data.embeddinggemma2_canonical_panels;
+            if (map.count() != old_count or map.capacity() != capacity or old_pointer != (if (map.metadata) |value| @intFromPtr(value) else @as(usize, 0)) or data.embeddinggemma2_f32_class_bytes[@backingInt(class)] != used) {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                continue;
+            }
+            // The actual loaded-entry pin excludes payload eviction while
+            // copied pointer/shape/dtype facts detect a changed receiving source.
+            var sources_match = true;
+            for (names, sources[0..count]) |name, source| {
+                const loaded = data.resident_weights.getPtr(name) orelse if (data.lazy_weights.getPtr(name)) |entry| (if (entry.loaded) |*loaded| loaded else null) else null;
+                if (loaded == null) {
+                    sources_match = false;
+                    break;
+                }
+                const tensor = &loaded.?.tensor;
+                if (source.tensor != tensor or source.raw.ptr != tensor.data.ptr or source.raw.len != tensor.data.len or source.dtype != tensor.dtype or tensor.shape.len != 2 or tensor.shape[0] != source.rows or tensor.shape[1] != source.k or loaded.?.quantized_storage != null) sources_match = false;
+            }
+            if (!sources_match or native.useBlas() or !self.cache_embeddinggemma2_bf16_weights or (!metadata_pin.held and !self.hasModelCacheReader())) {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return error.NativeWeightPreparationChanged;
+            }
+            if (replace_map) {
+                var entries = map.iterator();
+                while (entries.next()) |entry| staged_map.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
+            }
+            growth.commit() catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                if (err == error.PreparedCacheGrowthChanged) continue;
+                return err;
+            };
+            if (replace_map) {
+                old_map = map.*;
+                old_map_bytes = data.canonical_panel_prepared_map_bytes;
+                map.* = staged_map;
+                staged_map = .empty;
+                data.canonical_panel_prepared_map_bytes = map_bytes;
+            }
+            map.putAssumeCapacityNoClobber(owned_key, .{ .panels = .{ .data = values, .n = n, .k = k }, .class = class, .prepared_physical_bytes = bytes + key.len, .source_stamps = nativeCacheSourceStampsLocked(data, names) });
+            metadata_pin.adoptLocked();
+            key_moved = true;
+            values_moved = true;
+            data.embeddinggemma2_f32_cache_bytes += bytes;
+            data.embeddinggemma2_f32_class_bytes[@backingInt(class)] += bytes;
+            data.embeddinggemma2_f32_cache_lock.unlock();
+            data.prefetch.unlock();
+            old_map.deinit(data.allocator); // metadata only; borrowed entries untouched
+            if (old_map_bytes != 0) {
+                data.prefetch.lock();
+                cache.notePreparedReleaseWithLogical(.host, 0, old_map_bytes, old_map_bytes);
+                data.prefetch.unlock();
+            }
+            try cache.flushReleasedOutsideExecution();
+            return true;
+        }
+        return error.ResourceTemporarilyUnavailable;
+    }
+
+    pub fn typedLazyWeightNeedsColdPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        if (!self.data.prefetch_initialized) return false;
+        self.data.prefetch.lock();
+        defer self.data.prefetch.unlock();
+        const entry = self.data.lazy_weights.getPtr(name) orelse return false;
+        if (entry.loaded != null or entry.expert_coord != null or entry.tensor_ref.quantized) return false;
+        const store = self.data.tensor_store orelse return false;
+        return (try store.nativeTypedMappedSource(&entry.tensor_ref)) != null;
+    }
+
+    pub fn prepareTypedWeightOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        return prepareTypedPanelLazyOutside(self, cb, name, pin);
+    }
+
+    /// Exact on-demand immutable typed mmap load. No generic loader runs
+    /// under prefetch; the original selected payload/LRU bytes are unchanged.
+    fn prepareTypedPanelLazyOutside(self: *NativeCompute, cb: *const ComputeBackend, name: []const u8, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !bool {
+        const data = self.data;
+        data.prefetch.lock();
+        if (data.resident_weights.contains(name)) {
+            data.prefetch.unlock();
+            return true;
+        }
+        const entry = data.lazy_weights.getPtr(name) orelse {
+            data.prefetch.unlock();
+            return false;
+        };
+        if (entry.loaded != null) {
+            data.prefetch.unlock();
+            return true;
+        }
+        if (entry.expert_coord != null or entry.tensor_ref.quantized) {
+            data.prefetch.unlock();
+            return false;
+        }
+        const store = data.tensor_store orelse {
+            data.prefetch.unlock();
+            return false;
+        };
+        const source = store.nativeTypedMappedSource(&entry.tensor_ref) catch |err| {
+            data.prefetch.unlock();
+            return err;
+        };
+        const tensor = source orelse {
+            data.prefetch.unlock();
+            return false;
+        };
+        entry.pin_count = std.math.add(usize, entry.pin_count, 1) catch |err| {
+            data.prefetch.unlock();
+            return err;
+        };
+        data.prefetch.unlock();
+        defer {
+            data.prefetch.lock();
+            releaseLazyEntryPinLocked(data, entry);
+            data.prefetch.unlock();
+        }
+        var reclaim_budget = data.lazy_weights.count();
+        while (true) {
+            try cb.checkExecutionControl();
+            data.prefetch.lock();
+            if (data.lazy_weights.getPtr(name) != entry or data.tensor_store.?.ptr != store.ptr or data.tensor_store.?.vtable != store.vtable) {
+                data.prefetch.unlock();
+                return error.NativeWeightPreparationChanged;
+            }
+            if (entry.loaded != null) {
+                data.prefetch.unlock();
+                return true;
+            }
+            const cache = if (data.tier_cache) |*value| value else {
+                data.prefetch.unlock();
+                return false;
+            };
+            cache.deferPhysicalReleases();
+            evictColdNonExpertWeightsToFitLocked(data, .host, tensor.data.len, entry);
+            var growth = cache.snapshotMappedGrowthLocked(tensor.data.len, 0) catch |err| {
+                data.prefetch.unlock();
+                return err;
+            };
+            data.prefetch.unlock();
+            defer growth.finishOutsideExecution();
+            try cache.flushReleasedOutsideExecution();
+            growth.fundOutsideExecution(pin) catch |err| {
+                if (err != error.MemoryBudgetExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+                data.prefetch.lock();
+                const released = if (reclaim_budget != 0) reclaimOneHostCacheEntryLocked(data, entry) else 0;
+                if (released == 0) cache.noteDenied(.host, tensor.data.len);
+                data.prefetch.unlock();
+                try cache.flushReleasedOutsideExecution();
+                if (released == 0) return err;
+                reclaim_budget -= 1;
+                continue;
+            };
+            data.prefetch.lock();
+            defer data.prefetch.unlock();
+            if (data.lazy_weights.getPtr(name) != entry or data.tensor_store.?.ptr != store.ptr or data.tensor_store.?.vtable != store.vtable) return error.NativeWeightPreparationChanged;
+            if (entry.loaded != null) return true;
+            const now = (try store.nativeTypedMappedSource(&entry.tensor_ref)) orelse return error.NativeWeightPreparationChanged;
+            if (now.data.ptr != tensor.data.ptr or now.data.len != tensor.data.len or now.dtype != tensor.dtype or !std.mem.eql(i64, now.shape, tensor.shape)) return error.NativeWeightPreparationChanged;
+            try growth.commit();
+            entry.loaded = .{ .tensor = tensor, .quantized = false };
+            entry.loaded_bytes = tensor.data.len;
+            entry.active_tier = .host;
+            return true;
+        }
+    }
+
+    fn acquireCanonicalPanelSource(data: *WeightStore, name: []const u8, k: usize) !?CanonicalPanelSource {
+        data.prefetch.lock();
+        defer data.prefetch.unlock();
+        var lazy: ?*LazyWeightEntry = null;
+        const loaded = data.resident_weights.getPtr(name) orelse if (data.lazy_weights.getPtr(name)) |entry| blk: {
+            lazy = entry;
+            break :blk if (entry.loaded) |*value| value else return error.NativeWeightPreparationChanged;
+        } else return error.MissingWeight;
+        const tensor = &loaded.tensor;
+        if (loaded.quantized_storage != null or tensor.shape.len != 2 or tensor.shape[0] <= 0 or tensor.shape[1] != k) return null;
+        if (tensor.dtype != .f32 and tensor.dtype != .bf16 and tensor.dtype != .f16) return null;
+        const rows: usize = @intCast(tensor.shape[0]);
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, k), tensor.dtype.byteSize());
+        if (tensor.data.len != bytes) return error.InvalidTensorShape;
+        if (lazy) |entry| entry.pin_count = try std.math.add(usize, entry.pin_count, 1);
+        return .{ .tensor = tensor, .lazy = lazy, .raw = tensor.data, .dtype = tensor.dtype, .rows = rows, .k = k };
+    }
+
+    fn canonicalPanelMapBytes(entries: u32) !usize {
+        const Recorder = struct {
+            bytes: usize = 0,
+            fn alloc(raw: *anyopaque, bytes: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.bytes = bytes;
+                return null;
+            }
+            fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+                return false;
+            }
+            fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+                return null;
+            }
+            fn free(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+                unreachable;
+            }
+        };
+        var recorder: Recorder = .{};
+        const allocator = std.mem.Allocator{ .ptr = &recorder, .vtable = &.{ .alloc = Recorder.alloc, .resize = Recorder.resize, .remap = Recorder.remap, .free = Recorder.free } };
+        var map: @FieldType(WeightStore, "embeddinggemma2_canonical_panels") = .empty;
+        map.ensureTotalCapacity(allocator, entries) catch {
+            if (recorder.bytes == 0) return error.InvalidNativeCacheMetadataLayout;
+            return recorder.bytes;
+        };
+        return error.InvalidNativeCacheMetadataLayout;
+    }
+
+    fn mirrorMetadataNeedsPreparation(data: *WeightStore) !bool {
+        const map_bytes = try NativeCompute.DenseCacheCold.currentMapBytes(&data.embeddinggemma2_f32_cache);
+        if (data.embeddinggemma2_f32_prepared_map_bytes != map_bytes) return true;
+        var entries = data.embeddinggemma2_f32_cache.valueIterator();
+        while (entries.next()) |entry| if (entry.prepared_physical_bytes == 0) return true;
+        return false;
+    }
+    fn retainMirrorReader(self: *NativeCompute) !void {
+        if (self.hasModelCacheReader()) return;
+        self.data.embeddinggemma2_f32_readers = try std.math.add(usize, self.data.embeddinggemma2_f32_readers, 1);
+        self.embeddinggemma2_cache_reader = true;
+    }
+    /// Receiving Model is held by the actual operation callback. This query
+    /// records the existing cache reader before any Source suspension; it
+    /// allocates nothing and never pins mutable source bytes permanently.
+    pub fn beginF32MirrorCacheOperation(cb: *const ComputeBackend, expected_data: *const anyopaque, current: @import("../execution/cleanup_context.zig").Context) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data or self.shared_operation_owner != null) return error.ForeignNativeWeightModel;
+        if (!self.cache_embeddinggemma2_bf16_weights or !self.data.prefetch_initialized or self.data.tier_cache == null or self.mirror_cache_receiving or self.canonical_panel_receiving) return false;
+        self.data.prefetch.lock();
+        defer self.data.prefetch.unlock();
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        if (!self.mirror_source_claim) {
+            self.data.canonical_panel_source_readers = try std.math.add(usize, self.data.canonical_panel_source_readers, 1);
+            self.mirror_source_claim = true;
+        }
+        return true;
+    }
+    pub fn f32MirrorWeightNeedsColdPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8) !bool {
+        return f32WeightCacheNeedsColdPreparation(cb, expected_data, .{ .embedding = name });
+    }
+    pub fn receiveF32MirrorCacheOperation(cb: *const ComputeBackend, expected_data: *const anyopaque, current: @import("../execution/cleanup_context.zig").Context) !ops.EmbeddingCacheScope {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        // A nested same-operation fallback never owns/clears the outer loan.
+        if (self.mirror_cache_receiving or self.canonical_panel_receiving) return .{};
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        self.mirror_cache_receiving = true;
+        return .{ .ptr = self, .close_fn = closeF32MirrorCacheOperation };
+    }
+    fn closeF32MirrorCacheOperation(raw: *anyopaque) void {
+        const self: *NativeCompute = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.mirror_cache_receiving);
+        self.mirror_cache_receiving = false;
+        self.releaseMirrorSourceClaim();
+    }
+    /// A failed begin/needs/cold/restore/receive never returns a scope. End
+    /// only its pending source claim; nested active receiving owns its scope.
+    pub fn abortWeightCacheOperation(cb: *const ComputeBackend, expected_data: *const anyopaque) void {
+        if (cb.vtable != &vtable_impl) return;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data or self.mirror_cache_receiving or self.canonical_panel_receiving) return;
+        self.releaseMirrorSourceClaim();
+    }
+    fn releaseMirrorSourceClaim(self: *NativeCompute) void {
+        if (!self.mirror_source_claim) return;
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        std.debug.assert(self.data.canonical_panel_source_readers != 0);
+        self.data.canonical_panel_source_readers -= 1;
+        self.mirror_source_claim = false;
+        self.data.embeddinggemma2_f32_cache_lock.unlock();
+    }
+    /// Adopt existing raw entries/key/shape/map metadata without reallocating
+    /// their values. SAME PreparedGrowth upgrades the existing physical owner;
+    /// quota callbacks and unused metadata settle only after all locks unlock.
+    fn prepareF32MirrorMetadataOutside(self: *NativeCompute, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        const data = self.data;
+        for (0..8) |_| {
+            data.prefetch.lock();
+            platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+            const bytes = DenseCacheCold.currentMapBytes(&data.embeddinggemma2_f32_cache) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            if (data.embeddinggemma2_f32_prepared_map_bytes != 0 and data.embeddinggemma2_f32_prepared_map_bytes != bytes) {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return error.NativeCacheLayoutChangedOutsidePreparedProtocol;
+            }
+            const old_pointer = DenseCacheCold.pointer(&data.embeddinggemma2_f32_cache);
+            const count = data.embeddinggemma2_f32_cache.count();
+            var raw_payload: usize = 0;
+            var metadata: usize = if (data.embeddinggemma2_f32_prepared_map_bytes == 0) bytes else 0;
+            var entries = data.embeddinggemma2_f32_cache.iterator();
+            while (entries.next()) |entry| if (entry.value_ptr.prepared_physical_bytes == 0) {
+                const actual_bytes = std.math.mul(usize, entry.value_ptr.data.len, @sizeOf(f32)) catch |err| {
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    return err;
+                };
+                if (entry.value_ptr.bytes != actual_bytes) {
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    return error.InvalidNativeCacheMetadataLayout;
+                }
+                raw_payload = std.math.add(usize, raw_payload, entry.value_ptr.bytes) catch |err| {
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    return err;
+                };
+                const shape_bytes = if (entry.value_ptr.prepared_shape) |shape| std.math.mul(usize, shape.len, @sizeOf(i64)) catch |err| {
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    return err;
+                } else 0;
+                metadata = std.math.add(usize, metadata, std.math.add(usize, entry.key_ptr.*.len, shape_bytes) catch |err| {
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    return err;
+                }) catch |err| {
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    return err;
+                };
+                _ = std.math.add(usize, entry.value_ptr.bytes, std.math.add(usize, entry.key_ptr.*.len, shape_bytes) catch |err| {
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    return err;
+                }) catch |err| {
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    return err;
+                };
+            };
+            if (metadata == 0) {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return;
+            }
+            const cache = &data.tier_cache.?;
+            var growth = (if (raw_payload != 0) cache.snapshotExistingPhysicalComponentLocked(raw_payload, metadata) else cache.snapshotPhysicalOwnerGrowthLocked(0, metadata)) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            data.embeddinggemma2_f32_cache_lock.unlock();
+            data.prefetch.unlock();
+            defer growth.finishOutsideExecution();
+            try growth.validatePhysicalBacking();
+            try growth.fundOutsideExecution(pin);
+            data.prefetch.lock();
+            platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+            if (count != data.embeddinggemma2_f32_cache.count() or old_pointer != DenseCacheCold.pointer(&data.embeddinggemma2_f32_cache)) {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                continue;
+            }
+            growth.commit() catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                if (err == error.PreparedCacheGrowthChanged) continue;
+                return err;
+            };
+            entries = data.embeddinggemma2_f32_cache.iterator();
+            while (entries.next()) |entry| if (entry.value_ptr.prepared_physical_bytes == 0) {
+                const shape_bytes = if (entry.value_ptr.prepared_shape) |shape| shape.len * @sizeOf(i64) else 0;
+                entry.value_ptr.prepared_physical_bytes = entry.value_ptr.bytes + entry.key_ptr.*.len + shape_bytes;
+            };
+            data.embeddinggemma2_f32_prepared_map_bytes = bytes;
+            data.embeddinggemma2_f32_cache_lock.unlock();
+            data.prefetch.unlock();
+            return;
+        }
+        return error.ResourceTemporarilyUnavailable;
+    }
+    /// Actual Source is outside Model/lane before calling. Only immutable
+    /// source/map facts and existing reader pins cross the cold window. The
+    /// SAME cache map/key/F32 representation and original decoder are used.
+    pub fn prepareF32MirrorOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        const recipe = (try F32CacheRecipe.init(.single, &.{name}, &.{}, 0)) orelse return;
+        _ = try prepareF32RecipeValueOutside(cb, expected_data, recipe, pin);
+    }
+    fn f32RecipeLocked(self: *NativeCompute, request: ops.NativeWeightCachePreparation) !?F32CacheRecipe {
+        if (!self.cache_embeddinggemma2_bf16_weights) return null;
+        switch (request) {
+            .weight, .acquire => |name| {
+                if (native.useBlas()) if (embeddinggemma2_weight_cache.projectionGroup(name)) |group| {
+                    var storage: [3][256]u8 = undefined;
+                    var names: [3][]const u8 = undefined;
+                    const siblings = try group.names(&storage, &names);
+                    var complete = true;
+                    for (siblings) |sibling| complete = complete and (self.data.resident_weights.contains(sibling) or self.data.lazy_weights.contains(sibling));
+                    if (complete) return F32CacheRecipe.init(.joined, siblings, &.{}, 0);
+                };
+                return F32CacheRecipe.init(.single, &.{name}, &.{}, 0);
+            },
+            .embedding => |name| return F32CacheRecipe.init(.single, &.{name}, &.{}, 0),
+            .panels => |request_panels| {
+                if (request_panels.names.len != 0) return F32CacheRecipe.init(.joined, request_panels.names, request_panels.widths, request_panels.in_dim);
+                if (request_panels.operation != .triple_no_bias) return null;
+                if (!native.useBlas() and request_panels.in_dim >= 64) return null; // original triple selector
+                var names: [3][]const u8 = undefined;
+                var count: usize = 0;
+                for (request_panels.weights) |value| {
+                    const weight = value orelse break;
+                    const buf = toBuf(weight);
+                    if (!buf.whole_named_weight or weightData(self, buf) != self.data or buf.quantized_storage != null) return null;
+                    names[count] = buf.name;
+                    count += 1;
+                }
+                if (count != 3) return null;
+                const widths: [3]usize = @splat(request_panels.out_dim);
+                return F32CacheRecipe.init(.joined, &names, &widths, request_panels.in_dim);
+            },
+            .constant => |constant| {
+                if (!std.mem.startsWith(u8, constant.key, "audio_tower.prepared.")) return null;
+                var recipe = (try F32CacheRecipe.init(.constant, &.{constant.key}, &.{}, 0)) orelse return null;
+                recipe.constant_value = constant.value;
+                return recipe;
+            },
+        }
+    }
+
+    fn f32RecipeSourcesLocked(self: *NativeCompute, recipe: *const F32CacheRecipe) !?F32CacheSources {
+        const data = self.data;
+        var value: F32CacheSources = .{ .policy = undefined, .count = recipe.count };
+        if (recipe.kind == .constant) {
+            const input = recipe.constant_value orelse return null;
+            const values = toBuf(input).data;
+            const bytes = try std.math.mul(usize, values.len, @sizeOf(f32));
+            if (bytes == 0) return null; // SAME original prepared-constant selector
+            const shape = tensorStoredShape(input) orelse return error.UnsupportedShape;
+            value.constant = true;
+            value.tensors[0] = .{ .data = std.mem.sliceAsBytes(values), .shape = shape, .dtype = .f32, .name = "", .allocator = data.allocator, .owns_data = false, .owns_shape = false };
+            value.policy = .{ .class = .audio, .bytes = bytes, .limit = embeddinggemma2_weight_cache.audio_max_bytes };
+            return value;
+        }
+        var names: [3][]const u8 = undefined;
+        var bytes: usize = 0;
+        var class: ?embeddinggemma2_weight_cache.MetalClass = null;
+        for (0..recipe.count) |index| {
+            const name = recipe.name(index);
+            names[index] = name;
+            const loaded = data.resident_weights.getPtr(name) orelse if (data.lazy_weights.getPtr(name)) |entry| blk: {
+                value.lazy[index] = entry;
+                break :blk if (entry.loaded) |*present| present else return null;
+            } else return null;
+            if (loaded.quantized_storage != null) return null;
+            const tensor = &loaded.tensor;
+            value.tensors[index] = tensor.*;
+            if (recipe.kind == .single) {
+                // Preserve the actual loader's typed borrow before its mirror.
+                if (shouldBorrowTypedWeightTensor(self, name, tensor)) return null;
+                value.policy = (try selectedF32Mirror(self, name, tensor)) orelse return null;
+                var elements: usize = 1;
+                for (tensor.shape) |axis| {
+                    if (axis < 0) return error.InvalidTensorShape;
+                    elements = try std.math.mul(usize, elements, @intCast(axis));
+                }
+                if (try std.math.mul(usize, elements, 2) != tensor.data.len) return error.InvalidTensorData;
+            } else {
+                const selected_class = embeddinggemma2_weight_cache.nativeClass(name) orelse return null;
+                if (class) |expected| {
+                    if (selected_class != expected) return null;
+                } else class = selected_class;
+                if (tensor.dtype != .bf16 and tensor.dtype != .f32) return null; // original packedMediaLinears
+                if (tensor.shape.len != 2 or tensor.shape[0] <= 0 or tensor.shape[1] <= 0) return null;
+                const k = if (recipe.in_dim != 0) recipe.in_dim else @as(usize, @intCast(tensor.shape[1]));
+                const width = if (recipe.widths[index] != 0) recipe.widths[index] else @as(usize, @intCast(tensor.shape[0]));
+                if (index == 0) value.in_dim = k else if (value.in_dim != k) return null;
+                if (tensor.shape[0] != width or tensor.shape[1] != k or tensor.data.len != try std.math.mul(usize, try std.math.mul(usize, width, k), tensor.dtype.byteSize())) return null;
+                value.widths[index] = width;
+                bytes = try std.math.add(usize, bytes, try std.math.mul(usize, try std.math.mul(usize, width, k), @sizeOf(f32)));
+            }
+        }
+        value.stamps = nativeCacheSourceStampsLocked(data, names[0..recipe.count]);
+        if (recipe.kind == .joined) value.policy = .{ .class = class.?, .bytes = bytes, .limit = embeddinggemma2_weight_cache.classLimit(class.?) };
+        return value;
+    }
+    fn f32RecipeEntryMatches(recipe: *const F32CacheRecipe, entry: *const DenseDequantCacheEntry) bool {
+        if (recipe.kind == .single) return true;
+        if (recipe.kind == .constant) return entry.prepared_shape != null;
+        if (entry.in_dim == 0 or entry.bytes != entry.data.len * @sizeOf(f32)) return false;
+        if (recipe.in_dim != 0 and entry.in_dim != recipe.in_dim) return false;
+        for (0..recipe.count) |index| if (recipe.widths[index] != 0 and entry.projection_widths[index] != recipe.widths[index]) return false;
+        return true;
+    }
+    fn f32RecipeNeedsLocked(self: *NativeCompute, recipe: *const F32CacheRecipe) !bool {
+        const data = self.data;
+        // Original constants are immutable by key; null-value lookup must
+        // adopt an existing raw value without manufacturing a source tensor.
+        if (recipe.kind == .constant) if (data.embeddinggemma2_f32_cache.get(recipe.key())) |entry| {
+            if (!f32RecipeEntryMatches(recipe, &entry)) return error.InvalidTensorShape;
+            try self.retainMirrorReader();
+            return entry.prepared_physical_bytes == 0 or data.embeddinggemma2_f32_prepared_map_bytes != try DenseCacheCold.currentMapBytes(&data.embeddinggemma2_f32_cache);
+        };
+        // The original joined warm lookup precedes any raw sibling load.
+        if (recipe.kind == .joined) if (data.embeddinggemma2_f32_cache.get(recipe.key())) |entry| {
+            if (!f32RecipeEntryMatches(recipe, &entry)) return error.InvalidTensorShape;
+            if (f32EntrySourcesCurrentLocked(data, recipe.key(), &entry)) {
+                try self.retainMirrorReader(); // actual selected value, before unlock
+                return entry.prepared_physical_bytes == 0 or data.embeddinggemma2_f32_prepared_map_bytes != try NativeCompute.DenseCacheCold.currentMapBytes(&data.embeddinggemma2_f32_cache);
+            }
+            return true; // exact stale target, cold rebind/retire only
+        };
+        for (0..if (recipe.kind == .constant) @as(usize, 0) else recipe.count) |index| {
+            const name = recipe.name(index);
+            if (data.lazy_weights.getPtr(name)) |entry| if (!data.resident_weights.contains(name) and entry.loaded == null) {
+                const store = data.tensor_store orelse return false;
+                return (try store.nativeTypedMappedSource(&entry.tensor_ref)) != null;
+            };
+        }
+        const selected = (try self.f32RecipeSourcesLocked(recipe)) orelse return false;
+        if (data.embeddinggemma2_f32_cache.get(recipe.key())) |entry| {
+            if (entry.bytes != selected.policy.bytes) return true;
+            if (!f32EntrySourcesCurrentLocked(data, recipe.key(), &entry)) return true;
+            try self.retainMirrorReader();
+            return entry.prepared_physical_bytes == 0 or data.embeddinggemma2_f32_prepared_map_bytes != try NativeCompute.DenseCacheCold.currentMapBytes(&data.embeddinggemma2_f32_cache);
+        }
+        const used = data.embeddinggemma2_f32_class_bytes[@backingInt(selected.policy.class)];
+        if (recipe.kind == .constant and !f32ConstantWithinLimits(data, selected.policy.bytes)) return false;
+        return data.embeddinggemma2_f32_cache.count() < embeddinggemma2_weight_cache.max_entries and used <= selected.policy.limit and selected.policy.bytes <= selected.policy.limit - used;
+    }
+    pub fn f32WeightCacheNeedsColdPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativeWeightCachePreparation) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        const data = self.data;
+        data.prefetch.lock();
+        defer data.prefetch.unlock();
+        if (request == .weight) if (self.weight_handles.get(request.weight)) |tensor| {
+            if (!std.meta.eql(toBuf(tensor).weight_handle.?.source_stamp, nativeCacheSourceStampLocked(data, request.weight))) return error.NativeWeightPreparationChanged;
+            return false;
+        };
+        platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+        defer data.embeddinggemma2_f32_cache_lock.unlock();
+        const recipe = (try self.f32RecipeLocked(request)) orelse return false;
+        return self.f32RecipeNeedsLocked(&recipe);
+    }
+    pub fn prepareF32WeightCacheOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, request: ops.NativeWeightCachePreparation, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        self.data.prefetch.lock();
+        const maybe_recipe = self.f32RecipeLocked(request) catch |err| {
+            self.data.prefetch.unlock();
+            return err;
+        };
+        self.data.prefetch.unlock();
+        const recipe = maybe_recipe orelse return;
+        // Preserve joined warm hit before raw demand, including evicted siblings.
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        const already = self.data.embeddinggemma2_f32_cache.get(recipe.key());
+        const map_paid = self.data.embeddinggemma2_f32_prepared_map_bytes == (DenseCacheCold.currentMapBytes(&self.data.embeddinggemma2_f32_cache) catch |err| {
+            self.data.embeddinggemma2_f32_cache_lock.unlock();
+            return err;
+        });
+        const ready = if (already) |entry| entry.prepared_physical_bytes != 0 and map_paid and f32EntrySourcesCurrentLocked(self.data, recipe.key(), &entry) else false;
+        if (ready and recipe.kind == .joined) self.retainMirrorReader() catch |err| {
+            self.data.embeddinggemma2_f32_cache_lock.unlock();
+            return err;
+        };
+        self.data.embeddinggemma2_f32_cache_lock.unlock();
+        if (ready and recipe.kind == .joined) return;
+
+        for (0..if (recipe.kind == .constant) @as(usize, 0) else recipe.count) |index| {
+            if (try typedLazyWeightNeedsColdPreparation(cb, expected_data, recipe.name(index))) _ = try prepareTypedWeightOutsideExecution(cb, expected_data, recipe.name(index), pin);
+        }
+        _ = try prepareF32RecipeValueOutside(cb, expected_data, recipe, pin);
+    }
+
+    fn prepareF32RecipeValueOutside(cb: *const ComputeBackend, expected_data: *const anyopaque, recipe: F32CacheRecipe, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data or self.shared_operation_owner != null or self.mirror_cache_receiving) return error.ForeignNativeWeightModel;
+        const data = self.data;
+        if (!self.cache_embeddinggemma2_bf16_weights or !data.prefetch_initialized or data.tier_cache == null) return false;
+        if (data.tier_cache.?.admission == null) return false; // raw owner has no prepared Domain receipt
+        const Map = @FieldType(WeightStore, "embeddinggemma2_f32_cache");
+        const name = recipe.key();
+        var metadata_pin = try F32CacheReadPin.acquire(self);
+        defer metadata_pin.release();
+        for (0..8) |_| {
+            try self.prepareF32MirrorMetadataOutside(pin);
+            try cb.checkExecutionControl();
+            data.prefetch.lock();
+            platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+            if (data.embeddinggemma2_f32_cache.get(name)) |entry| {
+                if ((recipe.kind == .constant and entry.prepared_shape != null) or f32EntrySourcesCurrentLocked(data, name, &entry)) {
+                    metadata_pin.adoptLocked();
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    if (!f32RecipeEntryMatches(&recipe, &entry)) return error.InvalidTensorShape;
+                    return true;
+                }
+                // A same-name maintained mutation never grants stale-ready
+                // credit. Exact target rebind/retirement is handled cold below.
+            }
+            const selected = self.f32RecipeSourcesLocked(&recipe) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            const sources = selected orelse {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return false;
+            };
+            const policy = sources.policy;
+            if (data.embeddinggemma2_f32_cache.contains(name)) {
+                // No reader may lose an old alias. If this is the sole
+                // temporary pin, detach ONLY this invalidated target, then
+                // physical death/refund runs outside all metadata locks.
+                if (metadata_pin.held and data.embeddinggemma2_f32_readers == 1) {
+                    metadata_pin.releaseLocked();
+                    const dead = data.embeddinggemma2_f32_cache.fetchRemove(name).?;
+                    data.embeddinggemma2_f32_cache_bytes -= dead.value.bytes;
+                    data.embeddinggemma2_f32_class_bytes[@backingInt(policy.class)] -= dead.value.bytes;
+                    data.embeddinggemma2_f32_cache_lock.unlock();
+                    data.prefetch.unlock();
+                    data.allocator.free(dead.value.data);
+                    if (dead.value.prepared_shape) |shape| data.allocator.free(shape);
+                    data.allocator.free(dead.key);
+                    data.prefetch.lock();
+                    if (dead.value.prepared_physical_bytes != 0) data.tier_cache.?.notePreparedReleaseWithLogical(.host, dead.value.bytes, dead.value.prepared_physical_bytes, dead.value.prepared_physical_bytes) else data.tier_cache.?.noteRelease(.host, dead.value.bytes);
+                    data.prefetch.unlock();
+                    try data.tier_cache.?.flushReleasedOutsideExecution();
+                    metadata_pin = try F32CacheReadPin.acquire(self);
+                    continue;
+                }
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return false;
+            }
+            const class_index = @backingInt(policy.class);
+            const used = data.embeddinggemma2_f32_class_bytes[class_index];
+            const count = data.embeddinggemma2_f32_cache.count();
+            const constant_count = data.embeddinggemma2_constant_count;
+            const constant_bytes = data.embeddinggemma2_constant_bytes;
+            if ((recipe.kind == .constant and !f32ConstantWithinLimits(data, policy.bytes)) or count >= embeddinggemma2_weight_cache.max_entries or used > policy.limit or policy.bytes > policy.limit - used) {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return false;
+            }
+            const map_pointer = DenseCacheCold.pointer(&data.embeddinggemma2_f32_cache);
+            const capacity = data.embeddinggemma2_f32_cache.capacity();
+            const old_map_bytes = data.embeddinggemma2_f32_prepared_map_bytes;
+            const map_bytes = DenseCacheCold.mapAllocation(data.embeddinggemma2_f32_cache, 1) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            const shape_bytes = if (recipe.kind == .constant) std.math.mul(usize, sources.tensors[0].shape.len, @sizeOf(i64)) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            } else 0;
+            const entry_bytes = std.math.add(usize, policy.bytes, std.math.add(usize, name.len, shape_bytes) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            }) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            const physical = std.math.add(usize, entry_bytes, map_bytes) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            var growth = data.tier_cache.?.snapshotPhysicalOwnerGrowthLocked(policy.bytes, physical) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            defer growth.finishOutsideExecution();
+            retainF32RecipeSourcesLocked(data, &sources) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            data.embeddinggemma2_f32_cache_lock.unlock();
+            data.prefetch.unlock();
+            defer releaseF32RecipeSources(data, &sources);
+            try growth.validatePhysicalBacking();
+            growth.fundOutsideExecution(pin) catch |err| switch (err) {
+                error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable => return false,
+                else => return err,
+            };
+            var staged: Map = .empty;
+            defer staged.deinit(data.allocator);
+            if (map_bytes != 0) try staged.ensureTotalCapacity(data.allocator, count + 1);
+            const key = try data.allocator.dupe(u8, name);
+            var key_moved = false;
+            defer if (!key_moved) data.allocator.free(key);
+            const shape = if (recipe.kind == .constant) try data.allocator.dupe(i64, sources.tensors[0].shape) else null;
+            var shape_moved = false;
+            defer if (!shape_moved) if (shape) |owned| data.allocator.free(owned);
+            const values = if (recipe.kind == .single)
+                try convertTensorToOwnedF32(data.allocator, &sources.tensors[0])
+            else if (recipe.kind == .constant)
+                try data.allocator.dupe(f32, @as([*]const f32, @ptrCast(@alignCast(sources.tensors[0].data.ptr)))[0 .. policy.bytes / @sizeOf(f32)])
+            else packed_values: {
+                const output = try data.allocator.alloc(f32, policy.bytes / @sizeOf(f32));
+                fillF32RecipePackedValues(&sources, output);
+                break :packed_values output;
+            };
+            var values_moved = false;
+            defer if (!values_moved) data.allocator.free(values);
+            try cb.checkExecutionControl();
+            var old: Map = .empty;
+            data.prefetch.lock();
+            platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+            const receiving = self.f32RecipeSourcesLocked(&recipe) catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                return err;
+            };
+            if (receiving == null or !f32RecipeSourcesEqual(&sources, &receiving.?) or count != data.embeddinggemma2_f32_cache.count() or capacity != data.embeddinggemma2_f32_cache.capacity() or map_pointer != DenseCacheCold.pointer(&data.embeddinggemma2_f32_cache) or used != data.embeddinggemma2_f32_class_bytes[class_index] or old_map_bytes != data.embeddinggemma2_f32_prepared_map_bytes or (recipe.kind == .constant and (constant_count != data.embeddinggemma2_constant_count or constant_bytes != data.embeddinggemma2_constant_bytes))) {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                continue;
+            }
+            if (map_bytes != 0) {
+                var entries = data.embeddinggemma2_f32_cache.iterator();
+                while (entries.next()) |entry| staged.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
+            }
+            growth.commit() catch |err| {
+                data.embeddinggemma2_f32_cache_lock.unlock();
+                data.prefetch.unlock();
+                if (err == error.PreparedCacheGrowthChanged) continue;
+                return err;
+            };
+            if (map_bytes != 0) {
+                old = data.embeddinggemma2_f32_cache;
+                data.embeddinggemma2_f32_cache = staged;
+                staged = .empty;
+                data.embeddinggemma2_f32_prepared_map_bytes = map_bytes;
+            }
+            data.embeddinggemma2_f32_cache.putAssumeCapacityNoClobber(key, .{ .data = values, .bytes = policy.bytes, .prepared_physical_bytes = entry_bytes, .prepared_shape = shape, .projection_widths = sources.widths, .in_dim = sources.in_dim, .source_stamps = sources.stamps });
+            metadata_pin.adoptLocked();
+            key_moved = true;
+            values_moved = true;
+            shape_moved = true;
+            if (recipe.kind == .constant) {
+                data.embeddinggemma2_constant_count += 1;
+                data.embeddinggemma2_constant_bytes += policy.bytes;
+            }
+            data.embeddinggemma2_f32_cache_bytes += policy.bytes;
+            data.embeddinggemma2_f32_class_bytes[class_index] += policy.bytes;
+            data.embeddinggemma2_f32_cache_lock.unlock();
+            data.prefetch.unlock();
+            old.deinit(data.allocator);
+            if (map_bytes != 0 and old_map_bytes != 0) {
+                data.prefetch.lock();
+                data.tier_cache.?.notePreparedReleaseWithLogical(.host, 0, old_map_bytes, old_map_bytes);
+                data.prefetch.unlock();
+            }
+            try data.tier_cache.?.flushReleasedOutsideExecution();
+            return true;
+        }
+        return error.ResourceTemporarilyUnavailable;
+    }
+
     pub fn importHostTensor(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !CT {
         switch (tensor.dtype) {
             .i8, .i16, .i32, .i64, .u8, .bool_ => return copyDenseSourceTensorWithShape(self, tensor, tensor.shape),
@@ -5481,11 +6806,17 @@ fn deinitEmbeddingGemma2F32Cache(data: *WeightStore) void {
     while (canonical.next()) |entry| {
         const dead_bytes = entry.value_ptr.panels.data.len * @sizeOf(f32);
         entry.value_ptr.panels.deinit(data.allocator);
-        if (data.tier_cache) |*cache| cache.noteRelease(.host, dead_bytes);
         data.allocator.free(entry.key_ptr.*);
+        if (data.tier_cache) |*cache| {
+            if (entry.value_ptr.prepared_physical_bytes != 0) cache.notePreparedReleaseWithLogical(.host, dead_bytes, entry.value_ptr.prepared_physical_bytes, entry.value_ptr.prepared_physical_bytes) else cache.noteRelease(.host, dead_bytes);
+        }
     }
     data.embeddinggemma2_canonical_panels.deinit(data.allocator);
     data.embeddinggemma2_canonical_panels = .empty;
+    if (data.canonical_panel_prepared_map_bytes != 0) {
+        if (data.tier_cache) |*cache| cache.notePreparedReleaseWithLogical(.host, 0, data.canonical_panel_prepared_map_bytes, data.canonical_panel_prepared_map_bytes);
+        data.canonical_panel_prepared_map_bytes = 0;
+    }
     var panels = data.embeddinggemma2_panels.valueIterator();
     while (panels.next()) |entry| {
         const dead_bytes = entry.panels.data.len * @sizeOf(f32);
@@ -5499,10 +6830,19 @@ fn deinitEmbeddingGemma2F32Cache(data: *WeightStore) void {
         data.allocator.free(entry.key_ptr.*);
         data.allocator.free(entry.value_ptr.data);
         if (entry.value_ptr.prepared_shape) |shape| data.allocator.free(shape);
-        if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.value_ptr.bytes);
+        if (data.tier_cache) |*cache| {
+            if (entry.value_ptr.prepared_physical_bytes != 0)
+                cache.notePreparedReleaseWithLogical(.host, entry.value_ptr.bytes, entry.value_ptr.prepared_physical_bytes, entry.value_ptr.prepared_physical_bytes)
+            else
+                cache.noteRelease(.host, entry.value_ptr.bytes);
+        }
     }
     data.embeddinggemma2_f32_cache.deinit(data.allocator);
     data.embeddinggemma2_f32_cache = .empty;
+    if (data.embeddinggemma2_f32_prepared_map_bytes != 0) {
+        if (data.tier_cache) |*cache| cache.notePreparedReleaseWithLogical(.host, 0, data.embeddinggemma2_f32_prepared_map_bytes, data.embeddinggemma2_f32_prepared_map_bytes);
+        data.embeddinggemma2_f32_prepared_map_bytes = 0;
+    }
     data.embeddinggemma2_f32_cache_bytes = 0;
     data.embeddinggemma2_constant_bytes = 0;
     data.embeddinggemma2_constant_count = 0;
@@ -5531,7 +6871,9 @@ pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, class: embeddinggemma2_
         data.allocator.free(entry.key);
         data.embeddinggemma2_f32_cache_bytes -= bytes;
         data.embeddinggemma2_f32_class_bytes[@backingInt(class)] -= bytes;
-        if (data.tier_cache) |*cache| cache.noteRelease(.host, bytes);
+        if (data.tier_cache) |*cache| {
+            if (entry.value.prepared_physical_bytes != 0) cache.notePreparedReleaseWithLogical(.host, bytes, entry.value.prepared_physical_bytes, entry.value.prepared_physical_bytes) else cache.noteRelease(.host, bytes);
+        }
         released += bytes;
     }
     while (true) {
@@ -5566,7 +6908,12 @@ pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, class: embeddinggemma2_
         data.allocator.free(entry.key);
         data.embeddinggemma2_f32_cache_bytes -= entry.value.bytes;
         data.embeddinggemma2_f32_class_bytes[@backingInt(class)] -= entry.value.bytes;
-        if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.value.bytes);
+        if (data.tier_cache) |*cache| {
+            if (entry.value.prepared_physical_bytes != 0)
+                cache.notePreparedReleaseWithLogical(.host, entry.value.bytes, entry.value.prepared_physical_bytes, entry.value.prepared_physical_bytes)
+            else
+                cache.noteRelease(.host, entry.value.bytes);
+        }
         released += entry.value.bytes;
     }
     return released;
@@ -5582,6 +6929,7 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
     defer self.data.embeddinggemma2_f32_cache_lock.unlock();
     if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+        if ((self.mirror_cache_receiving or self.canonical_panel_receiving) and (entry.prepared_physical_bytes == 0 or self.data.embeddinggemma2_f32_prepared_map_bytes != try NativeCompute.DenseCacheCold.currentMapBytes(&self.data.embeddinggemma2_f32_cache))) return null;
         if (!self.hasModelCacheReader()) {
             self.data.embeddinggemma2_f32_readers += 1;
             self.embeddinggemma2_cache_reader = true;
@@ -5592,6 +6940,7 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
         // The caller's errdefer owns the unreturned tensor on attach failure.
         return self.attachWeightAuthorityBorrowed(tensor);
     }
+    if (self.mirror_cache_receiving or self.canonical_panel_receiving) return null;
     const input = value orelse return null;
     const data = toBuf(input).data;
     const bytes = try std.math.mul(usize, data.len, @sizeOf(f32));
@@ -5609,7 +6958,7 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     errdefer if (!committed) self.data.allocator.free(name);
     const snapshot = try self.data.allocator.dupe(f32, data);
     errdefer if (!committed) self.data.allocator.free(snapshot);
-    try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, name, .{ .data = snapshot, .bytes = bytes, .prepared_shape = shape });
+    try putF32MirrorCache(self.data, name, .{ .data = snapshot, .bytes = bytes, .prepared_shape = shape });
     self.data.embeddinggemma2_f32_cache_bytes += bytes;
     self.data.embeddinggemma2_constant_bytes += bytes;
     self.data.embeddinggemma2_constant_count += 1;
@@ -5627,7 +6976,223 @@ fn modelConstantOp(ctx: *anyopaque, key: []const u8, value: ?CT) anyerror!?CT {
     return self.attachWeightAuthorityBorrowed(tensor);
 }
 
-fn cachedEmbeddingGemma2F32Weight(self: *NativeCompute, name: []const u8, source: *const tensor_mod.Tensor) !?[]f32 {
+/// Preserve raw append policy while retiring an already paid map allocation
+/// only after its actual CPU death. Existing SharedCache defers quota callbacks
+/// until outside settlement; entry key/value owners are transferred unchanged.
+fn putF32MirrorCache(data: *WeightStore, name: []const u8, entry: DenseDequantCacheEntry) !void {
+    var stamped = entry;
+    captureF32EntrySourcesLocked(data, name, &stamped);
+    if (data.embeddinggemma2_f32_prepared_map_bytes == 0 or try NativeCompute.DenseCacheCold.mapAllocation(data.embeddinggemma2_f32_cache, 1) == 0)
+        return data.embeddinggemma2_f32_cache.put(data.allocator, name, stamped);
+    var replacement: @FieldType(WeightStore, "embeddinggemma2_f32_cache") = .empty;
+    errdefer replacement.deinit(data.allocator);
+    try replacement.ensureTotalCapacity(data.allocator, try std.math.add(u32, data.embeddinggemma2_f32_cache.count(), 1));
+    var old_entries = data.embeddinggemma2_f32_cache.iterator();
+    while (old_entries.next()) |old| replacement.putAssumeCapacityNoClobber(old.key_ptr.*, old.value_ptr.*);
+    replacement.putAssumeCapacityNoClobber(name, stamped);
+    var old = data.embeddinggemma2_f32_cache;
+    const old_bytes = data.embeddinggemma2_f32_prepared_map_bytes;
+    data.embeddinggemma2_f32_cache = replacement;
+    data.embeddinggemma2_f32_prepared_map_bytes = 0; // new raw metadata awaits cold adoption
+    old.deinit(data.allocator);
+    if (data.tier_cache) |*cache| cache.notePreparedReleaseWithLogical(.host, 0, old_bytes, old_bytes);
+}
+
+/// Temporary map custody starts after selected raw sources have loaded, so
+/// their original pressure reclaim can run. A selected cache value adopts it.
+const F32CacheReadPin = struct {
+    compute: *NativeCompute,
+    held: bool = false,
+    fn acquire(compute: *NativeCompute) !@This() {
+        platform.sync.lockYielding(&compute.data.embeddinggemma2_f32_cache_lock);
+        defer compute.data.embeddinggemma2_f32_cache_lock.unlock();
+        var result: @This() = .{ .compute = compute };
+        if (!compute.hasModelCacheReader()) {
+            compute.data.embeddinggemma2_f32_readers = try std.math.add(usize, compute.data.embeddinggemma2_f32_readers, 1);
+            result.held = true;
+        }
+        return result;
+    }
+    fn releaseLocked(self: *@This()) void {
+        if (!self.held) return;
+        std.debug.assert(self.compute.data.embeddinggemma2_f32_readers != 0);
+        self.compute.data.embeddinggemma2_f32_readers -= 1;
+        self.held = false;
+    }
+    fn adoptLocked(self: *@This()) void {
+        if (!self.held) return;
+        if (self.compute.hasModelCacheReader()) self.releaseLocked() else {
+            self.compute.embeddinggemma2_cache_reader = true;
+            self.held = false;
+        }
+    }
+    fn release(self: *@This()) void {
+        if (!self.held) return;
+        platform.sync.lockYielding(&self.compute.data.embeddinggemma2_f32_cache_lock);
+        self.releaseLocked();
+        self.compute.data.embeddinggemma2_f32_cache_lock.unlock();
+    }
+};
+fn retainF32RecipeSourcesLocked(data: *WeightStore, sources: *const F32CacheSources) !void {
+    if (sources.constant) return; // caller owns this synchronous CT across the cold window
+    // Prevalidate all counters before mutating any source pin.
+    _ = try std.math.add(usize, data.canonical_panel_source_readers, 1);
+    for (sources.lazy[0..sources.count], 0..) |maybe, index| if (maybe) |entry| {
+        var duplicates: usize = 1;
+        for (sources.lazy[0..index]) |earlier| if (earlier == entry) {
+            duplicates += 1;
+        };
+        _ = try std.math.add(usize, entry.pin_count, duplicates);
+    };
+    data.canonical_panel_source_readers += 1;
+    for (sources.lazy[0..sources.count]) |maybe| if (maybe) |entry| {
+        entry.pin_count += 1;
+    };
+}
+fn releaseF32RecipeSources(data: *WeightStore, sources: *const F32CacheSources) void {
+    if (sources.constant) return;
+    data.prefetch.lock();
+    platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+    std.debug.assert(data.canonical_panel_source_readers != 0);
+    data.canonical_panel_source_readers -= 1;
+    data.embeddinggemma2_f32_cache_lock.unlock();
+    for (sources.lazy[0..sources.count]) |maybe| if (maybe) |entry| releaseLazyEntryPinLocked(data, entry);
+    data.prefetch.unlock();
+}
+fn fillF32RecipePackedValues(sources: *const F32CacheSources, output: []f32) void {
+    var offset: usize = 0;
+    for (sources.tensors[0..sources.count], sources.widths[0..sources.count]) |*source, width| {
+        const destination = output[offset..][0 .. width * sources.in_dim];
+        copyPackedMediaWeight(destination, if (source.dtype == .bf16) source else null, source.data);
+        offset += destination.len;
+    }
+}
+fn f32ConstantWithinLimits(data: *const WeightStore, bytes: usize) bool {
+    const policy = embeddinggemma2_weight_cache;
+    return bytes != 0 and data.embeddinggemma2_constant_bytes <= policy.prepared_max_bytes and bytes <= policy.prepared_max_bytes - data.embeddinggemma2_constant_bytes and data.embeddinggemma2_constant_count < policy.prepared_max_entries;
+}
+
+fn f32RecipeSourcesEqual(a: *const F32CacheSources, b: *const F32CacheSources) bool {
+    if (a.count != b.count or !std.meta.eql(a.stamps, b.stamps) or !std.meta.eql(a.policy, b.policy) or !std.meta.eql(a.widths, b.widths) or a.in_dim != b.in_dim) return false;
+    for (a.tensors[0..a.count], b.tensors[0..b.count]) |left, right| {
+        if (left.data.ptr != right.data.ptr or left.data.len != right.data.len or left.dtype != right.dtype or !std.mem.eql(i64, left.shape, right.shape)) return false;
+    }
+    return true;
+}
+
+fn f32PackedKey(storage: []u8, names: []const []const u8) ![]const u8 {
+    if (names.len == 0 or names.len > 3) return error.InvalidTensorShape;
+    const joined = try canonicalPanelKey(storage, names);
+    if (joined.len + 4 > storage.len) return error.NativePanelKeyTooLong;
+    @memcpy(storage[joined.len..][0..4], ".qkv");
+    return storage[0 .. joined.len + 4];
+}
+const F32CacheRecipe = struct {
+    kind: enum { single, joined, constant } = .single,
+    constant_value: ?CT = null,
+    count: usize = 0,
+    names_storage: [3][256]u8 = undefined,
+    names_len: [3]usize = @splat(0),
+    key_storage: [3 * 256 + 6]u8 = undefined,
+    key_len: usize = 0,
+    widths: [3]usize = @splat(0),
+    in_dim: usize = 0,
+    fn name(self: *const @This(), index: usize) []const u8 {
+        return self.names_storage[index][0..self.names_len[index]];
+    }
+    fn key(self: *const @This()) []const u8 {
+        return self.key_storage[0..self.key_len];
+    }
+    fn init(kind: @FieldType(@This(), "kind"), names: []const []const u8, widths: []const usize, in_dim: usize) !?@This() {
+        if (names.len == 0 or names.len > 3) return null;
+        if (widths.len != 0 and widths.len != names.len) return error.InvalidTensorShape;
+        var value: @This() = .{ .kind = kind, .count = names.len, .in_dim = in_dim };
+        for (names, 0..) |source_name, index| {
+            if (source_name.len == 0 or source_name.len > 256) return null;
+            @memcpy(value.names_storage[index][0..source_name.len], source_name);
+            value.names_len[index] = source_name.len;
+            if (index != 0) {
+                value.key_storage[value.key_len] = '|';
+                value.key_len += 1;
+            }
+            @memcpy(value.key_storage[value.key_len..][0..source_name.len], source_name);
+            value.key_len += source_name.len;
+            if (widths.len != 0) value.widths[index] = widths[index];
+        }
+        if (kind == .joined) {
+            @memcpy(value.key_storage[value.key_len..][0..4], ".qkv");
+            value.key_len += 4;
+        }
+        return value;
+    }
+};
+const F32CacheSources = struct {
+    constant: bool = false,
+    count: usize = 0,
+    tensors: [3]tensor_mod.Tensor = undefined,
+    lazy: [3]?*LazyWeightEntry = @splat(null),
+    widths: [3]usize = @splat(0),
+    in_dim: usize = 0,
+    stamps: NativeCacheSourceStamps = .{},
+    policy: F32MirrorSelection,
+};
+
+/// Source stamps refer to the existing exact slots, never an allocator address
+/// or a global revision. Lazy unload/reload leaves its immutable source intact.
+/// Return the exact selected current generation only. A stale cache value
+/// with surviving aliases remains alive; this operation takes the original
+/// uncached fallback instead of returning/mutating another generation's value.
+fn selectedF32CacheEntryLocked(self: *NativeCompute, key: []const u8) !?DenseDequantCacheEntry {
+    const entry = self.data.embeddinggemma2_f32_cache.get(key) orelse return null;
+    if (!self.canonical_panel_preparation_required and !self.mirror_cache_receiving and !self.canonical_panel_receiving) return entry;
+    if (!f32EntrySourcesCurrentLocked(self.data, key, &entry)) {
+        if (self.mirror_cache_receiving or self.canonical_panel_receiving) return null;
+        return error.NativeWeightPreparationChanged;
+    }
+    if ((self.mirror_cache_receiving or self.canonical_panel_receiving) and entry.prepared_physical_bytes == 0) return null;
+    return entry;
+}
+fn f32EntrySourcesCurrentLocked(data: *const WeightStore, key: []const u8, entry: *const DenseDequantCacheEntry) bool {
+    if (entry.prepared_shape != null and std.mem.startsWith(u8, key, "audio_tower.prepared.")) return true;
+    if (entry.source_stamps.count == 0) return false;
+    if (entry.in_dim == 0) return nativeCacheStampsCurrentLocked(data, &.{key}, entry.source_stamps);
+    if (!std.mem.endsWith(u8, key, ".qkv")) return false;
+    var names: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, key[0 .. key.len - 4], '|');
+    while (parts.next()) |name| {
+        if (count == 3 or name.len == 0) return false;
+        names[count] = name;
+        count += 1;
+    }
+    return nativeCacheStampsCurrentLocked(data, names[0..count], entry.source_stamps);
+}
+fn captureF32EntrySourcesLocked(data: *const WeightStore, key: []const u8, entry: *DenseDequantCacheEntry) void {
+    if (entry.prepared_shape != null and std.mem.startsWith(u8, key, "audio_tower.prepared.")) return;
+    if (entry.in_dim == 0) {
+        entry.source_stamps = nativeCacheSourceStampsLocked(data, &.{key});
+        return;
+    }
+    if (!std.mem.endsWith(u8, key, ".qkv")) return;
+    var names: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, key[0 .. key.len - 4], '|');
+    while (parts.next()) |name| {
+        if (count == 3 or name.len == 0) return;
+        names[count] = name;
+        count += 1;
+    }
+    entry.source_stamps = nativeCacheSourceStampsLocked(data, names[0..count]);
+}
+
+/// Exactly the original BF16 widening/F32 copy body, shared by raw packed
+/// producer and the same cold transaction. No matrix arithmetic is performed.
+fn copyPackedMediaWeight(destination: []f32, typed: ?*const tensor_mod.Tensor, dense_bytes: []const u8) void {
+    if (typed) |source| tensor_mod.widenBf16LittleEndian(source.data, destination) else @memcpy(std.mem.sliceAsBytes(destination), dense_bytes);
+}
+
+const F32MirrorSelection = struct { class: embeddinggemma2_weight_cache.MetalClass, bytes: usize, limit: usize };
+fn selectedF32Mirror(self: *NativeCompute, name: []const u8, source: *const tensor_mod.Tensor) !?F32MirrorSelection {
     if (!self.cache_embeddinggemma2_bf16_weights or source.dtype != .bf16) return null;
     const class = embeddinggemma2_weight_cache.nativeClass(name) orelse return null;
     if (embeddinggemma2_weight_cache.projectionGroup(name)) |group| {
@@ -5638,22 +7203,34 @@ fn cachedEmbeddingGemma2F32Weight(self: *NativeCompute, name: []const u8, source
         for (siblings) |sibling| complete = complete and (self.data.resident_weights.contains(sibling) or self.data.lazy_weights.contains(sibling));
         if (complete) return null;
     }
-    const class_index = @backingInt(class);
     const limit = embeddinggemma2_weight_cache.classLimit(class);
-    const cache = if (self.data.tier_cache) |*cache| cache else return null;
+    if (self.data.tier_cache == null) return null;
     if (source.data.len % 2 != 0) return error.InvalidTensorShape;
     const bytes = std.math.mul(usize, source.data.len, 2) catch return null;
     if (bytes == 0 or bytes > limit) return null;
+    return .{ .class = class, .bytes = bytes, .limit = limit };
+}
+
+fn cachedEmbeddingGemma2F32Weight(self: *NativeCompute, name: []const u8, source: *const tensor_mod.Tensor) !?[]f32 {
+    const selected = (try selectedF32Mirror(self, name, source)) orelse return null;
+    const class_index = @backingInt(selected.class);
+    const bytes = selected.bytes;
+    const limit = selected.limit;
+    const cache = &self.data.tier_cache.?;
     platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
     defer self.data.embeddinggemma2_f32_cache_lock.unlock();
-    if (!self.hasModelCacheReader()) {
+    if (!self.mirror_cache_receiving and !self.canonical_panel_receiving and !self.hasModelCacheReader()) {
         self.data.embeddinggemma2_f32_readers += 1;
         self.embeddinggemma2_cache_reader = true;
     }
-    if (self.data.embeddinggemma2_f32_cache.get(name)) |entry| {
+    if (try selectedF32CacheEntryLocked(self, name)) |entry| {
+        try self.retainMirrorReader();
         if (entry.bytes != bytes) return error.InvalidTensorShape;
+        if ((self.mirror_cache_receiving or self.canonical_panel_receiving) and entry.prepared_physical_bytes == 0) return null;
         return entry.data;
     }
+    if (self.mirror_cache_receiving or self.canonical_panel_receiving) return null;
+    if (self.canonical_panel_preparation_required) return error.UnpreparedNativePanelCacheOperation;
     if (self.data.embeddinggemma2_f32_cache.count() >= embeddinggemma2_weight_cache.max_entries or
         self.data.embeddinggemma2_f32_class_bytes[class_index] > limit or
         bytes > limit - self.data.embeddinggemma2_f32_class_bytes[class_index]) return null;
@@ -5666,7 +7243,7 @@ fn cachedEmbeddingGemma2F32Weight(self: *NativeCompute, name: []const u8, source
     errdefer self.data.allocator.free(owned_name);
     const dense = try convertTensorToOwnedF32(self.data.allocator, source);
     errdefer self.data.allocator.free(dense);
-    try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, owned_name, .{ .data = dense, .bytes = bytes });
+    try putF32MirrorCache(self.data, owned_name, .{ .data = dense, .bytes = bytes });
     self.data.embeddinggemma2_f32_cache_bytes += bytes;
     self.data.embeddinggemma2_f32_class_bytes[class_index] += bytes;
     return dense;
@@ -6587,6 +8164,12 @@ fn getWeightForPreparation(self: *NativeCompute, name: []const u8, prepare_matri
 }
 fn getWeightForPreparedLazy(self: *NativeCompute, name: []const u8, prepare_matrix: bool, denied: bool) !CT {
     if (self.weight_handles.get(name)) |tensor| {
+        if (self.cache_embeddinggemma2_bf16_weights and (self.canonical_panel_preparation_required or self.mirror_cache_receiving or self.canonical_panel_receiving)) {
+            if (self.data.prefetch_initialized) self.data.prefetch.lock();
+            const current = nativeCacheSourceStampLocked(self.data, name);
+            if (self.data.prefetch_initialized) self.data.prefetch.unlock();
+            if (!std.meta.eql(toBuf(tensor).weight_handle.?.source_stamp, current)) return error.NativeWeightPreparationChanged;
+        }
         toBuf(tensor).weight_handle.?.references += 1;
         return tensor;
     }
@@ -6596,6 +8179,11 @@ fn getWeightForPreparedLazy(self: *NativeCompute, name: []const u8, prepare_matr
     const stable_name = self.data.resident_weights.getKey(name) orelse self.data.lazy_weights.getKey(name) orelse name;
     const tensor = (try canonicalProjectionWeight(self, stable_name)) orelse try loadPreparedLazyWeight(self, stable_name, prepare_matrix, denied);
     _ = try self.attachWeightAuthority(tensor);
+    if (self.cache_embeddinggemma2_bf16_weights and (self.canonical_panel_preparation_required or self.mirror_cache_receiving or self.canonical_panel_receiving)) {
+        if (self.data.prefetch_initialized) self.data.prefetch.lock();
+        handle.source_stamp = nativeCacheSourceStampLocked(self.data, name);
+        if (self.data.prefetch_initialized) self.data.prefetch.unlock();
+    }
     toBuf(tensor).weight_handle = handle;
     toBuf(tensor).cached_weight = true;
     self.weight_handles.putAssumeCapacityNoClobber(handle.name(), tensor);
@@ -6613,14 +8201,19 @@ fn canonicalProjectionWeight(self: *NativeCompute, name: []const u8) !?CT {
     const siblings = try group.names(&storage, &names);
     for (siblings) |sibling| if (!self.data.resident_weights.contains(sibling) and !self.data.lazy_weights.contains(sibling)) return null;
     // A hot row view needs no checkpoint handle, conversion or staging.
-    const joined = try std.mem.join(self.allocator, "|", siblings);
-    defer self.allocator.free(joined);
-    const key = try std.mem.concat(self.allocator, u8, &.{ joined, ".qkv" });
-    defer self.allocator.free(key);
+    var key_storage: [3 * 256 + 6]u8 = undefined;
+    const managed_key = self.mirror_cache_receiving or self.canonical_panel_receiving or self.canonical_panel_preparation_required;
+    const key = if (managed_key) try f32PackedKey(&key_storage, siblings) else raw_key: {
+        const joined = try std.mem.join(self.allocator, "|", siblings);
+        defer self.allocator.free(joined);
+        break :raw_key try std.mem.concat(self.allocator, u8, &.{ joined, ".qkv" });
+    };
+    defer if (!managed_key) self.allocator.free(key);
     {
         platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
         defer self.data.embeddinggemma2_f32_cache_lock.unlock();
-        if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+        if (try selectedF32CacheEntryLocked(self, key)) |entry| {
+            if (self.mirror_cache_receiving and entry.prepared_physical_bytes == 0) return null;
             if (!self.hasModelCacheReader()) {
                 self.data.embeddinggemma2_f32_readers += 1;
                 self.embeddinggemma2_cache_reader = true;
@@ -6634,6 +8227,7 @@ fn canonicalProjectionWeight(self: *NativeCompute, name: []const u8) !?CT {
             return self.withLogicalShape(view, &.{ @intCast(width), @intCast(entry.in_dim) });
         }
     }
+    if (self.mirror_cache_receiving) return null; // original individual uncached fallback, no hot grouped supplier
     var weights: [3]CT = undefined;
     var widths: [3]usize = undefined;
     var count: usize = 0;
@@ -6737,6 +8331,7 @@ fn loadWeightImplWithPreparedLazy(self: *NativeCompute, name: []const u8, prepar
     self.data.prefetch.lock();
     defer self.data.prefetch.unlock();
     if (self.data.lazy_weights.getPtr(name)) |entry| {
+        if (self.canonical_panel_preparation_required and entry.loaded == null) return error.UnpreparedNativePanelCacheOperation;
         if (denied) {
             // The cold refusal belongs to an unloaded source. A peer winner
             // must pass the Source's actual selected-layout revalidation again.
@@ -7456,6 +9051,18 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
     const out = try self.allocator.alloc(f32, out_len);
     var raw_owned = true;
     errdefer if (raw_owned) self.allocator.free(out);
+    try embeddingLookupInto(weight, ids, total, dim, out);
+    const result = try self.makeBuf(out, true);
+    raw_owned = false;
+    errdefer freeTensor(self, result);
+    _ = try self.withLogicalShape(result, &.{ @intCast(total), @intCast(dim) });
+    return result;
+}
+
+/// The original embedding body with caller-owned output. Allocation, shape
+/// headers and the original discard ordering remain in the wrapper above.
+fn embeddingLookupInto(weight: CT, ids: []const i64, total: usize, dim: usize, out: []f32) !void {
+    if (ids.len < total or out.len != try std.math.mul(usize, total, dim)) return error.InvalidTensorShape;
     const weight_buf = toBuf(weight);
     if (weight_buf.quantized_storage) |storage| {
         const rows = try quantizedEmbeddingRows(storage, dim);
@@ -7577,11 +9184,6 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
             @memcpy(out[i * dim .. (i + 1) * dim], emb_table[idx * dim .. (idx + 1) * dim]);
         }
     }
-    const result = try self.makeBuf(out, true);
-    raw_owned = false;
-    errdefer freeTensor(self, result);
-    _ = try self.withLogicalShape(result, &.{ @intCast(total), @intCast(dim) });
-    return result;
 }
 
 const QuantLinearKind = enum {
@@ -7593,6 +9195,7 @@ const QuantLinearKind = enum {
 };
 
 const QuantLinearRequest = struct {
+    activation_workspace: ?[]u8 = null,
     dense_prepared: bool = false,
     matrix_scratch: ?[]f32 = null,
     cleanup: @import("../execution/cleanup_context.zig").Context = .{},
@@ -7653,7 +9256,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a)) {
                 if (try tryLinearQuantizedDequantSgemmGroupedFromStores(1, false, self, .{stores[0]}, .{request.storage_a}, .{request.name_a}, .{&.{}}, request.input, .{request.output_a}, request.rows, request.in_dim, request.out_dim, request.dense_prepared)) return true;
             }
-            if (try linearNoBiasQuantized(self.io, request.storage_a, request.input, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
+            if (try linearNoBiasQuantizedWithWorkspace(.automatic, self.io, request.storage_a, request.input, request.output_a, request.rows, request.in_dim, request.out_dim, request.activation_workspace)) return true;
             return false;
         },
         .single_bias => {
@@ -7676,7 +9279,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
         .pair_no_bias => {
             const storage_b = request.storage_b orelse return false;
             const output_b = request.output_b orelse return false;
-            if (try linearNoBiasQuantizedPair(self.io, self.allocator, request.storage_a, storage_b, request.input, request.output_a, output_b, request.rows, request.in_dim, request.out_dim)) return true;
+            if (try linearNoBiasQuantizedPairWithWorkspace(self.io, self.allocator, request.storage_a, storage_b, request.input, request.output_a, output_b, request.rows, request.in_dim, request.out_dim, request.activation_workspace)) return true;
             return false;
         },
         .pair_bias => {
@@ -9513,6 +11116,62 @@ fn gemma4AudioLocalAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, sc
 
 /// One model-owned panel representation, built directly from typed checkpoint
 /// rows. Names, rather than mapping addresses, survive lazy unload/reload.
+fn canonicalPanelKey(storage: []u8, names: []const []const u8) ![]const u8 {
+    var used: usize = 0;
+    for (names, 0..) |name, index| {
+        if (name.len > 256 or name.len == 0) return error.UnsupportedNativePanelName;
+        if (index != 0) {
+            if (used == storage.len) return error.UnsupportedNativePanelName;
+            storage[used] = '|';
+            used += 1;
+        }
+        if (name.len > storage.len - used) return error.UnsupportedNativePanelName;
+        @memcpy(storage[used..][0..name.len], name);
+        used += name.len;
+    }
+    return storage[0..used];
+}
+
+const CanonicalPanelSource = struct {
+    tensor: ?*const tensor_mod.Tensor = null,
+    lazy: ?*LazyWeightEntry = null,
+    raw: []const u8 = &.{},
+    f32_data: ?[]const f32 = null,
+    dtype: tensor_mod.DType = .f32,
+    rows: usize,
+    k: usize,
+};
+fn fillCanonicalPanelSources(weights: []const CanonicalPanelSource, data: []f32, k: usize) void {
+    @memset(data, 0);
+    var row: usize = 0;
+    for (weights) |weight| {
+        for (0..weight.rows) |r| for (0..k) |c| {
+            const src = r * k + c;
+            const v: f32 = if (weight.f32_data) |values| values[src] else if (weight.dtype == .f32)
+                @bitCast(std.mem.readInt(u32, weight.raw[src * 4 ..][0..4], .little))
+            else blk: {
+                const bits = std.mem.readInt(u16, weight.raw[src * 2 ..][0..2], .little);
+                break :blk if (weight.dtype == .bf16) @bitCast(@as(u32, bits) << 16) else @floatCast(@as(f16, @bitCast(bits)));
+            };
+            const dest = row + r;
+            data[dest / 64 * k * 64 + c * 64 + dest % 64] = v;
+        };
+        row += weight.rows;
+    }
+}
+fn fillCanonicalPanelBytes(weights: []const CT, data: []f32, k: usize) void {
+    var sources: [3]CanonicalPanelSource = undefined;
+    for (weights, sources[0..weights.len]) |value, *source| {
+        const buf = toBuf(value);
+        source.* = .{ .rows = @intCast(buf.logical_shape.?[0]), .k = k, .f32_data = if (buf.source_tensor == null) buf.data else null };
+        if (buf.source_tensor) |tensor| {
+            source.raw = tensor.data;
+            source.dtype = tensor.dtype;
+        }
+    }
+    fillCanonicalPanelSources(sources[0..weights.len], data, k);
+}
+
 fn canonicalCpuPanels(self: *NativeCompute, names: []const []const u8, k: usize) !?linalg.prepared_gemm.Panels {
     if (!self.cache_embeddinggemma2_bf16_weights or names.len == 0 or names.len > 3) return null;
     const class = embeddinggemma2_weight_cache.nativeClass(names[0]) orelse return null;
@@ -9521,13 +11180,15 @@ fn canonicalCpuPanels(self: *NativeCompute, names: []const []const u8, k: usize)
         if (!self.data.resident_weights.contains(name) and !self.data.lazy_weights.contains(name)) return null;
     }
     const cache = if (self.data.tier_cache) |*cache| cache else return null;
-    const key = if (names.len == 1) names[0] else try std.mem.join(self.allocator, "|", names);
-    defer if (names.len != 1) self.allocator.free(key);
+    var key_storage: [3 * 256 + 2]u8 = undefined;
+    const key = if (self.canonical_panel_receiving or self.canonical_panel_preparation_required) try canonicalPanelKey(&key_storage, names) else if (names.len == 1) names[0] else try std.mem.join(self.allocator, "|", names);
+    defer if (!self.canonical_panel_receiving and !self.canonical_panel_preparation_required and names.len != 1) self.allocator.free(key);
     {
         platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
         defer self.data.embeddinggemma2_f32_cache_lock.unlock();
         if (self.data.embeddinggemma2_canonical_panels.get(key)) |entry| {
             if (entry.panels.k != k) return error.InvalidTensorShape;
+            if ((self.canonical_panel_preparation_required or self.canonical_panel_receiving) and !nativeCacheStampsCurrentLocked(self.data, names, entry.source_stamps)) return error.NativeWeightPreparationChanged;
             if (!self.hasModelCacheReader()) {
                 self.data.embeddinggemma2_f32_readers += 1;
                 self.embeddinggemma2_cache_reader = true;
@@ -9535,6 +11196,8 @@ fn canonicalCpuPanels(self: *NativeCompute, names: []const []const u8, k: usize)
             return entry.panels;
         }
     }
+    if (self.canonical_panel_receiving) return null; // same-op optional decline, no raw supplier
+    if (self.canonical_panel_preparation_required) return error.UnpreparedNativePanelCacheOperation;
     var weights: [3]CT = undefined;
     var count: usize = 0;
     defer for (weights[0..count]) |value| freeTensor(self, value);
@@ -9582,26 +11245,11 @@ fn canonicalCpuPanels(self: *NativeCompute, names: []const []const u8, k: usize)
     errdefer cache.noteRelease(.host, bytes);
     const data = try self.data.allocator.alloc(f32, bytes / @sizeOf(f32));
     errdefer self.data.allocator.free(data);
-    @memset(data, 0);
-    var row: usize = 0;
-    for (weights[0..count]) |value| {
-        const buf = toBuf(value);
-        const rows: usize = @intCast(buf.logical_shape.?[0]);
-        for (0..rows) |r| for (0..k) |c| {
-            const src = r * k + c;
-            const v: f32 = if (buf.source_tensor) |source| blk: {
-                const bits = std.mem.readInt(u16, source.data[src * 2 ..][0..2], .little);
-                break :blk if (source.dtype == .bf16) @bitCast(@as(u32, bits) << 16) else @floatCast(@as(f16, @bitCast(bits)));
-            } else buf.data[src];
-            const dest = row + r;
-            data[dest / 64 * k * 64 + c * 64 + dest % 64] = v;
-        };
-        row += rows;
-    }
+    fillCanonicalPanelBytes(weights[0..count], data, k);
     const owned_key = try self.data.allocator.dupe(u8, key);
     errdefer self.data.allocator.free(owned_key);
     const panels = linalg.prepared_gemm.Panels{ .data = data, .n = n, .k = k };
-    try self.data.embeddinggemma2_canonical_panels.put(self.data.allocator, owned_key, .{ .panels = panels, .class = class });
+    try self.data.embeddinggemma2_canonical_panels.put(self.data.allocator, owned_key, .{ .panels = panels, .class = class, .source_stamps = nativeCacheSourceStampsLocked(self.data, names) });
     self.data.embeddinggemma2_f32_cache_bytes += bytes;
     self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)] += bytes;
     if (!self.hasModelCacheReader()) {
@@ -9825,7 +11473,7 @@ fn linearNoBiasPlannedOp(ctx: *anyopaque, request: *const ops.LinearNoBiasPlanne
 fn linearPlannedOp(ctx: *anyopaque, request: *const ops.LinearPlannedRequest) anyerror!CT {
     return allocateLinearOutputWithPlan(ctx, request.input, request.weight, request.bias, request.rows, request.in_dim, request.out_dim, request.operator_plan);
 }
-fn plannedQuantLinearInto(self: *NativeCompute, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, plan: ops.OperatorPlan) !void {
+fn plannedQuantLinearInto(self: *NativeCompute, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, plan: ops.OperatorPlan, activation_workspace: ?[]u8) !void {
     const weight_buf = toBuf(weight);
     const storage = weight_buf.quantized_storage orelse return error.InvalidPartitionPlan;
     defer maybeDiscardMappedWeightAfterUse(self, weight);
@@ -9844,6 +11492,7 @@ fn plannedQuantLinearInto(self: *NativeCompute, input: CT, weight: CT, bias: ?CT
         .bias_a = if (bias) |value| getData(value) else null,
         .output_a = output,
         .plan = plan,
+        .activation_workspace = activation_workspace,
     })) return error.UnsupportedOperation;
 }
 
@@ -9948,29 +11597,13 @@ fn linearNoBiasPairPrepared(
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
-    if (weight_buf_a.quantized_storage) |storage_a| {
-        if (weight_buf_b.quantized_storage) |storage_b| {
+    if (weight_buf_a.quantized_storage != null) {
+        if (weight_buf_b.quantized_storage != null) {
             defer maybeDiscardMappedWeightAfterUse(self, weight_a);
             defer maybeDiscardMappedWeightAfterUse(self, weight_b);
             var outputs = try GroupedLinearOutputs(2).init(self, rows * out_dim);
             defer outputs.deinit(self);
-            if (try dispatchQuantizedLinear(.{
-                .compute = self,
-                .dense_prepared = dense_prepared,
-                .kind = .pair_no_bias,
-                .input = getData(input),
-                .rows = rows,
-                .in_dim = in_dim,
-                .out_dim = out_dim,
-                .storage_a = storage_a,
-                .storage_b = storage_b,
-                .name_a = weight_buf_a.name,
-                .weight_buf_a = weight_buf_a,
-                .name_b = weight_buf_b.name,
-                .weight_buf_b = weight_buf_b,
-                .output_a = outputs.raw[0].?,
-                .output_b = outputs.raw[1].?,
-            })) {
+            if (try quantizedLinearPairInto(self, input, weight_a, weight_b, rows, in_dim, out_dim, outputs.raw[0].?, outputs.raw[1].?, dense_prepared, null)) {
                 const results = try outputs.intoResults(self, rows, out_dim);
                 return .{ .first = results[0], .second = results[1] };
             }
@@ -9981,6 +11614,34 @@ fn linearNoBiasPairPrepared(
     errdefer freeTensor(ctx, first);
     const second = try allocateLinearOutputPrepared(ctx, input, weight_b, null, rows, in_dim, out_dim, null, dense_prepared, null);
     return .{ .first = first, .second = second };
+}
+
+/// Existing pair dispatch with caller-owned outputs. The allocating wrapper
+/// retains its original guards/discard ordering. Authored paired schedules must
+/// validate BOTH actual slots/liveness/aliases before entering this helper.
+fn quantizedLinearPairInto(self: *NativeCompute, input: CT, weight_a: CT, weight_b: CT, rows: usize, in_dim: usize, out_dim: usize, output_a: []f32, output_b: []f32, dense_prepared: bool, activation_workspace: ?[]u8) !bool {
+    const weight_buf_a = toBuf(weight_a);
+    const weight_buf_b = toBuf(weight_b);
+    const storage_a = weight_buf_a.quantized_storage orelse return false;
+    const storage_b = weight_buf_b.quantized_storage orelse return false;
+    return dispatchQuantizedLinear(.{
+        .compute = self,
+        .dense_prepared = dense_prepared,
+        .kind = .pair_no_bias,
+        .input = getData(input),
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .storage_a = storage_a,
+        .storage_b = storage_b,
+        .name_a = weight_buf_a.name,
+        .weight_buf_a = weight_buf_a,
+        .name_b = weight_buf_b.name,
+        .weight_buf_b = weight_buf_b,
+        .output_a = output_a,
+        .output_b = output_b,
+        .activation_workspace = activation_workspace,
+    });
 }
 
 fn inferMulMatIdExpertAxis(shape: []const i64, expert_count: usize) ?usize {
@@ -10260,13 +11921,15 @@ fn linearPairPrepared(
 fn linearTripleNoBiasNamedOp(ctx: *anyopaque, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (self.cache_embeddinggemma2_bf16_weights) {
-        const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}.qkv", .{ names[0], names[1], names[2] });
-        defer self.allocator.free(key);
+        var key_storage: [3 * 256 + 6]u8 = undefined;
+        const managed_key = self.mirror_cache_receiving or self.canonical_panel_receiving or self.canonical_panel_preparation_required;
+        const key = if (managed_key) try f32PackedKey(&key_storage, &names) else try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}.qkv", .{ names[0], names[1], names[2] });
+        defer if (!managed_key) self.allocator.free(key);
         var cached: ?CT = null;
         {
             platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
             defer self.data.embeddinggemma2_f32_cache_lock.unlock();
-            if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+            if (try selectedF32CacheEntryLocked(self, key)) |entry| {
                 if (entry.data.len != 3 * in_dim * out_dim) return error.InvalidTensorShape;
                 if (!self.hasModelCacheReader()) {
                     self.data.embeddinggemma2_f32_readers += 1;
@@ -10323,17 +11986,21 @@ fn linearPackedNamedOp(ctx: *anyopaque, input: CT, names: []const []const u8, wi
         try observedPreparedGemm(self.io, rows, panels, getData(input), output);
         return makeLinearNoBiasResult(self, output, rows, total);
     }
-    const joined = try std.mem.join(self.allocator, "|", names);
-    defer self.allocator.free(joined);
-    const key = try std.mem.concat(self.allocator, u8, &.{ joined, ".qkv" });
-    defer self.allocator.free(key);
+    var key_storage: [3 * 256 + 6]u8 = undefined;
+    const managed_key = self.mirror_cache_receiving or self.canonical_panel_receiving or self.canonical_panel_preparation_required;
+    const key = if (managed_key) try f32PackedKey(&key_storage, names) else raw_key: {
+        const joined = try std.mem.join(self.allocator, "|", names);
+        defer self.allocator.free(joined);
+        break :raw_key try std.mem.concat(self.allocator, u8, &.{ joined, ".qkv" });
+    };
+    defer if (!managed_key) self.allocator.free(key);
     var total: usize = 0;
     for (widths) |width| total = try std.math.add(usize, total, width);
     var cached: ?CT = null;
     {
         platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
         defer self.data.embeddinggemma2_f32_cache_lock.unlock();
-        if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| {
+        if (try selectedF32CacheEntryLocked(self, key)) |entry| {
             if (entry.data.len != in_dim * total) return error.InvalidTensorShape;
             if (!self.hasModelCacheReader()) {
                 self.data.embeddinggemma2_f32_readers += 1;
@@ -10346,6 +12013,7 @@ fn linearPackedNamedOp(ctx: *anyopaque, input: CT, names: []const []const u8, wi
         defer freeTensor(ctx, weight);
         return try linearNoBiasOp(ctx, input, weight, rows, in_dim, total);
     }
+    if (self.mirror_cache_receiving) return null;
     var weights: [3]CT = undefined;
     var count: usize = 0;
     defer for (weights[0..count]) |weight| freeTensor(ctx, weight);
@@ -10384,18 +12052,28 @@ fn packedMediaLinears(self: *NativeCompute, weights: []const CT, in_dim: usize, 
         } else if (buf.data.len != in_dim * width) return null;
         out_dim = try std.math.add(usize, out_dim, width);
     }
-    const key = try packedLinearKey(self.allocator, weights, ".qkv");
-    defer self.allocator.free(key);
+    var names: [3][]const u8 = undefined;
+    for (weights, names[0..weights.len]) |weight, *name| name.* = toBuf(weight).name;
+    var key_storage: [3 * 256 + 6]u8 = undefined;
+    const managed_key = self.mirror_cache_receiving or self.canonical_panel_receiving or self.canonical_panel_preparation_required;
+    const key = if (managed_key) try f32PackedKey(&key_storage, names[0..weights.len]) else try packedLinearKey(self.allocator, weights, ".qkv");
+    defer if (!managed_key) self.allocator.free(key);
     const cache = if (self.data.tier_cache) |*cache| cache else return null;
     self.data.prefetch.lock();
     defer self.data.prefetch.unlock();
     platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
     defer self.data.embeddinggemma2_f32_cache_lock.unlock();
-    if (!self.hasModelCacheReader()) {
+    if (!self.mirror_cache_receiving and !self.canonical_panel_receiving and !self.hasModelCacheReader()) {
         self.data.embeddinggemma2_f32_readers += 1;
         self.embeddinggemma2_cache_reader = true;
     }
-    if (self.data.embeddinggemma2_f32_cache.get(key)) |entry| return self.makeBuf(entry.data, false);
+    if (try selectedF32CacheEntryLocked(self, key)) |entry| {
+        try self.retainMirrorReader();
+        if ((self.mirror_cache_receiving or self.canonical_panel_receiving) and entry.prepared_physical_bytes == 0) return null;
+        return self.makeBuf(entry.data, false);
+    }
+    if (self.mirror_cache_receiving or self.canonical_panel_receiving) return null;
+    if (self.canonical_panel_preparation_required) return error.UnpreparedNativePanelCacheOperation;
     const bytes = in_dim * out_dim * @sizeOf(f32);
     const used = self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)];
     const limit = embeddinggemma2_weight_cache.classLimit(class);
@@ -10413,12 +12091,12 @@ fn packedMediaLinears(self: *NativeCompute, weights: []const CT, in_dim: usize, 
     for (weights, widths) |weight, width| {
         const destination = combined_weight[offset..][0 .. in_dim * width];
         const buf = toBuf(weight);
-        if (buf.source_tensor) |source| tensor_mod.widenBf16LittleEndian(source.data, destination) else @memcpy(destination, buf.data);
+        copyPackedMediaWeight(destination, buf.source_tensor, std.mem.sliceAsBytes(buf.data));
         offset += in_dim * width;
     }
     var projection_widths: [3]usize = @splat(0);
     @memcpy(projection_widths[0..widths.len], widths);
-    try self.data.embeddinggemma2_f32_cache.put(self.data.allocator, name, .{ .data = combined_weight, .bytes = bytes, .projection_widths = projection_widths, .in_dim = in_dim });
+    try putF32MirrorCache(self.data, name, .{ .data = combined_weight, .bytes = bytes, .projection_widths = projection_widths, .in_dim = in_dim });
     self.data.embeddinggemma2_f32_cache_bytes += bytes;
     self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)] += bytes;
     // Ownership has transferred to the model before allocating the handle.
@@ -10622,6 +12300,20 @@ fn linearNoBiasQuantizedWithPolicy(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
+    return linearNoBiasQuantizedWithWorkspace(policy, io, storage, input, output, rows, in_dim, out_dim, null);
+}
+
+fn linearNoBiasQuantizedWithWorkspace(
+    policy: QuantizedActivationPolicy,
+    io: ?std.Io,
+    storage: *const QuantizedStorage,
+    input: []const f32,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    activation_workspace: ?[]u8,
+) !bool {
     if (storage.tensor_type.eql(.{ .known = .Q4_K }) or
         storage.tensor_type.eql(.{ .known = .Q5_K }) or
         storage.tensor_type.eql(.{ .known = .Q6_K }))
@@ -10637,7 +12329,7 @@ fn linearNoBiasQuantizedWithPolicy(
                 storage.preparedBytes(.row_major_blocks) != null)
             {
                 const panel16_blocks = if (q6KPanel16SingleEnabledForShape(rows, out_dim, row_blocks)) storage.preparedBytes(.panel16) else null;
-                try linearNoBiasQ6KPreparedQ8KActivation(storage.allocator, io, input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), panel16_blocks, output, rows, in_dim, out_dim);
+                try linearNoBiasQ6KPreparedQ8KActivationWithWorkspace(storage.allocator, io, input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), panel16_blocks, output, rows, in_dim, out_dim, activation_workspace);
                 @import("../execution/runtime_observation.zig").nativeDispatchFamily(@as(enum { q6_k_q8k_activation }, .q6_k_q8k_activation), .successful_return);
                 return true;
             }
@@ -10652,10 +12344,10 @@ fn linearNoBiasQuantizedWithPolicy(
                 (policy == .automatic and shouldUseQ4_Q5_KQ8KActivationQuant(rows, out_dim, row_blocks)) and
                 storage.preparedBytes(.row_major_blocks) != null)
             {
-                try linearNoBiasQ4Q5KPreparedQ8KActivation(storage.allocator, io, input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), storage.preparedBytes(.panel16), null, output, rows, in_dim, out_dim, switch (storage.tensor_type) {
+                try linearNoBiasQ4Q5KPreparedQ8KActivationWithWorkspace(storage.allocator, io, input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), storage.preparedBytes(.panel16), null, output, rows, in_dim, out_dim, switch (storage.tensor_type) {
                     .known => |known| known,
                     else => unreachable,
-                });
+                }, activation_workspace);
                 noteNativeQuantOuterDispatch(.q4_q5_k_q8k_activation, .successful_return);
                 return true;
             }
@@ -10792,7 +12484,7 @@ fn linearNoBiasQuantizedWithPolicy(
     if (storage.tensor_type.eql(.{ .known = .Q8_0 }) and storage.packed_expert == null) {
         if (storage.shape.len != 2) return false;
         if (storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
-        try linearNoBiasQ8_0WithPolicy(policy, storage.allocator, io, input, storage.raw_bytes, storage.preparedBytes(.row_major_blocks), storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), output, rows, in_dim, out_dim);
+        try linearNoBiasQ8_0WithWorkspace(policy, storage.allocator, io, input, storage.raw_bytes, storage.preparedBytes(.row_major_blocks), storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), output, rows, in_dim, out_dim, activation_workspace);
         noteNativeQuantOuterDispatch(.q8_0_direct, .successful_return);
         return true;
     }
@@ -10896,6 +12588,10 @@ fn NativeProjectionFamily(comptime n: usize) type {
         }
 
         inline fn applyQ8_0(self: @This(), allocator: std.mem.Allocator, io: ?std.Io, input: []const f32, rows: usize, in_dim: usize, out_dim: usize) !void {
+            return self.applyQ8_0WithWorkspace(allocator, io, input, rows, in_dim, out_dim, null);
+        }
+
+        inline fn applyQ8_0WithWorkspace(self: @This(), allocator: std.mem.Allocator, io: ?std.Io, input: []const f32, rows: usize, in_dim: usize, out_dim: usize, activation_workspace: ?[]u8) !void {
             var raw: [n][]const u8 = undefined;
             var blocks: [n]?[]const u8 = undefined;
             var panels: [n]?[]const u8 = undefined;
@@ -10906,7 +12602,7 @@ fn NativeProjectionFamily(comptime n: usize) type {
                 panels[i] = storage.preparedBytes(.panel4);
                 panels8[i] = storage.preparedBytes(.panel8);
             }
-            return linearQ8_0Projections(n, allocator, io, input, raw, blocks, panels, panels8, self.biases, self.outputs, rows, in_dim, out_dim);
+            return linearQ8_0ProjectionsWithWorkspace(n, allocator, io, input, raw, blocks, panels, panels8, self.biases, self.outputs, rows, in_dim, out_dim, activation_workspace);
         }
 
         inline fn addBias(self: @This(), rows: usize, out_dim: usize) void {
@@ -10967,6 +12663,22 @@ pub fn linearNoBiasQuantizedPair(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
+    return linearNoBiasQuantizedPairWithWorkspace(io, allocator, storage_a, storage_b, input, output_a, output_b, rows, in_dim, out_dim, null);
+}
+
+fn linearNoBiasQuantizedPairWithWorkspace(
+    io: ?std.Io,
+    allocator: std.mem.Allocator,
+    storage_a: *const QuantizedStorage,
+    storage_b: *const QuantizedStorage,
+    input: []const f32,
+    output_a: []f32,
+    output_b: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    activation_workspace: ?[]u8,
+) !bool {
     const projections = NativeProjectionFamily(2){
         .storage = .{ storage_a, storage_b },
         .outputs = .{ output_a, output_b },
@@ -10990,26 +12702,19 @@ pub fn linearNoBiasQuantizedPair(
                 const q8_block_size: usize = 292;
                 const q_input_len = rows * row_blocks * q8_block_size;
                 // quant-kernel-codegen:begin CPU activation linearNoBiasQuantizedPair pipeline 1
-                if (q_input_len <= q8_k_activation_stack_max_bytes) {
+                if (activation_workspace) |q_input| {
+                    if (q_input.len != q_input_len) return error.InvalidAssignedHostWorkspace;
+                    try runPreparedKBlockPairActivation(io, input, q_input, storage_a, storage_b, output_a, output_b, rows, in_dim, out_dim, known);
+                } else if (q_input_len <= q8_k_activation_stack_max_bytes) {
                     var q_input_buf: [q8_k_activation_stack_max_bytes]u8 = undefined;
                     const q_input = q_input_buf[0..q_input_len];
-                    const quant_start = nativeQuantPhaseStart();
-                    try quantizeQ8_KActivationRowsDispatch(io, input, q_input, rows, in_dim, row_blocks);
-                    noteNativeQuantPhase(.q8k_activation_quant, quant_start);
-                    const compute_start = nativeQuantPhaseStart();
-                    try linearKPreparedQ8KActivationPairDispatch(false, io, q_input, storage_a.preparedBytes(.row_major_blocks).?, storage_a.preparedBytes(.panel4), storage_a.preparedBytes(.panel8), storage_a.preparedBytes(.panel16), output_a, storage_b.preparedBytes(.row_major_blocks).?, storage_b.preparedBytes(.panel4), storage_b.preparedBytes(.panel8), storage_b.preparedBytes(.panel16), output_b, rows, in_dim, out_dim, known);
-                    noteNativeQuantPhase(.q4q5_q8k_pair_compute, compute_start);
+                    try runPreparedKBlockPairActivation(io, input, q_input, storage_a, storage_b, output_a, output_b, rows, in_dim, out_dim, known);
                 } else {
                     const alloc_start = nativeQuantPhaseStart();
                     const q_input = try allocator.alloc(u8, q_input_len);
                     defer allocator.free(q_input);
                     noteNativeQuantPhase(.q8k_activation_alloc, alloc_start);
-                    const quant_start = nativeQuantPhaseStart();
-                    try quantizeQ8_KActivationRowsDispatch(io, input, q_input, rows, in_dim, row_blocks);
-                    noteNativeQuantPhase(.q8k_activation_quant, quant_start);
-                    const compute_start = nativeQuantPhaseStart();
-                    try linearKPreparedQ8KActivationPairDispatch(false, io, q_input, storage_a.preparedBytes(.row_major_blocks).?, storage_a.preparedBytes(.panel4), storage_a.preparedBytes(.panel8), storage_a.preparedBytes(.panel16), output_a, storage_b.preparedBytes(.row_major_blocks).?, storage_b.preparedBytes(.panel4), storage_b.preparedBytes(.panel8), storage_b.preparedBytes(.panel16), output_b, rows, in_dim, out_dim, known);
-                    noteNativeQuantPhase(.q4q5_q8k_pair_compute, compute_start);
+                    try runPreparedKBlockPairActivation(io, input, q_input, storage_a, storage_b, output_a, output_b, rows, in_dim, out_dim, known);
                 }
                 // quant-kernel-codegen:end CPU activation linearNoBiasQuantizedPair pipeline 1
                 noteNativeQuantOuterDispatch(.q4_q5_k_q8k_activation_pair, .successful_return);
@@ -11177,7 +12882,7 @@ pub fn linearNoBiasQuantizedPair(
             }
             // Avoid the runtime dot-function pair fallback for Q8_0; use the
             // specialized MR/NR tiled path with one shared worker dispatch.
-            try projections.applyQ8_0(allocator, io, input, rows, in_dim, out_dim);
+            try projections.applyQ8_0WithWorkspace(allocator, io, input, rows, in_dim, out_dim, activation_workspace);
             noteNativeQuantOuterDispatch(.q8_0_pair, .successful_return);
             return true;
         } else if (known == .Q8_1) {
@@ -11297,6 +13002,16 @@ pub fn linearNoBiasQuantizedPair(
         else => {},
     }
     return false;
+}
+
+fn runPreparedKBlockPairActivation(io: ?std.Io, input: []const f32, q_input: []u8, storage_a: *const QuantizedStorage, storage_b: *const QuantizedStorage, output_a: []f32, output_b: []f32, rows: usize, in_dim: usize, out_dim: usize, known: gguf_tensor_types.KnownTensorType) !void {
+    const row_blocks = in_dim / 256;
+    const quant_start = nativeQuantPhaseStart();
+    try quantizeQ8_KActivationRowsDispatch(io, input, q_input, rows, in_dim, row_blocks);
+    noteNativeQuantPhase(.q8k_activation_quant, quant_start);
+    const compute_start = nativeQuantPhaseStart();
+    try linearKPreparedQ8KActivationPairDispatch(false, io, q_input, storage_a.preparedBytes(.row_major_blocks).?, storage_a.preparedBytes(.panel4), storage_a.preparedBytes(.panel8), storage_a.preparedBytes(.panel16), output_a, storage_b.preparedBytes(.row_major_blocks).?, storage_b.preparedBytes(.panel4), storage_b.preparedBytes(.panel8), storage_b.preparedBytes(.panel16), output_b, rows, in_dim, out_dim, known);
+    noteNativeQuantPhase(.q4q5_q8k_pair_compute, compute_start);
 }
 
 fn linearQ4Q5KPreparedQ8KActivationWithBias(
@@ -24222,6 +25937,23 @@ fn linearNoBiasQ6KPreparedQ8KActivation(
     in_dim: usize,
     out_dim: usize,
 ) !void {
+    return linearNoBiasQ6KPreparedQ8KActivationWithWorkspace(allocator, io, input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, output, rows, in_dim, out_dim, null);
+}
+
+fn linearNoBiasQ6KPreparedQ8KActivationWithWorkspace(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    prepared_blocks: []const u8,
+    panel_blocks: ?[]const u8,
+    panel8_blocks: ?[]const u8,
+    panel16_blocks: ?[]const u8,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    activation_workspace: ?[]u8,
+) !void {
     const values_per_block: usize = 256;
     const q8_block_size: usize = 292;
     if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
@@ -24237,6 +25969,11 @@ fn linearNoBiasQ6KPreparedQ8KActivation(
         if (blocks.len != preparedKPanel16ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
     }
     const q_input_len = rows * row_blocks * q8_block_size;
+    if (activation_workspace) |scratch| {
+        if (scratch.len != q_input_len) return error.InvalidAssignedHostWorkspace;
+        try runPreparedKBlockSingleActivation(io, input, scratch, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, null, output, rows, in_dim, out_dim, .Q6_K, q_input_len > q8_k_activation_stack_max_bytes);
+        return;
+    }
     // quant-kernel-codegen:begin CPU activation linearNoBiasQ6KPreparedQ8KActivation pipeline 1
     if (q_input_len <= q8_k_activation_stack_max_bytes) {
         var q_input_buf: [q8_k_activation_stack_max_bytes]u8 = undefined;
@@ -24293,6 +26030,25 @@ fn linearNoBiasQ4Q5KPreparedQ8KActivation(
     out_dim: usize,
     known: gguf_tensor_types.KnownTensorType,
 ) !void {
+    return linearNoBiasQ4Q5KPreparedQ8KActivationWithWorkspace(allocator, io, input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, bias, output, rows, in_dim, out_dim, known, null);
+}
+
+fn linearNoBiasQ4Q5KPreparedQ8KActivationWithWorkspace(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    prepared_blocks: []const u8,
+    panel_blocks: ?[]const u8,
+    panel8_blocks: ?[]const u8,
+    panel16_blocks: ?[]const u8,
+    bias: ?[]const f32,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    known: gguf_tensor_types.KnownTensorType,
+    activation_workspace: ?[]u8,
+) !void {
     const values_per_block: usize = 256;
     const q8_block_size: usize = 292;
     if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
@@ -24308,33 +26064,42 @@ fn linearNoBiasQ4Q5KPreparedQ8KActivation(
         if (blocks.len != preparedKPanel16ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
     }
     const q_input_len = rows * row_blocks * q8_block_size;
+    if (activation_workspace) |scratch| {
+        if (scratch.len != q_input_len) return error.InvalidAssignedHostWorkspace;
+        try runPreparedKBlockSingleActivation(io, input, scratch, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, bias, output, rows, in_dim, out_dim, known, q_input_len > q8_k_activation_stack_max_bytes);
+        return;
+    }
     // quant-kernel-codegen:begin CPU activation linearNoBiasQ4Q5KPreparedQ8KActivation pipeline 1
     if (q_input_len <= q8_k_activation_stack_max_bytes) {
         var q_input_buf: [q8_k_activation_stack_max_bytes]u8 = undefined;
         const q_input = q_input_buf[0..q_input_len];
-        const quant_start = nativeQuantPhaseStart();
-        if (rows == 1) {
-            quantizeQ8_KActivationRows(input, q_input, rows, in_dim, row_blocks);
-        } else {
-            try quantizeQ8_KActivationRowsDispatch(io, input, q_input, rows, in_dim, row_blocks);
-        }
-        noteNativeQuantPhase(.q8k_activation_quant, quant_start);
-        const compute_start = nativeQuantPhaseStart();
-        try linearQ4Q5KPreparedQ8KActivationDispatch(io, q_input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, bias, output, rows, in_dim, out_dim, known);
-        noteNativeQuantPhase(.q4q5_q8k_compute, compute_start);
+        try runPreparedKBlockSingleActivation(io, input, q_input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, bias, output, rows, in_dim, out_dim, known, false);
         return;
     }
     const alloc_start = nativeQuantPhaseStart();
     const q_input = try allocator.alloc(u8, rows * row_blocks * q8_block_size);
     defer allocator.free(q_input);
     noteNativeQuantPhase(.q8k_activation_alloc, alloc_start);
+    try runPreparedKBlockSingleActivation(io, input, q_input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, bias, output, rows, in_dim, out_dim, known, true);
+    // quant-kernel-codegen:end CPU activation linearNoBiasQ4Q5KPreparedQ8KActivation pipeline 1
+}
+
+fn runPreparedKBlockSingleActivation(io: ?std.Io, input: []const f32, q_input: []u8, prepared_blocks: []const u8, panel_blocks: ?[]const u8, panel8_blocks: ?[]const u8, panel16_blocks: ?[]const u8, bias: ?[]const f32, output: []f32, rows: usize, in_dim: usize, out_dim: usize, known: gguf_tensor_types.KnownTensorType, dispatch_pack: bool) !void {
+    if (known == .Q6_K and bias != null) return error.InvalidQuantizedLinearShape;
+    const row_blocks = in_dim / 256;
     const quant_start = nativeQuantPhaseStart();
-    try quantizeQ8_KActivationRowsDispatch(io, input, q_input, rows, in_dim, row_blocks);
+    if (!dispatch_pack and rows == 1) {
+        quantizeQ8_KActivationRows(input, q_input, rows, in_dim, row_blocks);
+    } else {
+        try quantizeQ8_KActivationRowsDispatch(io, input, q_input, rows, in_dim, row_blocks);
+    }
     noteNativeQuantPhase(.q8k_activation_quant, quant_start);
+    if (known == .Q6_K) {
+        return linearQ6KPreparedQ8KActivationDispatch(io, q_input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, output, rows, in_dim, out_dim);
+    }
     const compute_start = nativeQuantPhaseStart();
     try linearQ4Q5KPreparedQ8KActivationDispatch(io, q_input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, bias, output, rows, in_dim, out_dim, known);
     noteNativeQuantPhase(.q4q5_q8k_compute, compute_start);
-    // quant-kernel-codegen:end CPU activation linearNoBiasQ4Q5KPreparedQ8KActivation pipeline 1
 }
 
 fn linearQ4Q5KPreparedQ8KActivationDispatch(
@@ -30040,9 +31805,27 @@ fn linearNoBiasQ8_0WithPolicy(
     in_dim: usize,
     out_dim: usize,
 ) !void {
+    return linearNoBiasQ8_0WithWorkspace(policy, allocator, io, input, weight_raw, prepared_blocks, prepared_panel_blocks, prepared_panel8_blocks, output, rows, in_dim, out_dim, null);
+}
+
+fn linearNoBiasQ8_0WithWorkspace(
+    policy: QuantizedActivationPolicy,
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    weight_raw: []const u8,
+    prepared_blocks: ?[]const u8,
+    prepared_panel_blocks: ?[]const u8,
+    prepared_panel8_blocks: ?[]const u8,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    activation_workspace: ?[]u8,
+) !void {
     const row_blocks = try validateQ8_0ProjectionFamily(1, .{weight_raw}, .{prepared_blocks}, .{prepared_panel_blocks}, .{prepared_panel8_blocks}, in_dim, out_dim);
     if (policy == .automatic and shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks))
-        return applyQuantizedActivationProjections(.q8, 1, true, allocator, io, input, .{weight_raw}, .{prepared_blocks}, .{prepared_panel_blocks}, .{prepared_panel8_blocks}, .{null}, .{output}, rows, in_dim, out_dim);
+        return applyQuantizedActivationProjectionsWithWorkspace(.q8, 1, true, allocator, io, input, .{weight_raw}, .{prepared_blocks}, .{prepared_panel_blocks}, .{prepared_panel8_blocks}, .{null}, .{output}, rows, in_dim, out_dim, activation_workspace);
 
     if (try linearNoBiasQ8_0Parallel(io, input, weight_raw, prepared_blocks, prepared_panel_blocks, output, rows, in_dim, out_dim)) return;
     q8_0F32Apply(input, weight_raw, prepared_blocks, prepared_panel_blocks, null, output, rows, in_dim, out_dim, 0, out_dim);
@@ -30097,18 +31880,45 @@ inline fn applyQuantizedActivationProjections(
     in_dim: usize,
     out_dim: usize,
 ) !void {
+    return applyQuantizedActivationProjectionsWithWorkspace(codec, n, profile, allocator, io, input, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim, null);
+}
+
+inline fn applyQuantizedActivationProjectionsWithWorkspace(
+    comptime codec: ActivationProjectionCodec,
+    comptime n: usize,
+    comptime profile: bool,
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    weights: [n][]const u8,
+    prepared: [n]?[]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    activation_workspace: ?[]u8,
+) !void {
     const blocks = in_dim / 32;
+    if (activation_workspace) |workspace| {
+        const value_bytes = try std.math.mul(usize, rows, in_dim);
+        const scale_count = try std.math.mul(usize, rows, blocks);
+        const bytes = try std.math.add(usize, value_bytes, try std.math.mul(usize, scale_count, @sizeOf(f32)));
+        if (workspace.len != bytes or @intFromPtr(workspace.ptr) % @alignOf(f32) != 0 or value_bytes % @alignOf(f32) != 0) return error.InvalidAssignedHostWorkspace;
+        const values = workspace[0..value_bytes];
+        const scales = std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) u8, @alignCast(workspace[value_bytes..])));
+        try runQuantizedActivationProjections(codec, n, profile, io, input, values, scales, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
+        return;
+    }
+
     if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
         var values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
         var scales_buf: [small_row_q8_0_stack_max_in_dim / 32]f32 = undefined;
         const values = values_buf[0..in_dim];
         const scales = scales_buf[0..blocks];
-        const quant_start = if (profile) nativeQuantPhaseStart() else 0;
-        if (codec == .q1) quantizeQ8_0ActivationRows(input, values, scales, rows, in_dim, blocks) else try quantizeQ8_0ActivationRowsDispatch(io, input, values, scales, rows, in_dim, blocks);
-        if (profile) noteNativeQuantPhase(.q8_0_activation_quant, quant_start);
-        const compute_start = if (profile) nativeQuantPhaseStart() else 0;
-        try dispatchActivationProjections(codec, n, io, values, scales, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
-        if (profile) noteNativeQuantPhase(.q8_0_compute, compute_start);
+        try runQuantizedActivationProjections(codec, n, profile, io, input, values, scales, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
         return;
     }
     const alloc_start = if (profile) nativeQuantPhaseStart() else 0;
@@ -30117,13 +31927,35 @@ inline fn applyQuantizedActivationProjections(
     const scales = try allocator.alloc(f32, rows * blocks);
     defer allocator.free(scales);
     if (profile) noteNativeQuantPhase(.q8_0_activation_alloc, alloc_start);
+    try runQuantizedActivationProjections(codec, n, profile, io, input, values, scales, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
+    return;
+}
+
+inline fn runQuantizedActivationProjections(
+    comptime codec: ActivationProjectionCodec,
+    comptime n: usize,
+    comptime profile: bool,
+    io: ?std.Io,
+    input: []const f32,
+    values: []u8,
+    scales: []f32,
+    weights: [n][]const u8,
+    prepared: [n]?[]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
+    const blocks = in_dim / 32;
     const quant_start = if (profile) nativeQuantPhaseStart() else 0;
     if (codec == .q1) quantizeQ8_0ActivationRows(input, values, scales, rows, in_dim, blocks) else try quantizeQ8_0ActivationRowsDispatch(io, input, values, scales, rows, in_dim, blocks);
     if (profile) noteNativeQuantPhase(.q8_0_activation_quant, quant_start);
     const compute_start = if (profile) nativeQuantPhaseStart() else 0;
     try dispatchActivationProjections(codec, n, io, values, scales, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
     if (profile) noteNativeQuantPhase(.q8_0_compute, compute_start);
-    return;
 }
 
 inline fn linearPreparedActivationProjections(
@@ -30194,9 +32026,28 @@ inline fn linearQ8_0Projections(
     in_dim: usize,
     out_dim: usize,
 ) !void {
+    return linearQ8_0ProjectionsWithWorkspace(n, allocator, io, input, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim, null);
+}
+
+inline fn linearQ8_0ProjectionsWithWorkspace(
+    comptime n: usize,
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    weights: [n][]const u8,
+    prepared: [n]?[]const u8,
+    panels: [n]?[]const u8,
+    panels8: [n]?[]const u8,
+    biases: [n]?[]const f32,
+    outputs: [n][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    activation_workspace: ?[]u8,
+) !void {
     const row_blocks = try validateQ8_0ProjectionFamily(n, weights, prepared, panels, panels8, in_dim, out_dim);
     if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks))
-        return applyQuantizedActivationProjections(.q8, n, false, allocator, io, input, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim);
+        return applyQuantizedActivationProjectionsWithWorkspace(.q8, n, false, allocator, io, input, weights, prepared, panels, panels8, biases, outputs, rows, in_dim, out_dim, activation_workspace);
     if (try linearQ8_0ProjectedParallel(n, io, input, weights, prepared, panels, biases, outputs, rows, in_dim, out_dim)) return;
     inline for (0..n) |plane| q8_0F32Apply(input, weights[plane], prepared[plane], panels[plane], biases[plane], outputs[plane], rows, in_dim, out_dim, 0, out_dim);
 }
@@ -50946,7 +52797,7 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
 // remain outside this buffer metric and in optional allocator observations.
 // Draft insertion in native_compute.zig. Broader typed/source/quant storage
 // remains explicitly unknown until all retained planes have one owner report.
-fn storageOwnershipOp(_: *anyopaque, tensor: CT, visitor: @import("../execution/storage_ownership.zig").Visitor) anyerror!@import("../execution/storage_ownership.zig").Coverage {
+fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../execution/storage_ownership.zig").Visitor) anyerror!@import("../execution/storage_ownership.zig").Coverage {
     const ownership = @import("../execution/storage_ownership.zig");
     const ml = @import("ml");
     const view = toBuf(tensor);
@@ -50959,7 +52810,35 @@ fn storageOwnershipOp(_: *anyopaque, tensor: CT, visitor: @import("../execution/
         if (lease == null) lease = root.physical_lease;
     }
     if (lease) |physical| root = toBuf(physical.tensor);
-    if (root.quantized_storage != null or root.owned_quantized_storage != null) return .unknown;
+    if (root.quantized_storage != null or root.owned_quantized_storage != null) {
+        const compute: *NativeCompute = @ptrCast(@alignCast(ctx));
+        ResidentWeightPreparation.lock(compute.data);
+        const quantized_source = namedResidentQuantizedStorageLocked(compute, tensor);
+        const fact = if (quantized_source != null) NativeCompute.authoredResidentSourceQueryLocked(compute.data, root.name) catch null else null;
+        // Copy value-only addresses/extents while excluded, never callback with
+        // the metadata mutex held. Actual owning CT/Model remain pinned.
+        const raw = if (quantized_source) |value| value.raw_bytes else &.{};
+        const raw_backing = if (quantized_source) |value| quantizedRawBacking(value) else null;
+        var entries: [@typeInfo(QuantizedStorage.PreparedQuantLayout).@"enum".field_names.len]?[]const u8 = @splat(null);
+        if (quantized_source) |value| for (value.prepared.entries, 0..) |entry, i| if (entry) |bytes| {
+            entries[i] = bytes.bytes;
+        };
+        ResidentWeightPreparation.unlock(compute.data);
+        if (fact == null or fact.?.quantized == null or raw_backing == null) return .unknown;
+        const format = backend_contracts.quantFormatFromGgufTensorType(.{ .known = fact.?.quantized.?.kind }) orelse return .unknown;
+        var descriptor = backend_contracts.TensorDesc.packedQuant(fact.?.shape.?, format);
+        descriptor.current_backend = .native;
+        descriptor.resident_backend = .native;
+        const raw_identity = ownership.Identity{ .kind = .host, .base = @intFromPtr(raw_backing.?.bytes.ptr) };
+        try visitor.emit(.{ .backing = .{ .identity = raw_identity, .domain = .host, .requested_bytes = raw_backing.?.bytes.len, .backing_bytes = raw_backing.?.bytes.len, .access = .read_only, .ownership = .borrowed_model } });
+        try visitor.emit(.{ .plane = .{ .descriptor = descriptor, .role = .primary, .backing = raw_identity, .byte_offset = raw_backing.?.offset, .logical_bytes = raw.len, .readable_bytes = raw.len } });
+        for (entries, 0..) |entry, i| if (entry) |bytes| {
+            const identity = ownership.Identity{ .kind = .host, .base = @intFromPtr(bytes.ptr) };
+            try visitor.emit(.{ .backing = .{ .identity = identity, .domain = .host, .requested_bytes = bytes.len, .backing_bytes = bytes.len, .access = .read_only, .ownership = .borrowed_model } });
+            try visitor.emit(.{ .plane = .{ .descriptor = descriptor, .role = .packed_weight, .layout_key = @intCast(i), .backing = identity, .byte_offset = 0, .logical_bytes = bytes.len, .readable_bytes = bytes.len } });
+        };
+        return .complete;
+    }
     if (root.source_tensor) |source| {
         if (root.owned or !source.owns_data or source.shape.len > 8 or root.view_strides != null) return .unknown;
         const identity = ownership.Identity{ .kind = .host, .base = @intFromPtr(source.data.ptr) };
@@ -51143,9 +53022,11 @@ fn validateAssignedPagedAttention(geometry: ops.kernel_descriptor.PagedAttention
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const descriptor = request.descriptor;
+    const packed_row_route: ?*const PackedRowRoute = if (request.prepared_route) |selected| (if (selected.vtable == &PackedRowRoute.vtable) @ptrCast(@alignCast(selected.context)) else null) else null;
+    const quantized_route: ?*const QuantizedSingleRoute = if (request.prepared_route) |selected| (if (selected.vtable == &QuantizedSingleRoute.vtable) @ptrCast(@alignCast(selected.context)) else null) else null;
     const source_route: ?*const NativeSourceRoute = if (request.prepared_route) |selected| prepared: {
-        if (selected.implementation.context != ctx) return error.InvalidPreparedKernelRoute;
-        if (@import("../execution/assigned_kernel_route.zig").isDirect(selected)) break :prepared null;
+        if (selected.implementation.context != ctx or ((selected.vtable == &QuantizedSingleRoute.vtable or selected.vtable == &PackedRowRoute.vtable) and selected.implementation.table != @as(*const anyopaque, @ptrCast(&vtable_impl)))) return error.InvalidPreparedKernelRoute;
+        if (@import("../execution/assigned_kernel_route.zig").isDirect(selected) or selected.vtable == &QuantizedSingleRoute.vtable or selected.vtable == &PackedRowRoute.vtable) break :prepared null;
         if (selected.vtable != &NativeSourceRoute.vtable) return error.InvalidPreparedKernelRoute;
         break :prepared @ptrCast(@alignCast(selected.context));
     } else null;
@@ -51164,6 +53045,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     for (request.inputs, 0..) |input, i| {
         const buf = toBuf(input);
         if (source_route != null and i == 1) continue;
+        if (packed_row_route != null and i == 0) continue;
         if (descriptor.operation == .gather and i == 1 and descriptor.input_shapes[i].dtype != .f32) {
             const source = integerSource(input) orelse return false;
             if (source.dtype != switch (descriptor.input_shapes[i].dtype) {
@@ -51177,7 +53059,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
             if (buf.quantized_storage) |storage| {
                 const linear = descriptor.operation.linear;
                 if (storage.packed_expert != null or storage.shape.len != 2 or storage.shape[0] != linear.out_dim or storage.shape[1] != linear.in_dim) return false;
-                const selected = nativeQuantMatmulOperatorPlanForTensor(input, linear.rows, linear.in_dim, linear.out_dim) orelse return false;
+                const selected = if (quantized_route) |owner| owner.recipe.operator_plan else nativeQuantMatmulOperatorPlanForTensor(input, linear.rows, linear.in_dim, linear.out_dim) orelse return false;
                 try validateQuantLinearPlan(request.operatorPlan() orelse selected, storage, linear.rows, linear.in_dim, linear.out_dim);
                 continue;
             }
@@ -51194,6 +53076,8 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     if (descriptor.operation == .dot and (toBuf(request.inputs[0]).quantized_storage != null or toBuf(request.inputs[1]).quantized_storage != null)) return false;
     if (descriptor.operation == .rope and (request.auxiliaries.len != 0 or !descriptor.operation.rope.valid(descriptor.output_shape.dims[0..descriptor.output_shape.rank()], descriptor.elements()))) return false;
     if (source_route) |selected| try selected.validateInvocation(request);
+    if (quantized_route) |selected| try selected.validateInvocation(request);
+    if (packed_row_route) |selected| try selected.validateInvocation(request);
     const output_ct = request.output orelse return true;
     const target = toBuf(output_ct);
     if (nativeTensorReadOnly(target)) return error.ReadOnlyPhysicalStorage;
@@ -51235,7 +53119,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         .transpose, .broadcast => unreachable,
         .concat => |geometry| try concatDenseInto(dense_inputs[0], dense_inputs[1], output, geometry),
         .slice => |slice| try sliceDenseInto(dense_inputs[0], output, try slice.plan(descriptor.input_shapes[0], descriptor.output_shape)),
-        .gather => |gather| try gatherAxisInto(dense_inputs[0], if (descriptor.input_shapes[1].dtype == .f32) try @import("index_metadata.zig").Reader.init(.f32, std.mem.sliceAsBytes(dense_inputs[1])) else try IndexReader.init(request.inputs[1]), output, gather.geometry, true),
+        .gather => |gather| if (packed_row_route) |selected| try selected.execute(request, output) else try gatherAxisInto(dense_inputs[0], if (descriptor.input_shapes[1].dtype == .f32) try @import("index_metadata.zig").Reader.init(.f32, std.mem.sliceAsBytes(dense_inputs[1])) else try IndexReader.init(request.inputs[1]), output, gather.geometry, true),
         .dot => |dot| denseDotInto(dense_inputs[0], dense_inputs[1], output, dot),
         .reduction => |reduction| reduceInto(dense_inputs[0], output, reduction.geometry, reduction.mode),
         .rope => |rope_request| ropeDenseInto(dense_inputs[0], output, rope_request),
@@ -51260,8 +53144,8 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
             if (source_route) |selected| {
                 try selected.execute(request, output);
             } else if (toBuf(request.inputs[1]).quantized_storage != null) {
-                const selected = request.operatorPlan() orelse nativeQuantMatmulOperatorPlanForTensor(request.inputs[1], linear.rows, linear.in_dim, linear.out_dim).?;
-                try plannedQuantLinearInto(self, request.inputs[0], request.inputs[1], bias, linear.rows, linear.in_dim, linear.out_dim, output, selected);
+                const selected = if (quantized_route) |owner| owner.recipe.operator_plan else request.operatorPlan() orelse nativeQuantMatmulOperatorPlanForTensor(request.inputs[1], linear.rows, linear.in_dim, linear.out_dim).?;
+                try plannedQuantLinearInto(self, request.inputs[0], request.inputs[1], bias, linear.rows, linear.in_dim, linear.out_dim, output, selected, if (quantized_route != null) request.host_workspace else null);
             } else if (linear.bias) try linearInto(ctx, request.inputs[0], request.inputs[1], request.inputs[2], linear.rows, linear.in_dim, linear.out_dim, output) else try linearNoBiasInto(ctx, request.inputs[0], request.inputs[1], linear.rows, linear.in_dim, linear.out_dim, output);
         },
         .unary => |op| switch (op) {
@@ -51318,7 +53202,7 @@ fn allocateLinearOutputPrepared(ctx: *anyopaque, input: CT, weight: CT, bias: ?C
     var owned: ?[]f32 = try self.allocator.alloc(f32, try std.math.mul(usize, rows, out_dim));
     errdefer if (owned) |data| self.allocator.free(data);
     if (plan != null and toBuf(weight).quantized_storage != null) {
-        try plannedQuantLinearInto(self, input, weight, bias, rows, in_dim, out_dim, owned.?, plan.?);
+        try plannedQuantLinearInto(self, input, weight, bias, rows, in_dim, out_dim, owned.?, plan.?, null);
     } else if (bias) |value| try linearIntoPrepared(ctx, input, weight, value, rows, in_dim, out_dim, owned.?, dense_prepared, matrix_scratch) else try linearNoBiasIntoPrepared(ctx, input, weight, rows, in_dim, out_dim, owned.?, dense_prepared, matrix_scratch);
     const result = try self.makeBuf(owned.?, true);
     owned = null;
@@ -54118,6 +56002,348 @@ const NativeSourceRoute = struct {
     }
 };
 
+// Private receiving recipe for the original single-no-bias KBlock schedule.
+// Actual pointer/extent arrays are equality witnesses, never template facts or
+// admission credit. Prepared storage stays owned by the real named weight CT.
+const QuantizedSingleRecipe = struct {
+    const layout_count = @typeInfo(QuantizedStorage.PreparedQuantLayout).@"enum".field_names.len;
+    shape: [2]i64,
+    kind: gguf_tensor_types.KnownTensorType,
+    raw_pointer: usize,
+    raw_bytes: usize,
+    prepared_pointers: [layout_count]usize,
+    prepared_lengths: [layout_count]usize,
+    panel_epoch: u64,
+    preparation_policy: [7]bool,
+    q8_activation: bool,
+    activation_bytes: usize,
+    operator_plan: ops.OperatorPlan,
+};
+
+const QuantizedRawBacking = struct { bytes: []const u8, offset: usize };
+fn quantizedRawBacking(storage: *const QuantizedStorage) ?QuantizedRawBacking {
+    const whole = if (storage.raw_mmap_region) |region| region.data else if (storage.raw_mmap_backed) storage.raw_mmap_source_bytes orelse return null else if (storage.raw_owned) storage.raw_bytes else return null;
+    const base = @intFromPtr(whole.ptr);
+    const address = @intFromPtr(storage.raw_bytes.ptr);
+    if (address < base) return null;
+    const offset = address - base;
+    if (offset > whole.len or storage.raw_bytes.len > whole.len - offset) return null;
+    return .{ .bytes = whole, .offset = offset };
+}
+
+/// Borrowed named source under the existing model metadata lock. This is NOT
+/// authority over arbitrary quantized CTs, nor permission to prepare a layout.
+fn namedResidentQuantizedStorageLocked(self: *NativeCompute, tensor: CT) ?*const QuantizedStorage {
+    const view = toBuf(tensor);
+    if (view.owned or view.source_tensor != null or (view.declared_dtype != null and view.declared_dtype != .f32) or !view.whole_named_weight or weightData(self, view) != self.data or view.view_strides != null or view.view_base_offset != 0 or view.physical_lease != null or view.owned_quantized_storage != null) return null;
+    var root = view;
+    while (root.retained_parent) |parent| root = toBuf(parent);
+    if (!root.cached_weight or root.weight_handle == null or root.weight_handle.?.references == 0 or root.owned or root.data.len != 0 or view.data.len != 0 or root.source_tensor != null or root.physical_lease != null or root.lazy_entry != null) return null;
+    if (!std.mem.eql(u8, root.name, view.name)) return null;
+    const loaded = self.data.resident_weights.getPtr(root.name) orelse return null;
+    const source = if (loaded.quantized_storage) |*storage| storage else return null;
+    if (!loaded.quantized or loaded.tensor.data.len != 0 or quantizedRawBacking(source) == null or root.quantized_storage != source or view.quantized_storage != source or source.packed_expert != null or source.prepared_group_cache != null) return null;
+    if (root.logical_shape == null or view.logical_shape == null or !std.mem.eql(i64, root.logical_shape.?, source.shape) or !std.mem.eql(i64, view.logical_shape.?, source.shape)) return null;
+    return source;
+}
+
+fn quantizedSingleRecipe(self: *NativeCompute, tensor: CT, descriptor: *const ops.kernel_descriptor.Descriptor) !?QuantizedSingleRecipe {
+    return quantizedSingleRecipeWithPlan(self, tensor, descriptor, null);
+}
+fn quantizedSingleRecipeWithPlan(self: *NativeCompute, tensor: CT, descriptor: *const ops.kernel_descriptor.Descriptor, frozen_plan: ?ops.OperatorPlan) !?QuantizedSingleRecipe {
+    if (descriptor.operation != .linear or !nativeResidentDenseLinearRouteSupported(self, descriptor)) return null;
+    const linear = descriptor.operation.linear;
+    if (linear.rows != 1 or linear.bias or self.quantized_activation_policy != .automatic) return null;
+    ResidentWeightPreparation.lock(self.data);
+    defer ResidentWeightPreparation.unlock(self.data);
+    const storage = namedResidentQuantizedStorageLocked(self, tensor) orelse return null;
+    if (storage.shape.len != 2 or storage.shape[0] != linear.out_dim or storage.shape[1] != linear.in_dim) return null;
+    const kind = switch (storage.tensor_type) {
+        .known => |known| known,
+        else => return null,
+    };
+    if (kind != .Q4_K and kind != .Q5_K and kind != .Q6_K and kind != .Q8_0) return null;
+    if (linear.in_dim % (if (kind == .Q8_0) @as(u32, 32) else 256) != 0) return null;
+    if (kind == .Q8_0 and originalQ8NeedsTasks(self.io, linear.rows, linear.in_dim, linear.out_dim)) return null;
+    if (shouldUseLayaDequantSgemm(toBuf(tensor).name) or shouldUseQuantizedDequantSgemm(toBuf(tensor).name, linear.rows, linear.out_dim, storage)) return null;
+    const q8 = kind == .Q8_0;
+    const blocks = @as(usize, linear.in_dim) / (if (q8) @as(usize, 32) else 256);
+    const raw = gguf_tensor_types.byteLen(storage.tensor_type, &.{ linear.out_dim, linear.in_dim }) orelse return null;
+    if (storage.raw_bytes.len != raw) return null;
+    const row_major = storage.preparedBytes(.row_major_blocks) orelse return null;
+    if (q8) {
+        _ = try validateQ8_0ProjectionFamily(1, .{storage.raw_bytes}, .{row_major}, .{storage.preparedBytes(.panel4)}, .{storage.preparedBytes(.panel8)}, linear.in_dim, linear.out_dim);
+    } else {
+        const row_blocks = try std.math.mul(usize, linear.out_dim, blocks);
+        if (row_major.len != try std.math.mul(usize, row_blocks, prepared_q4_k_block_bytes)) return null;
+        if (storage.preparedBytes(.panel4)) |bytes| if (bytes.len != preparedKPanelByteSize(linear.out_dim, blocks)) return null;
+        if (storage.preparedBytes(.panel8)) |bytes| if (bytes.len != (if (kind == .Q6_K) preparedQ6KPanel8ByteSize(linear.out_dim, blocks) else preparedKPanel8ByteSize(linear.out_dim, blocks))) return null;
+        if (storage.preparedBytes(.panel16)) |bytes| if (bytes.len != preparedKPanel16ByteSize(linear.out_dim, blocks)) return null;
+    }
+    // Authored spans own exactly the original activation representation. The
+    // original raw API keeps its stack/heap choice and worker schedules.
+    if (!q8 and kind != .Q6_K and try std.math.mul(usize, blocks, 292) > q8_k_activation_stack_max_bytes) return null;
+    const quantized_activation = if (q8) shouldUseQ8_0ActivationQuant(1, linear.out_dim, blocks) else if (kind == .Q6_K) shouldUseQ6_KQ8KActivationQuant(1, linear.out_dim, blocks) else shouldUseQ4_Q5_KQ8KActivationQuant(1, linear.out_dim, blocks);
+    if (kind == .Q6_K and originalQ6SingleNeedsTasks(self.io, linear.rows, linear.in_dim, linear.out_dim, quantized_activation)) return null;
+    const activation_bytes = if (!quantized_activation) 0 else if (q8) try std.math.add(usize, linear.in_dim, try std.math.mul(usize, blocks, @sizeOf(f32))) else try std.math.mul(usize, blocks, 292);
+    // Cold selection happens only without a frozen route plan. Invocation
+    // validation reuses that value and checks actual format/dimensions instead
+    // of selecting another operator under numerical ownership.
+    const plan = frozen_plan orelse (nativeQuantMatmulOperatorPlanForTensor(tensor, linear.rows, linear.in_dim, linear.out_dim) orelse return null);
+    try validateQuantLinearPlan(plan, storage, linear.rows, linear.in_dim, linear.out_dim);
+    var pointers: [QuantizedSingleRecipe.layout_count]usize = @splat(0);
+    var lengths: [QuantizedSingleRecipe.layout_count]usize = @splat(0);
+    for (storage.prepared.entries, 0..) |entry, i| if (entry) |owned| {
+        pointers[i] = @intFromPtr(owned.bytes.ptr);
+        lengths[i] = owned.bytes.len;
+    };
+    return .{ .shape = .{ storage.shape[0], storage.shape[1] }, .kind = kind, .raw_pointer = @intFromPtr(storage.raw_bytes.ptr), .raw_bytes = storage.raw_bytes.len, .prepared_pointers = pointers, .prepared_lengths = lengths, .panel_epoch = storage.panel16_epoch.load(.acquire), .preparation_policy = ResidentWeightPreparation.selectedPolicy(kind), .q8_activation = quantized_activation, .activation_bytes = activation_bytes, .operator_plan = plan };
+}
+
+const QuantizedSingleRoute = struct {
+    allocator: std.mem.Allocator,
+    backend: ops.ComputeBackend,
+    descriptor: ops.kernel_descriptor.Descriptor,
+    slot: @import("../execution/kernel_route.zig").OutputSlot,
+    recipe: QuantizedSingleRecipe,
+    fn tensor(self: *const @This(), binding: @import("../execution/kernel_route.zig").Binding) ?CT {
+        if (binding != .tensor) return null;
+        if (binding.tensor.implementation.context != self.backend.ptr or binding.tensor.implementation.table != @as(*const anyopaque, @ptrCast(self.backend.vtable))) return null;
+        return binding.tensor.value;
+    }
+    fn sameSlot(self: *const @This(), slot: @import("../execution/kernel_route.zig").OutputSlot) bool {
+        return slot.allocation == self.slot.allocation and slot.node == self.slot.node and slot.epoch == self.slot.epoch and slot.logical.eq(self.slot.logical);
+    }
+    fn matches(raw: *anyopaque, request: @import("../execution/kernel_route.zig").Validate) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.sameSlot(request.output) or request.inputs.len != 2) return false;
+        if (!@import("../execution/assigned_kernel_route.zig").bindingDense(self.backend, request.inputs[0], self.descriptor.input_shapes[0])) return false;
+        const weight = self.tensor(request.inputs[1]) orelse return false;
+        const compute: *NativeCompute = @ptrCast(@alignCast(self.backend.ptr));
+        const actual = (quantizedSingleRecipeWithPlan(compute, weight, &self.descriptor, self.recipe.operator_plan) catch return false) orelse return false;
+        return std.meta.eql(actual, self.recipe);
+    }
+    fn validate(raw: *anyopaque, request: @import("../execution/kernel_route.zig").Validate) !void {
+        if (!matches(raw, request)) return error.PreparedKernelBindingChanged;
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.allocator.destroy(self);
+    }
+    fn validateInvocation(self: *const @This(), invocation: ops.kernel_descriptor.Invocation) !void {
+        if (!std.meta.eql(self.descriptor, invocation.descriptor.*) or invocation.inputs.len != 2) return error.PreparedKernelBindingChanged;
+        const compute: *NativeCompute = @ptrCast(@alignCast(self.backend.ptr));
+        const actual = (try quantizedSingleRecipeWithPlan(compute, invocation.inputs[1], invocation.descriptor, self.recipe.operator_plan)) orelse return error.PreparedKernelBindingChanged;
+        if (!std.meta.eql(actual, self.recipe)) return error.PreparedKernelBindingChanged;
+        if (invocation.operatorPlan()) |supplied| if (!std.meta.eql(supplied, self.recipe.operator_plan)) return error.PreparedKernelBindingChanged;
+        const output_ct = invocation.output orelse return;
+        const scratch = invocation.host_workspace;
+        if (scratch.len != self.recipe.activation_bytes) return error.InvalidAssignedHostWorkspace;
+        if (self.recipe.kind == .Q8_0 and scratch.len != 0 and @intFromPtr(scratch.ptr) % @alignOf(f32) != 0) return error.InvalidAssignedHostWorkspace;
+        if (scratch.len != 0) {
+            const input_bytes = assignedDenseF32Input(invocation.inputs[0], self.descriptor.input_shapes[0]) orelse return error.PreparedKernelBindingChanged;
+            if (kernel_geometry.byteRangesOverlap(@intFromPtr(scratch.ptr), scratch.len, @intFromPtr(input_bytes.ptr), input_bytes.len * 4)) return error.InvalidAssignedAlias;
+            if (kernel_geometry.byteRangesOverlap(@intFromPtr(scratch.ptr), scratch.len, self.recipe.raw_pointer, self.recipe.raw_bytes)) return error.InvalidAssignedAlias;
+            for (self.recipe.prepared_pointers, self.recipe.prepared_lengths) |address, bytes| if (bytes != 0 and kernel_geometry.byteRangesOverlap(@intFromPtr(scratch.ptr), scratch.len, address, bytes)) return error.InvalidAssignedAlias;
+            const output_bytes = toBuf(output_ct).data;
+            if (kernel_geometry.byteRangesOverlap(@intFromPtr(scratch.ptr), scratch.len, @intFromPtr(output_bytes.ptr), output_bytes.len * 4)) return error.InvalidAssignedAlias;
+        }
+
+        const assigned = invocation.assigned_output orelse return error.MissingAssignedOutput;
+        const output_bytes_count = try std.math.mul(usize, invocation.descriptor.elements(), 4);
+        if (!self.sameSlot(assigned.slot) or assigned.slot.writable_bytes != output_bytes_count) return error.PreparedKernelBindingChanged;
+        const output = toBuf(output_ct);
+        const input = assignedDenseF32Input(invocation.inputs[0], self.descriptor.input_shapes[0]) orelse return error.PreparedKernelBindingChanged;
+        if (kernel_geometry.byteRangesOverlap(@intFromPtr(input.ptr), input.len * 4, @intFromPtr(output.data.ptr), output.data.len * 4)) return error.InvalidAssignedAlias;
+        const lease = output.physical_lease orelse return error.InvalidAssignedOutputAuthority;
+        if (!lease.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region)) return error.InvalidAssignedOutputAuthority;
+        // A separately wrapped immutable packed source never becomes writable.
+        if (kernel_geometry.byteRangesOverlap(self.recipe.raw_pointer, self.recipe.raw_bytes, @intFromPtr(output.data.ptr), output.data.len * 4)) return error.InvalidAssignedAlias;
+        for (self.recipe.prepared_pointers, self.recipe.prepared_lengths) |pointer, bytes| if (bytes != 0 and kernel_geometry.byteRangesOverlap(pointer, bytes, @intFromPtr(output.data.ptr), output.data.len * 4)) return error.InvalidAssignedAlias;
+    }
+    const vtable = @import("../execution/kernel_route.zig").Owned.VTable{ .matches = matches, .validate = validate, .deinit = deinit };
+};
+
+/// SAME original Q8 column/row/activation selectors. The opaque caller Io
+/// task allocator has no prepared-task receipt, so those selected jobs must
+/// decline BEFORE publication, rather than run serial or allocate under math.
+fn originalQ8NeedsTasks(io: ?std.Io, rows: usize, in_dim: usize, out_dim: usize) bool {
+    const blocks = in_dim / 32;
+    const requested = quantParallelEnabled();
+    const maximum = quantParallelMaxWorkers();
+    return chooseQuantLinearColumnParallelPlan(requested, quantParallelDispatchAvailable(io), rows, out_dim, blocks, maximum).worker_count > 1 or
+        chooseQuantLinearParallelPlan(requested, rows, out_dim, blocks, maximum).worker_count > 1 or
+        (shouldUseQ8_0ActivationQuant(rows, out_dim, blocks) and chooseActivationQuantParallelPlan(requested, rows, in_dim, maximum).worker_count > 1);
+}
+
+fn originalQ6SingleNeedsTasks(io: ?std.Io, rows: usize, in_dim: usize, out_dim: usize, quantized_activation: bool) bool {
+    if (rows != 1) return true;
+    if (quantized_activation) {
+        // linearNoBiasQ6KPreparedQ8KActivationParallel returns false for one
+        // row before consulting column plans. Heap activation-pack dispatch
+        // also uses its original one-row plan; do not force a serial override.
+        return chooseActivationQuantParallelPlan(quantParallelEnabled(), rows, in_dim, quantParallelMaxWorkers()).worker_count > 1;
+    }
+    const blocks = in_dim / 256;
+    return chooseQuantLinearColumnParallelPlan(quantParallelEnabled(), quantParallelDispatchAvailable(io), rows, out_dim, blocks, quantParallelMaxWorkers()).worker_count > 1 or
+        chooseQuantLinearParallelPlan(quantParallelEnabled(), rows, out_dim, blocks, quantParallelMaxWorkers()).worker_count > 1;
+}
+
+fn originalPairNeedsTasks(self: *NativeCompute, descriptor: *const ops.kernel_descriptor.Descriptor, a: QuantizedSingleRecipe, b: QuantizedSingleRecipe) bool {
+    const linear = descriptor.operation.linear;
+    if (linear.rows != 1) return true;
+    if (a.kind == .Q8_0 or b.kind == .Q8_0) return a.kind != b.kind or originalQ8NeedsTasks(self.io, linear.rows, linear.in_dim, linear.out_dim);
+    const blocks = @as(usize, linear.in_dim) / 256;
+    const maximum = quantParallelMaxWorkers();
+    const requested = quantParallelEnabled();
+    const available = quantParallelDispatchAvailable(self.io);
+    const panel16 = @backingInt(QuantizedStorage.PreparedQuantLayout.panel16);
+    const columns = if (a.q8_activation)
+        chooseQuantLinearColumnParallelPlanWithMaxRows(requested, linear.rows, linear.out_dim, blocks, maximum, q4q5PreparedQ8KColumnParallelMaxRowsForShape(available, a.kind, a.prepared_lengths[panel16] != 0 and b.prepared_lengths[panel16] != 0))
+    else
+        chooseQuantLinearColumnParallelPlan(requested, available, linear.rows, linear.out_dim, blocks, maximum);
+    // Rows==1 also bounds the original row-parallel and activation-pack plans
+    // to one worker. This is an eligibility decision, never a policy override.
+    return columns.worker_count > 1 or chooseQuantLinearParallelPlan(requested, 1, linear.out_dim, blocks, maximum).worker_count > 1 or chooseActivationQuantParallelPlan(requested, 1, linear.in_dim, maximum).worker_count > 1;
+}
+
+fn runAssignedLinearPairImpl(self: *NativeCompute, first: ops.kernel_descriptor.Invocation, second: ops.kernel_descriptor.Invocation, current: @import("../execution/cleanup_context.zig").Context, execute: bool) !void {
+    const requests = [_]ops.kernel_descriptor.Invocation{ first, second };
+    var owners: [2]*const QuantizedSingleRoute = undefined;
+    var outputs: [2][]f32 = undefined;
+    for (requests, 0..) |invocation, i| {
+        const selected = invocation.prepared_route orelse return error.MissingPreparedKernelRoute;
+        if (selected.implementation.context != @as(*anyopaque, @ptrCast(self)) or selected.implementation.table != @as(*const anyopaque, @ptrCast(&vtable_impl)) or selected.vtable != &QuantizedSingleRoute.vtable) return error.InvalidPreparedKernelRoute;
+        const owner: *const QuantizedSingleRoute = @ptrCast(@alignCast(selected.context));
+        // Exact descriptor, policy, current source identities, selected plan,
+        // actual output allocation authority and all local alias checks.
+        try owner.validateInvocation(invocation);
+        const output = toBuf(invocation.output orelse return error.MissingAssignedOutput);
+        if (output.physical_lease.?.admission != null and current.boundary == null) return error.MissingCurrentCleanupEpoch;
+        if (output.data.len != owner.descriptor.elements()) return error.InvalidAssignedOutputAuthority;
+        owners[i] = owner;
+        outputs[i] = output.data;
+    }
+    if (first.inputs[0] != second.inputs[0] or !std.meta.eql(owners[0].descriptor, owners[1].descriptor) or owners[0].recipe.kind != owners[1].recipe.kind or owners[0].recipe.q8_activation != owners[1].recipe.q8_activation or first.host_workspace.ptr != second.host_workspace.ptr or first.host_workspace.len != second.host_workspace.len) return error.PreparedKernelBindingChanged;
+    if (kernel_geometry.byteRangesOverlap(@intFromPtr(outputs[0].ptr), outputs[0].len * 4, @intFromPtr(outputs[1].ptr), outputs[1].len * 4)) return error.InvalidAssignedAlias;
+    // Cross-source alias checks too: neither output may overwrite the other
+    // projection's raw bytes or any selected prepared panel.
+    for (outputs) |output| for (owners) |owner| {
+        if (kernel_geometry.byteRangesOverlap(owner.recipe.raw_pointer, owner.recipe.raw_bytes, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
+        for (owner.recipe.prepared_pointers, owner.recipe.prepared_lengths) |address, bytes| if (bytes != 0 and kernel_geometry.byteRangesOverlap(address, bytes, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
+    };
+    if (originalPairNeedsTasks(self, &owners[0].descriptor, owners[0].recipe, owners[1].recipe)) return error.PreparedKernelBindingChanged;
+    if (!execute) return;
+    defer maybeDiscardMappedWeightAfterUse(self, first.inputs[1]);
+    defer maybeDiscardMappedWeightAfterUse(self, second.inputs[1]);
+    const linear = owners[0].descriptor.operation.linear;
+    if (!try quantizedLinearPairInto(self, first.inputs[0], first.inputs[1], second.inputs[1], linear.rows, linear.in_dim, linear.out_dim, outputs[0], outputs[1], false, first.host_workspace)) return error.AssignedKernelDeclinedAfterBinding;
+}
+
+const PackedRowRecipe = struct {
+    shape: @import("ml").graph.Shape,
+    kind: gguf_tensor_types.KnownTensorType,
+    source: AuthoredQuantizedIdentity,
+};
+fn packedRowRecipe(self: *NativeCompute, weight: CT, descriptor: *const ops.kernel_descriptor.Descriptor) !?PackedRowRecipe {
+    const Shape = @import("ml").graph.Shape;
+    if (descriptor.operation != .gather or descriptor.input_count != 2 or descriptor.input_shapes[0].dtype != .f32 or descriptor.input_shapes[0].rank() != 2 or descriptor.input_shapes[1].dtype != .i64 or descriptor.input_shapes[1].numElements() != 1) return null;
+    const shape = descriptor.input_shapes[0];
+    if (shape.dim(0) <= 0 or shape.dim(1) <= 0 or !descriptor.output_shape.eq(Shape.init(.f32, &.{ 1, shape.dim(1) })) or descriptor.operation.gather.axis != 0) return null;
+    const geometry = try kernel_geometry.GatherAxis.init(std.math.maxInt(u32), shape.dims[0..shape.rank()], 0);
+    if (!std.meta.eql(geometry, descriptor.operation.gather.geometry)) return null;
+    ResidentWeightPreparation.lock(self.data);
+    defer ResidentWeightPreparation.unlock(self.data);
+    const storage = namedResidentQuantizedStorageLocked(self, weight) orelse return null;
+    const fact = try NativeCompute.authoredResidentSourceQueryLocked(self.data, toBuf(weight).name);
+    if (fact.quantized == null or fact.shape == null or !fact.shape.?.eq(shape)) return null;
+    if (try quantizedEmbeddingRows(storage, @intCast(shape.dim(1))) != @as(usize, @intCast(shape.dim(0)))) return null;
+    return .{ .shape = shape, .kind = fact.quantized.?.kind, .source = try NativeCompute.authoredQuantizedIdentityLocked(self, fact.name, weight) };
+}
+const PackedRowRoute = struct {
+    allocator: std.mem.Allocator,
+    backend: ops.ComputeBackend,
+    descriptor: ops.kernel_descriptor.Descriptor,
+    slot: @import("../execution/kernel_route.zig").OutputSlot,
+    recipe: PackedRowRecipe,
+    fn sameSlot(self: *const @This(), slot: @import("../execution/kernel_route.zig").OutputSlot) bool {
+        return slot.allocation == self.slot.allocation and slot.node == self.slot.node and slot.epoch == self.slot.epoch and slot.logical.eq(self.slot.logical);
+    }
+    fn matches(raw: *anyopaque, request: @import("../execution/kernel_route.zig").Validate) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.sameSlot(request.output) or request.inputs.len != 2 or request.inputs[0] != .tensor) return false;
+        const source = request.inputs[0].tensor;
+        if (source.implementation.context != self.backend.ptr or source.implementation.table != @as(*const anyopaque, @ptrCast(self.backend.vtable))) return false;
+        if (!@import("../execution/assigned_kernel_route.zig").bindingDense(self.backend, request.inputs[1], self.descriptor.input_shapes[1])) return false;
+        const compute: *NativeCompute = @ptrCast(@alignCast(self.backend.ptr));
+        const actual = (packedRowRecipe(compute, source.value, &self.descriptor) catch return false) orelse return false;
+        return std.meta.eql(actual, self.recipe);
+    }
+    fn validate(raw: *anyopaque, request: @import("../execution/kernel_route.zig").Validate) !void {
+        if (!matches(raw, request)) return error.PreparedKernelBindingChanged;
+    }
+    fn bounds(raw: *anyopaque, index: usize) ?@import("../execution/host_ingress.zig").IndexBounds {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return if (index == 1) .{ .extent = @intCast(self.recipe.shape.dim(0)) } else null;
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.allocator.destroy(self);
+    }
+    fn validateInvocation(self: *const @This(), invocation: ops.kernel_descriptor.Invocation) !void {
+        if (!std.meta.eql(self.descriptor, invocation.descriptor.*) or invocation.inputs.len != 2) return error.PreparedKernelBindingChanged;
+        const compute: *NativeCompute = @ptrCast(@alignCast(self.backend.ptr));
+        const actual = (try packedRowRecipe(compute, invocation.inputs[0], invocation.descriptor)) orelse return error.PreparedKernelBindingChanged;
+        if (!std.meta.eql(actual, self.recipe)) return error.PreparedKernelBindingChanged;
+        const index = integerSource(invocation.inputs[1]) orelse return error.InvalidTensorShape;
+        if (index.dtype != .i64 or try integerTensorCount(index) != 1) return error.InvalidTensorShape;
+        const output_ct = invocation.output orelse return;
+        const output = toBuf(output_ct);
+        const assigned = invocation.assigned_output orelse return error.MissingAssignedOutput;
+        const bytes = try std.math.mul(usize, invocation.descriptor.elements(), 4);
+        const lease = output.physical_lease orelse return error.InvalidAssignedOutputAuthority;
+        if (!self.sameSlot(assigned.slot) or assigned.slot.writable_bytes != bytes or output.data.len != invocation.descriptor.elements() or !lease.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region)) return error.InvalidAssignedOutputAuthority;
+        if (kernel_geometry.byteRangesOverlap(@intFromPtr(index.data.ptr), index.data.len, @intFromPtr(output.data.ptr), bytes) or kernel_geometry.byteRangesOverlap(self.recipe.source.raw_pointer, self.recipe.source.raw_bytes, @intFromPtr(output.data.ptr), bytes)) return error.InvalidAssignedAlias;
+        for (self.recipe.source.prepared_pointers, self.recipe.source.prepared_lengths) |address, extent| if (extent != 0 and kernel_geometry.byteRangesOverlap(address, extent, @intFromPtr(output.data.ptr), bytes)) return error.InvalidAssignedAlias;
+    }
+    fn execute(self: *const @This(), invocation: ops.kernel_descriptor.Invocation, output: []f32) !void {
+        const compute: *NativeCompute = @ptrCast(@alignCast(self.backend.ptr));
+        defer maybeDiscardMappedWeightAfterUse(compute, invocation.inputs[0]);
+        const index = try IndexReader.init(invocation.inputs[1]);
+        // Match generic Gather semantics without converting the model payload.
+        // The actual Program token boundary already refuses negative tokens;
+        // generic gathers retain their original one-negative-wrap contract.
+        const selected: i64 = @intCast(try index.normalized(0, @intCast(self.recipe.shape.dim(0))));
+        try embeddingLookupInto(invocation.inputs[0], &.{selected}, 1, @intCast(self.recipe.shape.dim(1)), output);
+    }
+    const vtable = @import("../execution/kernel_route.zig").Owned.VTable{ .matches = matches, .validate = validate, .deinit = deinit, .host_input_constraint = bounds };
+};
+fn preparePackedRowRoute(self: *NativeCompute, target: ops.ComputeBackend, request: @import("../execution/kernel_route.zig").Prepare) !?@import("../execution/kernel_route.zig").Owned {
+    if (request.inputs.len != 2 or request.inputs[0] != .tensor) return null;
+    const source = request.inputs[0].tensor;
+    if (source.implementation.context != target.ptr or source.implementation.table != @as(*const anyopaque, @ptrCast(target.vtable))) return null;
+    if (!@import("../execution/assigned_kernel_route.zig").bindingDense(target, request.inputs[1], request.descriptor.input_shapes[1])) return null;
+    const recipe = (try packedRowRecipe(self, source.value, request.descriptor)) orelse return null;
+    const bytes = try std.math.mul(usize, request.descriptor.elements(), 4);
+    const owner = try request.allocator.create(PackedRowRoute);
+    owner.* = .{ .allocator = request.allocator, .backend = target.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .recipe = recipe };
+    return .{ .context = owner, .implementation = .{ .context = target.ptr, .table = target.vtable }, .key = @intCast(request.output.node), .requirements = .{ .primary_bytes = bytes, .primary_alignment = request.descriptor.alignment, .profile = 0 }, .vtable = &PackedRowRoute.vtable };
+}
+
+fn prepareQuantizedSingleRoute(self: *NativeCompute, target: ops.ComputeBackend, request: @import("../execution/kernel_route.zig").Prepare) !?@import("../execution/kernel_route.zig").Owned {
+    if (request.inputs.len != 2 or request.inputs[1] != .tensor) return null;
+    const tensor = request.inputs[1].tensor;
+    if (tensor.implementation.context != target.ptr or tensor.implementation.table != @as(*const anyopaque, @ptrCast(target.vtable))) return null;
+    if (!@import("../execution/assigned_kernel_route.zig").bindingDense(target, request.inputs[0], request.descriptor.input_shapes[0])) return null;
+    const recipe = (try quantizedSingleRecipe(self, tensor.value, request.descriptor)) orelse return null;
+    const primary_bytes = try std.math.mul(usize, request.descriptor.elements(), 4);
+    const owner = try request.allocator.create(QuantizedSingleRoute);
+    owner.* = .{ .allocator = request.allocator, .backend = target.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .recipe = recipe };
+    // Invocation scope is deliberate: mutable backend policy and physical
+    // prepared representation identities are rechecked, never template authority.
+    return .{ .context = owner, .implementation = .{ .context = target.ptr, .table = target.vtable }, .key = @intCast(request.output.node), .requirements = .{ .primary_bytes = primary_bytes, .primary_alignment = request.descriptor.alignment, .profile = 0, .workspace = .{ .host_byte_size = recipe.activation_bytes }, .host_alignment = if (recipe.kind == .Q8_0 and recipe.activation_bytes != 0) @alignOf(f32) else 1 }, .vtable = &QuantizedSingleRoute.vtable };
+}
+
 fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_route.zig").Prepare) anyerror!?@import("../execution/kernel_route.zig").Owned {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const descriptor = request.descriptor;
@@ -54125,11 +56351,13 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_r
     if (implementation.context != ctx or implementation.table != @as(*const anyopaque, @ptrCast(&vtable_impl))) return null;
     const target = ops.ComputeBackend{ .ptr = ctx, .vtable = @ptrCast(@alignCast(implementation.table)) };
     if ((target.vtable.kernels orelse return null).runAssignedKernel != &runAssignedKernelOp) return null;
+    if (descriptor.operation == .gather) if (try preparePackedRowRoute(self, target, request)) |selected| return selected;
     if (descriptor.operation != .linear) return @import("../execution/assigned_kernel_route.zig").prepareImmutable(target, request, nativeDirectRouteSupported);
     // Dense resident model planes use the SAME original F32 Into schedule.
     // Source-tensor conversion and prepared-panel variants retain their route.
     if (request.inputs.len == descriptor.input_count and request.inputs.len >= 2 and (request.inputs[1] == .resident or request.inputs[1] == .planned))
         return @import("../execution/assigned_kernel_route.zig").prepareImmutable(target, request, nativeResidentDenseLinearRouteSupported);
+    if (try prepareQuantizedSingleRoute(self, target, request)) |selected| return selected;
     if (request.inputs.len != descriptor.input_count) return null;
     const linear = descriptor.operation.linear;
     if (linear.rows == 0 or linear.in_dim == 0 or linear.out_dim == 0) return null;
@@ -57255,4 +59483,805 @@ test "Native raw peer map growth reattests exact new metadata preserves payload 
 test "Native raw map upgrade exact physical cap includes owner header and one below preserves raw backing" {
     try nativeRawDenseMapMutationCase(.exact);
     try nativeRawDenseMapMutationCase(.below);
+}
+
+test "native packed row Into preserves original Q4 Q5 decoded bits without numerical allocation" {
+    const a = std.testing.allocator;
+    var dense: [512]f32 = undefined;
+    for (&dense, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 83)) / 19 - 2;
+    inline for (.{ gguf_tensor_types.KnownTensorType.Q4_K, gguf_tensor_types.KnownTensorType.Q5_K }) |kind| {
+        const raw = try (if (kind == .Q4_K) quant_codec.quantizeQ4_KFromF32(a, &dense) else quant_codec.quantizeQ5_KFromF32(a, &dense));
+        defer a.free(raw);
+        var storage = QuantizedStorage{ .tensor_type = .{ .known = kind }, .raw_bytes = raw, .shape = &.{ 2, 256 }, .raw_owned = false, .allocator = a };
+        var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+        var compute = NativeCompute.init(a, &store, null);
+        defer compute.deinit();
+        const weight = try compute.makeBufWithEntry(empty_f32[0..], false, "row.weight", null, &storage, null);
+        defer freeTensor(&compute, weight);
+        const reference = try embeddingLookup(&compute, weight, &.{1}, 1, 256);
+        defer freeTensor(&compute, reference);
+        var actual: [256]f32 = @splat(91);
+        var forbidden = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const saved_allocator = compute.allocator;
+        compute.allocator = forbidden.allocator();
+        storage.allocator = forbidden.allocator();
+        defer {
+            compute.allocator = saved_allocator;
+            storage.allocator = a;
+        }
+        try embeddingLookupInto(weight, &.{1}, 1, 256, &actual);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(getData(reference)), std.mem.sliceAsBytes(&actual));
+        @memset(&actual, 91);
+        try std.testing.expectError(error.InvalidTensorShape, embeddingLookupInto(weight, &.{2}, 1, 256, &actual));
+        for (actual) |v| try std.testing.expectEqual(@as(f32, 91), v);
+        try std.testing.expectError(error.InvalidTensorShape, embeddingLookupInto(weight, &.{}, 1, 256, &actual));
+        try std.testing.expectError(error.InvalidTensorShape, embeddingLookupInto(weight, &.{0}, 1, 256, actual[0..255]));
+        for (actual) |v| try std.testing.expectEqual(@as(f32, 91), v);
+        try std.testing.expectEqual(@as(usize, 0), forbidden.allocations);
+    }
+}
+
+pub const Testing = if (builtin.is_test) struct {
+    pub fn q8NeedsTasks(rows: usize, in_dim: usize, out_dim: usize) bool {
+        return originalQ8NeedsTasks(null, rows, in_dim, out_dim);
+    }
+} else struct {};
+
+test "Native Q8 original single shared pair values scales match assigned workspace without allocation and reject malformed scratch" {
+    const a = std.testing.allocator;
+    if (originalQ8NeedsTasks(null, 1, 256, 512)) return error.SkipZigTest;
+    const dense = try a.alloc(f32, 512 * 256);
+    defer a.free(dense);
+    var stores: [2]QuantizedStorage = undefined;
+    var initialized: usize = 0;
+    var raws: [2][]u8 = undefined;
+    defer for (stores[0..initialized], raws[0..initialized]) |*store, raw| {
+        store.deinit();
+        a.free(raw);
+    };
+    for (&stores, &raws, 0..) |*store, *raw, index| {
+        for (dense, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 7 + index) % 73)) / 31 - 1;
+        raw.* = try quant_codec.quantizeQ8_0FromF32(a, dense);
+        const shape = a.dupe(i64, &.{ 512, 256 }) catch |err| {
+            a.free(raw.*);
+            return err;
+        };
+        store.* = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw.*, .shape = shape, .raw_owned = false, .allocator = a };
+        initialized += 1;
+        try prepareNativeQuantizedStorage(store);
+    }
+    var input: [256]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 47)) / 23 - 1;
+    var expected: [2][512]f32 = undefined;
+    var actual: [2][512]f32 = undefined;
+    const raw = .{ stores[0].raw_bytes, stores[1].raw_bytes };
+    const prepared = .{ stores[0].preparedBytes(.row_major_blocks), stores[1].preparedBytes(.row_major_blocks) };
+    const panels = .{ stores[0].preparedBytes(.panel4), stores[1].preparedBytes(.panel4) };
+    const panels8 = .{ stores[0].preparedBytes(.panel8), stores[1].preparedBytes(.panel8) };
+    try linearQ8_0Projections(2, a, null, &input, raw, prepared, panels, panels8, .{ null, null }, .{ &expected[0], &expected[1] }, 1, 256, 512);
+    var forbidden = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var workspace: [256 + 8 * 4]u8 align(@alignOf(f32)) = undefined;
+    try linearQ8_0ProjectionsWithWorkspace(2, forbidden.allocator(), null, &input, raw, prepared, panels, panels8, .{ null, null }, .{ &actual[0], &actual[1] }, 1, 256, 512, &workspace);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&actual));
+    try linearNoBiasQ8_0WithPolicy(.automatic, a, null, &input, raw[0], prepared[0], panels[0], panels8[0], &expected[0], 1, 256, 512);
+    try linearNoBiasQ8_0WithWorkspace(.automatic, forbidden.allocator(), null, &input, raw[0], prepared[0], panels[0], panels8[0], &actual[0], 1, 256, 512, &workspace);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected[0]), std.mem.asBytes(&actual[0]));
+    @memset(&actual[0], -91);
+    @memset(&actual[1], -91);
+    try std.testing.expectError(error.InvalidAssignedHostWorkspace, linearQ8_0ProjectionsWithWorkspace(2, forbidden.allocator(), null, &input, raw, prepared, panels, panels8, .{ null, null }, .{ &actual[0], &actual[1] }, 1, 256, 512, workspace[0 .. workspace.len - 1]));
+    var misaligned: [workspace.len + 1]u8 align(@alignOf(f32)) = undefined;
+    try std.testing.expectError(error.InvalidAssignedHostWorkspace, linearNoBiasQ8_0WithWorkspace(.automatic, forbidden.allocator(), null, &input, raw[0], prepared[0], panels[0], panels8[0], &actual[0], 1, 256, 512, misaligned[1..]));
+    for (actual) |values| for (values) |v| try std.testing.expectEqual(@as(f32, -91), v);
+    try std.testing.expectEqual(@as(usize, 0), forbidden.allocations);
+}
+
+test "Native Q6 original stack and heap activation kernels consume exact assigned workspace without allocation" {
+    const a = std.testing.allocator;
+    const widths = [_]usize{ 256, (q8_k_activation_stack_max_bytes / 292 + 1) * 256 };
+    for (widths) |in_dim| {
+        const out_dim: usize = 16;
+        const dense = try a.alloc(f32, in_dim * out_dim);
+        defer a.free(dense);
+        for (dense, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 71)) / 31 - 1;
+        const raw = try quant_codec.quantizeQ6_KFromF32(a, dense);
+        defer a.free(raw);
+        const shape = try a.dupe(i64, &.{ @intCast(out_dim), @intCast(in_dim) });
+        var store: QuantizedStorage = .{ .tensor_type = .{ .known = .Q6_K }, .raw_bytes = raw, .shape = shape, .raw_owned = false, .allocator = a };
+        defer store.deinit();
+        try prepareNativeQuantizedStorage(&store);
+        const input = try a.alloc(f32, in_dim);
+        defer a.free(input);
+        for (input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 43)) / 19 - 1;
+        var expected: [out_dim]f32 = undefined;
+        var actual: [out_dim]f32 = undefined;
+        const blocks = in_dim / 256;
+        const panel16 = if (q6KPanel16SingleEnabledForShape(1, out_dim, blocks)) store.preparedBytes(.panel16) else null;
+        try linearNoBiasQ6KPreparedQ8KActivation(a, null, input, store.preparedBytes(.row_major_blocks).?, store.preparedBytes(.panel4), store.preparedBytes(.panel8), panel16, &expected, 1, in_dim, out_dim);
+        const scratch = try a.alloc(u8, blocks * 292);
+        defer a.free(scratch);
+        var forbidden = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try linearNoBiasQ6KPreparedQ8KActivationWithWorkspace(forbidden.allocator(), null, input, store.preparedBytes(.row_major_blocks).?, store.preparedBytes(.panel4), store.preparedBytes(.panel8), panel16, &actual, 1, in_dim, out_dim, scratch);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&actual));
+        try std.testing.expectEqual(@as(usize, 0), forbidden.allocations);
+        try std.testing.expect(!forbidden.has_induced_failure);
+        @memset(&actual, 91);
+        try std.testing.expectError(error.InvalidAssignedHostWorkspace, linearNoBiasQ6KPreparedQ8KActivationWithWorkspace(forbidden.allocator(), null, input, store.preparedBytes(.row_major_blocks).?, store.preparedBytes(.panel4), store.preparedBytes(.panel8), panel16, &actual, 1, in_dim, out_dim, scratch[0 .. scratch.len - 1]));
+        for (actual) |value| try std.testing.expectEqual(@as(f32, 91), value);
+    }
+}
+
+test "Native Q6 authored task eligibility preserves original direct workers and one-row activation schedule" {
+    const rows: usize = 1;
+    const in_dim: usize = 8192;
+    const out_dim: usize = 65536;
+    const original_direct_tasks = chooseQuantLinearColumnParallelPlan(quantParallelEnabled(), quantParallelDispatchAvailable(std.testing.io), rows, out_dim, in_dim / 256, quantParallelMaxWorkers()).worker_count > 1 or chooseQuantLinearParallelPlan(quantParallelEnabled(), rows, out_dim, in_dim / 256, quantParallelMaxWorkers()).worker_count > 1;
+    try std.testing.expectEqual(original_direct_tasks, originalQ6SingleNeedsTasks(std.testing.io, rows, in_dim, out_dim, false));
+    // Original activation dispatcher explicitly returns false for rows==1;
+    // this does not alter worker policy or turn a selected parallel run serial.
+    try std.testing.expect(!originalQ6SingleNeedsTasks(std.testing.io, rows, in_dim, out_dim, true));
+    try std.testing.expect(originalQ6SingleNeedsTasks(std.testing.io, 2, in_dim, out_dim, true));
+}
+
+fn nativePanelColdTransactionCase(a: std.mem.Allocator, below: bool) !void {
+    if (native.useBlas()) return error.SkipZigTest;
+    const names = [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" };
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const physical = 128 * 64 * @sizeOf(f32) + names[0].len + 1 + names[1].len + try NativeCompute.canonicalPanelMapBytes(1);
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 32768 }) };
+    initPrefetchQueue(&data, a);
+    defer data.resident_weights.deinit(a);
+    defer data.tier_cache.?.deinitAdmission();
+    defer deinitPrefetchQueue(&data);
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = physical - @intFromBool(below) }, .{});
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    var raw: [2][64 * 64]u16 = .{ @splat(0x3f80), @splat(0x4000) };
+    for (names, 0..) |name, i| try data.resident_weights.put(a, name, .{ .tensor = .{ .data = std.mem.sliceAsBytes(&raw[i]), .shape = &.{ 64, 64 }, .dtype = .bf16, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    try NativeCompute.configurePanelPreparationPolicy(&cb, true);
+    try std.testing.expectError(error.MissingNativePanelAdmission, NativeCompute.configurePanelPreparationPolicy(&cb, false));
+    try std.testing.expect(compute.canonical_panel_preparation_required and data.canonical_panel_source_readers != 0);
+    const sink = @import("../execution/retirement_sink.zig");
+    var owner = try sink.Ref.create();
+    defer owner.release();
+    var guard = try owner.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const current = @import("../execution/cleanup_context.zig").Context{ .boundary = &epoch };
+    try std.testing.expectError(error.UnpreparedNativePanelCacheOperation, canonicalCpuPanels(&compute, &names, 64));
+    try std.testing.expectEqual(@as(usize, 0), data.tier_cache.?.host_bytes);
+    try std.testing.expect(try NativeCompute.beginPanelCacheOperation(&cb, &data, current));
+    const request = ops.NativePanelPreparation{ .names = &names, .in_dim = 64 };
+    try std.testing.expect(try NativeCompute.panelCacheOperationNeedsPreparation(&cb, &data, request));
+    try NativeCompute.preparePanelCacheOperationOutsideExecution(&cb, &data, request, &pin);
+    var scope = try NativeCompute.receivePanelCacheOperation(&cb, &data, current);
+    defer scope.close();
+    if (below) {
+        try std.testing.expect(try canonicalCpuPanels(&compute, &names, 64) == null);
+        try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_canonical_panels.count());
+        try std.testing.expectEqualDeep(run_memory.AdmissionAmounts{}, pin.controller().snapshot());
+    } else {
+        const panels = (try canonicalCpuPanels(&compute, &names, 64)).?;
+        try std.testing.expectEqual(physical, pin.controller().snapshot().host_weight_bytes);
+        try std.testing.expect(!try NativeCompute.panelCacheOperationNeedsPreparation(&cb, &data, request));
+        const before = panels.data.ptr;
+        const warm = (try canonicalCpuPanels(&compute, &names, 64)).?;
+        try std.testing.expect(before == warm.data.ptr);
+        var input: [128]f32 = @splat(1);
+        var output: [256]f32 = undefined;
+        try linalg.sgemmPrepared(null, 2, panels, &input, &output);
+        for (0..2) |row| {
+            for (output[row * 128 ..][0..64]) |value| try std.testing.expectEqual(@as(f32, 64), value);
+            for (output[row * 128 + 64 ..][0..64]) |value| try std.testing.expectEqual(@as(f32, 128), value);
+        }
+        // Nested operations borrow the existing scope without clearing it.
+        try std.testing.expect(!try NativeCompute.beginPanelCacheOperation(&cb, &data, current));
+        try std.testing.expect(compute.canonical_panel_receiving);
+    }
+    scope.close();
+    guard.finish();
+    try std.testing.expectError(error.RetirementEpochSealed, NativeCompute.beginPanelCacheOperation(&cb, &data, current));
+}
+
+test "Native canonical panel cold transaction exact cap and cap minus one preserve optional same-operation fallback" {
+    try nativePanelColdTransactionCase(std.testing.allocator, false);
+    try nativePanelColdTransactionCase(std.testing.allocator, true);
+}
+
+test "Native canonical panel cold transaction unwinds every allocation failure without false ready" {
+    if (native.useBlas()) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativePanelColdTransactionCase, .{false});
+}
+
+test "Native canonical panel shared pack preserves original F32 BF16 and F16 byte decoding" {
+    var f32_values: [64]f32 = @splat(1.25);
+    var bf16_values: [64]u16 = @splat(0x4000);
+    var f16_values: [64]f16 = @splat(3.0);
+    const sources = [_]CanonicalPanelSource{
+        .{ .rows = 1, .k = 64, .f32_data = &f32_values },
+        .{ .rows = 1, .k = 64, .dtype = .bf16, .raw = std.mem.sliceAsBytes(&bf16_values) },
+        .{ .rows = 1, .k = 64, .dtype = .f16, .raw = std.mem.sliceAsBytes(&f16_values) },
+    };
+    var values: [64 * 64]f32 = undefined;
+    fillCanonicalPanelSources(&sources, &values, 64);
+    for (0..64) |col| {
+        try std.testing.expectEqual(@as(f32, 1.25), values[col * 64]);
+        try std.testing.expectEqual(@as(f32, 2), values[col * 64 + 1]);
+        try std.testing.expectEqual(@as(f32, 3), values[col * 64 + 2]);
+        for (values[col * 64 + 3 ..][0..61]) |value| try std.testing.expectEqual(@as(f32, 0), value);
+    }
+}
+
+fn nativePanelMappedLazyCase(a: std.mem.Allocator) !void {
+    if (native.useBlas()) return error.SkipZigTest;
+    const names = [_][]const u8{ "language_model.layers.0.mlp.gate_proj.weight", "language_model.layers.0.mlp.up_proj.weight" };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = "{\"language_model.layers.0.mlp.gate_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[64,64],\"data_offsets\":[0,8192]},\"language_model.layers.0.mlp.up_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[64,64],\"data_offsets\":[8192,16384]}}";
+    const padded = std.mem.alignForward(usize, header.len, 8);
+    const bytes = try a.alloc(u8, 8 + padded + 16384);
+    defer a.free(bytes);
+    std.mem.writeInt(u64, bytes[0..8], padded, .little);
+    @memset(bytes[8..][0..padded], ' ');
+    @memcpy(bytes[8..][0..header.len], header);
+    for (0..8192) |i| std.mem.writeInt(u16, bytes[8 + padded + i * 2 ..][0..2], if (i < 4096) 0x3f80 else 0x4000, .little);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = bytes });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "model.safetensors", a);
+    defer a.free(path);
+    const store = (try tensor_store_mod.SafetensorsStore.initAbsolute(a, path)).tensorStore();
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tensor_store = store, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1 << 20 }) };
+    defer data.deinitOwned();
+    initPrefetchQueue(&data, a);
+    for (names) |name| {
+        var ref = try store.describeTensor(a, name);
+        var ref_moved = false;
+        defer if (!ref_moved) ref.deinit(a);
+        const key = try a.dupe(u8, name);
+        var key_moved = false;
+        defer if (!key_moved) a.free(key);
+        try data.lazy_weights.put(a, key, .{ .tensor_ref = ref });
+        key_moved = true;
+        ref_moved = true;
+    }
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 1 << 20 }, .{});
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    try NativeCompute.configurePanelPreparationPolicy(&cb, true);
+    try std.testing.expect(try NativeCompute.typedLazyWeightNeedsColdPreparation(&cb, &data, names[0]));
+    try NativeCompute.preparePanelCacheOperationOutsideExecution(&cb, &data, .{ .names = &names, .in_dim = 64 }, &pin);
+    for (names) |name| {
+        const entry = data.lazy_weights.getPtr(name).?;
+        const mapped = (try store.nativeTypedMappedSource(&entry.tensor_ref)).?;
+        try std.testing.expect(entry.loaded != null and entry.loaded.?.tensor.dtype == .bf16 and entry.active_tier == .host);
+        try std.testing.expectEqual(@as(usize, 8192), entry.loaded_bytes);
+        try std.testing.expect(entry.loaded.?.tensor.data.ptr == mapped.data.ptr and !entry.loaded.?.tensor.owns_data and !entry.loaded.?.tensor.owns_shape);
+        try std.testing.expectEqual(@as(usize, 0), entry.pin_count);
+    }
+    const key = "language_model.layers.0.mlp.gate_proj.weight|language_model.layers.0.mlp.up_proj.weight";
+    const panels = data.embeddinggemma2_canonical_panels.get(key).?.panels;
+    var input: [128]f32 = @splat(1);
+    var output: [256]f32 = undefined;
+    try linalg.sgemmPrepared(null, 2, panels, &input, &output);
+    for (0..2) |row| {
+        for (output[row * 128 ..][0..64]) |value| try std.testing.expectEqual(@as(f32, 64), value);
+        for (output[row * 128 + 64 ..][0..64]) |value| try std.testing.expectEqual(@as(f32, 128), value);
+    }
+    try std.testing.expectEqual(@as(usize, 16384 + 32768), data.tier_cache.?.host_bytes);
+}
+
+test "Native canonical panel cold named siblings publish exact typed mapped lazy sources before shared packing" {
+    try nativePanelMappedLazyCase(std.testing.allocator);
+}
+
+test "Native canonical panel cold typed mapped lazy sources unwind every allocation failure" {
+    if (native.useBlas()) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativePanelMappedLazyCase, .{});
+}
+
+fn nativeF32MirrorColdCase(a: std.mem.Allocator, raw_first: bool, below: bool, grow: bool) !void {
+    const name = "language_model.norm.weight";
+    var bits = [_]u16{ 0x3f80, 0xc000, 0x3f00, 0x0001 };
+    const expected = [_]f32{ 1, -2, 0.5, @bitCast(@as(u32, 0x00010000)) };
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var model: std.atomic.Mutex = .unlocked;
+    const Probe = struct {
+        model: *std.atomic.Mutex,
+        cache: *std.atomic.Mutex,
+        violation: bool = false,
+        checking: bool = false,
+        calls: usize = 0,
+        fn inspect(self: *@This()) void {
+            if (!self.checking) return; // original raw cold cache contract
+            if (self.model.tryLock()) self.model.unlock() else self.violation = true;
+            if (self.cache.tryLock()) self.cache.unlock() else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+            self.calls += 1;
+            return 81;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+    };
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = if (grow) 4096 else 16 }) };
+    defer data.resident_weights.deinit(a);
+    var probe = Probe{ .model = &model, .cache = &data.embeddinggemma2_f32_cache_lock };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    defer pin.controller().configureResourceBudget(null) catch @panic("mirror test retained resource token");
+    initPrefetchQueue(&data, a);
+    defer {
+        deinitPrefetchQueue(&data);
+        data.tier_cache.?.deinitAdmission();
+        _ = @import("../execution/resource_retirement.zig").poll();
+    }
+    const map_bytes = try NativeCompute.DenseCacheCold.mapAllocation(.empty, 1);
+    const physical = 16 + name.len + map_bytes;
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = if (grow) 16384 else physical - @intFromBool(below) }, .{});
+    try data.resident_weights.put(a, name, .{ .tensor = .{ .data = std.mem.sliceAsBytes(&bits), .dtype = .bf16, .shape = &.{4}, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+    var compute = NativeCompute.init(a, &data, null);
+    var compute_live = true;
+    defer if (compute_live) compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    var raw_pointer: ?[*]f32 = null;
+    if (raw_first) {
+        data.prefetch.lock();
+        const raw = cachedEmbeddingGemma2F32Weight(&compute, name, &data.resident_weights.getPtr(name).?.tensor) catch |err| {
+            data.prefetch.unlock();
+            return err;
+        };
+        data.prefetch.unlock();
+        raw_pointer = raw.?.ptr;
+    }
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    probe.checking = true;
+    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    var held_epoch = try owner.epoch().?.retain();
+    defer held_epoch.release();
+    const current = @import("../execution/cleanup_context.zig").Context{ .boundary = &held_epoch };
+    // begin holds the source claim through the receiving getter. A failed
+    // needs/prepare/receive must abort it before the test seals current B.
+    errdefer if (compute_live) NativeCompute.abortWeightCacheOperation(&cb, &data);
+    {
+        platform.sync.lockYielding(&model);
+        defer model.unlock();
+        try std.testing.expect(try NativeCompute.beginF32MirrorCacheOperation(&cb, &data, current));
+        try std.testing.expect(try NativeCompute.f32MirrorWeightNeedsColdPreparation(&cb, &data, name));
+    }
+    if (below) {
+        try NativeCompute.prepareF32MirrorOutsideExecution(&cb, &data, name, &pin);
+        var scope = try NativeCompute.receiveF32MirrorCacheOperation(&cb, &data, current);
+        defer scope.close();
+        const calls = probe.calls;
+        data.prefetch.lock();
+        const denied = cachedEmbeddingGemma2F32Weight(&compute, name, &data.resident_weights.getPtr(name).?.tensor) catch |err| {
+            data.prefetch.unlock();
+            return err;
+        };
+        data.prefetch.unlock();
+        try std.testing.expect(denied == null);
+        try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_f32_cache.count());
+        try std.testing.expectEqual(calls, probe.calls);
+        scope.close();
+        try std.testing.expectEqual(@as(usize, 0), data.canonical_panel_source_readers);
+        try std.testing.expect(!probe.violation);
+        return;
+    }
+    try NativeCompute.prepareF32MirrorOutsideExecution(&cb, &data, name, &pin);
+    // Preparation deliberately retains the source claim until the actual
+    // getter and outer receiving scope complete; nested scopes cannot drop it.
+    try std.testing.expectEqual(@as(usize, 1), data.canonical_panel_source_readers);
+    const entry = data.embeddinggemma2_f32_cache.get(name) orelse return error.MissingF32Mirror;
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.sliceAsBytes(entry.data));
+    if (raw_pointer) |before| try std.testing.expect(before == entry.data.ptr);
+    try std.testing.expectEqual(@as(usize, 16), data.tier_cache.?.host_bytes);
+    try std.testing.expectEqual(physical, pin.controller().snapshot().host_weight_bytes);
+    try std.testing.expectEqual(map_bytes, data.embeddinggemma2_f32_prepared_map_bytes);
+    try std.testing.expectEqual(@as(usize, 16 + name.len), entry.prepared_physical_bytes);
+    try std.testing.expect(!try NativeCompute.f32MirrorWeightNeedsColdPreparation(&cb, &data, name));
+    var scope = try NativeCompute.receiveF32MirrorCacheOperation(&cb, &data, current);
+    defer scope.close();
+    var nested = try NativeCompute.receiveF32MirrorCacheOperation(&cb, &data, current);
+    nested.close();
+    try std.testing.expect(compute.mirror_cache_receiving);
+    const saved = data.allocator;
+    var forbidden = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    data.allocator = forbidden.allocator();
+    defer data.allocator = saved;
+    const calls = probe.calls;
+    data.prefetch.lock();
+    const warm = cachedEmbeddingGemma2F32Weight(&compute, name, &data.resident_weights.getPtr(name).?.tensor) catch |err| {
+        data.prefetch.unlock();
+        return err;
+    };
+    data.prefetch.unlock();
+    try std.testing.expect(warm.?.ptr == entry.data.ptr);
+    try std.testing.expectEqual(@as(usize, 0), forbidden.allocations);
+    try std.testing.expectEqual(calls, probe.calls);
+    data.allocator = saved;
+    scope.close();
+    try std.testing.expectEqual(@as(usize, 0), data.canonical_panel_source_readers);
+    try std.testing.expect(!compute.mirror_cache_receiving);
+    var copied = cb.vtable.*;
+    var foreign = cb;
+    foreign.vtable = &copied;
+    foreign.ptr = @ptrFromInt(16);
+    try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.receiveF32MirrorCacheOperation(&foreign, &data, current));
+    try std.testing.expectError(error.ForeignNativeWeightModel, NativeCompute.beginF32MirrorCacheOperation(&cb, @ptrFromInt(16), current));
+    if (grow) {
+        var index: usize = 0;
+        while (data.embeddinggemma2_f32_prepared_map_bytes != 0) : (index += 1) {
+            if (index > 32) return error.MirrorRawGrowWasNotReached;
+            var buffer: [96]u8 = undefined;
+            const raw_name = try std.fmt.bufPrint(&buffer, "language_model.mirror.{d}.weight", .{index});
+            const source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&bits), .dtype = .bf16, .shape = &.{4}, .name = raw_name, .allocator = a, .owns_data = false, .owns_shape = false };
+            // The unchanged explicit raw writer may append after a managed
+            // request. Its grow retires old paid metadata after actual free.
+            probe.checking = false;
+            data.prefetch.lock();
+            const value = cachedEmbeddingGemma2F32Weight(&compute, raw_name, &source) catch |err| {
+                data.prefetch.unlock();
+                return err;
+            };
+            data.prefetch.unlock();
+            probe.checking = true;
+            try std.testing.expect(value != null);
+        }
+        try std.testing.expect(try NativeCompute.f32MirrorWeightNeedsColdPreparation(&cb, &data, name));
+        try NativeCompute.prepareF32MirrorOutsideExecution(&cb, &data, name, &pin);
+        try std.testing.expect(entry.data.ptr == data.embeddinggemma2_f32_cache.get(name).?.data.ptr);
+        const paid_map = try NativeCompute.DenseCacheCold.currentMapBytes(&data.embeddinggemma2_f32_cache);
+        try std.testing.expectEqual(paid_map, data.embeddinggemma2_f32_prepared_map_bytes);
+        try std.testing.expectEqual(@as(usize, 0), reclaimEmbeddingGemma2Weights(&data, .language)); // actual live compute reader
+        compute.deinit();
+        compute_live = false;
+        try std.testing.expect(reclaimEmbeddingGemma2Weights(&data, .language) > 0);
+        try data.tier_cache.?.flushReleasedOutsideExecution();
+        try std.testing.expectEqual(@as(u32, 0), data.embeddinggemma2_f32_cache.count());
+        try std.testing.expectEqual(@as(usize, 0), data.tier_cache.?.host_bytes);
+        // Empty retained map metadata is still physically alive and charged.
+        try std.testing.expectEqual(paid_map, pin.controller().snapshot().host_weight_bytes);
+    }
+    owner.finishAfterUnlock();
+    if (compute_live) try std.testing.expectError(error.RetirementEpochSealed, NativeCompute.receiveF32MirrorCacheOperation(&cb, &data, current));
+    try std.testing.expect(!probe.violation);
+}
+
+test "Native F32 mirror cold exact physical cap and optional cap minus one keep original values and no hot supplier" {
+    try nativeF32MirrorColdCase(std.testing.allocator, false, false, false);
+    try nativeF32MirrorColdCase(std.testing.allocator, false, true, false);
+    try nativeF32MirrorColdCase(std.testing.allocator, true, false, false);
+}
+
+test "Native F32 mirror cold key payload map and raw metadata upgrade unwind every allocation failure" {
+    const Case = struct {
+        fn fresh(a: std.mem.Allocator) !void {
+            try nativeF32MirrorColdCase(a, false, false, false);
+        }
+        fn raw(a: std.mem.Allocator) !void {
+            try nativeF32MirrorColdCase(a, true, false, false);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.fresh, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.raw, .{});
+}
+
+test "Native F32 mirror receiving miss preserves original BF16 and F16 request conversion without cache growth" {
+    const a = std.testing.allocator;
+    const name = "language_model.norm.weight";
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 64 }) };
+    defer data.resident_weights.deinit(a);
+    initPrefetchQueue(&data, a);
+    defer deinitPrefetchQueue(&data);
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    var scope = try NativeCompute.receiveF32MirrorCacheOperation(&cb, &data, .{ .boundary = owner.epoch() });
+    defer scope.close();
+    var bf16 = [_]u16{ 0x3f80, 0xc000 };
+    const expected = [_]f32{ 1, -2 };
+    const bf = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&bf16), .dtype = .bf16, .shape = &.{2}, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+    var half_values = [_]f16{ 1, -2 };
+    const half = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&half_values), .dtype = .f16, .shape = &.{2}, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+    for ([_]tensor_mod.Tensor{ bf, half }, 0..) |source, index| {
+        const selected_name = if (index == 0) name else "language_model.layers.0.input_layernorm.weight";
+        var selected_source = source;
+        selected_source.name = selected_name;
+        try data.resident_weights.put(a, selected_name, .{ .tensor = selected_source });
+        const weight = try cb.getWeight(selected_name);
+        defer cb.free(weight);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.sliceAsBytes(toBuf(weight).data));
+        try std.testing.expect(toBuf(weight).owned);
+        try std.testing.expectEqual(@as(u32, 0), data.embeddinggemma2_f32_cache.count());
+    }
+    try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_f32_cache_bytes);
+}
+
+test "Native F32 mirror paid map raw grow readoption and actual reclaim conserve physical quota" {
+    try nativeF32MirrorColdCase(std.testing.allocator, false, false, true);
+}
+
+fn nativeF32JoinedOriginalOracle(a: std.mem.Allocator, count: usize) ![]f32 {
+    const names = [_][]const u8{ "language_model.layers.0.self_attn.q_proj.weight", "language_model.layers.0.self_attn.k_proj.weight", "language_model.layers.0.self_attn.v_proj.weight" };
+    const widths = [_]usize{ 2, 2, 2 };
+    var bits: [3][8]u16 = .{ @splat(0x3f80), @splat(0xc000), @splat(0x3f00) };
+    // The independent control executes the original raw packed publisher,
+    // including its BF16 decoder, joined order, key and output shape.
+    var original = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 4096 }) };
+    defer original.resident_weights.deinit(a);
+    initPrefetchQueue(&original, a);
+    defer deinitPrefetchQueue(&original);
+    for (names[0..count], 0..) |name, index| try original.resident_weights.put(a, name, .{ .tensor = .{ .name = name, .data = std.mem.sliceAsBytes(&bits[index]), .dtype = .bf16, .shape = &.{ 2, 4 }, .allocator = a, .owns_data = false, .owns_shape = false } });
+    var old_compute = NativeCompute.init(a, &original, null);
+    defer old_compute.deinit();
+    old_compute.cache_embeddinggemma2_bf16_weights = true;
+    old_compute.borrow_typed_matrix_weights = true;
+    const old_cb = old_compute.computeBackend();
+    var old_weights: [3]CT = undefined;
+    var old_count: usize = 0;
+    defer for (old_weights[0..old_count]) |value| old_cb.free(value);
+    for (names[0..count], 0..) |name, index| {
+        old_weights[index] = try old_cb.getEmbeddingWeight(name);
+        old_count += 1;
+    }
+    const expected = (try packedMediaLinears(&old_compute, old_weights[0..count], 4, widths[0..count])) orelse return error.TestExpectedOriginalPackedWeights;
+    defer old_cb.free(expected);
+    return a.dupe(f32, getData(expected));
+}
+
+fn nativeF32JoinedColdCase(a: std.mem.Allocator, count: usize, below: bool, expected: []const f32) !void {
+    const names = [_][]const u8{ "language_model.layers.0.self_attn.q_proj.weight", "language_model.layers.0.self_attn.k_proj.weight", "language_model.layers.0.self_attn.v_proj.weight" };
+    const widths = [_]usize{ 2, 2, 2 };
+    var bits: [3][8]u16 = .{ @splat(0x3f80), @splat(0xc000), @splat(0x3f00) };
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const recipe = (try F32CacheRecipe.init(.joined, names[0..count], widths[0..count], 4)).?;
+    const payload = count * 8 * @sizeOf(f32);
+    const physical = payload + recipe.key().len + try NativeCompute.DenseCacheCold.mapAllocation(.empty, 1);
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = payload }) };
+    defer data.resident_weights.deinit(a);
+    initPrefetchQueue(&data, a);
+    defer {
+        deinitPrefetchQueue(&data);
+        data.tier_cache.?.deinitAdmission();
+    }
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = physical - @intFromBool(below) }, .{});
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    for (names[0..count], 0..) |name, index| try data.resident_weights.put(a, name, .{ .tensor = .{ .name = name, .data = std.mem.sliceAsBytes(&bits[index]), .dtype = .bf16, .shape = &.{ 2, 4 }, .allocator = a, .owns_data = false, .owns_shape = false }, .source_version = @intCast(index) });
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const current = @import("../execution/cleanup_context.zig").Context{ .boundary = owner.epoch() };
+    const request = ops.NativeWeightCachePreparation{ .panels = .{ .names = names[0..count], .widths = widths[0..count], .in_dim = 4 } };
+    try std.testing.expect(try NativeCompute.beginWeightCacheOperation(&cb, &data, request, current));
+    errdefer NativeCompute.abortWeightCacheOperation(&cb, &data);
+    try std.testing.expect(try NativeCompute.weightCacheOperationNeedsPreparation(&cb, &data, request));
+    // A cold miss has no actual F32 borrow: preserve original optional reclaim.
+    try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_f32_readers);
+    try NativeCompute.prepareWeightCacheOperationOutsideExecution(&cb, &data, request, &pin);
+    var scope = try NativeCompute.receiveWeightCacheOperation(&cb, &data, request, current);
+    defer scope.close();
+    if (below) {
+        try std.testing.expectEqual(@as(u32, 0), data.embeddinggemma2_f32_cache.count());
+        try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_f32_readers);
+    } else {
+        const selected = data.embeddinggemma2_f32_cache.get(recipe.key()).?;
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(selected.data));
+        try std.testing.expectEqual(physical, pin.controller().snapshot().host_weight_bytes);
+        try std.testing.expect(nativeCacheStampsCurrentLocked(&data, names[0..count], selected.source_stamps));
+        const saved = data.allocator;
+        var forbidden = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        data.allocator = forbidden.allocator();
+        defer data.allocator = saved;
+        try std.testing.expect(!try NativeCompute.weightCacheOperationNeedsPreparation(&cb, &data, request));
+        try std.testing.expectEqual(@as(usize, 0), forbidden.allocations);
+        // Unrelated actual slot changes cannot invalidate this group.
+        try data.resident_weights.put(a, "language_model.norm.weight", .{ .tensor = data.resident_weights.get(names[0]).?.tensor, .source_version = 7 });
+        try std.testing.expect(!try NativeCompute.weightCacheOperationNeedsPreparation(&cb, &data, request));
+        data.resident_weights.getPtr(names[0]).?.source_version += 1;
+        try std.testing.expect(!f32EntrySourcesCurrentLocked(&data, recipe.key(), &selected));
+        // Existing old aliases stay valid; receiving lookup declines this
+        // exact target to the original uncached operation, never stale-ready.
+        try std.testing.expect((try selectedF32CacheEntryLocked(&compute, recipe.key())) == null);
+        data.allocator = saved;
+    }
+    scope.close();
+    try std.testing.expectEqual(@as(usize, 0), data.canonical_panel_source_readers);
+}
+
+test "Native joined F32 cache cold single pair triple preserve original packed bytes exact cap and optional denial" {
+    for (1..4) |count| {
+        const expected = try nativeF32JoinedOriginalOracle(std.testing.allocator, count);
+        defer std.testing.allocator.free(expected);
+        try nativeF32JoinedColdCase(std.testing.allocator, count, false, expected);
+        try nativeF32JoinedColdCase(std.testing.allocator, count, true, expected);
+    }
+}
+test "Native joined F32 cache staged key values map and source pin unwind every allocation failure" {
+    // The original publisher deliberately turns denied raw reservations into
+    // null. Build its immutable successful oracle BEFORE failure injection so
+    // a reference-side OOM cannot masquerade as a new-route correctness error.
+    const expected = try nativeF32JoinedOriginalOracle(std.testing.allocator, 3);
+    defer std.testing.allocator.free(expected);
+    const Case = struct {
+        fn run(a: std.mem.Allocator, original: []const f32) !void {
+            try nativeF32JoinedColdCase(a, 3, false, original);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{expected});
+}
+test "Native weight cache failed pre-scope control releases pending source claim and preserves unrelated readers" {
+    const a = std.testing.allocator;
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 4096 }) };
+    defer data.resident_weights.deinit(a);
+    initPrefetchQueue(&data, a);
+    defer deinitPrefetchQueue(&data);
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const current = @import("../execution/cleanup_context.zig").Context{ .boundary = owner.epoch() };
+    try std.testing.expect(try NativeCompute.beginF32MirrorCacheOperation(&cb, &data, current));
+    try std.testing.expect(compute.mirror_source_claim);
+    try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_f32_readers);
+    NativeCompute.abortWeightCacheOperation(&cb, &data);
+    NativeCompute.abortWeightCacheOperation(&cb, &data);
+    try std.testing.expectEqual(@as(usize, 0), data.canonical_panel_source_readers);
+    const empty = ops.NativeWeightCachePreparation{ .panels = .{ .names = &.{}, .in_dim = 4 } };
+    try std.testing.expect(!try NativeCompute.weightCacheOperationNeedsPreparation(&cb, &data, empty));
+    try std.testing.expectError(error.ForeignNativeWeightModel, NativeCompute.beginF32MirrorCacheOperation(&cb, @ptrFromInt(16), current));
+}
+
+fn nativePreparedConstantColdCase(a: std.mem.Allocator, raw_first: bool, below: bool) !void {
+    const key = "audio_tower.prepared.cold163.relative";
+    const expected = [_]f32{ 1, -2, 0.5, 4 };
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 16 }) };
+    initPrefetchQueue(&data, a);
+    defer {
+        deinitPrefetchQueue(&data);
+        data.tier_cache.?.deinitAdmission();
+        _ = @import("../execution/resource_retirement.zig").poll();
+    }
+    const map_bytes = try NativeCompute.DenseCacheCold.mapAllocation(.empty, 1);
+    const entry_bytes = @sizeOf(@TypeOf(expected)) + key.len + 2 * @sizeOf(i64);
+    const physical = entry_bytes + map_bytes;
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = physical - @intFromBool(below) }, .{});
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&expected, &.{ 2, 2 });
+    defer cb.free(input);
+    var raw_pointer: ?[*]f32 = null;
+    if (raw_first) {
+        const raw = (try cb.modelConstant(key, input)).?;
+        defer cb.free(raw);
+        raw_pointer = toBuf(raw).data.ptr;
+    }
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const current = @import("../execution/cleanup_context.zig").Context{ .boundary = owner.epoch() };
+    const request: ops.NativeWeightCachePreparation = .{ .constant = .{ .key = key, .value = if (raw_first) null else input } };
+    try std.testing.expect(try NativeCompute.beginWeightCacheOperation(&cb, &data, request, current));
+    try std.testing.expect(try NativeCompute.weightCacheOperationNeedsPreparation(&cb, &data, request));
+    try NativeCompute.prepareWeightCacheOperationOutsideExecution(&cb, &data, request, &pin);
+    if (!below) {
+        const before_count = data.embeddinggemma2_constant_count;
+        const before_bytes = data.embeddinggemma2_constant_bytes;
+        const before_pointer = data.embeddinggemma2_f32_cache.get(key).?.data.ptr;
+        // Direct begin->prepare must preserve the immutable keyed hit too.
+        try NativeCompute.prepareWeightCacheOperationOutsideExecution(&cb, &data, request, &pin);
+        try std.testing.expectEqual(before_count, data.embeddinggemma2_constant_count);
+        try std.testing.expectEqual(before_bytes, data.embeddinggemma2_constant_bytes);
+        try std.testing.expect(before_pointer == data.embeddinggemma2_f32_cache.get(key).?.data.ptr);
+    }
+    var scope = try NativeCompute.receiveWeightCacheOperation(&cb, &data, request, current);
+    defer scope.close();
+    if (below) {
+        try std.testing.expect(try cb.modelConstant(key, input) == null);
+        try std.testing.expectEqual(@as(u32, 0), data.embeddinggemma2_f32_cache.count());
+        try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_constant_bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.sliceAsBytes(toBuf(input).data));
+        return;
+    }
+    const entry = data.embeddinggemma2_f32_cache.get(key) orelse return error.MissingPreparedConstant;
+    try std.testing.expectEqual(entry_bytes, entry.prepared_physical_bytes);
+    try std.testing.expectEqual(physical, pin.controller().snapshot().host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 16), data.tier_cache.?.host_bytes);
+    try std.testing.expectEqual(@as(usize, 16), data.embeddinggemma2_constant_bytes);
+    try std.testing.expectEqual(@as(usize, 1), data.embeddinggemma2_constant_count);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, entry.prepared_shape.?);
+    if (raw_pointer) |before| try std.testing.expect(before == entry.data.ptr);
+    const lookup: ops.NativeWeightCachePreparation = .{ .constant = .{ .key = key, .value = null } };
+    try std.testing.expect(!try NativeCompute.weightCacheOperationNeedsPreparation(&cb, &data, lookup));
+    const saved = data.allocator;
+    var forbidden = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    data.allocator = forbidden.allocator();
+    defer data.allocator = saved;
+    const result = (try cb.modelConstant(key, null)).?;
+    defer cb.free(result);
+    try std.testing.expectEqual(@as(usize, 0), forbidden.allocations);
+    try std.testing.expect(toBuf(result).data.ptr == entry.data.ptr);
+    try std.testing.expect((try cb.tensorShapeMatches(result, &.{ 2, 2 })).?);
+    @memset(toBuf(input).data, 0);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.sliceAsBytes(toBuf(result).data));
+    // Original caller input remains its independent owner; the map owns both
+    // the copied payload and shape. A receiving miss cannot invoke raw reserve.
+    try std.testing.expect(try cb.modelConstant("audio_tower.prepared.unfunded163", input) == null);
+    try std.testing.expectEqual(@as(u32, 1), data.embeddinggemma2_f32_cache.count());
+    data.allocator = saved;
+}
+
+test "Native prepared audio constant SAME cache cold exact cap raw shape adoption and one below" {
+    try nativePreparedConstantColdCase(std.testing.allocator, false, false);
+    try nativePreparedConstantColdCase(std.testing.allocator, true, false);
+    try nativePreparedConstantColdCase(std.testing.allocator, false, true);
+}
+
+test "Native prepared audio constant SAME recipe shape key map payload and consumer OOM unwind" {
+    const Case = struct {
+        fn fresh(a: std.mem.Allocator) !void {
+            try nativePreparedConstantColdCase(a, false, false);
+        }
+        fn raw(a: std.mem.Allocator) !void {
+            try nativePreparedConstantColdCase(a, true, false);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.fresh, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.raw, .{});
+}
+
+test "Native prepared audio constant original count byte and zero payload ceilings are independent" {
+    var data = WeightStore{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    try std.testing.expect(!f32ConstantWithinLimits(&data, 0));
+    try std.testing.expect(f32ConstantWithinLimits(&data, 16));
+    data.embeddinggemma2_constant_count = embeddinggemma2_weight_cache.prepared_max_entries;
+    try std.testing.expect(!f32ConstantWithinLimits(&data, 16));
+    data.embeddinggemma2_constant_count = 0;
+    data.embeddinggemma2_constant_bytes = embeddinggemma2_weight_cache.prepared_max_bytes - 15;
+    try std.testing.expect(!f32ConstantWithinLimits(&data, 16));
+    try std.testing.expect(f32ConstantWithinLimits(&data, 15));
 }
