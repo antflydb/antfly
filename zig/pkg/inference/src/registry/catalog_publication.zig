@@ -103,13 +103,15 @@ pub const Publication = struct {
     io: std.Io,
     path: []u8,
     lock: std.Io.File,
-    write_lease: publication_lease.WriteLease,
+    destination: []u8,
+    write_lease: ?publication_lease.WriteLease = null,
     journal: []u8,
     started: bool = false,
     finished: bool = false,
 
-    /// Serialize publishers and wait for constructors while readers retain
-    /// the stable catalog. No busy journal is exposed during preparation.
+    /// Serialize publishers while readers retain the stable catalog and may
+    /// continue construction. The exclusive destination lease is acquired only
+    /// for recovery or active namespace mutation, after content comparison.
     pub fn prepare(a: std.mem.Allocator, io: std.Io, root: []const u8, relative_destination: []const u8) !Publication {
         try publication_lease.Lease.assertMutable(a, io, root);
         const lock_path = try std.fs.path.join(a, &.{ root, ".antfly-catalog.lock" });
@@ -123,13 +125,16 @@ pub const Publication = struct {
         const recovered = try recoverInterrupted(a, io, root, path);
         if (recovered or (try read(a, io, root)).kind == .legacy) try writeStableGeneration(a, io, path);
         const destination = try journalDestination(a, io, root, relative_destination);
-        defer a.free(destination);
-        var lease = try publication_lease.WriteLease.acquire(a, io, destination);
-        errdefer lease.deinit(io);
+        errdefer a.free(destination);
         const journal = try std.json.Stringify.valueAlloc(a, Journal{ .destination = relative_destination }, .{});
         errdefer a.free(journal);
         if (journal.len > 4096) return error.ModelArtifactsChanging;
-        return .{ .allocator = a, .io = io, .path = path, .lock = lock, .write_lease = lease, .journal = journal };
+        return .{ .allocator = a, .io = io, .path = path, .lock = lock, .destination = destination, .journal = journal };
+    }
+
+    pub fn writeLease(self: *Publication) !*const publication_lease.WriteLease {
+        if (self.write_lease == null) self.write_lease = try publication_lease.WriteLease.acquire(self.allocator, self.io, self.destination);
+        return &self.write_lease.?;
     }
 
     /// Compatibility boundary for callers that immediately mutate the store.
@@ -143,13 +148,22 @@ pub const Publication = struct {
     pub fn start(self: *Publication) !void {
         if (self.started) return;
         if (self.finished) return error.ModelArtifactsChanging;
+        _ = try self.writeLease();
+        try self.startJournal();
+    }
+
+    fn startJournal(self: *Publication) !void {
+        if (self.started) return;
+        if (self.finished) return error.ModelArtifactsChanging;
         try download.writeFileAtomically(self.allocator, self.io, self.path, self.journal);
         self.started = true;
     }
 
     fn startMutation(raw: *anyopaque) !void {
         const self: *Publication = @ptrCast(@alignCast(raw));
-        try self.start();
+        // The transaction/recovery already holds its destination-bound lease.
+        // Do not recursively acquire it when recovery owns a borrowed lease.
+        try self.startJournal();
     }
     fn mutationJournal(self: *Publication) publication_lease.MutationJournal {
         return .{ .ptr = self, .begin_fn = startMutation };
@@ -157,14 +171,24 @@ pub const Publication = struct {
 
     pub fn recoverDestination(self: *Publication) !void {
         if (self.finished) return error.ModelArtifactsChanging;
-        try download.recoverManagedPublicationWithLease(self.allocator, self.io, self.write_lease.destination, &self.write_lease, self.mutationJournal());
+        // No backup means no namespace mutation and no exclusive lease.
+        // Recovery acquires its own destination lease before journaling.
+        if (self.write_lease) |*lease| {
+            try download.recoverManagedPublicationWithLease(self.allocator, self.io, self.destination, lease, self.mutationJournal());
+        } else try download.recoverManagedPublicationJournaled(self.allocator, self.io, self.destination, self.mutationJournal());
     }
 
     pub fn commit(self: *Publication, transaction: *download.ManagedModelTransaction) !void {
         if (self.finished) return error.ModelArtifactsChanging;
-        // Complete validation and unchanged-content checks under the write
-        // lease, then journal immediately before the first namespace mutation.
-        try transaction.commitWithLease(self.io, &self.write_lease, self.mutationJournal());
+        const destination = try @import("managed_receipt.zig").resolveRequestedFilePath(self.allocator, self.io, transaction.destination);
+        defer self.allocator.free(destination);
+        if (!std.mem.eql(u8, self.destination, destination)) return error.ModelArtifactsChanging;
+        if (self.write_lease == null) {
+            var shared = try publication_lease.Lease.shared(self.allocator, self.io, self.destination);
+            defer shared.deinit(self.io);
+            if (try transaction.finishIfUnchanged(self.io)) return;
+        } else if (try transaction.finishIfUnchanged(self.io)) return;
+        try transaction.publishWithLease(self.io, try self.writeLease(), self.mutationJournal());
     }
 
     pub fn finish(self: *Publication) !void {
@@ -177,10 +201,11 @@ pub const Publication = struct {
         defer _ = self.io.swapCancelProtection(previous);
         // Never authenticate a potentially failed rename/rollback implicitly.
         // Errors during preparation leave the existing catalog readable.
-        self.write_lease.deinit(self.io);
+        if (self.write_lease) |*lease| lease.deinit(self.io);
         self.lock.close(self.io);
         self.allocator.free(self.journal);
         self.allocator.free(self.path);
+        self.allocator.free(self.destination);
     }
 };
 
@@ -302,8 +327,15 @@ test "model selection publication preparation keeps the catalog readable while c
     Probe.readable = false;
     table.fileLock = Probe.lock;
     const contended_io = std.Io{ .userdata = io.userdata, .vtable = &table };
-    try std.testing.expectError(error.Canceled, Publication.prepare(a, contended_io, root, "owner/model"));
-    try std.testing.expect(Probe.readable);
+    {
+        var preparing = try Publication.prepare(a, contended_io, root, "owner/model");
+        defer preparing.deinit();
+        try std.testing.expect(preparing.write_lease == null);
+        // Preparation succeeds alongside readers; only mutation waits for them.
+        try std.testing.expectError(error.Canceled, preparing.start());
+        try std.testing.expect(!preparing.started);
+        try std.testing.expect(Probe.readable);
+    }
     try std.testing.expectEqual(prior, try read(a, io, root));
     held.deinit(io);
     var prepared = try Publication.prepare(a, io, root, "owner/model");
@@ -369,12 +401,15 @@ test "model selection unchanged content comparison leaves the catalog available"
     const Probe = struct {
         var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
         var root_path: []const u8 = undefined;
+        var model_path: []const u8 = undefined;
         var expected: Generation = undefined;
         var checks: usize = 0;
         var readable = true;
         fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
             if (std.mem.endsWith(u8, path, "model.gguf")) {
                 checks += 1;
+                var execution = publication_lease.Lease.shared(std.testing.allocator, std.testing.io, model_path) catch return error.Unexpected;
+                defer execution.deinit(std.testing.io);
                 const current = read(std.testing.allocator, std.testing.io, root_path) catch return error.Unexpected;
                 readable = readable and std.meta.eql(expected, current);
             }
@@ -384,6 +419,7 @@ test "model selection unchanged content comparison leaves the catalog available"
     var table = io.vtable.*;
     Probe.original = table.dirOpenFile;
     Probe.root_path = root;
+    Probe.model_path = model;
     Probe.expected = prior;
     Probe.checks = 0;
     Probe.readable = true;

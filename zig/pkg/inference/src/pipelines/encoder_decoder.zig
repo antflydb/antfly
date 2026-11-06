@@ -287,7 +287,18 @@ const decoder_candidates = &[_][]const u8{
 /// Discovery only. The runtime qualifies the loaded graph before choosing it;
 /// filename presence is not a cache capability declaration.
 pub fn findMergedDecoder(allocator: std.mem.Allocator, model_dir: []const u8) !?[]const u8 {
-    return findModelFile(allocator, model_dir, &.{"decoder_model_merged.onnx"});
+    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, std.Options.debug_io, model_dir, null);
+    defer artifacts.deinit();
+    return findMergedDecoderWithArtifacts(&artifacts);
+}
+
+/// Warm planning resolves receipt membership only; graph hashing belongs to
+/// the coalesced cold constructor, not to every cached acquisition.
+pub fn findMergedDecoderWithArtifacts(artifacts: *const @import("../registry/published_artifacts.zig").PublishedArtifacts) !?[]const u8 {
+    for ([_][]const u8{ "decoder_model_merged.onnx", "onnx/decoder_model_merged.onnx" }) |relative| {
+        if (try artifacts.resolve(relative)) |path| return path;
+    }
+    return null;
 }
 
 /// Check if a model directory contains encoder-decoder ONNX files.

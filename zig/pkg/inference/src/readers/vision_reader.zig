@@ -72,10 +72,7 @@ pub const LoadedVisionReader = struct {
 
             for ([_][]const u8{ paths.encoder, paths.decoder }) |path| {
                 if (!std.mem.endsWith(u8, path, ".onnx")) continue;
-                try artifacts.verifyPath(path);
-                var graph = try backends.imported_onnx_session.inspectArtifactSet(allocator, path);
-                defer graph.deinit();
-                for (graph.external_paths) |external| try artifacts.verifyPath(external);
+                try artifacts.verifyOnnx(path);
             }
             const config_bytes = artifacts.read("config.json", 16 * 1024 * 1024) catch |err| switch (err) {
                 error.FileNotFound => null,
@@ -98,6 +95,7 @@ pub const LoadedVisionReader = struct {
                 session_manager.preferred_backends,
                 &.{ paths.encoder, paths.decoder },
             );
+            loader = loader.withArtifacts(&artifacts);
             var reader = try loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, preproc, &loader, null, control);
             errdefer reader.deinit();
             try artifacts.verify();
