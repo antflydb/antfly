@@ -4960,6 +4960,7 @@ pub const ProvisionedTableReadSource = struct {
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, routed.catalog, table_name, group_ids.len);
         try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = self.monotonicNs();
+        const logical_shard_count: u32 = @intCast(if (usesRetainedQueryCarrier(req)) req.native_query_cut.?.cover.len else group_ids.len);
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             if ((control_only_storage_sources or routed.local_read_source != null) and delivery == null and !queryRequiresCoordinatorFinalization(req)) {
                 const local_source = try routed.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation);
@@ -5076,7 +5077,7 @@ pub const ProvisionedTableReadSource = struct {
 
             var meta: query_api.QueryResponseMeta = .{
                 .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
-                .shard_count = @intCast(group_ids.len),
+                .shard_count = logical_shard_count,
                 .merged = true,
             };
             defer meta.deinit(alloc);
@@ -5112,8 +5113,8 @@ pub const ProvisionedTableReadSource = struct {
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
             .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
-            .shard_count = @intCast(group_ids.len),
-            .merged = group_ids.len > 1,
+            .shard_count = logical_shard_count,
+            .merged = logical_shard_count > 1,
         };
         defer meta.deinit(alloc);
         if (collection_req != null) try requireCompleteAggregationFullResult(search_req, merged, "provisioned-single-pass");
@@ -7576,17 +7577,21 @@ pub const HostedProvisionedTableReadSource = struct {
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
         try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = self.monotonicNs();
-        if (delivery == null and group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
+        const logical_shard_count: u32 = @intCast(if (usesRetainedQueryCarrier(req)) req.native_query_cut.?.cover.len else group_ids.len);
+        // Coordinator-owned transforms always use raw retrieval below. Do not
+        // resolve the same carrier once here and again for that retrieval.
+        if (delivery == null and group_ids.len == 1 and !distributed_graph.supportsCrossRange(req) and !ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
             defer route.deinit(alloc);
 
+            // Requests needing finalization, including retained pages, take
+            // the raw path below and move the single-carrier result.
+            const retained_cover = req.native_query_cut != null and !req.native_query_cut.?.create;
             if (route == .local)
                 return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), consistency);
-            // A retained cover is executed completely by its current carrier.
-            // Preserve its finalized response when the carrier is remote too;
-            // remerging a cursor page cannot infer exhaustion from total_hits,
-            // which deliberately counts matches before the cursor.
-            if (req.native_query_cut != null and !req.native_query_cut.?.create)
+            // Preserve a retained cover's finalized response when the carrier
+            // is remote too.
+            if (retained_cover and route == .remote)
                 return try queryResponseRemote(self.internalExecutor(), alloc, route.remote.base_uri, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name));
         }
 
@@ -7628,7 +7633,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
             var meta: query_api.QueryResponseMeta = .{
                 .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
-                .shard_count = @intCast(group_ids.len),
+                .shard_count = logical_shard_count,
                 .merged = true,
             };
             defer meta.deinit(alloc);
@@ -7644,8 +7649,8 @@ pub const HostedProvisionedTableReadSource = struct {
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
             .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
-            .shard_count = @intCast(group_ids.len),
-            .merged = group_ids.len > 1,
+            .shard_count = logical_shard_count,
+            .merged = logical_shard_count > 1,
         };
         defer meta.deinit(alloc);
         if (collection_req != null) try requireCompleteAggregationFullResult(search_req, merged, "hosted-single-pass");
@@ -8900,6 +8905,59 @@ fn distributedCoordinatorPaging(req: db_mod.types.SearchRequest) DistributedCoor
 }
 
 const complete_match_anchor_order = [_]db_mod.types.SortField{.{ .field = "_id" }};
+
+/// A retained cover's one carrier already selected the complete ordered
+/// window, even when it contains fewer hits than the corpus total. Moving that
+/// result preserves its native ordering and metadata without a schema lookup,
+/// sorting, payload clones, or a second inference about cursor exhaustion.
+/// Runtime transforms receive the widened candidate window and page it later.
+fn takeSingleCarrierQueryWindow(
+    result: *db_mod.types.SearchResult,
+    paging: DistributedCoordinatorPaging,
+) !db_mod.types.SearchResult {
+    const limit = if (paging.limit == 0) std.math.maxInt(u32) else paging.limit;
+    try query_post_processing.pageSearchHitsAfterScoreTransforms(result.alloc, result, result.hits.len, paging.offset, limit);
+    const owned = result.*;
+    result.* = .{ .alloc = owned.alloc, .hits = &.{}, .total_hits = 0 };
+    return owned;
+}
+
+fn usesRetainedQueryCarrier(req: db_mod.types.SearchRequest) bool {
+    const cut = req.native_query_cut orelse return false;
+    return !cut.create and cut.cover.len != 0;
+}
+
+/// The carrier executes the immutable original cover, including its logical
+/// range fanout and hierarchy hydration. Its current group is only a routing
+/// slot: neither its generation nor its topology describes that retained plan.
+/// Fetch one raw candidate window and leave runtime finalization to the caller.
+fn queryRetainedCarrierResult(
+    comptime Source: type,
+    self: *Source,
+    alloc: std.mem.Allocator,
+    group_ids: []const u64,
+    req: db_mod.types.SearchRequest,
+    table_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !db_mod.types.SearchResult {
+    if (group_ids.len != 1) return error.CatalogGenerationChanged;
+    var worker_req = distributedSearchShardRequest(req, &.{}, true);
+    worker_req.identity_read_generation = null;
+    // The carrier owns retrieval over the old cover; the outer coordinator
+    // still owns aggregation and runtime transforms for this public request.
+    worker_req.aggregations_json = "";
+    worker_req.defer_hierarchy_child_hydration = req.defer_hierarchy_child_hydration;
+    var result = if (Source == HostedProvisionedTableReadSource) remote: {
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids[0], routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+        defer route.deinit(alloc);
+        break :remote switch (route) {
+            .local => (try self.groupLocalSource().searchResultGroupLocal(alloc, group_ids[0], table_name, worker_req, consistency)) orelse return error.TableNotFound,
+            .remote => |owner| queryRemote(self.internalExecutor(), alloc, owner.base_uri, group_ids[0], table_name, worker_req) catch |err| return normalizeDistributedQueryOperationalError(err),
+        };
+    } else (try self.groupLocalSource().searchResultGroupLocal(alloc, group_ids[0], table_name, worker_req, consistency)) orelse return error.TableNotFound;
+    defer result.deinit();
+    return try takeSingleCarrierQueryWindow(&result, distributedCoordinatorPaging(req));
+}
 
 /// Canonical MATCH is a graph relation over the authorized source-table
 /// universe, not over the public retrieval page. Build one stable identity-only
@@ -11079,6 +11137,8 @@ fn queryProvisionedAcrossGroupsAtGenerations(
     if (!db_mod.types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
+    if (usesRetainedQueryCarrier(req))
+        return queryRetainedCarrierResult(ProvisionedTableReadSource, self, alloc, group_ids, req, table_name, consistency);
     const distributed_text_stats = try collectProvisionedSearchRequestTextStats(self, alloc, group_ids, req, table_name, required_identity_generations);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
     const selected_generations = try alloc.alloc(?u64, group_ids.len);
@@ -11237,6 +11297,8 @@ fn queryHostedAcrossGroupsAtGenerations(
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, active_self.catalog, table_name, group_ids.len);
     try validateResolvedDocFilterForGroups(alloc, active_self.catalog, table_name, group_ids, req);
     try rejectHostedRemoteResolvedDocFilter(active_self, alloc, group_ids, table_name, req, consistency);
+    if (usesRetainedQueryCarrier(req))
+        return queryRetainedCarrierResult(HostedProvisionedTableReadSource, active_self, alloc, group_ids, req, table_name, consistency);
     const distributed_text_stats = try collectHostedSearchRequestTextStats(active_self, alloc, group_ids, req, table_name, consistency, required_identity_generations);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
     const selected_generations = try alloc.alloc(?u64, group_ids.len);
@@ -11366,7 +11428,10 @@ fn queryProvisionedAcrossGroupsPhase(
     var merge_req = req;
     if (graph_accumulator != null) merge_req.clearGraphQueries();
     const coordinator_paging = distributedCoordinatorPaging(req);
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], coordinator_paging.offset, coordinator_paging.limit);
+    var merged = if (req.native_query_cut != null and initialized == 1)
+        try takeSingleCarrierQueryWindow(&shard_results[0], coordinator_paging)
+    else
+        try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     if (graph_accumulator) |*accumulator|
         merged.graph_results = try accumulator.toOwned();
@@ -11445,7 +11510,10 @@ fn queryHostedAcrossGroupsPhase(
     var merge_req = req;
     if (graph_accumulator != null) merge_req.clearGraphQueries();
     const coordinator_paging = distributedCoordinatorPaging(req);
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], coordinator_paging.offset, coordinator_paging.limit);
+    var merged = if (req.native_query_cut != null and initialized == 1)
+        try takeSingleCarrierQueryWindow(&shard_results[0], coordinator_paging)
+    else
+        try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], coordinator_paging.offset, coordinator_paging.limit);
     errdefer merged.deinit();
     if (graph_accumulator) |*accumulator|
         merged.graph_results = try accumulator.toOwned();
@@ -16264,7 +16332,11 @@ fn queryRemoteWithScratch(
     else
         try local_query_contract.parseRemoteSearchResultWithScratch(alloc, scratch, result.json);
     errdefer parsed.deinit();
-    parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
+    // A retained cover can combine independently versioned original ranges.
+    // Its authenticated cut pins those generations; the current carrier has
+    // no scalar generation to attest. Ordinary shard reads still require one.
+    parsed.identity_read_generation = result.identity_read_generation;
+    if (parsed.identity_read_generation == null and !usesRetainedQueryCarrier(req)) return error.InvalidQueryRequest;
     if (req.document_authority_mode != .none and req.document_authority_mode != .lookup) {
         if (parsed.document_authority_version != 1) {
             if (req.document_authority_mode != .candidates) return error.StorageReadTemporarilyUnavailable;
@@ -22883,6 +22955,137 @@ fn consumerTests() type {
             try std.testing.expect(runtime_cfg.antfly_provider == null);
             try std.testing.expect(runtime_cfg.secret_store == null);
             try std.testing.expect(runtime_cfg.remote_content == null);
+        }
+
+        test "hosted retained local and remote carriers finalize short cursor windows once" {
+            const alloc = std.testing.allocator;
+            const Fixture = struct {
+                remote: bool,
+                calls: usize = 0,
+
+                fn localNode(_: *anyopaque) u64 {
+                    return 1;
+                }
+                fn localStatus(raw: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return if (self.remote) .absent else .active;
+                }
+                fn leader(raw: *anyopaque, _: u64) ?u64 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return if (self.remote) 2 else 1;
+                }
+                fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+                    return .active;
+                }
+                fn uri(_: *anyopaque, a: std.mem.Allocator, _: u64) !?[]u8 {
+                    return try a.dupe(u8, "http://remote.test");
+                }
+                fn search(raw: *anyopaque, a: std.mem.Allocator, _: u64, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expect(req.pruner == null);
+                    try std.testing.expect(req.native_query_cut != null);
+                    const hits = try a.alloc(db_mod.types.SearchHit, 1);
+                    hits[0] = try testTableReadIdSortedHitAlloc(a, "tail");
+                    hits[0].score = 0.5;
+                    return .{ .alloc = a, .hits = hits, .total_hits = 100 };
+                }
+                fn ownedRetainedCarrierAckHeaderForTest(a: std.mem.Allocator) ![]http_common.Header {
+                    const headers = try a.alloc(http_common.Header, 1);
+                    errdefer a.free(headers);
+                    const name = try a.dupe(u8, metadata_api.catalog_route_fence_ack_header);
+                    errdefer a.free(name);
+                    headers[0] = .{ .name = name, .value = try a.dupe(u8, metadata_api.catalog_route_fence_ack_value) };
+                    return headers;
+                }
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, "/groups/7001/tables/docs/query"));
+                    var body = try std.json.parseFromSlice(std.json.Value, a, req.body, .{});
+                    defer body.deinit();
+                    try std.testing.expect(body.value.object.get("pruner") == null);
+                    try std.testing.expect(body.value.object.get("_native_cut") != null);
+                    return .{
+                        .status = 200,
+                        .headers = try ownedRetainedCarrierAckHeaderForTest(a),
+                        .body = try a.dupe(u8,
+                            \\{"responses":[{"hits":{"total":{"value":100,"relation":"exact"},"hits":[{"_id":"tail","_score":0.5,"_sort":["tail"]}]},"took":0,"status":200,"table":"docs"}]}
+                        ),
+                    };
+                }
+            };
+            for ([_]bool{ false, true }) |remote| {
+                var fixture: Fixture = .{ .remote = remote };
+                var catalog = MutableReadTopologyCatalog{};
+                var hosted = HostedProvisionedTableReadSource.init("unused", catalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier(), .{
+                    .ptr = &fixture,
+                    .vtable = &.{ .local_node_id = Fixture.localNode, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_status = Fixture.nodeStatus, .node_base_uri = Fixture.uri },
+                }, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+                _ = hosted.withLocalReadSource(.{ .ptr = &fixture, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .search_result_group_local = Fixture.search } });
+                const id: [64]u8 = @splat('a');
+                const Cut = @typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child;
+                const Range = @typeInfo(@FieldType(Cut, "cover")).pointer.child;
+                const cover = [_]Range{
+                    .{ .group_id = 10, .namespace = .{ .table_id = 7, .shard_id = 10, .range_id = 10 }, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 20, .namespace = .{ .table_id = 7, .shard_id = 20, .range_id = 20 }, .start_key = "m" },
+                };
+                const cursor = [_]std.json.Value{.{ .string = @constCast("before-tail") }};
+                var response = (try hosted.source().query(alloc, "docs", .{
+                    .order_by = &.{.{ .field = "_id" }},
+                    .search_after = &cursor,
+                    .limit = 2,
+                    .profile = true,
+                    .include_stored = false,
+                    .pruner = .{ .min_absolute_score = 1 },
+                    .native_query_cut = .{ .id = &id, .table_id = 7, .expires_ms = std.math.maxInt(u64), .cover = &cover, .recipe = .{ .schema_json = "", .read_schema_json = "", .indexes_json = "{}" } },
+                }, .read_index)).?;
+                defer response.deinit(alloc);
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+                defer parsed.deinit();
+                const wire = parsed.value.object.get("responses").?.array.items[0].object;
+                try std.testing.expectEqual(@as(i64, 2), wire.get("profile").?.object.get("shards").?.object.get("total").?.integer);
+                const hits = wire.get("hits").?.object;
+                try std.testing.expectEqual(@as(usize, 0), hits.get("hits").?.array.items.len);
+                try std.testing.expectEqual(@as(i64, 100), hits.get("total").?.object.get("value").?.integer);
+            }
+        }
+
+        test "retained single-carrier window moves short and empty cursor pages without merging" {
+            const alloc = std.testing.allocator;
+            for ([_]u32{ 0, 1, 2 }) |offset| {
+                const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+                hits[0] = try testTableReadIdSortedHitAlloc(alloc, "tail");
+                const id_ptr = hits[0].id.ptr;
+                var carrier: db_mod.types.SearchResult = .{
+                    .alloc = alloc,
+                    .hits = hits,
+                    .total_hits = 100,
+                    .identity_read_generation = 42,
+                    // The private proof is deliberately absent on raw RPC
+                    // results. Corpus totals cannot prove tail exhaustion.
+                    .ordered_window_complete = false,
+                };
+                defer carrier.deinit();
+                var window = try takeSingleCarrierQueryWindow(&carrier, .{ .offset = offset, .limit = 2 });
+                defer window.deinit();
+                try std.testing.expectEqual(@as(usize, 0), carrier.hits.len);
+                try std.testing.expectEqual(@as(u32, 100), window.total_hits);
+                try std.testing.expectEqual(@as(?u64, 42), window.identity_read_generation);
+                try std.testing.expectEqual(@as(usize, if (offset == 0) 1 else 0), window.hits.len);
+                if (offset == 0) {
+                    try std.testing.expectEqual(hits.ptr, window.hits.ptr);
+                    try std.testing.expectEqual(id_ptr, window.hits[0].id.ptr);
+                    try std.testing.expectEqualStrings("tail", window.hits[0].sort_values[0].string);
+                }
+            }
+            var empty: db_mod.types.SearchResult = .{ .alloc = alloc, .hits = &.{}, .total_hits = 100 };
+            defer empty.deinit();
+            var window = try takeSingleCarrierQueryWindow(&empty, .{ .offset = 0, .limit = 0 });
+            defer window.deinit();
+            try std.testing.expectEqual(@as(usize, 0), window.hits.len);
+            try std.testing.expectEqual(@as(u32, 100), window.total_hits);
         }
 
         test "provisioned single-group queries retain coordinator-owned finalization" {
