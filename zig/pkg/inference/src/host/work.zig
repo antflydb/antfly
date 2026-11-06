@@ -746,13 +746,9 @@ pub const BoundedInvocationAllocator = struct {
     }
 
     pub fn allocator(self: *BoundedInvocationAllocator) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{
-            .alloc = alloc,
-            .resize = resize,
-            .remap = remap,
-            .free = free,
-        } };
+        return .{ .ptr = self, .vtable = &vtable };
     }
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
 
     // The limit check, backing operation and accounting form one transaction.
     // Duplex transport can free upload buffers while parsing response frames;
@@ -776,21 +772,27 @@ pub const BoundedInvocationAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        return self.allocOn(self.backing, len, alignment, ret_addr);
+    }
+    fn allocOn(self: *BoundedInvocationAllocator, backing: std.mem.Allocator, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         self.lock();
         defer self.mutex.unlock();
         if (!self.permit(len)) return null;
-        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        const ptr = backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.recordGrowth(len);
         return ptr;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        return self.resizeOn(self.backing, memory, alignment, new_len, ret_addr);
+    }
+    fn resizeOn(self: *BoundedInvocationAllocator, backing: std.mem.Allocator, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         self.lock();
         defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > 0 and !self.permit(growth)) return false;
-        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (!backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
         self.live_bytes = self.live_bytes -| memory.len +| new_len;
         self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return true;
@@ -798,11 +800,14 @@ pub const BoundedInvocationAllocator = struct {
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        return self.remapOn(self.backing, memory, alignment, new_len, ret_addr);
+    }
+    fn remapOn(self: *BoundedInvocationAllocator, backing: std.mem.Allocator, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         self.lock();
         defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > 0 and !self.permit(growth)) return null;
-        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        const ptr = backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
         self.live_bytes = self.live_bytes -| memory.len +| new_len;
         self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return ptr;
@@ -810,12 +815,101 @@ pub const BoundedInvocationAllocator = struct {
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *BoundedInvocationAllocator = @ptrCast(@alignCast(ctx));
+        return self.freeOn(self.backing, memory, alignment, ret_addr);
+    }
+    fn freeOn(self: *BoundedInvocationAllocator, backing: std.mem.Allocator, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         self.lock();
         defer self.mutex.unlock();
-        self.backing.rawFree(memory, alignment, ret_addr);
+        backing.rawFree(memory, alignment, ret_addr);
         self.live_bytes -|= memory.len;
     }
 };
+
+/// Stack-owned scratch capability. Unwrap arenas while preserving every
+/// invocation quota in the chain. Results must still use the caller allocator;
+/// this allocator is only for temporary work released before this scope ends.
+pub const ReclaimingInvocationAllocator = struct {
+    original: std.mem.Allocator,
+    nodes: [16]Node = undefined,
+    const Node = struct {
+        owner: *BoundedInvocationAllocator,
+        backing: std.mem.Allocator,
+        const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+        fn allocator(self: *Node) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *Node = @ptrCast(@alignCast(ctx));
+            return self.owner.allocOn(self.backing, len, alignment, ret_addr);
+        }
+        fn resize(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+            const self: *Node = @ptrCast(@alignCast(ctx));
+            return self.owner.resizeOn(self.backing, bytes, alignment, len, ret_addr);
+        }
+        fn remap(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *Node = @ptrCast(@alignCast(ctx));
+            return self.owner.remapOn(self.backing, bytes, alignment, len, ret_addr);
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *Node = @ptrCast(@alignCast(ctx));
+            self.owner.freeOn(self.backing, bytes, alignment, ret_addr);
+        }
+    };
+    pub fn init(alloc: std.mem.Allocator) ReclaimingInvocationAllocator {
+        return .{ .original = alloc };
+    }
+    pub fn allocator(self: *ReclaimingInvocationAllocator) std.mem.Allocator {
+        var probe = std.heap.ArenaAllocator.init(self.original);
+        var current = self.original;
+        var count: usize = 0;
+        for (0..64) |_| {
+            if (current.vtable == probe.allocator().vtable) {
+                const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(current.ptr));
+                current = arena.child_allocator;
+            } else if (count < self.nodes.len and current.vtable == &BoundedInvocationAllocator.vtable) {
+                const owner: *BoundedInvocationAllocator = @ptrCast(@alignCast(current.ptr));
+                self.nodes[count] = .{ .owner = owner, .backing = undefined };
+                count += 1;
+                current = owner.backing;
+            } else if (count < self.nodes.len and current.vtable == &Node.vtable) {
+                const node: *Node = @ptrCast(@alignCast(current.ptr));
+                self.nodes[count] = .{ .owner = node.owner, .backing = undefined };
+                count += 1;
+                current = node.backing;
+            } else break;
+        }
+        while (count != 0) {
+            count -= 1;
+            self.nodes[count].backing = current;
+            current = self.nodes[count].allocator();
+        }
+        return current;
+    }
+};
+
+test "privacy scratch reclaims arena-backed batch memory without bypassing invocation quotas" {
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var arena = std.heap.ArenaAllocator.init(counter.allocator());
+    defer arena.deinit();
+    var outer = BoundedInvocationAllocator.init(arena.allocator(), 2 * 1024 * 1024);
+    var nested_arena = std.heap.ArenaAllocator.init(outer.allocator());
+    defer nested_arena.deinit();
+    var inner = BoundedInvocationAllocator.init(nested_arena.allocator(), 2 * 1024 * 1024);
+    var scratch = ReclaimingInvocationAllocator.init(inner.allocator());
+    const a = scratch.allocator();
+    const baseline = counter.allocated_bytes - counter.freed_bytes;
+    const bytes = try a.alloc(u8, 1024 * 1024);
+    // Interleave a retained allocation: arena-backed frees alone cannot
+    // release the batch once a later result occupies the same parent arena.
+    const retained = try inner.allocator().dupe(u8, "retained");
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 2 * 1024 * 1024));
+    try std.testing.expect(inner.limit_exceeded);
+    a.free(bytes);
+    try std.testing.expect(outer.live_bytes < 4096);
+    try std.testing.expect(counter.allocated_bytes - counter.freed_bytes < baseline + 4096);
+    try std.testing.expectEqualStrings("retained", retained);
+    inner.allocator().free(retained);
+}
 
 test "executor-owned invocation plans keep public results inside the bounded allocator" {
     const valid = InvocationMemoryPlan{

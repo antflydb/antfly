@@ -389,6 +389,21 @@ const DecodeBudgetAllocator = struct {
         return result;
     }
 
+    fn adopt(self: *DecodeBudgetAllocator, source: *DecodeBudgetAllocator, bytes: []u8) !void {
+        try self.adoptAllocation(source, bytes.len);
+    }
+
+    fn adoptAllocation(self: *DecodeBudgetAllocator, source: *DecodeBudgetAllocator, byte_count: usize) !void {
+        // Move ownership between ledgers sharing one backing allocator;
+        // neither copy the data nor charge the backing live bytes twice.
+        std.debug.assert(self.backing.ptr == source.backing.ptr and self.backing.vtable == source.backing.vtable);
+        std.debug.assert(source.live_bytes >= byte_count);
+        if (!self.permitsGrowth(byte_count)) return error.OutOfMemory;
+        source.live_bytes -= byte_count;
+        self.live_bytes += byte_count;
+        self.recordSuccessfulGrowth(byte_count);
+    }
+
     fn allocator(self: *DecodeBudgetAllocator) Allocator {
         return .{
             .ptr = self,
@@ -3140,15 +3155,88 @@ const PageTextProperty = struct {
 // resource/property objects; only the small selected-name records are copied.
 // A sorted index is built once per property dictionary, without resolving
 // unreferenced property values. The bounded allocator owns every borrow.
+const MetadataObjectStreamCache = struct {
+    budget: ?*DecodeBudgetAllocator = null,
+    live_budget: ?*DecodeBudgetAllocator = null,
+    frame: ?Frame = null,
+    loads: usize = 0,
+
+    const Entry = struct { id: u32, start: usize, end: usize };
+    const Frame = struct { id: u32, bytes: []u8, first: usize, entries: []Entry };
+
+    fn deinit(self: *@This()) void {
+        if (self.frame) |frame| {
+            const a = self.budget.?.allocator();
+            a.free(frame.entries);
+            a.free(frame.bytes);
+            self.frame = null;
+        }
+    }
+
+    fn beginAllocation(self: *@This()) void {
+        self.budget.?.limit_exceeded = false;
+        if (self.live_budget) |live| live.limit_exceeded = false;
+    }
+
+    fn decodeFailure(budget: *DecodeBudgetAllocator, err: anyerror) anyerror {
+        defer budget.limit_exceeded = false;
+        return if (err == error.OutOfMemory and budget.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else err;
+    }
+
+    fn load(self: *@This(), reader: *const Reader, id: u32, stream: *const syntax.Object, first: usize, count: usize) !*const Frame {
+        // One frame and index, charged to the same live/cumulative allowance
+        // as retained metadata. Locators remain valid after eviction.
+        self.deinit();
+        const a = self.budget.?.allocator();
+        var scratch = DecodeBudgetAllocator.initWithCumulativeLimit(self.budget.?.backing, 0, self.budget.?.max_live_bytes, self.budget.?.max_live_bytes *| 4);
+        defer std.debug.assert(scratch.live_bytes == 0);
+        const decode_allocator = scratch.allocator();
+        var decoder = reader.*;
+        decoder.alloc = decode_allocator;
+        decoder.metadata_frames = null;
+        var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+        defer encrypted_streams.deinit(decode_allocator);
+        decoder.encrypted_streams = &encrypted_streams;
+        decoder.encrypted_stream_generation = 0;
+        if (reader.encrypted_streams.get(stream.stream.data_offset)) |reference|
+            decoder.rememberEncryptedStream(stream.stream.data_offset, reference) catch |err| return decodeFailure(&scratch, err);
+        const bytes = decoder.readDecodedStreamData(stream) catch |err| return decodeFailure(&scratch, err);
+        scratch.limit_exceeded = false;
+        self.beginAllocation();
+        errdefer decode_allocator.free(bytes);
+        if (first > bytes.len or count > first) return error.InvalidObjectStream;
+        const entries = try a.alloc(Entry, count);
+        errdefer a.free(entries);
+        _ = decoder.scanObjectStreamIndex(bytes, first, count, 0, entries) catch |err| return decodeFailure(&scratch, err);
+        scratch.limit_exceeded = false;
+        self.beginAllocation();
+        try self.budget.?.adopt(&scratch, bytes);
+        self.frame = .{ .id = id, .bytes = bytes, .first = first, .entries = entries };
+        self.loads += 1;
+        return &self.frame.?;
+    }
+};
+
+fn metadataScanControl(reader: *const Reader) syntax.ScanControl {
+    return .{
+        .remaining_work = @min(2 * 1024 * 1024 * 1024, @max(1024 * 1024, reader.decode_limits.max_working_set_bytes *| 16)),
+        .context = reader.cancellation.context,
+        .is_cancelled_fn = reader.cancellation.is_cancelled_fn,
+    };
+}
+
 const TextResourceCache = struct {
     budget: *DecodeBudgetAllocator,
+    frames: MetadataObjectStreamCache = .{},
+    scan_control: syntax.ScanControl = .{},
+    scan_ready: bool = false,
     live_budget: ?*DecodeBudgetAllocator = null,
     objects: std.AutoHashMapUnmanaged(ObjectKey, union(enum) { object: syntax.Object, invalid }) = .empty,
     bindings: std.ArrayList(*Bindings) = .empty,
     direct_resources: std.ArrayList(syntax.Object) = .empty,
     scopes: std.AutoHashMapUnmanaged(usize, []PropertyEntry) = .empty,
     page_resources: ?syntax.Object = null,
-    property_resources: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty,
+    property_resources: std.AutoHashMapUnmanaged(usize, ResourceSource) = .empty,
 
     const PropertyValue = struct {
         actual_text: ?EncodedActualText = null,
@@ -3159,6 +3247,15 @@ const TextResourceCache = struct {
         raw: *const syntax.DictEntry,
         parsed: ?PropertyValue = null,
     };
+
+    fn prepareScan(self: *@This(), reader: *const Reader) void {
+        if (!self.scan_ready) {
+            self.scan_control = metadataScanControl(reader);
+            self.frames.budget = self.budget;
+            self.frames.live_budget = self.live_budget;
+            self.scan_ready = true;
+        }
+    }
 
     fn allocator(self: *@This()) Allocator {
         return self.budget.allocator();
@@ -3177,6 +3274,7 @@ const TextResourceCache = struct {
         self.objects.deinit(a);
         for (self.direct_resources.items) |*object| object.deinit(a);
         self.direct_resources.deinit(a);
+        self.frames.deinit();
     }
 
     // Call only at a cache-budget allocation boundary, never around work
@@ -3196,13 +3294,14 @@ const TextResourceCache = struct {
 
     // Metadata is parsed with a temporary per-object allocation allowance,
     // sharing the live-byte ceiling with retained cache entries. Only fields
-    // used by native extraction are copied into the retained cache. Unknown
+    // used by native extraction enter the retained cache. Unknown
     // payloads can never accumulate merely because a dictionary was inspected.
-    const Purpose = enum { resources, required_resources, resource_properties, property_table, property };
-    const ObjectKey = struct { reference: u64, purpose: Purpose };
+    const Purpose = enum { resources, required_resources, resource_properties, container_properties, property_table, property };
+    const ResourceSource = struct { reference: syntax.ObjRef, container: bool = false };
+    const ObjectKey = struct { reference: u64, purpose: Purpose, start: usize = 0 };
 
     fn cloneMetadata(self: *@This(), reader: *const Reader, object: syntax.Object, purpose: Purpose) anyerror!syntax.Object {
-        if (object == .obj_ref) return object;
+        if (object == .obj_ref or object == .deferred) return object;
         if (object != .dict) return .null;
         var count: usize = 0;
         for (object.dict) |entry| if (keepsField(purpose, entry.key)) {
@@ -3234,7 +3333,7 @@ const TextResourceCache = struct {
                 // Keep a small marker for the deferred source. It also gives
                 // property-only resource dictionaries distinct stable storage.
                 .required_resources => if (std.mem.eql(u8, entry.key, "Properties")) .null else entry.value.clone(self.allocator()) catch |err| return self.allocationFailure(err),
-                .resource_properties => unreachable,
+                .resource_properties, .container_properties => unreachable,
                 .property_table => try self.cloneMetadata(reader, entry.value, .property),
                 .property => switch (entry.value) {
                     .obj_ref, .null => entry.value,
@@ -3264,57 +3363,92 @@ const TextResourceCache = struct {
                 if (std.mem.eql(u8, key, field)) break true;
             } else false,
             .required_resources => keepsField(.resources, key),
-            .resource_properties => unreachable,
+            .resource_properties, .container_properties => unreachable,
             .property_table => true,
             .property => std.mem.eql(u8, key, "MCID") or std.mem.eql(u8, key, "ActualText"),
         };
     }
 
     fn resolve(self: *@This(), reader: *const Reader, raw: *const syntax.Object, purpose: Purpose) !syntax.Object {
-        return self.resolveImpl(reader, raw, purpose) catch |original| {
-            const err = self.allocationFailure(original);
-            if (raw.* == .obj_ref and (purpose == .property_table or purpose == .property or purpose == .resource_properties) and
-                (err == error.PdfDecodeWorkingSetTooLarge or err == error.DecodedStreamTooLarge))
-            {
-                // A shared optional object that exceeded a deterministic limit
-                // must not be parsed again for every Form using that resource.
-                self.beginResolution();
-                const key = ObjectKey{ .reference = (@as(u64, raw.obj_ref.id) << 16) | raw.obj_ref.gen, .purpose = purpose };
-                self.objects.put(self.allocator(), key, .invalid) catch |cache_err| return self.allocationFailure(cache_err);
-            }
-            return err;
-        };
-    }
-
-    fn resolveImpl(self: *@This(), reader: *const Reader, raw: *const syntax.Object, purpose: Purpose) !syntax.Object {
         try reader.checkCancellation();
-        if (raw.* != .obj_ref) return raw.*;
-        const key = ObjectKey{ .reference = (@as(u64, raw.obj_ref.id) << 16) | raw.obj_ref.gen, .purpose = purpose };
+        self.prepareScan(reader);
+        if (raw.* != .obj_ref and raw.* != .deferred) return raw.*;
+        const reference = if (raw.* == .obj_ref) raw.obj_ref else raw.deferred.reference;
+        const key = ObjectKey{ .reference = (@as(u64, reference.id) << 16) | reference.gen, .purpose = purpose, .start = if (raw.* == .deferred) raw.deferred.start else 0 };
         if (self.objects.get(key)) |entry| return switch (entry) {
             .object => |value| value,
             .invalid => error.InvalidPdfStructure,
         };
         self.beginResolution();
+        // Reserve before parsing: if the map cannot grow, fail without
+        // repeatedly reading the same optional object for every Form scope.
+        // Parsing and projection do not insert into this map, so both success
+        // and deterministic failure can commit without another allocation.
+        self.objects.ensureUnusedCapacity(self.allocator(), 1) catch |err| return self.allocationFailure(err);
+        return self.resolveUncached(reader, raw, purpose, key) catch |original| {
+            const err = self.allocationFailure(original);
+            if ((purpose == .property_table or purpose == .property or purpose == .resource_properties or purpose == .container_properties) and
+                (err == error.PdfDecodeWorkingSetTooLarge or err == error.DecodedStreamTooLarge or err == error.PdfMetadataWorkLimit))
+            {
+                // A shared optional object that exceeded a deterministic limit
+                // must not be parsed again for every Form using that resource.
+                self.objects.putAssumeCapacity(key, .invalid);
+            }
+            return err;
+        };
+    }
+
+    fn resolveUncached(self: *@This(), reader: *const Reader, raw: *const syntax.Object, purpose: Purpose, key: ObjectKey) !syntax.Object {
+        self.beginResolution();
         var scratch = DecodeBudgetAllocator.initWithCumulativeLimit(self.budget.backing, 0, self.budget.max_live_bytes, self.budget.max_live_bytes *| 4);
-        const context = StructureResolverContext{ .reader = reader, .budget = &scratch };
-        var parsed = StructureResolverContext.resolve(&context, scratch.allocator(), raw) catch |err| switch (err) {
+        const context = StructureResolverContext{ .reader = reader, .budget = &scratch, .scan = &self.scan_control, .frames = &self.frames };
+        const projection: syntax.Projection = switch (purpose) {
+            .resources => .resources,
+            .required_resources => .required_resources,
+            .resource_properties => .resource_properties,
+            .container_properties => .container_properties,
+            .property_table => .property_table,
+            .property => .property,
+        };
+        var parsed = context.resolveProjected(scratch.allocator(), raw, projection) catch |err| switch (err) {
             error.OutOfMemory => {
                 const classified = if (scratch.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else self.allocationFailure(err);
                 self.beginResolution();
                 return classified;
             },
-            error.Canceled, error.PdfDecodeWorkingSetTooLarge, error.DecodedStreamTooLarge => return err,
+            error.Canceled, error.PdfDecodeWorkingSetTooLarge, error.DecodedStreamTooLarge, error.PdfMetadataWorkLimit => return err,
             else => {
-                self.objects.put(self.allocator(), key, .invalid) catch |cache_err| return self.allocationFailure(cache_err);
+                self.objects.putAssumeCapacity(key, .invalid);
                 return error.InvalidPdfStructure;
             },
         };
         defer parsed.deinit(scratch.allocator());
         self.beginResolution();
-        const metadata = if (purpose == .resource_properties) (if (parsed.get("Properties")) |props| props.* else syntax.Object.null) else parsed;
-        var value = try self.cloneMetadata(reader, metadata, if (purpose == .resource_properties) .property_table else purpose);
-        errdefer value.deinit(self.allocator());
-        self.objects.put(self.allocator(), key, .{ .object = value }) catch |err| return self.allocationFailure(err);
+        const resource_object = if (purpose == .container_properties) parsed.get("Resources") else &parsed;
+        const properties_only = purpose == .resource_properties or purpose == .container_properties;
+        var value: syntax.Object = .null;
+        if (properties_only) {
+            if (resource_object) |resources_object| if (resources_object.get("Properties")) |properties| {
+                value = properties.*;
+                @constCast(properties).* = .null;
+            };
+        } else {
+            value = parsed;
+            parsed = .null;
+        }
+        parsed.deinit(scratch.allocator());
+        parsed = .null;
+        if (value != .dict and value != .obj_ref and value != .deferred) {
+            value.deinit(scratch.allocator());
+            value = .null;
+        }
+        errdefer value.deinit(scratch.allocator());
+        // Projection already removed unused fields. Retain its owned graph
+        // directly, avoiding a second copy alongside a decoded source frame.
+        if (scratch.live_bytes > self.budget.max_live_bytes -| self.budget.live_bytes) self.frames.deinit();
+        try self.budget.adoptAllocation(&scratch, scratch.live_bytes);
+        std.debug.assert(scratch.live_bytes == 0);
+        self.objects.putAssumeCapacity(key, .{ .object = value });
         return value;
     }
 
@@ -3328,14 +3462,30 @@ const TextResourceCache = struct {
     fn resources(self: *@This(), reader: *const Reader, raw: *const syntax.Object) !syntax.Object {
         if (raw.* == .obj_ref) {
             const value = try self.resolve(reader, raw, .required_resources);
-            if (value.get("Properties") != null and !self.property_resources.contains(@intFromPtr(value.dict.ptr))) self.property_resources.put(self.allocator(), @intFromPtr(value.dict.ptr), raw.obj_ref) catch |err| return self.allocationFailure(err);
+            try self.rememberPropertySource(value, .{ .reference = raw.obj_ref });
             return value;
         }
         return self.retain(try self.cloneMetadata(reader, raw.*, .resources));
     }
 
+    fn rememberPropertySource(self: *@This(), value: syntax.Object, source: ResourceSource) !void {
+        if (value.get("Properties") != null and !self.property_resources.contains(@intFromPtr(value.dict.ptr)))
+            self.property_resources.put(self.allocator(), @intFromPtr(value.dict.ptr), source) catch |err| return self.allocationFailure(err);
+    }
+
+    fn inheritedResources(self: *@This(), reader: *const Reader, raw: *const syntax.Object, container: syntax.ObjRef) !syntax.Object {
+        if (raw.* == .obj_ref) return self.resources(reader, raw);
+        // The parent projection kept a Properties marker, not its values.
+        // Retain the parent's identity so selected scopes can resolve those
+        // values later without forcing unused or overridden replacements.
+        const value = try self.retain(try self.cloneMetadata(reader, raw.*, .required_resources));
+        try self.rememberPropertySource(value, .{ .reference = container, .container = true });
+        return value;
+    }
+
     fn pageResources(self: *@This(), reader: *const Reader, page: *const syntax.Object) !syntax.Object {
         if (self.page_resources) |value| return value;
+        self.prepareScan(reader);
         if (page.get("Resources")) |raw| {
             self.page_resources = try self.resources(reader, raw);
             return self.page_resources.?;
@@ -3345,11 +3495,13 @@ const TextResourceCache = struct {
         var scoped = reader.*;
         scoped.alloc = scratch.allocator();
         scoped.object_depth_limit = 128;
+        scoped.metadata_scan = &self.scan_control;
+        scoped.metadata_frames = &self.frames;
         var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
         defer encrypted_streams.deinit(scratch.allocator());
         scoped.encrypted_streams = &encrypted_streams;
         scoped.encrypted_stream_generation = 0;
-        self.page_resources = (scoped.findInheritedTextResources(page, self) catch |err| {
+        self.page_resources = (scoped.findInheritedTextResources(page, self, null, 0) catch |err| {
             const classified = if (err == error.OutOfMemory and scratch.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else self.allocationFailure(err);
             self.beginResolution();
             return classified;
@@ -3403,7 +3555,7 @@ const TextResourceCache = struct {
 
     const PropertySource = union(enum) {
         table: syntax.Object,
-        resources: syntax.ObjRef,
+        resources: ResourceSource,
     };
 
     fn propertySource(self: *@This(), resource_object: *const syntax.Object) ?PropertySource {
@@ -3416,9 +3568,9 @@ const TextResourceCache = struct {
     fn sourceEntries(self: *@This(), reader: *const Reader, source: PropertySource) !?[]PropertyEntry {
         return switch (source) {
             .table => |raw| self.entries(reader, &raw),
-            .resources => |ref| blk: {
-                const raw = syntax.Object{ .obj_ref = ref };
-                const table = try self.resolve(reader, &raw, .resource_properties);
+            .resources => |source_resource| blk: {
+                const raw = syntax.Object{ .obj_ref = source_resource.reference };
+                const table = try self.resolve(reader, &raw, if (source_resource.container) .container_properties else .resource_properties);
                 break :blk self.entries(reader, &table);
             },
         };
@@ -3454,24 +3606,114 @@ const TextResourceCache = struct {
         return null;
     }
 
+    fn keyLess(self: *@This(), left: []const u8, right: []const u8) !bool {
+        try self.scan_control.spend(1 +| @min(left.len, right.len));
+        return std.mem.lessThan(u8, left, right);
+    }
+
+    fn entryLess(self: *@This(), left: PropertyEntry, right: PropertyEntry) !bool {
+        return self.keyLess(left.raw.key, right.raw.key);
+    }
+
+    fn siftEntries(self: *@This(), items: []PropertyEntry, initial: usize) !void {
+        var root = initial;
+        while (root < items.len / 2) {
+            var child = root * 2 + 1;
+            if (child + 1 < items.len and try self.entryLess(items[child], items[child + 1])) child += 1;
+            if (!try self.entryLess(items[root], items[child])) return;
+            std.mem.swap(PropertyEntry, &items[root], &items[child]);
+            root = child;
+        }
+    }
+
+    fn heapEntries(self: *@This(), items: []PropertyEntry) !void {
+        // In-place heapsort keeps index memory bounded and allows work and
+        // cancellation checks inside the sort, not just before and after it.
+        var root = items.len / 2;
+        while (root > 0) {
+            root -= 1;
+            try self.siftEntries(items, root);
+        }
+        var end = items.len;
+        while (end > 1) {
+            end -= 1;
+            std.mem.swap(PropertyEntry, &items[0], &items[end]);
+            try self.siftEntries(items[0..end], 0);
+        }
+    }
+
+    fn sortRange(self: *@This(), input: []PropertyEntry, depth: usize) anyerror!void {
+        var items = input;
+        var remaining = depth;
+        while (items.len > 16) {
+            if (remaining == 0) return self.heapEntries(items);
+            remaining -= 1;
+            const middle = items.len / 2;
+            const last = items.len - 1;
+            if (try self.entryLess(items[middle], items[0])) std.mem.swap(PropertyEntry, &items[middle], &items[0]);
+            if (try self.entryLess(items[last], items[0])) std.mem.swap(PropertyEntry, &items[last], &items[0]);
+            if (try self.entryLess(items[last], items[middle])) std.mem.swap(PropertyEntry, &items[last], &items[middle]);
+            const pivot = items[middle].raw.key;
+            var left: usize = 0;
+            var right: usize = last;
+            while (true) {
+                while (left < last and try self.keyLess(items[left].raw.key, pivot)) left += 1;
+                while (right > 0 and try self.keyLess(pivot, items[right].raw.key)) right -= 1;
+                if (left >= right) break;
+                std.mem.swap(PropertyEntry, &items[left], &items[right]);
+                left += 1;
+                right -= 1;
+            }
+            if (left == 0 or left == items.len) return self.heapEntries(items);
+            // Recurse only into the smaller partition: O(log n) stack space.
+            if (left < items.len - left) {
+                try self.sortRange(items[0..left], remaining);
+                items = items[left..];
+            } else {
+                try self.sortRange(items[left..], remaining);
+                items = items[0..left];
+            }
+        }
+        for (1..items.len) |i| {
+            var j = i;
+            while (j > 0 and try self.entryLess(items[j], items[j - 1])) : (j -= 1)
+                std.mem.swap(PropertyEntry, &items[j], &items[j - 1]);
+        }
+    }
+
+    fn sortEntries(self: *@This(), items: []PropertyEntry) !void {
+        if (items.len < 2) return;
+        var ordered = true;
+        for (1..items.len) |i| if (try self.entryLess(items[i], items[i - 1])) {
+            ordered = false;
+            break;
+        };
+        if (ordered) return;
+        var depth: usize = 0;
+        var count = items.len;
+        while (count > 1) : (count /= 2) depth += 2;
+        try self.sortRange(items, depth);
+    }
+
     fn entries(self: *@This(), reader: *const Reader, raw: *const syntax.Object) !?[]PropertyEntry {
         self.beginResolution();
         const value = try self.resolve(reader, raw, .property_table);
         if (value != .dict) return null;
         const id = @intFromPtr(value.dict.ptr);
         if (self.scopes.get(id)) |cached| return cached;
+        self.prepareScan(reader);
+        try self.scan_control.spend(1);
+        // No fallible map growth may remain after allocating and sorting a
+        // shared index. A saturated cache must reject before doing that work.
+        self.scopes.ensureUnusedCapacity(self.allocator(), 1) catch |err| return self.allocationFailure(err);
         const index = self.allocator().alloc(PropertyEntry, value.dict.len) catch |err| return self.allocationFailure(err);
         errdefer self.allocator().free(index);
         for (value.dict, index, 0..) |*entry, *slot, i| {
             if (i % 256 == 0) try reader.checkCancellation();
             slot.* = .{ .raw = entry };
         }
-        std.mem.sort(PropertyEntry, index, {}, struct {
-            fn less(_: void, left: PropertyEntry, right: PropertyEntry) bool {
-                return std.mem.lessThan(u8, left.raw.key, right.raw.key);
-            }
-        }.less);
-        self.scopes.put(self.allocator(), id, index) catch |err| return self.allocationFailure(err);
+        try self.sortEntries(index);
+        self.scopes.putAssumeCapacity(id, index);
         return index;
     }
 
@@ -4961,11 +5203,16 @@ const PageIndexEntry = struct {
 const StructureResolverContext = struct {
     reader: *const Reader,
     budget: *DecodeBudgetAllocator,
+    scan: ?*syntax.ScanControl = null,
+    frames: ?*MetadataObjectStreamCache = null,
     fn root(raw: *const anyopaque, alloc: Allocator) anyerror!syntax.Object {
         const self: *const @This() = @ptrCast(@alignCast(raw));
         var reader = self.reader.*;
         reader.alloc = alloc;
         reader.object_depth_limit = 128;
+        var local_scan = metadataScanControl(self.reader);
+        reader.metadata_scan = self.scan orelse &local_scan;
+        reader.metadata_frames = self.frames;
         // Metadata reads may inspect stream headers or compressed objects, but
         // must not mutate the source Reader's encryption registry/generation
         // through a temporary allocator. Payload reads stay in this scope.
@@ -4979,14 +5226,24 @@ const StructureResolverContext = struct {
     }
     fn resolve(raw: *const anyopaque, alloc: Allocator, value: *const syntax.Object) anyerror!syntax.Object {
         const self: *const @This() = @ptrCast(@alignCast(raw));
+        return self.resolveProjected(alloc, value, .full);
+    }
+    fn resolveProjected(self: *const @This(), alloc: Allocator, value: *const syntax.Object, projection: syntax.Projection) anyerror!syntax.Object {
         var reader = self.reader.*;
         reader.alloc = alloc;
         reader.object_depth_limit = 128;
+        var local_scan = metadataScanControl(self.reader);
+        reader.metadata_scan = self.scan orelse &local_scan;
+        reader.metadata_frames = self.frames;
         var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
         defer encrypted_streams.deinit(alloc);
         reader.encrypted_streams = &encrypted_streams;
         reader.encrypted_stream_generation = 0;
-        return reader.resolveValue(value);
+        return switch (value.*) {
+            .obj_ref => reader.readIndirectObjectProjected(value.obj_ref, projection),
+            .deferred => reader.readDeferredObjectProjected(value.deferred, projection),
+            else => value.clone(alloc),
+        };
     }
     fn check(raw: *const anyopaque) anyerror!void {
         const self: *const @This() = @ptrCast(@alignCast(raw));
@@ -5006,6 +5263,8 @@ const StructureMetadataCache = struct {
 
 pub const Reader = struct {
     object_depth_limit: usize = std.math.maxInt(usize),
+    metadata_scan: ?*syntax.ScanControl = null,
+    metadata_frames: ?*MetadataObjectStreamCache = null,
     structure_cache: ?*StructureMetadataCache = null,
     alloc: Allocator,
     bytes: []const u8,
@@ -5445,18 +5704,26 @@ pub const Reader = struct {
     }
 
     pub fn readIndirectObject(self: *const Reader, ptr: syntax.ObjRef) anyerror!syntax.Object {
+        return self.readIndirectObjectProjected(ptr, .full);
+    }
+
+    fn readIndirectObjectProjected(self: *const Reader, ptr: syntax.ObjRef, projection: syntax.Projection) anyerror!syntax.Object {
         const entry = self.findXref(ptr) orelse return error.ObjectNotFound;
         if (!entry.in_use) return error.ObjectNotInUse;
         if (entry.compressed_obj_stream_id) |obj_stream_id| {
-            return try self.readCompressedObject(ptr, obj_stream_id, entry.compressed_index orelse return error.InvalidObjectStream);
+            return try self.readCompressedObject(ptr, obj_stream_id, entry.compressed_index orelse return error.InvalidObjectStream, projection, null);
         }
         if (entry.offset >= self.bytes.len) return error.InvalidObjectOffset;
+        if (projection == .required_resources or projection == .resource_container)
+            if (self.metadata_frames) |frames| frames.deinit();
 
         var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[entry.offset..], entry.offset);
         scanner.max_object_depth = self.object_depth_limit;
+        scanner.source_ref = ptr;
+        scanner.control = self.metadata_scan;
         defer scanner.deinit();
 
-        var parsed = try scanner.readObject();
+        var parsed = try scanner.readObjectProjected(projection);
         errdefer parsed.deinit(self.alloc);
         if (parsed != .obj_def) return error.ExpectedIndirectObject;
         if (parsed.obj_def.ptr.id != ptr.id or parsed.obj_def.ptr.gen != ptr.gen) return error.ObjectPointerMismatch;
@@ -5471,6 +5738,23 @@ pub const Reader = struct {
         errdefer decrypted.deinit(self.alloc);
         if (self.encryption != null) try self.decryptObject(&decrypted, ptr);
         return decrypted;
+    }
+
+    fn readDeferredObjectProjected(self: *const Reader, location: syntax.DeferredValue, projection: syntax.Projection) !syntax.Object {
+        const entry = self.findXref(location.reference) orelse return error.ObjectNotFound;
+        if (!entry.in_use) return error.ObjectNotInUse;
+        if (entry.compressed_obj_stream_id) |stream_id|
+            return self.readCompressedObject(location.reference, stream_id, entry.compressed_index orelse return error.InvalidObjectStream, projection, location);
+        if (location.start < entry.offset or location.start >= location.end or location.end > self.bytes.len) return error.InvalidObjectOffset;
+        var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[location.start..location.end], location.start);
+        scanner.max_object_depth = self.object_depth_limit;
+        scanner.source_ref = location.reference;
+        scanner.control = self.metadata_scan;
+        defer scanner.deinit();
+        var value = try scanner.readObjectProjected(projection);
+        errdefer value.deinit(self.alloc);
+        if (self.encryption != null) try self.decryptObject(&value, location.reference);
+        return value;
     }
 
     pub fn readRawStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
@@ -5929,20 +6213,21 @@ pub const Reader = struct {
         const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
         defer self.alloc.free(decoded_content);
         defer self.alloc.free(stream_ranges.?);
-        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
-        defer {
-            for (fonts) |*font| font.deinit(self.alloc);
-            self.alloc.free(fonts);
-        }
-        const gstates = try self.collectPageTextExtGStatesForContentAlloc(&page, decoded_content);
-        defer {
-            for (gstates) |*gstate| gstate.deinit(self.alloc);
-            self.alloc.free(gstates);
-        }
         var resource_live_budget = DecodeBudgetAllocator.init(self.alloc, 0, self.decode_limits.max_working_set_bytes);
         var resource_budget = DecodeBudgetAllocator.initWithCumulativeLimit(resource_live_budget.allocator(), 0, self.decode_limits.max_working_set_bytes, self.decode_limits.max_working_set_bytes *| 4);
         var text_resources = TextResourceCache{ .budget = &resource_budget, .live_budget = &resource_live_budget };
         defer text_resources.deinit();
+        const resources = try text_resources.pageResources(self, &page);
+        const fonts = try self.collectFontsFromResourcesAlloc(&resources, decoded_content);
+        defer {
+            for (fonts) |*font| font.deinit(self.alloc);
+            self.alloc.free(fonts);
+        }
+        const gstates = try self.collectTextExtGStatesFromResourcesAlloc(&resources, decoded_content);
+        defer {
+            for (gstates) |*gstate| gstate.deinit(self.alloc);
+            self.alloc.free(gstates);
+        }
         const forms = try self.collectPageTextFormsForContentAlloc(&page, decoded_content, &text_resources);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
@@ -5953,7 +6238,7 @@ pub const Reader = struct {
             for (text_properties) |*property| property.deinit(self.alloc);
             self.alloc.free(text_properties);
         }
-        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        const color_spaces = try self.collectColorSpacesFromResourcesAlloc(&resources, decoded_content);
         defer {
             for (color_spaces) |*color_space| color_space.deinit(self.alloc);
             self.alloc.free(color_spaces);
@@ -6923,7 +7208,7 @@ pub const Reader = struct {
 
         for (1..count + 1) |page_num| {
             const text = self.extractPageTextAlloc(page_num) catch |err| switch (err) {
-                std.mem.Allocator.Error.OutOfMemory => return err,
+                std.mem.Allocator.Error.OutOfMemory, error.Canceled => return err,
                 else => continue,
             };
             defer self.alloc.free(text);
@@ -7045,58 +7330,83 @@ pub const Reader = struct {
         return null;
     }
 
-    fn readCompressedObject(self: *const Reader, ptr: syntax.ObjRef, obj_stream_id: u32, obj_index: usize) anyerror!syntax.Object {
+    fn readCompressedObject(self: *const Reader, ptr: syntax.ObjRef, obj_stream_id: u32, obj_index: usize, projection: syntax.Projection, location: ?syntax.DeferredValue) anyerror!syntax.Object {
+        if (self.metadata_frames) |cache| if (cache.frame) |*frame| {
+            if (frame.id == obj_stream_id) {
+                if (obj_index >= frame.entries.len) return error.ObjectNotFound;
+                return self.parseCompressedObject(frame.bytes, frame.first, frame.entries[obj_index], ptr, projection, location);
+            }
+        };
         var obj_stream = try self.readIndirectObject(.{ .id = obj_stream_id, .gen = 0 });
         defer obj_stream.deinit(self.alloc);
         if (obj_stream != .stream) return error.ExpectedObjectStream;
-
         const ty = obj_stream.get("Type") orelse return error.ExpectedObjectStream;
-        if (!std.mem.eql(u8, ty.asName() orelse return error.ExpectedObjectStream, "ObjStm")) {
-            return error.ExpectedObjectStream;
-        }
-
+        if (!std.mem.eql(u8, ty.asName() orelse return error.ExpectedObjectStream, "ObjStm")) return error.ExpectedObjectStream;
         const first_i = (obj_stream.get("First") orelse return error.InvalidObjectStream).asInteger() orelse return error.InvalidObjectStream;
         const count_i = (obj_stream.get("N") orelse return error.InvalidObjectStream).asInteger() orelse return error.InvalidObjectStream;
         if (first_i < 0 or count_i < 0) return error.InvalidObjectStream;
-        const first: usize = @intCast(first_i);
-        const count: usize = @intCast(count_i);
+        const first = std.math.cast(usize, first_i) orelse return error.InvalidObjectStream;
+        const count = std.math.cast(usize, count_i) orelse return error.InvalidObjectStream;
         if (obj_index >= count) return error.ObjectNotFound;
-
+        const keep_frame = switch (projection) {
+            .resource_properties, .container_properties, .property_table, .property => true,
+            else => location != null,
+        };
+        if (keep_frame) if (self.metadata_frames) |cache| {
+            const frame = try cache.load(self, obj_stream_id, &obj_stream, first, count);
+            return self.parseCompressedObject(frame.bytes, frame.first, frame.entries[obj_index], ptr, projection, location);
+        };
+        if (self.metadata_frames) |frames| frames.deinit();
         const decoded = try self.readDecodedStreamData(&obj_stream);
         defer self.alloc.free(decoded);
+        const entry = try self.scanObjectStreamIndex(decoded, first, count, obj_index, null);
+        return self.parseCompressedObject(decoded, first, entry, ptr, projection, location);
+    }
+
+    fn scanObjectStreamIndex(self: *const Reader, decoded: []const u8, first: usize, count: usize, selected: usize, output: ?[]MetadataObjectStreamCache.Entry) !MetadataObjectStreamCache.Entry {
         if (first > decoded.len) return error.InvalidObjectStream;
-
-        var header_scanner = syntax.Scanner.init(self.alloc, decoded[0..first]);
-        header_scanner.max_object_depth = self.object_depth_limit;
-        defer header_scanner.deinit();
-
-        var found_id: ?u32 = null;
-        var found_offset: ?usize = null;
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            var id_obj = try header_scanner.readObject();
-            defer id_obj.deinit(self.alloc);
-            var off_obj = try header_scanner.readObject();
-            defer off_obj.deinit(self.alloc);
-
-            const id_i = id_obj.asInteger() orelse return error.InvalidObjectStream;
-            const off_i = off_obj.asInteger() orelse return error.InvalidObjectStream;
-            if (id_i < 0 or off_i < 0) return error.InvalidObjectStream;
-            if (i == obj_index) {
-                found_id = @intCast(id_i);
-                found_offset = @intCast(off_i);
+        var scanner = syntax.Scanner.init(self.alloc, decoded[0..first]);
+        scanner.control = self.metadata_scan;
+        defer scanner.deinit();
+        var result: ?MetadataObjectStreamCache.Entry = null;
+        var previous_offset: ?usize = null;
+        for (0..count) |i| {
+            if (i % 256 == 0) try self.checkCancellation();
+            var id_token = try scanner.readLexeme();
+            defer syntax.Scanner.freeLexeme(self.alloc, &id_token);
+            var offset_token = try scanner.readLexeme();
+            defer syntax.Scanner.freeLexeme(self.alloc, &offset_token);
+            if (id_token != .integer or offset_token != .integer) return error.InvalidObjectStream;
+            const id_i = id_token.integer;
+            const off_i = offset_token.integer;
+            if (id_i < 0 or id_i > std.math.maxInt(u32) or off_i < 0) return error.InvalidObjectStream;
+            const offset = std.math.cast(usize, off_i) orelse return error.InvalidObjectStream;
+            if (offset >= decoded.len - first) return error.InvalidObjectStream;
+            if (previous_offset) |previous| if (offset <= previous) return error.InvalidObjectStream;
+            previous_offset = offset;
+            const entry = MetadataObjectStreamCache.Entry{ .id = @intCast(id_i), .start = offset, .end = decoded.len - first };
+            if (output) |entries| {
+                entries[i] = entry;
+                if (i > 0) entries[i - 1].end = offset;
             }
+            if (i == selected) result = entry else if (i == selected + 1) result.?.end = offset;
         }
+        return result orelse error.ObjectNotFound;
+    }
 
-        const target_id = found_id orelse return error.ObjectNotFound;
-        const target_offset = found_offset orelse return error.ObjectNotFound;
-        if (target_id != ptr.id) return error.ObjectPointerMismatch;
-        if (first + target_offset > decoded.len) return error.InvalidObjectStream;
-
-        var obj_scanner = syntax.Scanner.init(self.alloc, decoded[first + target_offset ..]);
-        obj_scanner.max_object_depth = self.object_depth_limit;
-        defer obj_scanner.deinit();
-        return try obj_scanner.readObject();
+    fn parseCompressedObject(self: *const Reader, decoded: []const u8, first: usize, entry: MetadataObjectStreamCache.Entry, ptr: syntax.ObjRef, projection: syntax.Projection, location: ?syntax.DeferredValue) !syntax.Object {
+        if (entry.id != ptr.id) return error.ObjectPointerMismatch;
+        const bytes = decoded[first + entry.start .. first + entry.end];
+        const start = if (location) |value| value.start else 0;
+        const end = if (location) |value| value.end else bytes.len;
+        if (start >= end or end > bytes.len) return error.InvalidObjectOffset;
+        var scanner = syntax.Scanner.initWithOffset(self.alloc, bytes[start..end], start);
+        scanner.source_ref = ptr;
+        scanner.control = self.metadata_scan;
+        scanner.allow_stream = false;
+        scanner.max_object_depth = self.object_depth_limit;
+        defer scanner.deinit();
+        return scanner.readObjectProjected(projection);
     }
 
     fn resolveValue(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
@@ -8750,7 +9060,14 @@ pub const Reader = struct {
             for (records) |*record| record.deinit(self.alloc);
             self.alloc.free(records);
         }
-        if (index == null) if (source) |property_source| try cache.deferBindings(self, property_source, records);
+        if (index == null and !dense_direct) if (source) |property_source| {
+            cache.deferBindings(self, property_source, records) catch |err| {
+                // Binding storage is optional metadata too. Records already
+                // contain invalid values, diagnosed only if a scope selects
+                // them. A known direct-table failure needs no deferred retry.
+                _ = try cache.selectedFailure(err);
+            };
+        };
         return records;
     }
 
@@ -12685,13 +13002,14 @@ pub const Reader = struct {
 
     // Preserve an inherited resource reference so optional property metadata
     // can be resolved independently, only when a selected marked scope needs it.
-    fn findInheritedTextResources(self: *const Reader, page: *const syntax.Object, cache: *TextResourceCache) !?syntax.Object {
+    fn findInheritedTextResources(self: *const Reader, page: *const syntax.Object, cache: *TextResourceCache, container: ?syntax.ObjRef, depth: usize) !?syntax.Object {
         try self.checkCancellation();
-        if (page.get("Resources")) |value| return try cache.resources(self, value);
+        if (depth > 128) return error.InvalidPageTree;
+        if (page.get("Resources")) |value| return if (container) |reference| try cache.inheritedResources(self, value, reference) else try cache.resources(self, value);
         if (page.get("Parent")) |parent| {
-            var resolved_parent = try self.resolveValue(parent);
+            var resolved_parent = if (parent.* == .obj_ref) try self.readIndirectObjectProjected(parent.obj_ref, .resource_container) else try self.resolveValue(parent);
             defer resolved_parent.deinit(self.alloc);
-            if (resolved_parent == .dict) return self.findInheritedTextResources(&resolved_parent, cache);
+            if (resolved_parent == .dict) return self.findInheritedTextResources(&resolved_parent, cache, if (parent.* == .obj_ref) parent.obj_ref else null, depth + 1);
         }
         return null;
     }
@@ -36176,9 +36494,32 @@ fn buildCompressedPropertyMetadataTestPdfAlloc(a: Allocator, count: usize, priva
     return buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a, count, private_bytes, overridden, if (table_in_stream) .table else .dictionary);
 }
 
-fn buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a: Allocator, count: usize, private_bytes: usize, overridden: bool, location: enum { dictionary, table, resources }) ![]u8 {
-    const table_in_stream = location == .table;
-    const resource_in_stream = location == .resources;
+const PropertyMetadataLocation = enum { dictionary, table, resources, parent };
+
+const CompressedPropertyMetadataFixture = struct {
+    count: usize = 1,
+    private_bytes: usize,
+    overridden: bool = false,
+    location: PropertyMetadataLocation = .dictionary,
+    reference_properties: bool = true,
+    flate: bool = true,
+    actual_text_payload: bool = false,
+    selected_name: ?[]const u8 = null,
+    additional_properties: ?[]const u8 = null,
+    payload: enum { automatic, literal, escaped, sequence, array, integer, integer_pair, dictionary, nested } = .automatic,
+};
+
+fn buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a: Allocator, count: usize, private_bytes: usize, overridden: bool, location: PropertyMetadataLocation) ![]u8 {
+    return buildCompressedPropertyMetadataFixtureAlloc(a, .{ .count = count, .private_bytes = private_bytes, .overridden = overridden, .location = location });
+}
+
+fn buildCompressedPropertyMetadataFixtureAlloc(a: Allocator, fixture: CompressedPropertyMetadataFixture) ![]u8 {
+    const count = fixture.count;
+    const private_bytes = fixture.private_bytes;
+    const overridden = fixture.overridden;
+    const table_in_stream = fixture.location == .table;
+    const parent_resources = fixture.location == .parent;
+    const resource_in_stream = fixture.location == .resources or parent_resources;
     std.debug.assert(!resource_in_stream or count == 1);
     std.debug.assert(!table_in_stream or count == 1);
     var content = std.ArrayList(u8).empty;
@@ -36187,7 +36528,12 @@ fn buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a: Allocator, count: us
     defer properties.deinit(a);
     if (overridden) try content.appendSlice(a, "/Span << /ActualText (Outer) >> BDC ");
     for (0..count) |i| {
-        try content.print(a, "/Span /Tag{d} BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC ", .{i});
+        if (fixture.reference_properties) {
+            if (fixture.selected_name) |name|
+                try content.print(a, "/Span /{s} BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC ", .{name})
+            else
+                try content.print(a, "/Span /Tag{d} BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC ", .{i});
+        } else try content.appendSlice(a, "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET ");
         try properties.print(a, "/Tag{d} {d} 0 R ", .{ i, 6 + count + i });
     }
     if (overridden) try content.appendSlice(a, "EMC");
@@ -36195,12 +36541,14 @@ fn buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a: Allocator, count: us
     defer a.free(table);
     const resource_source = if (resource_in_stream) try a.dupe(u8, "7 0 R") else try std.fmt.allocPrint(a, "<< /Font << /F1 5 0 R >> /Properties {s} >>", .{table});
     defer a.free(resource_source);
-    const page = try std.fmt.allocPrint(a, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources {s} /Contents 4 0 R >>\nendobj\n", .{resource_source});
+    const resource_field = if (parent_resources) try a.dupe(u8, "") else try std.fmt.allocPrint(a, "/Resources {s}", .{resource_source});
+    defer a.free(resource_field);
+    const page = try std.fmt.allocPrint(a, "3 0 obj\n<< /Type /Page /Parent {d} 0 R /MediaBox [0 0 400 300] {s} /Contents 4 0 R >>\nendobj\n", .{ @as(usize, if (parent_resources) 7 else 2), resource_field });
     defer a.free(page);
     const paint = try std.fmt.allocPrint(a, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.items.len, content.items });
     defer a.free(paint);
     const fixed = [_][]const u8{
-        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        if (parent_resources) "1 0 obj\n<< /Type /Catalog /Pages 7 0 R >>\nendobj\n" else "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
         page,
         paint,
@@ -36220,6 +36568,9 @@ fn buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a: Allocator, count: us
     const padding = try a.alloc(u8, private_bytes);
     defer a.free(padding);
     @memset(padding, 'X');
+    if (fixture.payload == .sequence) for (padding, 0..) |*byte, i| {
+        byte.* = if (i % 2 == 0) '0' else ' ';
+    };
     for (0..count) |i| {
         const header = try std.fmt.allocPrint(a, "{d} 0 ", .{6 + count + i});
         defer a.free(header);
@@ -36227,18 +36578,41 @@ fn buildCompressedPropertyMetadataAtLocationTestPdfAlloc(a: Allocator, count: us
         defer compressed.deinit();
         var history: [std.compress.flate.max_window_len]u8 = undefined;
         var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);
-        try compressor.writer.writeAll(header);
-        if (table_in_stream) try compressor.writer.writeAll("<< /Tag0 ");
-        if (resource_in_stream) try compressor.writer.writeAll("<< /Font << /F1 5 0 R >> /Properties << /Tag0 ");
-        try compressor.writer.writeAll(if (resource_in_stream) "<< /ActualText (" else "<< /ActualText (Ignored) /Private (");
-        try compressor.writer.writeAll(padding);
-        try compressor.writer.writeAll(") >>");
-        if (table_in_stream) try compressor.writer.writeAll(" >>");
-        if (resource_in_stream) try compressor.writer.writeAll(" >> >>");
-        try compressor.finish();
+        var raw = try std.Io.Writer.Allocating.initCapacity(a, 256);
+        defer raw.deinit();
+        const writer = if (fixture.flate) &compressor.writer else &raw.writer;
+        try writer.writeAll(header);
+        if (table_in_stream) try writer.writeAll("<< /Tag0 ");
+        if (parent_resources) try writer.writeAll("<< /Type /Pages /Count 1 /Kids [3 0 R] /Resources ");
+        if (resource_in_stream) try writer.writeAll("<< /Font << /F1 5 0 R >> /Properties << /Tag0 ");
+        try writer.writeAll(if (fixture.actual_text_payload or (resource_in_stream and fixture.payload == .automatic)) "<< /ActualText " else "<< /ActualText (Ignored) /Private ");
+        try writer.writeAll(switch (fixture.payload) {
+            .automatic, .literal => "(",
+            .escaped => "(\\n",
+            .sequence => "[",
+            .array => "[(",
+            .integer => "[0 (",
+            .integer_pair => "[0 1 (",
+            .dictionary => "[<< >> (",
+            .nested => "[<< /Deep [(",
+        });
+        try writer.writeAll(padding);
+        try writer.writeAll(switch (fixture.payload) {
+            .automatic, .literal, .escaped => ")",
+            .sequence => "]",
+            .array, .integer, .integer_pair, .dictionary => ")]",
+            .nested => ")] >>]",
+        });
+        try writer.writeAll(" >>");
+        if (fixture.additional_properties) |additional| try writer.writeAll(additional);
+        if (table_in_stream) try writer.writeAll(" >>");
+        if (resource_in_stream) try writer.writeAll(" >> >>");
+        if (parent_resources) try writer.writeAll(" >>");
+        if (fixture.flate) try compressor.finish();
+        const encoded = if (fixture.flate) compressed.written() else raw.written();
         offsets[6 + i] = out.items.len;
-        try out.print(a, "{d} 0 obj\n<< /Type /ObjStm /N 1 /First {d} /Filter /FlateDecode /Length {d} >>\nstream\n", .{ 6 + i, header.len, compressed.written().len });
-        try out.appendSlice(a, compressed.written());
+        try out.print(a, "{d} 0 obj\n<< /Type /ObjStm /N 1 /First {d} {s}/Length {d} >>\nstream\n", .{ 6 + i, header.len, if (fixture.flate) "/Filter /FlateDecode " else "", encoded.len });
+        try out.appendSlice(a, encoded);
         try out.appendSlice(a, "\nendstream\nendobj\n");
     }
     offsets[xref_id] = out.items.len;
@@ -36437,7 +36811,7 @@ test "reader property metadata property-only resource identities remain distinct
     defer a.free(sample);
     var reader = try Reader.init(a, sample);
     defer reader.deinit();
-    try std.testing.checkAllAllocationFailures(a, exerciseDistinctPropertyResources, .{&reader});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseDistinctPropertyResources, .{&reader});
 }
 
 test "reader property metadata inherited resource references preserve lazy scope resolution" {
@@ -36478,10 +36852,12 @@ test "reader property metadata limit failures are memoized across scopes" {
     var cache = TextResourceCache{ .budget = &budget };
     defer cache.deinit();
     const raw = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
-    try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.resolve(&reader, &raw, .property_table));
-    try std.testing.expectEqual(@as(usize, 1), cache.objects.count());
+    try std.testing.expect((try cache.property(&reader, &raw, "Tag")).invalid);
+    // Indexing succeeds without materializing the oversized direct value;
+    // selecting it records a deterministic failure independently of siblings.
+    try std.testing.expectEqual(@as(usize, 2), cache.objects.count());
     const retained = budget.cumulative_growth_bytes;
-    for (0..512) |_| try std.testing.expectError(error.InvalidPdfStructure, cache.resolve(&reader, &raw, .property_table));
+    for (0..512) |_| try std.testing.expect((try cache.property(&reader, &raw, "Tag")).invalid);
     try std.testing.expectEqual(retained, budget.cumulative_growth_bytes);
 }
 
@@ -36550,5 +36926,659 @@ test "reader property metadata recovered quotas preserve caller OOM through both
     defer a.free(sample);
     inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| inline for (.{ false, true }) |analysis_api| {
         try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseQuotaRecoveryAllocations, .{ sample, policy, analysis_api });
+    };
+}
+
+test "reader lookahead payloads preserve native and selected text within resource limits" {
+    const a = std.testing.allocator;
+    inline for (.{ .literal, .escaped, .sequence, .array, .integer, .integer_pair, .dictionary, .nested }) |payload| {
+        inline for (.{ .unused, .selected, .overridden }) |selection| {
+            const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{
+                .private_bytes = 55 * 1024,
+                .location = .resources,
+                .payload = payload,
+                .reference_properties = selection != .unused,
+                .overridden = selection == .overridden,
+            });
+            defer a.free(sample);
+            var caller = DecodeBudgetAllocator.init(a, 0, 2 * 1024 * 1024);
+            const alloc = caller.allocator();
+            {
+                var reader = try Reader.initWithDecodeLimits(alloc, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+                defer reader.deinit();
+                inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                    reader.setTextExtractionPolicy(policy);
+                    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+                    defer analysis.deinit(alloc);
+                    const plain = try reader.extractPlainTextAlloc();
+                    defer alloc.free(plain);
+                    try std.testing.expectEqualStrings(switch (selection) {
+                        .unused => "SOURCE\n",
+                        .selected => "Ignored\n",
+                        .overridden => "Outer\n",
+                        else => unreachable,
+                    }, analysis.text);
+                    try std.testing.expectEqualStrings(analysis.text, plain);
+                    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), caller.live_bytes);
+            try std.testing.expect(!caller.limit_exceeded);
+        }
+    }
+}
+
+test "reader saturated object cache rejects before parsing and preserves retry semantics" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 512);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const object = try std.fmt.allocPrint(a, "11 0 obj\n<< /Tag << /ActualText (Label) /Private ({s}) >> >>\nendobj\n", .{padding});
+    defer a.free(object);
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{object} });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 64 * 1024 else 128 * 1024);
+        var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, if (limit_live) 128 * 1024 else 64 * 1024, 512 * 1024);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        // Fill the current map to its growth boundary, with enough remaining
+        // memory for parsing the object but not for doubling the map.
+        for (0..12) |i| try cache.objects.put(cache.allocator(), .{ .reference = (100 + i) << 16, .purpose = .property }, .invalid);
+        var filler: ?[]u8 = try cache.allocator().alloc(u8, @min(retained.max_live_bytes, live.max_live_bytes) - retained.live_bytes - 1536);
+        defer if (filler) |bytes| cache.allocator().free(bytes);
+        const raw = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
+        const before = live.cumulative_growth_bytes;
+        for (0..512) |_| try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.resolve(&reader, &raw, .property_table));
+        try std.testing.expectEqual(before, live.cumulative_growth_bytes);
+        try std.testing.expectEqual(@as(usize, 12), cache.objects.count());
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+
+        cache.allocator().free(filler.?);
+        filler = null;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, cache.resolve(&reader, &raw, .property_table));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 12), cache.objects.count());
+        live.backing = a;
+        const value = try cache.resolve(&reader, &raw, .property_table);
+        try std.testing.expect(value.get("Tag").?.* == .deferred);
+        try std.testing.expectEqual(@as(usize, 13), cache.objects.count());
+        const selected = try cache.property(&reader, &raw, "Tag");
+        try std.testing.expectEqualStrings("Label", selected.actual_text.?.string);
+        try std.testing.expectEqual(@as(usize, 14), cache.objects.count());
+        const cached = live.cumulative_growth_bytes;
+        _ = try cache.property(&reader, &raw, "Tag");
+        try std.testing.expectEqual(cached, live.cumulative_growth_bytes);
+    }
+}
+
+test "reader inherited direct properties skip large opaque payloads during metadata parsing" {
+    const a = std.testing.allocator;
+    inline for (.{ .escaped, .sequence }) |payload| inline for (.{ false, true }) |overridden| {
+        const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{
+            .private_bytes = 55 * 1024,
+            .location = .parent,
+            .payload = payload,
+            .overridden = overridden,
+        });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const text = try reader.extractPlainTextAlloc();
+            defer a.free(text);
+            try std.testing.expectEqualStrings(if (overridden) "Outer\n" else "Ignored\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, text);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    };
+}
+
+fn buildObjectStreamBoundaryTestPdfAlloc(a: Allocator, objects: []const []const u8, header_override: ?[]const u8) ![]u8 {
+    var header = std.ArrayList(u8).empty;
+    defer header.deinit(a);
+    var object_offset: usize = 0;
+    for (objects, 0..) |object, i| {
+        try header.print(a, "{d} {d} ", .{ 7 + i, object_offset });
+        object_offset += object.len + 1;
+    }
+    const header_bytes = header_override orelse header.items;
+    var compressed = try std.Io.Writer.Allocating.initCapacity(a, 256);
+    defer compressed.deinit();
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);
+    try compressor.writer.writeAll(header_bytes);
+    for (objects) |object| {
+        try compressor.writer.writeAll(object);
+        try compressor.writer.writeByte(' ');
+    }
+    try compressor.finish();
+    const content = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET";
+    const paint = try std.fmt.allocPrint(a, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ content.len, content });
+    defer a.free(paint);
+    const stream = try std.fmt.allocPrint(a, "<< /Type /ObjStm /N {d} /First {d} /Filter /FlateDecode /Length {d} >>\nstream\n{s}\nendstream", .{ objects.len, header_bytes.len, compressed.written().len, compressed.written() });
+    defer a.free(stream);
+    const fixed = [_][]const u8{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources 7 0 R /Contents 4 0 R >>",
+        paint,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream,
+    };
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "%PDF-1.7\n");
+    var offsets: [7]usize = @splat(0);
+    for (fixed, 1..) |object, id| {
+        offsets[id] = out.items.len;
+        try out.print(a, "{d} 0 obj\n{s}\nendobj\n", .{ id, object });
+    }
+    const xref_id = 7 + objects.len;
+    const xref = out.items.len;
+    try out.print(a, "{d} 0 obj\n<< /Type /XRef /Size {d} /Root 1 0 R /W [1 4 2] /Length {d} >>\nstream\n", .{ xref_id, xref_id + 1, (xref_id + 1) * 7 });
+    for (0..xref_id + 1) |id| {
+        var record: [7]u8 = undefined;
+        record[0] = if (id == 0) 0 else if (id < 7 or id == xref_id) 1 else 2;
+        std.mem.writeInt(u32, record[1..5], @intCast(if (id == xref_id) xref else if (id < 7) offsets[id] else 6), .big);
+        std.mem.writeInt(u16, record[5..7], @intCast(if (id == 0) 65535 else if (id < 7 or id == xref_id) 0 else id - 7), .big);
+        try out.appendSlice(a, &record);
+    }
+    try out.print(a, "\nendstream\nendobj\nstartxref\n{d}\n%%EOF\n", .{xref});
+    return out.toOwnedSlice(a);
+}
+
+test "reader compressed object lookahead never materializes adjacent payloads" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 63 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'A');
+    inline for (.{ "(\\n{s})", "/{s}", "<{s}>", "[({s})]" }) |format| {
+        const next = try std.fmt.allocPrint(a, format, .{padding});
+        defer a.free(next);
+        const sample = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{ "<< /Font << /F1 5 0 R >> >>", next }, null);
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("SOURCE\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+        // The last object remains independently readable under the same limits.
+        var last = try reader.readIndirectObject(.{ .id = 8, .gen = 0 });
+        defer last.deinit(a);
+    }
+}
+
+test "reader validates compressed object boundaries before parsing" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "7 0 8 0 ", "7 1 8 0 ", "7 0 8 999999 ", "4294967296 0 8 4 ", "7 0 /Bad 4 " }) |header| {
+        const sample = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{ "<< >>", "null" }, header);
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        try std.testing.expectError(error.InvalidObjectStream, reader.readIndirectObject(.{ .id = 7, .gen = 0 }));
+    }
+    const sample = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{ "[ 1", "]" }, null);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.UnexpectedEof, reader.readIndirectObject(.{ .id = 7, .gen = 0 }));
+    const ordered = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{ "null", "42", "true" }, null);
+    defer a.free(ordered);
+    var ordered_reader = try Reader.init(a, ordered);
+    defer ordered_reader.deinit();
+    var middle = try ordered_reader.readIndirectObject(.{ .id = 8, .gen = 0 });
+    defer middle.deinit(a);
+    try std.testing.expectEqual(@as(i64, 42), middle.integer);
+    var last = try ordered_reader.readIndirectObject(.{ .id = 9, .gen = 0 });
+    defer last.deinit(a);
+    try std.testing.expect(last.boolean);
+}
+
+test "reader inherited direct replacements remain deferred until selected" {
+    const a = std.testing.allocator;
+    inline for (.{ .unused, .selected, .overridden }) |selection| {
+        const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{
+            .private_bytes = 63 * 1024,
+            .location = .parent,
+            .payload = .escaped,
+            .actual_text_payload = true,
+            .reference_properties = selection != .unused,
+            .overridden = selection == .overridden,
+        });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 128 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (selection == .overridden) "Outer\n" else "SOURCE\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(selection == .selected, analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader saturated property index cache rejects before allocating and sorting" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "" });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const fields = try a.alloc(syntax.DictEntry, 512);
+    var initialized: usize = 0;
+    defer {
+        for (fields[0..initialized]) |entry| a.free(entry.key);
+        a.free(fields);
+    }
+    for (fields, 0..) |*field, i| {
+        field.* = .{ .key = try std.fmt.allocPrint(a, "Tag{d:0>4}", .{511 - i}), .value = .null };
+        initialized += 1;
+    }
+    const raw = syntax.Object{ .dict = fields };
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 64 * 1024 else 128 * 1024);
+        var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, if (limit_live) 128 * 1024 else 64 * 1024, 4 * 128 * 1024);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        for (0..12) |i| try cache.scopes.put(cache.allocator(), 100 + i, &.{});
+        const index_bytes = fields.len * @sizeOf(TextResourceCache.PropertyEntry);
+        var filler: ?[]u8 = try cache.allocator().alloc(u8, @min(retained.max_live_bytes, live.max_live_bytes) - retained.live_bytes - index_bytes - 128);
+        defer if (filler) |bytes| cache.allocator().free(bytes);
+        // Leave room for the index, but not for both it and map growth.
+        // Previously every request allocated and sorted before failing to put.
+        const initial = live.cumulative_growth_bytes;
+        try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.entries(&reader, &raw));
+        // Reserving the small map may succeed once, leaving too little room
+        // for the index. No index allocation or sorting may have occurred.
+        try std.testing.expect(live.cumulative_growth_bytes - initial < index_bytes);
+        const before = live.cumulative_growth_bytes;
+        for (0..512) |_| try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.entries(&reader, &raw));
+        try std.testing.expectEqual(before, live.cumulative_growth_bytes);
+        try std.testing.expectEqual(@as(usize, 12), cache.scopes.count());
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+        cache.allocator().free(filler.?);
+        filler = null;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, cache.entries(&reader, &raw));
+        try std.testing.expect(failing.has_induced_failure);
+        live.backing = a;
+        const index = (try cache.entries(&reader, &raw)).?;
+        try std.testing.expectEqualStrings("Tag0000", index[0].raw.key);
+        try std.testing.expectEqualStrings("Tag0511", index[index.len - 1].raw.key);
+        const cached = live.cumulative_growth_bytes;
+        _ = try cache.entries(&reader, &raw);
+        try std.testing.expectEqual(cached, live.cumulative_growth_bytes);
+    }
+}
+
+fn exerciseInheritedPropertySourceAllocations(a: Allocator, sample: []const u8, analysis_api: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    if (analysis_api) {
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expectEqualStrings("Ignored\n", analysis.text);
+        try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+    } else {
+        const plain = try reader.extractPlainTextAlloc();
+        defer a.free(plain);
+        try std.testing.expectEqualStrings("Ignored\n", plain);
+    }
+}
+
+test "reader inherited property source ownership survives every allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{ .private_bytes = 256, .location = .parent, .payload = .literal });
+    defer a.free(sample);
+    inline for (.{ false, true }) |analysis_api| {
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseInheritedPropertySourceAllocations, .{ sample, analysis_api });
+    }
+}
+
+test "reader deferred binding quotas preserve native fallback and backing OOM" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{"11 0 obj\n<< /Tag << /ActualText (Label) >> >>\nendobj\n"} });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(a, "<< /Properties 11 0 R >>");
+    defer scanner.deinit();
+    var resources = try scanner.readObject();
+    defer resources.deinit(a);
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 0 else 1024 * 1024);
+        var retained = DecodeBudgetAllocator.init(live.allocator(), 0, if (limit_live) 1024 * 1024 else 0);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        inline for (.{ false, true }) |overridden| {
+            const paint = "/Span /Tag BDC BT /F1 10 Tf (SOURCE) Tj ET EMC";
+            const content = if (overridden) "/Span << /ActualText (Outer) >> BDC " ++ paint ++ " EMC" else paint;
+            const records = try reader.collectTextPropertiesFromResourcesAlloc(&resources, content, &cache);
+            defer {
+                for (records) |*record| record.deinit(a);
+                a.free(records);
+            }
+            try std.testing.expect((try findTextProperty(records, "Tag").?.value()).invalid);
+            const text = try extractTextFromContentAlloc(a, content, &.{}, &.{}, records, 0);
+            defer a.free(text);
+            try std.testing.expectEqualStrings(if (overridden) "Outer" else "SOURCE", std.mem.trimEnd(u8, text, "\n"));
+            try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+            try std.testing.expectEqual(@as(usize, 0), cache.bindings.items.len);
+        }
+        retained.max_live_bytes = 1024 * 1024;
+        live.max_live_bytes = 1024 * 1024;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, reader.collectTextPropertiesFromResourcesAlloc(&resources, "/Span /Tag BDC EMC", &cache));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+    }
+}
+
+test "reader unselected direct replacements cannot exhaust selected siblings" {
+    const a = std.testing.allocator;
+    inline for (.{ PropertyMetadataLocation.resources, .parent, .table }) |location| inline for (.{ false, true }) |overridden| {
+        const sample = try buildCompressedPropertyMetadataFixtureAlloc(a, .{
+            .private_bytes = 127 * 1024,
+            .location = location,
+            .payload = .escaped,
+            .actual_text_payload = true,
+            .flate = false,
+            .selected_name = "Small",
+            .additional_properties = " /Small << /ActualText (Label) >> ",
+            .overridden = overridden,
+        });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 256 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (overridden) "Outer\n" else "Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    };
+}
+
+test "reader deferred direct dictionaries share frame and index and survive eviction" {
+    const a = std.testing.allocator;
+    var properties = std.ArrayList(u8).empty;
+    defer properties.deinit(a);
+    try properties.appendSlice(a, "<< /Font << /F1 5 0 R >> /Properties << ");
+    const padding: [128]u8 = @splat('X');
+    for (0..1024) |i| try properties.print(a, "/Tag{d:0>4} << /ActualText (Label) /Private ({s}) >> ", .{ i, &padding });
+    try properties.appendSlice(a, ">> >>");
+    const sample = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{properties.items}, null);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var live = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
+    {
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        const raw = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+        const resources = try cache.resources(&reader, &raw);
+        const entries = (try cache.sourceEntries(&reader, cache.propertySource(&resources).?)).?;
+        try std.testing.expectEqual(@as(usize, 1024), entries.len);
+        for (entries[0 .. entries.len - 1]) |*entry| {
+            const value = try cache.entryProperty(&reader, entry);
+            try std.testing.expectEqualStrings("Label", value.actual_text.?.string);
+        }
+        try std.testing.expectEqual(@as(usize, 1), cache.frames.loads);
+        cache.frames.deinit();
+        const last = try cache.entryProperty(&reader, &entries[entries.len - 1]);
+        try std.testing.expectEqualStrings("Label", last.actual_text.?.string);
+        try std.testing.expectEqual(@as(usize, 2), cache.frames.loads);
+        const growth = live.cumulative_growth_bytes;
+        _ = try cache.entryProperty(&reader, &entries[0]);
+        try std.testing.expectEqual(growth, live.cumulative_growth_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), live.live_bytes);
+}
+
+test "decode budgets transfer retained ownership without duplicating live charges" {
+    const a = std.testing.allocator;
+    var live = DecodeBudgetAllocator.init(a, 0, 1024);
+    var temporary = DecodeBudgetAllocator.init(live.allocator(), 0, 1024);
+    var retained = DecodeBudgetAllocator.init(live.allocator(), 0, 16);
+    const bytes = try temporary.allocator().alloc(u8, 32);
+    try std.testing.expectError(error.OutOfMemory, retained.adopt(&temporary, bytes));
+    try std.testing.expectEqual(@as(usize, 32), temporary.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), retained.live_bytes);
+    retained.max_live_bytes = 1024;
+    retained.limit_exceeded = false;
+    try retained.adopt(&temporary, bytes);
+    try std.testing.expectEqual(@as(usize, 0), temporary.live_bytes);
+    try std.testing.expectEqual(@as(usize, 32), retained.live_bytes);
+    try std.testing.expectEqual(@as(usize, 32), live.live_bytes);
+    retained.allocator().free(bytes);
+    try std.testing.expectEqual(@as(usize, 0), live.live_bytes);
+}
+
+test "reader metadata scan cancellation and work exhaustion remain bounded and retryable" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 64 * 1024);
+    defer a.free(padding);
+    for (padding, 0..) |*byte, i| byte.* = if (i % 2 == 0) '0' else ' ';
+    const resource11 = try std.fmt.allocPrint(a, "11 0 obj\n<< /Font << /F1 5 0 R >> /Properties << /Unused << /Private [{s}] >> >> >>\nendobj\n", .{padding});
+    defer a.free(resource11);
+    const resource12 = try std.fmt.allocPrint(a, "12 0 obj\n<< /Font << /F1 5 0 R >> /Properties << /Unused << /Private [{s}] >> >> >>\nendobj\n", .{padding});
+    defer a.free(resource12);
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{ resource11, resource12 } });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        active: bool = true,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.active and self.calls >= 4;
+        }
+    };
+    var probe = Probe{};
+    reader.cancellation = .{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+    var budget = DecodeBudgetAllocator.init(a, 0, 32 * 1024);
+    var cache = TextResourceCache{ .budget = &budget };
+    defer cache.deinit();
+    const raw11 = syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } };
+    try std.testing.expectError(error.Canceled, cache.resolve(&reader, &raw11, .required_resources));
+    try std.testing.expectEqual(@as(usize, 0), cache.objects.count());
+    try std.testing.expect(2 * 1024 * 1024 * 1024 - cache.scan_control.remaining_work < 32 * 1024);
+    probe.active = false;
+    const value = try cache.resolve(&reader, &raw11, .required_resources);
+    try std.testing.expectEqual(@as(u32, 5), value.get("Font").?.get("F1").?.obj_ref.id);
+    cache.scan_control.remaining_work = 64;
+    const raw12 = syntax.Object{ .obj_ref = .{ .id = 12, .gen = 0 } };
+    try std.testing.expectError(error.PdfMetadataWorkLimit, cache.resolve(&reader, &raw12, .property_table));
+    const work = cache.scan_control.remaining_work;
+    const growth = budget.cumulative_growth_bytes;
+    for (0..512) |_| try std.testing.expectError(error.InvalidPdfStructure, cache.resolve(&reader, &raw12, .property_table));
+    try std.testing.expectEqual(work, cache.scan_control.remaining_work);
+    try std.testing.expectEqual(growth, budget.cumulative_growth_bytes);
+    _ = try cache.resolve(&reader, &raw11, .required_resources);
+}
+
+fn exerciseEncryptedDeferredProperties(a: Allocator, sample: []const u8, id: u32) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var live = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    var retained = DecodeBudgetAllocator.initWithCumulativeLimit(live.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
+    {
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        const raw = syntax.Object{ .obj_ref = .{ .id = id, .gen = 0 } };
+        const resources = try cache.resources(&reader, &raw);
+        const entries = (try cache.sourceEntries(&reader, cache.propertySource(&resources).?)).?;
+        const value = try cache.entryProperty(&reader, &entries[0]);
+        try std.testing.expectEqualStrings("Label", value.actual_text.?.string);
+        try std.testing.expectEqual(@as(u64, 0), reader.encrypted_stream_generation);
+        try std.testing.expectEqual(@as(usize, 0), reader.encrypted_streams.count());
+    }
+    try std.testing.expectEqual(@as(usize, 0), live.live_bytes);
+}
+
+test "reader deferred properties preserve encryption ownership through allocation failure" {
+    const a = std.testing.allocator;
+    const file_key: [16]u8 = @splat(3);
+    const key = objectEncryptionKey(file_key, 5, .{ .id = 11, .gen = 0 }, .rc4);
+    var encrypted: [5]u8 = "Label".*;
+    rc4Crypt(key.bytes[0..key.len], &encrypted);
+    var hex: std.ArrayList(u8) = .empty;
+    defer hex.deinit(a);
+    for (encrypted) |byte| try hex.print(a, "{x:0>2}", .{byte});
+    const object = try std.fmt.allocPrint(a, "11 0 obj\n<< /Properties << /Tag << /ActualText <{s}> /Private [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] >> >> >>\nendobj\n", .{hex.items});
+    defer a.free(object);
+    const direct = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{object} });
+    defer a.free(direct);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedDeferredProperties, .{ direct, @as(u32, 11) });
+
+    const compressed = try buildObjectStreamBoundaryTestPdfAlloc(a, &.{"<< /Properties << /Tag << /ActualText (Label) /Private [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] >> >> >>"}, null);
+    defer a.free(compressed);
+    {
+        var reader = try Reader.init(a, compressed);
+        defer reader.deinit();
+        var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+        defer stream.deinit(a);
+        const stream_key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+        rc4Crypt(stream_key.bytes[0..stream_key.len], compressed[stream.stream.data_offset..][0..stream.stream.data_length]);
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedDeferredProperties, .{ compressed, @as(u32, 7) });
+}
+
+test "reader property index sorting observes cancellation without caching partial order" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "" });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const fields = try a.alloc(syntax.DictEntry, 512);
+    var initialized: usize = 0;
+    defer {
+        for (fields[0..initialized]) |entry| a.free(entry.key);
+        a.free(fields);
+    }
+    for (fields, 0..) |*field, i| {
+        field.* = .{ .key = try std.fmt.allocPrint(a, "Tag{d:0>4}", .{511 - i}), .value = .null };
+        initialized += 1;
+    }
+    const Probe = struct {
+        calls: usize = 0,
+        active: bool = true,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.active and self.calls >= 6;
+        }
+    };
+    var probe = Probe{};
+    reader.cancellation = .{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+    var budget = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
+    var cache = TextResourceCache{ .budget = &budget };
+    defer cache.deinit();
+    const raw = syntax.Object{ .dict = fields };
+    try std.testing.expectError(error.Canceled, cache.entries(&reader, &raw));
+    try std.testing.expectEqual(@as(usize, 0), cache.scopes.count());
+    probe.active = false;
+    const index = (try cache.entries(&reader, &raw)).?;
+    try std.testing.expectEqualStrings("Tag0000", index[0].raw.key);
+    try std.testing.expectEqualStrings("Tag0511", index[index.len - 1].raw.key);
+}
+
+test "reader document and page text APIs propagate cancellation during extraction" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "BT /F1 10 Tf (SOURCE) Tj ET" });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    _ = try reader.pageCount();
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    inline for (.{ false, true }) |document_api| {
+        var probe = Probe{};
+        reader.cancellation = .{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+        if (document_api)
+            try std.testing.expectError(error.Canceled, reader.extractPlainTextAlloc())
+        else
+            try std.testing.expectError(error.Canceled, reader.extractPageTextAnalysisAlloc(1));
+    }
+}
+
+test "reader cancellable property introsort preserves ordering and permutation without allocations" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 1, 2, 16, 17, 31, 1024 }) |count| for (0..6) |pattern| {
+        const fields = try a.alloc(syntax.DictEntry, count);
+        defer a.free(fields);
+        const index = try a.alloc(TextResourceCache.PropertyEntry, count);
+        defer a.free(index);
+        const seen = try a.alloc(bool, count);
+        defer a.free(seen);
+        @memset(seen, false);
+        var initialized: usize = 0;
+        defer for (fields[0..initialized]) |field| a.free(field.key);
+        var random: u64 = 17;
+        for (fields, index, 0..) |*field, *entry, i| {
+            random = random *% 6364136223846793005 +% 1;
+            const key = switch (pattern) {
+                0 => i,
+                1 => count - i,
+                2 => 0,
+                3 => @as(usize, @intCast(random % 4096)),
+                4 => @min(i, count - i),
+                else => @as(usize, @intCast(random % 17)),
+            };
+            field.* = .{ .key = try std.fmt.allocPrint(a, "K{d:0>6}", .{key}), .value = .{ .integer = @intCast(i) } };
+            initialized += 1;
+            entry.* = .{ .raw = field };
+        }
+        var budget = DecodeBudgetAllocator.init(a, 0, 0);
+        var cache = TextResourceCache{ .budget = &budget };
+        defer cache.deinit();
+        if (count > 16 and pattern == 4)
+            try cache.sortRange(index, 0)
+        else
+            try cache.sortEntries(index);
+        for (index, 0..) |entry, i| {
+            if (i > 0) try std.testing.expect(!std.mem.lessThan(u8, entry.raw.key, index[i - 1].raw.key));
+            const original: usize = @intCast(entry.raw.value.integer);
+            try std.testing.expect(!seen[original]);
+            seen[original] = true;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.cumulative_growth_bytes);
     };
 }

@@ -173,8 +173,8 @@ pub const Proof = struct {
         };
         const identity = publication.namespaceFromBytes(self.namespace);
         for (self.sources, 0..) |source, index| {
-            if (source.document_key.len == 0 or (index != 0 and
-                std.mem.order(u8, self.sources[index - 1].document_key, source.document_key) != .lt))
+            if (index != 0 and
+                std.mem.order(u8, self.sources[index - 1].document_key, source.document_key) != .lt)
                 return error.ArtifactCatalogCorrupt;
             if (source.exists) {
                 if (source.timestamp == 0) return error.ArtifactCatalogCorrupt;

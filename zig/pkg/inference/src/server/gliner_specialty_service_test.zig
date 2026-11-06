@@ -43,6 +43,65 @@ fn body(model: []const u8, case: anytype, count: usize) ![]u8 {
     }, .{});
 }
 
+fn windowBody(model: []const u8, case: anytype, count: usize) ![]u8 {
+    const raw = try body(model, case, count);
+    defer a.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    const owned = parsed.arena.allocator();
+    const long = try std.json.parseFromSliceLeaky(std.json.Value, owned, "{\"mode\":\"window\",\"window_words\":384,\"overlap_words\":32,\"max_windows\":64}", .{});
+    const options = parsed.value.object.getPtr("options").?;
+    try options.object.put(owned, "long_document", long);
+    try options.object.put(owned, "overlap", .{ .string = "allow" });
+    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
+
+fn checkWindowBatches(transport: *Loopback, loaded: *server.model_manager.LoadedModel, model: []const u8, case: anytype) !usize {
+    const single = try windowBody(model, case, 1);
+    defer a.free(single);
+    // Warm the exact execution route before measuring physical work.
+    var warmup = try transport.post(single);
+    defer warmup.deinit();
+    errdefer std.debug.print("privacy window warmup status={d} body={s}\n", .{ warmup.status.code, warmup.body orelse "<missing>" });
+    try std.testing.expectEqual(@as(u16, 200), warmup.status.code);
+    const before_single = factory.getCudaRuntimeStats(loaded.session);
+    const single_start = platform.time.monotonicNs();
+    var baseline = try transport.post(single);
+    const single_ns = platform.time.monotonicNs() - single_start;
+    defer baseline.deinit();
+    try std.testing.expectEqual(@as(u16, 200), baseline.status.code);
+    const after_single = factory.getCudaRuntimeStats(loaded.session);
+    const expected = try std.json.parseFromSlice(std.json.Value, a, baseline.body.?, .{});
+    defer expected.deinit();
+    const row = expected.value.object.get("data").?.array.items[0];
+    try std.testing.expectEqual(@as(i64, 1), row.object.get("long_document").?.object.get("window_count").?.integer);
+    var maximum: usize = 0;
+    for ([_]usize{ 2, 8, 9 }) |count| {
+        const batched = try windowBody(model, case, count);
+        defer a.free(batched);
+        maximum = @max(maximum, try reservation(loaded, batched, .pii));
+        const before = factory.getCudaRuntimeStats(loaded.session);
+        const batch_start = platform.time.monotonicNs();
+        var response = try transport.post(batched);
+        const batch_ns = platform.time.monotonicNs() - batch_start;
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const actual = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer actual.deinit();
+        const rows = actual.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(count, rows.len);
+        for (rows) |sample| try @import("gliner_family_cuda_socket_test.zig").equalBatchValue(row, sample, 5e-4);
+        std.debug.print("privacy_window_throughput backend={s} items={d} single_ns={d} batch_ns={d} parity=true\n", .{ @tagName(loaded.session.backend()), count, single_ns, batch_ns });
+        if (comptime @import("build_options").enable_cuda) if (before) |stats| {
+            const launches = factory.getCudaRuntimeStats(loaded.session).?.kernel_launches - stats.kernel_launches;
+            const serial_launches = after_single.?.kernel_launches - before_single.?.kernel_launches;
+            try std.testing.expect(launches < serial_launches * count);
+            std.debug.print("privacy_window_batch items={d} launches={d} serial_launches={d} parity=true\n", .{ count, launches, serial_launches * count });
+        };
+    }
+    return maximum;
+}
+
 fn number(value: std.json.Value) !f64 {
     return switch (value) {
         .float => |x| x,
@@ -255,7 +314,13 @@ fn qualify(comptime profile: qualification.Profile, comptime backend: Backend) !
     try expectRejected(transport, invalid, 400);
     const long = try std.fmt.allocPrint(a, "{{\"schema_version\":2,\"model\":{f},\"inputs\":[{{\"content\":\"hello\"}}],\"schema\":{s},\"options\":{{\"long_document\":{{\"mode\":\"window\"}}}}}}", .{ std.json.fmt(model, .{}), first.native_schema_json });
     defer a.free(long);
-    try expectRejected(transport, long, 400);
+    if (profile == .gliguard) {
+        try expectRejected(transport, long, 400);
+    } else {
+        var response = try transport.post(long);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    }
     const oversized_text = try a.alloc(u8, 4096);
     defer a.free(oversized_text);
     for (oversized_text, 0..) |*char, i| char.* = if (i % 2 == 0) 'a' else ' ';
@@ -435,4 +500,57 @@ test "GLiNER specialty GLiGuard public HTTP CUDA" {
 }
 test "GLiNER specialty GLiGuard public HTTP Metal" {
     try qualify(.gliguard, .metal);
+}
+
+/// Independent of the historical upstream-head capture format: this regression
+/// compares the same source and policy through singleton and batched windows.
+fn qualifyPrivacyWindowBatches(comptime backend: Backend) !void {
+    if (backend == .cuda and !@import("build_options").enable_cuda) return error.SkipZigTest;
+    if (backend == .metal and !@import("build_options").enable_metal) return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER_PII_MODEL_DIR") orelse return error.SkipZigTest;
+    const GiB = 1024 * 1024 * 1024;
+    var node = try server.Node.init(a, .{
+        .models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 8,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{
+            .host_limit_bytes = 12 * GiB,
+            .backend_limit_bytes = 12 * GiB,
+            .combined_limit_bytes = 24 * GiB,
+            .scratch_limit_bytes = 8 * GiB,
+        },
+    });
+    defer node.deinit();
+    node.session_manager.preferred_backends = &.{backend};
+    node.session_manager.required_backend = backend;
+    node.model_manager.session_manager.preferred_backends = &.{backend};
+    node.model_manager.session_manager.required_backend = backend;
+    try node.attachIo(std.testing.io);
+    var handle = try node.model_manager.acquireFromDir(directory);
+    defer handle.release();
+    const loaded = handle.get();
+    try std.testing.expectEqual(backend, loaded.session.backend());
+    try std.testing.expectEqual(qualification.Profile.pii, try qualification.require(try factory.getGlinerDecisionIdentity(loaded.session)));
+    const transport = try Loopback.initWithLimits(a, &node, 8, .{
+        .transport_memory_limit_bytes = 256 * 1024 * 1024,
+        .max_request_body_bytes = 1024 * 1024,
+    });
+    defer transport.deinit();
+    try transport.start();
+    _ = try checkWindowBatches(transport, loaded, std.fs.path.basename(directory), .{
+        .id = "unicode",
+        .text = "Éva: maria.jensen@example.dk.",
+        .native_schema_json = "{\"entities\":[\"email\",\"person\"]}",
+        .threshold = @as(f32, 0.5),
+    });
+    try transport.idle();
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "privacy windowed PII physical batches Metal" {
+    try qualifyPrivacyWindowBatches(.metal);
+}
+test "privacy windowed PII physical batches CUDA" {
+    try qualifyPrivacyWindowBatches(.cuda);
 }

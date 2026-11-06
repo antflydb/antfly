@@ -3052,6 +3052,20 @@ pub fn parseQueryRequestWithDeadline(
             owned.req.defer_stored_projection = control.value.defer_stored_projection;
         };
     }
+    if (std.mem.indexOf(u8, body, "_privacy_policy_version") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_privacy_policy_version")) |value| {
+            if (value != .string) return error.InvalidQueryRequest;
+            var version: [64]u8 = @splat(0);
+            if (!std.mem.eql(u8, value.string, "none")) {
+                if (value.string.len != 64) return error.InvalidQueryRequest;
+                for (value.string) |byte| if (!std.ascii.isHex(byte)) return error.InvalidQueryRequest;
+                @memcpy(&version, value.string);
+            }
+            owned.req.privacy_policy_version = version;
+        };
+    }
     return owned;
 }
 
@@ -12702,6 +12716,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_native_cut",
         "_response_live_read",
         "_document_authority",
+        "_privacy_policy_version",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -13082,6 +13097,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_native_cut",
         "_response_live_read",
         "_document_authority",
+        "_privacy_policy_version",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
