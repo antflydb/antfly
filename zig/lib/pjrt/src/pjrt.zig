@@ -719,34 +719,7 @@ pub const Client = struct {
         data: []const f32,
         dims: []const i64,
     ) PjrtError!Buffer {
-        var args = c.ClientBufferFromHostBufferArgs{
-            .struct_size = @sizeOf(c.ClientBufferFromHostBufferArgs),
-            .extension_start = null,
-            .client = self.handle,
-            .data = @ptrCast(data.ptr),
-            .buffer_type = .float32,
-            .dims = dims.ptr,
-            .num_dims = dims.len,
-            .byte_strides = null,
-            .num_byte_strides = 0,
-            .host_buffer_semantics = .immutable_only_during_call,
-            .device = self.device,
-            .memory = null,
-            .device_layout = null,
-            .done_with_host_buffer = null,
-            .buffer = null,
-        };
-        try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
-
-        // Wait for host→device transfer to complete so caller can free data
-        if (args.done_with_host_buffer) |event| {
-            try awaitAndDestroyEvent(self.api, event);
-        }
-
-        return .{
-            .api = self.api,
-            .handle = args.buffer orelse return PjrtError.PjrtApiError,
-        };
+        return self.uploadBuffer(@ptrCast(data.ptr), .float32, dims, self.device);
     }
 
     /// Upload i64 data from host to device, returning a Buffer handle.
@@ -755,33 +728,7 @@ pub const Client = struct {
         data: []const i64,
         dims: []const i64,
     ) PjrtError!Buffer {
-        var args = c.ClientBufferFromHostBufferArgs{
-            .struct_size = @sizeOf(c.ClientBufferFromHostBufferArgs),
-            .extension_start = null,
-            .client = self.handle,
-            .data = @ptrCast(data.ptr),
-            .buffer_type = .int64,
-            .dims = dims.ptr,
-            .num_dims = dims.len,
-            .byte_strides = null,
-            .num_byte_strides = 0,
-            .host_buffer_semantics = .immutable_only_during_call,
-            .device = self.device,
-            .memory = null,
-            .device_layout = null,
-            .done_with_host_buffer = null,
-            .buffer = null,
-        };
-        try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
-
-        if (args.done_with_host_buffer) |event| {
-            try awaitAndDestroyEvent(self.api, event);
-        }
-
-        return .{
-            .api = self.api,
-            .handle = args.buffer orelse return PjrtError.PjrtApiError,
-        };
+        return self.uploadBuffer(@ptrCast(data.ptr), .int64, dims, self.device);
     }
 
     /// Initialize PJRT client by searching for the plugin in standard locations.
@@ -805,33 +752,33 @@ pub const Client = struct {
         dims: []const i64,
         target_device: *c.PjrtDevice,
     ) PjrtError!Buffer {
-        var args = c.ClientBufferFromHostBufferArgs{
-            .struct_size = @sizeOf(c.ClientBufferFromHostBufferArgs),
-            .extension_start = null,
-            .client = self.handle,
-            .data = @ptrCast(data.ptr),
-            .buffer_type = .float32,
-            .dims = dims.ptr,
-            .num_dims = dims.len,
-            .byte_strides = null,
-            .num_byte_strides = 0,
-            .host_buffer_semantics = .immutable_only_during_call,
-            .device = target_device,
-            .memory = null,
-            .device_layout = null,
-            .done_with_host_buffer = null,
-            .buffer = null,
-        };
-        try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
+        return self.uploadBuffer(@ptrCast(data.ptr), .float32, dims, target_device);
+    }
 
+    /// Acquire output ownership after a successful native call. Completion
+    /// can fail after a valid buffer has been returned, and callers cannot
+    /// release a buffer that this helper never returns to them.
+    fn uploadBuffer(self: *const Client, data: *const anyopaque, kind: c.BufferType, dims: []const i64, device: *c.PjrtDevice) PjrtError!Buffer {
+        var args = std.mem.zeroes(c.ClientBufferFromHostBufferArgs);
+        args.struct_size = @sizeOf(@TypeOf(args));
+        args.client = self.handle;
+        args.data = data;
+        args.buffer_type = kind;
+        args.dims = dims.ptr;
+        args.num_dims = dims.len;
+        args.host_buffer_semantics = .immutable_only_during_call;
+        args.device = device;
+        try checkError(self.api, self.api.clientBufferFromHostBuffer(&args));
+        defer if (args.done_with_host_buffer) |event| destroyEvent(self.api, event);
+        errdefer if (args.buffer) |handle| {
+            var buffer = Buffer{ .api = self.api, .handle = handle };
+            buffer.deinit();
+        };
         if (args.done_with_host_buffer) |event| {
+            args.done_with_host_buffer = null;
             try awaitAndDestroyEvent(self.api, event);
         }
-
-        return .{
-            .api = self.api,
-            .handle = args.buffer orelse return PjrtError.PjrtApiError,
-        };
+        return .{ .api = self.api, .handle = args.buffer orelse return error.PjrtApiError };
     }
 };
 

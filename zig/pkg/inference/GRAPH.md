@@ -665,3 +665,15 @@ executables cannot consume the old generation needed by a failed decode retry.
 The enclosing resource envelope configures unified-device ceilings. Metadata
 suballocations reuse that stable policy and retain batched physical-pressure
 checks, avoiding a fresh OS limit probe for each parser allocation.
+
+Standalone discovery evaluates parameter modes in priority order. It streams a
+compact header before parsing a candidate's shapes or bindings at every file
+size, and releases an incomplete mode's catalog before considering fallback.
+Lower-priority large sidecars and small JSON files with large metadata expansion
+cannot force full parsing while a complete preferred mode is selected. Package
+and standalone lookup still share parsed metadata within the active mode;
+ambiguity and selected-chain identity/deserialization errors remain errors.
+Native upload helpers share one ownership guard for returned buffers and
+completion events. Completion failure destroys the buffer that cannot be handed
+to the caller. The standalone upload regression checks successful and failed
+ownership transfers without suppressing production native-error diagnostics.

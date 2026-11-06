@@ -305,9 +305,19 @@ pub fn readManifestFile(allocator: std.mem.Allocator, io: std.Io, file: std.Io.F
 /// Request inspection is only a filter. Revalidate the fully parsed manifest
 /// from the same descriptor, including after concurrent in-place changes.
 pub fn readManifestIf(a: std.mem.Allocator, io: std.Io, path: []const u8, context: anytype, comptime matches: anytype) !?std.json.Parsed(Manifest) {
+    return readManifestMatching(a, io, path, context, matches, false);
+}
+
+/// Selection must reject lower-priority metadata before full parsing, including
+/// small JSON files whose shape/binding arrays expand far beyond their text.
+pub fn readManifestIfInspected(a: std.mem.Allocator, io: std.Io, path: []const u8, context: anytype, comptime matches: anytype) !?std.json.Parsed(Manifest) {
+    return readManifestMatching(a, io, path, context, matches, true);
+}
+
+fn readManifestMatching(a: std.mem.Allocator, io: std.Io, path: []const u8, context: anytype, comptime matches: anytype, comptime inspect_small: bool) !?std.json.Parsed(Manifest) {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
-    if (!try inspectRequest(a, io, file, context, matches)) return null;
+    if (!try inspectRequest(a, io, file, context, matches, inspect_small)) return null;
     var parsed = try readManifestFile(a, io, file);
     if (!matches(parsed.value, context)) {
         parsed.deinit();
@@ -317,13 +327,14 @@ pub fn readManifestIf(a: std.mem.Allocator, io: std.Io, path: []const u8, contex
 }
 
 /// Parse only the request identity and profile. The streaming scanner skips
-/// bindings, shapes, and unknown fields without allocating their values. Small
-/// files take the existing single-parse path; selected large files are still
-/// fully parsed and revalidated before use, so inspection cannot weaken ABI,
+/// bindings, shapes, and unknown fields without allocating their values. Generic
+/// readers keep the small-file single-parse path; selection always inspects.
+/// Matching files are fully parsed and revalidated before use, so inspection
+/// cannot weaken ABI,
 /// identity, duplicate-candidate, or selected-chain failure handling.
-fn inspectRequest(a: std.mem.Allocator, io: std.Io, file: std.Io.File, context: anytype, comptime matches: anytype) !bool {
+fn inspectRequest(a: std.mem.Allocator, io: std.Io, file: std.Io.File, context: anytype, comptime matches: anytype, comptime inspect_small: bool) !bool {
     const stat = try file.stat(io);
-    if (stat.size <= 16 * 1024) return true;
+    if (!inspect_small and stat.size <= 16 * 1024) return true;
     const Header = struct {
         kind: []const u8,
         backend: []const u8,
@@ -340,7 +351,7 @@ fn inspectRequest(a: std.mem.Allocator, io: std.Io, file: std.Io.File, context: 
             return .{ .kind = self.kind, .backend = self.backend, .model_dir = self.model_dir, .artifact_role = self.artifact_role, .seq_len = self.seq_len, .query_seq_len = self.query_seq_len, .attention_mode = self.attention_mode, .pjrt_parameter_mode = self.pjrt_parameter_mode, .pjrt_memory_plan = self.pjrt_memory_plan, .partition_signature = self.partition_signature, .artifact_path = "", .prompt_tokens = 0, .raw_prompt = false, .chat_template_applied = false };
         }
     };
-    const buffer = try a.alloc(u8, 8192);
+    const buffer = try a.alloc(u8, @intCast(@max(1, @min(stat.size, 8192))));
     defer a.free(buffer);
     var reader = file.reader(io, buffer);
     var scanner = std.json.Reader.init(a, &reader.interface);
@@ -504,7 +515,7 @@ fn findMatchingArtifactPathMode(
         const manifest_path = try std.fs.path.join(allocator, &.{ search_dir, entry.name });
         errdefer allocator.free(manifest_path);
 
-        var parsed = (readManifestIf(allocator, io, manifest_path, req, matchesRequest) catch |err| switch (err) {
+        var parsed = (readManifestIfInspected(allocator, io, manifest_path, req, matchesRequest) catch |err| switch (err) {
             error.FileNotFound, error.InvalidCharacter, error.SyntaxError, error.UnexpectedToken, error.UnknownField => {
                 allocator.free(manifest_path);
                 continue;

@@ -25,7 +25,7 @@ pub const Request = struct {
 };
 
 /// Keep parsed metadata through executor construction. Package inspection and
-/// standalone fallback share one catalog, so each sidecar is parsed once.
+/// standalone fallback share one catalog within the current parameter mode.
 pub const Selection = struct {
     catalog: Catalog,
     chain: []usize,
@@ -50,6 +50,7 @@ const Catalog = struct {
     const Entry = struct { path: []u8, parsed: std.json.Parsed(artifact.Manifest), available: bool, standalone: bool = false };
     allocator: std.mem.Allocator,
     io: std.Io,
+    parameter_mode: ?[]const u8 = null,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     by_path: std.StringHashMapUnmanaged(usize) = .empty,
 
@@ -64,7 +65,7 @@ const Catalog = struct {
 
     fn read(self: *@This(), path: []const u8, filter: ?Request) !?usize {
         if (self.by_path.get(path)) |index| return index;
-        const parsed = (if (filter) |request| artifact.readManifestIf(self.allocator, self.io, path, request, relevant) else artifact.readManifestIf(self.allocator, self.io, path, {}, struct {
+        const parsed = (if (filter) |request| artifact.readManifestIfInspected(self.allocator, self.io, path, ModeFilter{ .request = request, .mode = self.parameter_mode }, relevantMode) else artifact.readManifestIf(self.allocator, self.io, path, {}, struct {
             fn matches(_: artifact.Manifest, _: void) bool {
                 return true;
             }
@@ -111,6 +112,13 @@ const Catalog = struct {
         }
     }
 };
+
+const ModeFilter = struct { request: Request, mode: ?[]const u8 };
+
+fn relevantMode(value: artifact.Manifest, filter: ModeFilter) bool {
+    if (filter.mode) |mode| if (!std.mem.eql(u8, value.pjrt_parameter_mode, mode)) return false;
+    return relevant(value, filter.request);
+}
 
 fn relevant(value: artifact.Manifest, request: Request) bool {
     return matchesPrefill(value, request, artifact.pjrt_parameter_mode_embedded) or
@@ -237,19 +245,18 @@ pub fn findAdmitted(allocator: std.mem.Allocator, io: std.Io, directory: []const
 }
 
 fn find(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, request: Request) !?Selection {
-    var catalog = Catalog{ .allocator = allocator, .io = io };
-    var owned = true;
-    defer if (owned) catalog.deinit();
-    var scanned = false;
     for ([_][]const u8{ artifact.pjrt_parameter_mode_embedded, artifact.pjrt_parameter_mode_inputs }) |mode| {
+        // Inspect one priority at a time. Failed/incomplete higher-priority
+        // metadata is released before attempting the fallback, while package
+        // and standalone lookup still share parsed entries within this mode.
+        var catalog = Catalog{ .allocator = allocator, .io = io, .parameter_mode = mode };
+        var owned = true;
+        defer if (owned) catalog.deinit();
         if (try packageChain(&catalog, directory, request, mode)) |chain| {
             owned = false;
             return .{ .catalog = catalog, .chain = chain };
         }
-        if (!scanned) {
-            try catalog.scan(directory, request);
-            scanned = true;
-        }
+        try catalog.scan(directory, request);
         if (try standaloneChain(&catalog, request, mode)) |chain| {
             owned = false;
             return .{ .catalog = catalog, .chain = chain };
@@ -498,4 +505,129 @@ test "managed PJRT layerless chain compatibility uses the runtime identity" {
     // Ambiguous sources cannot share one logical state.
     present[0].layer_index = 7;
     try std.testing.expect(!kvShapesCompatible(source, target));
+}
+
+test "managed PJRT mode priority skips unselected metadata and releases fallback catalogs" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const exe = try std.fs.path.join(a, &.{ root, "model.exec" });
+    defer a.free(exe);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.exec", .data = "unused-by-selection" });
+    const embedded = try std.fs.path.join(a, &.{ root, "embedded.inference.json" });
+    defer a.free(embedded);
+    const manifest = artifact.Manifest{ .backend = "xla", .kind = "pjrt_executable", .model_dir = root, .artifact_path = exe, .prompt_tokens = 1, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill", .raw_prompt = true, .chat_template_applied = false, .pjrt_memory_plan = .{ .platform = .cpu, .artifact_sha256 = @splat(0), .plugin_sha256 = @splat(0), .memory = .{} } };
+    try artifact.writeManifest(a, io, embedded, manifest);
+    const manager_mod = @import("../server/model_manager.zig");
+    var manager = manager_mod.ModelManager.init(a, @import("../backends/backends.zig").SessionManager.init(a));
+    defer manager.deinit();
+    const policy = manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 } };
+    try policy.configure(&manager);
+    const context = @import("pjrt_admission.zig").Context{ .allocator = a, .manager = &manager, .policy = policy };
+    const request = Request{ .model_dir = root, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill", .decode_steps = 0 };
+    {
+        var selected = (try findAdmitted(a, io, root, request, &context)).?;
+        defer selected.deinit();
+        try std.testing.expectEqualStrings(artifact.pjrt_parameter_mode_embedded, selected.manifests.?[0].pjrt_parameter_mode);
+    }
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, ' ');
+    var alternative = manifest;
+    alternative.pjrt_parameter_mode = artifact.pjrt_parameter_mode_inputs;
+    const json = try std.json.Stringify.valueAlloc(a, alternative, .{});
+    defer a.free(json);
+    @memcpy(padding[0..json.len], json);
+    try tmp.dir.writeFile(io, .{ .sub_path = "inputs.inference.json", .data = padding });
+    {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 128 * 1024);
+        defer quota.deinit();
+        var selected = (try findAdmitted(quota.allocator(), io, root, request, &context)).?;
+        defer selected.deinit();
+        try std.testing.expectEqualStrings(artifact.pjrt_parameter_mode_embedded, selected.manifests.?[0].pjrt_parameter_mode);
+        try std.testing.expect(quota.peak_bytes < 64 * 1024);
+        try std.testing.expectEqual(@as(usize, 0), quota.largest_rejected_growth);
+    }
+
+    var shapes: [4000][]i64 = @splat(&.{});
+    alternative.pjrt_input_shapes = &shapes;
+    const compact = try std.json.Stringify.valueAlloc(a, alternative, .{});
+    defer a.free(compact);
+    try std.testing.expect(compact.len < 16 * 1024);
+    try tmp.dir.writeFile(io, .{ .sub_path = "inputs.inference.json", .data = compact });
+    {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 128 * 1024);
+        defer quota.deinit();
+        var selected = (try findAdmitted(quota.allocator(), io, root, request, &context)).?;
+        defer selected.deinit();
+        try std.testing.expectEqualStrings(artifact.pjrt_parameter_mode_embedded, selected.manifests.?[0].pjrt_parameter_mode);
+        try std.testing.expect(quota.peak_bytes < 64 * 1024);
+    }
+    {
+        // Explicit-runner discovery shares the same streaming mode filter.
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 128 * 1024);
+        defer quota.deinit();
+        var located = (try artifact.findUniqueMatchingArtifactPath(quota.allocator(), io, root, .{
+            .backend = "xla",
+            .model_dir = root,
+            .kind = "pjrt_executable",
+            .artifact_role = artifact.artifact_role_prefill,
+            .seq_len = 1,
+            .query_seq_len = 1,
+            .attention_mode = "paged_prefill",
+            .pjrt_parameter_mode = artifact.pjrt_parameter_mode_embedded,
+            .require_pjrt_memory_plan = true,
+        })).?;
+        defer located.deinit(quota.allocator());
+        try std.testing.expectEqualStrings(exe, located.artifact_path);
+        try std.testing.expect(quota.peak_bytes < 64 * 1024);
+        try std.testing.expectEqual(@as(usize, 0), quota.largest_rejected_growth);
+    }
+    alternative.pjrt_input_shapes = &.{};
+
+    // Both modes fit separately. The incomplete embedded arena must be freed
+    // before parsing the inputs fallback, rather than accumulating catalogs.
+    const source = try a.alloc(u8, 40 * 1024);
+    defer a.free(source);
+    @memset(source, 's');
+    var large_embedded = manifest;
+    large_embedded.source_path = source;
+    try artifact.writeManifest(a, io, embedded, large_embedded);
+    alternative.source_path = source;
+    const inputs_path = try std.fs.path.join(a, &.{ root, "inputs.inference.json" });
+    defer a.free(inputs_path);
+    try artifact.writeManifest(a, io, inputs_path, alternative);
+    var decode = alternative;
+    decode.source_path = "";
+    decode.seq_len = 2;
+    decode.artifact_role = artifact.artifact_role_decode;
+    decode.attention_mode = "paged_decode";
+    const decode_path = try std.fs.path.join(a, &.{ root, "decode.inference.json" });
+    defer a.free(decode_path);
+    try artifact.writeManifest(a, io, decode_path, decode);
+    var fallback_manager = manager_mod.ModelManager.init(a, @import("../backends/backends.zig").SessionManager.init(a));
+    defer fallback_manager.deinit();
+    const fallback_policy = manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 192 * 1024 } };
+    try fallback_policy.configure(&fallback_manager);
+    const fallback_context = @import("pjrt_admission.zig").Context{ .allocator = a, .manager = &fallback_manager, .policy = fallback_policy };
+    var fallback_request = request;
+    fallback_request.decode_steps = 1;
+    {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 192 * 1024);
+        defer quota.deinit();
+        var selected = (try findAdmitted(quota.allocator(), io, root, fallback_request, &fallback_context)).?;
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 2), selected.manifests.?.len);
+        try std.testing.expectEqualStrings(artifact.pjrt_parameter_mode_inputs, selected.manifests.?[0].pjrt_parameter_mode);
+        try std.testing.expectEqual(@as(usize, 0), quota.largest_rejected_growth);
+    }
+    // Priority filtering must preserve ambiguity checks within the selected mode.
+    alternative.source_path = "";
+    const duplicate = try std.fs.path.join(a, &.{ root, "duplicate.inference.json" });
+    defer a.free(duplicate);
+    try artifact.writeManifest(a, io, duplicate, alternative);
+    try std.testing.expectError(error.AmbiguousCompiledArtifact, findAdmitted(a, io, root, fallback_request, &fallback_context));
 }
