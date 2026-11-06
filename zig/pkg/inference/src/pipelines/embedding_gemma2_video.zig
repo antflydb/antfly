@@ -939,7 +939,7 @@ test "embeddinggemma2 video contract pixels follow the first decodable track on 
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
     const portable = try inspectPlan(std.testing.allocator, bytes, .{}, .reference, &pool, false);
     const cuda = try @import("../ops/cuda/video.zig").inspectEmbedding(std.testing.allocator, bytes, .{});
-    try std.testing.expectEqual(@as(u64, 192 * 192), portable.pixels);
+    try std.testing.expectEqual(@as(u64, 4 * 192 * 192), portable.pixels);
     try std.testing.expectEqual(@as(u64, 4 * 192 * 192), @as(u64, cuda.width) * cuda.height * cuda.frames);
     try std.testing.expectEqual(@as(u64, 4 * 192 * 192), try inspectPixels(bytes, .{}));
     try std.testing.expectError(error.Timeout, inspectPixels(bytes, .{ .deadline_ns = 0 }));
