@@ -6813,6 +6813,16 @@ test "WS5 serviceRetirement retires every lane in exactly one native commit" {
     const path = try testPath(a, tmp, "ws5-one-commit.aflite");
     defer a.free(path);
     var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    // This test measures serviceRetirement's own single-commit contract via
+    // the store-wide commit_sequence counter. That counter also advances for
+    // any background maintenance turn, and appendReplayOpaque's commit below
+    // already calls startMaintenance() in its defer -- so without this, a
+    // background turn can race the explicit serviceRetirement call below and
+    // retire (part of) the same watermark first, making commit_sequence
+    // advance by 2 instead of 1. Suppressing the background loop keeps the
+    // measurement deterministic without weakening what is actually being
+    // asserted: serviceRetirement itself commits exactly once.
+    store.maintenance_start_suppressed = true;
     defer store.close();
 
     const payload = try change_journal_mod.encodeRecord(a, .{
