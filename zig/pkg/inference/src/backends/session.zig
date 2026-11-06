@@ -2834,6 +2834,15 @@ pub const Session = struct {
         return self.admitHostPreprocessWithPressure(host_scratch_bytes, &pressure);
     }
 
+    /// Necessary same-task host lower bound, without reserving either part.
+    /// A fresh final bank is additional to the unchanged preprocessing/raw
+    /// floor. Complete source/input/workspace admission still follows cold.
+    pub fn validateHostPreprocessWithOutput(self: Session, host_floor_bytes: usize, rows: usize, width: usize) !void {
+        const output_bytes = try HostOutputProducer.requiredBytes(rows, width);
+        const policy = self.run_admission orelse return error.UnmanagedHostOutput;
+        try policy.validateOwnedHostScratch(try addBytes(host_floor_bytes, output_bytes));
+    }
+
     /// One original whole-task host reservation, with a named final-output
     /// bank ADDITIONAL to the unchanged metadata/raw-result handoff floor.
     /// Caller consumes it cold before tokenization or any numerical owner.
@@ -9714,4 +9723,55 @@ test "raw F32 producer overlap declaration matches actual host and resident allo
     try actualRawF32PacketBytes(.host_tensor);
     try actualRawF32PacketBytes(.resident_tensor);
     try std.testing.expectError(error.ResourceLimitExceeded, HostOutputProducer.rawF32CopyHostBytes(2, std.math.maxInt(usize), 1, .host_tensor, true));
+}
+
+test "fresh host output and retained floor preflight classifies impossible split before supplier or execution" {
+    const Supplier = struct {
+        reserves: usize = 0,
+        fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reserves += 1;
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    var supplier: Supplier = .{};
+    try controller.configureResourceBudget(.{ .context = &supplier, .try_reserve = Supplier.reserve, .retain = Supplier.retain, .release = Supplier.release });
+    defer controller.configureResourceBudget(null) catch unreachable;
+    const rows = 7;
+    const width = 8;
+    const bank = try HostOutputProducer.requiredBytes(rows, width);
+    const raw_floor = rows * (@sizeOf([]f32) + width * @sizeOf(f32));
+    const combined = raw_floor + bank;
+    try std.testing.expect(raw_floor < combined - 1 and bank < combined - 1);
+    var peer = try controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = bank + 1 }, false);
+    defer peer.release();
+    // No backend/public callback header is needed or authorized for this
+    // metadata-only proof, even when the controller is genuinely occupied.
+    var session: Session = .{ .ptr = @ptrFromInt(16), .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = combined - 1 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    const before = controller.snapshot();
+    const callbacks = supplier.reserves;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitHostPreprocess(raw_floor));
+    try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(raw_floor, rows, width));
+    session.run_admission.?.limits = .{ .combined_limit_bytes = combined - 1 };
+    try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(raw_floor, rows, width));
+    session.run_admission.?.limits = .{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = combined - 1 });
+    try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(raw_floor, rows, width));
+    controller.configureSharedLimits(.{ .unified_limit_bytes = combined - 1 });
+    try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(raw_floor, rows, width));
+    controller.configureSharedLimits(.{});
+    session.run_admission.?.limits = .{ .host_limit_bytes = combined, .combined_limit_bytes = combined };
+    try session.validateHostPreprocessWithOutput(raw_floor, rows, width);
+    // The lower bound fits intrinsically; this real peer still makes the
+    // first partial acquisition temporary. No quota is granted by preflight.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitHostPreprocess(raw_floor));
+    try std.testing.expectError(error.InvalidHostOutputGeometry, session.validateHostPreprocessWithOutput(raw_floor, 0, width));
+    try std.testing.expectError(error.InvalidHostOutputGeometry, session.validateHostPreprocessWithOutput(raw_floor, rows, 0));
+    try std.testing.expectError(error.ResourceLimitExceeded, session.validateHostPreprocessWithOutput(std.math.maxInt(usize), rows, width));
+    try std.testing.expectEqualDeep(before, controller.snapshot());
+    try std.testing.expectEqual(callbacks, supplier.reserves);
 }

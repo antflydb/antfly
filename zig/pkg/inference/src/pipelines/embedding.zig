@@ -564,6 +564,10 @@ pub const EmbeddingPipeline = struct {
                 dest.* = try self.allocator.dupe(f32, source);
                 count += 1;
             }
+            // Publish the successful original cohort's usage/timing from its
+            // actual reclaiming execution owner, alongside the escaped rows.
+            self.last_input_tokens = scoped.last_input_tokens;
+            self.last_resident_backend_timing = scoped.last_resident_backend_timing;
             return output;
         }
         return self.embedUnscoped(texts);
@@ -955,7 +959,13 @@ pub const EmbeddingPipeline = struct {
         // SAME public raw whole-call retained-row floor, independent of the
         // ADDITIONAL named final bank on the first actual original Source.
         const row_bytes = try std.math.add(usize, @sizeOf([]f32), try std.math.mul(usize, self.config.embedding_gemma2_dimensions, @sizeOf(f32)));
-        var retained = if (windowed) try self.session.admitHostPreprocess(try std.math.mul(usize, texts.len, row_bytes)) else null;
+        const retained_bytes = if (windowed) try std.math.mul(usize, texts.len, row_bytes) else 0;
+        // This fresh task certainly needs BOTH its unchanged raw handoff floor
+        // and an additional final bank. Reject an intrinsically impossible
+        // split before acquiring either partial lease or entering a producer.
+        // Each actual Source still admits its complete geometry below.
+        try self.session.validateHostPreprocessWithOutput(retained_bytes, texts.len, task_output.width);
+        var retained = if (windowed) try self.session.admitHostPreprocess(retained_bytes) else null;
         defer if (retained) |*permit| permit.deinit();
         var cursor: usize = 0;
         var tokens: usize = 0;
@@ -1759,6 +1769,7 @@ pub const EmbeddingPipeline = struct {
 
     /// Benchmark-facing encoder contract without tokenization or model load.
     pub fn embedTokenized(self: *EmbeddingPipeline, input_ids: []const i64, attention_mask: []const i64, batch: usize, seq_len: usize) ![][]f32 {
+        self.last_input_tokens = 0;
         return (try self.embedTokenizedResult(input_ids, attention_mask, batch, seq_len, false, .{}, null, null)).requireRows();
     }
 
@@ -1772,6 +1783,7 @@ pub const EmbeddingPipeline = struct {
         if (!consumer_cleanup.outside_execution or consumer_cleanup.boundary != null or consumer_cleanup.operation != null) return error.OwnedOutputRequiresOutsideEntry;
         if (self.gemma_workspace != null) return error.OwnedOutputRequiresColdWorkspaceOwner;
         var scoped = self.*;
+        scoped.last_input_tokens = 0;
         scoped.allocator = @import("embedding_gemma2.zig").workspaceBackingAllocator(self.session.backend());
         defer {
             self.last_resident_backend_timing = scoped.last_resident_backend_timing;
@@ -2050,7 +2062,12 @@ pub const EmbeddingPipeline = struct {
             };
             defer vectors.deinit(alloc);
             if (vectors.count() != batch) return error.UnexpectedOutputShape;
-            return self.finishPreparedTextRows(&vectors, &source, batch, task_output, owned);
+            const result = try self.finishPreparedTextRows(&vectors, &source, batch, task_output, owned);
+            // Count the validated caller mask once after successful output
+            // consumption. Private length buckets accumulate into their owner;
+            // public tokenized entries reset their own per-call totals.
+            self.last_input_tokens +|= active_rows;
+            return result;
         }
         return error.ResourceTemporarilyUnavailable;
     }
@@ -8129,9 +8146,11 @@ test "Qwen manual raw callback stays uncharged and admitted missing domain refus
     // No tokenizer/kernel/context is fabricated to make an opaque callback a
     // modern workspace producer. Its public raw host contract is unchanged.
     try std.testing.expect(!pipeline.boundedQwenBatchingEnabled());
+    pipeline.last_input_tokens = 999;
     const result = try pipeline.embedTokenized(&.{ 1, 2 }, &.{ 1, 1 }, 1, 2);
     defer freeEmbeddingSlices(std.testing.allocator, result);
     try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, result[0]);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.last_input_tokens);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     var controller: memory_admission.AdmissionController = .{};
     pipeline.session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
@@ -8140,6 +8159,7 @@ test "Qwen manual raw callback stays uncharged and admitted missing domain refus
     // unexpected successful owning result and masking the routing failure.
     defer if (denied) |unexpected| freeEmbeddingSlices(std.testing.allocator, unexpected) else |_| {};
     try std.testing.expectError(error.MissingWorkspaceAdmissionDomain, denied);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.last_input_tokens);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(memory_admission.AdmissionAmounts{}, controller.snapshot());
     try std.testing.expect(gate.tryLock());
@@ -8395,8 +8415,10 @@ test "Metal actual modern shared roots support zero-credit generic host and expl
     // Same original encoder/normalization policy through both public owners.
     const raw = try pipeline.embedTokenized(&ids, &mask, 2, 16);
     defer freeEmbeddingSlices(Q.a, raw);
+    try std.testing.expectEqual(@as(usize, 32), pipeline.last_input_tokens);
     var owned = try pipeline.embedTokenizedOwned(&ids, &mask, 2, 16, .{ .outside_execution = true });
     defer owned.deinitOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 32), pipeline.last_input_tokens);
     for (raw, 0..) |row, index| try Q.compare(row, owned.values(index), fixture.hidden);
     const before_cancel = domain.controller.snapshot();
     const Cancel = struct {
@@ -8816,12 +8838,22 @@ test "Gemma public text original source task escrow preserves four-row windows c
                 try std.testing.expect(!invalid_width.canEmbedOwned());
             }
         }
+        var expected_input_tokens: usize = 0;
+        for (texts) |text| {
+            const rendered = try std.fmt.allocPrint(a, "{s}{s}", .{ pipeline.config.text_prefix, text });
+            defer a.free(rendered);
+            var encoded = try pipeline.tok.encodeForModel(a, rendered, pipeline.config.max_length + 1);
+            defer encoded.deinit();
+            for (encoded.attention_mask) |value| expected_input_tokens += @intFromBool(value != 0);
+        }
+        try std.testing.expect(expected_input_tokens > 0);
         var owned_trace: embedding_trace.Trace = .{ .allocator = a, .io = std.testing.io, .directory = "", .id = 0, .started_ns = 0, .path = "", .model = "", .inputs = &texts, .task_type = "CLUSTERING", .instruction = null };
         pipeline.trace = &owned_trace;
         // FIRST forward is actual public text owned with the same real lane;
         // no tokenized/reference warmup or alternate encoder is introduced.
         var owned = try pipeline.embedOwned(&texts, .{ .outside_execution = true });
         defer owned.deinitOutsideExecution();
+        try std.testing.expectEqual(expected_input_tokens, pipeline.last_input_tokens);
         if (kind == .native) {
             const data = @import("../execution/architecture_session.zig").nativePanelPreparationModelData(session) orelse return error.MissingCanonicalNativeModel;
             if (!@import("../backends/native.zig").useBlas()) {
@@ -8844,6 +8876,7 @@ test "Gemma public text original source task escrow preserves four-row windows c
         original_pipeline.session.model_contract.normalized_text_host_output_width = null;
         const raw = try original_pipeline.embed(&texts);
         defer freeEmbeddingSlices(a, raw);
+        try std.testing.expectEqual(expected_input_tokens, original_pipeline.last_input_tokens);
         try std.testing.expect(owned_trace.shape_count > 0);
         try std.testing.expectEqual(owned_trace.shape_count, raw_trace.shape_count);
         try std.testing.expectEqualDeep(owned_trace.shapes[0..owned_trace.shape_count], raw_trace.shapes[0..raw_trace.shape_count]);

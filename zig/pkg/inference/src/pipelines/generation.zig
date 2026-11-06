@@ -2307,25 +2307,7 @@ pub const NativeDecodeState = graph_mod.decode_state_runtime.NativeDecodeState;
 
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
 
-fn reserveSpeculativeTargetVerification(
-    decode_runtime: *BorrowedDecodeStateRuntime,
-    backend: ops.BackendKind,
-    target_config: gpt_mod.Config,
-    query_len: usize,
-    draft_count: usize,
-) !void {
-    // The qualified resident A4B Metal runtime owns qLen=1 decode only. A
-    // speculative verification pass is genuinely multi-row; do not mutate KV
-    // state or disguise sequential decode as batched verification until the
-    // backend exposes a qualified multi-row verify operation.
-    if (backend == .metal and
-        query_len > 1 and
-        gemma4_runtime.isQualifiedA4bArchitecture(target_config))
-    {
-        return error.Gemma4A4bMetalSpeculativeVerificationNotQualified;
-    }
-    _ = try decode_runtime.appendGeneratedTokens(draft_count);
-}
+const reserveSpeculativeTargetVerification = decoder_forward.reserveSpeculativeTargetVerification;
 
 const retryDirectPrefillAfterMemoryBudgetExceeded = decoder_prefill.retryAfterMemoryBudgetExceeded;
 
@@ -6388,19 +6370,13 @@ pub const NativeGenerationPipeline = struct {
             _ = di;
             // Run draft model forward on the last token
             const draft_seq = seq_len.* + draft_count;
-            const draft_query_len: usize = if (draft_runtime.kvView() != null and draft_count > 0) 1 else if (draft_runtime.kvView() != null) 1 else draft_seq;
-            const draft_ctx = draft_runtime.makeDecodeContext(draft_seq, draft_query_len);
-            const draft_input = if (draft_query_len == draft_seq)
-                token_ids[0..draft_seq]
-            else
-                token_ids[draft_seq - 1 .. draft_seq];
+            var draft_decoder = draft_pipeline.physicalDecoder();
+            var draft_logits = try draft_decoder.speculativeDraftLogits(token_ids, draft_seq, draft_decode_state);
+            defer draft_logits.deinit();
 
-            const draft_logits = try draft_pipeline.forwardAllLogits(draft_input, 1, draft_seq, &draft_ctx);
-            defer allocator.free(draft_logits);
-
-            // Greedy sample from draft
-            const last_offset = (draft_query_len - 1) * draft_pipeline.gpt_config.vocab_size;
-            const draft_token = activations.argmax(draft_logits[last_offset..][0..draft_pipeline.gpt_config.vocab_size]);
+            // Greedy proposal remains task policy; the runtime selects the
+            // physical query and returns its last logical vocabulary row.
+            const draft_token = activations.argmax(draft_logits.last());
 
             draft_tokens[draft_count] = @intCast(draft_token);
             token_ids[seq_len.* + draft_count] = @intCast(draft_token);
@@ -6426,43 +6402,18 @@ pub const NativeGenerationPipeline = struct {
         // We need logits for positions seq_len-1 .. seq_len+draft_count-1
         // (seq_len-1 gives us the logit that should predict token_ids[seq_len],
         //  and so on through seq_len+draft_count-1 which predicts the bonus token)
-        const verify_len = draft_count + 1; // +1 so we get logits for the last draft token too
         const verify_seq = seq_len.* + draft_count;
 
-        const target_query_len: usize = if (decode_runtime.kvView() != null) verify_len else verify_seq;
-        // Validate the real batched shape before extending target KV. The A4B
-        // prepared decoder is currently qLen=1-only and must fail closed here.
-        try reserveSpeculativeTargetVerification(
-            &decode_runtime,
-            self.cb.kind(),
-            self.gpt_config,
-            target_query_len,
-            draft_count,
-        );
-        const target_ctx = decode_runtime.makeDecodeContext(verify_seq, target_query_len);
-        // Input: the last token before drafts + all draft tokens
-        const verify_start = if (target_query_len == verify_seq) 0 else verify_seq - target_query_len;
-        const verify_input = token_ids[verify_start..verify_seq];
-
-        const target_logits = self.forwardAllLogits(
-            verify_input,
-            1,
-            verify_seq,
-            &target_ctx,
-        ) catch |err| {
-            // On failure, roll back the KV extensions
-            decode_runtime.truncateGeneratedTokens(draft_count) catch {};
-            draft_runtime.truncateGeneratedTokens(draft_count) catch {};
-            return err;
-        };
-        defer allocator.free(target_logits);
+        var target_decoder = self.physicalDecoder();
+        var target_logits = try target_decoder.speculativeVerificationLogits(token_ids, verify_seq, draft_count, decode_state, draft_decode_state);
+        defer target_logits.deinit();
 
         const verify_result = try self.acceptVerifiedDraftTokens(
             token_ids,
             seq_len.*,
             draft_tokens[0..draft_count],
-            target_logits,
-            target_query_len,
+            target_logits.values,
+            target_logits.query_rows,
             config,
             &round_penalties,
             token_table,
@@ -11351,6 +11302,30 @@ test "speculative draft A4B multi-row verification fails before target state mut
     var allowed_runtime = BorrowedDecodeStateRuntime.init(&allowed_state);
     try reserveSpeculativeTargetVerification(&allowed_runtime, .cuda, a4b_config, 5, 4);
     try std.testing.expectEqual(@as(usize, 6), allowed_state.total_tokens);
+
+    if (comptime !build_options.enable_native) return;
+    // A pre-forward capability refusal must retire the draft suffix without
+    // truncating target tokens which were never reserved. The kind override
+    // only exercises refusal; no Metal numerical callback is invoked.
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(std.testing.allocator);
+    defer model.deinit(std.testing.allocator);
+    var pipeline = model.pipeline(std.testing.allocator, a4b_config);
+    const Refused = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .metal;
+        }
+    };
+    var table = PreparedEmbeddingsTestModel.native_compute.vtable_impl;
+    table.backendKind = Refused.kind;
+    pipeline.cb.vtable = &table;
+    var decoder = pipeline.physicalDecoder();
+    var draft_state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer draft_state.deinit();
+    try draft_state.notePrefill(3);
+    try std.testing.expectError(error.Gemma4A4bMetalSpeculativeVerificationNotQualified, decoder.speculativeVerificationLogits(&.{ 0, 0, 0 }, 3, 1, &blocked_state, &draft_state));
+    try std.testing.expectEqual(@as(usize, 2), blocked_state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 2), draft_state.total_tokens);
 }
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -14792,6 +14767,14 @@ test "physical materialization rolls back paged KV reservations on failed forwar
     try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
     try std.testing.expectEqual(@as(usize, 2), manager.tokenCount(state.sequence_id.?).?);
     try std.testing.expectEqual(@as(usize, 1), state.kvView().?.logical_block_count);
+    var draft_state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer draft_state.deinit();
+    try draft_state.notePrefill(3);
+    try std.testing.expectError(error.MissingWeight, decoder.speculativeVerificationLogits(&ids, 3, 1, &state, &draft_state));
+    try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 2), draft_state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 2), manager.tokenCount(state.sequence_id.?).?);
+    try std.testing.expectEqual(@as(usize, 2), manager.tokenCount(draft_state.sequence_id.?).?);
 }
 
 test "pipelined decode arm enters the actual published execution lane" {
@@ -15462,4 +15445,64 @@ test "cooperative decode publication cancels only the expired row after a shared
     try std.testing.expect(x.logits == null and x.ready.load(.acquire));
     defer a.free(y.logits.?);
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, y.logits.?);
+}
+
+test "speculative runtime query windows match original cached and recomputed physical forwards" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    try model.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try model.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 1, 0, 0, 0, 0, 1, 0, 0 });
+    var pipeline = model.pipeline(a, .{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .intermediate_size = 8, .vocab_size = 2, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope });
+    var decoder = pipeline.physicalDecoder();
+    const ids = [_]i64{ 0, 1, 0, 1 };
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 4, .store_cpu_bytes = false });
+    for ([_]bool{ false, true }) |paged| {
+        var target = if (paged) NativeDecodeState.initPaged(a, &manager, pool, null) else NativeDecodeState.initContiguous(a);
+        defer target.deinit();
+        var draft = if (paged) NativeDecodeState.initPaged(a, &manager, pool, null) else NativeDecodeState.initContiguous(a);
+        defer draft.deinit();
+        try target.notePrefill(2);
+        try draft.notePrefill(2);
+        var draft_physical = BorrowedDecodeStateRuntime.init(&draft);
+        const draft_rows: usize = if (paged) 1 else 2;
+        const draft_context = draft_physical.makeDecodeContext(2, draft_rows);
+        const expected_draft = try pipeline.forwardAllLogits(ids[2 - draft_rows .. 2], 1, 2, &draft_context);
+        defer a.free(expected_draft);
+        // The draft output allocator is deliberately distinct from the target
+        // task allocator. Retirement must use the real producer's allocator.
+        var draft_outputs = std.testing.FailingAllocator.init(a, .{});
+        var draft_pipeline = model.pipeline(draft_outputs.allocator(), pipeline.gpt_config);
+        var draft_decoder = draft_pipeline.physicalDecoder();
+        {
+            var actual_draft = try draft_decoder.speculativeDraftLogits(&ids, 2, &draft);
+            defer actual_draft.deinit();
+            try std.testing.expectEqual(draft_rows, actual_draft.query_rows);
+            try std.testing.expectEqualSlices(f32, expected_draft, actual_draft.values);
+            try std.testing.expectEqualSlices(f32, expected_draft[(draft_rows - 1) * 2 ..][0..2], actual_draft.last());
+        }
+        try std.testing.expect(draft_outputs.allocated_bytes > 0);
+        try std.testing.expectEqual(draft_outputs.allocated_bytes, draft_outputs.freed_bytes);
+        try std.testing.expectEqual(@as(usize, 2), draft.total_tokens);
+        try draft.appendGeneratedTokens(2);
+        var actual_verify = try decoder.speculativeVerificationLogits(&ids, 4, 2, &target, &draft);
+        defer actual_verify.deinit();
+        const verify_rows: usize = if (paged) 3 else 4;
+        var target_physical = BorrowedDecodeStateRuntime.init(&target);
+        const verify_context = target_physical.makeDecodeContext(4, verify_rows);
+        const expected_verify = try pipeline.forwardAllLogits(ids[4 - verify_rows ..], 1, 4, &verify_context);
+        defer a.free(expected_verify);
+        try std.testing.expectEqual(verify_rows, actual_verify.query_rows);
+        try std.testing.expectEqualSlices(f32, expected_verify, actual_verify.values);
+        try std.testing.expectEqual(@as(usize, 4), target.total_tokens);
+        try std.testing.expectEqual(@as(usize, 4), draft.total_tokens);
+        if (paged) {
+            try std.testing.expectEqual(@as(usize, 4), manager.tokenCount(target.sequence_id.?).?);
+            try std.testing.expectEqual(@as(usize, 4), manager.tokenCount(draft.sequence_id.?).?);
+        }
+    }
 }

@@ -110,6 +110,10 @@ preparation API do not by themselves complete these remaining requirements:
   owners retain their existing envelopes. CUDA prepared projections declare
   supported reduced/packed conversions and vendor workspace; these declarations
   preserve their tuned launches rather than replacing them with generic math.
+  Ordinary F32 matrix multiplication stages a dynamic RHS transpose in assigned
+  workspace and reuses the projection family's original SIMT/vendor policy.
+  The current RHS is validated on every invocation rather than treated as an
+  immutable cached weight; transpose and vendor workspace remain disjoint.
   Eligible CUDA frames capture stable output, workspace, mutable-input and
   immutable-literal banks. Binding roles, exact context identity, immutable
   handle ownership and copy/launch costs gate admission. Explicit literal
@@ -182,6 +186,11 @@ preparation API do not by themselves complete these remaining requirements:
   output bank. Compatibility row copies declare their exact packet, input and
   allocator-header overlap before execution; admission checks the complete
   request against the actual retained allocator owner after trimming.
+  Before reserving a partial task floor, metadata-only preflight rejects a
+  known impossible sum of that floor and the mandatory fresh output bank.
+  This grants no quota; otherwise feasible requests retain ordinary contention
+  and each Source still admits its complete execution geometry. Token usage
+  follows successful output consumption and survives scoped wrapper teardown.
   `execution/submission.zig` owns command scopes, preserving foreign batches,
   cancelling only owned unsubmitted work and avoiding replay after submission
   errors. Nine generic command callbacks live in `CommandSubmissionRegion`;
@@ -212,7 +221,11 @@ preparation API do not by themselves complete these remaining requirements:
   `execution/decoder_forward.zig` owns logits/hidden-state and compiled token
   dispatch behind a borrowed runtime context, without task or tokenizer
   dependencies. It derives eager query geometry from live decode state and
-  selects compiled token or logits execution. Resident token slots own handoff,
+  selects compiled token or logits execution. Ordinary speculative draft and
+  verification queries also use that owner for physical windows, target
+  reservation and failed-forward rollback. Host logit windows retain their
+  producer allocator; proposal acceptance and prefix selection remain task
+  policy. Resident token slots own handoff,
   readback and cancellation-independent retirement across ordinary and pending
   decode. Generation supplies semantic eligibility, schedules turns and publishes
   results. Native whole-model execution shares the last-logits implementation;
@@ -222,6 +235,8 @@ preparation API do not by themselves complete these remaining requirements:
   Metal and generation reuse it while explicitly preserving architectural versus
   compact stored-layer layouts and host-mirror choices. Remaining specialized
   task transitions and compatibility arenas retain their explicit owners.
+  Generated-token append still spans manager/storage allocation and trimming;
+  failure atomicity across those owners requires a prepared state transaction.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU

@@ -213,6 +213,39 @@ pub const EagerStepRequest = struct {
 /// allocator and retain the ordinary task sampler/grammar path.
 pub const EagerStepResult = union(enum) { token: usize, logits: []f32 };
 
+/// A synchronous host logit window owned by the actual invocation allocator.
+/// Task code may sample rows without reconstructing the physical query layout.
+pub const SpeculativeLogits = struct {
+    allocator: std.mem.Allocator,
+    values: []f32,
+    query_rows: usize,
+    vocabulary_size: usize,
+
+    pub fn last(self: *const SpeculativeLogits) []const f32 {
+        return self.values[(self.query_rows - 1) * self.vocabulary_size ..][0..self.vocabulary_size];
+    }
+
+    pub fn deinit(self: *SpeculativeLogits) void {
+        self.allocator.free(self.values);
+        self.* = undefined;
+    }
+};
+
+pub fn reserveSpeculativeTargetVerification(
+    decode_runtime: *BorrowedDecodeStateRuntime,
+    backend: ops.BackendKind,
+    target_config: @import("../models/gpt.zig").Config,
+    query_len: usize,
+    draft_count: usize,
+) !void {
+    // Qualified A4B Metal currently owns qLen=1 only. Reject the actual
+    // multi-row shape before changing target KV; never replay it sequentially.
+    if (backend == .metal and query_len > 1 and
+        @import("../architectures/gemma4_runtime.zig").isQualifiedA4bArchitecture(target_config))
+        return error.Gemma4A4bMetalSpeculativeVerificationNotQualified;
+    _ = try decode_runtime.appendGeneratedTokens(draft_count);
+}
+
 pub const Runtime = struct {
     fn classifyDeviceStep(result: DeviceStepResult) @import("invocation_observation.zig").ResultClassification {
         return .{ .unsupported = result == .declined };
@@ -817,6 +850,34 @@ pub const Runtime = struct {
     fn forwardAllLogits(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
         var fallback_count: u64 = 0;
         return graph_mod.decoder_step_executor.forwardAll(&self.context, self.graph_cache, input_ids, batch, seq_len, decode_context, self.replay_fallbacks orelse &fallback_count);
+    }
+
+    /// Draft KV is already positioned by the task's previous accepted proposal.
+    /// Cached execution consumes one token; uncached execution recomputes history.
+    pub fn speculativeDraftLogits(self: *Runtime, history: []const i64, sequence_length: usize, state: *NativeDecodeState) !SpeculativeLogits {
+        var physical = BorrowedDecodeStateRuntime.init(state);
+        const query_rows: usize = if (physical.kvView() != null) 1 else sequence_length;
+        const decode = physical.makeDecodeContext(sequence_length, query_rows);
+        const input = history[sequence_length - query_rows .. sequence_length];
+        return .{ .allocator = self.context.allocator, .values = try self.forwardAllLogits(input, 1, sequence_length, &decode), .query_rows = query_rows, .vocabulary_size = self.context.gpt_config.vocab_size };
+    }
+
+    /// Reserve and forward the true target verification window. Failed physical
+    /// execution restores both target and draft reservations in the original order;
+    /// successful acceptance and prefix rollback remain task decisions.
+    pub fn speculativeVerificationLogits(self: *Runtime, history: []const i64, sequence_length: usize, draft_count: usize, state: *NativeDecodeState, draft_state: *NativeDecodeState) !SpeculativeLogits {
+        var physical = BorrowedDecodeStateRuntime.init(state);
+        var draft = BorrowedDecodeStateRuntime.init(draft_state);
+        const query_rows: usize = if (physical.kvView() != null) draft_count + 1 else sequence_length;
+        // Draft proposals already reserved these tokens. Even an admission or
+        // capability failure before target reservation must retire that suffix.
+        errdefer draft.truncateGeneratedTokens(draft_count) catch {};
+        try reserveSpeculativeTargetVerification(&physical, self.context.cb.kind(), self.context.gpt_config.*, query_rows, draft_count);
+        errdefer physical.truncateGeneratedTokens(draft_count) catch {};
+        const decode = physical.makeDecodeContext(sequence_length, query_rows);
+        const input = history[sequence_length - query_rows .. sequence_length];
+        const values = try self.forwardAllLogits(input, 1, sequence_length, &decode);
+        return .{ .allocator = self.context.allocator, .values = values, .query_rows = query_rows, .vocabulary_size = self.context.gpt_config.vocab_size };
     }
 
     pub fn rejectUnsupportedDeepSeekV4GraphMode(self: *const Runtime) !void {
