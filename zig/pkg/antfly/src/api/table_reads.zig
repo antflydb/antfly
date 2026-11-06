@@ -7580,17 +7580,19 @@ pub const HostedProvisionedTableReadSource = struct {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
             defer route.deinit(alloc);
 
+            // A retained cover is executed completely by its current carrier;
+            // remerging a cursor page cannot infer exhaustion from total_hits,
+            // which deliberately counts matches before the cursor.
+            const retained_cover = req.native_query_cut != null and !req.native_query_cut.?.create;
             // Like the provisioned source, only bypass the coordinator when no
             // coordinator-side finalization (reranking, pruning, hit
             // evaluation, projection receipts, algebraic joins) is requested;
             // the physical owner does not apply those transforms.
-            if (route == .local and !ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(req))
+            if (route == .local and (retained_cover or !ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(req)))
                 return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), consistency);
-            // A retained cover is executed completely by its current carrier.
-            // Preserve its finalized response when the carrier is remote too;
-            // remerging a cursor page cannot infer exhaustion from total_hits,
-            // which deliberately counts matches before the cursor.
-            if (req.native_query_cut != null and !req.native_query_cut.?.create)
+            // Preserve a retained cover's finalized response when the carrier
+            // is remote too.
+            if (retained_cover and route == .remote)
                 return try queryResponseRemote(self.internalExecutor(), alloc, route.remote.base_uri, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name));
         }
 
