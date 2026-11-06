@@ -22,12 +22,15 @@ pub const PublishedArtifacts = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
+    requested_root: []u8,
     receipt: ?managed.ValidatedReceipt,
     publication: ?[32]u8,
     verified_stamps: []?managed.ArtifactStamp = &.{},
     canonical_index: std.StringHashMapUnmanaged(usize) = .empty,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected) !PublishedArtifacts {
+        const requested_root = try absolutePath(a, io, root);
+        errdefer a.free(requested_root);
         var receipt = try managed.loadValidated(a, io, root);
         errdefer if (receipt) |*value| value.deinit();
         const publication = if (receipt) |value| value.publication_generation else null;
@@ -37,9 +40,10 @@ pub const PublishedArtifacts = struct {
         if (receipt) |value| for (value.artifacts, 0..) |artifact, i| try index.put(a, artifact.canonical_path, i);
         const verified = try a.alloc(?managed.ArtifactStamp, if (receipt) |value| value.artifacts.len else 0);
         @memset(verified, null);
-        return .{ .allocator = a, .io = io, .root = root, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
+        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
     }
     pub fn deinit(self: *PublishedArtifacts) void {
+        self.allocator.free(self.requested_root);
         self.allocator.free(self.verified_stamps);
         self.canonical_index.deinit(self.allocator);
         if (self.receipt) |*receipt| receipt.deinit();
@@ -61,28 +65,57 @@ pub const PublishedArtifacts = struct {
         }
     }
     pub fn read(self: *const PublishedArtifacts, relative: []const u8, max_bytes: usize) ![]u8 {
+        if (self.receipt) |*receipt| {
+            const artifact = receipt.find(relative) orelse return error.FileNotFound;
+            return self.readSelected(artifact.canonical_path, artifact, max_bytes);
+        }
         const path = (try self.resolve(relative)) orelse return error.FileNotFound;
         defer self.allocator.free(path);
         return self.readPath(path, max_bytes);
     }
-    /// Read an already selected sidecar and authenticate the exact consumed
-    /// bytes. Managed paths use the normalized canonical receipt contract;
-    /// legacy paths retain containment without requiring a completion receipt.
+    fn absolutePath(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+        if (std.fs.path.isAbsolute(path)) return std.fs.path.resolve(a, &.{path});
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+        defer a.free(cwd);
+        return std.fs.path.resolve(a, &.{ cwd, path });
+    }
+    /// Select by the name captured by this acquisition, never by a new target
+    /// discovered while opening it. Both resolved and logical receipt paths
+    /// retain their original checksum when a leaf/ancestor is retargeted.
+    fn indexForPath(self: *const PublishedArtifacts, path: []const u8) !usize {
+        const absolute = try absolutePath(self.allocator, self.io, path);
+        defer self.allocator.free(absolute);
+        if (self.canonical_index.get(absolute)) |index| return index;
+        if (managed.pathIsWithinRoot(self.requested_root, absolute)) {
+            const offset = self.requested_root.len + @intFromBool(!std.fs.path.isSep(self.requested_root[self.requested_root.len - 1]));
+            if (self.receipt.?.path_index.get(absolute[offset..])) |index| return index;
+        }
+        return error.InvalidManagedDownload;
+    }
+    /// Read an already selected sidecar and authenticate its actual bytes
+    /// against the original member's contract, even if the pathname changes.
     pub fn readPath(self: *const PublishedArtifacts, path: []const u8, max_bytes: usize) ![]u8 {
+        if (self.receipt) |*receipt| {
+            const artifact = &receipt.artifacts[try self.indexForPath(path)];
+            return self.readSelected(path, artifact, max_bytes);
+        }
         const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
         defer self.allocator.free(canonical);
-        const artifact: ?*const managed.ValidatedArtifact = if (self.receipt) |*receipt|
-            &receipt.artifacts[self.canonical_index.get(canonical) orelse return error.InvalidManagedDownload]
-        else legacy: {
-            const root = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.root, self.allocator);
-            defer self.allocator.free(root);
-            if (!managed.pathIsWithinRoot(root, canonical)) return error.ModelArtifactOutsideRoot;
-            break :legacy null;
-        };
+        const root = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.root, self.allocator);
+        defer self.allocator.free(root);
+        if (!managed.pathIsWithinRoot(root, canonical)) return error.ModelArtifactOutsideRoot;
+        return self.readSelected(canonical, null, max_bytes);
+    }
+    fn readSelected(self: *const PublishedArtifacts, path: []const u8, artifact: ?*const managed.ValidatedArtifact, max_bytes: usize) ![]u8 {
+        if (artifact) |member| {
+            const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
+            defer self.allocator.free(canonical);
+            if (!std.mem.eql(u8, canonical, member.canonical_path)) return error.ModelArtifactsChanging;
+        }
         const limit = if (artifact) |member| @min(max_bytes, std.math.cast(usize, member.size) orelse return error.FileTooLarge) else max_bytes;
         // Io.Limit rejects a stream when the limit is reached, so leave one
         // byte of headroom to observe EOF for an exactly sized artifact.
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, canonical, self.allocator, .limited(limit +| 1)) catch |err| switch (err) {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(limit +| 1)) catch |err| switch (err) {
             error.StreamTooLong => return if (artifact != null and artifact.?.size <= max_bytes) error.InvalidManagedDownload else error.FileTooLarge,
             else => return err,
         };
@@ -95,10 +128,13 @@ pub const PublishedArtifacts = struct {
     /// tensors only while the opened file's complete identity is unchanged.
     fn verifyIndex(self: *PublishedArtifacts, index: usize) !void {
         const artifact = &self.receipt.?.artifacts[index];
-        const expected = artifact.sha256 orelse return;
         const stamp = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(self.io, artifact.canonical_path, .{ .follow_symlinks = false }));
+        if (stamp.kind != .file or stamp.size != artifact.size) return error.InvalidManagedDownload;
         if (self.verified_stamps[index]) |prior| if (std.meta.eql(prior, stamp)) return;
-        self.verified_stamps[index] = try managed.verifyValidatedArtifactSha256AndStamp(self.io, artifact, expected);
+        self.verified_stamps[index] = if (artifact.sha256) |expected|
+            try managed.verifyValidatedArtifactSha256AndStamp(self.io, artifact, expected)
+        else
+            stamp;
     }
     pub fn verifyFile(self: *PublishedArtifacts, relative: []const u8) !void {
         if (self.receipt) |*receipt| {
@@ -111,10 +147,11 @@ pub const PublishedArtifacts = struct {
     /// read(). They must belong to the same receipt as the graph itself.
     pub fn verifyPath(self: *PublishedArtifacts, path: []const u8) !void {
         if (self.receipt != null) {
+            const index = try self.indexForPath(path);
             const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
             defer self.allocator.free(canonical);
-            const index = self.canonical_index.get(canonical) orelse return error.InvalidManagedDownload;
-            try self.verifyIndex(index);
+            if (!std.mem.eql(u8, canonical, self.receipt.?.artifacts[index].canonical_path)) return error.ModelArtifactsChanging;
+            try self.verifyIndex(self.canonical_index.get(canonical).?);
         }
     }
     /// Authenticate the complete graph dependency set before a pathname-based
@@ -246,4 +283,79 @@ test "model selection canonical aliases retain the strongest checksum in either 
             try std.testing.expectError(error.ChecksumMismatch, published.read("model.onnx", 8));
         }
     }
+}
+
+test "model selection reads retain artifact identity after leaf and ancestor retargets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |ancestor| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "first");
+        try tmp.dir.createDirPath(io, "second");
+        try tmp.dir.writeFile(io, .{ .sub_path = "first/model.onnx", .data = "aaaa" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "second/model.onnx", .data = "bbbb" });
+        var first: [32]u8 = undefined;
+        var second: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("aaaa", &first, .{});
+        std.crypto.hash.sha2.Sha256.hash("bbbb", &second, .{});
+        const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .artifacts = .{
+            .{ .path = "first/model.onnx", .size = @as(u64, 4), .sha256 = std.fmt.bytesToHex(first, .lower) },
+            .{ .path = "second/model.onnx", .size = @as(u64, 4), .sha256 = std.fmt.bytesToHex(second, .lower) },
+        } }, .{});
+        defer a.free(receipt);
+        try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = receipt });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var artifacts = try PublishedArtifacts.init(a, io, root, null);
+        defer artifacts.deinit();
+        const selected_path = (try artifacts.resolve("first/model.onnx")).?;
+        defer a.free(selected_path);
+        const original = try artifacts.readPath(selected_path, 4);
+        defer a.free(original);
+        try std.testing.expectEqualStrings("aaaa", original);
+        if (ancestor) {
+            try tmp.dir.rename("first", tmp.dir, "saved", io);
+            try tmp.dir.symLink(io, "second", "first", .{ .is_directory = true });
+        } else {
+            try tmp.dir.deleteFile(io, "first/model.onnx");
+            try tmp.dir.symLink(io, "../second/model.onnx", "first/model.onnx", .{});
+        }
+        try std.testing.expectError(error.ModelArtifactsChanging, artifacts.read("first/model.onnx", 4));
+        try std.testing.expectError(error.ModelArtifactsChanging, artifacts.readPath(selected_path, 4));
+        try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verifyPath(selected_path));
+        const other = try artifacts.read("second/model.onnx", 4);
+        defer a.free(other);
+        try std.testing.expectEqualStrings("bbbb", other);
+    }
+}
+
+test "model selection logical paths keep receipt identity through a directory alias" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "installed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "installed/model.onnx", .data = "data" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "installed/.antfly-download-complete.json", .data =
+        \\{"version":2,"artifacts":[{"path":"model.onnx","size":4}]}
+    });
+    try tmp.dir.symLink(io, "installed", "alias", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "alias" });
+    defer a.free(alias);
+    const logical = try std.fs.path.join(a, &.{ alias, "model.onnx" });
+    defer a.free(logical);
+    var artifacts = try PublishedArtifacts.init(a, io, alias, null);
+    defer artifacts.deinit();
+    const bytes = try artifacts.readPath(logical, 4);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("data", bytes);
+    try artifacts.verifyPath(logical);
+    try artifacts.verify();
+    // Checksum-free receipts still fence size/kind and subsequent replacement.
+    try tmp.dir.writeFile(io, .{ .sub_path = "installed/model.onnx", .data = "longer" });
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+    try std.testing.expectError(error.InvalidManagedDownload, artifacts.verifyPath(logical));
 }
