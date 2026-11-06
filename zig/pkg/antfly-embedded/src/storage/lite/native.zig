@@ -14611,19 +14611,239 @@ test "lite native recovery falls back past a torn higher-sequence slot" {
     try std.testing.expect((try file.check()).valid);
 }
 
-// Three tests against the now-correctly-scoped manifest window lived here:
-// a small commit taking the manifest path with an oversized one falling
-// back to presynced; a deferred commit not leaving flushTransactionWrites'
-// page reservation unwritten; and a durable commit's manifest catching a
-// torn page from an *earlier* non-durable commit in the same
-// since-last-durable window (recovery correctly reverts to the checkpoint
-// from before any of them). All three passed. They were removed because
-// manifest_commits_enabled is false again (see its doc comment for why:
-// a reused-but-never-written page surfaced by the debug cross-check
-// against real DB-layer traffic, not yet root-caused) and with it off
-// `allow_manifest_reservation` never fires, so none of the three would
-// exercise anything. Restore them -- the commit history has the exact
-// text -- alongside re-enabling the flag.
+// WS1(b) required tests, restored (and extended) now that
+// manifest_commits_enabled is true. Bare `file.putDocument`/
+// `putDocumentBatch` calls with no open transaction never reach
+// commitTransactionWithDurability at all -- indexed_reclamation files
+// route them through putIndexedDocumentBatch's own hand-rolled
+// publishCheckpoint(next, false) (always presynced, pre-dating and
+// independent of this feature; see "lite native durable commit costs
+// two syncs after dropping the active_checkpoint hint" above, which
+// still correctly asserts 2 there). Every test below wraps its writes
+// in an explicit beginTransaction/commitTransaction pair so `putDocument`
+// takes the staged-transaction path instead and actually exercises
+// flushTransactionWrites/tryBuildCommitManifest.
+
+test "lite native small durable commit builds a manifest and costs one sync" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-small-commit.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+
+    const before = file.test_sync_calls.load(.monotonic);
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "durable");
+        try file.commitTransaction();
+    }
+    try std.testing.expectEqual(@as(u64, 1), file.test_sync_calls.load(.monotonic) - before);
+
+    const slot = file.activeCheckpoint();
+    try std.testing.expect(!slot.presynced);
+    try std.testing.expect(slot.manifest_page != 0);
+    try std.testing.expect((try file.check()).valid);
+    const value = (try file.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("durable", value);
+}
+
+test "lite native oversized commit falls back to presynced with two syncs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-oversized-commit.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+
+    // One value spanning more than max_single_sync_pages value-chain pages,
+    // all written inside one transaction: tryBuildCommitManifest must give
+    // up (too many entries to list) and fall back to the historical
+    // presync-then-slot-sync order.
+    const large = try allocator.alloc(u8, (max_single_sync_pages + 64) * 4000);
+    defer allocator.free(large);
+    @memset(large, 'v');
+
+    const before = file.test_sync_calls.load(.monotonic);
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("big", large);
+        try file.commitTransaction();
+    }
+    try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+
+    const slot = file.activeCheckpoint();
+    try std.testing.expect(slot.presynced);
+    try std.testing.expectEqual(@as(u64, 0), slot.manifest_page);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native manifest catches a torn page from an earlier non-durable commit in the same window" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-window-torn-page.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "stable");
+        try file.commitTransaction();
+    }
+    const stable_sequence = file.activeCheckpoint().commit_sequence;
+
+    // A non-durable commit inside the same since-last-durable window: it
+    // still writes real pages through the ordinary tracked hook, and
+    // manifest_builder keeps tracking them even though this attempt never
+    // calls tryBuildCommitManifest/publishCheckpoint's real branch. A large
+    // value forces an external value chain: unlike the tiny document/index
+    // structure pages (which the next commit's own unrelated edit to "doc"
+    // can easily revisit and overwrite, erasing the tear before
+    // verification ever runs), a value chain is immutable once written and
+    // belongs only to this document -- nothing else has any reason to
+    // reuse or rewrite it in this short a window.
+    const non_durable_value = try allocator.alloc(u8, 20 * 4000);
+    defer allocator.free(non_durable_value);
+    @memset(non_durable_value, 'n');
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("non-durable-marker", non_durable_value);
+        try file.commitTransactionWithDurability(false);
+    }
+    try std.testing.expect(file.manifest_builder.entries.count() > 0);
+
+    // Tear every page this non-durable commit touched -- the handful of
+    // small structural pages (free map, catalog, index) may well get
+    // rewritten and "repaired" by the next commit's own edit to "doc"
+    // below, but the bulk of these entries are the value chain's own pages
+    // and none of them are.
+    {
+        var it = file.manifest_builder.entries.keyIterator();
+        while (it.next()) |page_id| {
+            // verifyManifest compares the page's *stored* CRC field against
+            // the CRC the manifest recorded at write time; it does not
+            // recompute a fresh CRC from the current payload (full
+            // structural re-verification is the slot's own, separate
+            // check). Corrupting the CRC field itself (not a payload byte)
+            // is what that comparison actually catches.
+            const damaged = page_id.* * @as(u64, file.header.page_size) + page_crc_offset;
+            try file.file.writePositionalAll(file.runtimeIo(), "X", damaged);
+        }
+    }
+
+    // The eventual durable commit's manifest must cover that torn page,
+    // so its slot fails verification on reopen and recovery falls all the
+    // way back to the checkpoint from before either of these two commits.
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "durable-after");
+        try file.commitTransaction();
+    }
+    file.close();
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(stable_sequence, report.commit_sequence);
+
+    var reopened = try NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(stable_sequence, reopened.activeCheckpoint().commit_sequence);
+    const recovered = (try reopened.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings("stable", recovered);
+}
+
+// WS1(b) required test: "when the slot is durable but its pages were
+// dropped, the manifest check fails and recovery falls back."
+test "lite native recovery falls back and truncates when a manifest-listed page is dropped" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "manifest-dropped-page.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "stable");
+        try file.commitTransaction();
+    }
+    const stable_sequence = file.activeCheckpoint().commit_sequence;
+    const stable_page_count = file.activeCheckpoint().page_count;
+
+    {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", "newest");
+        try file.commitTransaction();
+    }
+    const newest = file.activeCheckpoint();
+    try std.testing.expect(!newest.presynced);
+    try std.testing.expect(newest.manifest_page != 0);
+
+    // Corrupt every page this commit wrote (everything from the previous
+    // frontier up to the new one), except the manifest page itself and the
+    // slot: both of their own CRCs stay intact, so only verifyManifest's
+    // per-entry CRC check over the data pages it lists can catch this.
+    var candidate = stable_page_count;
+    while (candidate < newest.page_count) : (candidate += 1) {
+        if (candidate == newest.manifest_page) continue;
+        // See the matching comment in the earlier window test: corrupt the
+        // stored CRC field itself, which is what verifyManifest compares,
+        // not a payload byte (a full structural re-check is the slot's own
+        // separate, different concern).
+        const damaged = candidate * @as(u64, file.header.page_size) + page_crc_offset;
+        try file.file.writePositionalAll(file.runtimeIo(), "X", damaged);
+    }
+    file.close();
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(stable_sequence, report.commit_sequence);
+    try std.testing.expectEqual(stable_page_count, report.page_count);
+
+    var reopened = try NativeFile.openWithIo(allocator, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(stable_sequence, reopened.activeCheckpoint().commit_sequence);
+    const recovered = (try reopened.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings("stable", recovered);
+}
+
+// WS1(b) required test: "a v8 build refuses a v7 file" (design doc §3.1).
+test "lite native indexed open refuses a pre-v8 format version" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-pre-v8-indexed.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+        file.close();
+    }
+    {
+        var raw_version: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw_version, indexed_format_version - 1, .little);
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.writePositionalAll(std.testing.io, &raw_version, version_offset);
+    }
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(allocator, path, true));
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(allocator, path, false));
+}
 
 test "lite native create writes inspectable aflite file" {
     const allocator = std.testing.allocator;
