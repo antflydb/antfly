@@ -537,6 +537,15 @@ pub fn createExecutorFromSerializedExecutableWithShapes(
     );
 }
 
+fn validateInputNodes(graph: *const Graph, bindings: []const compiler.InputBinding) !void {
+    for (bindings) |binding| switch (binding) {
+        .graph_node => |node_id| {
+            if (node_id >= graph.nodeCount()) return error.MissingArtifactMetadata;
+        },
+        .embedding_ids, .semantic_past_graph_node => {},
+    };
+}
+
 fn createExecutorFromLoadedExecutable(
     allocator: Allocator,
     graph: *const Graph,
@@ -548,6 +557,7 @@ fn createExecutorFromLoadedExecutable(
     host_backend: *const ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
 ) !*PjrtExecutor {
+    try validateInputNodes(graph, input_bindings_source);
     const num_inputs = input_bindings_source.len;
     const num_outputs = output_node_ids_source.len;
     if (input_shapes_source) |shapes| {
@@ -686,6 +696,10 @@ pub const PjrtRetainedBufferCache = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     owns_entries: bool = true,
     fixed_capacity: bool = false,
+    // Open-addressed table of entry index + 1, at less than 50% occupancy.
+    // Admitted runtime slots own this storage; reset clears it without allocating.
+    // Layerless bindings use their name as part of the semantic identity.
+    semantic_index: []usize = &.{},
 
     pub const Entry = struct {
         name: []const u8,
@@ -715,6 +729,7 @@ pub const PjrtRetainedBufferCache = struct {
             if (entry.owns_name) self.allocator.free(entry.name);
         }
         self.entries.clearRetainingCapacity();
+        @memset(self.semantic_index, 0);
     }
 
     pub fn len(self: *const PjrtRetainedBufferCache) usize {
@@ -732,6 +747,11 @@ pub const PjrtRetainedBufferCache = struct {
         self: *const PjrtRetainedBufferCache,
         binding: PjrtSemanticInputBinding,
     ) ?*const pjrt_lib.pjrt.Buffer {
+        if (self.semantic_index.len != 0) {
+            const slot = self.semanticSlot(binding.name, binding.layer_index, binding.kind);
+            const index = self.semantic_index[slot];
+            return if (index == 0) null else &self.entries.items[index - 1].buffer;
+        }
         if (self.get(binding.name)) |buffer| return buffer;
         for (self.entries.items) |*entry| {
             if (retainedEntryMatchesSemanticInput(entry.*, binding)) return &entry.buffer;
@@ -756,9 +776,23 @@ pub const PjrtRetainedBufferCache = struct {
         try self.putName(name, false, layer_index, kind, buffer);
     }
 
+    fn semanticSlot(self: *const @This(), name: []const u8, layer: ?u32, kind: PjrtRetainedBufferKind) usize {
+        var h = std.hash.Wyhash.init(0);
+        if (layer) |value| h.update(std.mem.asBytes(&value)) else h.update(name);
+        h.update(std.mem.asBytes(&kind));
+        var slot = h.final() % self.semantic_index.len;
+        while (self.semantic_index[slot] != 0) : (slot = (slot + 1) % self.semantic_index.len) {
+            const entry = self.entries.items[self.semantic_index[slot] - 1];
+            if (entry.layer_index == layer and entry.kind == kind and (layer != null or std.mem.eql(u8, entry.name, name))) break;
+        }
+        return slot;
+    }
+
     fn putName(self: *@This(), name: []const u8, owns_name: bool, layer_index: ?u32, kind: PjrtRetainedBufferKind, buffer: pjrt_lib.pjrt.Buffer) !void {
-        for (self.entries.items) |*entry| {
-            const matches = if (owns_name) std.mem.eql(u8, entry.name, name) else entry.layer_index == layer_index and entry.kind == kind;
+        const indexed_slot: ?usize = if (!owns_name and self.semantic_index.len != 0) self.semanticSlot(name, layer_index, kind) else null;
+        const candidates = if (indexed_slot) |slot| if (self.semantic_index[slot] == 0) self.entries.items[0..0] else self.entries.items[self.semantic_index[slot] - 1 .. self.semantic_index[slot]] else self.entries.items;
+        for (candidates) |*entry| {
+            const matches = if (owns_name) std.mem.eql(u8, entry.name, name) else entry.layer_index == layer_index and entry.kind == kind and (layer_index != null or std.mem.eql(u8, entry.name, name));
             if (!matches) continue;
             entry.buffer.deinit();
             if (entry.owns_name) self.allocator.free(entry.name);
@@ -773,6 +807,7 @@ pub const PjrtRetainedBufferCache = struct {
         }
         if (self.fixed_capacity) {
             if (self.entries.items.len == self.entries.capacity) return error.MissingArtifactMetadata;
+            if (indexed_slot) |slot| self.semantic_index[slot] = self.entries.items.len + 1;
             self.entries.appendAssumeCapacity(.{ .name = name, .owns_name = owns_name, .layer_index = layer_index, .kind = kind, .buffer = buffer });
             return;
         }
@@ -790,7 +825,7 @@ fn retainedEntryMatchesSemanticInput(
     entry: PjrtRetainedBufferCache.Entry,
     binding: PjrtSemanticInputBinding,
 ) bool {
-    return entry.kind == binding.kind and entry.layer_index == binding.layer_index;
+    return entry.kind == binding.kind and entry.layer_index == binding.layer_index and (binding.layer_index != null or std.mem.eql(u8, entry.name, binding.name));
 }
 
 pub const PjrtModelExecutor = struct {
@@ -822,6 +857,7 @@ pub const PjrtModelExecutor = struct {
         busy: std.atomic.Value(bool) = .init(false),
         runtime: PjrtModelRuntime = undefined,
         entries: []PjrtRetainedBufferCache.Entry,
+        semantic_index: []usize,
     };
 
     /// Host metadata for every execution slot is admitted and allocated during
@@ -831,9 +867,16 @@ pub const PjrtModelExecutor = struct {
         const slots = try self.allocator.alloc(RuntimeSlot, capacity);
         errdefer self.allocator.free(slots);
         var initialized: usize = 0;
-        errdefer for (slots[0..initialized]) |slot| self.allocator.free(slot.entries);
+        errdefer for (slots[0..initialized]) |slot| {
+            self.allocator.free(slot.entries);
+            self.allocator.free(slot.semantic_index);
+        };
         for (slots) |*slot| {
-            slot.* = .{ .entries = try self.allocator.alloc(PjrtRetainedBufferCache.Entry, self.retained_capacity) };
+            const entries = try self.allocator.alloc(PjrtRetainedBufferCache.Entry, self.retained_capacity);
+            errdefer self.allocator.free(entries);
+            const index = try self.allocator.alloc(usize, try std.math.add(usize, try std.math.mul(usize, self.retained_capacity, 2), 1));
+            @memset(index, 0);
+            slot.* = .{ .entries = entries, .semantic_index = index };
             initialized += 1;
         }
         self.runtime_slots = slots;
@@ -870,7 +913,7 @@ pub const PjrtModelExecutor = struct {
             .executor = self.executor,
             .host_backend = self.host_backend,
             .input_materialization = self.input_materialization,
-            .retained_buffers = if (selected) |slot| .{ .allocator = self.allocator, .entries = .initBuffer(slot.entries), .owns_entries = false, .fixed_capacity = true } else PjrtRetainedBufferCache.init(allocator),
+            .retained_buffers = if (selected) |slot| .{ .allocator = self.allocator, .entries = .initBuffer(slot.entries), .owns_entries = false, .fixed_capacity = true, .semantic_index = slot.semantic_index } else PjrtRetainedBufferCache.init(allocator),
             .execution_lease = execution_lease,
             .semantic_input_bindings = self.semantic_input_bindings,
             .semantic_output_bindings = self.semantic_output_bindings,
@@ -901,6 +944,7 @@ pub const PjrtModelExecutor = struct {
         for (self.runtime_slots) |slot| {
             std.debug.assert(!slot.busy.load(.acquire));
             allocator.free(slot.entries);
+            allocator.free(slot.semantic_index);
         }
         allocator.free(self.runtime_slots);
         if (self.artifact_owner) |owner| owner.deinit();
@@ -1100,6 +1144,7 @@ const PjrtModelRuntime = struct {
             if (findSemanticInputBinding(phase.semantic_input_bindings, input_index) != null) continue;
             switch (binding) {
                 .graph_node => |node_id| {
+                    if (node_id >= values.len) return error.MissingArtifactMetadata;
                     if (values[@intCast(node_id)] != null) continue;
                     const node = self.graph.node(node_id);
                     if (node.op != .parameter) return error.MissingValue;
@@ -1110,6 +1155,7 @@ const PjrtModelRuntime = struct {
                 },
                 .embedding_ids => {},
                 .semantic_past_graph_node => |node_id| {
+                    if (node_id >= values.len) return error.MissingArtifactMetadata;
                     if (values[@intCast(node_id)] != null) continue;
                 },
             }
@@ -2023,4 +2069,64 @@ test "managed PJRT borrowed KV names replace semantic identities without allocat
     cache.deinit();
     live = false;
     try std.testing.expectEqual(@as(usize, 2), Fake.destroyed);
+}
+
+test "managed PJRT indexed layerless states remain distinct across replacement and reset" {
+    const c = pjrt_lib.c_types;
+    const Fake = struct {
+        fn destroy(_: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[58] = @ptrCast(&Fake.destroy);
+    var entries: [2]PjrtRetainedBufferCache.Entry = undefined;
+    var index: [5]usize = @splat(0);
+    var cache = PjrtRetainedBufferCache{ .allocator = std.testing.failing_allocator, .entries = .initBuffer(&entries), .owns_entries = false, .fixed_capacity = true, .semantic_index = &index };
+    defer cache.deinit();
+    for (0..3) |_| {
+        try cache.putBorrowed("a", null, .key, .{ .api = &api, .handle = @ptrFromInt(1) });
+        try cache.putBorrowed("b", null, .key, .{ .api = &api, .handle = @ptrFromInt(2) });
+        try cache.putBorrowed("a", null, .key, .{ .api = &api, .handle = @ptrFromInt(3) });
+        try std.testing.expectEqual(@as(usize, 2), cache.len());
+        const a = cache.getForSemanticInput(.{ .input_index = 0, .name = "a", .layer_index = null, .kind = .key }).?;
+        const b = cache.getForSemanticInput(.{ .input_index = 1, .name = "b", .layer_index = null, .kind = .key }).?;
+        try std.testing.expectEqual(@as(usize, 3), @intFromPtr(a.handle));
+        try std.testing.expectEqual(@as(usize, 2), @intFromPtr(b.handle));
+        cache.clear();
+    }
+}
+
+test "managed PJRT rejects out of range graph references before materialization" {
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    try std.testing.expectError(error.MissingArtifactMetadata, validateInputNodes(&graph, &.{.{ .graph_node = 2147483647 }}));
+    // Semantic KV IDs refer to the compiled phase, not the host graph.
+    try validateInputNodes(&graph, &.{.{ .semantic_past_graph_node = 2147483647 }});
+}
+
+test "managed PJRT semantic index resolves collisions without allocation" {
+    const c = pjrt_lib.c_types;
+    const Fake = struct {
+        fn destroy(_: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[58] = @ptrCast(&Fake.destroy);
+    var entries: [256]PjrtRetainedBufferCache.Entry = undefined;
+    var index: [513]usize = @splat(0);
+    var cache = PjrtRetainedBufferCache{ .allocator = std.testing.failing_allocator, .entries = .initBuffer(&entries), .owns_entries = false, .fixed_capacity = true, .semantic_index = &index };
+    defer cache.deinit();
+    for (0..2) |_| {
+        for (0..256) |i| try cache.putBorrowed("present", @intCast(i), .key, .{ .api = &api, .handle = @ptrFromInt(i + 1) });
+        for (0..256) |i| {
+            const buffer = cache.getForSemanticInput(.{ .input_index = i, .name = "past", .layer_index = @intCast(i), .kind = .key }).?;
+            try std.testing.expectEqual(i + 1, @intFromPtr(buffer.handle));
+        }
+        try std.testing.expect(cache.getForSemanticInput(.{ .input_index = 0, .name = "absent", .layer_index = 999, .kind = .key }) == null);
+        cache.clear();
+    }
 }

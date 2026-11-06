@@ -613,3 +613,11 @@ Near-term graph/backend work:
 > **Relocated:** The item-by-item graph/backend progress narrative that previously lived here (56 lines) is preserved verbatim in [docs/design/inference/history/graph-current-progress-history.md](../../../docs/design/inference/history/graph-current-progress-history.md). The durable ModelExecutor/ModelRuntime/PartitionExecutor split it described is decision 8 above.
 
 See also: [MULTIDEVICE.md](MULTIDEVICE.md) for multi-device inference, [FINETUNING.md](finetuning/FINETUNING.md) for training support.
+
+Serialized PJRT executables are checked against the provider's native output count
+before use. A sidecar with a mismatched count, out-of-range input graph reference,
+or duplicate semantic ownership of a native output is rejected during loading.
+KV identity is `(layer_index, kind)` when a layer is supplied and `(name, kind)`
+otherwise. Admitted runtime slots preallocate a semantic hash index alongside
+retained entries; KV lookup and replacement require no per-step allocation and
+have expected constant cost per binding. Reset clears both entries and the index.

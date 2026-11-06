@@ -341,6 +341,7 @@ pub const Api = extern struct {
     const FN_CLIENT_COMPILE = 20;
     const FN_CLIENT_BUFFER_FROM_HOST = 22;
     const FN_EXEC_DESTROY = 41;
+    const FN_EXEC_NUM_OUTPUTS = 45;
     const FN_EXEC_SERIALIZE = 49;
     const FN_LOADED_EXEC_DESTROY = 50;
     const FN_LOADED_EXEC_GET_EXECUTABLE = 51;
@@ -445,6 +446,15 @@ pub const Api = extern struct {
         return f(args);
     }
 
+    pub fn executableNumOutputs(self: *const Api, args: *ExecutableNumOutputsArgs) ?*PjrtError {
+        const f = castFn(*const fn (*ExecutableNumOutputsArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_NUM_OUTPUTS].?);
+        return f(args);
+    }
+
+    pub fn hasOutputCount(self: *const Api) bool {
+        return self.hasOwnedExecutableAccess() and self.hasFunction(FN_EXEC_NUM_OUTPUTS);
+    }
+
     pub fn executableSerialize(self: *const Api, args: *ExecutableSerializeArgs) ?*PjrtError {
         const f = castFn(*const fn (*ExecutableSerializeArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_SERIALIZE].?);
         return f(args);
@@ -483,3 +493,10 @@ pub const Api = extern struct {
 
 /// Entry point function exported by PJRT plugins.
 pub const GetPjrtApiFn = *const fn () callconv(.c) *const Api;
+
+pub const ExecutableNumOutputsArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: *PjrtExecutable,
+    num_outputs: usize,
+};

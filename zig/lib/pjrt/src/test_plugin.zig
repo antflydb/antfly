@@ -101,6 +101,10 @@ fn serialize(args: *c.ExecutableSerializeArgs) callconv(.c) ?*c.PjrtError {
     args.serialized_executable_deleter = &deleteSerialized;
     return null;
 }
+fn numOutputs(args: *c.ExecutableNumOutputsArgs) callconv(.c) ?*c.PjrtError {
+    args.num_outputs = if (@as(*const u8, @ptrCast(args.executable)).* == 0) 1 else 3;
+    return null;
+}
 fn stats(args: *c.ExecutableGetCompiledMemoryStatsArgs) callconv(.c) ?*c.PjrtError {
     args.generated_code_size_in_bytes = 64;
     args.argument_size_in_bytes = 4096;
@@ -178,6 +182,7 @@ var api: c.Api = blk: {
     value._fns[16] = @ptrCast(&addressable);
     value._fns[20] = @ptrCast(&compile);
     value._fns[22] = @ptrCast(&upload);
+    value._fns[45] = @ptrCast(&numOutputs);
     value._fns[41] = @ptrCast(&destroyExecutable);
     value._fns[49] = @ptrCast(&serialize);
     value._fns[50] = @ptrCast(&destroyLoaded);

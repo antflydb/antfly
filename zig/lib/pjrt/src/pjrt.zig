@@ -29,6 +29,7 @@ pub const PjrtError = error{
     NoDevices,
     UnsupportedPjrtFeature,
     InvalidMemoryStats,
+    OutputCountMismatch,
 };
 
 /// Compiler-reported single-device execution footprint. Keep inputs and
@@ -597,12 +598,25 @@ pub const Client = struct {
         };
         try checkError(self.api, self.api.executableDeserializeAndLoad(&args));
 
-        return .{
+        var loaded = LoadedExecutable{
             .api = self.api,
             .handle = args.loaded_executable orelse return PjrtError.PjrtApiError,
             .device = self.device,
             .num_outputs = num_outputs,
         };
+        errdefer loaded.deinit();
+        if (!self.api.hasOutputCount()) return error.UnsupportedPjrtFeature;
+        var owned = try loaded.executable();
+        defer owned.deinit();
+        var count = c.ExecutableNumOutputsArgs{
+            .struct_size = @sizeOf(c.ExecutableNumOutputsArgs),
+            .extension_start = null,
+            .executable = owned.handle,
+            .num_outputs = 0,
+        };
+        try checkError(self.api, self.api.executableNumOutputs(&count));
+        if (count.num_outputs != num_outputs) return error.OutputCountMismatch;
+        return loaded;
     }
 
     /// Upload f32 data from host to device, returning a Buffer handle.

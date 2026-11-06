@@ -2656,6 +2656,7 @@ fn preparedArtifactScenario(a: std.mem.Allocator, root: []const u8, artifact: co
         try std.testing.expect(staged.host_weight_bytes >= before.host_weight_bytes + 2 * prepared.encoded_bytes);
         var client = try prepared.createClient(plugin);
         defer client.deinit();
+        try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable(prepared.bytes, 2));
         var executable = try client.deserializeExecutable(prepared.bytes, 1);
         defer executable.deinit();
         const stats = try executable.compiledMemoryStats();
