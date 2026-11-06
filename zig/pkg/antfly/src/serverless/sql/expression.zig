@@ -90,6 +90,7 @@ pub const Program = struct {
     }
     pub fn validate(self: Program, width: usize) !void {
         if ((self.version != 1 and self.version != 2) or self.instructions.len == 0 or self.instructions.len > 4096 or self.root >= self.instructions.len or self.parameterCount() > 256 or (self.parameter_values != null and (self.version != 2 or self.parameters.len != 0))) return error.InvalidSqlDistributedPlan;
+        scalar.validateTypedInstructions(self.instructions, self.root, self.output) catch return error.InvalidSqlDistributedPlan;
         for (self.instructions, 0..) |instruction, index| switch (instruction.operation) {
             .literal => {},
             .column => |ordinal| if (ordinal >= width) return error.InvalidSqlDistributedPlan,
@@ -832,4 +833,25 @@ test "distributed SQL typed parameter ownership unwinds allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Canonical.run, .{&bound});
+}
+
+test "distributed SQL scalar admission rejects malformed calls before cache preparation" {
+    const t: scalar.Type = .{ .kind = .boolean };
+    const malformed: Program = .{ .instructions = &.{.{ .type = t, .operation = .{ .call = .{ .function = .is_missing, .args = &.{} } } }}, .root = 0, .output = t };
+    try std.testing.expectError(error.InvalidSqlDistributedPlan, malformed.validate(1));
+    try std.testing.expectError(error.InvalidSqlProgram, scalar.Program.fromTypedInstructions(std.testing.failing_allocator, malformed.instructions, 0, t, .{}));
+    try std.testing.expectError(error.InvalidSqlProgram, scalar.Program.fromTypedInstructions(std.testing.allocator, malformed.instructions, 0, t, .{}));
+    const invalid_calls = [_]scalar.Instruction{
+        .{ .type = t, .operation = .{ .call = .{ .function = .is_missing, .args = &.{ 0, 0 } } } },
+        .{ .type = t, .operation = .{ .call = .{ .function = .substring, .args = &.{ 0, 0, 0, 0 } } } },
+        .{ .type = t, .operation = .{ .call = .{ .function = .regexp_like, .args = &.{0} } } },
+        .{ .type = t, .operation = .{ .call = .{ .function = .jsonb_build_object, .args = &.{0} } } },
+        .{ .type = t, .operation = .{ .call = .{ .function = .coalesce, .args = &.{} } } },
+        .{ .type = t, .operation = .{ .call = .{ .function = .is_missing, .args = &.{2} } } },
+        .{ .type = .{ .kind = .array, .element_type = .int64 }, .operation = .{ .call = .{ .function = .array_cat, .args = &.{ 0, 0 } } } },
+    };
+    for (invalid_calls) |call| {
+        const instructions = [_]scalar.Instruction{ .{ .type = .{ .kind = .integer }, .operation = .{ .literal = .{ .integer = 1 } } }, call };
+        try std.testing.expectError(error.InvalidSqlProgram, scalar.Program.fromTypedInstructions(std.testing.allocator, &instructions, 1, call.type, .{}));
+    }
 }

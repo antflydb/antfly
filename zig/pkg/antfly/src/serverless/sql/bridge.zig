@@ -86,7 +86,7 @@ pub const Bridge = struct {
         if (join.output_order) |order| for (order, projection) |ordinal, *out| {
             out.* = std.math.cast(u16, ordinal) orelse return error.InvalidSqlBackendResponse;
         };
-        const specification = plan.choose(try self.input(scratch, scans[left.index].table, left.source_columns, l, left_filter), try self.input(scratch, scans[right.index].table, right.source_columns, r, right_filter), service.tenant, @min(l.expires_ms, r.expires_ms), .{ .kind = std.meta.stringToEnum(@FieldType(plan.Join, "kind"), @tagName(join.kind)) orelse return null, .left_keys = left_keys[0..join.left_keys.len], .right_keys = right_keys[0..join.right_keys.len], .projection = projection, .condition = condition }, self.limits, service.clock.now()) catch |err| switch (err) {
+        const specification = plan.choosePhysical(scratch, try self.input(scratch, scans[left.index].table, left.source_columns, l, left_filter), try self.input(scratch, scans[right.index].table, right.source_columns, r, right_filter), service.tenant, @min(l.expires_ms, r.expires_ms), .{ .kind = std.meta.stringToEnum(@FieldType(plan.Join, "kind"), @tagName(join.kind)) orelse return null, .left_keys = left_keys[0..join.left_keys.len], .right_keys = right_keys[0..join.right_keys.len], .projection = projection, .condition = condition }, self.limits, service.clock.now()) catch |err| switch (err) {
             error.SqlDistributedJoinUnsupported => return null,
             else => return err,
         };

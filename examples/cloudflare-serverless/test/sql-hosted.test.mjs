@@ -353,3 +353,17 @@ test('WASM scalar V2 retains exact literal identity and prepares typed array par
  assert.ok(complete);
  assert.equal((await host.request({...request,op:'sql_result'})).rows,fixture.expected_rows??2);
 });
+
+test('WASM rejects malformed scalar calls at admission without durable writes', async () => {
+  const fixture = JSON.parse(await readFile(new URL('../dist/sql-fixture.json', import.meta.url)));
+  const buckets = {source: new Bucket(), execution: new Bucket()};
+  for (const object of fixture.objects) await buckets[object.bucket].put(object.key, Buffer.from(object.body_base64, 'base64'));
+  const host = await instantiateHost(module, createR2Transport(buckets), {clock: () => JSON.parse(fixture.raw_plan).expires_ms - 1000});
+  const before = buckets.execution.objects.size;
+  for (const [name, args] of [['is_missing', []], ['regexp_like', []], ['jsonb_build_object', [0]], ['is_missing', [1]]]) {
+    const plan = JSON.parse(fixture.raw_plan);
+    plan.join.condition = {version: 2, instructions: [{type: {kind: 'boolean'}, operation: {call: {function: name, args}}}], root: 0, output: {kind: 'boolean'}};
+    await assert.rejects(host.request({config: fixture.config, tenant: fixture.tenant, owner: 'admission', op: 'sql_submit', raw_plan: JSON.stringify(plan)}), /InvalidSqlDistributedPlan/);
+    assert.equal(buckets.execution.objects.size, before);
+  }
+});

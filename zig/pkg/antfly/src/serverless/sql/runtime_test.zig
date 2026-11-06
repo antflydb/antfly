@@ -38,7 +38,10 @@ const Fixture = struct {
     fn retain(raw: *anyopaque, _: A, spec: plan.Plan, context: Context) !void {
         const self: *Fixture = @ptrCast(@alignCast(raw));
         try context.ensureActive();
-        if (!std.mem.eql(u8, spec.left.snapshot, "old-left") or !std.mem.eql(u8, spec.right.snapshot, "old-right") or spec.left.wal_cut != 7 or spec.right.wal_cut != 8) return error.SqlExecutionUnauthorized;
+        for ([_]plan.Input{ spec.left, spec.right }) |input| {
+            const left = input.table_id == 1;
+            if (!std.mem.eql(u8, input.snapshot, if (left) "old-left" else "old-right") or input.wal_cut != (if (left) @as(u64, 7) else 8)) return error.SqlExecutionUnauthorized;
+        }
         self.retained += 1;
     }
     const InputStream = struct {
@@ -511,6 +514,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         const Self = @This();
         fixture: *Fixture,
         captures: usize = 0,
+        reverse_estimates: bool = false,
         scanned: usize = 0,
         const Read = struct {
             a: A,
@@ -533,7 +537,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
             fn capability(raw: *anyopaque, _: A) !?local.sql_catalog.ReadCapability {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.backend.captures += 1;
-                return .{ .token = "retained-accepted-cut", .schema = @splat('b'), .snapshot = if (self.table == 1) "old-left" else "old-right", .wal_cut = if (self.table == 1) 7 else 8, .expires_ms = 1000000, .estimated_bytes = if (self.table == 1) 400000 else 100, .estimated_rows = if (self.table == 1) 3 else 4 };
+                return .{ .token = "retained-accepted-cut", .schema = @splat('b'), .snapshot = if (self.table == 1) "old-left" else "old-right", .wal_cut = if (self.table == 1) 7 else 8, .expires_ms = 1000000, .estimated_bytes = if ((self.table == 1) != self.backend.reverse_estimates) 400000 else 100, .estimated_rows = if (self.table == 1) 3 else 4 };
             }
             fn close(_: *anyopaque) void {}
             fn next(raw: *anyopaque, a_: A, maximum: u32) !local.sql_catalog.Page {
@@ -624,6 +628,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>5 ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
         .{ .sql = "SELECT l.id, r.id FROM l FULL JOIN r ON l.id=r.id ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id WHERE l.id>1 ORDER BY l.id, r.id" },
+        .{ .sql = "SELECT l.id, r.id FROM l RIGHT JOIN r ON l.id=r.id AND l.id>1 ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
         .{ .sql = "SELECT count(*) AS n FROM l LEFT JOIN r ON l.id=r.id" },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>$1 ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .integer = 5 }} },
         .{ .sql = "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id AND NOT is_missing(r.id) ORDER BY l.id, r.id" },
@@ -631,12 +636,12 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id::numeric < $1::numeric ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .string = "5.00000000000000000001" }} },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id::numeric < 5.00000000000000000001 ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
     };
-    for ([_]bool{ false, true }) |remote| for (queries) |query_case| {
+    for ([_]bool{ false, true }) |reverse_estimates| for ([_]bool{ false, true }) |remote| for (queries) |query_case| {
         const sql = query_case.sql;
         var memory = storage.MemoryClient.init(a);
         defer memory.deinit();
         var fixture: Fixture = .{};
-        var backend: Backend = .{ .fixture = &fixture };
+        var backend: Backend = .{ .fixture = &fixture, .reverse_estimates = reverse_estimates };
         var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
         var bridge: @import("bridge.zig").Bridge = .{ .service = fixture.service(a, memory.client(), "coordinator"), .dispatcher = .{ .ptr = &dispatch, .dispatch = Dispatch.run }, .local_bytes = 0, .limits = .{ .task_output_bytes = 16384 } };
         var remote_service: Remote = .{ .service = bridge.service, .dispatcher = bridge.dispatcher };
@@ -1183,6 +1188,7 @@ test "distributed SQL result manifests checkpoint bounded pages across coordinat
     const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 1000, .splits = 1000 };
     var right = input;
     right.splits = 1;
+    right.table_id = 2;
     right.snapshot = "old-right";
     right.wal_cut = 8;
     const spec: plan.Plan = .{ .tenant = service.tenant, .expires_ms = 1000000, .left = input, .right = right, .join = .{ .left_keys = &.{0}, .right_keys = &.{0} }, .strategy = .broadcast, .partitions = 1, .limits = .{ .task_output_bytes = 4096 } };
@@ -2961,4 +2967,18 @@ test "distributed SQL stale expired and collected task deliveries acknowledge wi
     defer unchanged.deinit(a);
     try std.testing.expectEqual(@as(u32, 1), unchanged.value.stage);
     try std.testing.expectEqual(state.Status.running, unchanged.value.status);
+}
+
+test "distributed SQL malformed scalar submission performs no durable or source operations" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    const service = fixture.service(a, memory.client(), "coordinator");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var spec = try plan.choose(input, input, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, fixture.now);
+    spec.join.condition = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .call = .{ .function = .is_missing, .args = &.{} } } }}, .root = 0, .output = .{ .kind = .boolean } };
+    try std.testing.expectError(error.InvalidSqlDistributedPlan, service.submit(spec));
+    try std.testing.expectEqual(@as(usize, 0), fixture.retained);
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
 }

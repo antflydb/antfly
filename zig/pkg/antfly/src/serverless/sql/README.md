@@ -102,7 +102,10 @@ lifetimes automatically.
 ## Durable protocol
 
 Plans are versioned, pointer-free JSON; scalar fragments contain validated
-instruction DAGs with bound parameter values. Process caches, settings captures,
+instruction DAGs with bound parameter values. A shared scalar validator checks
+operand references, function arities and typed kernel shapes before admission or
+cache preparation; malformed submissions perform no source retention or durable
+writes. Runtime errors in undemanded branches remain lazy. Process caches, settings captures,
 external AI calls, and relation-node pointers are not serialized. Parameter
 slots retain the compiler's zero-based ordinals and are validated against the
 bound value count before admission. Scalar V2 carries referenced canonical typed
@@ -426,3 +429,11 @@ failures on all task listener paths.
 API and dedicated query listeners share SQL control dispatch and terminal status
 mapping. Both register signed submit, turn, result, cancellation and task routes;
 control requests do not consume task execution admission slots.
+
+The compiler bridge compares admissible physical orientations for inner and outer
+joins using exchange traffic estimates and build retention as a tie breaker.
+Swaps exchange join keys, invert left/right preservation, and remap residual and
+projection ordinals so logical results and aggregate inputs retain SQL order.
+Semi and anti joins retain logical left ownership. Both orientations undergo the
+same task, memory, retry and exchange admission checks; a rejected orientation
+does not prevent admission of a viable alternative.

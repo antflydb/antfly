@@ -349,6 +349,64 @@ pub fn estimatedRetained(input: Input) u64 {
     const fixed = @sizeOf(local.sql_operators.Row) + input.columns.len * @sizeOf(local.sql_scalar.Datum);
     return input.estimated_bytes +| input.estimated_rows *| fixed;
 }
+/// Compare admissible physical orientations while preserving logical ordinals.
+/// Remapped projection and instruction storage belongs to the caller's allocator.
+pub fn choosePhysical(a: A, left: Input, right: Input, tenant: Digest, expires_ms: u64, join: Join, limits: Limits, now_ms: u64) !Plan {
+    const forward = choose(left, right, tenant, expires_ms, join, limits, now_ms) catch |err| switch (err) {
+        error.SqlJoinBudgetExceeded => null,
+        else => return err,
+    };
+    if (join.kind == .semi or join.kind == .anti) return forward orelse error.SqlJoinBudgetExceeded;
+    var reversed = join;
+    reversed.left_keys = join.right_keys;
+    reversed.right_keys = join.left_keys;
+    reversed.kind = switch (join.kind) {
+        .left => .right,
+        .right => .left,
+        else => join.kind,
+    };
+    const backward = choose(right, left, tenant, expires_ms, reversed, limits, now_ms) catch |err| switch (err) {
+        error.SqlJoinBudgetExceeded => null,
+        else => return err,
+    };
+    var selected = backward orelse return forward orelse error.SqlJoinBudgetExceeded;
+    if (forward) |original| {
+        const original_cost = orientationCost(original);
+        const swapped_cost = orientationCost(selected);
+        if (original_cost < swapped_cost or (original_cost == swapped_cost and estimatedRetained(original.right) <= estimatedRetained(selected.right))) return original;
+    }
+    const projection = try a.alloc(u16, if (join.projection.len == 0) left.columns.len + right.columns.len else join.projection.len);
+    errdefer a.free(projection);
+    for (projection, 0..) |*ordinal, index| ordinal.* = swappedOrdinal(if (join.projection.len == 0) @intCast(index) else join.projection[index], left.columns.len, right.columns.len);
+    selected.join.projection = projection;
+    var instructions: ?[]local.sql_scalar.Instruction = null;
+    errdefer if (instructions) |owned| a.free(owned);
+    if (join.condition) |condition| {
+        const owned = try a.dupe(local.sql_scalar.Instruction, condition.instructions);
+        instructions = owned;
+        for (owned) |*instruction| if (instruction.operation == .column) {
+            instruction.operation.column = swappedOrdinal(@intCast(instruction.operation.column), left.columns.len, right.columns.len);
+        };
+        var remapped = condition;
+        remapped.instructions = owned;
+        selected.join.condition = remapped;
+    }
+    try selected.validate(now_ms);
+    return selected;
+}
+fn swappedOrdinal(ordinal: u16, left_width: usize, right_width: usize) u16 {
+    return @intCast(if (ordinal < left_width) right_width + ordinal else ordinal - left_width);
+}
+fn orientationCost(p: Plan) u128 {
+    // Source scans are common. Broadcast transports the build per probe split;
+    // shuffle writes and reads both inputs. Ties prefer smaller build residency.
+    return switch (p.strategy) {
+        .bucket => 0,
+        .broadcast => @as(u128, estimatedRetained(p.right)) * p.left.splits,
+        .shuffle => 2 * (@as(u128, estimatedRetained(p.left)) + estimatedRetained(p.right)),
+    };
+}
+
 pub fn choose(left: Input, right: Input, tenant: Digest, expires_ms: u64, join: Join, limits: Limits, now_ms: u64) !Plan {
     if (left.bucket) |l| if (right.bucket) |r| {
         const aligned = for (join.left_keys, join.right_keys) |lk, rk| {
@@ -404,4 +462,57 @@ test "distributed SQL plan preserves join semantics and admits retry and exchang
     try std.testing.expectError(error.InvalidSqlExecutionState, selected.withPhysical(&.{}, &.{.{ .partition = 0, .left = &.{.{}}, .right = &.{.{}} }}));
     selected.limits.query_exchange_bytes = 1;
     try std.testing.expectError(error.SqlJoinBudgetExceeded, selected.validate(1));
+}
+
+test "distributed SQL physical orientation selects small builds and remaps logical ordinals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const small: Input = .{ .table_id = 1, .schema = @splat('a'), .snapshot = "1", .wal_cut = 0, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 1024, .estimated_rows = 10, .splits = 1 };
+    var big = small;
+    big.table_id = 2;
+    big.columns = &.{ .{ .name = "id", .type = .integer }, .{ .name = "extra", .type = .integer } };
+    big.estimated_bytes = 64 * 1024 * 1024;
+    big.estimated_rows = 1_000_000;
+    big.splits = 64;
+    const condition: @import("expression.zig").Program = .{ .instructions = &.{
+        .{ .type = .{ .kind = .integer }, .operation = .{ .column = 0 } },
+        .{ .type = .{ .kind = .integer }, .operation = .{ .column = 2 } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .eq, .left = 0, .right = 1 } } },
+    }, .root = 2, .output = .{ .kind = .boolean } };
+    const join: Join = .{ .left_keys = &.{0}, .right_keys = &.{0}, .condition = condition };
+    const Ownership = struct {
+        fn check(allocator: A, l: Input, r: Input, j: Join) !void {
+            const result = try choosePhysical(allocator, l, r, @splat('b'), 10000, j, .{ .task_output_bytes = 4096 }, 1);
+            defer allocator.free(result.join.projection);
+            defer allocator.free(result.join.condition.?.instructions);
+            try std.testing.expectEqual(@as(u64, 1), result.right.table_id);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Ownership.check, .{ small, big, join });
+    const chosen = try choosePhysical(a, small, big, @splat('b'), 10000, join, .{ .task_output_bytes = 4096 }, 1);
+    try std.testing.expectEqual(Strategy.broadcast, chosen.strategy);
+    try std.testing.expectEqual(@as(u32, 65), try chosen.taskCount());
+    const constrained = try choosePhysical(a, small, big, @splat('b'), 10000, join, .{ .task_output_bytes = 4096, .max_tasks = 100 }, 1);
+    try std.testing.expectEqual(Strategy.broadcast, constrained.strategy);
+    const equivalent = try choosePhysical(a, big, small, @splat('b'), 10000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .task_output_bytes = 4096 }, 1);
+    try std.testing.expectEqual(chosen.strategy, equivalent.strategy);
+    try std.testing.expectEqual(try chosen.taskCount(), try equivalent.taskCount());
+    try std.testing.expectEqual(@as(u64, 1), chosen.right.table_id);
+    try std.testing.expectEqualSlices(u16, &.{ 2, 0, 1 }, chosen.join.projection);
+    try std.testing.expectEqual(@as(u32, 2), chosen.join.condition.?.instructions[0].operation.column);
+    try std.testing.expectEqual(@as(u32, 1), chosen.join.condition.?.instructions[1].operation.column);
+    try std.testing.expectEqual(@as(u32, 0), condition.instructions[0].operation.column);
+    var right_join = join;
+    right_join.kind = .right;
+    right_join.projection = &.{ 2, 0, 2 };
+    const outer = try choosePhysical(a, small, big, @splat('b'), 10000, right_join, .{ .task_output_bytes = 4096 }, 1);
+    try std.testing.expectEqual(Strategy.broadcast, outer.strategy);
+    try std.testing.expectEqual(@as(@FieldType(Join, "kind"), .left), outer.join.kind);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 2, 1 }, outer.join.projection);
+    var semi = join;
+    semi.kind = .semi;
+    const existence = try choosePhysical(a, small, big, @splat('b'), 10000, semi, .{ .task_output_bytes = 4096 }, 1);
+    try std.testing.expectEqual(@as(u64, 1), existence.left.table_id);
+    try std.testing.expectEqual(Strategy.shuffle, existence.strategy);
 }

@@ -285,6 +285,93 @@ pub const Instruction = struct {
     const Branch = struct { condition: u32, value: u32 };
 };
 
+/// Allocation-free admission for serialized typed DAGs, before speculative
+/// caches inspect operands. Binder and remote consumers share function arities.
+/// Runtime value checks still own errors in demanded expressions (bad casts,
+/// division by zero, array shapes), preserving SQL short-circuit semantics.
+pub fn validateTypedInstructions(instructions: []const Instruction, root: u32, output: Type) !void {
+    if (instructions.len == 0 or root >= instructions.len or !std.meta.eql(instructions[root].type, output)) return error.InvalidSqlProgram;
+    for (instructions, 0..) |instruction, index| {
+        validateParameterType(instruction.type) catch return error.InvalidSqlProgram;
+        switch (instruction.operation) {
+            .literal => |value| {
+                if (value == .null) continue;
+                const kind = instruction.type.kind orelse return error.InvalidSqlProgram;
+                const valid = switch (value) {
+                    .null => unreachable,
+                    .bool => kind == .boolean or kind == .json,
+                    .integer, .float, .number_string => kind == .integer or kind == .number or kind == .json,
+                    .string => kind == .string or kind == .uuid or kind == .datetime or kind == .json or (kind == .number and instruction.type.element_type == .numeric),
+                    .array, .object => kind == .json,
+                };
+                if (!valid) return error.InvalidSqlProgram;
+            },
+            .column, .parameter => if (instruction.type.kind == null) return error.InvalidSqlProgram,
+            .unary => |op| {
+                if (op.operand >= index) return error.InvalidSqlProgram;
+                switch (op.op) {
+                    .not, .is_true, .is_not_true, .is_false, .is_not_false, .is_unknown, .is_not_unknown => try requireInstructionKind(instructions[op.operand].type, .boolean),
+                    .positive, .negative => {
+                        const kind = instructions[op.operand].type.kind;
+                        if (kind != null and kind != .integer and kind != .number) return error.InvalidSqlProgram;
+                    },
+                    else => {},
+                }
+            },
+            .binary => |op| {
+                if (op.left >= index or op.right >= index) return error.InvalidSqlProgram;
+                if (op.op == .@"and" or op.op == .@"or") {
+                    try requireInstructionKind(instructions[op.left].type, .boolean);
+                    try requireInstructionKind(instructions[op.right].type, .boolean);
+                    try requireInstructionKind(instruction.type, .boolean);
+                }
+            },
+            .cast => |op| {
+                if (op.operand >= index or instruction.type.kind != op.type) return error.InvalidSqlProgram;
+                validateParameterType(.{ .kind = op.type, .element_type = op.element_type, .numeric_modifier = op.numeric_modifier }) catch return error.InvalidSqlProgram;
+            },
+            .case_when => |op| {
+                if (op.otherwise) |ordinal| if (ordinal >= index) return error.InvalidSqlProgram;
+                for (op.branches) |branch| {
+                    if (branch.condition >= index or branch.value >= index) return error.InvalidSqlProgram;
+                    try requireInstructionKind(instructions[branch.condition].type, .boolean);
+                }
+            },
+            .in_list => |op| {
+                if (op.operand >= index) return error.InvalidSqlProgram;
+                for (op.values) |ordinal| if (ordinal >= index) return error.InvalidSqlProgram;
+                try requireInstructionKind(instruction.type, .boolean);
+            },
+            .call => |op| {
+                validateFunctionArity(op.function, op.args.len) catch return error.InvalidSqlProgram;
+                for (op.args) |ordinal| if (ordinal >= index) return error.InvalidSqlProgram;
+                // These kernels borrow typed array pointers/element descriptors;
+                // prove the static shape before any optional cache can inspect it.
+                switch (op.function) {
+                    .array_cat => {
+                        try requireInstructionKind(instructions[op.args[0]].type, .array);
+                        try requireInstructionKind(instructions[op.args[1]].type, .array);
+                        if (instruction.type.kind != .array) return error.InvalidSqlProgram;
+                    },
+                    .array_append, .array_prepend => {
+                        try requireInstructionKind(instructions[op.args[@intFromBool(op.function == .array_prepend)]].type, .array);
+                        if (instruction.type.kind != .array) return error.InvalidSqlProgram;
+                    },
+                    .@"$array", .string_to_array => if (instruction.type.kind != .array) return error.InvalidSqlProgram,
+                    .array_position => if (op.args.len == 3) try requireInstructionKind(instructions[op.args[2]].type, .integer),
+                    .is_missing => if (instruction.type.kind != .boolean) return error.InvalidSqlProgram,
+                    .value_identity => if (instruction.type.kind != .string) return error.InvalidSqlProgram,
+                    else => {},
+                }
+            },
+        }
+    }
+}
+fn requireInstructionKind(descriptor: Type, expected: ast.ColumnType) !void {
+    // An untyped NULL is safe in strict and non-strict SQL kernels alike.
+    if (descriptor.kind != null and descriptor.kind != expected) return error.InvalidSqlProgram;
+}
+
 const TextTranslation = std.AutoHashMapUnmanaged(u21, []const u8);
 
 const ConstantPool = struct {
@@ -488,6 +575,7 @@ pub const Program = struct {
     /// No binder, settings, or statement-owned invocation pointers are copied.
     pub fn fromTypedInstructions(alloc: Allocator, instructions: []const Instruction, root: u32, output: Type, limits: BindLimits) !Program {
         if (root >= instructions.len or !std.meta.eql(instructions[root].type, output)) return error.InvalidSqlBackendResponse;
+        try validateTypedInstructions(instructions, root, output);
         const arena = try alloc.create(std.heap.ArenaAllocator);
         errdefer alloc.destroy(arena);
         arena.* = .init(alloc);
@@ -2111,7 +2199,7 @@ test "SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and error
     }
 }
 
-fn arity(function: Function, count: usize) !void {
+pub fn validateFunctionArity(function: Function, count: usize) !void {
     if (regexFunction(function)) |regex| {
         if (!regex_functions.validArity(regex, count)) return error.SqlUndefinedFunction;
         return;
@@ -2329,7 +2417,7 @@ const Binder = struct {
                     break :blk .{ .kind = .integer, .nullable = false };
                 }
                 const function = try functionId(call.name);
-                try arity(function, call.args.len);
+                try validateFunctionArity(function, call.args.len);
                 if (function == .value_identity or function == .is_missing) {
                     _ = try self.infer(call.args[0], depth + 1);
                     break :blk .{ .kind = if (function == .value_identity) .string else .boolean, .element_type = if (function == .value_identity) .text else .boolean, .nullable = function == .value_identity };
