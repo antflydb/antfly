@@ -524,6 +524,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_model_filters = [_][]const u8{"capi local model "};
     const capi_default_filters = [_][]const u8{
+        "lite write amplification",
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
@@ -634,6 +635,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // it once through capi_default_filters.
     b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
         .dependOn(&capiTestRun(b, capi_tests, &.{"storage owner remote content source"}, true).step);
+    b.step("lite-write-amplification", "Run the Lite write-amplification counting harness and print its JSON report")
+        .dependOn(&capiTestRun(b, capi_tests, &.{"lite write amplification"}, true).step);
     const run_capi_models = capiTestRun(b, capi_tests, &capi_model_filters, true);
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")

@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const change_journal_mod = @import("change_journal.zig");
 const catch_up_policy = @import("catch_up_policy.zig");
 const replay_source_mod = @import("replay_source.zig");
+const wal_trace = @import("../../write_amplification_trace.zig");
 const derived_types = @import("derived_types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const db_types = @import("../types.zig");
@@ -233,6 +234,7 @@ fn catchUpIndexFromReplaySource(
     apply_fn: ApplyFn,
     options: CatchUpOptions,
 ) !CatchUpStats {
+    wal_trace.recordOp(.source_turn);
     const hint = targetHintForManagedIndex(index_ref);
     var stats = CatchUpStats{};
     const next_sequence = from_sequence;

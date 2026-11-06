@@ -26,6 +26,7 @@ const alloc = std.heap.c_allocator;
 
 const memo_mod = @import("antfly_inference_query_embedding_cache");
 const cache_budget = @import("antfly_cache_budget");
+const wal_trace = @import("../storage/write_amplification_trace.zig");
 const embedding_memo_bytes = 16 * 1024 * 1024;
 const EnrichmentRuntime = std.meta.Child(std.meta.Child(@FieldType(h.db_mod.DB, "enrichment_runtime")));
 const PublicationPort = std.meta.Child(@FieldType(EnrichmentRuntime, "generated_publication"));
@@ -867,10 +868,40 @@ fn nowNs() i96 {
     return std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
 }
 
+/// Which durable-consumer kinds a background turn could currently do
+/// anything useful for. See docs/design/lite-performance/lite-single-commit-write-path.md
+/// §3.6 "No-consumer path". `registeredDemand()` computes this cheaply
+/// (O(1) per table) from the catalog; once the commit path (write-path
+/// rewrite, WS2/WS3) threads a write-specific mask through, `notifyDemand`
+/// can be called with a precise mask instead of the conservative registry
+/// snapshot `notifyMutation()` uses today.
+pub const Demand = packed struct(u8) {
+    index: bool = false,
+    enrichment: bool = false,
+    group_source: bool = false,
+    ttl: bool = false,
+    resolver: bool = false,
+    _reserved: u3 = 0,
+
+    pub const none: Demand = .{};
+
+    pub fn any(self: Demand) bool {
+        return @as(u8, @bitCast(self)) != 0;
+    }
+
+    pub fn merge(self: Demand, other: Demand) Demand {
+        return @bitCast(@as(u8, @bitCast(self)) | @as(u8, @bitCast(other)));
+    }
+};
+
 pub const Owner = struct {
     // Only bootstrap small files at close. Large files must finish their
     // existing worker proof; shutdown never starts another whole-file walk.
     const close_allocator_proof_max_bytes = 4 * 1024 * 1024;
+    // Sentinel for maintenanceWaitMillis/maintenanceLoop: no durable
+    // consumer is registered and nothing is pending from the last turn, so
+    // the loop parks on `wake` without a timer instead of polling.
+    const no_scheduled_wait: i64 = -1;
     const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
@@ -1014,11 +1045,17 @@ pub const Owner = struct {
     test_after_stop: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
     test_before_storage_service: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
     test_before_maintenance_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
+    /// Per-owner, test-local count of background turns the maintenance
+    /// loop actually ran (as opposed to waking and finding nothing to do).
+    /// Unlike the diagnostic-only write_amplification_trace counters, this
+    /// is scoped to one Owner instance, so concurrent tests never share it.
+    test_background_turn_count: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
     /// uses its pinned generation without reopening the connection.
     pub fn refresh(self: *Owner) !*h.Handle {
+        wal_trace.recordOp(.serving_runtime_refresh);
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
@@ -1307,11 +1344,60 @@ pub const Owner = struct {
         return entry.value_ptr.group_sources.?;
     }
 
-    pub fn notifyMutation(self: *Owner) void {
-        self.allocator_certificate_pending = true;
+    /// Cheap (O(1) per table), read-only snapshot of which durable-consumer
+    /// kinds are currently registered on the live root and every embedded
+    /// table under it. A zero result means a background turn has nothing
+    /// registered to do: no index, enrichment, group/replication source,
+    /// TTL or resolver. Durable obligations that do not yet have a live
+    /// in-memory registry here (outbox, repair pins, hot standby) are left
+    /// for `lite/recovery_agenda.zig` per the design doc §3.6; see the
+    /// final report for why that wiring isn't included in this change.
+    fn registeredDemand(self: *Owner) Demand {
+        const root = self.current orelse return .none;
+        var demand = tableDemand(&root.db);
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table| demand = demand.merge(tableDemand(&table.*.db));
+        return demand;
+    }
+
+    fn tableDemand(database: *h.db_mod.DB) Demand {
+        return .{
+            .index = database.core.hasManagedIndexes(),
+            .enrichment = database.core.index_manager.enrichments.items.len != 0,
+            .group_source = database.core.index_manager.hasGroupSources(),
+            .ttl = database.ttl_runtime != null,
+            .resolver = database.core.index_manager.resolvers.items.len != 0,
+        };
+    }
+
+    pub fn registeredDemandForTest(self: *Owner) Demand {
+        std.debug.assert(h.builtin.is_test);
+        return self.registeredDemand();
+    }
+
+    /// Wakes the maintenance worker only for a non-zero demand mask. A
+    /// zero mask (nothing a background turn could help with is currently
+    /// registered) leaves the worker parked and untouched: no lease
+    /// acquisition, no serving-runtime refresh, no turn.
+    pub fn notifyDemand(self: *Owner, mask: Demand) void {
+        if (!mask.any()) return;
         if (self.worker == null) return;
         self.maintenance_pending = true;
         self.wake.set(h.handleLockIo());
+    }
+
+    /// Conservative fallback for call sites (capi/db.zig's post-commit
+    /// notify sites, among others) that have not yet threaded a
+    /// write-specific Demand mask through the commit path: wake for
+    /// whatever this owner's registry currently reports as live. The
+    /// allocator certificate flag still follows every call here, pending
+    /// the close/size-threshold-driven version described in the design
+    /// doc §3.6 (see the final report: that needs a change to
+    /// certifyAllocatorOnClose's own gating, which is out of this
+    /// change's scope).
+    pub fn notifyMutation(self: *Owner) void {
+        self.allocator_certificate_pending = true;
+        self.notifyDemand(self.registeredDemand());
     }
 
     /// Scope registration reuse to admission; closing the path lease also
@@ -1336,6 +1422,7 @@ pub const Owner = struct {
         if (self.gate.mutex.takeRetained()) |held| {
             var lease = held;
             stats.recordAcquired(.handoff, 0);
+            wal_trace.recordOp(.maintenance_lease_acquired);
             lease.startHold(stats);
             return self.withReadRegistrationBatch(lease);
         }
@@ -1355,6 +1442,7 @@ pub const Owner = struct {
         };
         errdefer held.close();
         stats.recordAcquired(if (held.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+        wal_trace.recordOp(.maintenance_lease_acquired);
         held.startHold(stats);
         if (self.stopping.load(.acquire)) return error.Canceled;
         return self.withReadRegistrationBatch(held);
@@ -2191,19 +2279,27 @@ pub const Owner = struct {
 
     fn maintenanceLoop(self: *Owner) void {
         const io = h.handleLockIo();
-        var next_wait_ms: i64 = 1000;
+        // No durable consumer is known yet at spawn, so start parked; the
+        // first notifyMutation()/notifyDemand() with a non-zero mask (or an
+        // explicit stop) wakes this immediately.
+        var next_wait_ms: i64 = if (self.registeredDemand().any()) 1000 else no_scheduled_wait;
         var earliest_turn_ns: i96 = 0;
         while (!self.stopping.load(.acquire)) {
-            self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(next_wait_ms), .clock = .awake } }) catch {};
+            if (next_wait_ms < 0) {
+                self.wake.waitUncancelable(io);
+            } else {
+                self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(next_wait_ms), .clock = .awake } }) catch {};
+            }
             self.wake.reset();
             if (self.stopping.load(.acquire)) break;
             const now = std.Io.Clock.awake.now(io).nanoseconds;
-            if (now < earliest_turn_ns) {
+            if (next_wait_ms >= 0 and now < earliest_turn_ns) {
                 // Coalesce mutation wakes between rounds. Every selected
                 // namespace still yields the gate to queued foreground calls.
                 next_wait_ms = @intCast(@divCeil(earliest_turn_ns - now, std.time.ns_per_ms));
                 continue;
             }
+            if (comptime h.builtin.is_test) _ = self.test_background_turn_count.fetchAdd(1, .release);
             const pending = self.maintenanceTurn() catch |err| blk: {
                 // Capture/control failures otherwise disappear before the
                 // detached replay diagnostics can observe them.
@@ -2217,7 +2313,7 @@ pub const Owner = struct {
             // namespace. Otherwise 45 unrelated tables add 4.5 seconds to
             // every activation, delivery, claim and publication observation.
             next_wait_ms = self.maintenanceWaitMillis(pending);
-            earliest_turn_ns = std.Io.Clock.awake.now(io).nanoseconds + if (pending) @as(i96, next_wait_ms) * std.time.ns_per_ms else 0;
+            earliest_turn_ns = if (next_wait_ms < 0) 0 else std.Io.Clock.awake.now(io).nanoseconds + if (pending) @as(i96, next_wait_ms) * std.time.ns_per_ms else 0;
         }
     }
 
@@ -2230,7 +2326,13 @@ pub const Owner = struct {
         // through path leases, marker scans and the foreground gate at zero delay.
         if (!self.allocator_proof_mutex.tryLock()) return 100;
         self.allocator_proof_mutex.unlock(h.handleLockIo());
-        return if (self.maintenance_storage_pending or self.maintenance_table_cursor != 0) 0 else if (pending) 100 else 1000;
+        if (self.maintenance_storage_pending or self.maintenance_table_cursor != 0) return 0;
+        if (pending) return 100;
+        // Nothing left from this turn. With no durable consumer registered
+        // at all, a fixed-interval poll could only ever rediscover the same
+        // "nothing to do" answer that a future notifyDemand() wake already
+        // delivers, so idle turns stop polling instead of repeating every second.
+        return if (self.registeredDemand().any()) 1000 else no_scheduled_wait;
     }
 
     pub fn maintenanceWaitMillisForTest(self: *Owner, pending: bool) i64 {
@@ -4431,6 +4533,155 @@ test "issue1015 issue1431 native background turns coordinate across independent 
     owner.maintenance_table_cursor = 0;
     _ = try owner.maintenanceTurn();
     try std.testing.expectEqual(@as(usize, 1), probe.captures);
+}
+
+test "no-consumer path registeredDemand is empty for a plain Lite DB" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("no-consumer-demand-registry");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const owner = wrapper.lite_connection.?.owner;
+
+    // No index, enrichment, group/replication source, TTL or resolver is
+    // registered, so there is nothing a background turn could help with.
+    try std.testing.expect(!owner.registeredDemandForTest().any());
+    // maintenanceWaitMillis must therefore report "park without a timer"
+    // rather than the periodic 1000ms poll, once nothing is pending.
+    try std.testing.expectEqual(Owner.no_scheduled_wait, owner.maintenanceWaitMillisForTest(false));
+    // Pending-from-this-turn still takes priority over demand, unaffected.
+    try std.testing.expectEqual(@as(i64, 100), owner.maintenanceWaitMillisForTest(true));
+}
+
+test "no-consumer path N primary writes cause zero background turns, leases or refreshes" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("no-consumer-zero-turns");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    // The real maintenance worker is left running (not stopped/joined, as
+    // other fixtures in this file do) so this exercises the live
+    // wake/park path, not just the synchronous demand computation above.
+    try std.testing.expect(owner.worker != null);
+
+    // Simulate 1,037 single-document primary-only writes: each commit's
+    // post-write notification is exactly connection.notifyMutation()
+    // (capi/db.zig:816 and :879 call this same method after every commit
+    // whose checkpoint advanced).
+    for (0..1037) |_| connection.notifyMutation();
+
+    // Nothing should have woken the background loop: no turn ran, so no
+    // maintenance lease was acquired and no background serving-runtime
+    // refresh happened. These are per-Owner counters (test_background_turn_count
+    // is test-only and local to this Owner; publication_stats.maintenance_lease
+    // is this Owner's own lease-timing stats), so they cannot be polluted by
+    // any other concurrently-running test or agent in this binary.
+    try std.testing.expectEqual(@as(u64, 0), owner.test_background_turn_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.maintenance_lease.acquisitions);
+    try std.testing.expect(!owner.maintenance_pending);
+}
+
+test "no-consumer path registering an index produces demand and wakes a background turn" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("consumer-demand-wakes-turn");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    const root = owner.current.?;
+
+    try std.testing.expect(!owner.registeredDemandForTest().any());
+
+    {
+        var lease = try connection.acquire();
+        defer {
+            lease.close();
+            connection.gate.mutex.unlock(io);
+        }
+        try root.db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    }
+    try std.testing.expect(owner.registeredDemandForTest().index);
+
+    // addIndex's own catalog write already notifies; call again directly to
+    // mirror a subsequent primary write's post-commit notification.
+    connection.notifyMutation();
+
+    var waited_ms: u64 = 0;
+    while (owner.test_background_turn_count.load(.acquire) == 0 and waited_ms < 5000) : (waited_ms += 5) {
+        io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(owner.test_background_turn_count.load(.acquire) != 0);
+    try std.testing.expect(owner.publication_stats.maintenance_lease.acquisitions != 0);
+}
+
+test "no-consumer path adding an index after writes backfills every prior document" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("no-consumer-then-backfill");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    const root = owner.current.?;
+
+    try std.testing.expect(!owner.registeredDemandForTest().any());
+
+    // Ten primary-only writes with zero registered consumers. This change
+    // (WS7, scheduling only) never touches whether a replay/journal record
+    // is written for them (that gate belongs to the commit-path rewrite,
+    // WS5) — only whether a background turn wakes for them. addIndex below
+    // must still find and index every one of them from primary, exactly as
+    // it does today (it backfills by scanning primary directly, not by
+    // replaying the change journal; see storage/db/catalog/index_manager.zig
+    // backfillTextIndex).
+    try root.db.batch(.{ .writes = &.{
+        .{ .key = "doc:0", .value = "{\"search_text\":\"raft snapshot number 0\"}" },
+        .{ .key = "doc:1", .value = "{\"search_text\":\"raft snapshot number 1\"}" },
+        .{ .key = "doc:2", .value = "{\"search_text\":\"raft snapshot number 2\"}" },
+        .{ .key = "doc:3", .value = "{\"search_text\":\"raft snapshot number 3\"}" },
+        .{ .key = "doc:4", .value = "{\"search_text\":\"raft snapshot number 4\"}" },
+        .{ .key = "doc:5", .value = "{\"search_text\":\"raft snapshot number 5\"}" },
+        .{ .key = "doc:6", .value = "{\"search_text\":\"raft snapshot number 6\"}" },
+        .{ .key = "doc:7", .value = "{\"search_text\":\"raft snapshot number 7\"}" },
+        .{ .key = "doc:8", .value = "{\"search_text\":\"raft snapshot number 8\"}" },
+        .{ .key = "doc:9", .value = "{\"search_text\":\"raft snapshot number 9\"}" },
+    } });
+
+    {
+        var lease = try connection.acquire();
+        defer {
+            lease.close();
+            connection.gate.mutex.unlock(io);
+        }
+        try root.db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    }
+
+    var result = try root.db.search(a, .{ .query = .{ .match_all = {} }, .limit = 100 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 10), result.total_hits);
 }
 
 test "issue1015 issue1431 unverified peer opens yield to a detached proof turn" {

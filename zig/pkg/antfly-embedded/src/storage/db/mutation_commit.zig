@@ -54,6 +54,7 @@ const relational_index_plans = @import("relational_index_plan.zig");
 const relational_index_records = @import("relational_index_records.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store = @import("relational_store.zig");
+const replay_reference = @import("derived/replay_reference.zig");
 const replication_commit = @import("commit_integration.zig");
 const replication_contract = @import("replication_contract.zig");
 const replication_effects_mod = @import("replication_effects.zig");
@@ -5167,12 +5168,47 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             min_applied = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, min_applied);
             min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, min_applied);
+
+            // WS5: this same consumer walk is a minimal, catalog-derived
+            // consumer registry for the hinted replay lanes. A durable,
+            // explicitly-registered registry is WS7's job; until it lands,
+            // refresh the gate every time retirement safety is evaluated so
+            // a dropped index (or a never-configured resolver/promoter)
+            // stops paying for lanes nothing consumes, and a newly-added one
+            // starts getting them again on its very next safety pass.
+            var hint_presence = replay_reference.Presence{
+                .full_text = false,
+                .dense_vector = false,
+                .sparse_vector = false,
+                .graph = false,
+                .algebraic = false,
+                .enrichment = ctx.index_manager.hasGeneratedEnrichmentTargets(),
+                .resolution = ctx.resolution_runtime != null,
+                .promotion = ctx.promotion_runtime != null,
+            };
+            for (managed_indexes) |index_ref| {
+                switch (index_ref.kind) {
+                    .full_text => hint_presence.full_text = true,
+                    .dense_vector => hint_presence.dense_vector = true,
+                    .sparse_vector => hint_presence.sparse_vector = true,
+                    .graph => hint_presence.graph = true,
+                    .algebraic => hint_presence.algebraic = true,
+                }
+            }
+            ctx.store.setActiveConsumerHintMask(hint_presence.toMask());
+
             if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
             try truncateReplayLogs(ctx, min_applied);
         }
 
+        /// WS5: foreground/ack callers never physically retire the replay
+        /// journal -- that would reintroduce the extra commit this
+        /// workstream removes from the acknowledgement path. This only
+        /// raises the watermark; the owner-only maintenance turn (Lite
+        /// path-lease holder or Raft leader) drains it one bounded,
+        /// single-transaction chunk per turn via `DocStore.serviceRetirement`.
         pub fn truncateReplayLogs(ctx: *const BatchExecutionContext, up_to_sequence: u64) !void {
-            try ctx.store.truncateReplayUpTo(ctx.alloc, up_to_sequence);
+            ctx.store.requestRetirement(up_to_sequence);
             ctx.executor.releaseBacklogThrough(up_to_sequence);
         }
 
