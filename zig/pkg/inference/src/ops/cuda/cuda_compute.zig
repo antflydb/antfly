@@ -53900,6 +53900,14 @@ fn qualifyCudaBatchedDotOwnedRoute(comptime lhs_transposed: bool, comptime rhs_t
     defer routes.releaseWithCleanup(if (budget) |*value| value.cleanup() else .{});
     const witness = routes.pool.completeOwnedPayload() orelse return error.MissingCompleteCudaPayload;
     try std.testing.expectEqual(.device, witness.accounting_class);
+    // The first add(dot, dot) is canonically mul(dot, scalar(2)). Only
+    // this independently known immutable F32 literal may upload once cold.
+    try std.testing.expect(routes.pool.literal_store != null);
+    const literal_store = routes.pool.literal_store.?;
+    try std.testing.expectEqual(@as(usize, 1), literal_store.literals.len);
+    try std.testing.expect(literal_store.literals[0].shape.eq(ml.graph.Shape.scalar(.f32)));
+    try std.testing.expectEqualSlices(f32, &.{2}, literal_store.literals[0].data);
+    try std.testing.expect(routes.pool.literalEnabled(0));
     const selected = routes.pool.preparedKernelRoute(program.id_map[dot]) orelse return error.MissingBatchedDotRoute;
     try std.testing.expectEqual(route.ValidationScope.invocation, selected.validation_scope);
     try std.testing.expectEqual(route.OutputPlaneMetadata.assigned_dense, selected.output_plane_metadata);
@@ -53952,8 +53960,13 @@ fn qualifyCudaBatchedDotOwnedRoute(comptime lhs_transposed: bool, comptime rhs_t
         };
         @import("../../execution/transfer_audit.zig").end();
         defer result.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
-        try std.testing.expectEqual(@as(u64, 2), audit.upload_calls);
+        const input_upload_bytes: u64 = batches * (rows + columns) * width * @sizeOf(f32);
+        const expected_upload_calls: u64 = if (iteration == 0) 3 else 2;
+        const expected_upload_bytes = input_upload_bytes + (if (iteration == 0) @as(u64, @sizeOf(f32)) else 0);
+        try std.testing.expectEqual(expected_upload_calls, audit.upload_calls);
+        try std.testing.expectEqual(expected_upload_bytes, audit.upload_bytes);
         try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
         try std.testing.expectEqual(ordinal, compute.temp_trace_seq);
         if (iteration >= 2) try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
         captures += result.stats.physical_graph_captures;
