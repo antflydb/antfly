@@ -898,6 +898,13 @@ pub const Owner = struct {
     // Only bootstrap small files at close. Large files must finish their
     // existing worker proof; shutdown never starts another whole-file walk.
     const close_allocator_proof_max_bytes = 4 * 1024 * 1024;
+    // notifyMutation only raises allocator_certificate_bootstrap_worthwhile
+    // once the checkpoint has grown this much since the last baseline, not
+    // on every write (design doc §3.6). Modest relative to
+    // close_allocator_proof_max_bytes: large enough that a handful of small
+    // writes (the no-consumer path's common case) never trips it, small
+    // enough that a real write burst still gets certified at close.
+    const allocator_certificate_threshold_bytes: u64 = 256 * 1024;
     // Sentinel for maintenanceWaitMillis/maintenanceLoop: no durable
     // consumer is registered and nothing is pending from the last turn, so
     // the loop parks on `wake` without a timer instead of polling.
@@ -955,6 +962,20 @@ pub const Owner = struct {
     allocator_proof_receipt: ?native.NativeFile.AllocatorProofReceipt = null,
     verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
     allocator_certificate_pending: bool = false,
+    /// Threshold-gated sibling of `allocator_certificate_pending` consulted
+    /// only by certifyAllocatorOnClose's bootstrap decision (starting a
+    /// brand new verification walk at close) -- see notifyMutation's doc
+    /// comment for why this is a separate flag from
+    /// `allocator_certificate_pending` itself.
+    allocator_certificate_bootstrap_worthwhile: bool = false,
+    /// Checkpoint bytes observed the last time notifyMutation() considered
+    /// `allocator_certificate_bootstrap_worthwhile`; null until the first
+    /// call establishes a baseline. Lets notifyMutation flip that flag only
+    /// once the checkpoint has grown past
+    /// `allocator_certificate_threshold_bytes` since then, instead of on
+    /// every write (design doc §3.6: "allocator certificates run at close
+    /// or past a size threshold, not on every write").
+    allocator_certificate_baseline_bytes: ?u64 = null,
     // Historical attempts suppress close-time retries; only active work is
     // allowed to finish when shutdown cancels the remaining maintenance.
     allocator_verification_started: bool = false,
@@ -1395,15 +1416,43 @@ pub const Owner = struct {
     /// Conservative fallback for call sites (capi/db.zig's post-commit
     /// notify sites, among others) that have not yet threaded a
     /// write-specific Demand mask through the commit path: wake for
-    /// whatever this owner's registry currently reports as live. The
-    /// allocator certificate flag still follows every call here, pending
-    /// the close/size-threshold-driven version described in the design
-    /// doc §3.6 (see the final report: that needs a change to
-    /// certifyAllocatorOnClose's own gating, which is out of this
-    /// change's scope).
+    /// whatever this owner's registry currently reports as live.
+    ///
+    /// `allocator_certificate_pending` itself still follows every call:
+    /// Connection.close()'s `finish_proof` reads it to decide whether an
+    /// *already in-flight* worker-driven verification walk is worth letting
+    /// finish rather than canceling mid-walk, which must stay keyed on "did
+    /// anything mutate since that walk started", not a size threshold --
+    /// the walk itself (not this write) is the expensive part to waste.
+    /// `maybeRaiseAllocatorCertificateBootstrapWorthwhile` below is the
+    /// separate, threshold-gated signal for certifyAllocatorOnClose's own
+    /// *bootstrap* decision (starting a brand new walk at close, design doc
+    /// §3.6: "allocator certificates run at close or past a size
+    /// threshold, not on every write").
     pub fn notifyMutation(self: *Owner) void {
         self.allocator_certificate_pending = true;
+        self.maybeRaiseAllocatorCertificateBootstrapWorthwhile();
         self.notifyDemand(self.registeredDemand());
+    }
+
+    /// Cheap and lock-free (reads fields already resident on the current
+    /// root's Store, no I/O), so it costs nothing close to a real demand
+    /// check, unlike certifyAllocatorOnClose's own bootstrap walk which
+    /// this exists to skip on an idle/trivial-activity close.
+    fn maybeRaiseAllocatorCertificateBootstrapWorthwhile(self: *Owner) void {
+        if (self.allocator_certificate_bootstrap_worthwhile) return;
+        // Matches certifyAllocatorOnClose's own early return: certificates
+        // are a native-writer-only optimization.
+        if (self.options.profile != .native or self.options.open_mode != .writer) return;
+        const root = self.current orelse return;
+        const backend = root.owned_lite_backend orelse return;
+        const store = backend.native_docstore orelse return;
+        const bytes = store.file.activeCheckpoint().page_count *| store.file.header.page_size;
+        const baseline = self.allocator_certificate_baseline_bytes orelse {
+            self.allocator_certificate_baseline_bytes = bytes;
+            return;
+        };
+        if (bytes -| baseline >= allocator_certificate_threshold_bytes) self.allocator_certificate_bootstrap_worthwhile = true;
     }
 
     /// Scope registration reuse to admission; closing the path lease also
@@ -2495,7 +2544,7 @@ pub const Owner = struct {
                     return;
                 }
             }
-            if (attempt != 0 or !can_prove_current or !self.allocator_certificate_pending or self.allocator_verification_started or
+            if (attempt != 0 or !can_prove_current or !self.allocator_certificate_bootstrap_worthwhile or self.allocator_verification_started or
                 proof_bytes > close_allocator_proof_max_bytes) return;
             // Registry close has drained foreground calls and joined the
             // worker. Bootstrap a small, never-scheduled pool, but never
