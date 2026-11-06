@@ -17,11 +17,13 @@
 
 import hashlib
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from uuid import uuid4
 
 import pytest
 from helpers import start_http_server, wait_until
+from privacy_findings_read import read_findings_page
 
 
 @pytest.mark.parametrize("escaped", [False, True], ids=["large", "escaped"])
@@ -137,6 +139,9 @@ def test_privacy_findings_empty_id_byte_cutoff(stateful_api, escaped):
 
         assert wait_until(inspected, timeout_s=180, interval_s=0.2), api.get(path)
 
+        # Availability retries share this budget across every page and the
+        # final GET replay; failed reads never advance cursor or observations.
+        deadline = time.monotonic() + 180
         cursor = None
         previous = set()
         observed = []
@@ -145,9 +150,11 @@ def test_privacy_findings_empty_id_byte_cutoff(stateful_api, escaped):
         # A one-finding limit forces inclusive continuations within each
         # document, as well as exclusive continuations across the ID cutoff.
         for _ in range(5):
-            page = api.post(
-                path + "/findings",
+            page = read_findings_page(
+                api.s,
+                api.url + path,
                 {"limit": 1, **({"cursor": cursor} if cursor else {})},
+                deadline=deadline,
             )
             assert page["pending_documents"] == 0
             examined.append(page["examined_documents"])
@@ -181,13 +188,13 @@ def test_privacy_findings_empty_id_byte_cutoff(stateful_api, escaped):
         assert len(continuations) == 4
         # The exclusive cursor after the empty ID must also resume through
         # GET, while larger opaque cursors continue through the POST body.
-        response = api.s.get(
-            api.url + path + "/findings",
-            params={"cursor": continuations[1], "limit": 1},
-            timeout=30,
+        page = read_findings_page(
+            api.s,
+            api.url + path,
+            {"cursor": continuations[1], "limit": 1},
+            deadline=deadline,
+            method="GET",
         )
-        assert response.status_code == 200, response.text[:1000]
-        page = response.json()
         assert page["examined_documents"] == 1
         assert len(page["findings"]) == 1
         assert (
