@@ -424,6 +424,45 @@ private addresses or ports. Run one source with
 `POST /v1/sync` and `{"source_id": "<uuid>"}` to publish a new upload without syncing
 the others. Runs are serialized across the service, so a concurrent run returns 409.
 
+### Moving a local store to a bucket
+
+```sh
+antfly-source migrate-local --config sources.json --state-dir /var/lib/antfly-sources/runner \
+  --public-url http://127.0.0.1:8082 --admin-token-env ANTFLY_SOURCE_ADMIN_TOKEN --media-key-env ANTFLY_SOURCE_MEDIA_KEY \
+  --source <source-uuid> --from-connection local --from-prefix assets \
+  --to-connection bucket --to-bucket my-bucket --to-prefix migrated \
+  [--dry-run]
+```
+
+This copies one source's objects to an S3-compatible connection, keeping the
+`objects/sha256/<digest>[.ext]` layout so the digest stays the key. Every copy is
+verified by an independent read-back and hash of the destination object, whether
+just uploaded or already there from an earlier run, before anything can reference
+it; a mismatch fails that object and the run. Rerunning only uploads what's still
+missing, and a clean rerun uploads nothing. It never deletes or edits the local
+store; once satisfied, remove `<local_root>/<prefix>/objects/sha256` yourself.
+
+It operates on the same durable state directory as `serve` and reuses that
+service's own admission and the ordinary `PUT /v1/sources/{id}` plus
+`POST /v1/sync` calls to repoint the source and resync it, so stop `serve` first;
+`migrate-local` refuses to start otherwise, exactly like a second `serve`
+would. Restart `serve` afterward so it starts fetching from the bucket. An
+upload that lands in the local store while this runs (or afterward) is simply
+left there; it is never lost, and a later `migrate-local` run copies and
+publishes it even after the source already points at the bucket.
+
+**Repointing re-keys every document.** A provider switch changes the item
+identity (`local://...` becomes `s3://...`), and the catalog's document ID is a
+hash of that identity, not of the bytes. The resync therefore deletes each old
+row and inserts a new one, even though the digest is unchanged. Any derived data
+attached to the old row -- OCR text, chunks, embeddings -- does not carry over
+and must be recomputed against the new row. Only the original content's digest
+survives unrecomputed; search over the migrated content still works once that
+recomputation finishes (plain text and metadata are available immediately).
+
+GCS is not a supported `--to-connection` yet: this package's GCS connector only
+reads through the Google JSON API and has no upload path.
+
 ## Media and runtime source registration
 
 Run the optional **source companion** when applications need runtime connections,
