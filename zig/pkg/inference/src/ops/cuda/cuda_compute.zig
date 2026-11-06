@@ -48601,6 +48601,13 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         try std.testing.expectEqual(@as(usize, 0), selected_program.profile.conversion_bytes);
         try std.testing.expectEqual(rows * width * 2, selected_program.profile.rounded_output_bytes);
         try std.testing.expect(first_projection.requirements.capture == .unsupported);
+        // The immutable root was capture-eligible before input-aware selection.
+        // Its private ordinary-only variant retains its own binding banks while
+        // preserving the root template for other supported specializations.
+        try std.testing.expect(pool.replay_backend != null);
+        try std.testing.expectEqual(@import("../../execution/stats.zig").PhysicalReplayDecision.unsupported_representation, routes.pool.replay_decision);
+        try std.testing.expect(pool.replay_inputs.len != 0 and routes.pool.replay_inputs.len == pool.replay_inputs.len);
+        try std.testing.expect(routes.pool.replay_inputs.ptr != pool.replay_inputs.ptr);
         try std.testing.expect(plane_selection.planes_witnessed[program.id_map[normalized]]);
         const norm_route = plane_selection.routes[program.id_map[normalized]] orelse return error.MissingRmsMirrorRoute;
         try std.testing.expect(norm_route.validation_scope == .invocation and norm_route.output_plane_metadata == .assigned_dense);

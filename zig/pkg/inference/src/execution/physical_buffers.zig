@@ -987,11 +987,14 @@ pub const Pool = struct {
         try @import("reachable_projection.zig").deactivate(child);
         child.selection = try RouteSelection.createWithAuthority(child, inputs, metadata.token());
         if (policy == .select_regions) try child.prepareRegionsWithAuthority(metadata.token());
-        try child.applyRouteRequirements();
+        const capture_supported = try child.applyRouteRequirements();
         try child.recomputeHostWorkspace();
         try child.prepareHostIngress();
         child.selectNativeBorrowedHostInputs();
-        if (child.replay_backend == null) if (child.replay_config) |config| {
+        // A selected ordinary-only route or region may disable capture while
+        // retaining inherited input/output banks for ordinary execution. Only
+        // reconsider capture when the current selected schedule supports it.
+        if (capture_supported and child.replay_backend == null) if (child.replay_config) |config| {
             var qualified = false;
             for (child.host_input_plans) |input| qualified = qualified or input.index_bounds != null;
             if (qualified or child.cuda_frame_dispatch) {
@@ -1388,8 +1391,9 @@ pub const Pool = struct {
         if (value == 0 or !std.math.isPowerOfTwo(value)) return error.InvalidPreparedKernelAlignment;
     }
 
-    fn applyRouteRequirements(self: *Pool) !void {
-        const selected = if (self.selection) |*value| value else return;
+    fn applyRouteRequirements(self: *Pool) !bool {
+        var capture_supported = self.regions.len == 0;
+        const selected = if (self.selection) |*value| value else return capture_supported;
         // Existing independently qualified compatibility routes retain their
         // original storage. Selected exact routes replace their own scratch,
         // never silently selecting a new profile after admission.
@@ -1435,10 +1439,12 @@ pub const Pool = struct {
             }
             kernel.auxiliaries = auxiliaries;
             if (required.capture != .supported) {
+                capture_supported = false;
                 self.replay_backend = null;
                 self.replay_decision = .unsupported_representation;
             }
         }
+        return capture_supported;
     }
 
     pub fn literalEnabled(self: *const Pool, index: usize) bool {
