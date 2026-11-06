@@ -1338,10 +1338,12 @@ const MutationRequest = struct {
     apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void,
     next: ?*MutationRequest = null,
     done: bool = false,
-    leader: bool = false,
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
+    /// Caller-estimated size of this member's writes, used only to bound
+    /// group formation (`group_max_bytes`); never required to be exact.
+    estimated_bytes: usize = 0,
     result: anyerror!void = {},
 };
 
@@ -1522,6 +1524,12 @@ pub const Store = struct {
     commit_head: ?*MutationRequest = null,
     commit_tail: ?*MutationRequest = null,
     commit_draining: bool = false,
+    /// Group-commit bounds (WS2): at most this many staged requests, or this
+    /// many estimated bytes, join one native transaction/fsync. A single
+    /// request larger than `group_max_bytes` still forms its own group of
+    /// one -- these bound the group, not any individual member.
+    group_max_requests: usize = 64,
+    group_max_bytes: usize = 4 * 1024 * 1024,
     writer_admission: ?WriterAdmission = null,
     writer_active: bool = false,
     writer_ticketed: bool = false,
@@ -2828,11 +2836,181 @@ pub const Store = struct {
         }
     }
 
-    /// Synchronous group commit. Callbacks run in queue order under the store
-    /// mutex, and every member completes only after the shared checkpoint is
-    /// durable. Requests arriving during I/O form the next bounded group.
-    /// A failed group publishes none of its mutations (or reports an uncertain
-    /// publication to all its members). Callback-owned buffers stay borrowed.
+    /// A staged, not-yet-durable mutation (WS2). `Store.stage` never blocks on
+    /// I/O: it only enqueues onto the bounded in-memory group-commit queue
+    /// and, if the caller becomes the group's leader, drives the queue until
+    /// it drains. `Ticket.wait` is the only place that blocks for durability.
+    /// This lets a caller release locks scoped to "a transaction is open"
+    /// (the writer slot, an apply lock, a cross-process lease) before paying
+    /// for the fsync its mutation shares with whichever other group members
+    /// are staged by the time its group's turn to apply comes up.
+    pub const MutationPlan = struct {
+        context: *anyopaque,
+        apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void,
+        durable: bool = true,
+        index_only: bool = false,
+        artifact_lease: bool = false,
+        /// Estimated size of this member's writes. Used only to bound group
+        /// formation (`group_max_bytes`); never required to be exact.
+        estimated_bytes: usize = 0,
+    };
+
+    pub const Ticket = struct {
+        store: *Store,
+        request: *MutationRequest,
+
+        /// Block until this ticket's group is durable (or has failed). The
+        /// request is heap-owned by the ticket and freed here; a ticket must
+        /// be waited on exactly once.
+        pub fn wait(self: Ticket) !void {
+            const io = self.store.file.runtime();
+            self.store.commit_mutex.lockUncancelable(io);
+            while (!self.request.done) self.store.commit_ready.waitUncancelable(io, &self.store.commit_mutex);
+            const result = self.request.result;
+            self.store.commit_mutex.unlock(io);
+            self.store.allocator.destroy(self.request);
+            return result;
+        }
+    };
+
+    /// Enqueue `plan` and return a ticket resolved once its group is durable.
+    /// `plan.context` must stay valid until `Ticket.wait` returns: the group
+    /// leader (this caller, or another thread already draining the queue)
+    /// calls `plan.apply` before the ticket can become done.
+    pub fn stage(self: *Store, plan: MutationPlan) !Ticket {
+        if (self.read_only) return error.ReadOnly;
+        const io = self.file.runtime();
+        const request = try self.allocator.create(MutationRequest);
+        request.* = .{
+            .context = plan.context,
+            .apply = plan.apply,
+            .durable = plan.durable,
+            .index_only = plan.index_only,
+            .artifact_lease = plan.artifact_lease,
+            .estimated_bytes = plan.estimated_bytes,
+        };
+        errdefer self.allocator.destroy(request);
+
+        self.commit_mutex.lockUncancelable(io);
+        if (self.commit_tail) |tail| tail.next = request else self.commit_head = request;
+        self.commit_tail = request;
+        const become_leader = !self.commit_draining;
+        if (become_leader) self.commit_draining = true;
+        self.commit_mutex.unlock(io);
+
+        // The leader drains the queue inline on its own stack, like
+        // storage/wal.zig's driveAppendCoordinator: at most one group is
+        // ever being applied at a time, and whatever stages while that
+        // group's `commitTransactionWithDurability` runs (including its
+        // fsync) forms the next group, bounding flight to the applying
+        // group plus the one accumulating behind it.
+        if (become_leader) self.driveMutationCoordinator();
+
+        return .{ .store = self, .request = request };
+    }
+
+    /// The durable (post-fsync) commit sequence. Blocks only as long as a
+    /// group is mid-apply; never waits on a merely-staged mutation.
+    pub fn durableSequence(self: *Store) u64 {
+        lockStore(self);
+        defer self.mutex.unlock();
+        return self.file.activeCheckpoint().commit_sequence;
+    }
+
+    const MutationBatch = struct {
+        head: ?*MutationRequest = null,
+    };
+
+    fn drainMutationBatchLocked(self: *Store) MutationBatch {
+        var batch = MutationBatch{};
+        var tail: ?*MutationRequest = null;
+        var count: usize = 0;
+        var bytes: usize = 0;
+        while (self.commit_head) |request| {
+            if (batch.head != null and (count >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
+            self.commit_head = request.next;
+            if (self.commit_head == null) self.commit_tail = null;
+            request.next = null;
+            if (tail) |t| t.next = request else batch.head = request;
+            tail = request;
+            count += 1;
+            bytes +|= request.estimated_bytes;
+        }
+        return batch;
+    }
+
+    /// Run until the pending queue is empty, applying one bounded group at a
+    /// time. Only the thread that staged the first request of a newly-formed
+    /// queue (`become_leader` in `stage`) ever runs this; every other staging
+    /// thread only enqueues and waits on its own ticket.
+    fn driveMutationCoordinator(self: *Store) void {
+        const io = self.file.runtime();
+        while (true) {
+            self.commit_mutex.lockUncancelable(io);
+            const batch = self.drainMutationBatchLocked();
+            const head = batch.head orelse {
+                self.commit_draining = false;
+                self.commit_ready.broadcast(io);
+                self.commit_mutex.unlock(io);
+                break;
+            };
+            self.commit_mutex.unlock(io);
+
+            const result = self.applyMutationGroup(head);
+
+            self.commit_mutex.lockUncancelable(io);
+            var current: ?*MutationRequest = head;
+            if (result) |_| {
+                // A member that failed its own apply already has its
+                // specific error in `item.result`; one that was admitted
+                // keeps its default success. Nothing to overwrite.
+            } else |err| {
+                // The shared commit (admission, transaction open, or the
+                // final fsync) failed: every member's durability is equally
+                // unknown, including one that had already failed its own
+                // apply and rolled back.
+                while (current) |item| {
+                    item.result = err;
+                    current = item.next;
+                }
+                current = head;
+            }
+            while (current) |item| {
+                item.done = true;
+                current = item.next;
+            }
+            self.commit_ready.broadcast(io);
+            self.commit_mutex.unlock(io);
+
+            if (result) |_| {} else |err| {
+                if (err == error.LiteStorageBudgetExceeded) self.recordMaintenanceError(err);
+            }
+        }
+        // Start after publication, and only once -- after this leader's
+        // entire queue (including anything staged while it was draining
+        // earlier batches) is confirmed empty. Calling this per-batch,
+        // inside the loop above, let a mutation this very call enqueues
+        // (most notably the maintenance cycle `startMaintenance` itself can
+        // start, if it services retirement via the normal mutation path) be
+        // swept into this same leader's next iteration instead of becoming
+        // its own, independent group commit -- silently turning what a
+        // caller expects to be its one commit into two. Running this once,
+        // after `break`, keeps every commit this call injects into the
+        // queue on the far side of "the queue is empty", so it is always
+        // some later call's leader, never this one's.
+        self.startMaintenance();
+        // Only wake an already-running loop. One that never started has no
+        // reclamation debt worth a turn (that is exactly what
+        // startMaintenance() above just decided), and a loop the call above
+        // just spawned begins its first turn immediately without needing
+        // this event.
+        if (self.maintenance_started.load(.acquire)) self.maintenance_wake.set(io);
+    }
+
+    /// Synchronous group commit. Equivalent to `stage` immediately followed
+    /// by `Ticket.wait`, preserved for callers that have no locks to release
+    /// between staging and durability. Callback-owned buffers stay borrowed
+    /// until this call returns.
     pub fn submitMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
         return self.submitMutationWithDurability(context, apply, true);
     }
@@ -2864,56 +3042,25 @@ pub const Store = struct {
     }
 
     fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
-        if (self.read_only) return error.ReadOnly;
-        defer {
-            // Start after publication: even one large final mutation crossing
-            // the threshold must launch maintenance without another write.
-            self.startMaintenance();
-            // Only wake an already-running loop. One that never started has
-            // no reclamation debt worth a turn (that is exactly what
-            // startMaintenance() above just decided), and a loop the call
-            // above just spawned begins its first turn immediately without
-            // needing this event.
-            if (self.maintenance_started.load(.acquire)) self.maintenance_wake.set(self.file.runtime());
-        }
-        const io = self.file.runtime();
-        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease };
-        self.commit_mutex.lockUncancelable(io);
-        if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
-        self.commit_tail = &request;
-        if (self.commit_draining) {
-            while (!request.done and !request.leader) self.commit_ready.waitUncancelable(io, &self.commit_mutex);
-            if (request.done) {
-                self.commit_mutex.unlock(io);
-                return request.result;
-            }
-        }
-        self.commit_draining = true;
-        const head = self.commit_head.?;
-        var tail = head;
-        var count: usize = 1;
-        while (count < 64) : (count += 1) tail = tail.next orelse break;
-        self.commit_head = tail.next;
-        if (self.commit_head == null) self.commit_tail = null;
-        tail.next = null;
-        self.commit_mutex.unlock(io);
-        const result = self.applyMutationGroup(head);
-        self.commit_mutex.lockUncancelable(io);
-        var current: ?*MutationRequest = head;
-        while (current) |item| {
-            item.result = result;
-            item.done = true;
-            current = item.next;
-        }
-        if (self.commit_head) |next| next.leader = true else self.commit_draining = false;
-        self.commit_ready.broadcast(io);
-        self.commit_mutex.unlock(io);
-        if (result) |_| {} else |err| {
-            if (err == error.LiteStorageBudgetExceeded) self.recordMaintenanceError(err);
-        }
-        return request.result;
+        const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+        return ticket.wait();
     }
 
+    /// Apply every member of one bounded group inside a single native
+    /// transaction and commit it at most once. Each member's writes run
+    /// under their own savepoint (WS2): a member whose `apply` fails is
+    /// rolled back alone (`item.result` captures its error) while members
+    /// staged before and after it are unaffected. Returns an error only when
+    /// the shared commit itself fails (admission, transaction open, or the
+    /// final `commitTransactionWithDurability`/fsync) -- the caller then
+    /// treats every member's durability as unknown, per `driveMutationCoordinator`.
+    /// Any error this returns (admission, transaction open, or the final
+    /// commit/fsync) leaves every member's durability equally uncertain,
+    /// even a member that had already failed its own apply and rolled back.
+    /// Callers must overwrite every member's `result` with that error; see
+    /// `driveMutationCoordinator`. A member whose own apply failed inside
+    /// the loop below, with the group otherwise committing, keeps that
+    /// specific error instead (this function then returns successfully).
     fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
         var index_only = true;
         var artifact_lease_only = true;
@@ -2942,10 +3089,24 @@ pub const Store = struct {
         // next owner must see its allocator and index roots on disk; a volatile
         // durable_header cannot safely survive that ownership handoff.
         var durable = self.writer_admission != null;
+        var admitted_any = false;
         while (current) |item| {
             durable = durable or item.durable;
-            try item.apply(item.context, &self.file);
+            const savepoint = try self.file.beginTransactionSavepoint();
+            if (item.apply(item.context, &self.file)) |_| {
+                self.file.releaseTransactionSavepoint(savepoint);
+                admitted_any = true;
+            } else |err| {
+                self.file.rollbackTransactionSavepoint(savepoint);
+                item.result = err;
+            }
             current = item.next;
+        }
+        if (!admitted_any) {
+            // Nothing survived staging; there is no durability to buy for a
+            // transaction that would otherwise flush and publish no change.
+            self.file.abortTransaction();
+            return;
         }
         try self.file.commitTransactionWithDurability(durable);
     }
@@ -3392,9 +3553,11 @@ pub const Txn = struct {
         defer allocator.free(mutations);
         var node = self.pending_tree.getMin();
         var i: usize = 0;
+        var estimated_bytes: usize = 0;
         while (node) |current| : (i += 1) {
             const pending = self.pending.items[pendingNode(current).ordinal];
             mutations[i] = .{ .key = pending.key, .value = pending.value orelse "", .is_delete = pending.value == null };
+            estimated_bytes += pending.key.len + mutations[i].value.len;
             node = current.next();
         }
 
@@ -3414,12 +3577,18 @@ pub const Txn = struct {
         }
         const wal_trace_scope = wal_trace.scope(.primary_commit);
         defer wal_trace_scope.end();
-        try store.submitMutation(&context, Commit.apply);
+        // Stage, then release the writer slot before waiting on durability
+        // (WS2): the slot only serializes who may stage the next write, not
+        // who must wait for this one's fsync. Releasing it here lets the next
+        // writer open and stage into the same group while this one's commit
+        // (and the fsync it may share with other stagers) is still running.
+        const ticket = try store.stage(.{ .context = &context, .apply = Commit.apply, .estimated_bytes = estimated_bytes });
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             store.releaseWriterSlot();
             self.writer_reserved = false;
         }
+        try ticket.wait();
 
         self.freePending();
         self.freeOwnedReads();
@@ -6079,7 +6248,10 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
     }
 }
 
-test "lite failed commit group discards every root and allows a clean retry" {
+test "lite a member failing its own apply rolls back alone inside a shared group" {
+    // WS2: a per-member savepoint over TransactionWrites means one member's
+    // failed apply no longer discards an unrelated member's writes staged
+    // in the same native transaction/fsync.
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6092,25 +6264,76 @@ test "lite failed commit group discards every root and allows a clean retry" {
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.fail) return error.InjectedGroupFailure;
-            try file.putDocument("doc", "unpublished");
-            try file.putIndexCatalogRecord("index", "unpublished");
+            try file.putDocument("doc", "published");
+            try file.putIndexCatalogRecord("index", "published");
         }
     };
     var good = Context{ .fail = false };
     var bad = Context{ .fail = true };
     var second = MutationRequest{ .context = &bad, .apply = Context.apply };
     var first = MutationRequest{ .context = &good, .apply = Context.apply, .next = &second };
-    try std.testing.expectError(error.InjectedGroupFailure, store.applyMutationGroup(&first));
-    try std.testing.expect((try store.file.getDocumentAlloc(alloc, "doc")) == null);
-    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(alloc, "index")) == null);
+    // The group as a whole still commits: the bad member's own apply failed
+    // and was rolled back alone, but the good member's writes are durable.
+    try store.applyMutationGroup(&first);
+    try first.result;
+    try std.testing.expectError(error.InjectedGroupFailure, second.result);
+    const doc = (try store.file.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(doc);
+    try std.testing.expectEqualStrings("published", doc);
+    const index = (try store.file.getIndexCatalogRecordAlloc(alloc, "index")).?;
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings("published", index);
     try std.testing.expect((try store.checkWithCancel(null)).valid);
-    try store.submitMutation(&good, Context.apply);
-    {
-        var read = try store.beginRead();
-        defer read.abort();
-        try std.testing.expectEqualStrings("unpublished", try read.get("doc"));
-    }
-    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite a group fsync failure sends OutcomeUnknown to every member" {
+    // WS2: when the shared commit itself fails (not an individual member's
+    // apply), durability is unknown for the whole group -- including a
+    // member whose own apply already succeeded.
+    const Fault = struct {
+        var remaining: usize = 0;
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (remaining != 0) {
+                remaining -= 1;
+                if (remaining == 0) return error.InputOutput;
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const Context = struct {
+        label: []const u8,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try file.putDocument(self.label, "staged");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "group-fsync-failure.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Fault.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io });
+    defer store.close();
+    var first_ctx = Context{ .label = "one" };
+    var second_ctx = Context{ .label = "two" };
+    var second = MutationRequest{ .context = &second_ctx, .apply = Context.apply };
+    var first = MutationRequest{ .context = &first_ctx, .apply = Context.apply, .next = &second };
+    // The second sync barrier fails while the checkpoint slot is being
+    // published, which leaves the whole group's durability unknown.
+    Fault.remaining = 2;
+    defer Fault.remaining = 0;
+    // Seed the queue directly and drive the real coordinator (rather than
+    // calling applyMutationGroup directly) so this exercises the exact
+    // per-member result propagation that `stage`/`Ticket.wait` depend on.
+    store.commit_head = &first;
+    store.commit_tail = &second;
+    store.commit_draining = true;
+    store.driveMutationCoordinator();
+    try std.testing.expectError(error.OutcomeUnknown, first.result);
+    try std.testing.expectError(error.OutcomeUnknown, second.result);
 }
 
 test "lite publication mutex reserves queued owners before a writer can reacquire" {
