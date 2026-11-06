@@ -1207,7 +1207,7 @@ The implementation must preserve the following invariants:
 ### 1. Inspect the document and select OCR candidates
 
 Embedded text extraction produces stable page units. OCR candidates are page
-metadata (`unit_index`, `page_number`, embedded `OcrQuality`, `force_ocr`)
+metadata (`unit_index`, `page_number`, embedded `TextQuality`, `force_ocr`)
 chosen by `ocr_mode` and quality, not rendered bytes. Sparse candidate lists
 (for example pages 1, 5, and 19) keep their original unit positions.
 
@@ -1890,3 +1890,113 @@ removing this lease.
 - Whether the attempt spool should eventually use a compact versioned binary
   unit codec instead of JSON after corpus measurements quantify serialization
   CPU and temporary storage size.
+
+### Native semantic replacements
+
+Native extraction retains decoded glyph runs unchanged. Each effective
+`/ActualText` scope owns one semantic span, its enclosing source run interval
+(including zero-glyph scopes), explicit glyph membership, and a constant-space summary of glyph, vector, and image
+paint evidence. Nested Forms inherit active scopes and graphics state. Image
+eligibility uses transformed bounds without decoding pixels. Page and visible
+eligibility are evaluated per paint before bounds are unioned; unknown paint
+extents remain conservative. Stroke joins and device hairlines do not receive
+an underestimated path-only bound.
+Visibility retains zero-opacity ancestry across nested transparency groups
+separately from each render group's compositing alpha. Nonzero group opacity
+does not become invisible through multiplication or quantization underflow.
+
+Structure-backed replacements resolve container-scoped MCIDs through a lazy
+ParentTree number-tree index. Parsed metadata and validated number-tree nodes
+are cached per Reader; render forks own independent caches.
+Changing either decode limit releases the structure metadata cache; an identical
+limit update preserves it. Subsequent lookups rebuild under the current limits,
+including recovery from a previously exhausted metadata allowance.
+Container arrays, ancestor decisions, stream container keys, and decoded owner
+text are reused within each page. MCIDs, number-tree keys, Limits endpoints,
+and root type names use the same bounded, memoized resolver for direct and
+indirect values. Unassigned ParentTree slots treat direct and indirect null
+equally; parent links still require real structure elements. Named property
+lookups at BDC remain logarithmic. Sparse scopes select names through a shared
+dictionary index; dense scopes reuse its sorted order in one pass.
+Named replacement strings retain their encoded bytes and decode only when
+selected. A bounded page-local cache shares each decoded string, including
+indirect values; overridden replacement values are never decoded or resolved.
+Indirect resource and property dictionaries are retained once per page. Form
+records borrow their raw strings, and property-name indexes are sorted once per
+dictionary. Repeated Form scopes cannot multiply a shared replacement's storage.
+The resource cache retains recognized resource fields and only MCID/ActualText
+from property dictionaries. Unknown payloads are released with temporary parsing
+storage rather than accumulating in the cache. Temporary per-object parsing and
+retained metadata share one live-byte ceiling, with separate cumulative-allocation
+allowances. Required fields from indirect resources retain only a small source
+reference for Properties; the optional table is projected on first selected use.
+Inherited resource references preserve this behavior. Direct table retention that
+exceeds its allowance becomes an invalid optional value, diagnosed only if used.
+Indirect property tables and dictionaries are resolved only when a selected
+scope needs them; overridden scopes do not read their object streams.
+The syntax scanner transfers owned string/name tokens into objects, avoiding a
+second full payload allocation while an object stream remains decoded.
+Selected missing or malformed property dictionaries retain native glyph text and
+report incomplete ActualText, including when selected optional metadata exceeds
+a decode or allocation allowance. Actual allocator failures and cancellation
+propagate; overridden scopes do not report irrelevant metadata errors. Cache
+allocations classify quota failures at their own boundary and consume rejection
+state during recovery. Caller allocation failures never use ambient cache flags,
+so a previous optional quota rejection cannot turn a later OOM into page loss.
+UTF-16 text-string BOM detection precedes payload-length validation, so odd or
+truncated replacements use the same explicit fallback as invalid surrogate pairs.
+Optional null ActualText, MCID, Pg, and Stm values behave like omitted entries.
+Known current-page references preserve identity without cloning page resources.
+Retained structure metadata and page-local structure lookup allocations share
+one live-byte allowance. ParentTree bindings are checked against the owner's declared
+content. An outer replacement wins over its descendants; repeated MCIDs owned
+by the same replacement merge paint evidence and emit text once, preserving
+unrelated interleaved runs. Glyph selection and span propagation remain linear
+even when enclosing source intervals overlap.
+
+Structure lookup has explicit byte, cumulative-allocation, work, and recursion
+limits and polls cancellation. Metadata object parsing is depth-limited before
+recursive syntax expansion. Missing/cyclic links, mismatched content, dangling
+marked-content scopes, malformed inline replacements, cross-page replacements, and unsupported OBJR content
+preserve native fallback and set `actual_text_incomplete`; document semantic
+coverage becomes partial. Page references retained in the shared immutable
+page index distinguish pages even when they reuse the same content stream.
+
+Layout consumes each replacement once. Entry and exit glyphs preserve spacing
+at scope boundaries; unpositioned or multiline replacements fence geometric
+reordering at their authored source slot. Blocks and regions consume semantic
+spans directly rather than rescanning replacement bytes for every covered
+source run. Unknown bounds produce text and diagnostics without invented
+geometry. `source_run_count` and `emitted_run_count` count original glyph runs;
+`outside_page_spans`, `invisible_spans`, and `unpositioned_spans` separately
+report nonempty semantic replacements. Empty replacements intentionally delete
+their covered glyph text. Extraction identity and unit fingerprints version the
+resulting text, geometry, and diagnostics together.
+
+Native text scanners frame inline-image payloads before interpreting content
+operators. Raw rows use exact dimensions, component counts, sample depth, and
+row padding; ASCIIHex, ASCII85, RunLength, LZW, and JPEG use their outer codec
+boundaries. Flate framing discards decoded bytes through a fixed history window
+with cancellation and a 64 MiB work ceiling. No pixel plane is materialized.
+The same framing protects font/resource discovery and marked-content scopes.
+Unsupported or ambiguous boundaries (including unfiltered named color spaces
+and CCITT without a supported framing path) fail with
+`UnsupportedPdfInlineImage`; truncated payloads fail with
+`InvalidPdfInlineImage`. Native completion remains false on such failures;
+encoded pixels are never guessed to be text. Native rendering explicitly
+rejects inline images rather than silently omitting them; the existing platform
+compatibility backend may render them where available. Other hosts report
+unsupported rendering. This does not add inline pixels to the native raster IR.
+
+Canonical ActualText tracking retains an active-scope bit across content
+streams, so sibling replacements do not rescan the marked-content stack.
+Overridden scopes retain only lightweight stack frames; their replacement
+strings are not resolved, decoded, or copied. Canonical Form decoding inherits
+that suppression while retaining raw glyph fallback until the outer scope
+closes.
+Cancellation is polled during canonical decoding and resource discovery.
+Empty replacements bridge spacing only along a deleted glyph sequence on the
+same line; unrelated line/column boundaries and empty vector labels retain the
+surviving text's layout context. Page/clip intersections exclude every glyph
+when empty, including unknown glyph extents. Degenerate rectangular subpaths
+do not establish fill visibility or enlarge clip bounds.

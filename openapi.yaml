@@ -34598,6 +34598,11 @@ components:
             physical generation; lake tokens retain the archive publication, metadata and accepted WAL
             cut, for the configured retention period (default five minutes; maximum one hour). Every use
             rechecks access, incarnation and recipe. Unavailable retained generations return 409.
+        live_read:
+          type: boolean
+          description: True when an ordered query read live state because this deployment's storage (Lite)
+            cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued
+            with search_after or search_before.
         evaluation:
           type: object
           additionalProperties: true
@@ -38954,6 +38959,85 @@ components:
         last_modified_field:
           type: string
           description: Row field holding the source last-modified timestamp.
+    DocumentExtractionTextQualityConfig:
+      type: object
+      description: Text-quality thresholds. `native_text.quality` assesses native document text and selects
+        fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality
+        flags are not guarantees of correct reading order or complete document semantics.
+      properties:
+        min_chars:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          default: 50
+          description: Minimum non-whitespace Unicode characters before text passes the length check.
+        garbled_min_words:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          default: 20
+          description: Minimum words before the garbled-text check applies.
+        garbled_sample_words:
+          type: integer
+          minimum: 1
+          default: 50
+          description: Words sampled by the garbled-text check.
+        max_single_char_word_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.4
+          description: Maximum ratio of single-character words before text counts as garbled.
+        min_line_chars:
+          type: integer
+          minimum: 1
+          default: 15
+          description: Minimum non-whitespace Unicode characters for a line to count in the corrupted-line
+            check.
+        max_corrupted_line_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.2
+          description: Maximum ratio of corrupted lines.
+        max_font_corruption:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.5
+          description: Font corruption score above which a substantial line counts as corrupted.
+        max_replacement_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.05
+          description: Maximum ratio of Unicode replacement characters.
+    DocumentExtractionNativeTextConfig:
+      type: object
+      description: Native document text policy and quality assessment. No OCR model is required. Native
+        quality diagnostics are recorded independently of extraction completion and OCR availability.
+      properties:
+        policy:
+          type: string
+          enum:
+            - source
+            - page
+            - visible
+          default: page
+          description: '`source` retains decoded source text, including off-page runs, for auditing. `page`
+            excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility
+            text. `visible` additionally excludes nonpainting and fully transparent text. These policies
+            do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.'
+        quality:
+          $ref: '#/components/schemas/DocumentExtractionTextQualityConfig'
     DocumentExtractionReaderConfig:
       type: object
       required:
@@ -39065,65 +39149,6 @@ components:
           maximum: 16384
           default: 4096
           description: Maximum width or height of a rendered page.
-    DocumentExtractionOcrQualityConfig:
-      type: object
-      description: Thresholds that decide when a PDF page's native text is too poor to keep, in `auto`
-        mode.
-      properties:
-        min_content_chars:
-          type: integer
-          x-go-type-skip-optional-pointer: false
-          minimum: 0
-          default: 50
-          description: Pages with fewer meaningful characters are read with OCR.
-        garbled_min_words:
-          type: integer
-          x-go-type-skip-optional-pointer: false
-          minimum: 0
-          default: 20
-          description: Minimum words before the garbled-text check applies.
-        garbled_sample_words:
-          type: integer
-          minimum: 1
-          default: 50
-          description: Words sampled by the garbled-text check.
-        max_single_char_word_ratio:
-          type: number
-          x-go-type-skip-optional-pointer: false
-          format: double
-          minimum: 0
-          maximum: 1
-          default: 0.4
-          description: Maximum ratio of single-character words before text counts as garbled.
-        substantial_line_min_chars:
-          type: integer
-          minimum: 1
-          default: 15
-          description: Minimum characters for a line to count in the corrupted-line check.
-        max_corrupted_line_ratio:
-          type: number
-          x-go-type-skip-optional-pointer: false
-          format: double
-          minimum: 0
-          maximum: 1
-          default: 0.2
-          description: Maximum ratio of corrupted lines.
-        font_corruption_score_threshold:
-          type: number
-          x-go-type-skip-optional-pointer: false
-          format: double
-          minimum: 0
-          maximum: 1
-          default: 0.5
-          description: Font corruption score at which text is replaced by OCR.
-        max_replacement_char_ratio:
-          type: number
-          x-go-type-skip-optional-pointer: false
-          format: double
-          minimum: 0
-          maximum: 1
-          default: 0.05
-          description: Maximum ratio of Unicode replacement characters.
     DocumentExtractionOcrConfig:
       type: object
       description: Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers
@@ -39142,7 +39167,7 @@ components:
             - auto
             - always
           default: auto
-          description: '`auto` reads PDF pages whose native text fails the `quality` checks, and images.
+          description: '`auto` reads PDF pages whose native text fails `native_text.quality`, and images.
             `always` reads every page.'
         prompt:
           type: string
@@ -39151,7 +39176,7 @@ components:
         render:
           $ref: '#/components/schemas/DocumentExtractionRenderConfig'
         quality:
-          $ref: '#/components/schemas/DocumentExtractionOcrQualityConfig'
+          $ref: '#/components/schemas/DocumentExtractionTextQualityConfig'
     CloudflareSTTConfig:
       type: object
       description: Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
@@ -39482,6 +39507,8 @@ components:
           x-go-type-skip-optional-pointer: false
           default: true
           description: Strip HTML markup from HTML sources before storing their text.
+        native_text:
+          $ref: '#/components/schemas/DocumentExtractionNativeTextConfig'
         ocr:
           $ref: '#/components/schemas/DocumentExtractionOcrConfig'
         transcription:
@@ -46329,12 +46356,69 @@ components:
           description: MIME type (audio/wav, image/gif, image/png, etc.).
         sampling:
           $ref: '#/components/schemas/VideoSamplingPolicy'
+    SourceContentPart:
+      type: object
+      additionalProperties: false
+      description: Image, audio, or video named by a source record's `content.resource`. Accepted only
+        on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security`
+        and replace this part with inline media, so the source URL never reaches a model vendor. Fetching
+        requires a nonempty `allowed_hosts`. Images are inlined within a 16 MiB expanded request. Audio
+        and video travel as binary attachments, up to 256 MiB per request and `max_download_size_bytes`.
+        Hosted providers receive them inline and may reject large requests. Models that do not support
+        the media type reject the request.
+      required:
+        - type
+        - source
+      properties:
+        type:
+          type: string
+          enum:
+            - source
+        source:
+          type: object
+          additionalProperties: false
+          required:
+            - type
+            - uri
+            - mime_type
+            - version
+            - length
+          properties:
+            type:
+              type: string
+              enum:
+                - source
+            uri:
+              type: string
+              maxLength: 16384
+              description: HTTP(S) URL. Treat source media URLs as private.
+            mime_type:
+              type: string
+              description: image/png, image/jpeg, image/webp, image/gif, or an audio/* or video/* type.
+            version:
+              type: string
+              minLength: 1
+              maxLength: 4096
+              description: Quoted strong ETag. The fetch fails if the source no longer has this version.
+            version_kind:
+              type: string
+              enum:
+                - strong_etag
+              default: strong_etag
+            length:
+              type: integer
+              format: int64
+              minimum: 1
+              maximum: 268435456
+              description: Exact object length. Images are limited by the 16 MiB request size.
     ContentPart:
-      description: A content part for multimodal input (text, image URL, or inline media).
+      description: A content part for multimodal input (text, image URL, inline media, or a pinned source
+        reference).
       oneOf:
         - $ref: '#/components/schemas/TextContentPart'
         - $ref: '#/components/schemas/ImageURLContentPart'
         - $ref: '#/components/schemas/MediaContentPart'
+        - $ref: '#/components/schemas/SourceContentPart'
     ChatMessageContent:
       x-go-type: stdjson.RawMessage
       x-go-type-import:
@@ -67572,6 +67656,17 @@ components:
           example:
             - /Users/data/
             - my-bucket/uploads/
+        source_media_base_urls:
+          type: array
+          description: Exact source companion base URLs that a chat `source` part may fetch, matched on
+            scheme, host, port and path. This is how a loopback or private companion is allowed; such
+            URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always
+            keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this
+            setting.
+          items:
+            type: string
+          example:
+            - http://127.0.0.1:8082/v1/media/
         user_agent:
           type: string
           description: User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
@@ -67956,11 +68051,40 @@ components:
         s3_credentials:
           $ref: '#/components/schemas/Credentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+        cooperative_execution:
+          type: object
+          additionalProperties: false
+          description: Opt-in interleaving of independently owned requests on backends declaring safe
+            step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal
+            routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with
+            one row per step.
+          properties:
+            mode:
+              type: string
+              enum:
+                - 'off'
+                - 'on'
+              default: 'off'
+            max_active_requests:
+              type: integer
+              minimum: 1
+              maximum: 2
+              default: 2
+            short_context_burst:
+              type: integer
+              minimum: 1
+              maximum: 8
+              default: 8
+            decode_handoff_wait_us:
+              type: integer
+              minimum: 0
+              maximum: 10000
+              default: 5000
         generation_batching:
           type: object
           additionalProperties: false
-          description: Experimental execution batching; mode on explicitly enables qualified CUDA scheduling.
-            Resource and request ceilings still apply.
+          description: Experimental row batching; independent from cooperative_execution. Mode on explicitly
+            enables qualified CUDA row scheduling. Resource and request ceilings still apply.
           properties:
             mode:
               type: string

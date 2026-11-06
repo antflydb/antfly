@@ -5504,10 +5504,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         lib_standalone_runtime_test_step.dependOn(&run.step);
         inference_host_test_step.dependOn(&run.step);
     }
+    const device_budget_host_root = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/test_device_budget_host.zig"), .target = target, .optimize = optimize });
+    device_budget_host_root.addImport("antfly_inference_engine", test_imports.runtime.inference_engine);
+    device_budget_host_root.addImport("inference_server", test_imports.runtime.inference_server);
+    device_budget_host_root.link_libc = true;
+    const device_budget_host_tests = b.addTest(.{ .root_module = device_budget_host_root, .max_rss = 24 * 1024 * 1024 * 1024 });
+    const run_device_budget_host_tests = b.addRunArtifact(device_budget_host_tests);
+    b.step("inference-device-budget-host-test", "Verify CUDA device ownership through the production engine host").dependOn(&run_device_budget_host_tests.step);
+    inference_host_test_step.dependOn(&run_device_budget_host_tests.step);
+    lib_standalone_runtime_test_step.dependOn(&run_device_budget_host_tests.step);
+    b.step("install-inference-device-budget-host-tests", "Install the production CUDA budget tests for hardware qualification").dependOn(&b.addInstallArtifact(device_budget_host_tests, .{ .dest_sub_path = "inference-device-budget-host-tests" }).step);
     const inference_host_tests = b.addTest(.{
         .root_module = test_imports.runtime.inference_host,
         .filters = &.{
             "local generate message conversion preserves tool history and admission",
+            "local generate message conversion gives video its own field and rejects mixed media",
+            "local generate video reaches a Gemma 4 model through the linked provider",
             "inference worker",
             "standalone inference host placement",
             "standalone chunk minimum content",
@@ -5637,6 +5649,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // These sources became shared modules; imported modules do not contribute
     // tests to the facade root. Keep their contracts in the aggregate gate.
     const shared_inference_contract_step = b.step("antfly-inference-contract-test", "Run shared inference work and provider contracts");
+    const redirect_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/provider_redirect_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    redirect_test_mod.addImport("httpx", antfly_imports.httpx);
+    redirect_test_mod.addImport("google", antfly_imports.google);
+    redirect_test_mod.addImport("inference_types", antfly_imports.inference_types);
+    redirect_test_mod.addImport("openai", antfly_imports.inference_openai);
+    redirect_test_mod.addImport("local", antfly_imports.inference_local);
+    redirect_test_mod.addImport("vertex", antfly_imports.inference_vertex);
+    redirect_test_mod.addImport("bedrock", antfly_imports.inference_bedrock);
+    redirect_test_mod.addImport("list_models", antfly_imports.inference_list_models);
+    redirect_test_mod.addImport("capabilities", antfly_imports.inference_remote_capabilities);
+    const redirect_tests = b.addTest(.{ .root_module = redirect_test_mod });
+    const run_redirect_tests = b.addRunArtifact(redirect_tests);
+    b.step("antfly-provider-redirect-test", "Verify inference and discovery never forward credentials or input through redirects")
+        .dependOn(&run_redirect_tests.step);
+    shared_inference_contract_step.dependOn(&run_redirect_tests.step);
+    unit_test_step.dependOn(&run_redirect_tests.step);
+
     inline for (.{ antfly_imports.cache_budget, antfly_imports.inference_types, antfly_imports.inference_work, antfly_imports.inference_local, antfly_imports.inference_vertex }) |mod| {
         const tests = b.addTest(.{ .root_module = mod });
         const run = b.addRunArtifact(tests);

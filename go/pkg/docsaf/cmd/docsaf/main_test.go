@@ -119,9 +119,9 @@ func TestCreateHierarchyIndexesIncludesSelectivePDFOCRInSingleConfig(t *testing.
 	if render := ocr["render"].(map[string]any); render["dpi"] != float64(200) {
 		t.Fatalf("render.dpi = %#v, want 200", render["dpi"])
 	}
-	quality := ocr["quality"].(map[string]any)
-	if quality["min_content_chars"] != float64(75) {
-		t.Fatalf("min_content_chars = %#v, want 75", quality["min_content_chars"])
+	quality := config["native_text"].(map[string]any)["quality"].(map[string]any)
+	if quality["min_chars"] != float64(75) {
+		t.Fatalf("min_chars = %#v, want 75", quality["min_chars"])
 	}
 	reader := ocr["reader"].(map[string]any)
 	if reader["model"] != "reader" {

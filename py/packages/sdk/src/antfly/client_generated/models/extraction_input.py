@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ..models.extraction_token import ExtractionToken
     from ..models.image_url_content_part import ImageURLContentPart
     from ..models.media_content_part import MediaContentPart
+    from ..models.source_content_part import SourceContentPart
     from ..models.text_content_part import TextContentPart
 
 
@@ -25,8 +26,8 @@ T = TypeVar("T", bound="ExtractionInput")
 class ExtractionInput:
     """
     Attributes:
-        content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str): Message content. Supports two
-            formats:
+        content (list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str): Message
+            content. Supports two formats:
             - Simple string: "Hello, how are you?"
             - Array of content parts: [{"type": "text", "text": "Hello"}]
         id (str | Unset):
@@ -40,7 +41,7 @@ class ExtractionInput:
         options (ExtractionOptions | Unset):
     """
 
-    content: list[ImageURLContentPart | MediaContentPart | TextContentPart] | str
+    content: list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str
     id: str | Unset = UNSET
     tokens: list[ExtractionToken] | Unset = UNSET
     metadata: ExtractionInputMetadata | Unset = UNSET
@@ -50,6 +51,7 @@ class ExtractionInput:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
 
         content: list[dict[str, Any]] | str
@@ -62,6 +64,10 @@ class ExtractionInput:
                         componentsschemas_chat_message_content_type_1_item_data.to_dict()
                     )
                 elif isinstance(componentsschemas_chat_message_content_type_1_item_data, ImageURLContentPart):
+                    componentsschemas_chat_message_content_type_1_item = (
+                        componentsschemas_chat_message_content_type_1_item_data.to_dict()
+                    )
+                elif isinstance(componentsschemas_chat_message_content_type_1_item_data, MediaContentPart):
                     componentsschemas_chat_message_content_type_1_item = (
                         componentsschemas_chat_message_content_type_1_item_data.to_dict()
                     )
@@ -124,11 +130,14 @@ class ExtractionInput:
         from ..models.extraction_token import ExtractionToken
         from ..models.image_url_content_part import ImageURLContentPart
         from ..models.media_content_part import MediaContentPart
+        from ..models.source_content_part import SourceContentPart
         from ..models.text_content_part import TextContentPart
 
         d = dict(src_dict)
 
-        def _parse_content(data: object) -> list[ImageURLContentPart | MediaContentPart | TextContentPart] | str:
+        def _parse_content(
+            data: object,
+        ) -> list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str:
             try:
                 if not isinstance(data, list):
                     raise TypeError()
@@ -140,7 +149,7 @@ class ExtractionInput:
 
                     def _parse_componentsschemas_chat_message_content_type_1_item(
                         data: object,
-                    ) -> ImageURLContentPart | MediaContentPart | TextContentPart:
+                    ) -> ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart:
                         try:
                             if not isinstance(data, dict):
                                 raise TypeError()
@@ -157,11 +166,19 @@ class ExtractionInput:
                             return componentsschemas_content_part_type_1
                         except (TypeError, ValueError, AttributeError, KeyError):
                             pass
+                        try:
+                            if not isinstance(data, dict):
+                                raise TypeError()
+                            componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
+
+                            return componentsschemas_content_part_type_2
+                        except (TypeError, ValueError, AttributeError, KeyError):
+                            pass
                         if not isinstance(data, dict):
                             raise TypeError()
-                        componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
+                        componentsschemas_content_part_type_3 = SourceContentPart.from_dict(data)
 
-                        return componentsschemas_content_part_type_2
+                        return componentsschemas_content_part_type_3
 
                     componentsschemas_chat_message_content_type_1_item = (
                         _parse_componentsschemas_chat_message_content_type_1_item(
@@ -176,7 +193,7 @@ class ExtractionInput:
                 return componentsschemas_chat_message_content_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(list[ImageURLContentPart | MediaContentPart | TextContentPart] | str, data)
+            return cast(list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str, data)
 
         content = _parse_content(d.pop("content"))
 

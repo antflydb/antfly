@@ -56,7 +56,7 @@ func NewCatalogRecord(binding Binding, provider, revision string, permissions Pe
 }
 func (r CatalogRecord) Validate() error {
 	switch r.Provider {
-	case ProviderS3, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
+	case ProviderS3, ProviderLocal, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
 	default:
 		return fmt.Errorf("unsupported catalog provider")
 	}
@@ -173,10 +173,10 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 		}
 		var result struct {
 			Responses []struct {
-				Status   int             `json:"status"`
-				Error    json.RawMessage `json:"error"`
-				Snapshot string          `json:"remote_snapshot"`
-				Hits     struct {
+				Status int             `json:"status"`
+				Error  json.RawMessage `json:"error"`
+				queryFreshness
+				Hits struct {
 					Hits []struct {
 						ID     string        `json:"_id"`
 						Source CatalogRecord `json:"_source"`
@@ -191,7 +191,7 @@ func (s CatalogStore) Read(ctx context.Context, ids []string) (map[string]Catalo
 		if err := json.Unmarshal(data, &result); err != nil {
 			return nil, err
 		}
-		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].readable() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
 			return nil, fmt.Errorf("catalog query requires a successful snapshot")
 		}
 		allowed := map[string]bool{}

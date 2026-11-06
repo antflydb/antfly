@@ -203,6 +203,8 @@ pub const Scanner = struct {
     base_offset: usize = 0,
     pos: usize = 0,
     unread: std.ArrayList(Token) = .empty,
+    max_object_depth: usize = std.math.maxInt(usize),
+    object_depth: usize = 0,
 
     pub fn init(alloc: Allocator, bytes: []const u8) Scanner {
         return initWithOffset(alloc, bytes, 0);
@@ -223,6 +225,9 @@ pub const Scanner = struct {
     }
 
     pub fn readObject(self: *Scanner) anyerror!Object {
+        if (self.object_depth >= self.max_object_depth) return error.PdfObjectNestingTooDeep;
+        self.object_depth += 1;
+        defer self.object_depth -= 1;
         var tok = try self.readToken();
         defer tok.deinit(self.alloc);
 
@@ -273,8 +278,14 @@ pub const Scanner = struct {
                 return .{ .integer = value };
             },
             .real => |value| return .{ .real = value },
-            .string => |value| return .{ .string = try self.alloc.dupe(u8, value) },
-            .name => |value| return .{ .name = try self.alloc.dupe(u8, value) },
+            .string => |value| {
+                tok = .eof;
+                return .{ .string = value };
+            },
+            .name => |value| {
+                tok = .eof;
+                return .{ .name = value };
+            },
             .keyword => |kw| {
                 if (std.mem.eql(u8, kw, "null")) return .null;
                 if (std.mem.eql(u8, kw, "[")) return try self.readArray();
@@ -496,6 +507,16 @@ pub const Scanner = struct {
     }
 
     fn readLiteralString(self: *Scanner) anyerror![]u8 {
+        // Most literal strings need no escape or nesting processing. Allocate
+        // their exact size once: geometric growth otherwise retains both old
+        // and new buffers alongside a decoded object stream during relocation.
+        if (std.mem.indexOfAny(u8, self.bytes[self.pos..], "()\\")) |end| {
+            if (self.bytes[self.pos + end] == ')') {
+                const result = try self.alloc.dupe(u8, self.bytes[self.pos .. self.pos + end]);
+                self.pos += end + 1;
+                return result;
+            }
+        }
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
 
@@ -966,6 +987,14 @@ test "scanner parses dict array object ref and objdef" {
     try std.testing.expectEqual(@as(u32, 5), def.obj_def.ptr.id);
     try std.testing.expect(def.obj_def.value.* == .string);
     try std.testing.expectEqualStrings("hi", def.obj_def.value.string);
+}
+
+test "bounded object scanner rejects nested arrays before recursive expansion" {
+    var scanner = Scanner.init(std.testing.allocator, "[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]");
+    defer scanner.deinit();
+    scanner.max_object_depth = 16;
+    try std.testing.expectError(error.PdfObjectNestingTooDeep, scanner.readObject());
+    try std.testing.expectEqual(@as(usize, 0), scanner.object_depth);
 }
 
 test "object clone duplicates nested data" {

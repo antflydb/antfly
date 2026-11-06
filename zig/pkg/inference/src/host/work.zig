@@ -127,7 +127,8 @@ pub const Modalities = packed struct(u8) {
     image: bool = false,
     audio: bool = false,
     document: bool = false,
-    _reserved: u4 = 0,
+    video: bool = false,
+    _reserved: u3 = 0,
 
     pub fn contains(self: Modalities, required: Modalities) bool {
         const available_bits: u8 = @bitCast(self);
@@ -448,6 +449,7 @@ pub fn encodedImagePixels(content_type: []const u8, bytes: []const u8) !u64 {
 test "inference capabilities measure physical image pixels and MIME" {
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 7, .big);
     std.mem.writeInt(u32, png[20..24], 5, .big);
     try std.testing.expectEqual(@as(u64, 35), try encodedImagePixels("image/png;charset=binary", &png));
@@ -1087,6 +1089,7 @@ pub fn modalityForMimeType(content_type: []const u8) ?Modalities {
         return .{ .text = true };
     if (std.mem.startsWith(u8, essence, "image/")) return .{ .image = true };
     if (std.mem.startsWith(u8, essence, "audio/")) return .{ .audio = true };
+    if (std.mem.startsWith(u8, essence, "video/")) return .{ .video = true };
     if (std.mem.startsWith(u8, essence, "application/")) return .{ .document = true };
     return null;
 }
@@ -1514,4 +1517,22 @@ test "work identity and execution reports preserve per-item semantics" {
         error.InvalidExecutionReport,
         (ExecutionReport{ .requested_items = 1, .native_batches = 2, .native_items = 1 }).validate(),
     );
+}
+
+test "video MIME types require the video modality" {
+    try std.testing.expect(modalityForMimeType("video/mp4").?.video);
+    var mime_types = MimeTypes{ .text_plain = true };
+    try mime_types.add("video/mp4");
+    var capabilities = InferenceCapabilities{
+        .task = .generate,
+        .input_modalities = .{ .text = true },
+        .accepted_mime_types = mime_types,
+        .input_granularity = .chunk,
+        .batch = .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 },
+        .output = .generated_text,
+    };
+    try std.testing.expectError(error.InvalidInferenceCapabilities, capabilities.validate());
+    capabilities.input_modalities.video = true;
+    try capabilities.validate();
+    try std.testing.expect(capabilities.acceptsMimeType("video/mp4"));
 }

@@ -108,7 +108,9 @@ paths:
     post:
       operationId: startSourceSync
       description: >-
-        Start one durable full-profile sync. HTTP disconnect does not cancel it.
+        Start one durable sync of the full profile, or of one source with
+        source_id. Sync is serialized across the service, so another source's
+        active sync also returns 409. HTTP disconnect does not cancel it.
         Concurrent sync returns 409. Restart discards a failed pinned selection,
         retaining ownership. A service restart marks unfinished jobs interrupted;
         POST again to resume through Runner's durable checkpoints. Only the most
@@ -125,6 +127,8 @@ paths:
               type: object
               additionalProperties: false
               properties:
+                source_id: {type: string, format: uuid, description: Sync only this source.}
+                request_key: {type: string, description: Idempotency key; reuse with a different request returns 409.}
                 restart: {type: boolean, default: false}
                 purge_only: {type: boolean, default: false}
       responses:
@@ -220,7 +224,7 @@ components:
       additionalProperties: false
       required: [provider]
       properties:
-        provider: {type: string, enum: [github, google_workspace, gcs, s3, slack, discord]}
+        provider: {type: string, enum: [github, google_workspace, gcs, s3, local, slack, discord]}
         secret_refs:
           type: object
           additionalProperties: false
@@ -238,6 +242,7 @@ components:
         session_token_env: {type: string}
         s3_endpoint: {type: string}
         s3_insecure: {type: boolean}
+        local_root: {type: string, description: 'Absolute store directory for provider local, within ANTFLY_SOURCE_LOCAL_ROOTS.'}
     Permissions:
       type: object
       required: [public, readers]

@@ -46,6 +46,8 @@ Create `sources.json` with secret **references**, rather than secret values:
 Source UUIDs and connection map keys are durable identities. Multiple sources can
 reuse a connection. Other connection forms:
 
+- Local store: `provider: "local"`, `local_root: "/var/lib/antfly-uploads"`; for
+  deployments with no object store. See [local content store](#local-content-store).
 - GitHub: `provider: "github"`, `token_env: "SOURCE_GITHUB_TOKEN"`; use a token
   scoped to the selected repositories/resources. Config accepts `repositories`
   with per-repository `repository`, `ref`, `prefix` and `include` selections.
@@ -92,7 +94,12 @@ antfly-grep --source-catalog ./catalog.json --source manuals 'retry budget'
 
 The runner creates a missing destination through the normal table API, writes
 canonical rows with a write barrier, and checks revision, content digest and
-permissions through a snapshot-capable query before declaring them searchable.
+permissions through a snapshot-capable query before declaring them searchable. On Lite, which
+cannot retain a snapshot, the same query reads live state and says so with `live_read`.
+An empty live result does not prove absence while inserts are awaiting indexing.
+Lite therefore checks authoritative cleanup against primary storage through scoped
+merge, with `full_index` visibility before completion. Catalog publication and
+retirement also use `full_index`. Retained snapshots keep the no-op cleanup shortcut.
 Multiple sources may share an ingestion destination. The runner never imports
 arbitrary application rows into its ownership ledger. All queries use existing Antfly table endpoints;
 self-hosted grep never invokes `antfly-cloud`.
@@ -387,6 +394,35 @@ extraction, the qualification gate, and owner-side bucket/prefix/version rejecti
 These tests do not qualify real Google identity exchange or model-based OCR,
 embeddings, relationship extraction, or production GPU capacity. They are
 explicitly opt-in and do not make normal source-module tests build Antfly.
+
+## Local content store
+
+The `local` provider serves a content-addressed directory through the same records
+and media protocol as a bucket, so an application keeps the same code when it moves
+to object storage. Objects live at `<local_root>/<prefix>/objects/sha256/<digest>[.ext]`.
+The name is the revision, and the extension selects the MIME type. Go applications
+can write with `PutLocalObject`; others write to a temporary dot-file in that
+directory and rename it. Source config accepts an optional `prefix`.
+
+`ANTFLY_SOURCE_LOCAL_ROOTS` lists the directories a connection may use, separated by
+the platform path-list separator. Unset denies local connections, because whoever can
+register a connection would otherwise choose which files the service reads.
+
+The store directory must already exist. A missing directory fails the run rather
+than reading as empty, so a lost mount cannot delete every published row. Removing an
+object retires its row on the next run. Symlinks and unexpected names fail the run.
+Objects are limited to 256 MiB, because delivery reads and verifies the complete object
+and serves its ranges from that copy. The service retains verified copies in a 256 MiB
+cache, so repeated ranges reuse them while still rechecking access. A changed object
+never delivers different bytes under the published ETag: it fails with 412 once its
+verified copy is gone, so write new content under its own digest. `PutLocalObject`
+replaces a damaged object with the same digest.
+Antfly reaches the store through `antfly-source serve`, which it must be allowed to
+fetch: list the listener in `remote_content.security.source_media_base_urls`, such as
+`http://127.0.0.1:8082/v1/media/`. This allows that listener without opening other
+private addresses or ports. Run one source with
+`POST /v1/sync` and `{"source_id": "<uuid>"}` to publish a new upload without syncing
+the others. Runs are serialized across the service, so a concurrent run returns 409.
 
 ## Media and runtime source registration
 

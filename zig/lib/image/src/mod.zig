@@ -168,7 +168,8 @@ pub fn detectFormat(bytes: []const u8) Format {
 pub fn inspectEncoded(bytes: []const u8) !EncodedImageInfo {
     switch (detectFormat(bytes)) {
         .png => {
-            if (bytes.len < 24) return error.InvalidImageEncoding;
+            // Dimensions are only meaningful inside the leading IHDR chunk.
+            if (bytes.len < 24 or !std.mem.eql(u8, bytes[12..16], "IHDR")) return error.InvalidImageEncoding;
             const width = std.mem.readInt(u32, bytes[16..20], .big);
             const height = std.mem.readInt(u32, bytes[20..24], .big);
             if (width == 0 or height == 0) return error.InvalidImageEncoding;
@@ -237,6 +238,7 @@ test "inference MIME registry contains only decodable formats" {
 test "inspectEncoded reports dimensions without decoding pixels" {
     var header = @as([24]u8, @splat(0));
     @memcpy(header[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(header[12..16], "IHDR");
     std.mem.writeInt(u32, header[16..20], 320, .big);
     std.mem.writeInt(u32, header[20..24], 200, .big);
     const info = try inspectEncoded(&header);
@@ -244,4 +246,13 @@ test "inspectEncoded reports dimensions without decoding pixels" {
     try std.testing.expectEqual(@as(u32, 200), info.height);
     try std.testing.expectEqual(@as(u64, 64_000), try info.pixels());
     try std.testing.expectError(error.UnsupportedImageEncoding, inspectEncoded("not an image"));
+}
+
+test "inspectEncoded rejects a PNG signature without an IHDR chunk" {
+    const signature = "\x89PNG\r\n\x1a\n";
+    try std.testing.expectError(error.InvalidImageEncoding, inspectEncoded(signature ++ "not actually a png file"));
+    const valid = signature ++ "\x00\x00\x00\x0dIHDR\x00\x00\x00\x02\x00\x00\x00\x03";
+    const info = try inspectEncoded(valid);
+    try std.testing.expectEqual(@as(u32, 2), info.width);
+    try std.testing.expectEqual(@as(u32, 3), info.height);
 }

@@ -118,6 +118,7 @@ const InferenceRuntimeConfig = struct {
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     resources: inference.platform.resource_policy.Resources = .{},
     generation_batching: inference.platform.inference_settings.GenerationBatching = .{},
+    cooperative_execution: inference.platform.inference_settings.CooperativeExecution = .{},
     kernel_jit: inference.graph.kernel_jit.Config = .{},
     prompt_cache: inference.server.PromptCacheConfig = .{},
 };
@@ -869,6 +870,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     node_config.max_concurrent_requests = policy.admission.max_concurrent_requests;
     node_config.max_work_units = policy.admission.workCapacity();
     node_config.request_limits = policy.request_limits;
+    node_config.cooperative_execution = inference.server.CooperativeExecutionConfig.fromSettings(runtime_config.value.cooperative_execution);
     node_config.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(runtime_config.value.generation_batching);
     const configured_limits = policy.memory.limits(inference.runtime.tier.memory.Limits);
     // CLI/bridge overrides take precedence field by field, while physical caps
@@ -2834,6 +2836,7 @@ fn validateLocalGenerateCapabilities(
             .text = preflight.text_bytes > 0,
             .image = preflight.image_count > 0,
             .audio = preflight.has_audio,
+            .video = preflight.video_count > 0,
         },
         .encoded_media_bytes = preflight.encoded_media_bytes,
         .decoded_pixels = decoded_pixels,
@@ -2901,6 +2904,7 @@ fn validateEncodedReadCapabilities(
 test "encoded reader ABI enforces resolved model capabilities" {
     var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(bytes[12..16], "IHDR");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const image = readers.EncodedImage{ .bytes = &bytes, .mime_type = "image/png" };
@@ -3263,6 +3267,10 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
+    if (task == .generate and inference.server.generatorAcceptsVideo(&manifest)) {
+        result.input_modalities.video = true;
+        for ([_][]const u8{ "video/mp4", "video/quicktime", "video/webm", "video/mp2t" }) |mime_type| try result.accepted_mime_types.add(mime_type);
+    }
     if (task == .embed) {
         result.model_aware_chunking_v1 = true;
         result.dense_output = if (manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
@@ -3414,13 +3422,16 @@ fn addLocalGenerateMediaPreflight(
 ) !void {
     const is_image = mimeEssenceStartsWith(descriptor.mime_type, "image/");
     const is_audio = mimeEssenceStartsWith(descriptor.mime_type, "audio/");
-    if (!is_image and (image_only or !is_audio)) return error.UnsupportedGeneratorProvider;
+    const is_video = mimeEssenceStartsWith(descriptor.mime_type, "video/");
+    if (!is_image and (image_only or !(is_audio or is_video))) return error.UnsupportedGeneratorProvider;
 
     try addLocalGenerateBytes(&preflight.encoded_media_bytes, descriptor.encoded_bytes);
     try addLocalGenerateBytes(&preflight.decoded_media_bytes, descriptor.decoded_bytes);
     try addLocalGenerateBytes(&preflight.media_count, 1);
     if (is_image) {
         try addLocalGenerateBytes(&preflight.image_count, 1);
+    } else if (is_video) {
+        try addLocalGenerateBytes(&preflight.video_count, 1);
     } else {
         preflight.has_audio = true;
     }
@@ -3487,6 +3498,8 @@ fn preflightLocalGenerateMessagesInternal(
         }
     }
     if (attachments) |values| if (attachment_index != values.len) return error.InvalidArguments;
+    if (preflight.video_count > 1) return error.VideoLimitExceeded;
+    if (preflight.video_count != 0 and (preflight.image_count != 0 or preflight.has_audio)) return error.UnsupportedMixedVideoInput;
     return preflight;
 }
 
@@ -3576,6 +3589,7 @@ fn convertLocalGenerateParts(
     errdefer text_buf.deinit(alloc);
     var images = std.ArrayListUnmanaged([]const u8).empty;
     errdefer images.deinit(alloc);
+    var video: ?[]const u8 = null;
     var audio = std.ArrayListUnmanaged([]const u8).empty;
     errdefer audio.deinit(alloc);
     var out_parts = std.ArrayListUnmanaged(inference.pipelines.GenerationMessage.ContentPart).empty;
@@ -3618,6 +3632,9 @@ fn convertLocalGenerateParts(
                     } else if (mimeEssenceStartsWith(attachment.content_type, "audio/")) {
                         try audio.append(alloc, attachment.bytes);
                         try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
+                    } else if (mimeEssenceStartsWith(attachment.content_type, "video/")) {
+                        if (video != null) return error.VideoLimitExceeded;
+                        video = attachment.bytes;
                     } else return error.UnsupportedGeneratorProvider;
                     attachment_index.* += 1;
                     continue;
@@ -3636,6 +3653,11 @@ fn convertLocalGenerateParts(
                     try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
                     decoded_owned = false;
+                } else if (mimeEssenceStartsWith(decoded.mime_type, "video/")) {
+                    if (video != null) return error.VideoLimitExceeded;
+                    try owner.owned_media.append(alloc, decoded.data);
+                    decoded_owned = false;
+                    video = decoded.data;
                 } else {
                     return error.UnsupportedGeneratorProvider;
                 }
@@ -3664,6 +3686,11 @@ fn convertLocalGenerateParts(
         slice_owned = false;
         break :blk slice;
     } else null;
+    // Video occupies its own message; its text is the plain message content.
+    if (video != null) {
+        if (image_slice != null or audio_slice != null) return error.UnsupportedMixedVideoInput;
+        out_parts.clearAndFree(alloc);
+    }
     const content_parts = if (out_parts.items.len > 0) blk: {
         const slice = try out_parts.toOwnedSlice(alloc);
         var slice_owned = true;
@@ -3678,8 +3705,106 @@ fn convertLocalGenerateParts(
         .content = text,
         .image_bytes = image_slice,
         .audio_bytes = audio_slice,
+        .video_bytes = video,
         .content_parts = content_parts,
     };
+}
+
+test "local generate message conversion gives video its own field and rejects mixed media" {
+    const alloc = std.testing.allocator;
+    const clip = "data:video/mp4;base64,AAAA";
+    const video: inference_types.ContentPart = .{ .media = .{ .mime_type = "video/mp4", .data = clip } };
+    const audio: inference_types.ContentPart = .{ .media = .{ .mime_type = "audio/wav", .data = "data:audio/wav;base64,AAAA" } };
+    const history: inference_types.ChatMessage = .{ .role = .user, .content = .{ .parts = &.{.{ .text = "first" }} } };
+    {
+        const messages = [_]inference_types.ChatMessage{ history, .{ .role = .user, .content = .{ .parts = &.{ .{ .text = "describe" }, video } } } };
+        // The linked entry points run preflight before conversion and compare both.
+        const preflight = try preflightLocalGenerateMessages(&messages);
+        try std.testing.expectEqual(@as(usize, 1), preflight.video_count);
+        try std.testing.expectEqual(@as(usize, 1), preflight.media_count);
+        try std.testing.expect(!preflight.has_audio);
+        var converted = try convertLocalGenerateMessages(alloc, &messages, preflight.decoded_media_bytes);
+        defer converted.deinit(alloc);
+        const message = converted.messages[1];
+        try std.testing.expectEqualStrings("\x00\x00\x00", message.video_bytes.?);
+        try std.testing.expectEqualStrings("describe", message.content);
+        try std.testing.expect(message.content_parts == null);
+        try std.testing.expect(converted.messages[0].content_parts != null);
+        const measured = try inference.server.Node.directGeneratePreflightForMessages(converted.messages);
+        try std.testing.expectEqual(preflight.video_count, measured.video_count);
+        try std.testing.expectEqual(preflight.media_count, measured.media_count);
+        try std.testing.expectEqual(preflight.decoded_media_bytes, measured.decoded_media_bytes);
+    }
+    const one_video: inference_types.ChatMessage = .{ .role = .user, .content = .{ .parts = &.{video} } };
+    try std.testing.expectError(error.VideoLimitExceeded, preflightLocalGenerateMessages(&.{ one_video, one_video }));
+    try std.testing.expectError(error.UnsupportedMixedVideoInput, preflightLocalGenerateMessages(&.{ .{ .role = .user, .content = .{ .parts = &.{audio} } }, one_video }));
+    // Models without video in their capabilities reject it during preflight.
+    const capabilities = inference_work.InferenceCapabilities{
+        .task = .generate,
+        .input_modalities = .{ .text = true, .image = true },
+        .accepted_mime_types = .{ .text_plain = true, .image_jpeg = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .serial_compatibility,
+            .preferred_items = 1,
+            .max_items = 1,
+            .max_encoded_media_bytes = clip.len,
+            .max_decoded_pixels = 5,
+            .max_media_parts_per_item = 1,
+        },
+        .output = .generated_text,
+    };
+    try std.testing.expectError(error.UnsupportedInferenceMimeType, preflightLocalGenerateMessagesInternal(&.{one_video}, null, capabilities));
+}
+
+test "local generate video reaches a Gemma 4 model through the linked provider" {
+    const platform = @import("antfly_platform");
+    const model = platform.env.getenv("ANTFLY_GEMMA4_VIDEO_TEST_MODEL") orelse return error.SkipZigTest;
+    const clip_path = platform.env.getenv("ANTFLY_GEMMA4_VIDEO_TEST_CLIP") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const clip = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, clip_path, a, .limited(16 * 1024 * 1024));
+    defer a.free(clip);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(clip.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, clip);
+    const uri = try std.fmt.allocPrint(a, "data:video/mp4;base64,{s}", .{encoded});
+    defer a.free(uri);
+
+    var state: LinkedInferenceState = undefined;
+    state.alloc = a;
+    state.io = std.testing.io;
+    state.worker = null;
+    state.node = try inference.server.Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .generation_budget_overrides = .{ .host_limit_bytes = 8 * 1024 * 1024 * 1024 }, .process_termination_available = true, .content_security = .{ .allowed_hosts = &.{@constCast("127.0.0.1")}, .block_private_ips = false } });
+    const node = &state.node;
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (@import("builtin").os.tag == .macos) .metal else .cuda;
+    node.model_manager.session_manager.required_backend = node.session_manager.required_backend;
+    const name = std.fs.path.basename(model);
+    const prompt = "What colors does this video show, and in what order? Answer briefly.";
+
+    const inline_messages = [_]inference_types.ChatMessage{
+        .{ .role = .user, .content = .{ .parts = &.{.{ .text = "My name is Sam." }} } },
+        .{ .role = .assistant, .content = .{ .text = "Hello Sam." } },
+        .{ .role = .user, .content = .{ .parts = &.{ .{ .text = prompt }, .{ .media = .{ .mime_type = "video/mp4", .data = uri } } } } },
+    };
+    const answer = try localAntflyGenerateMessages(node, std.testing.io, a, name, &inline_messages, .{ .max_tokens = 48 }, .{});
+    defer a.free(answer);
+    const lower = try std.ascii.allocLowerString(a, answer);
+    defer a.free(lower);
+    const red = std.mem.indexOf(u8, lower, "red") orelse return error.TestExpectedRedFrames;
+    const blue = std.mem.indexOf(u8, lower, "blue") orelse return error.TestExpectedBlueFrames;
+    try std.testing.expect(red < blue);
+
+    const attachments = [_]inference_work.Attachment{.{ .content_type = "video/mp4", .bytes = clip }};
+    const attached_messages = [_]inference_types.ChatMessage{
+        .{ .role = .user, .content = .{ .parts = &.{ .{ .text = prompt }, .{ .media = .{ .mime_type = "video/mp4", .data = "" } } } } },
+    };
+    const attached = try localAntflyGenerateMessagesWithAttachments(node, std.testing.io, a, name, &attached_messages, &attachments);
+    defer a.free(attached);
+    const attached_lower = try std.ascii.allocLowerString(a, attached);
+    defer a.free(attached_lower);
+    try std.testing.expect(std.mem.indexOf(u8, attached_lower, "red") != null);
 }
 
 test "local generate message conversion preserves tool history and admission" {
@@ -3729,7 +3854,7 @@ pub fn decodeLocalGenerateDataUri(
 }
 
 test "linked generator validates concrete MIME and decoded pixels" {
-    const uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const uri = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     const messages = [_]inference_types.ChatMessage{.{
         .role = .user,
         .content = .{ .parts = &.{.{ .image_url = .{ .url = uri } }} },

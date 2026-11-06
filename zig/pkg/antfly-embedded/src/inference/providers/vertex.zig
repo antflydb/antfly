@@ -185,6 +185,7 @@ pub const GeminiProvider = struct {
         defer self.allocator.free(url);
         const headers = [_][2][]const u8{self.api_key_header};
         var response = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = &headers,
@@ -241,6 +242,7 @@ pub const GeminiProvider = struct {
 
         const headers = [_][2][]const u8{self.api_key_header};
         var resp = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = &headers,
@@ -401,6 +403,7 @@ pub const Provider = struct {
         try headers.append(alloc, .{ "X-Goog-User-Project", self.project_id });
 
         var response = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = request_body,
             .headers = headers.items,
@@ -527,6 +530,7 @@ pub const Provider = struct {
         defer if (minted_auth) |value| alloc.free(value);
         try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
         var response = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = headers.items,
@@ -620,6 +624,7 @@ pub const Provider = struct {
         try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
 
         var resp = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = headers.items,
@@ -1180,7 +1185,7 @@ fn embedContent(alloc: Allocator, http: *httpx.Client, observer: ?httpx.AttemptO
         .outputDimensionality = options.dimensions,
     }, .{ .emit_null_optional_fields = false });
     defer alloc.free(body);
-    var response = try http.post(url, .{ .attempt_observer = observer, .json = body, .headers = headers, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = control.cancellation });
+    var response = try http.post(url, .{ .follow_redirects = false, .attempt_observer = observer, .json = body, .headers = headers, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = control.cancellation });
     defer response.deinit();
     if (!response.ok()) return mapEmbeddingStatus(response.status.code);
     const Response = struct { embedding: struct { values: []const f32 } };

@@ -789,7 +789,7 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
     const g = projector.embeddingGemma2VideoGeometry(display.width, display.height);
     // Apply SAR through target aspect; a single separable resample avoids an
     // intermediate stretched raster and its additional RGB8 rounding.
-    return .{ .width = g.width, .height = g.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (matrix == .gbr_identity) .gbr_reference else if (width % 16 == 0) .q13_components else .q16_luma };
+    return .{ .width = g.width, .height = g.height, .presentation_width = display.width, .presentation_height = display.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (matrix == .gbr_identity) .gbr_reference else if (width % 16 == 0) .q13_components else .q16_luma };
 }
 
 fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h264_dynamic.Session {
@@ -1236,6 +1236,37 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
     return plan;
 }
 
+/// Presentation time of each selected picture, in microseconds from the first
+/// picture. Slots match the slots delivered to a FrameObserver for this sampling.
+pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) ![]i64 {
+    const adapter = control.imageWorkControl();
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
+    if (isWebm(bytes)) {
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
+        defer index.deinit();
+        const selected = try selectWebm(a, index, sampling, source.control, null);
+        defer a.free(selected);
+        var first: i64 = std.math.maxInt(i64);
+        for (index.pictures) |picture| first = @min(first, picture.pts);
+        const output = try a.alloc(i64, selected.len);
+        for (selected, output) |id, *value| value.* = @divFloor(index.pictures[id].pts - first, 1000);
+        return output;
+    }
+    var input = try PacketInput.init(a, &source, bytes);
+    defer input.deinit();
+    const selected = try selectWithSampling(a, &input.reader, sampling);
+    defer a.free(selected);
+    var first: i64 = std.math.maxInt(i64);
+    for (input.reader.packets) |packet| first = @min(first, packet.pts);
+    const output = try a.alloc(i64, selected.len);
+    for (selected, output) |id, *value| {
+        const ticks: i128 = input.reader.packets[id].pts - first;
+        value.* = @intCast(@divFloor(ticks * std.time.us_per_s, input.reader.track.timescale));
+    }
+    return output;
+}
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
     if (sampling == .reference) return index.select();
     if (timeline) |cached| return switch (sampling) {

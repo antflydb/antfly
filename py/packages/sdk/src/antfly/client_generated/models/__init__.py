@@ -351,9 +351,10 @@ from .document_artifact_table_reprocess_response_reprocess_status import (
 )
 from .document_extraction_config import DocumentExtractionConfig
 from .document_extraction_config_route_preset import DocumentExtractionConfigRoutePreset
+from .document_extraction_native_text_config import DocumentExtractionNativeTextConfig
+from .document_extraction_native_text_config_policy import DocumentExtractionNativeTextConfigPolicy
 from .document_extraction_ocr_config import DocumentExtractionOcrConfig
 from .document_extraction_ocr_config_mode import DocumentExtractionOcrConfigMode
-from .document_extraction_ocr_quality_config import DocumentExtractionOcrQualityConfig
 from .document_extraction_reader_config import DocumentExtractionReaderConfig
 from .document_extraction_reader_config_provider import DocumentExtractionReaderConfigProvider
 from .document_extraction_reader_config_recognition_level import DocumentExtractionReaderConfigRecognitionLevel
@@ -364,6 +365,7 @@ from .document_extraction_route_extractor import DocumentExtractionRouteExtracto
 from .document_extraction_route_extractor_type import DocumentExtractionRouteExtractorType
 from .document_extraction_route_match import DocumentExtractionRouteMatch
 from .document_extraction_source_config import DocumentExtractionSourceConfig
+from .document_extraction_text_quality_config import DocumentExtractionTextQualityConfig
 from .document_extraction_transcription_config import DocumentExtractionTranscriptionConfig
 from .document_field_mapping import DocumentFieldMapping
 from .document_field_mapping_fields import DocumentFieldMappingFields
@@ -2270,6 +2272,8 @@ from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config import RuntimeConfig
+from .runtime_config_cooperative_execution import RuntimeConfigCooperativeExecution
+from .runtime_config_cooperative_execution_mode import RuntimeConfigCooperativeExecutionMode
 from .runtime_config_generation_batching import RuntimeConfigGenerationBatching
 from .runtime_config_generation_batching_mode import RuntimeConfigGenerationBatchingMode
 from .runtime_config_model_strategies import RuntimeConfigModelStrategies
@@ -2308,6 +2312,11 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .source_content_part import SourceContentPart
+from .source_content_part_source import SourceContentPartSource
+from .source_content_part_source_type import SourceContentPartSourceType
+from .source_content_part_source_version_kind import SourceContentPartSourceVersionKind
+from .source_content_part_type import SourceContentPartType
 from .sql_array_column_schema import SQLArrayColumnSchema
 from .sql_array_column_schema_type import SQLArrayColumnSchemaType
 from .sql_array_dimension import SQLArrayDimension
@@ -2886,9 +2895,10 @@ __all__ = (
     "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentExtractionConfig",
     "DocumentExtractionConfigRoutePreset",
+    "DocumentExtractionNativeTextConfig",
+    "DocumentExtractionNativeTextConfigPolicy",
     "DocumentExtractionOcrConfig",
     "DocumentExtractionOcrConfigMode",
-    "DocumentExtractionOcrQualityConfig",
     "DocumentExtractionReaderConfig",
     "DocumentExtractionReaderConfigProvider",
     "DocumentExtractionReaderConfigRecognitionLevel",
@@ -2899,6 +2909,7 @@ __all__ = (
     "DocumentExtractionRouteExtractorType",
     "DocumentExtractionRouteMatch",
     "DocumentExtractionSourceConfig",
+    "DocumentExtractionTextQualityConfig",
     "DocumentExtractionTranscriptionConfig",
     "DocumentFieldMapping",
     "DocumentFieldMappingFields",
@@ -4583,6 +4594,8 @@ __all__ = (
     "RowFilterEntry",
     "RowFilterEntryFilter",
     "RuntimeConfig",
+    "RuntimeConfigCooperativeExecution",
+    "RuntimeConfigCooperativeExecutionMode",
     "RuntimeConfigGenerationBatching",
     "RuntimeConfigGenerationBatchingMode",
     "RuntimeConfigModelStrategies",
@@ -4621,6 +4634,11 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SourceContentPart",
+    "SourceContentPartSource",
+    "SourceContentPartSourceType",
+    "SourceContentPartSourceVersionKind",
+    "SourceContentPartType",
     "SQLArrayColumnSchema",
     "SQLArrayColumnSchemaType",
     "SQLArrayDimension",
