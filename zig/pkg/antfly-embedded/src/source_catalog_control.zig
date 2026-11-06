@@ -655,6 +655,7 @@ pub const storage_vector_member_bindings = @import("storage/vector_member_bindin
 pub const storage_vector_payload_store = @import("storage/vector_payload_store.zig");
 pub const storage_vector_wal_view = @import("storage/vector_wal_view.zig");
 pub const storage_wal = @import("storage/wal.zig");
+pub const storage_write_amplification_trace = @import("storage/write_amplification_trace.zig");
 pub const system_catalog_domain = @import("system_catalog/domain.zig");
 pub const system_catalog_relation_names = @import("system_catalog/relation_names.zig");
 pub const system_catalog_relation_reconciliation = @import("system_catalog/relation_reconciliation.zig");

@@ -45,11 +45,11 @@ const text_bytes: usize = 1024;
 // ---------------------------------------------------------------------------
 
 var counted_vtable: std.Io.VTable = undefined;
-var counted_vtable_ready = false;
-var counted_vtable_mutex: std.Thread.Mutex = .{};
+var counted_vtable_ready = std.atomic.Value(bool).init(false);
 
 const CountingShim = struct {
     fn fileSync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        _ = userdata;
         try std.testing.io.vtable.fileSync(std.testing.io.userdata, file);
         wal_trace.recordSync();
     }
@@ -61,20 +61,22 @@ const CountingShim = struct {
         splat: usize,
         offset: u64,
     ) std.Io.File.WritePositionalError!usize {
+        _ = userdata;
         const written = try std.testing.io.vtable.fileWritePositional(std.testing.io.userdata, file, header, data, splat, offset);
         wal_trace.recordWrite(written);
         return written;
     }
 };
 
+// Only ever called from the harness's own single setup thread, before any
+// writer threads are spawned (see Fixture.open / measureConcurrent), so a
+// plain flag is enough: no concurrent first-call race to guard against.
 fn countingIo() std.Io {
-    counted_vtable_mutex.lock();
-    defer counted_vtable_mutex.unlock();
-    if (!counted_vtable_ready) {
+    if (!counted_vtable_ready.load(.monotonic)) {
         counted_vtable = std.testing.io.vtable.*;
         counted_vtable.fileSync = CountingShim.fileSync;
         counted_vtable.fileWritePositional = CountingShim.fileWritePositional;
-        counted_vtable_ready = true;
+        counted_vtable_ready.store(true, .monotonic);
     }
     return .{ .userdata = std.testing.io.userdata, .vtable = &counted_vtable };
 }
@@ -99,7 +101,7 @@ const Fixture = struct {
         var directory = try TestDirectory.init(name);
         errdefer directory.cleanup();
         try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
-        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+        const path = try std.fmt.allocPrint(alloc, "{s}/db.aflite", .{directory.path()});
         errdefer alloc.free(path);
 
         var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
@@ -125,7 +127,7 @@ const Fixture = struct {
     fn close(self: *Fixture) void {
         api.antfly_db_close(self.handle);
         self.runtime.deinit();
-        self.alloc.free(@constCast(self.path));
+        self.alloc.free(self.path);
         self.directory.cleanup();
     }
 };
@@ -144,10 +146,16 @@ fn payload(buffer: []u8, worker: usize, sequence: usize) []const u8 {
 }
 
 fn insertOne(alloc: std.mem.Allocator, handle: *anyopaque, key: []const u8, text: []const u8, sync_level: []const u8) !void {
+    const key_json = try jsonString(alloc, key);
+    defer alloc.free(key_json);
+    const text_json = try jsonString(alloc, text);
+    defer alloc.free(text_json);
+    const sync_level_json = try jsonString(alloc, sync_level);
+    defer alloc.free(sync_level_json);
     const body = try std.fmt.allocPrint(alloc, "{{\"inserts\":{{{s}:{{\"body\":{s}}}}},\"sync_level\":{s}}}", .{
-        try jsonString(alloc, key),
-        try jsonString(alloc, text),
-        try jsonString(alloc, sync_level),
+        key_json,
+        text_json,
+        sync_level_json,
     });
     defer alloc.free(body);
     var output: capi_types.Buffer = .{};
@@ -240,7 +248,7 @@ fn printStageTable(mode_name: []const u8, mode: ModeReport) void {
         mode.perUpdate(.calling_thread),
         mode.perUpdate(.background),
     });
-    inline for (std.meta.tags(wal_trace.Stage)) |stage| {
+    for (std.meta.tags(wal_trace.Stage)) |stage| {
         const counts = mode.report.stage(stage);
         if (counts.sync_calling_thread + counts.sync_background + counts.write_calls_calling_thread + counts.write_calls_background == 0) continue;
         std.debug.print("    {s}: sync(calling={d},background={d}) write_bytes(calling={d},background={d}) commits(calling={d},background={d})\n", .{
@@ -253,7 +261,7 @@ fn printStageTable(mode_name: []const u8, mode: ModeReport) void {
             counts.commits_background,
         });
     }
-    inline for (std.meta.tags(wal_trace.Op)) |op| {
+    for (std.meta.tags(wal_trace.Op)) |op| {
         const count = mode.report.op(op);
         if (count == 0) continue;
         std.debug.print("    op {s}: {d}\n", .{ @tagName(op), count });
