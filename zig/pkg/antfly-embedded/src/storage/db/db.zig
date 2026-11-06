@@ -10100,14 +10100,15 @@ pub const DB = struct {
                 error.NotFound => null,
                 else => return err,
             };
-            errdefer if (state) |value| alloc.free(value);
-
-            const manifest_json = try alloc.dupe(u8, row.value);
-            errdefer alloc.free(manifest_json);
-            try artifacts.append(
-                alloc,
-                try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state),
-            );
+            const manifest_json = alloc.dupe(u8, row.value) catch |err| {
+                if (state) |value| alloc.free(value);
+                return err;
+            };
+            // Ownership of manifest_json and state moves into the parser,
+            // which frees both itself when it fails.
+            var artifact = try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state);
+            errdefer artifact.deinit(alloc);
+            try artifacts.append(alloc, artifact);
         }
 
         var result: types.DocumentArtifactManifestList = .{
@@ -86042,6 +86043,31 @@ test "db public extraction budget rejection publishes a failure manifest" {
     try std.testing.expectEqualStrings("failed", manifest.merge_status);
     try std.testing.expectEqualStrings("DocumentExtractionWorkingSetTooLarge", manifest.last_error_code.?);
     try std.testing.expectEqual(@as(usize, 0), manifest.unit_count);
+}
+
+test "db artifact manifest list frees an unparseable asset value once" {
+    // Generic asset producers (for example a generator with content_type
+    // text/plain) store their raw output under the asset key, next to a state
+    // row. The manifest parser owns and frees both values when it rejects one;
+    // the list must not free them again.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "summary");
+    defer alloc.free(asset_key);
+    try db.core.store.put(asset_key, "generated summary text");
+    const state_key = try assetStateKeyAlloc(alloc, "doc", "summary");
+    defer alloc.free(state_key);
+    try db.core.store.put(state_key, "{\"generation\":1}");
+
+    try std.testing.expectError(error.SyntaxError, db.listDocumentArtifactManifests(alloc, "doc"));
+    try std.testing.expectError(error.SyntaxError, db.getDocumentArtifactManifest(alloc, "doc", "summary"));
 }
 
 test "db public artifact reprocess accepts durable work despite unrelated provider retries" {
