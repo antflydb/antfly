@@ -3157,7 +3157,30 @@ pub const Session = struct {
         lease.* = null;
     }
 
+    /// Same original resident producer, one Source admission and no numerical
+    /// replay. The actual Model/FIFO/B and output retirement shell are ready
+    /// before entry; outputs receive that SAME primary lease exactly once.
+    fn runColdNativeResident(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
+        var source: PreparedSource = .{};
+        defer source.deinitOutsideExecution();
+        // Keep the original public resident IO envelope, including an admitted
+        // input's old charged floor. Source resolves numerical geometry; it
+        // does not newly subtract planRun's input-residency credit here.
+        try source.initBeforeExecutionInto(self, self, self.execution_gate, .{ .host = inputs }, try RunRequest.fromTensors(inputs), null, .resident_consumer, allocator, null);
+        try source.enter();
+        var outputs = (try source.runResident(.{ .host = inputs })) orelse return null;
+        errdefer outputs.deinitWithBoundary(source.epoch());
+        if (!try source.handoffResident(&outputs)) return error.UnsupportedNativeResidentHandoff;
+        // The stored backend's synchronous fields were cleared by the actual
+        // resident callback. Source closes B/gates; output keeps Model+lease.
+        return outputs;
+    }
+
     pub fn runResident(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
+        // A mutable public policy bit cannot restore raw cache production on
+        // an actual Model/cache which still owns its admission Domain.
+        try @import("../execution/architecture_session.zig").validateNativePanelPreparationReceiver(self);
+        if (self.nativePanelPreparationReceiver()) return self.runColdNativeResident(inputs, allocator);
         if (self.preparesInvocation()) {
             var permit: RunPermit = undefined;
             try self.admitInputsInto(inputs, allocator, null, &permit);

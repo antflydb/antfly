@@ -9397,6 +9397,10 @@ test "Native Gemma fresh public Session and normalize false Source prepare cache
         lane: *Lane,
         violation: bool = false,
         calls: usize = 0,
+        primary_expected: ?memory_admission.AdmissionAmounts = null,
+        primary_calls: usize = 0,
+        primary_cookie: ?usize = null,
+        primary_releases: usize = 0,
         arms: usize = 0,
         disarms: usize = 0,
         fail_arm: bool = false,
@@ -9435,19 +9439,24 @@ test "Native Gemma fresh public Session and normalize false Source prepare cache
                 self.lane.mutex.unlock();
             } else self.violation = true;
         }
-        fn reserve(raw: *anyopaque, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
+        fn reserve(raw: *anyopaque, amounts: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.check();
             self.calls += 1;
+            if (self.primary_expected) |expected| if (std.meta.eql(expected, amounts)) {
+                self.primary_calls += 1;
+                self.primary_cookie = self.calls;
+            };
             return self.calls;
         }
         fn retain(raw: *anyopaque, _: usize, _: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.check();
         }
-        fn release(raw: *anyopaque, _: usize) void {
+        fn release(raw: *anyopaque, cookie: usize) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.check();
+            if (self.primary_cookie == cookie) self.primary_releases += 1;
         }
         fn close(session: session_mod.Session) void {
             var sink = @import("../execution/retirement_sink.zig").Ref.create() catch @panic("Native Source close sink");
@@ -9468,7 +9477,7 @@ test "Native Gemma fresh public Session and normalize false Source prepare cache
     const inputs = [_]Tensor{ ids, mask };
     // Each entry has its OWN new managed provider and independent raw model.
     // No staged/owned call primes the cache before any entry being witnessed.
-    for (0..8) |entry| {
+    for (0..9) |entry| {
         const raw = try session_factory.createNativeSession(a, model_path);
         defer raw.close();
         session_factory.attachIo(raw, std.testing.io);
@@ -9493,7 +9502,43 @@ test "Native Gemma fresh public Session and normalize false Source prepare cache
         session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 8 * GiB, .backend_limit_bytes = GiB }, .static_workspace_bytes = 0, .check_live_memory = false };
         try @import("../execution/architecture_session.zig").configureSharedCacheAdmissionForSession(session, a, &domain.controller, .cpu, session.run_admission.?.limits, .{});
         probe.model = session.execution_gate;
-        if (entry == 1) {
+        if (entry == 8) {
+            // This actual public call is FIRST on this managed provider.
+            // Cache metadata births are independent host_weight acquisitions;
+            // identify primary by its exact copied six-class declaration.
+            const old_request = try session_mod.RunRequest.fromTensors(&inputs);
+            const old_floor = try session.run_admission.?.estimateRequest(old_request, session.outputInfo());
+            var resolved = try session.planRun(&inputs, null);
+            resolved.pre_admitted_host_bytes = old_request.pre_admitted_host_bytes;
+            const source_floor = try session.run_admission.?.estimateRequest(resolved, session.outputInfo());
+            inline for (@typeInfo(memory_admission.AdmissionAmounts).@"struct".field_names) |field| try std.testing.expect(@field(source_floor, field) >= @field(old_floor, field));
+            probe.primary_expected = source_floor;
+            var expected = (try raw.runResident(&inputs, a)) orelse return error.ExpectedOriginalResidentOutput;
+            defer expected.deinit();
+            const expected_values = try expected.backend.toFloat32(expected.outputs[0], a);
+            defer a.free(expected_values);
+            var actual = (try session.runResident(&inputs, a)) orelse return error.ExpectedPublicResidentOutput;
+            var actual_live = true;
+            defer if (actual_live) actual.deinit();
+            try std.testing.expectEqual(@as(usize, 1), probe.primary_calls);
+            try std.testing.expect(actual.resource_lease != null);
+            try std.testing.expectEqualDeep(source_floor, actual.resource_lease.?.amounts);
+            try std.testing.expectEqual(probe.primary_cookie, actual.resource_lease.?.external_lease);
+            try std.testing.expectEqual(@as(usize, 0), probe.primary_releases);
+            try std.testing.expect(actual.backend.call_context == null and actual.backend.embedding_stage == null and actual.backend.native_weight_cache == null and actual.backend.execution_control == null);
+            probe.model = null;
+            Probe.close(session);
+            live = false;
+            try std.testing.expectEqual(@as(usize, 0), probe.primary_releases);
+            const values = try actual.backend.toFloat32(actual.outputs[0], a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_values), std.mem.sliceAsBytes(values));
+            actual.deinit();
+            actual_live = false;
+            _ = @import("../execution/resource_retirement.zig").poll();
+            try std.testing.expectEqual(@as(usize, 1), probe.primary_releases);
+            try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, domain.controller.snapshot());
+        } else if (entry == 1) {
             var raw_pipeline = EmbeddingPipeline.init(a, raw, tokenizer.tokenizer(), .{ .normalize = false, .resident_text_encoder = true, .max_length = 128, .embedding_gemma2_dimensions = 768 });
             raw_pipeline.execution_control = control;
             const expected = try raw_pipeline.embed(&texts);

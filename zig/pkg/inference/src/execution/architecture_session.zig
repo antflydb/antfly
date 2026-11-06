@@ -18054,12 +18054,36 @@ test "Native panel receiver uses actual Model binding when copied wrappers clear
     var copied = session;
     copied.run_admission.?.controller = &foreign;
     try std.testing.expectError(error.ForeignAdmissionDomain, validateNativePanelPreparationReceiver(copied));
+    try std.testing.expectError(error.ForeignAdmissionDomain, copied.runResident(&.{}, a));
     copied = session;
     copied.run_admission = null;
     try std.testing.expectError(error.MissingNativePanelAdmission, validateNativePanelPreparationReceiver(copied));
+    try std.testing.expectError(error.MissingNativePanelAdmission, copied.runResident(&.{}, a));
     copied.model_lifetime = null;
     copied.ptr = @ptrFromInt(16);
     try std.testing.expectError(error.MissingNativePanelOwner, validateNativePanelPreparationReceiver(copied));
+    try std.testing.expectError(error.MissingNativePanelOwner, copied.runResident(&.{}, a));
+    // Default self-contained public entry: no checkpoint/BLAS requirement.
+    // The original Native classifier resident callback declines before math;
+    // the new Source must preserve null and release its original one lease.
+    defer if (actual.model_lifetime.retirement_sink) |*sink| sink.release();
+    var scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{};
+    session.cohort_scheduler = &scheduler;
+    actual.task = .classifier;
+    var declined = try session.runResident(&.{}, a);
+    defer if (declined) |*output| output.deinit();
+    try std.testing.expect(declined == null);
+    try std.testing.expect(scheduler.head == null);
+    actual.task = .generic;
+    const malformed = session.runResident(&.{}, a);
+    defer if (malformed) |maybe| {
+        if (maybe) |value| {
+            var output = value;
+            output.deinit();
+        }
+    } else |_| {};
+    try std.testing.expectError(error.MissingInputs, malformed);
+    try std.testing.expect(scheduler.head == null);
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
 }
 
