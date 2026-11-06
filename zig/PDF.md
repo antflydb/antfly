@@ -1956,15 +1956,80 @@ then commit without allocation. Their in-place introsort polls cancellation and
 charges comparison work without a second index-sized buffer; a heapsort
 fallback bounds worst-case work and smaller-partition recursion bounds stack
 space.
-Metadata resolution shares one decoded object-stream frame and validated offset
-index per page. Both count against the retained/live byte allowance; codec
-scratch has a separate per-decode cumulative allowance. Decoded frames and
-projected object graphs move between accounting ledgers without copying or
-double-charging the shared backing allocator. Required reads evict unrelated
-frames; retained-budget pressure may also evict a frame before adopting a
-selected value.
+Metadata resolution uses a byte-budgeted LRU of decoded object-stream frames
+and validated offset indexes per page. Frame records, lookup storage, indexes,
+and payloads count against the retained/live allowance; codec scratch has a
+separate per-decode cumulative allowance. Stable frame records keep active
+parsers pinned while allocation pressure evicts only enough unpinned least
+recently used data. Required font/dependency reads share this cache, so a small
+descriptor container does not evict a reusable resource container when both fit.
+Lookup-table growth cannot reenter eviction on that table; verified allocation
+quota failures can evict before retrying index reservation. Genuine backing OOM
+is never retried as an admission failure.
+Decoded frames and projected object graphs move between accounting ledgers
+without copying or charging backing live bytes twice. Admission is preflighted
+against known minimum storage and the remaining cumulative allowance. A required
+read can parse a completed decode transiently if retention adoption fails; it
+does not discard that buffer and reinflate the container. When admission fails
+before decoding, required reads use the ordinary bounded uncached path. Private
+retention outcomes remain distinct from configured decoder limits: output-limit
+errors, actual decoder working-set errors, cancellation, and malformed input
+propagate immediately. Optional property reads retain their quota/fallback
+policy. Eviction never refunds cumulative allocation charges.
 Metadata scanning polls cancellation throughout tokens, strings, whitespace,
-comments, and skipped compound values. A page-local work allowance of 16 times
+comments, and skipped compound values. Stream-boundary searches for indirect
+lengths are a recovery path: valid indirect lengths are resolved first and
+seek directly to the declared payload end, preserving embedded endstream data.
+Length-reference chains and scalar parsing are depth-bounded. Dependency paths
+survive container reads so reentrant cycles are rejected. Ordinary stream
+lengths may be compressed; an object stream's own length remains uncompressed.
+Validated indirect lengths are normalized to integers in the owned header,
+avoiding repeated reference lookups and allocations during payload reads without
+increasing Object storage. Recovery searches use bounded chunks with marker
+overlap. Native text extraction classifies XObjects in a single dictionary pass.
+Only PDF Forms proceed to payload validation and decoding. Images, PostScript
+XObjects (both Subtype PS and Form/Subtype2 PS), and other ignored subtypes stop
+at the stream header, without resolving lengths, decoding length containers, or
+inspecting payload boundaries. Header views retain classification and the
+structure-presence marker, carry no payload range, and cannot be decoded.
+Dictionary order does not affect classification: unused fields are skipped,
+while allocating Form-only fields stay as source offsets until classification
+is complete, including an optional late Subtype2 PS. Form resource dictionaries
+are traversed once into at most five required fields. Required resource tables
+retain a bounded index of at most eight short names, with source spans for
+compound entries. Larger tables and long names fall back to a single source
+span; unselected tables cannot grow retained metadata merely through entry
+count. When content selects a large table, font, XObject, and graphics-state
+collectors retain only referenced entries, including escaped PDF names. Common
+indexed tables consume opaque values and comments once; large-table fallback
+trades a later bounded scan for constant initial index storage. Color-space
+resolution retains entry views for alias/default-space lookup without copying
+unused definitions. Indirect tables use the same projections.
+Properties retain their separate optional-metadata limits and lazy lookup.
+Collectors resolve entries only after determining which names the content uses.
+Source views preserve their owning object's identity so encrypted nested values
+are decrypted exactly once, including values inside compressed object streams.
+PDF Forms continue through ordinary length validation and decoding without
+reparsing the whole header.
+
+Annotation coverage inspects normal-appearance headers (including named states)
+without resolving payload lengths. Rendering resolves and validates the actual
+appearance stream. Tagged-text metadata resolution likewise returns header-only
+stream views for StructParents lookup. These probes cannot consume decoder
+allowances merely because a stream length lives in a large object stream.
+
+ICC color-space probes use a projected header containing only N, Alternate, and
+Range. Native classification, component counts, shading, mask ranges, and image
+alternate-space decoding never resolve ICC stream lengths or read ICC payloads.
+Encrypted retained header values are decrypted without registering a payload
+range. Header-only objects cannot be passed to payload decoders; ordinary stream
+and payload reads remain strict. OOM, cancellation, and
+exhausted work still propagate; payload readers remain strict.
+Numeric lookahead propagates
+cancellation and work exhaustion rather than treating them as end-of-input.
+Ordinary object reads also poll the Reader cancellation probe when no shared
+metadata work allowance is active.
+A page-local work allowance of 16 times
 the working-set byte limit (at least 1 MiB, at most 2 GiB) charges scanned bytes,
 token traversal, and property-index comparisons independently of allocations.
 Exhaustion is sticky; optional failures are memoized while cancellation and
