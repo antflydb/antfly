@@ -114,8 +114,8 @@ fn awaitAndDestroyEvent(api: *const c.Api, event: *c.PjrtEvent) PjrtError!void {
         .extension_start = null,
         .event = event,
     };
+    defer destroyEvent(api, event);
     try checkError(api, api.eventAwait(&await_args));
-    destroyEvent(api, event);
 }
 
 /// OpenXLA runtime flags can override Client_Create's allocator and fraction,
@@ -310,9 +310,18 @@ pub const LoadedExecutable = struct {
         defer allocator.free(output_ptrs);
         @memset(output_ptrs, null);
         var output_list_ptrs = [1][*]?*c.PjrtBuffer{output_ptrs.ptr};
+        const results = try allocator.alloc(Buffer, num_outputs);
+        errdefer allocator.free(results);
+        errdefer for (output_ptrs) |maybe_buffer| {
+            if (maybe_buffer) |handle| {
+                var buffer = Buffer{ .api = self.api, .handle = handle };
+                buffer.deinit();
+            }
+        };
 
         // Completion event slot
         var events: [1]?*c.PjrtEvent = .{null};
+        defer if (events[0]) |event| destroyEvent(self.api, event);
 
         // Execute options (zeroed = defaults)
         var options: c.ExecuteOptions = std.mem.zeroes(c.ExecuteOptions);
@@ -335,13 +344,13 @@ pub const LoadedExecutable = struct {
 
         // Wait for completion
         if (events[0]) |event| {
+            events[0] = null;
             try awaitAndDestroyEvent(self.api, event);
         }
 
         // Wrap output buffers
-        const results = try allocator.alloc(Buffer, num_outputs);
         for (0..num_outputs) |i| {
-            results[i] = .{ .api = self.api, .handle = output_ptrs[i].? };
+            results[i] = .{ .api = self.api, .handle = output_ptrs[i] orelse return error.PjrtApiError };
         }
         return results;
     }
@@ -1093,4 +1102,53 @@ test "bounded CUDA clients reject allocator environment overrides before plugin 
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "false", 1));
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[2], "0", 1));
     try validateBoundedCudaEnvironment();
+}
+
+test "execution owns all native outputs and completion events across host allocation failures" {
+    const Fake = struct {
+        var live_buffers: usize = 0;
+        var live_events: usize = 0;
+        var missing_output: bool = false;
+        fn execute(args: *c.LoadedExecutableExecuteArgs) callconv(.c) ?*c.PjrtError {
+            const lists: [*][*]?*c.PjrtBuffer = @ptrCast(@alignCast(args.output_lists.?));
+            lists[0][0] = @ptrFromInt(1);
+            live_buffers += 1;
+            if (!missing_output) {
+                lists[0][1] = @ptrFromInt(2);
+                live_buffers += 1;
+            }
+            args.device_complete_events.?[0] = @ptrFromInt(1);
+            live_events += 1;
+            return null;
+        }
+        fn destroyBuffer(_: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+            live_buffers -= 1;
+            return null;
+        }
+        fn destroyEvent_(_: *c.EventDestroyArgs) callconv(.c) ?*c.PjrtError {
+            live_events -= 1;
+            return null;
+        }
+        fn awaitEvent(_: *c.EventAwaitArgs) callconv(.c) ?*c.PjrtError {
+            return null;
+        }
+        fn scenario(a: std.mem.Allocator, executable: LoadedExecutable) !void {
+            defer std.debug.assert(live_buffers == 0 and live_events == 0);
+            const outputs = try executable.execute(&.{}, a);
+            defer a.free(outputs);
+            defer for (outputs) |*buffer| buffer.deinit();
+            try std.testing.expectEqual(@as(usize, 2), outputs.len);
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[55] = @ptrCast(&Fake.execute);
+    api._fns[58] = @ptrCast(&Fake.destroyBuffer);
+    api._fns[5] = @ptrCast(&Fake.destroyEvent_);
+    api._fns[8] = @ptrCast(&Fake.awaitEvent);
+    const executable = LoadedExecutable{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .num_outputs = 2 };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fake.scenario, .{executable});
+    Fake.missing_output = true;
+    defer Fake.missing_output = false;
+    try std.testing.expectError(error.PjrtApiError, Fake.scenario(std.testing.allocator, executable));
 }

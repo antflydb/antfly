@@ -431,8 +431,36 @@ fn runArtifactPromptWithContext(
     load_policy: ?model_manager_mod.ModelLoadPolicy,
     prepared: ?*ArtifactContext,
 ) !RunResult {
+    var effective = load_policy orelse model_manager_mod.ModelLoadPolicy{};
+    var resources: ?model_manager_mod.ModelManager.SharedResources = null;
+    if (prepared == null and effective.resources == null) {
+        resources = try model_manager_mod.ModelManager.SharedResources.init(allocator, effective.limits);
+        effective.resources = &resources.?;
+    }
+    defer if (resources) |*owned| owned.deinit();
+    var bootstrap = model_manager_mod.ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, io));
+    defer bootstrap.deinit();
+    if (prepared == null) try effective.configure(&bootstrap);
+    const admission = if (prepared) |context| context.admissionContext() else pjrt_admission.Context{ .allocator = allocator, .manager = &bootstrap, .policy = effective };
+    const budget = try @import("graph/pjrt_metadata.zig").Budget.create(allocator, &admission);
+    defer budget.destroy();
+    return runArtifactPromptWithMetadata(allocator, io, artifact_or_manifest_path, prompt, compare_host, no_chat_template, raw_prompt, effective, prepared, budget.allocator()) catch |err| return budget.translate(err);
+}
+
+fn runArtifactPromptWithMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    artifact_or_manifest_path: []const u8,
+    prompt: []const u8,
+    compare_host: bool,
+    no_chat_template: bool,
+    raw_prompt: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
+    prepared: ?*ArtifactContext,
+    metadata: std.mem.Allocator,
+) !RunResult {
     if (compiled_artifact.isPackageManifestPath(artifact_or_manifest_path)) {
-        var package = try compiled_artifact.readPackageManifest(allocator, io, artifact_or_manifest_path);
+        var package = try compiled_artifact.readPackageManifest(metadata, io, artifact_or_manifest_path);
         defer package.deinit();
         try compiled_artifact.validatePackageManifest(package.value, package.value.backend, package.value.model_dir, package.value.kind, if (std.mem.eql(u8, package.value.backend, "xla")) package.value.pjrt_parameter_mode else null);
         var owned_context = if (prepared == null) try ArtifactContext.init(allocator, io, package.value.model_dir, load_policy) else null;
@@ -440,7 +468,7 @@ fn runArtifactPromptWithContext(
         const context = prepared orelse &owned_context.?;
         if (!std.mem.eql(u8, context.model_dir, package.value.model_dir)) return error.ArtifactModelMismatch;
         const manifest_path = try resolvePackagePrefillManifestPath(
-            allocator,
+            metadata,
             io,
             artifact_or_manifest_path,
             prompt,
@@ -448,9 +476,9 @@ fn runArtifactPromptWithContext(
             raw_prompt,
             context,
         );
-        defer allocator.free(manifest_path);
+        defer metadata.free(manifest_path);
 
-        var parsed = try compiled_artifact.readManifest(allocator, io, manifest_path);
+        var parsed = try compiled_artifact.readManifest(metadata, io, manifest_path);
         defer parsed.deinit();
         return runParsedArtifactPrompt(
             allocator,
@@ -466,10 +494,10 @@ fn runArtifactPromptWithContext(
         );
     }
 
-    const manifest_path = try compiled_artifact.resolveManifestPath(allocator, artifact_or_manifest_path);
-    defer allocator.free(manifest_path);
+    const manifest_path = try compiled_artifact.resolveManifestPath(metadata, artifact_or_manifest_path);
+    defer metadata.free(manifest_path);
 
-    var parsed = try compiled_artifact.readManifest(allocator, io, manifest_path);
+    var parsed = try compiled_artifact.readManifest(metadata, io, manifest_path);
     defer parsed.deinit();
     return runParsedArtifactPrompt(
         allocator,
@@ -498,6 +526,24 @@ pub fn tryRunMatchingArtifact(
 ) !?RunResult {
     var context = try ArtifactContext.init(allocator, io, model_dir, load_policy);
     defer context.deinit();
+    const budget = try @import("graph/pjrt_metadata.zig").Budget.create(allocator, &context.admissionContext());
+    defer budget.destroy();
+    return tryRunMatchingArtifactWithMetadata(allocator, io, search_dir, backend, model_dir, prompt, no_chat_template, raw_prompt, load_policy, &context, budget.allocator()) catch |err| return budget.translate(err);
+}
+
+fn tryRunMatchingArtifactWithMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    search_dir: []const u8,
+    backend: []const u8,
+    model_dir: []const u8,
+    prompt: []const u8,
+    no_chat_template: bool,
+    raw_prompt: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
+    context: *ArtifactContext,
+    metadata: std.mem.Allocator,
+) !?RunResult {
     const model_manifest = &context.manifest;
     const assets = &context.assets;
 
@@ -526,7 +572,7 @@ pub fn tryRunMatchingArtifact(
     }
 
     if (try compiled_artifact.findManagedPjrtPackage(
-        allocator,
+        metadata,
         io,
         search_dir,
         backend,
@@ -535,7 +581,7 @@ pub fn tryRunMatchingArtifact(
         prompt_tokens,
         "paged_prefill",
     )) |package_manifest_path| {
-        defer allocator.free(package_manifest_path);
+        defer metadata.free(package_manifest_path);
         return try runArtifactPromptWithContext(
             allocator,
             io,
@@ -545,12 +591,12 @@ pub fn tryRunMatchingArtifact(
             no_chat_template,
             raw_prompt,
             load_policy,
-            &context,
+            context,
         );
     }
 
     var found = (try findMatchingFullModelArtifact(
-        allocator,
+        metadata,
         io,
         search_dir,
         backend,
@@ -565,9 +611,9 @@ pub fn tryRunMatchingArtifact(
         );
         return null;
     };
-    defer found.deinit(allocator);
+    defer found.deinit(metadata);
 
-    var parsed = try compiled_artifact.readManifest(allocator, io, found.manifest_path);
+    var parsed = try compiled_artifact.readManifest(metadata, io, found.manifest_path);
     defer parsed.deinit();
 
     const artifact = parsed.value;
@@ -583,7 +629,7 @@ pub fn tryRunMatchingArtifact(
         no_chat_template,
         raw_prompt,
         load_policy,
-        &context,
+        context,
     );
 }
 
@@ -3079,6 +3125,7 @@ fn managedPrefillReuseScenario(a: std.mem.Allocator, prefill: []const u8, plugin
     const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{}, &graph, &backend, &context, plugin);
     var owned = executor.modelExecutor();
     defer owned.deinit();
+    try platform.allocator.checkAllAllocationFailures(a, managedPrefillFailureScenario, .{ &owned, count });
     var run = try owned.createRuntime(a);
     defer run.deinit();
     const admitted = manager.currentAdmissionAmounts();
@@ -3097,4 +3144,37 @@ fn managedPrefillReuseScenario(a: std.mem.Allocator, prefill: []const u8, plugin
     defer retry.deinit(a);
     try std.testing.expectEqual(@as(usize, 8), count(12));
     try std.testing.expectEqualDeep(admitted, manager.currentAdmissionAmounts());
+}
+
+fn managedPrefillFailureScenario(a: std.mem.Allocator, owned: *model_runtime.ModelExecutor, count: *const fn (usize) callconv(.c) usize) !void {
+    const live = count(8) - count(9);
+    defer std.debug.assert(count(8) - count(9) == live);
+    var run = try owned.createRuntime(a);
+    defer run.deinit();
+    const ids: [16]i64 = @splat(1);
+    var output = try run.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+    defer output.deinit(a);
+}
+
+test "run-artifact admits bootstrap package and sidecar JSON before model lookup" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    const padding = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(padding);
+    @memset(padding, ' ');
+    // Valid JSON padding would previously be read and parsed before any model
+    // manager or invocation ledger existed. A denied read must win over the
+    // missing model/manifest fields, with every bootstrap allocation refunded.
+    @memcpy(padding[0..2], "{}");
+    for ([_][]const u8{ "artifact.inference.json", "artifact.antfly-inference-package.json" }) |name| {
+        const path = try std.fs.path.join(a, &.{ directory, name });
+        defer a.free(path);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = padding });
+        const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1024 * 1024, .combined_limit_bytes = 1024 * 1024 } };
+        try std.testing.expectError(error.ResourceLimitExceeded, runArtifactPrompt(a, io, path, "a", false, true, true, policy));
+    }
 }

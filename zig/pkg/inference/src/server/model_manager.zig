@@ -5168,6 +5168,13 @@ pub const ModelManager = struct {
         pub fn deinit(self: @This()) void {
             self.domain.release();
         }
+
+        /// Metadata allocations participate in the same process-wide ledger.
+        /// Probe physical pressure for bulk allocations; tiny parser nodes are
+        /// still charged exactly without a kernel probe for each JSON field.
+        pub fn acquireMetadata(self: @This(), limits: runtime.tier.memory.Limits, bytes: usize) !runtime.tier.memory.AdmissionLease {
+            return self.domain.admission.tryAcquire(.cpu, limits, .{ .host_weight_bytes = bytes }, bytes >= 64 * 1024);
+        }
     };
 
     pub fn retainResourceLifetime(self: *ModelManager) !ResourceLifetime {

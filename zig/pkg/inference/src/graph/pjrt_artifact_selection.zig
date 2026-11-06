@@ -29,6 +29,8 @@ pub const Request = struct {
 pub const Selection = struct {
     catalog: Catalog,
     chain: []usize,
+    budget: ?*@import("pjrt_metadata.zig").Budget = null,
+    manifests: ?[]artifact.Manifest = null,
 
     pub fn values(self: *const @This(), allocator: std.mem.Allocator) ![]artifact.Manifest {
         const result = try allocator.alloc(artifact.Manifest, self.chain.len);
@@ -37,8 +39,10 @@ pub const Selection = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        if (self.manifests) |manifests| self.catalog.allocator.free(manifests);
         self.catalog.allocator.free(self.chain);
         self.catalog.deinit();
+        if (self.budget) |budget| budget.destroy();
     }
 };
 
@@ -217,7 +221,19 @@ fn standaloneChain(catalog: *Catalog, request: Request, mode: []const u8) !?[]us
 /// Prefer embedded parameters only among complete compatible execution chains.
 /// Missing coverage can select another candidate; identity/deserialization
 /// failures from the selected chain remain errors in the executor loader.
-pub fn find(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, request: Request) !?Selection {
+pub fn findAdmitted(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, request: Request, context: *const @import("pjrt_admission.zig").Context) !?Selection {
+    const budget = try @import("pjrt_metadata.zig").Budget.create(allocator, context);
+    var transferred = false;
+    defer if (!transferred) budget.destroy();
+    var selection = (find(budget.allocator(), io, directory, request) catch |err| return budget.translate(err)) orelse return null;
+    errdefer selection.deinit();
+    selection.manifests = selection.values(budget.allocator()) catch |err| return budget.translate(err);
+    selection.budget = budget;
+    transferred = true;
+    return selection;
+}
+
+fn find(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, request: Request) !?Selection {
     var catalog = Catalog{ .allocator = allocator, .io = io };
     var owned = true;
     defer if (owned) catalog.deinit();
@@ -287,6 +303,8 @@ test "managed PJRT chain selection prefers modes only among complete compatible 
     const failures = @import("antfly_platform").allocator;
     try failures.checkAllAllocationFailures(a, selectedModeScenario, .{ root, @as(usize, 1), artifact.pjrt_parameter_mode_inputs });
     try selectedModeScenario(a, root, 0, artifact.pjrt_parameter_mode_embedded);
+    try admittedMetadataScenario(root, embedded, embedded_package);
+
     // Missing executable bytes make a candidate unavailable, even if its
     // sidecar still exists. Selection does not hash/read the bytes themselves.
     var unavailable = prefill;
@@ -349,4 +367,57 @@ test "managed PJRT chain KV compatibility uses node identities for sparse semant
     past[0].layer_index = 0;
     source.pjrt_output_shapes = outputs[0..1];
     try std.testing.expect(!kvShapesCompatible(source, target));
+}
+
+fn admittedSelectionFailureScenario(a: std.mem.Allocator, directory: []const u8, context: *const @import("pjrt_admission.zig").Context) !void {
+    const before = context.manager.currentAdmissionAmounts();
+    defer std.debug.assert(std.meta.eql(before, context.manager.currentAdmissionAmounts()));
+    var selection = (try findAdmitted(a, std.testing.io, directory, .{ .model_dir = directory, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill", .decode_steps = 0 }, context)) orelse return error.TestUnexpectedResult;
+    defer selection.deinit();
+    try std.testing.expect(selection.manifests.?.len == 1);
+    try std.testing.expect(context.manager.currentAdmissionAmounts().host_weight_bytes > before.host_weight_bytes);
+}
+
+fn admittedMetadataScenario(directory: []const u8, sidecar: []const u8, package: []const u8) !void {
+    const a = std.testing.allocator;
+    const manager_mod = @import("../server/model_manager.zig");
+    var manager = manager_mod.ModelManager.init(a, @import("../backends/backends.zig").SessionManager.init(a));
+    defer manager.deinit();
+    const policy = manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1024 * 1024, .combined_limit_bytes = 1024 * 1024 } };
+    try policy.configure(&manager);
+    const context = @import("pjrt_admission.zig").Context{ .allocator = a, .manager = &manager, .policy = policy };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, admittedSelectionFailureScenario, .{ directory, &context });
+    {
+        var selection = (try findAdmitted(a, std.testing.io, directory, .{ .model_dir = directory, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill", .decode_steps = 0 }, &context)) orelse return error.TestUnexpectedResult;
+        defer selection.deinit();
+        const retained = manager.currentAdmissionAmounts().host_weight_bytes;
+        try std.testing.expect(retained > 0);
+        var competing = try manager.acquireRunResourceAmounts(.cpu, @import("pjrt_admission.zig").ArtifactDeviceAdmission.limitsFor(&context, true), .{ .host_weight_bytes = 1024 * 1024 - retained });
+        defer competing.release();
+        // Each selection fits alone; outstanding ownership makes the second
+        // temporarily unavailable rather than an impossible-request error.
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, admittedSelectionFailureScenario(a, directory, &context));
+    }
+    // The raw file read is admitted before the backing allocator sees it.
+    // Test both the package and the selected executable's sidecar.
+    for ([_][]const u8{ package, sidecar }) |path| {
+        const io = std.testing.io;
+        const original = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024));
+        defer a.free(original);
+        const padded = try a.alloc(u8, 2 * 1024 * 1024);
+        defer a.free(padded);
+        @memset(padded, ' ');
+        @memcpy(padded[0..original.len], original);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = padded });
+        defer std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original }) catch unreachable;
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 1024 * 1024);
+        defer quota.deinit();
+        try std.testing.expectError(error.ResourceLimitExceeded, admittedSelectionFailureScenario(quota.allocator(), directory, &context));
+        try std.testing.expect(quota.largest_rejected_growth == 0);
+    }
+    // A reclaiming allocator ensures JSON arenas and temporary reads refund
+    // real memory even when the caller supplies an arena.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try admittedSelectionFailureScenario(arena.allocator(), directory, &context);
 }

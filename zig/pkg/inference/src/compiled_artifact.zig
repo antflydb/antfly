@@ -333,15 +333,18 @@ fn writeFileAtPath(io: std.Io, path: []const u8, data: []const u8) !void {
 }
 
 fn readFileAllocAtPath(io: std.Io, path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    if (!std.fs.path.isAbsolute(path)) {
-        return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.math.maxInt(usize)));
-    }
-
-    const parent = std.fs.path.dirname(path) orelse return error.BadPathName;
-    const base = std.fs.path.basename(path);
-    var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{});
-    defer dir.close(io);
-    return dir.readFileAlloc(io, base, allocator, .limited(std.math.maxInt(usize)));
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const info = try file.stat(io);
+    const size = std.math.cast(usize, info.size) orelse return error.ResourceLimitExceeded;
+    // A single exact allocation avoids geometric growth peaks, and an opened
+    // descriptor's size bounds memory even if the path is replaced or grows.
+    const bytes = try allocator.alloc(u8, size);
+    errdefer allocator.free(bytes);
+    if (try file.readPositionalAll(io, bytes, 0) != size) return error.InvalidArtifact;
+    var extra: [1]u8 = undefined;
+    if (try file.readPositionalAll(io, &extra, info.size) != 0) return error.InvalidArtifact;
+    return bytes;
 }
 
 pub fn validatePackageManifest(

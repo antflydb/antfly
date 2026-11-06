@@ -444,6 +444,13 @@ that cover the requested token count, so incomplete embedded packages cannot
 hide complete input-parameter packages or standalone chains. Selection caches
 request-relevant sidecar metadata, checks executable availability without reading
 its bytes, and passes the parsed manifests directly to the admitted loader.
+Raw package/sidecar reads, parser arenas, catalog indexes, and selected manifest
+copies acquire host admission before allocating and remain charged until freed.
+File reads use the opened descriptor's exact size, avoiding geometric growth
+peaks; file growth or truncation during the read is rejected. Temporary metadata
+uses a reclaiming allocator even when the request allocator is an arena. Explicit
+path-based loaders and `run-artifact` use the same accounting, sharing the
+invocation domain with tokenizer and executable residency.
 The loader still verifies executable/provider identity and loaded statistics;
 identity or deserialization failures do not trigger another candidate.
 
@@ -460,7 +467,10 @@ returns temporary-unavailability when all slots are occupied. Destruction frees
 retained KV before returning the slot; failed runtime allocation returns it too.
 PJRT prefill starts a fresh sequence and releases prior retained KV inside the
 runtime before allocating replacement outputs. This bound holds for direct
-runtime reuse, including an allocation failure followed by retry.
+runtime reuse, including an allocation failure followed by retry. Host output
+bookkeeping is allocated before native execution; execution errors destroy all
+returned native outputs and completion events before an execution slot can be
+returned.
 Capacity cannot grow beyond CUDA's already admitted fixed pool. Callers needing
 concurrent runtimes set the capacity when loading the executor, allowing full
 workspace concurrency without duplicating immutable executable residency.

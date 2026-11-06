@@ -174,7 +174,25 @@ pub fn createAdmittedModelExecutorFromPackageManifestPath(
     policy: *const admission_mod.Context,
     plugin: [:0]const u8,
 ) !*pjrt_executor.PjrtModelExecutor {
-    var package = try compiled_artifact.readPackageManifest(allocator, io, package_manifest_path);
+    const budget = try @import("pjrt_metadata.zig").Budget.create(allocator, policy);
+    defer budget.destroy();
+    return createAdmittedModelExecutorFromPackageManifestPathWithMetadata(allocator, io, package_manifest_path, prefill_seq_len, prefill_query_seq_len, prefill_attention_mode, graph, host_backend, policy, plugin, budget.allocator()) catch |err| return budget.translate(err);
+}
+
+fn createAdmittedModelExecutorFromPackageManifestPathWithMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    package_manifest_path: []const u8,
+    prefill_seq_len: usize,
+    prefill_query_seq_len: usize,
+    prefill_attention_mode: []const u8,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    policy: *const admission_mod.Context,
+    plugin: [:0]const u8,
+    metadata: std.mem.Allocator,
+) !*pjrt_executor.PjrtModelExecutor {
+    var package = try compiled_artifact.readPackageManifest(metadata, io, package_manifest_path);
     defer package.deinit();
 
     if (!std.mem.eql(u8, package.value.kind, "pjrt_hlo") and
@@ -198,19 +216,19 @@ pub fn createAdmittedModelExecutorFromPackageManifestPath(
     });
     const prefill_manifest_path = if (prefill_entry) |entry| entry.manifest_path else return error.ArtifactShapeMismatch;
 
-    var prefill_manifest = try compiled_artifact.readManifest(allocator, io, prefill_manifest_path);
+    var prefill_manifest = try compiled_artifact.readManifest(metadata, io, prefill_manifest_path);
     defer prefill_manifest.deinit();
     if (!compiled_artifact.matchesRequest(prefill_manifest.value, .{ .backend = "xla", .model_dir = package.value.model_dir, .kind = "pjrt_executable", .artifact_role = compiled_artifact.artifact_role_prefill, .seq_len = prefill_seq_len, .query_seq_len = prefill_query_seq_len, .attention_mode = prefill_attention_mode, .pjrt_parameter_mode = package.value.pjrt_parameter_mode, .require_pjrt_memory_plan = true })) return error.ArtifactShapeMismatch;
 
     const decode_manifest_paths = try findPackageDecodeManifestPaths(
-        allocator,
+        metadata,
         io,
         package.value,
         prefill_manifest_path,
         prefill_seq_len,
         policy.decode_steps_limit,
     );
-    defer allocator.free(decode_manifest_paths);
+    defer metadata.free(decode_manifest_paths);
 
     return createAdmittedModelExecutorFromManifestPaths(
         allocator,
@@ -234,22 +252,38 @@ pub fn createAdmittedModelExecutorFromManifestPaths(
     policy: *const admission_mod.Context,
     plugin: [:0]const u8,
 ) !*pjrt_executor.PjrtModelExecutor {
+    const budget = try @import("pjrt_metadata.zig").Budget.create(allocator, policy);
+    defer budget.destroy();
+    return createAdmittedModelExecutorFromManifestPathsWithMetadata(allocator, io, prefill_path, decode_paths, graph, host_backend, policy, plugin, budget.allocator()) catch |err| return budget.translate(err);
+}
+
+fn createAdmittedModelExecutorFromManifestPathsWithMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prefill_path: []const u8,
+    decode_paths: []const []const u8,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    policy: *const admission_mod.Context,
+    plugin: [:0]const u8,
+    metadata: std.mem.Allocator,
+) !*pjrt_executor.PjrtModelExecutor {
     const selected_decode_paths = decode_paths[0..@min(decode_paths.len, policy.decode_steps_limit orelse decode_paths.len)];
     if (policy.decode_steps_limit) |required| {
         if (selected_decode_paths.len != required) return error.PjrtLoadOnlyArtifactsRequired;
     }
-    const manifests = try allocator.alloc(std.json.Parsed(compiled_artifact.Manifest), selected_decode_paths.len + 1);
-    defer allocator.free(manifests);
+    const manifests = try metadata.alloc(std.json.Parsed(compiled_artifact.Manifest), selected_decode_paths.len + 1);
+    defer metadata.free(manifests);
     var initialized: usize = 0;
     defer for (manifests[0..initialized]) |*parsed| parsed.deinit();
-    manifests[0] = try compiled_artifact.readManifest(allocator, io, prefill_path);
+    manifests[0] = try compiled_artifact.readManifest(metadata, io, prefill_path);
     initialized += 1;
     for (selected_decode_paths, 1..) |path, i| {
-        manifests[i] = try compiled_artifact.readManifest(allocator, io, path);
+        manifests[i] = try compiled_artifact.readManifest(metadata, io, path);
         initialized += 1;
     }
-    const artifacts = try allocator.alloc(compiled_artifact.Manifest, manifests.len);
-    defer allocator.free(artifacts);
+    const artifacts = try metadata.alloc(compiled_artifact.Manifest, manifests.len);
+    defer metadata.free(artifacts);
     for (manifests, artifacts) |parsed, *artifact| artifact.* = parsed.value;
     return createAdmittedModelExecutorFromManifests(allocator, artifacts, graph, host_backend, policy, plugin);
 }

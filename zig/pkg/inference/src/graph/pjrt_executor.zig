@@ -970,6 +970,9 @@ const PjrtModelRuntime = struct {
 
         try self.materializeGraphInputs(values, phase);
 
+        const retained = try allocator.alloc(bool, phase.executor.output_node_ids.len);
+        defer allocator.free(retained);
+        @memset(retained, false);
         const exec_ctx: PartitionExecutor.ExecutionContext = .{ .embedding_ids = input_ids };
         var outputs = try phase.executor.executeToBuffersWithRetained(
             values,
@@ -987,9 +990,6 @@ const PjrtModelRuntime = struct {
             );
         }
 
-        var retained = try allocator.alloc(bool, outputs.len);
-        defer allocator.free(retained);
-        @memset(retained, false);
         defer {
             for (outputs, 0..) |*buffer, i| {
                 if (!retained[i]) {
