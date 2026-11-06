@@ -22134,6 +22134,25 @@ test "distributed SQL API control routes authenticate cancellation and share ter
         defer record.deinit(a);
         try std.testing.expectEqual(index == 2, record.value.cancel_requested);
     }
+    // Structurally decodable but invalid scalar IR must fail before retention.
+    const plan = @import("../serverless/sql/plan.zig");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('a'), .snapshot = "1", .wal_cut = 0, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 1, .estimated_rows = 1, .splits = 1 };
+    const malformed: plan.Plan = .{ .tenant = tenant, .expires_ms = now + 60000, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0}, .condition = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .call = .{ .function = .is_missing, .args = &.{} } } }}, .root = 0, .output = .{ .kind = .boolean } } }, .strategy = .broadcast, .partitions = 1, .limits = .{} };
+    const malformed_body = try malformed.encode(a);
+    defer a.free(malformed_body);
+    const before_invalid = memory.operationCount();
+    for ([_][]const u8{ malformed_body, "{", "{}" }) |invalid| {
+        var invalid_request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/queries/submit");
+        defer invalid_request.deinit();
+        invalid_request.body = invalid;
+        try invalid_request.headers.set(internal_service_auth.header_name, token);
+        var invalid_context = httpx.Context.init(a, std.testing.io, &invalid_request);
+        defer invalid_context.deinit();
+        var invalid_response = try server.router.find(.POST, transport.submit_path, &params).?.handler.invoke(&invalid_context);
+        defer invalid_response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), invalid_response.status.code);
+    }
+    try std.testing.expectEqual(before_invalid, memory.operationCount());
     // The API must return authoritative failure to gateway routing rather than
     // quarantine a healthy worker as though it had returned a provider error.
     const claim = (try store.claim(a, key, "test", 60000)).?;

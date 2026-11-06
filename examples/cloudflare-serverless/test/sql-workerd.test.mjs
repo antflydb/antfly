@@ -42,6 +42,10 @@ test('workerd coordinates retained lake SQL through alarms, Queues and R2 across
   const buckets={source:await mf.getR2Bucket('SQL_SOURCE'),execution:await mf.getR2Bucket('SQL_EXECUTION')};
   for(const item of fixture.objects)await buckets[item.bucket].put(item.key,Buffer.from(item.body_base64,'base64'));
   const unsigned=await mf.dispatchFetch('https://sql/internal/v1/sql/queries/submit',{method:'POST',body:fixture.raw_plan});assert.equal(unsigned.status,401);
+  const malformed=JSON.parse(fixture.raw_plan);malformed.join.condition={version:2,instructions:[{type:{kind:'boolean'},operation:{call:{function:'is_missing',args:[]}}}],root:0,output:{kind:'boolean'}};
+  for(const invalid of [JSON.stringify(malformed),'{','null','[]','{}',JSON.stringify({tenant:fixture.tenant})]){
+   const response=await mf.dispatchFetch('https://sql/internal/v1/sql/queries/submit',{method:'POST',headers:headers(),body:invalid});assert.equal(response.status,400,await response.text());
+  }
   const {query}=await call('queries/submit',fixture.raw_plan),locator={tenant:fixture.tenant,query};
   let result;
   const deadline=Date.now()+60000;

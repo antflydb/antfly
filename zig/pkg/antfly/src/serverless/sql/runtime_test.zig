@@ -1814,7 +1814,11 @@ fn slowResultAssembly(parallel: bool) !void {
     right.snapshot = "old-right";
     right.wal_cut = 8;
     right.splits = 1;
-    const spec = try plan.choose(left, right, service.tenant, 121000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .query_exchange_bytes = 16 * 1024 * 1024 * 1024 }, fixture.now);
+    var spec = try plan.choose(left, right, service.tenant, 121000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .query_exchange_bytes = 16 * 1024 * 1024 * 1024 }, fixture.now);
+    // Exercise coordinator fan-out independently of strategy cost heuristics.
+    spec.strategy = .broadcast;
+    spec.partitions = 1;
+    try spec.validate(fixture.now);
     try std.testing.expectEqual(@as(u32, 64), try spec.stageTasks(spec.finalStage() - 1));
     const query = try service.submit(spec);
     const claim = (try service.acquire(query)).?;
@@ -1909,7 +1913,11 @@ fn reconcileWindow(early_running: bool) !void {
     right.snapshot = "old-right";
     right.wal_cut = 8;
     right.splits = 1;
-    const spec = try plan.choose(left, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .concurrency = 256, .task_output_bytes = 4096 }, fixture.now);
+    var spec = try plan.choose(left, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .concurrency = 256, .task_output_bytes = 4096 }, fixture.now);
+    // Exercise coordinator fan-out independently of strategy cost heuristics.
+    spec.strategy = .broadcast;
+    spec.partitions = 1;
+    try spec.validate(fixture.now);
     const query = try service.submit(spec);
     const claim = (try service.acquire(query)).?;
     var records = service.state_store;

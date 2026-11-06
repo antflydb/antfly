@@ -407,7 +407,14 @@ fn orientationCost(p: Plan) u128 {
     };
 }
 
+/// Rank every admissible strategy for this fixed probe/build orientation.
+/// Eligibility is not a cost decision: a small build can still be expensive
+/// to broadcast across many splits. Keep candidate generation allocation-free.
 pub fn choose(left: Input, right: Input, tenant: Digest, expires_ms: u64, join: Join, limits: Limits, now_ms: u64) !Plan {
+    try limits.validate();
+    if (join.left_keys.len == 0 or join.left_keys.len != join.right_keys.len) return error.InvalidSqlDistributedPlan;
+    var best: ?Plan = null;
+    const base: Plan = .{ .tenant = tenant, .expires_ms = expires_ms, .left = left, .right = right, .join = join, .strategy = .shuffle, .partitions = 1, .limits = limits };
     if (left.bucket) |l| if (right.bucket) |r| {
         const aligned = for (join.left_keys, join.right_keys) |lk, rk| {
             if (lk == l.column and rk == r.column) break true;
@@ -418,22 +425,38 @@ pub fn choose(left: Input, right: Input, tenant: Digest, expires_ms: u64, join: 
             while (groups > 0) : (groups -= 1) {
                 if (gcd % groups != 0) continue;
                 if (estimatedRetained(right) / groups > limits.task_memory / 8 or (left.estimated_rows +| right.estimated_rows) / groups > limits.task_scan_rows / 2) break;
-                const result: Plan = .{ .tenant = tenant, .expires_ms = expires_ms, .left = left, .right = right, .join = join, .strategy = .bucket, .partitions = @intCast(groups), .limits = limits };
-                if (result.validate(now_ms)) |_| return result else |err| {
-                    if (err != error.SqlJoinBudgetExceeded) return err;
-                }
+                var candidate = base;
+                candidate.strategy = .bucket;
+                candidate.partitions = @intCast(groups);
+                try considerStrategy(&best, candidate, now_ms);
+                // The largest admitted bucket layout retains scan parallelism
+                // without exchange traffic; smaller layouts cannot improve it.
+                if (best != null) break;
             }
         }
     };
-    const broadcast = !join.preservesBuild() and estimatedRetained(right) <= @min(64 * 1024 * 1024, limits.task_memory / 8) and right.estimated_rows <= limits.task_scan_rows / 2;
-    var partitions: u16 = 1;
-    if (!broadcast) while (((estimatedRetained(left) +| estimatedRetained(right)) / partitions > limits.task_memory / 8 or (left.estimated_rows +| right.estimated_rows) / partitions > limits.task_scan_rows / 2) and partitions < limits.max_partitions) {
-        if (partitions > limits.max_partitions / 2) break;
-        partitions = std.math.mul(u16, partitions, 2) catch return error.SqlJoinBudgetExceeded;
+    if (!join.preservesBuild() and estimatedRetained(right) <= @min(64 * 1024 * 1024, limits.task_memory / 8) and right.estimated_rows <= limits.task_scan_rows / 2) {
+        var candidate = base;
+        candidate.strategy = .broadcast;
+        try considerStrategy(&best, candidate, now_ms);
+    }
+    var shuffled = base;
+    while (((estimatedRetained(left) +| estimatedRetained(right)) / shuffled.partitions > limits.task_memory / 8 or (left.estimated_rows +| right.estimated_rows) / shuffled.partitions > limits.task_scan_rows / 2) and shuffled.partitions < limits.max_partitions) {
+        if (shuffled.partitions > limits.max_partitions / 2) break;
+        shuffled.partitions = std.math.mul(u16, shuffled.partitions, 2) catch return error.SqlJoinBudgetExceeded;
+    }
+    try considerStrategy(&best, shuffled, now_ms);
+    return best orelse error.SqlJoinBudgetExceeded;
+}
+fn considerStrategy(best: *?Plan, candidate: Plan, now_ms: u64) !void {
+    candidate.validate(now_ms) catch |err| switch (err) {
+        error.SqlJoinBudgetExceeded => return,
+        else => return err,
     };
-    const result: Plan = .{ .tenant = tenant, .expires_ms = expires_ms, .left = left, .right = right, .join = join, .strategy = if (broadcast) .broadcast else .shuffle, .partitions = partitions, .limits = limits };
-    try result.validate(now_ms);
-    return result;
+    if (best.*) |current| {
+        if (orientationCost(candidate) >= orientationCost(current)) return;
+    }
+    best.* = candidate;
 }
 
 test "distributed SQL plan preserves join semantics and admits retry and exchange costs" {
@@ -515,4 +538,29 @@ test "distributed SQL physical orientation selects small builds and remaps logic
     const existence = try choosePhysical(a, small, big, @splat('b'), 10000, semi, .{ .task_output_bytes = 4096 }, 1);
     try std.testing.expectEqual(@as(u64, 1), existence.left.table_id);
     try std.testing.expectEqual(Strategy.shuffle, existence.strategy);
+}
+
+test "distributed SQL strategy ranking avoids broadcast amplification and honors admission" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input: Input = .{ .table_id = 1, .schema = @splat('a'), .snapshot = "42", .wal_cut = 1, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 2 * 1024 * 1024, .estimated_rows = 10000, .splits = 64 };
+    const selected = try choosePhysical(a, input, input, @splat('b'), 10000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .query_exchange_bytes = 32 * 1024 * 1024 * 1024 }, 1);
+    var alternative = selected;
+    alternative.strategy = .broadcast;
+    alternative.partitions = 1;
+    try alternative.validate(1);
+    try std.testing.expectEqual(Strategy.shuffle, selected.strategy);
+    try std.testing.expect(orientationCost(selected) < orientationCost(alternative));
+    // A cheaper shuffle can exceed the task ceiling while broadcast still fits.
+    const constrained = try choosePhysical(a, input, input, @splat('b'), 10000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .query_exchange_bytes = 32 * 1024 * 1024 * 1024, .max_tasks = 132 }, 1);
+    try std.testing.expectEqual(Strategy.broadcast, constrained.strategy);
+    var few = input;
+    few.splits = 1;
+    const small = try choosePhysical(a, few, few, @splat('b'), 10000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, 1);
+    try std.testing.expectEqual(Strategy.broadcast, small.strategy);
+    var bucketed = input;
+    bucketed.bucket = .{ .column = 0, .count = 4 };
+    const aligned = try choosePhysical(a, bucketed, bucketed, @splat('b'), 10000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .query_exchange_bytes = 32 * 1024 * 1024 * 1024 }, 1);
+    try std.testing.expectEqual(Strategy.bucket, aligned.strategy);
 }

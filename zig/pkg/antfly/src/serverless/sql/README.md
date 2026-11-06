@@ -432,8 +432,18 @@ control requests do not consume task execution admission slots.
 
 The compiler bridge compares admissible physical orientations for inner and outer
 joins using exchange traffic estimates and build retention as a tie breaker.
+Each orientation ranks bucket, broadcast and shuffle candidates after budget
+admission; broadcast eligibility alone does not imply that replication is cheaper
+than shuffle. Bucket ties retain the largest admitted layout's parallelism.
 Swaps exchange join keys, invert left/right preservation, and remap residual and
 projection ordinals so logical results and aggregate inputs retain SQL order.
 Semi and anti joins retain logical left ownership. Both orientations undergo the
 same task, memory, retry and exchange admission checks; a rejected orientation
 does not prevent admission of a viable alternative.
+
+Source normalization distinguishes scalar NUMERIC from NUMERIC array elements,
+so typed, bucket and WAL fallback scans preserve the same array payloads.
+Invalid plans and malformed admission requests return permanent HTTP 400 errors
+on native and hosted listeners. Native gateway clients stop on permanent 4xx
+admission responses without failing over or quarantining healthy workers; missing
+queries and transient provider failures retain their bounded recovery behavior.

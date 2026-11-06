@@ -14,7 +14,7 @@
 // limitations under the License.
 
 import {DurableObject} from 'cloudflare:workers';
-import {SQLControl,authenticateSQL,boundedSQLBody,consumeSQL,locatorName,scheduleSQLMaintenance,retiredSQLDelivery} from './sql-control.mjs';
+import {SQLControl,authenticateSQL,boundedSQLBody,consumeSQL,locatorName,scheduleSQLMaintenance,retiredSQLDelivery,sqlErrorStatus,digestText} from './sql-control.mjs';
 import {runSQL} from './sql-kernel.mjs';
 import {IngressBudget} from './ingress-budget.mjs';
 const ingress=new IngressBudget(2*1024*1024);
@@ -34,7 +34,6 @@ const paths=new Map([
  ['/internal/v1/sql/queries/cancel','cancel'],
  ['/internal/v1/sql/tasks/execute','execute'],
 ]);
-const status=error=>/SqlJoinBudgetExceeded|HostedWorkingSetBudgetExceeded|SqlProgramLimitExceeded/.test(String(error))?422:/SqlQueryExpired/.test(String(error))?410:/Canceled|Cancelled/.test(String(error))?408:/SqlExecutionFailed/.test(String(error))?409:/SqlExecutionUnauthorized/.test(String(error))?403:503;
 export default {
  async fetch(request,env){
   const action=paths.get(new URL(request.url).pathname);
@@ -44,7 +43,10 @@ export default {
   if(active>=16)return new Response('SQL runtime busy',{status:action==='execute'?429:503,headers:{'Retry-After':'1'}});
   active++;const reservation=ingress.open();
   try{
-   const raw=await boundedSQLBody(request,reservation),body=JSON.parse(raw);
+   const raw=await boundedSQLBody(request,reservation);
+   let body;try{body=JSON.parse(raw);}catch{throw Error('InvalidSqlDistributedPlan');}
+   if(body===null||typeof body!=='object'||Array.isArray(body))throw Error('InvalidSqlDistributedPlan');
+   digestText(body.tenant);
    if(action==='submit'){
     // Preserve exact integers/scalar values in the native plan's original JSON.
     const result=await runSQL(env,{op:'sql_submit',tenant:body.tenant,raw_plan:raw,owner:crypto.randomUUID()});
@@ -59,7 +61,7 @@ export default {
    try{await runSQL(env,{op:'sql_execute',...locator,ticket:body,owner:crypto.randomUUID()});}
    catch(error){if(retiredSQLDelivery(error))return new Response(null,{status:204});throw error;}
    return Response.json({});
-  }catch(error){return Response.json({error:String(error)},{status:status(error)});}finally{reservation.release();active--;}
+  }catch(error){return Response.json({error:String(error)},{status:sqlErrorStatus(error)});}finally{reservation.release();active--;}
  },
  async queue(batch,env){await consumeSQL(batch,env,runSQL);},
  async scheduled(_controller,env,ctx){

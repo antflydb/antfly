@@ -94,11 +94,11 @@ pub const Client = struct {
                     switch (err) {
                         // An authoritative application response proves reachability;
                         // missing queries keep the existing replay/failover behavior.
-                        error.SqlExecutionCancelled, error.SqlExecutionFailed, error.SqlJoinBudgetExceeded, error.SqlQueryExpired, error.SqlExecutionNotFound, error.SqlControlRequestRejected => {
+                        error.SqlExecutionCancelled, error.SqlExecutionFailed, error.SqlJoinBudgetExceeded, error.SqlQueryExpired, error.SqlExecutionNotFound, error.SqlControlRequestRejected, error.InvalidSqlDistributedPlan, error.SqlRequestTooLarge => {
                             self.routing.success(url);
                             try context.ensureActive();
                             if (err == error.SqlExecutionCancelled) return error.Canceled;
-                            if (err != error.SqlExecutionNotFound and err != error.SqlControlRequestRejected) return err;
+                            if (err != error.SqlExecutionNotFound) return err;
                         },
                         else => {
                             const cancelled = if (context.cancellation) |token| token.isCancelled() else false;
@@ -121,7 +121,7 @@ pub const Client = struct {
         }
         try context.ensureActive();
         return switch (last_error) {
-            error.DeadlineExceeded, error.Timeout, error.Canceled, error.Cancelled, error.SqlExecutionNotFound, error.SqlControlRequestRejected => error.SqlWorkerUnavailable,
+            error.DeadlineExceeded, error.Timeout, error.Canceled, error.Cancelled, error.SqlExecutionNotFound => error.SqlWorkerUnavailable,
             else => last_error,
         };
     }
@@ -212,6 +212,8 @@ pub const Client = struct {
         };
         errdefer response_.deinit(self.a);
         try context.ensureActive();
+        if (response_.status == 400) return error.InvalidSqlDistributedPlan;
+        if (response_.status == 413) return error.SqlRequestTooLarge;
         if (response_.status == 401 or response_.status == 403) return error.SqlExecutionUnauthorized;
         if (response_.status == 408) return error.SqlExecutionCancelled;
         if (response_.status == 504) return error.DeadlineExceeded;
@@ -361,6 +363,8 @@ pub fn control(factory: runtime.Factory, a: A, scratch: A, path: []const u8, bod
 }
 pub fn errorStatus(err: anyerror) u16 {
     return switch (err) {
+        error.InvalidSqlDistributedPlan, error.InvalidSqlProgram, error.InvalidSqlParameters, error.InvalidSqlIdentity, error.SqlDistributedJoinUnsupported, error.SqlControlRequestRejected => 400,
+        error.SqlRequestTooLarge => 413,
         error.SqlExecutionUnauthorized => 403,
         error.SqlTaskAdmissionUnavailable => 429,
         error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed, error.SqlWorkerUnavailable => 503,
@@ -626,9 +630,11 @@ test "distributed SQL control semantic responses and local pressure do not quara
     const a = std.testing.allocator;
     const Fake = struct {
         status: u16 = 200,
+        calls: usize = 0,
         failure: ?anyerror = null,
         fn execute(raw: *anyopaque, allocator: A, _: http.HttpRequest) !http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
             if (self.failure) |err| return err;
             return .{ .status = self.status, .owner_allocator = allocator, .body = try allocator.dupe(u8, "{}") };
         }
@@ -636,8 +642,8 @@ test "distributed SQL control semantic responses and local pressure do not quara
     const Case = struct { status: u16 = 200, failure: ?anyerror = null, expected: anyerror };
     const query: QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
     for ([_]Case{
-        .{ .status = 400, .expected = error.SqlWorkerUnavailable },
-        .{ .status = 413, .expected = error.SqlWorkerUnavailable },
+        .{ .status = 400, .expected = error.InvalidSqlDistributedPlan },
+        .{ .status = 413, .expected = error.SqlRequestTooLarge },
         .{ .status = 403, .expected = error.SqlExecutionUnauthorized },
         .{ .status = 408, .expected = error.Canceled },
         .{ .status = 409, .expected = error.SqlExecutionFailed },
@@ -651,6 +657,7 @@ test "distributed SQL control semantic responses and local pressure do not quara
         var routing: Routing = .{};
         var client: Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://worker"} };
         try std.testing.expectError(case.expected, client.result(a, query, .{}));
+        if (case.status != 404) try std.testing.expectEqual(@as(usize, 1), fake.calls);
         try std.testing.expectEqual(.healthy, routing.admit("http://worker", @import("antfly_platform").time.monotonicNs()).kind);
     }
 }
@@ -707,4 +714,11 @@ test "distributed SQL spill pressure fails over without quarantining responsive 
     try std.testing.expectError(error.SqlWorkerUnavailable, client.execute(ticket, .{}));
     try std.testing.expectEqual(.healthy, routing.admit("http://busy", @import("antfly_platform").time.monotonicNs()).kind);
     try std.testing.expectEqual(.healthy, routing.admit("http://ready", @import("antfly_platform").time.monotonicNs()).kind);
+}
+
+test "distributed SQL HTTP admission errors are permanent client failures" {
+    for ([_]anyerror{ error.InvalidSqlDistributedPlan, error.InvalidSqlProgram, error.InvalidSqlParameters, error.InvalidSqlIdentity, error.SqlDistributedJoinUnsupported }) |err| try std.testing.expectEqual(@as(u16, 400), errorStatus(err));
+    try std.testing.expectEqual(@as(u16, 422), errorStatus(error.SqlJoinBudgetExceeded));
+    try std.testing.expectEqual(@as(u16, 500), errorStatus(error.InvalidSqlExchange));
+    try std.testing.expectEqual(@as(u16, 503), errorStatus(error.SqlWorkerUnavailable));
 }

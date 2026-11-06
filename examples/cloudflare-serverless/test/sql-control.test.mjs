@@ -16,7 +16,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHmac,createHash} from 'node:crypto';
-import {SQLControl,authenticateSQL,consumeSQL,locatorName,scheduleSQLMaintenance} from '../sql-control.mjs';
+import {SQLControl,authenticateSQL,consumeSQL,locatorName,scheduleSQLMaintenance,sqlErrorStatus} from '../sql-control.mjs';
 import {Bucket} from './object-fixture.mjs';
 const digest=c=>Array(64).fill(c.charCodeAt(0));
 const locator={tenant:digest('a'),query:{id:digest('b'),expires_ms:1000000}};
@@ -345,4 +345,10 @@ test('SQL collector rotates its first lane durably before successful or failed e
  }
  assert.deepEqual(lanes,[0,1,2,0]);
  assert.equal(await storage.get('gc_failures'),undefined);
+});
+
+test('SQL HTTP admission status distinguishes permanent requests from infrastructure failures',()=>{
+ for(const name of ['InvalidSqlDistributedPlan','InvalidSqlProgram','InvalidSqlParameters','InvalidSqlIdentity','SqlDistributedJoinUnsupported','SqlControlRequestRejected','SqlRequestRequired'])assert.equal(sqlErrorStatus(Error(name)),400);
+ assert.equal(sqlErrorStatus(new SyntaxError('deployment configuration')),503);
+ for(const [name,status]of [['SqlRequestTooLarge',413],['SqlJoinBudgetExceeded',422],['SqlQueryExpired',410],['Canceled',408],['SqlExecutionCancelled',408],['SqlExecutionUnauthorized',403],['SqlExecutionNotFound',404],['SqlTaskAdmissionUnavailable',429],['DeadlineExceeded',504],['SqlExecutionFailed',409],['InvalidSqlExchange',503],['OutOfMemory',503],['SqlWorkerUnavailable',503]])assert.equal(sqlErrorStatus(Error(name)),status);
 });

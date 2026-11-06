@@ -62,6 +62,22 @@ export async function boundedSQLBody(request,reservation){
  const bytes=new Uint8Array(size);let at=0;for(const chunk of chunks){bytes.set(chunk,at);at+=chunk.length;}
  return new TextDecoder('utf-8',{fatal:true}).decode(bytes);
 }
+// Match the native transport contract. Only explicit request/admission errors
+// are permanent client failures; storage and exchange corruption remain 5xx.
+export function sqlErrorStatus(error){
+ const text=String(error);
+ if(/\b(?:InvalidSqlDistributedPlan|InvalidSqlProgram|InvalidSqlParameters|InvalidSqlIdentity|SqlDistributedJoinUnsupported|SqlControlRequestRejected|SqlRequestRequired)\b/.test(text))return 400;
+ if(/\bSqlRequestTooLarge\b/.test(text))return 413;
+ if(/\b(?:SqlJoinBudgetExceeded|HostedWorkingSetBudgetExceeded|SqlProgramLimitExceeded)\b/.test(text))return 422;
+ if(/\bSqlQueryExpired\b/.test(text))return 410;
+ if(/\b(?:Canceled|Cancelled|SqlExecutionCancelled)\b/.test(text))return 408;
+ if(/\bSqlExecutionFailed\b/.test(text))return 409;
+ if(/\bSqlExecutionUnauthorized\b/.test(text))return 403;
+ if(/\bSqlExecutionNotFound\b/.test(text))return 404;
+ if(/\bSqlTaskAdmissionUnavailable\b/.test(text))return 429;
+ if(/\bDeadlineExceeded\b/.test(text))return 504;
+ return 503;
+}
 export const retiredSQLDelivery=error=>/SqlQueryExpired|SqlExecutionFenced|SqlExecutionNotFound|SqlExecutionFailed/.test(String(error));
 export class SQLControl {
  constructor(ctx,env,run,{now=()=>Date.now(),owner=crypto.randomUUID()}={}){this.ctx=ctx;this.env=env;this.run=run;this.now=now;this.owner=owner;this.active=false;this.collectAgain=false;this.updates=Promise.resolve();}

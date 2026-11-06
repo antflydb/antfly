@@ -128,7 +128,10 @@ fn executeIn(a: A, client: storage.Client, io: std.Io, context: Context, raw: []
     const service: runtime.Service = .{ .build_cache = builds, .a = a, .state_store = .{ .client = client, .bucket = request.config.state.bucket, .prefix = request.config.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = client, .bucket = request.config.exchange.bucket, .prefix = request.config.exchange.prefix }, .tenant = request.tenant, .poll_query_cancellation = true, .role = .query_only, .owner = request.owner, .context = context, .retention = host.retention(), .source = host.source(), .task_memory_ceiling = request.config.task_memory };
     return switch (request.op) {
         .sql_submit => blk: {
-            const spec = try std.json.parseFromSliceLeaky(plan.Plan, a, request.raw_plan orelse return error.InvalidSqlDistributedPlan, .{ .allocate = .alloc_always });
+            const spec = std.json.parseFromSliceLeaky(plan.Plan, a, request.raw_plan orelse return error.InvalidSqlDistributedPlan, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidSqlDistributedPlan,
+            };
             break :blk std.json.Stringify.valueAlloc(a, .{ .query = try service.submit(spec) }, .{});
         },
         .sql_turn => blk: {

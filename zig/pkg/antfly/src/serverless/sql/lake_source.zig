@@ -792,3 +792,50 @@ test "distributed SQL filtered typed scans retire rejected pages before the next
     try std.testing.expect(try Owner.nextBatch(&owner, budget.allocator(), 256) == null);
     try std.testing.expect(budget.peak <= budget.limit);
 }
+
+test "distributed SQL numeric array payloads survive typed bucket and WAL fallback scans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var context: local.sql_numeric_value.Context = .{ .alloc = a };
+    const number = try local.sql_numeric_value.parse(&context, "1.250");
+    const array = try local.sql_array_value.Value.init(.numeric, &.{.{ .length = 1 }}, &.{Datum.typedNumeric(&number.value)}, .{});
+    const cells = [_]Datum{ Datum.json(.{ .integer = 7 }), Datum.typedArray(&array) };
+    var batch: local.sql_execution_batch.Batch = .{ .rows = &.{&cells} };
+    const Pages = struct {
+        fn columns(raw: *anyopaque, _: A, _: u32) !catalog.ColumnPage {
+            return .{ .native = .{ .values = @ptrCast(@alignCast(raw)), .names = &.{ "id", "payload" } }, .selection = &.{0} };
+        }
+        fn next(_: *anyopaque, _: A, _: u32) !catalog.Page {
+            return error.UnexpectedRowPath;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const input: plan.Input = .{ .table_id = 7, .schema = @splat('a'), .snapshot = "42", .wal_cut = 1, .cut = "cut", .columns = &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .array, .element_type = .numeric } }, .estimated_bytes = 1, .estimated_rows = 1, .splits = 1 };
+    const table: catalog.Table = .{ .id = 7, .physical_name = "t", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .array, .element_type = .numeric } } };
+    const cut: overlay.Cut = .{ .pending = .{ .lsn = 1, .key_fields = &.{"id"}, .changes = &.{} } };
+    var owner: Owner = .{ .a = a, .arena = .init(a), .input = input, .table = table, .cut = &cut, .filter = null, .context = .{}, .cursor = .{ .ptr = &batch, .next = Pages.next, .next_columns = Pages.columns, .close = Pages.close } };
+    defer owner.arena.deinit();
+    defer owner.retireBatchPage();
+    const clean = (try Owner.nextBatch(&owner, a, 256)).?;
+    try std.testing.expect((try clean.cell(a, 0, 1)).array != null);
+    owner.base_done = false;
+    owner.input.bucket = .{ .column = 0, .count = 1 };
+    owner.input.bucket_group = .{ .index = 0, .count = 1 };
+    const fallback = (try Owner.nextBatch(&owner, a, 256)).?;
+    try std.testing.expectEqual(@as(usize, 1), fallback.len());
+    const bucket_array = (try fallback.cell(a, 0, 1)).array.?;
+    try std.testing.expectEqual(local.sql_array_value.ElementType.numeric, bucket_array.element_type);
+    try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(array.elements[0], bucket_array.elements[0]));
+    var deleted: std.json.Value = .{ .object = .empty };
+    try deleted.object.put(a, "id", .{ .integer = 99 });
+    const wal = try overlay.Cut.initForTable(a, .{ .lsn = 1, .key_fields = &.{"id"}, .changes = &.{.{ .op = .delete, .row = deleted }} }, table);
+    owner.cut = &wal;
+    owner.base_done = false;
+    owner.input.bucket = null;
+    owner.input.bucket_group = null;
+    const reconciled = (try Owner.nextBatch(&owner, a, 256)).?;
+    try std.testing.expectEqual(@as(usize, 1), reconciled.len());
+    const wal_array = (try reconciled.cell(a, 0, 1)).array.?;
+    try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(array.elements[0], wal_array.elements[0]));
+}
