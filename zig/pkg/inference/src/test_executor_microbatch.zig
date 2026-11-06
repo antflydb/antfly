@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Read-pool broker ownership and caller-local classification presentation.
+//! Shared executor batching, GLiNER presentation, and document row ownership.
 const std = @import("std");
 const span = @import("extractors/gliner_span_v2_executor.zig");
 const wire = @import("extractors/extraction_v2.zig");
@@ -21,8 +21,7 @@ const processor = @import("pipelines/gliner_boundary_processor.zig");
 
 test {
     _ = @import("server/executor_microbatch.zig");
-    _ = @import("server/read_pool_microbatch.zig");
-    _ = @import("server/write_pool_microbatch.zig");
+    _ = @import("server/gliner_microbatch.zig");
     _ = @import("server/tensor_microbatch.zig");
     _ = @import("architectures/whisper.zig");
     _ = @import("pipelines/text_batch_admission.zig");
@@ -30,7 +29,7 @@ test {
     _ = @import("pipelines/embedding.zig");
 }
 
-test "read pool microbatch presents independent schemas without reentering the backend" {
+test "gliner microbatch presents independent schemas without reentering the backend" {
     const a = std.testing.allocator;
     var request = try wire.parseJson(a,
         \\{"schema_version":2,"model":"m","schema":{"classifications":[{"name":"intent","labels":["sales","support"]}]},"inputs":[{"id":"first","content":"Help"},{"id":"second","content":"Buy","schema":{"classifications":[{"name":"route","labels":["red","green","blue"]}]}}]}
@@ -76,7 +75,7 @@ const MaskedEncoder = struct {
     }
 };
 
-test "read pool microbatch document buckets bound input padding and backend tile rounding" {
+test "executor microbatch document buckets bound input padding and backend tile rounding" {
     const bucket = @import("pipelines/batch_execution.zig").maskedSequenceBucket;
     for (1..8193) |tokens| {
         const width = bucket(MaskedEncoder{}, tokens, 8192);
@@ -90,7 +89,7 @@ test "read pool microbatch document buckets bound input padding and backend tile
     try std.testing.expectEqual(@as(usize, 8192), bucket(MaskedEncoder{}, 8191, 8192));
 }
 
-test "read pool microbatch document rows share bounded forwards across heterogeneous arrays" {
+test "executor microbatch document rows share bounded forwards across heterogeneous arrays" {
     const broker_mod = @import("server/executor_microbatch.zig");
     const bucket = @import("pipelines/batch_execution.zig").maskedSequenceBucket;
     var broker = broker_mod.Broker.init(std.testing.allocator);

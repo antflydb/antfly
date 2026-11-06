@@ -123,6 +123,8 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 pub const metrics_mod = @import("metrics.zig");
 const inference_admission_mod = @import("inference_admission.zig");
 const executor_microbatch = @import("executor_microbatch.zig");
+const gliner_microbatch = @import("gliner_microbatch.zig");
+const OutputOwner = @import("output_owner.zig").OutputOwner;
 pub const ExecutorCancellation = executor_microbatch.Cancellation;
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
@@ -7597,11 +7599,9 @@ pub const Node = struct {
         }
     }
 
-    const read_pool_microbatch = @import("read_pool_microbatch.zig");
-    const DecideOutputOwner = read_pool_microbatch.OutputOwner;
-    const DecideRows = read_pool_microbatch.Rows;
-    const cloneDecideRows = read_pool_microbatch.clone;
-    const freeDecideRows = read_pool_microbatch.destroy;
+    const DecideRows = gliner_microbatch.ClassificationRows;
+    const cloneDecideRows = gliner_microbatch.cloneClassificationRows;
+    const freeDecideRows = gliner_microbatch.destroyClassificationRows;
 
     const DecideClassifyTicket = struct {
         model: *model_manager_mod.LoadedModel,
@@ -7644,7 +7644,7 @@ pub const Node = struct {
             }
         };
         const shared = std.heap.smp_allocator;
-        const results = try self.executorMicrobatchBroker().submitBatchControlled(DecideClassifyTicket, DecideRows, io, shared, .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .extract, .schema = key, .transform = "read-decide-classification", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_tokens = 8 * 512, .max_bytes = 8 * 512 * @sizeOf(i64), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse 200 }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, executeDecideClassificationMicrobatch);
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(DecideClassifyTicket, DecideRows, io, shared, .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .extract, .schema = key, .transform = "gliner-classification", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_tokens = 8 * 512, .max_bytes = 8 * 512 * @sizeOf(i64), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse 200 }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, executeDecideClassificationMicrobatch);
         const rows = try executor_microbatch.collectOwned(DecideRows, a, shared, results, cloneDecideRows, freeDecideRows);
         defer {
             for (rows) |row| freeDecideRows(a, row);
@@ -7670,12 +7670,12 @@ pub const Node = struct {
         const rows = self.forwardDecideClassificationMicrobatch(items) catch |err| {
             // Capacity subdivision happens before any forward. Never replay a
             // failed GPU operation or let one oversized cohort reject fit rows.
-            if (err == error.ReadMicrobatchCapacity and items.len > 1) {
+            if (err == error.ClassificationMicrobatchCapacity and items.len > 1) {
                 const half = items.len / 2;
                 try self.runDecideClassificationMicrobatch(items[0..half]);
                 return self.runDecideClassificationMicrobatch(items[half..]);
             }
-            return if (err == error.ReadMicrobatchCapacity) error.MemoryBudgetExceeded else err;
+            return if (err == error.ClassificationMicrobatchCapacity) error.MemoryBudgetExceeded else err;
         };
         const a = std.heap.smp_allocator;
         defer a.free(rows);
@@ -7697,8 +7697,8 @@ pub const Node = struct {
         const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check });
         var longest: usize = 0;
         for (items) |item| longest = @max(longest, item.payloadAs(DecideClassifyTicket).sample.input_ids.len);
-        var budget = read_pool_microbatch.classificationBudget(first.limits, first.config, longest, items.len) catch |err| {
-            if (err == error.MemoryBudgetExceeded) return error.ReadMicrobatchCapacity;
+        var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len) catch |err| {
+            if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
         };
         const device_bytes = budget.backend_scratch_bytes;
@@ -7708,7 +7708,7 @@ pub const Node = struct {
         try control.lock(&first.model.gliner_boundary_admission_lock);
         defer first.model.gliner_boundary_admission_lock.unlock();
         var lease = self.model_manager.acquireRunResourceAmounts(.gpu, first.limits, .{ .backend_scratch_bytes = device_bytes, .host_scratch_bytes = host_bytes }) catch |err| {
-            if (err == error.MemoryBudgetExceeded) return error.ReadMicrobatchCapacity;
+            if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
         };
         var lease_transferred = false;
@@ -7734,9 +7734,9 @@ pub const Node = struct {
         };
         const output = try a.alloc(DecideRows, items.len);
         errdefer a.free(output);
-        const owner = try a.create(DecideOutputOwner);
+        const owner = try a.create(OutputOwner);
         errdefer a.destroy(owner);
-        var retained: usize = @sizeOf(DecideOutputOwner) + output.len * @sizeOf(DecideRows);
+        var retained: usize = @sizeOf(OutputOwner) + output.len * @sizeOf(DecideRows);
         for (raw_rows) |rows| {
             retained += rows.len * @sizeOf([]f64);
             for (rows) |row| retained += row.len * @sizeOf(f64);
@@ -11918,8 +11918,7 @@ pub const Node = struct {
         options: boundary_executor.Options,
         working_bytes: usize,
     };
-    const BoundaryReply = @import("write_pool_microbatch.zig").Reply;
-    const BoundaryOutputOwner = @import("write_pool_microbatch.zig").OutputOwner;
+    const BoundaryReply = gliner_microbatch.BoundaryReply;
 
     fn tryBoundaryRequestMicrobatch(self: *Node, a: std.mem.Allocator, io: std.Io, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, request_json: []const u8, options: boundary_executor.Options, working_bytes: usize) !?[]u8 {
         const caps = loaded.session.executionCapabilities();
@@ -11929,8 +11928,7 @@ pub const Node = struct {
         // Regex compilers retain caller controls. They remain exclusive until
         // their validation contexts can be owned by the physical invocation.
         if ((try qualification.requiredFeaturesResolved(request, options.pipeline, options.control)).contains(.regex_validation)) return null;
-        const presentation = @import("write_pool_microbatch.zig");
-        const schema = (try presentation.boundaryKey(a, request_json)) orelse return null;
+        const schema = (try gliner_microbatch.boundaryKey(a, request_json)) orelse return null;
         defer a.free(schema);
         const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
         var preparations = boundary_executor.PreparationStore.init(a);
@@ -11963,10 +11961,10 @@ pub const Node = struct {
             }
         };
         const shared = std.heap.smp_allocator;
-        const results = try self.executorMicrobatchBroker().submitBatchControlled(BoundaryRequestTicket, BoundaryReply, io, shared, .{ .model = loaded.model_dir, .generation = @intFromPtr(loaded), .task = .extract, .schema = key, .transform = "write-boundary-short", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = caps.boundary_batch_padded_tokens, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse caps.boundary_batch_collection_wait_us }, &.{.{ .tokens = bucket, .geometry_key = bucket, .bytes = request_json.len }}, &.{.{}}, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, &.{.{ .model = loaded, .request = request, .options = options, .working_bytes = working_bytes }}, self, executeBoundaryRequestMicrobatch);
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(BoundaryRequestTicket, BoundaryReply, io, shared, .{ .model = loaded.model_dir, .generation = @intFromPtr(loaded), .task = .extract, .schema = key, .transform = "gliner-boundary-short", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = caps.boundary_batch_padded_tokens, .max_bytes = requestMediaMaxBytes(self), .max_wait_us = self.config.executor_microbatch_max_wait_us orelse caps.boundary_batch_collection_wait_us }, &.{.{ .tokens = bucket, .geometry_key = bucket, .bytes = request_json.len }}, &.{.{}}, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, &.{.{ .model = loaded, .request = request, .options = options, .working_bytes = working_bytes }}, self, executeBoundaryRequestMicrobatch);
         defer {
             for (results) |result| switch (result.result) {
-                .value => |value| @import("write_pool_microbatch.zig").destroyReply(shared, value),
+                .value => |value| gliner_microbatch.destroyBoundaryReply(shared, value),
                 .item_error => {},
             };
             shared.free(results);
@@ -11988,12 +11986,12 @@ pub const Node = struct {
     fn runBoundaryRequestMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) anyerror!void {
         if (items.len == 0) return;
         self.forwardBoundaryRequestMicrobatch(items) catch |err| {
-            if (err == error.WriteMicrobatchCapacity and items.len > 1) {
+            if (err == error.BoundaryMicrobatchCapacity and items.len > 1) {
                 const half = items.len / 2;
                 try self.runBoundaryRequestMicrobatch(items[0..half]);
                 return self.runBoundaryRequestMicrobatch(items[half..]);
             }
-            return if (err == error.WriteMicrobatchCapacity) error.MemoryBudgetExceeded else err;
+            return if (err == error.BoundaryMicrobatchCapacity) error.MemoryBudgetExceeded else err;
         };
     }
 
@@ -12008,7 +12006,7 @@ pub const Node = struct {
         // The physical cohort owns a separate admitted, reclaiming heap and
         // exactly one device reservation; it borrows no caller's budget.
         var lease = self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = first.working_bytes }) catch |err| {
-            if (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable) return error.WriteMicrobatchCapacity;
+            if (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable) return error.BoundaryMicrobatchCapacity;
             return err;
         };
         defer lease.release();
@@ -12034,11 +12032,11 @@ pub const Node = struct {
         // including results discarded by expired or disconnected callers.
         const header_bytes = try std.math.add(usize, 1024, try std.math.mul(usize, 6, first.request.model.len));
         const output_limit = try std.math.add(usize, options.max_response_bytes, try std.math.mul(usize, items.len, header_bytes));
-        var output_lease = self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = try std.math.add(usize, output_limit, @sizeOf(BoundaryOutputOwner)) }) catch |err| {
-            if (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable) return error.WriteMicrobatchCapacity;
+        var output_lease = self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = try std.math.add(usize, output_limit, @sizeOf(OutputOwner)) }) catch |err| {
+            if (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable) return error.BoundaryMicrobatchCapacity;
             return err;
         };
-        const output_owner = shared.create(BoundaryOutputOwner) catch |err| {
+        const output_owner = shared.create(OutputOwner) catch |err| {
             output_lease.release();
             return err;
         };
@@ -12060,7 +12058,7 @@ pub const Node = struct {
                 item.slot.fail(error.ExtractionOutputLimitExceeded);
                 continue;
             }
-            const output = @import("write_pool_microbatch.zig").boundaryRow(shared, parsed.value, index, observed.prompt_tokens, item.payloadAs(BoundaryRequestTicket).options.max_response_bytes) catch |err| {
+            const output = gliner_microbatch.boundaryRow(shared, parsed.value, index, observed.prompt_tokens, item.payloadAs(BoundaryRequestTicket).options.max_response_bytes) catch |err| {
                 item.slot.fail(err);
                 continue;
             };
@@ -12076,7 +12074,7 @@ pub const Node = struct {
         }
         // Shrinking can retain the conservative reservation on any refusal;
         // ownership remains valid until the final consumer releases it.
-        output_owner.lease.retain(.{ .host_scratch_bytes = output_bytes + @sizeOf(BoundaryOutputOwner) }) catch {};
+        output_owner.lease.retain(.{ .host_scratch_bytes = output_bytes + @sizeOf(OutputOwner) }) catch {};
     }
 
     fn executeBoundaryLoaded(self: *Node, scratch: std.mem.Allocator, loaded: *model_manager_mod.LoadedModel, request: *const extraction_v2.Request, supplied_options: boundary_executor.Options, budget: *runtime.tier.memory.RunBudget, working_bytes: usize, test_qualification: bool) ![]u8 {
@@ -12178,7 +12176,7 @@ pub const Node = struct {
                     workspace_permit = try self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, amounts);
                 };
                 device_lease = self.model_manager.acquireRunResourceAmounts(.gpu, device_limits, .{ .backend_scratch_bytes = request_device_bytes }) catch |err| {
-                    if (execution_options.brokered_request and (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable)) return error.WriteMicrobatchCapacity;
+                    if (execution_options.brokered_request and (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable)) return error.BoundaryMicrobatchCapacity;
                     return err;
                 };
             }
