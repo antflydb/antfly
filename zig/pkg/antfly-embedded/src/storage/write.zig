@@ -2464,6 +2464,18 @@ test "managed enrichments inherit the default inference credential with the defa
     try listener.start();
     const base_uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);
+    // A second listener stands in for a third-party endpoint named by an index.
+    var third_party = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeInference.executor());
+    defer third_party.deinit();
+    try third_party.start();
+    const third_party_uri = try third_party.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(third_party_uri);
+    const third_party_indexes_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"semantic_idx\":{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{{\"provider\":\"antfly\",\"model\":\"remote-model\",\"api_url\":\"{s}/ai/v1\"}}}}}}",
+        .{third_party_uri},
+    );
+    defer std.testing.allocator.free(third_party_indexes_json);
 
     const Case = struct { indexes_json: []const u8, expected: []const u8 };
     for ([_]Case{
@@ -2478,6 +2490,9 @@ test "managed enrichments inherit the default inference credential with the defa
             .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"remote-model\",\"api_key\":\"index-key\"}}}",
             .expected = "Bearer index-key",
         },
+        // An index that names its own endpoint never receives the node
+        // credential.
+        .{ .indexes_json = third_party_indexes_json, .expected = "" },
     }) |case| {
         FakeInference.embed_calls = 0;
         FakeInference.last_authorization_len = 0;

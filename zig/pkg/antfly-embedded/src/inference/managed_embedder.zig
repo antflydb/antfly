@@ -3109,7 +3109,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
             defer embedder_cfg.deinit(alloc);
             if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
             _ = parseEmbedderProvider(embedder_cfg) catch return error.UnsupportedCreateTableRequest;
-            break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_key);
+            break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_url, options.inference_api_key);
         } else null;
         defer if (embedder_json) |raw| alloc.free(raw);
         if (embedder_json == null and !artifact_backed) return error.InvalidCreateTableRequest;
@@ -3184,7 +3184,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer embedder_cfg.deinit(alloc);
         _ = try parseEmbedderProvider(embedder_cfg);
         if (embedder_cfg.model.len == 0) return error.InvalidCreateTableRequest;
-        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_key);
+        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, options.inference_api_url, options.inference_api_key);
     } else null;
     defer if (embedder_json) |raw| alloc.free(raw);
     if (!external and embedder_json == null and chunker_json == null and !artifact_backed) return error.InvalidCreateTableRequest;
@@ -5220,9 +5220,15 @@ fn buildManagedEmbeddingEntry(
         .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
         .cohere => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "COHERE_API_KEY"),
         .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "GEMINI_API_KEY"),
+        // `base_url` is the endpoint this embedder will call (explicit, catalog
+        // pinned, or the node default). Only the node default endpoint
+        // receives the node credential.
         .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(
             alloc,
-            embedder_cfg.api_key orelse options.inference_api_key,
+            embedder_cfg.api_key orelse if (sameAntflyInferenceEndpoint(base_url, options.inference_api_url))
+                options.inference_api_key
+            else
+                null,
             "ANTFLY_INFERENCE_API_KEY",
         ),
         .ollama, .bedrock, .vertex => null,
@@ -7178,6 +7184,32 @@ fn resolveAntflyInferenceBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_
     return try normalizeAntflyInferenceBaseUrl(alloc, raw);
 }
 
+/// Whether `endpoint` is the node default inference endpoint, compared after
+/// the same `/ai/v1` normalization requests use. An empty endpoint (linked
+/// in-process execution) or an absent default never matches.
+fn sameAntflyInferenceEndpoint(endpoint: []const u8, default_endpoint: ?[]const u8) bool {
+    const configured_default = default_endpoint orelse return false;
+    const requested = canonicalAntflyInferenceEndpoint(endpoint);
+    const node_default = canonicalAntflyInferenceEndpoint(configured_default);
+    return requested.len > 0 and node_default.len > 0 and std.ascii.eqlIgnoreCase(requested, node_default);
+}
+
+fn canonicalAntflyInferenceEndpoint(raw: []const u8) []const u8 {
+    var canonical = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \t\r\n"), "/");
+    if (std.mem.endsWith(u8, canonical, "/ai/v1")) {
+        canonical = std.mem.trimEnd(u8, canonical[0 .. canonical.len - "/ai/v1".len], "/");
+    }
+    return canonical;
+}
+
+test "node default inference endpoint matching ignores the api suffix only" {
+    try std.testing.expect(sameAntflyInferenceEndpoint("http://shared:8080/ai/v1", "http://shared:8080"));
+    try std.testing.expect(sameAntflyInferenceEndpoint("http://shared:8080/", "http://shared:8080/ai/v1/"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://third-party:8080/ai/v1", "http://shared:8080/ai/v1"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("", "http://shared:8080"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080", null));
+}
+
 fn configuredDefaultAntflyInferenceURL(options: InitOptions) ?[]const u8 {
     const value = options.inference_api_url orelse return null;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -8150,6 +8182,7 @@ fn stringifyManagedEmbedderConfigAlloc(
     alloc: std.mem.Allocator,
     cfg: embeddings_types.Config,
     raw_value: std.json.Value,
+    inference_api_url: ?[]const u8,
     inference_api_key: ?[]const u8,
 ) ![]u8 {
     const base_json = try embeddings_types.stringifyAlloc(alloc, cfg);
@@ -8157,7 +8190,10 @@ fn stringifyManagedEmbedderConfigAlloc(
 
     const requests_per_minute = configObjectU32(raw_value, "requests_per_minute");
     const burst = configObjectU32(raw_value, "burst");
-    const default_inference_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)))
+    // The node credential belongs to the node endpoint: an embedder that names
+    // its own (possibly third-party) URL never inherits it.
+    const default_inference_api_key = if (cfg.api_key == null and isAntflyProvider(try parseEmbedderProvider(cfg)) and
+        (cfg.url.len == 0 or sameAntflyInferenceEndpoint(cfg.url, inference_api_url)))
         inference_api_key
     else
         null;
