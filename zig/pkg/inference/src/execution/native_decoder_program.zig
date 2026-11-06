@@ -11,7 +11,7 @@ const gpt = @import("../architectures/gpt.zig");
 const Context = @import("../graph/execution.zig").Context;
 const GraphCache = @import("../graph/cache.zig").GraphCache;
 const Native = @import("../ops/native_compute.zig");
-const Runtime = @import("../graph/runtime.zig").Runtime;
+const PhysicalLayout = @import("../graph/runtime.zig").PhysicalLayout;
 const Analysis = @import("../graph/interpreter.zig").CachedAnalysis;
 const physical = @import("physical_buffers.zig");
 const route = @import("kernel_route.zig");
@@ -83,6 +83,7 @@ pub const Template = struct {
     /// Optional layout prototype, independent of backend/payload handles.
     /// Null retains the original current-derived descriptor path for adapters.
     tensor_descriptors: ?[]?TensorDesc,
+    physical_layout: ?PhysicalLayout,
     descriptors: []?ops.kernel_descriptor.Descriptor,
     authored_descriptors: []?ops.kernel_descriptor.Descriptor,
     steps: []StaticStep,
@@ -110,6 +111,7 @@ pub const Template = struct {
         allocator.free(self.authored_descriptors);
         allocator.free(self.steps);
         allocator.free(self.pairs);
+        if (self.physical_layout) |*layout| layout.deinit();
         self.artifact.deinit();
         allocator.destroy(self);
     }
@@ -307,6 +309,14 @@ pub const Template = struct {
             quantized_source = true;
             break;
         };
+        // Cache pure placement/layout only when the complete parameter format
+        // prototype is available. Adapter-only paths keep their original fresh
+        // current-derived descriptor/error boundary in Program creation.
+        var physical_layout: ?PhysicalLayout = if (tensor_descriptors) |prototype|
+            try PhysicalLayout.create(allocator, &artifact.graph, &.{&backend}, .{ .tensor_descs = prototype, .region_costs = null }, true)
+        else
+            null;
+        errdefer if (physical_layout) |*layout| layout.deinit();
         const self = try allocator.create(Template);
         var has_resident_quantized = false;
         for (queries) |query| if (query.quantized) |quantized| {
@@ -315,7 +325,7 @@ pub const Template = struct {
                 break;
             }
         };
-        self.* = .{ .allocator = allocator, .artifact = artifact, .queries = queries, .parameter_queries = parameter_queries, .has_unmatched_parameters = has_unmatched_parameters, .tensor_descriptors = tensor_descriptors, .descriptors = descriptors, .authored_descriptors = authored, .steps = ordered, .pairs = pairs, .input = token_input, .config_hash = context.gpt_config.fingerprint(), .reduction_policy = if (has_resident_quantized) .native_original_resident_quantized_v2 else if (pairs.len != 0) .native_original_kblock_pair_v1 else if (quantized_source) .native_original_kblock_single_v1 else .native_original_dense_v1, .use_blas = Native.useBlas() };
+        self.* = .{ .allocator = allocator, .artifact = artifact, .queries = queries, .parameter_queries = parameter_queries, .has_unmatched_parameters = has_unmatched_parameters, .tensor_descriptors = tensor_descriptors, .physical_layout = physical_layout, .descriptors = descriptors, .authored_descriptors = authored, .steps = ordered, .pairs = pairs, .input = token_input, .config_hash = context.gpt_config.fingerprint(), .reduction_policy = if (has_resident_quantized) .native_original_resident_quantized_v2 else if (pairs.len != 0) .native_original_kblock_pair_v1 else if (quantized_source) .native_original_kblock_single_v1 else .native_original_dense_v1, .use_blas = Native.useBlas() };
         return self;
     }
 };
@@ -380,7 +390,7 @@ pub const Program = struct {
     template: *Template,
     graph: *ml.graph.Graph,
     analysis: Analysis,
-    runtime: Runtime,
+    root_pool: *physical.Pool,
     selected: *@import("prepared_routes.zig").PreparedRoutes,
     bindings: []route.InputBinding,
     /// Matched entries borrow source_queries witnesses; unmatched adapter
@@ -524,9 +534,24 @@ pub const Program = struct {
             if (descriptor.operation != .linear or node.num_inputs < 2) continue;
             if (self.weights[node.inputs[1]]) |weight| try Native.NativeCompute.validateResidentQuantizedTaskOwnership(&self.backend, weight, descriptor);
         };
-        self.runtime = try Runtime.initWithOptions(allocator, self.graph, &self.backend, .partitioned, .{ .analysis = self.analysis, .region_costs = null, .kernel_descriptors = template.descriptors, .tensor_descs = descriptors });
-        errdefer self.runtime.deinit();
-        const pool = self.runtime.physical_pool orelse return error.IncompleteNativeProgram;
+        var current_layout: ?PhysicalLayout = null;
+        defer if (current_layout) |*layout| layout.deinit();
+        const layout = if (template.tensor_descriptors != null and template.physical_layout != null) &template.physical_layout.? else fresh: {
+            current_layout = try PhysicalLayout.create(allocator, self.graph, &.{&self.backend}, .{ .tensor_descs = descriptors, .region_costs = null }, false);
+            break :fresh &current_layout.?;
+        };
+        const created_pool = layout.createPool(allocator, self.graph, &.{&self.backend}, template.descriptors) catch |err| switch (err) {
+            // A policy change is a cold metadata reprepare, never a reason to
+            // reuse an old physical promise or decline a legal fresh layout.
+            error.PhysicalOutputLayoutChanged => fresh: {
+                current_layout = try PhysicalLayout.create(allocator, self.graph, &.{&self.backend}, .{ .tensor_descs = descriptors, .region_costs = null }, false);
+                break :fresh try current_layout.?.createPool(allocator, self.graph, &.{&self.backend}, template.descriptors);
+            },
+            else => return err,
+        };
+        const pool = created_pool orelse return error.IncompleteNativeProgram;
+        self.root_pool = pool;
+        errdefer pool.deinit();
         if (pool.backends.len != 1 or pool.backends[0].ptr != self.backend.ptr or pool.backends[0].vtable != self.backend.vtable or pool.plan.transfers.len != 0) return error.IncompleteNativeProgram;
         pool.coverage_graph = self.graph;
         pool.coverage_reachable = self.analysis.reachable;
@@ -779,7 +804,7 @@ pub const Program = struct {
             return;
         }
         self.selected.releaseWithCleanup(cleanup);
-        self.runtime.deinitWithCleanup(cleanup);
+        self.root_pool.deinitWithCleanup(cleanup);
         for (self.template.parameter_queries) |parameter| if (parameter.query == null) {
             if (self.weights[parameter.node]) |value| self.backend.freeWithCleanup(value, cleanup);
         };
@@ -1853,6 +1878,10 @@ test "native Definition template shares only immutable graph and descriptors acr
         try std.testing.expectEqual(@as(usize, 0), program.weight_planes.len);
     }
     try std.testing.expect(first.selected.pool != second.selected.pool);
+    try std.testing.expect(first.root_pool != second.root_pool);
+    try std.testing.expect(first.root_pool.plan.slots.ptr != second.root_pool.plan.slots.ptr);
+    try std.testing.expect(first.template.physical_layout != null);
+    for (first.template.physical_layout.?.partition.partitions) |part| try std.testing.expect(part.executor == null);
     try std.testing.expectEqual(@as(u64, 1), slot.stats.builds);
     try std.testing.expectEqual(@as(u64, 1), slot.stats.hits);
     const Kv = @import("../runtime/root.zig").kv;
@@ -2417,4 +2446,47 @@ test "native Definition parameter links preserve original independent lookup whe
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, expected, actual);
     try Native.NativeCompute.validateAuthoredSourceQueries(&backend, program.source_queries);
+}
+
+test "native physical output lease survives program template graph and layout destruction" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model = try TestModel.init(a);
+    defer model.data.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &model.data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const cfg = TestModel.config();
+    const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg };
+    var cleanup = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer cleanup.finishAfterUnlock();
+    const current = Cleanup{ .boundary = cleanup.epoch() };
+    const program = (try Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
+    var program_live = true;
+    defer if (program_live) program.destroyWithCleanup(current);
+    try std.testing.expectEqual(@as(usize, 1), program.template.references.load(.acquire));
+    const Kv = @import("../runtime/root.zig").kv;
+    var manager = Kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
+    const sequence = try manager.attachSequence(pool);
+    try manager.appendTokens(sequence, 1);
+    const decode = TestModel.decode(&manager, pool, sequence, 1);
+    var call = try program.beginCall(&.{2}, &decode, null);
+    defer call.close(current);
+    try call.prepareInto(a, null, current);
+    try call.run(&backend, cfg, &decode, current);
+    const expected = try call.takeOutput();
+    defer a.free(expected);
+    const actual_output = program.values[program.graph.outputs.items[0]] orelse return error.MissingValue;
+    // Native's existing row-view retains its original CT and physical Lease;
+    // it does not duplicate the numerical values or retain a graph/layout.
+    const held = try backend.sliceRows2D(a, actual_output, 0, 1, cfg.vocab_size);
+    defer backend.freeWithCleanup(held, current);
+    call.close(current);
+    program.destroyWithCleanup(current);
+    program_live = false;
+    const actual = try backend.toFloat32(held, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
 }

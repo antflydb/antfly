@@ -282,6 +282,9 @@ test {
     _ = @import("architectures/clip.zig");
     _ = @import("architectures/clap.zig");
     _ = @import("architectures/qwen2vl_vision.zig");
+    _ = @import("architectures/gemma3_vision.zig");
+    _ = @import("architectures/gemma3_projector.zig");
+    _ = @import("pipelines/gemma3_multimodal.zig");
     _ = architectures.projector_format;
     _ = architectures.qwen3vl_plan;
     _ = architectures.qwen3vl_projector;

@@ -98,6 +98,121 @@ pub const Result = struct {
     }
 };
 
+/// Backend-free placement and physical layout. It owns no provider, tensor,
+/// execution token, executor or physical allocation. Each receiving Pool is
+/// fresh and rechecks live provider output policy before using this metadata.
+pub const PhysicalLayout = struct {
+    allocator: std.mem.Allocator,
+    partition: partition_mod.PartitionPlan,
+    buffers: buffer_plan_mod.BufferPlan,
+    output_policy: []PhysicalOutputLayout.Check,
+    diagnostics: partition_mod.CapabilityDiagnostics,
+    target_kind: BackendKind,
+    fallback: bool,
+    partition_owned: bool = true,
+    buffers_owned: bool = true,
+
+    pub fn create(allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, options: Runtime.InitOptions, retain_output_policy: bool) !PhysicalLayout {
+        if (backends.len == 0 or backends.len > 2) return error.InvalidPhysicalBackendCount;
+        const target_kind = backendKindForPartition(backends[0].kind());
+        const use_native_fallback = backends.len == 2;
+        if (use_native_fallback and (target_kind == .native or backends[1].kind() != .native)) return error.InvalidPhysicalBackendCount;
+        var capabilities_buf: [2]partition_mod.Capability = undefined;
+        const capability_count: usize = if (use_native_fallback) blk: {
+            capabilities_buf[0] = .{
+                .backend = target_kind,
+                .priority = 10,
+                .supports = backend_policy.supports(target_kind),
+                .decide = backend_policy.decide(target_kind),
+            };
+            capabilities_buf[1] = .{
+                .backend = .native,
+                .priority = 0,
+                .supports = &partition_mod.supportsAll,
+                .decide = &partition_mod.decideNative,
+            };
+            break :blk 2;
+        } else blk: {
+            capabilities_buf[0] = .{
+                .backend = target_kind,
+                .priority = 0,
+                .supports = backend_policy.supports(target_kind),
+                .decide = backend_policy.decide(target_kind),
+            };
+            break :blk 1;
+        };
+        const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(allocator, graph);
+        defer allocator.free(descriptor_seeds);
+        try partition_mod.seedAllUploadableResidency(descriptor_seeds, graph, target_kind, 0);
+        if (options.tensor_descs) |provided| {
+            if (provided.len != descriptor_seeds.len) return error.InvalidTensorDescriptorTable;
+            for (provided, descriptor_seeds) |desc, *seed| if (desc) |value| {
+                seed.* = value;
+            };
+        }
+
+        var diagnostics = partition_mod.CapabilityDiagnostics{};
+        var base = try partition_mod.partitionWithOptions(allocator, graph, capabilities_buf[0..capability_count], .{
+            .tensor_descs = descriptor_seeds,
+            .diagnostics = &diagnostics,
+            .region_costs = if (use_native_fallback and (target_kind == .metal or target_kind == .cuda)) options.region_costs else null,
+        });
+        errdefer base.deinit();
+        const checks = try allocator.alloc(PhysicalOutputLayout.Check, if (retain_output_policy) graph.nodeCount() else 0);
+        errdefer allocator.free(checks);
+        var output_layout = PhysicalOutputLayout{ .graph = graph, .backends = backends, .checks = checks };
+        var buffers = try buffer_plan_mod.build(allocator, graph, &base, .{ .output_layout = .{ .context = &output_layout, .resolve = &PhysicalOutputLayout.resolve } });
+        errdefer buffers.deinit();
+        try buffers.validate(graph, &base);
+        return .{ .allocator = allocator, .partition = base, .buffers = buffers, .output_policy = checks, .diagnostics = diagnostics, .target_kind = target_kind, .fallback = use_native_fallback };
+    }
+
+    pub fn validateCurrent(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend) !void {
+        if (self.output_policy.len != 0) for (backends) |backend| {
+            const functions = backend.vtable.kernels orelse return error.PhysicalOutputLayoutChanged;
+            if (!functions.accepts(backend.vtable)) return error.PhysicalOutputLayoutChanged;
+        };
+        if (backends.len != (if (self.fallback) @as(usize, 2) else 1) or backendKindForPartition(backends[0].kind()) != self.target_kind or (self.fallback and backends[1].kind() != .native)) return error.InvalidPhysicalBackendCount;
+        if (graphPartitionReportRequested()) {
+            if (graphPartitionReportTargetOverride()) |target| if (target != self.target_kind) try dumpPartitionReportForTarget(allocator, graph, target);
+            dumpPartitionReport(graph, &self.partition, self.target_kind, self.fallback, &self.diagnostics);
+        }
+        try enforceGraphRuntimePartitionGates(graph, &self.partition, self.target_kind, .{ .require_no_fallback = graphRuntimeRequireNoFallbackRequested(), .require_no_host_assisted = graphRuntimeRequireNoHostAssistedRequested() });
+        if (self.output_policy.len != 0) {
+            if (self.output_policy.len != graph.nodeCount()) return error.InvalidTensorDescriptorTable;
+            const policy = PhysicalOutputLayout{ .graph = graph, .backends = backends };
+            for (self.output_policy, 0..) |check, id| {
+                const current = PhysicalOutputLayout.resolveImpl(&policy, check.backend, @intCast(id), check.inferred);
+                if (!std.meta.eql(current, check.resolved)) return error.PhysicalOutputLayoutChanged;
+            }
+        }
+    }
+
+    /// Reuse layout only; actual provider eligibility/workspace/aliases and
+    /// literal/storage owners are resolved anew by the existing Pool factory.
+    pub fn createPool(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("../execution/physical_buffers.zig").Pool {
+        try self.validateCurrent(allocator, graph, backends);
+        var plan = try self.buffers.clone(allocator);
+        var transferred = false;
+        errdefer if (!transferred) plan.deinit();
+        const pool = (try @import("../execution/physical_buffers.zig").Pool.createWithDescriptors(allocator, graph, &plan, backends, self.partition.node_operator_plans, descriptors)) orelse {
+            plan.deinit();
+            return null;
+        };
+        pool.owns_plan = true;
+        transferred = true;
+        errdefer pool.deinit();
+        try pool.plan.validate(graph, &self.partition);
+        return pool;
+    }
+
+    pub fn deinit(self: *PhysicalLayout) void {
+        self.allocator.free(self.output_policy);
+        if (self.buffers_owned) self.buffers.deinit();
+        if (self.partition_owned) self.partition.deinit();
+    }
+};
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     strategy: Strategy,
@@ -496,68 +611,17 @@ pub const Runtime = struct {
         };
         self.mesh = try device_mesh_mod.DeviceMesh.init(self.allocator, devices_buf[0..device_count]);
 
-        var capabilities_buf: [2]partition_mod.Capability = undefined;
-        const capability_count: usize = if (use_native_fallback) blk: {
-            capabilities_buf[0] = .{
-                .backend = target_kind,
-                .priority = 10,
-                .supports = backend_policy.supports(target_kind),
-                .decide = backend_policy.decide(target_kind),
-            };
-            capabilities_buf[1] = .{
-                .backend = .native,
-                .priority = 0,
-                .supports = &partition_mod.supportsAll,
-                .decide = &partition_mod.decideNative,
-            };
-            break :blk 2;
-        } else blk: {
-            capabilities_buf[0] = .{
-                .backend = target_kind,
-                .priority = 0,
-                .supports = backend_policy.supports(target_kind),
-                .decide = backend_policy.decide(target_kind),
-            };
-            break :blk 1;
-        };
-        const report_target_override = graphPartitionReportTargetOverride();
-        if (graphPartitionReportRequested()) {
-            if (report_target_override) |report_target| {
-                if (report_target != target_kind) {
-                    try dumpPartitionReportForTarget(self.allocator, graph, report_target);
-                }
-            }
-        }
-
-        const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(self.allocator, graph);
-        defer self.allocator.free(descriptor_seeds);
-        try partition_mod.seedAllUploadableResidency(descriptor_seeds, graph, target_kind, 0);
-        if (options.tensor_descs) |provided| {
-            if (provided.len != descriptor_seeds.len) return error.InvalidTensorDescriptorTable;
-            for (provided, descriptor_seeds) |desc, *seed| if (desc) |value| {
-                seed.* = value;
-            };
-        }
-
-        var diagnostics = partition_mod.CapabilityDiagnostics{};
-        var base = try partition_mod.partitionWithOptions(self.allocator, graph, capabilities_buf[0..capability_count], .{
-            .tensor_descs = descriptor_seeds,
-            .diagnostics = &diagnostics,
-            .region_costs = if (use_native_fallback and (target_kind == .metal or target_kind == .cuda)) options.region_costs else null,
-        });
-        // Once self.plan takes ownership of base/assignments (below), plan.deinit
-        // (run via the Runtime.init errdefer) is the sole owner. Guard the local
-        // ownership errdefers with this flag so a failure in the compiled-executor
-        // attach after installation does not free base/assignments a second time.
+        var physical_backends: [2]*const ComputeBackend = undefined;
+        for (devices_buf[0..device_count], 0..) |device, i| physical_backends[i] = device.backend;
+        var layout = try PhysicalLayout.create(self.allocator, graph, physical_backends[0..device_count], options, false);
+        // Only pure placement/layout is shared. Runtime still attaches its own
+        // actual interpreter/compiled executors and owns their retirement.
+        defer layout.deinit();
+        try layout.validateCurrent(self.allocator, graph, physical_backends[0..device_count]);
+        var base = layout.partition;
         var plan_installed = false;
         errdefer if (!plan_installed) base.deinit();
-        if (graphPartitionReportRequested()) {
-            dumpPartitionReport(graph, &base, target_kind, use_native_fallback, &diagnostics);
-        }
-        try enforceGraphRuntimePartitionGates(graph, &base, target_kind, .{
-            .require_no_fallback = graphRuntimeRequireNoFallbackRequested(),
-            .require_no_host_assisted = graphRuntimeRequireNoHostAssistedRequested(),
-        });
+        layout.partition_owned = false;
 
         const assignments = try self.allocator.alloc(device_mesh_mod.DeviceId, base.partitions.len);
         errdefer if (!plan_installed) self.allocator.free(assignments);
@@ -573,12 +637,8 @@ pub const Runtime = struct {
         };
         plan_installed = true;
         try self.attachCompiledPartitionExecutors(graph, backend, target_kind);
-        var physical_backends: [2]*const ComputeBackend = undefined;
-        for (devices_buf[0..device_count], 0..) |device, i| physical_backends[i] = device.backend;
-        var output_layout = PhysicalOutputLayout{ .graph = graph, .backends = physical_backends[0..device_count] };
-        self.buffer_plan = try buffer_plan_mod.build(self.allocator, graph, &self.plan.?.base, .{
-            .output_layout = .{ .context = &output_layout, .resolve = &PhysicalOutputLayout.resolve },
-        });
+        self.buffer_plan = layout.buffers;
+        layout.buffers_owned = false;
         self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.createWithDescriptors(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans, options.kernel_descriptors);
         try self.buffer_plan.?.validate(graph, &self.plan.?.base);
     }
@@ -1378,8 +1438,17 @@ const PhysicalOutputLayout = struct {
     graph: *const Graph,
     backends: []const *const ComputeBackend,
 
+    checks: []Check = &.{},
+    const Check = struct { backend: BackendKind, inferred: contracts.TensorDesc, resolved: contracts.TensorDesc };
+
     fn resolve(ctx: *anyopaque, kind: BackendKind, id: NodeId, inferred: contracts.TensorDesc) contracts.TensorDesc {
-        const self: *const PhysicalOutputLayout = @ptrCast(@alignCast(ctx));
+        const self: *PhysicalOutputLayout = @ptrCast(@alignCast(ctx));
+        const result = resolveImpl(self, kind, id, inferred);
+        if (self.checks.len != 0) self.checks[id] = .{ .backend = kind, .inferred = inferred, .resolved = result };
+        return result;
+    }
+
+    fn resolveImpl(self: *const PhysicalOutputLayout, kind: BackendKind, id: NodeId, inferred: contracts.TensorDesc) contracts.TensorDesc {
         for (self.backends) |backend| {
             if (backend.kind() != kind) continue;
             const functions = backend.vtable.kernels orelse continue;
@@ -1511,4 +1580,58 @@ test "graph result retains actual Native output with durable header after execut
         try std.testing.expectEqualSlices(f32, &.{ 0, 2, 0, 4 }, actual);
         try std.testing.expectEqual(before, Run.callbacks);
     }
+}
+
+const PhysicalLayoutFixture = struct {
+    fn check(allocator: std.mem.Allocator) !void {
+        var context = try @import("../backends/compute_context.zig").BackendContext.init(allocator, .native, null);
+        defer context.deinit(allocator);
+        const backend = context.computeBackend();
+        var graph = Graph.init(allocator);
+        defer graph.deinit();
+        var builder = Builder.init(&graph);
+        const input = try builder.parameter("layout.x", Shape.init(.f32, &.{ 2, 4 }));
+        const partial = try builder.sliceLastDim(input, 1, 3);
+        try graph.markOutput(partial);
+        var layout = try PhysicalLayout.create(allocator, &graph, &.{&backend}, .{}, true);
+        var layout_live = true;
+        defer if (layout_live) layout.deinit();
+        for (layout.partition.partitions) |part| try std.testing.expect(part.executor == null);
+        try std.testing.expectEqual(graph.nodeCount(), layout.output_policy.len);
+        const planned = layout.buffers.slotForNode(partial).?;
+        try std.testing.expectEqual(buffer_plan_mod.SlotKind.allocation, planned.kind);
+        try std.testing.expectEqual(@as(u64, 16), layout.buffers.allocations[planned.allocation].byte_size);
+        const first = (try layout.createPool(allocator, &graph, &.{&backend}, null)) orelse return error.MissingPhysicalPool;
+        defer first.deinit();
+        const second = (try layout.createPool(allocator, &graph, &.{&backend}, null)) orelse return error.MissingPhysicalPool;
+        defer second.deinit();
+        try std.testing.expect(first.owns_plan and second.owns_plan);
+        try std.testing.expect(first.plan.slots.ptr != second.plan.slots.ptr and first.plan.slots.ptr != layout.buffers.slots.ptr);
+        try std.testing.expect(first.plan.allocations.ptr != second.plan.allocations.ptr and first.plan.allocations.ptr != layout.buffers.allocations.ptr);
+        try std.testing.expectEqualSlices(buffer_plan_mod.LogicalSlot, layout.buffers.slots, first.plan.slots);
+        // No inherited callback table can attest the cached materialization.
+        var copied = backend.vtable.*;
+        std.mem.doNotOptimizeAway(&copied);
+        try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(backend.vtable));
+        var foreign = backend;
+        foreign.vtable = &copied;
+        foreign.ptr = @ptrFromInt(16);
+        try std.testing.expectError(error.PhysicalOutputLayoutChanged, layout.validateCurrent(allocator, &graph, &.{&foreign}));
+        layout.deinit();
+        layout_live = false;
+        // Fresh roots own every copied plan/kernel fact. Their subsequent
+        // resource recipe must not read the destroyed layout's arrays.
+        _ = try first.storageRequirement();
+        _ = try second.storageRequirement();
+    }
+};
+
+test "pure physical layout gives fresh pools independent storage and rechecks actual output policy" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try PhysicalLayoutFixture.check(std.testing.allocator);
+}
+
+test "pure physical layout and fresh pool metadata unwind every allocation failure" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, PhysicalLayoutFixture.check, .{});
 }

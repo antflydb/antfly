@@ -238,8 +238,11 @@ preparation API do not by themselves complete these remaining requirements:
   Canonical KV owners prepare unpublished attachment, full prefill, generated-token page growth,
   shared-tail copies, window trimming, replay reservations and view metadata
   before committing either owner. The unchanged-ID path preserves the existing
-  table without allocation or a history copy. Grown host tables retain their
-  allocating owner through state teardown; generation admission declares their
+  table without allocation or a history copy. At reservation/page boundaries,
+  paired plans prove an unchanged combined ID prefix before copying only new
+  IDs; growth, COW, window trimming and unsynchronized views use full copies.
+  Grown host tables retain their allocating owner through state teardown;
+  generation admission declares their
   checked host footprint and both simultaneous plans' ID-array scratch
   separately from device scratch. Serial batches take
   the peak after request-state death; coordinated participants add their live
@@ -249,6 +252,12 @@ preparation API do not by themselves complete these remaining requirements:
   prepaid workspaces before applying explicit operator limits once. Opaque
   providers and incompatible state transitions retain compatibility ownership; host-table
   retention alone does not certify every device cancellation/drain endpoint.
+- Native decoder templates retain only backend-free placement, buffer layout and
+  output-policy facts. Graph runtime and decoder preparation use the same layout
+  builder; each decoder program creates fresh physical pools and revalidates the
+  current provider policy. It does not construct unused graph executors or a
+  device mesh. Escaping outputs retain their storage lease independently of the
+  program, graph and template lifetime.
 - `execution/speculative_activation.zig` owns predictor rounds, including draft
   chains, logits and accepted activation handoff. The physical decoder owns
   verification suffix geometry and pending tensor/scalar selection; task code

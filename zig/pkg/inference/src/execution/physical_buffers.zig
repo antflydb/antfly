@@ -933,25 +933,8 @@ pub const Pool = struct {
         }
     }
 
-    fn clonePlan(allocator: std.mem.Allocator, source: buffers.BufferPlan) !buffers.BufferPlan {
-        const slots = try allocator.dupe(buffers.LogicalSlot, source.slots);
-        errdefer allocator.free(slots);
-        const node_slots = try allocator.dupe(buffers.SlotId, source.node_slots);
-        errdefer allocator.free(node_slots);
-        const positions = try allocator.dupe(u32, source.node_positions);
-        errdefer allocator.free(positions);
-        const enabled = try allocator.dupe(bool, source.allocation_enabled);
-        errdefer allocator.free(enabled);
-        const allocations = try allocator.dupe(buffers.PhysicalAllocation, source.allocations);
-        errdefer allocator.free(allocations);
-        const transfers = try allocator.dupe(buffers.TransferEdge, source.transfers);
-        errdefer allocator.free(transfers);
-        const index = try source.transfer_index.clone(allocator);
-        return .{ .execution_reachable = source.execution_reachable, .allocation_enabled = enabled, .allocator = allocator, .slots = slots, .node_slots = node_slots, .node_positions = positions, .allocations = allocations, .transfers = transfers, .transfer_index = index };
-    }
-
     fn cloneVariant(self: *Pool) !*Pool {
-        var plan = try clonePlan(self.allocator, self.plan);
+        var plan = try self.plan.clone(self.allocator);
         errdefer plan.deinit();
         const selected = try self.allocator.dupe(?KernelPlan, self.kernels);
         errdefer self.allocator.free(selected);

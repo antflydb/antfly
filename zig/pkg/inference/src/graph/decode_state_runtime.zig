@@ -588,6 +588,17 @@ pub const NativeDecodeState = struct {
             state.kv_manager.?.copyLogicalBlocksWithReservationsInto(sequence, state.kv_block_ids.items);
             state.kv_block_ids_synchronized = true;
         }
+
+        /// Only the prepared owner can attest that the old combined sequence
+        /// remains a prefix. Never overwrite IDs visible to an older view.
+        fn copySuffixFrom(self: *@This(), sequence: runtime.kv.manager.SequenceId, prefix: usize) void {
+            const state = self.state;
+            std.debug.assert(self.replacement.capacity == 0 and state.kv_block_ids.items.len == prefix and prefix <= self.count);
+            state.kv_block_ids_synchronized = false;
+            state.kv_block_ids.items.len = self.count;
+            state.kv_manager.?.copyLogicalBlocksWithReservationsSuffixInto(sequence, prefix, state.kv_block_ids.items[prefix..]);
+            state.kv_block_ids_synchronized = true;
+        }
     };
 
     fn prepareKvView(self: *NativeDecodeState, count: usize) !PreparedKvView {
@@ -992,12 +1003,18 @@ pub const NativeDecodeState = struct {
         // Prepare growth without invalidating the still-published table.
         var prepared_view = try self.prepareKvView(block_count);
         defer prepared_view.deinit();
+        const prefix = manager_append.preservedCombinedPrefix();
+        const preserve_prefix = self.kv_block_ids_synchronized and prepared_view.replacement.capacity == 0 and
+            prefix != null and prefix.? == self.kv_block_ids.items.len and prefix.? <= block_count and
+            (if (storage_append) |*prepared| prepared.preservedCombinedPrefix() != null else true);
 
         // All remaining work is infallible under the canonical owners' prepared
         // contracts. The common KV lock/readback boundary remains held by caller.
         manager_append.commit();
         if (storage_append) |*prepared| prepared.commit();
-        if (!ids_unchanged) prepared_view.copyFrom(sequence);
+        if (!ids_unchanged) {
+            if (preserve_prefix) prepared_view.copySuffixFrom(sequence, prefix.?) else prepared_view.copyFrom(sequence);
+        }
         self.total_tokens = total;
         self.publishPagedKvViewForDecode();
         return true;
@@ -1827,7 +1844,9 @@ test "paired generated append host bound covers both simultaneous real plan spil
     tracked.peak = tracked.live;
     tracked.armed = true;
     defer tracked.armed = false;
+    runtime.kv.manager.TestingViewCopies.ids = 0;
     try state.appendGeneratedTokens(1);
+    try std.testing.expectEqual(state.kv_block_ids.items.len, runtime.kv.manager.TestingViewCopies.ids);
     tracked.armed = false;
     const retired_blocks = (prompt + 1 - 512) / 16;
     const actual_joint_peak = actual_view_bytes + 2 * retired_blocks * @sizeOf(runtime.kv.block.KvBlockId);
@@ -1955,4 +1974,108 @@ test "fresh paired prefill sequence mismatch leaves both unpublished endpoints r
     try std.testing.expect(manager.tokenCount(other_sequence) != null);
     try std.testing.expect(manager.tokenCount(other_sequence + 1) == null);
     try std.testing.expect(storage.tokenCount(1) == null);
+}
+
+test "long canonical generated append copies only new combined IDs and preserves held views across growth refusal" {
+    const a = std.testing.allocator;
+    const Id = runtime.kv.block.KvBlockId;
+    const copies = runtime.kv.manager.TestingViewCopies;
+    for ([_]bool{ false, true }) |paired| {
+        var state_alloc = std.testing.FailingAllocator.init(a, .{});
+        var manager = runtime.kv.manager.KvManager.init(a);
+        defer manager.deinit();
+        const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1, .store_cpu_bytes = false };
+        const pool = try manager.addPool(config);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+        defer storage.deinit();
+        var state = NativeDecodeState.initPaged(state_alloc.allocator(), &manager, pool, null);
+        state.kv_storage = if (paired) &storage else null;
+        defer state.deinit();
+        try state.notePrefill(24000);
+        const sequence = state.sequence_id.?;
+        try manager.reserveTokenCapacity(sequence, 24032);
+        // Independent physical owners may hold different reservation lengths.
+        if (paired) try storage.reserveTokenCapacity(sequence, 24048);
+        try state.syncPagedKvBlockTable();
+        state.publishPagedKvViewForDecode();
+        const held = state.kvView().?;
+        const snapshot = try a.dupe(Id, held.logical_blocks.?);
+        defer a.free(snapshot);
+        for ([_]usize{ 1, 16 }) |count| {
+            copies.ids = 0;
+            try state.appendGeneratedTokens(count);
+            try std.testing.expectEqual(@as(usize, 0), copies.ids);
+            try std.testing.expectEqual(held.logical_blocks.?.ptr, state.kv_block_ids.items.ptr);
+            try std.testing.expectEqualSlices(Id, snapshot, held.logical_blocks.?);
+            try std.testing.expectEqual(state.total_tokens, manager.tokenCount(sequence).?);
+            if (paired) try std.testing.expectEqual(state.total_tokens, storage.tokenCount(sequence).?);
+            try std.testing.expectEqual(state.total_tokens, state.kvView().?.token_count);
+            try std.testing.expect(state.kv_block_ids_synchronized);
+        }
+        copies.ids = 0;
+        try state.appendGeneratedTokens(16);
+        try std.testing.expectEqual(@as(usize, 1), copies.ids);
+        try std.testing.expectEqual(@as(usize, 1503), state.kv_block_ids.items.len);
+        const manager_row = try manager.sequenceMut(sequence);
+        try std.testing.expectEqualSlices(Id, manager_row.block_table.blocks.items, state.kv_block_ids.items);
+        try std.testing.expectEqualSlices(Id, snapshot, held.logical_blocks.?);
+
+        const before = state.kvView().?;
+        const before_ids = try a.dupe(Id, state.kv_block_ids.items);
+        defer a.free(before_ids);
+        const before_tokens = state.total_tokens;
+        const grow_count = (state.kv_block_ids.capacity + 1) * 16 - before_tokens;
+        // Both replacement payload and retirement-owner allocation can fail.
+        for (0..2) |failure_step| {
+            state_alloc.fail_index = state_alloc.alloc_index + failure_step;
+            copies.ids = 0;
+            try std.testing.expectError(error.OutOfMemory, state.appendGeneratedTokens(grow_count));
+            try std.testing.expectEqual(@as(usize, 0), copies.ids);
+            try std.testing.expectEqual(before_tokens, state.total_tokens);
+            try std.testing.expectEqual(before_tokens, manager.tokenCount(sequence).?);
+            if (paired) try std.testing.expectEqual(before_tokens, storage.tokenCount(sequence).?);
+            try std.testing.expectEqual(before.logical_blocks.?.ptr, state.kv_block_ids.items.ptr);
+            try std.testing.expectEqualSlices(Id, before_ids, state.kv_block_ids.items);
+            try std.testing.expectEqualSlices(Id, snapshot, held.logical_blocks.?);
+            try std.testing.expect(state.kv_block_ids_synchronized);
+        }
+        state_alloc.fail_index = std.math.maxInt(usize);
+        copies.ids = 0;
+        try state.appendGeneratedTokens(grow_count);
+        try std.testing.expectEqual(state.kv_block_ids.items.len, copies.ids);
+        try std.testing.expectEqual(@as(usize, 2049), copies.ids);
+        try std.testing.expectEqual(@as(usize, 1), state.retired_kv_block_ids.items.len);
+        try std.testing.expectEqual(before.logical_blocks.?.ptr, state.retired_kv_block_ids.items[0].items.ptr);
+        try std.testing.expectEqualSlices(Id, before_ids, before.logical_blocks.?);
+        try std.testing.expectEqualSlices(Id, snapshot, held.logical_blocks.?);
+        try std.testing.expectEqual(state.total_tokens, state.kvView().?.token_count);
+    }
+}
+
+test "generated append shared tail falls back to complete combined ID copy" {
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1 };
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.notePrefill(17);
+    const sequence = state.sequence_id.?;
+    const manager_pool = manager.getPool(pool).?;
+    const manager_tail = (try manager.sequenceMut(sequence)).block_table.last().?;
+    const storage_tail = (try storage.sequenceMut(sequence)).block_table.last().?;
+    try manager_pool.retain(manager_tail);
+    defer _ = manager_pool.releaseRef(a, manager_tail) catch unreachable;
+    try storage.storage.retain(storage_tail);
+    defer _ = storage.storage.releaseRef(a, storage_tail) catch unreachable;
+    runtime.kv.manager.TestingViewCopies.ids = 0;
+    try state.appendGeneratedToken();
+    try std.testing.expectEqual(state.kv_block_ids.items.len, runtime.kv.manager.TestingViewCopies.ids);
+    try std.testing.expect(manager_tail != (try manager.sequenceMut(sequence)).block_table.last().?);
+    try std.testing.expect(storage_tail != (try storage.sequenceMut(sequence)).block_table.last().?);
+    try std.testing.expectEqual(@as(usize, 18), state.kvView().?.token_count);
 }

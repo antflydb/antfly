@@ -20,6 +20,12 @@ const writable = @import("writable_blocks.zig");
 const pool_mod = @import("pool.zig");
 const storage_mod = @import("storage.zig");
 
+/// Test-only observation at the actual authoritative ID copy boundary.
+/// Thread-local counters do not couple independent test workers.
+pub const TestingViewCopies = if (@import("builtin").is_test) struct {
+    pub threadlocal var ids: usize = 0;
+} else struct {};
+
 pub const SequenceId = u32;
 
 pub const SequenceState = struct {
@@ -342,12 +348,23 @@ pub const KvManager = struct {
     /// Commit-only copy after exact destination sizing and paired KV commit.
     /// No allocator, provider callback or token publication occurs here.
     pub fn copyLogicalBlocksWithReservationsInto(self: *const KvManager, sequence_id: SequenceId, destination: []block.KvBlockId) void {
+        self.copyLogicalBlocksWithReservationsSuffixInto(sequence_id, 0, destination);
+    }
+
+    /// Exact suffix of the same authoritative logical-then-reserved sequence.
+    /// The prepared append proves any retained prefix; this method never infers
+    /// validity from pointers or counts alone.
+    pub fn copyLogicalBlocksWithReservationsSuffixInto(self: *const KvManager, sequence_id: SequenceId, start: usize, destination: []block.KvBlockId) void {
         const state = self.sequenceState(sequence_id) catch @panic("invalid prepared KV view owner");
         const logical = state.block_table.blocks.items;
         const reserved = state.reserved_tail_blocks.items;
-        std.debug.assert(destination.len == logical.len + reserved.len);
-        @memcpy(destination[0..logical.len], logical);
-        @memcpy(destination[logical.len..], reserved);
+        const total = logical.len + reserved.len;
+        std.debug.assert(start <= total and destination.len == total - start);
+        const logical_start = @min(start, logical.len);
+        const logical_suffix = logical[logical_start..];
+        @memcpy(destination[0..logical_suffix.len], logical_suffix);
+        @memcpy(destination[logical_suffix.len..], reserved[start - logical_start ..]);
+        if (@import("builtin").is_test) TestingViewCopies.ids += destination.len;
     }
 
     pub fn appendTokens(self: *KvManager, sequence_id: SequenceId, count: u16) !void {

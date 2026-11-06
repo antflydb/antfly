@@ -170,6 +170,23 @@ pub const BufferPlan = struct {
         self.transfer_index.deinit(self.allocator);
     }
 
+    pub fn clone(source: BufferPlan, allocator: std.mem.Allocator) !BufferPlan {
+        const slots = try allocator.dupe(LogicalSlot, source.slots);
+        errdefer allocator.free(slots);
+        const node_slots = try allocator.dupe(SlotId, source.node_slots);
+        errdefer allocator.free(node_slots);
+        const positions = try allocator.dupe(u32, source.node_positions);
+        errdefer allocator.free(positions);
+        const enabled = try allocator.dupe(bool, source.allocation_enabled);
+        errdefer allocator.free(enabled);
+        const allocations = try allocator.dupe(PhysicalAllocation, source.allocations);
+        errdefer allocator.free(allocations);
+        const transfers = try allocator.dupe(TransferEdge, source.transfers);
+        errdefer allocator.free(transfers);
+        const index = try source.transfer_index.clone(allocator);
+        return .{ .execution_reachable = source.execution_reachable, .allocation_enabled = enabled, .allocator = allocator, .slots = slots, .node_slots = node_slots, .node_positions = positions, .allocations = allocations, .transfers = transfers, .transfer_index = index };
+    }
+
     /// One scratch region per backend/frame is sufficient for sequential
     /// command submission. Its lifetime spans the executable's entire graph.
     pub fn addWorkspace(self: *BufferPlan, backend: BackendKind, bytes: usize, alignment: u32) !AllocationId {

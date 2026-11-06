@@ -189,6 +189,17 @@ pub const PreparedAppend = struct {
     pub fn idsChanged(self: *const @This()) bool {
         return self.append_pages != 0 or self.drop_pages != 0 or self.cow != null or self.future_reserved != self.old_reserved;
     }
+    /// Existing logical IDs followed by reservations keep their exact order
+    /// when a unique append only consumes their boundary and appends new IDs.
+    /// This is stronger than idsChanged: that method also tracks the boundary.
+    pub fn preservedCombinedPrefix(self: *const @This()) ?usize {
+        if (self.cow != null or self.drop_pages != 0 or self.recycle_count != 0 or self.recycle_cow) return null;
+        const prefix = std.math.add(usize, self.old_blocks, self.old_reserved) catch return null;
+        const logical = std.math.add(usize, self.old_blocks, self.append_pages) catch return null;
+        const future = std.math.add(usize, logical, self.future_reserved) catch return null;
+        const appended = std.math.add(usize, prefix, self.acquired) catch return null;
+        return if (future == appended) prefix else null;
+    }
     pub fn futureLogicalBlockCount(self: *const @This()) usize {
         return self.old_blocks + self.append_pages - self.drop_pages;
     }
@@ -654,6 +665,7 @@ test "prepared KV append keeps shared tail reservations and window unpublished u
             try std.testing.expectEqual(@as(u32, 2), storage.blockInfo(source).?.refcount);
             var plan = try prepareAppend(&storage, &table, &reserved, a, 4, 8, 3, 1, true, null);
             defer plan.abort();
+            try std.testing.expectEqual(@as(?usize, null), plan.preservedCombinedPrefix());
             plan.commit();
             plan.abort(); // transferred ownership is never retired twice
             try std.testing.expectEqual(@as(usize, 3), table.tokenCount(2));
@@ -761,6 +773,7 @@ test "prepared KV window recycles unique old fronts only at commit without extra
     var plan = try prepareAppend(&storage, &table, &reserved, failing.allocator(), 2, 8, 4, 1, true, null);
     defer plan.abort();
     try std.testing.expect(plan.idsChanged());
+    try std.testing.expectEqual(@as(?usize, null), plan.preservedCombinedPrefix());
     try std.testing.expectEqual(@as(usize, 2), plan.futureLogicalBlockCount());
     try std.testing.expectEqual(@as(usize, 2), plan.futureReservedBlockCount());
     try std.testing.expectEqual(@as(usize, 6), table.tokenCount(2));
