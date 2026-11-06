@@ -409,10 +409,13 @@ def _task_server(api_key: str, enforce: bool):
 
 
 # Families that must reach the shared endpoint from background enrichment
-# (storage-owned). Generator producers are covered by unit tests: a remote
-# generator producer currently aborts the server after its first response
-# (reproduces on main with an explicit generator url), independent of auth.
-BACKGROUND_TASKS = {"chunk", "read", "extract", "transcribe"}
+# (storage-owned): model chunking and document-extraction OCR. Generator,
+# extractor, transcriber and standalone reader producers are covered by unit
+# tests only: against this stand-in a remote generator or transcriber producer
+# aborts the server after its first response, and Antfly extractor and reader
+# producers send no request; these reproduce on main with an explicit
+# producer url, independent of credentials.
+BACKGROUND_TASKS = {"chunk", "read"}
 
 
 @pytest.mark.parametrize("storage_engine", ["local", "lite"])
@@ -463,25 +466,30 @@ def test_default_inference_api_key_reaches_remote_tasks_only_at_default_endpoint
             timeout=60,
         )
         assert created.status_code == 200, created.text
-        producers = {
-            "ocr": ("img", {"type": "reader", "config": {"provider": "antfly", "model": TASK_MODELS["readers"]}}),
-            "entities": ("text", {"type": "extractor", "config": {"provider": "antfly", "model": TASK_MODELS["extractors"], "entity_definitions": {"person": "A person"}}}),
-            "speech": ("audio", {"type": "transcriber", "config": {"provider": "antfly", "model": TASK_MODELS["transcribers"]}}),
+        # Document extraction with OCR: the reader inherits the default
+        # endpoint and must inherit its credential.
+        extraction = {
+            "type": "document_extraction",
+            "config": {
+                "source": {"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"},
+                "ocr": {"mode": "always", "reader": {"provider": "antfly", "model": TASK_MODELS["readers"]}},
+            },
         }
-        for name, (field, producer) in producers.items():
-            response = requests.put(
-                f"{api_url}/tables/{table}/artifacts/{name}/enrichment",
-                json={"kind": "asset", "field": field, "content_type": "text/plain", "producer": producer},
-                timeout=30,
-            )
-            assert response.status_code in (200, 201), response.text
+        response = requests.put(
+            f"{api_url}/tables/{table}/artifacts/document_units/enrichment",
+            json={"kind": "asset", "field": "img", "content_type": "application/json", "producer_json": json.dumps(extraction)},
+            timeout=30,
+        )
+        assert response.status_code in (200, 201), response.text
 
         def insert(start: int) -> None:
             rows = {
                 f"doc{n}": {
                     "text": f"Ada Lovelace wrote shared inference row {n}",
                     "img": _data_uri("image/jpeg", "testdata/image/jpeg/baseline/white-2x1.jpg"),
-                    "audio": _data_uri("audio/wav", "lib/audio/testdata/tone.wav"),
+                    "filename": f"page{n}.jpg",
+                    "mime_type": "image/jpeg",
+                    "version": "1",
                 }
                 for n in range(start, start + 2)
             }
