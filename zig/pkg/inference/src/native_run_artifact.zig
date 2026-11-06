@@ -224,6 +224,10 @@ const ArtifactContext = struct {
     policy: ?model_manager_mod.ModelLoadPolicy,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, policy: ?model_manager_mod.ModelLoadPolicy) !@This() {
+        // Keep metadata and tokenizer preparation in the same publication.
+        // Later session construction revalidates this retained manifest.
+        var publication_lease = try @import("registry/publication_lease.zig").Lease.shared(allocator, io, model_dir);
+        defer publication_lease.deinit(io);
         var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
         errdefer manifest.deinit();
         if (policy) |configured| if (configured.preflight) |preflight| {

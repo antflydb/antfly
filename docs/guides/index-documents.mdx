@@ -62,6 +62,16 @@ antfly inference pull lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671b
 
 The 4B checkpoint, `lightonai/LightOnOCR-3-4B`, is more accurate on dense or degraded pages and needs about 9 GB instead of 1.7 GB.
 
+The pull reference pins the installed weights. Requests use a selector advertised
+by \`GET /ai/v1/models\`: the bare repository name below selects the sole installed
+artifact (or the configured default). Discovery also advertises variant-qualified
+and immutable revision selectors for managed installations. Use the advertised
+immutable selector when the enrichment must keep using that exact artifact;
+unknown revisions fail instead of silently selecting another checkpoint.
+Manually copied models without managed installation receipts retain their literal
+local identifiers. Pull the artifact through the registry before requesting a
+verified format or revision; a directory name alone does not prove those pins.
+
 ### 2. Create the Table
 
 ```bash
