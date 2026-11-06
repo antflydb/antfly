@@ -1984,14 +1984,23 @@ structure-presence marker, carry no payload range, and cannot be decoded.
 Dictionary order does not affect classification: unused fields are skipped,
 while allocating Form-only fields stay as source offsets until classification
 is complete, including an optional late Subtype2 PS. Form resource dictionaries
-are traversed once into at most five required fields; compound resource tables
-retain source views. Opaque entries and intervening comments are consumed in
-that pass; later lookups address the required field spans. Resource tables are
-resolved only when their names are used by the content. Scalar references are
-parsed once. Source views preserve their owning
-object's identity so encrypted nested properties are decrypted exactly once.
+are traversed once into at most five required fields. Required resource tables
+index names and scalar references in that pass, retaining source spans for
+compound entries. Unused inline font, XObject, graphics-state and color-space
+definitions are never materialized; their payloads and intervening comments
+are scanned once. Indirect tables use the same projection when selected.
+Properties retain their separate optional-metadata limits and lazy lookup.
+Collectors resolve entries only after determining which names the content uses.
+Source views preserve their owning object's identity so encrypted nested values
+are decrypted exactly once, including values inside compressed object streams.
 PDF Forms continue through ordinary length validation and decoding without
 reparsing the whole header.
+
+Annotation coverage inspects normal-appearance headers (including named states)
+without resolving payload lengths. Rendering resolves and validates the actual
+appearance stream. Tagged-text metadata resolution likewise returns header-only
+stream views for StructParents lookup. These probes cannot consume decoder
+allowances merely because a stream length lives in a large object stream.
 
 ICC color-space probes use a projected header containing only N, Alternate, and
 Range. Native classification, component counts, shading, mask ranges, and image

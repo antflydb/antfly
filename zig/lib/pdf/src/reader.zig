@@ -5249,7 +5249,7 @@ const StructureResolverContext = struct {
     }
     fn resolve(raw: *const anyopaque, alloc: Allocator, value: *const syntax.Object) anyerror!syntax.Object {
         const self: *const @This() = @ptrCast(@alignCast(raw));
-        return self.resolveProjected(alloc, value, .full);
+        return self.resolveProjected(alloc, value, .structure_metadata);
     }
     fn resolveProjected(self: *const @This(), alloc: Allocator, value: *const syntax.Object, projection: syntax.Projection) anyerror!syntax.Object {
         var reader = self.reader.*;
@@ -6002,12 +6002,18 @@ pub const Reader = struct {
         }
     };
     fn annotationValue(self: *Reader, object: *const syntax.Object) !AnnotationValue {
+        return self.annotationValueProjected(object, .full);
+    }
+    fn annotationValueProjected(self: *Reader, object: *const syntax.Object, projection: syntax.Projection) !AnnotationValue {
         var result = AnnotationValue{ .value = object.* };
         errdefer result.deinit(self.alloc);
         for (0..32) |_| {
-            if (result.value != .obj_ref) return result;
+            if (result.value != .obj_ref and result.value != .deferred) return result;
             try self.checkCancellation();
-            const next = try self.readIndirectObject(result.value.obj_ref);
+            const next = if (result.value == .obj_ref)
+                try self.readIndirectObjectProjected(result.value.obj_ref, projection)
+            else
+                try self.readDeferredObjectProjected(result.value.deferred, projection);
             result.deinit(self.alloc);
             result = .{ .value = next, .owned = true };
         }
@@ -6099,7 +6105,7 @@ pub const Reader = struct {
 
     /// Resolve only static normal appearances. No actions, scripts, rollover
     /// state or viewer-generated painting are executed by this path.
-    fn staticAppearance(self: *Reader, annotation: *const syntax.Object) !?StaticAppearance {
+    fn staticAppearance(self: *Reader, annotation: *const syntax.Object, metadata_only: bool) !?StaticAppearance {
         if (annotation.get("OC") != null) return null; // Optional-content visibility needs its own policy.
         if (annotation.get("CA")) |alpha| if (try self.annotationNumber(alpha) != 1) return null;
         if (annotation.get("BM")) |blend| {
@@ -6123,20 +6129,21 @@ pub const Reader = struct {
         var ap = try self.annotationValue(annotation.get("AP") orelse return null);
         defer ap.deinit(self.alloc);
         if (ap.value != .dict) return null;
-        var normal = try self.annotationValue(ap.value.get("N") orelse return null);
+        const projection: syntax.Projection = if (metadata_only) .appearance_header else .full;
+        var normal = try self.annotationValueProjected(ap.value.get("N") orelse return null, projection);
         defer normal.deinit(self.alloc);
         if (normal.value == .dict) {
             var state = try self.annotationValue(annotation.get("AS") orelse return null);
             defer state.deinit(self.alloc);
             if (state.value != .name) return error.InvalidPdfAnnotations;
             const selected = normal.value.get(state.value.name) orelse return null;
-            var resolved = try self.annotationValue(selected);
+            var resolved = try self.annotationValueProjected(selected, projection);
             defer resolved.deinit(self.alloc);
             const owned = try resolved.value.clone(self.alloc);
             normal.deinit(self.alloc);
             normal = .{ .value = owned, .owned = true };
         }
-        if (normal.value != .stream) return null;
+        if (normal.value != .stream and !(metadata_only and normal.value == .stream_header)) return null;
         const subtype = normal.value.get("Subtype") orelse return null;
         if (!std.mem.eql(u8, subtype.asName() orelse return null, "Form")) return null;
         var bounds = try self.annotationValue(normal.value.get("BBox") orelse return null);
@@ -6163,6 +6170,7 @@ pub const Reader = struct {
             transformed[3] = @max(transformed[3], y);
         }
         if (transformed[0] >= transformed[2] or transformed[1] >= transformed[3]) return error.InvalidPdfAnnotations;
+        if (metadata_only) return .{ .stream = .null, .rect = normalized, .bounds = transformed };
         var stream = try normal.value.clone(self.alloc);
         errdefer stream.deinit(self.alloc);
         try self.setRenderNumericArray(&stream, "BBox", &b);
@@ -6186,7 +6194,7 @@ pub const Reader = struct {
             var annotation = try self.annotationValue(raw);
             defer annotation.deinit(self.alloc);
             if (!try self.annotationIsVisible(&annotation.value)) continue;
-            var appearance = (try self.staticAppearance(&annotation.value)) orelse return true;
+            var appearance = (try self.staticAppearance(&annotation.value, true)) orelse return true;
             appearance.deinit(self.alloc);
         }
         return false;
@@ -6235,7 +6243,7 @@ pub const Reader = struct {
             var annotation = try self.annotationValue(raw);
             defer annotation.deinit(self.alloc);
             if (!try self.annotationIsVisible(&annotation.value)) continue;
-            var appearance = (try self.staticAppearance(&annotation.value)) orelse return error.UnsupportedPdfAnnotationRendering;
+            var appearance = (try self.staticAppearance(&annotation.value, false)) orelse return error.UnsupportedPdfAnnotationRendering;
             defer appearance.deinit(self.alloc);
             var name_buffer: [64]u8 = undefined;
             const name = while (true) : (id += 1) {
@@ -7520,6 +7528,17 @@ pub const Reader = struct {
                 }
                 break :blk value;
             },
+            else => try obj.clone(self.alloc),
+        };
+    }
+
+    // Tables retain names and references, with source spans for compound values.
+    // Collectors select entries before resolving them; unused definitions are
+    // scanned once and never allocated, even in indirect/compressed tables.
+    fn resourceTable(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
+        return switch (obj.*) {
+            .obj_ref => |ptr| try self.readIndirectObjectProjected(ptr, .resource_table),
+            .deferred => |location| try self.readDeferredObjectProjected(location, .resource_table),
             else => try obj.clone(self.alloc),
         };
     }
@@ -9031,7 +9050,7 @@ pub const Reader = struct {
         if (references.names.count() == 0) return try self.alloc.alloc(PageColorSpace, 0);
 
         const color_spaces_obj = resources.get("ColorSpace") orelse return try self.alloc.alloc(PageColorSpace, 0);
-        var resolved_color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
+        var resolved_color_spaces = self.resourceTable(color_spaces_obj) catch |err| switch (err) {
             error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
             else => return try self.alloc.alloc(PageColorSpace, 0),
         };
@@ -9224,7 +9243,7 @@ pub const Reader = struct {
         var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageFont, 0);
-        var resolved_fonts = try self.resolveValue(fonts_obj);
+        var resolved_fonts = try self.resourceTable(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
 
@@ -9279,7 +9298,7 @@ pub const Reader = struct {
         var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageFont, 0);
-        var resolved_fonts = try self.resolveValue(fonts_obj);
+        var resolved_fonts = try self.resourceTable(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
 
@@ -9313,7 +9332,7 @@ pub const Reader = struct {
     ) !bool {
         const value = image.get("ColorSpace") orelse return false;
         const color_spaces_obj = resources.get("ColorSpace") orelse return false;
-        var color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
+        var color_spaces = self.resourceTable(color_spaces_obj) catch |err| switch (err) {
             error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
             else => return false,
         };
@@ -9435,7 +9454,7 @@ pub const Reader = struct {
     fn resolveImageColorSpaceForDecodeRawAlloc(self: *const Reader, value: *const syntax.Object) anyerror!syntax.Object {
         const resources = self.image_color_space_resources orelse return try self.resolveValue(value);
         const color_spaces_obj = resources.get("ColorSpace") orelse return try self.resolveValue(value);
-        var color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
+        var color_spaces = self.resourceTable(color_spaces_obj) catch |err| switch (err) {
             error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
             else => return try self.resolveValue(value),
         };
@@ -9446,7 +9465,7 @@ pub const Reader = struct {
 
     fn collectImagesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageImage {
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageImage, 0);
-        var resolved_xobjects = try self.resolveValue(xobject_obj);
+        var resolved_xobjects = try self.resourceTable(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageImage, 0);
         var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"Do"}, self.cancellation);
@@ -9586,7 +9605,7 @@ pub const Reader = struct {
         var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"gs"}, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageExtGState, 0);
-        var resolved_ext = try self.resolveValue(ext_obj);
+        var resolved_ext = try self.resourceTable(ext_obj);
         defer resolved_ext.deinit(self.alloc);
         if (resolved_ext != .dict) return try self.alloc.alloc(PageExtGState, 0);
 
@@ -9924,7 +9943,7 @@ pub const Reader = struct {
     fn collectFormsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8, exclude_type3_fonts: bool) anyerror![]PageForm {
         if (depth > 1) return try self.alloc.alloc(PageForm, 0);
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageForm, 0);
-        var resolved_xobjects = try self.resolveValue(xobject_obj);
+        var resolved_xobjects = try self.resourceTable(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
         var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
@@ -10066,6 +10085,7 @@ pub const Reader = struct {
         // Images and ignored XObjects stop at their header.
         return switch (raw.*) {
             .obj_ref => |reference| try self.readIndirectObjectProjected(reference, .text_xobject),
+            .deferred => |location| try self.readDeferredObjectProjected(location, .text_xobject),
             else => try raw.clone(self.alloc),
         };
     }
@@ -10083,7 +10103,7 @@ pub const Reader = struct {
         var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageForm, 0);
-        var resolved_xobjects = try self.resolveValue(xobject_obj);
+        var resolved_xobjects = try self.resourceTable(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
 
@@ -37191,6 +37211,7 @@ const ObjectStreamFixture = struct {
     content_length_reference: ?usize = null,
     object_stream_type: []const u8 = "ObjStm",
     resources: []const u8 = "7 0 R",
+    page_fields: []const u8 = "",
 };
 
 fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]u8 {
@@ -37227,7 +37248,7 @@ fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]
     defer a.free(paint);
     const stream = try std.fmt.allocPrint(a, "<< /Type /{s} /N {d} /First {d} {s}/Length {s} >>\nstream\n{s}\nendstream", .{ fixture.object_stream_type, objects.len, header_bytes.len, if (fixture.flate) "/Filter /FlateDecode " else "", length, encoded });
     defer a.free(stream);
-    const page = try std.fmt.allocPrint(a, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources {s} /Contents 4 0 R >>", .{fixture.resources});
+    const page = try std.fmt.allocPrint(a, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources {s} /Contents 4 0 R {s} >>", .{ fixture.resources, fixture.page_fields });
     defer a.free(page);
     const fixed = [_][]const u8{
         "<< /Type /Catalog /Pages 2 0 R >>",
@@ -38698,5 +38719,149 @@ test "reader native Form resource views retain only needed metadata and resolve 
             try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
         }
         try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseFormResourceViewOwnership, .{sample});
+    }
+}
+
+// The same appearance can be probed many times without decoding its indirect
+// length container. Rendering must still resolve and validate that payload.
+test "reader annotation coverage ignores appearance payload lengths" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const opaque_object = try std.fmt.allocPrint(a, "null %{s}\n", .{padding});
+    defer a.free(opaque_object);
+    for ([_][]const u8{ "7 0 R", "99 0 R", "-1" }) |length| {
+        const appearance = try std.fmt.allocPrint(a, "<< /Subtype /Form /StructParents 1 /BBox [0 0 10 10] /Resources << /Unused ({s}) >> /Length {s} >>\nstream\nq Q\nendstream", .{ padding, length });
+        defer a.free(appearance);
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{ "3", opaque_object },
+            .extra = &.{appearance},
+            .resources = "<< /Font << /F1 5 0 R >> >>",
+            .page_fields = "/Annots [<< /Subtype /Stamp /F 4 /Rect [0 0 10 10] /AP << /N 9 0 R >> >> << /Subtype /Stamp /F 4 /Rect [0 0 10 10] /AS /On /AP << /N << /On 9 0 R >> >> >>]",
+            .content = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET",
+        });
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            try std.testing.expectEqualStrings("Hello\n", analysis.text);
+            try std.testing.expect(!analysis.has_unrendered_annotations);
+        }
+        try std.testing.expectEqual(@as(usize, 0), reader.encrypted_streams.count());
+        try std.testing.expectError(if (std.mem.eql(u8, length, "7 0 R")) error.PdfDecodeWorkingSetTooLarge else if (std.mem.eql(u8, length, "99 0 R")) error.ObjectNotFound else error.InvalidStreamLength, reader.extractPageRenderRunsAlloc(1));
+        var budget = DecodeBudgetAllocator.init(a, 0, 8192);
+        const context = StructureResolverContext{ .reader = &reader, .budget = &budget };
+        const raw = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+        var header = try StructureResolverContext.resolve(&context, budget.allocator(), &raw);
+        defer header.deinit(budget.allocator());
+        try std.testing.expect(header == .stream_header);
+        try std.testing.expectEqual(@as(i64, 1), header.get("StructParents").?.integer);
+        try std.testing.expectError(error.NotAStream, reader.readRawStreamData(&header));
+    }
+}
+
+fn exerciseResourceTableViews(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var form = try reader.textXObject(&reference);
+    defer form.deinit(a);
+    const resources = form.get("Resources").?;
+    for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace" }) |name| {
+        var table = try reader.resourceTable(resources.get(name).?);
+        defer table.deinit(a);
+        const unused = table.get("Unused").?;
+        try std.testing.expect(unused.* == .deferred);
+        try std.testing.expectEqual(@as(u32, 9), unused.deferred.reference.id);
+    }
+    const fonts = try reader.collectFontsFromResourcesAlloc(resources, "BT /F1 10 Tf (Hello) Tj ET");
+    defer {
+        for (fonts) |*font| font.deinit(a);
+        a.free(fonts);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fonts.len);
+}
+
+test "reader resource tables skip unused inline definitions in one bounded scan" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const content = "BT /F1 10 Tf (Hello) Tj ET";
+    const form = try std.fmt.allocPrint(a, "<< /Subtype /Form /Resources << /Font << /F1 5 0 R %{s}\n /Unused << /Private ({s}) >> >> /XObject << /Unused << /Private ({s}) >> >> /ExtGState << /Unused << /Private ({s}) >> >> /ColorSpace << /Unused [/Private ({s})] >> >> /Length {d} >>\nstream\n{s}\nendstream", .{ padding, padding, padding, padding, padding, content.len, content });
+    defer a.free(form);
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ "null", "null" }, .extra = &.{form}, .resources = "<< /XObject << /Fm 9 0 R >> >>", .content = "/Fm Do" });
+    defer a.free(sample);
+    var budget = DecodeBudgetAllocator.init(a, 0, 512 * 1024);
+    // One scan of the large values plus small dictionary/lexical overhead.
+    var scan = syntax.ScanControl{ .remaining_work = form.len * 2 + 16384 };
+    var reader = try Reader.init(budget.allocator(), sample);
+    defer reader.deinit();
+    reader.metadata_scan = &scan;
+    try exerciseResourceTableViews(budget.allocator(), sample);
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var view = try reader.textXObject(&reference);
+    defer view.deinit(budget.allocator());
+    const fonts = try reader.collectFontsFromResourcesAlloc(view.get("Resources").?, content);
+    defer {
+        for (fonts) |*font| font.deinit(budget.allocator());
+        budget.allocator().free(fonts);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fonts.len);
+    try std.testing.expect(scan.remaining_work > 0);
+    try std.testing.expect(!budget.limit_exceeded);
+    reader.metadata_scan = null;
+    const text = try reader.extractPlainTextAlloc();
+    defer budget.allocator().free(text);
+    try std.testing.expectEqualStrings("Hello\n", text);
+    // Exercise ownership and failure cleanup with the same shape at small size.
+    const small = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ "null", "null" }, .extra = &.{"<< /Subtype /Form /Resources << /Font << /F1 5 0 R /Unused << /Private (ignored) >> >> /XObject << /Unused << >> >> /ExtGState << /Unused << >> >> /ColorSpace << /Unused [/Private] >> >> /Length 0 >>\nstream\n\nendstream"} });
+    defer a.free(small);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseResourceTableViews, .{small});
+}
+
+fn exerciseEncryptedResourceTable(a: Allocator, sample: []const u8, compressed: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    const ref = syntax.ObjRef{ .id = if (compressed) 7 else 9, .gen = 0 };
+    var resources = try reader.readIndirectObjectProjected(ref, .required_resources);
+    defer resources.deinit(a);
+    var table = try reader.resourceTable(resources.get("Font").?);
+    defer table.deinit(a);
+    const selected = table.get("F1").?;
+    try std.testing.expect(selected.* == .deferred);
+    try std.testing.expectEqual(ref.id, selected.deferred.reference.id);
+    var font = try reader.resolveValue(selected);
+    defer font.deinit(a);
+    try std.testing.expectEqualStrings("Label", font.get("Private").?.string);
+}
+
+test "reader resource entry views decrypt selected strings exactly once" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |compressed| {
+        var label = "Label".*;
+        const file_key: [16]u8 = @splat(3);
+        if (!compressed) {
+            const key = objectEncryptionKey(file_key, 5, .{ .id = 9, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], &label);
+        }
+        const resources = try std.fmt.allocPrint(a, "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Private <{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}> >> /Unused << /Private (ignored) >> >> >>", .{ label[0], label[1], label[2], label[3], label[4] });
+        defer a.free(resources);
+        const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ if (compressed) resources else "null", "null" }, .extra = &.{resources}, .flate = false });
+        defer a.free(sample);
+        if (compressed) {
+            var reader = try Reader.init(a, sample);
+            defer reader.deinit();
+            var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+            defer stream.deinit(a);
+            const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedResourceTable, .{ sample, compressed });
     }
 }

@@ -234,6 +234,9 @@ pub const Projection = enum {
     text_xobject,
     xobject_header,
     color_profile_header,
+    appearance_header,
+    structure_metadata,
+    resource_table,
     resource_fields,
     name,
     resources,
@@ -251,6 +254,19 @@ pub const Projection = enum {
     fn field(self: Projection, key: []const u8) Field {
         return switch (self) {
             .full => .{ .keep = true },
+            .structure_metadata => blk: {
+                // Structure nodes, number trees, and content-container headers
+                // share this resolver. Payload-related dictionaries are never
+                // needed, even when a referenced container is a PDF Form.
+                for ([_][]const u8{ "Type", "ParentTree", "K", "Kids", "Limits", "Nums", "P", "Pg", "S", "Stm", "MCID", "ActualText", "StructParents" }) |name| {
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true, .child = .structure_metadata };
+                }
+                break :blk .{ .keep = false };
+            },
+            // Normal appearances can also be state dictionaries. Preserve their
+            // names/references while leaving unrelated compound fields as views.
+            .appearance_header => if (std.mem.eql(u8, key, "Subtype") or std.mem.eql(u8, key, "BBox") or std.mem.eql(u8, key, "Matrix")) .{ .keep = true } else .{ .keep = true, .view = true },
+            .resource_table => .{ .keep = true, .view = true },
             .text_xobject => blk: {
                 if (std.mem.eql(u8, key, "Subtype") or std.mem.eql(u8, key, "Subtype2") or std.mem.eql(u8, key, "Type")) break :blk .{ .keep = true, .child = .name };
                 if (std.mem.eql(u8, key, "StructParent")) break :blk .{ .keep = true, .skip = true };
@@ -265,14 +281,14 @@ pub const Projection = enum {
             .color_profile_header => if (std.mem.eql(u8, key, "N")) .{ .keep = true, .child = .integer } else .{ .keep = std.mem.eql(u8, key, "Alternate") or std.mem.eql(u8, key, "Range") },
             .resource_fields => blk: {
                 for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace", "Properties" }) |name| {
-                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true, .view = true };
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true, .view = std.mem.eql(u8, key, "Properties"), .child = .resource_table };
                 }
                 break :blk .{ .keep = false };
             },
             .resources, .required_resources => blk: {
                 if (std.mem.eql(u8, key, "Properties")) break :blk .{ .keep = true, .skip = self == .required_resources, .child = .property_table };
                 for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace" }) |name| {
-                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true };
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true, .child = .resource_table };
                 }
                 break :blk .{ .keep = false };
             },
@@ -362,7 +378,7 @@ pub const Scanner = struct {
                 const compound = first == '[' or (first == '<' and self.pos + 1 < self.bytes.len and self.bytes[self.pos + 1] == '<');
                 const string = first == '(' or (first == '<' and !compound);
                 const reject = switch (projection) {
-                    .full => false,
+                    .full, .structure_metadata => false,
                     .integer => compound or string or first == '/',
                     .text => compound or first == '/',
                     .name => compound or string,
@@ -404,7 +420,7 @@ pub const Scanner = struct {
                                 self.alloc.destroy(boxed);
                             }
                             const prior_source_ref = self.source_ref;
-                            if (projection == .text_xobject and self.source_ref == null)
+                            if ((projection == .text_xobject or projection == .resource_table or projection == .resource_fields) and self.source_ref == null)
                                 self.source_ref = .{ .id = @intCast(value), .gen = @intCast(tok2.integer) };
                             defer self.source_ref = prior_source_ref;
                             boxed.* = try self.readObjectProjected(projection);
@@ -444,7 +460,7 @@ pub const Scanner = struct {
             },
             .keyword => |kw| {
                 if (std.mem.eql(u8, kw, "null")) return .null;
-                if (std.mem.eql(u8, kw, "[")) return try self.readArray();
+                if (std.mem.eql(u8, kw, "[")) return try self.readArray(if (projection == .structure_metadata) .structure_metadata else .full);
                 if (std.mem.eql(u8, kw, "<<")) return try self.readDictOrStream(projection);
                 return error.UnexpectedKeyword;
             },
@@ -463,7 +479,7 @@ pub const Scanner = struct {
         tok.deinit(alloc);
     }
 
-    fn readArray(self: *Scanner) anyerror!Object {
+    fn readArray(self: *Scanner, projection: Projection) anyerror!Object {
         var items = std.ArrayList(Object).empty;
         defer items.deinit(self.alloc);
         errdefer {
@@ -476,7 +492,7 @@ pub const Scanner = struct {
             if (tok == .eof) return error.UnexpectedEof;
             if (tok == .keyword and std.mem.eql(u8, tok.keyword, "]")) break;
             try self.unreadOwnedToken(&tok);
-            var item = try self.readObject();
+            var item = try self.readObjectProjected(projection);
             errdefer item.deinit(self.alloc);
             try items.append(self.alloc, item);
             item = .null;
@@ -629,7 +645,7 @@ pub const Scanner = struct {
             self.alloc.free(owned);
         }
 
-        if (!self.allow_stream or projection == .resource_fields) return .{ .dict = owned };
+        if (!self.allow_stream or projection == .resource_fields or projection == .resource_table) return .{ .dict = owned };
         var tok = try self.readToken();
         defer tok.deinit(self.alloc);
         if (tok != .keyword or !std.mem.eql(u8, tok.keyword, "stream")) {
@@ -649,7 +665,7 @@ pub const Scanner = struct {
 
         // Header-only views deliberately have no payload range. They cannot
         // be passed to a stream decoder or mistaken for a validated stream.
-        if (projection == .xobject_header or projection == .color_profile_header or header_only) return .{ .stream_header = owned };
+        if (projection == .xobject_header or projection == .color_profile_header or projection == .appearance_header or projection == .structure_metadata or header_only) return .{ .stream_header = owned };
 
         const data_start = self.pos;
         const data_offset = self.base_offset + data_start;
@@ -2136,7 +2152,8 @@ fn exerciseFormResourceViews(a: Allocator, input: []const u8) !void {
     const resources = object.obj_def.value.get("Resources").?;
     try std.testing.expect(resources.* == .dict);
     try std.testing.expect(resources.get("Private") == null);
-    for ([_][]const u8{ "Font", "Properties" }) |name| {
+    try std.testing.expectEqual(@as(u32, 5), resources.get("Font").?.get("F1").?.obj_ref.id);
+    for ([_][]const u8{"Properties"}) |name| {
         const field = resources.get(name).?;
         try std.testing.expect(field.* == .deferred);
         try std.testing.expectEqual(@as(u32, 8), field.deferred.reference.id);
@@ -2144,7 +2161,7 @@ fn exerciseFormResourceViews(a: Allocator, input: []const u8) !void {
     }
     var copy = try object.clone(a);
     defer copy.deinit(a);
-    try std.testing.expect(copy.obj_def.value.get("Resources").?.get("Font").?.* == .deferred);
+    try std.testing.expectEqual(@as(u32, 5), copy.obj_def.value.get("Resources").?.get("Font").?.get("F1").?.obj_ref.id);
 }
 
 test "scanner native Form resources index only needed fields without rescanning opaque data" {
