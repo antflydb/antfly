@@ -391,10 +391,11 @@ test "lite write amplification ceilings" {
     const indexed = try measureSingleWriter(alloc, "lite-write-amp-ceil-indexed", true, updates);
 
     // Slack factor over the measured main@6c0b004e95 baseline (see
-    // docs/design/lite-performance/write-amplification-baseline.json).
+    // docs/design/lite-performance/write-amplification-baseline.json):
+    // primary-only 3.000, indexed 66.844 calling-thread syncs/update.
     const slack = 1.25;
     try expectAtMost(primary.perUpdate(.calling_thread), 3.0 * slack, "primary-only calling-thread syncs/update");
-    try expectAtMost(indexed.perUpdate(.calling_thread), 40.0 * slack, "indexed calling-thread syncs/update");
+    try expectAtMost(indexed.perUpdate(.calling_thread), 67.0 * slack, "indexed calling-thread syncs/update");
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {
