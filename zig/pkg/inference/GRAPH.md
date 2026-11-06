@@ -444,6 +444,33 @@ that cover the requested token count, so incomplete embedded packages cannot
 hide complete input-parameter packages or standalone chains. Selection caches
 request-relevant sidecar metadata, checks executable availability without reading
 its bytes, and passes the parsed manifests directly to the admitted loader.
+Raw package/sidecar reads, parser arenas, catalog indexes, and selected manifest
+copies acquire host admission before allocating and remain charged until freed.
+File reads use the opened descriptor's exact size, avoiding geometric growth
+peaks; file growth or truncation during the read is rejected. Temporary metadata
+uses a reclaiming allocator even when the request allocator is an arena. Explicit
+path-based loaders and `run-artifact` use the same accounting, sharing the
+invocation domain with tokenizer and executable residency.
+Executor-owned graph copies, shapes, binding names, and variant structures use
+an admission allocator retained through the last runtime's destruction. Package
+bookkeeping is admitted before allocation. Every metadata allocation consumes
+physical headroom, including small parser allocations: a bounded pending-credit
+batch amortizes OS probes, with an exact-size fallback under pressure. Unused
+headroom is returned before handing off construction and after loading; frees
+return only residency credit from their own pressure epoch.
+Construction admission uses the manager's pressure/reclamation path, including
+optional host caches, while retaining batched OS probes. Escaped metadata owners
+detach the borrowed manager and derive accounting lifetimes from retained owners.
+Loading admits and preallocates each runtime slot for the largest phase's
+semantic KV set. Slots borrow immutable executor binding names and identify entries by
+(layer, kind), so phase-specific aliases do not copy names or grow the cache on
+every token. Runtime creation remains valid after manager shutdown.
+
+Standalone selection streams a compact request header for large sidecars,
+skipping shape/binding arrays and unknown fields without retaining their values.
+Unrelated artifacts cannot exhaust the request's metadata budget. Matching files
+still undergo full admitted parsing, compatibility checks, and identity checks;
+inspection is only a filter and does not authorize execution.
 The loader still verifies executable/provider identity and loaded statistics;
 identity or deserialization failures do not trigger another candidate.
 
@@ -460,7 +487,10 @@ returns temporary-unavailability when all slots are occupied. Destruction frees
 retained KV before returning the slot; failed runtime allocation returns it too.
 PJRT prefill starts a fresh sequence and releases prior retained KV inside the
 runtime before allocating replacement outputs. This bound holds for direct
-runtime reuse, including an allocation failure followed by retry.
+runtime reuse, including an allocation failure followed by retry. Host output
+bookkeeping is allocated before native execution; execution errors destroy all
+returned native outputs and completion events before an execution slot can be
+returned.
 Capacity cannot grow beyond CUDA's already admitted fixed pool. Callers needing
 concurrent runtimes set the capacity when loading the executor, allowing full
 workspace concurrency without duplicating immutable executable residency.
@@ -583,3 +613,67 @@ Near-term graph/backend work:
 > **Relocated:** The item-by-item graph/backend progress narrative that previously lived here (56 lines) is preserved verbatim in [docs/design/inference/history/graph-current-progress-history.md](../../../docs/design/inference/history/graph-current-progress-history.md). The durable ModelExecutor/ModelRuntime/PartitionExecutor split it described is decision 8 above.
 
 See also: [MULTIDEVICE.md](MULTIDEVICE.md) for multi-device inference, [FINETUNING.md](finetuning/FINETUNING.md) for training support.
+
+Compiled HLO and serialized PJRT executables are checked against the provider's
+native output count before use. Executor loading also verifies native F32 output
+types and exact dimensions against the supplied shapes, before publishing a runtime.
+A sidecar with a mismatched count, out-of-range input graph reference,
+or duplicate semantic ownership of a native output is rejected during loading.
+KV identity is `(layer_index, kind)` when a layer is supplied and `(name, kind)`
+otherwise. Admitted runtime slots preallocate a semantic hash index alongside
+retained entries; KV lookup and replacement require no per-step allocation and
+have expected constant cost per binding. Reset clears both entries and the index.
+
+The PJRT wrapper's function slots and executable argument layouts are checked
+against an independently vendored upstream C header by `zig/lib/pjrt`'s
+`zig build test`. The provider fixture must use the upstream table order; matching
+hand-written wrapper and fixture numbers alone do not establish ABI compatibility.
+
+KV selection, shape compatibility, cache capacity, and runtime lookup share the
+same identity implementation. Layerless names must match across phases; layered
+names may differ. A phase cannot give two outputs ownership of one logical KV
+state. Semantic input bindings are canonicalized by input position when cloned.
+Execution validates this ordering and traverses sparse bindings alongside inputs
+in linear time, without creating an index or copying names on each step.
+
+Logits output positions are resolved once for each phase before publication;
+decode phase selection uses binary search over the sorted sequence lengths.
+F32 readback queries the provider's host-transfer size rather than physical device
+storage, validates element type, logical dimensions, and checked byte count before
+allocation, and releases completion events on failures. Whole-model readback also
+checks runtime dimensions against the admitted logits shape before slicing.
+
+Each admitted runtime slot also owns its graph-indexed value table and a bounded
+bookkeeping arena sized for the largest phase. Argument/output handle lists,
+ownership flags, upload shapes, and readback layout metadata use that arena;
+only the admitted transfer buffers and returned logits use the request allocator.
+Per-token cleanup visits bound inputs rather than scanning the whole graph.
+Readback requests explicit untiled row-major host layout for both size discovery
+and transfer. Native device padding is charged to device execution memory and
+never determines logical host size or retained-KV compatibility. KV matching
+checks native F32 type and logical dimensions (with dynamic input dimensions
+acting as wildcards). New KV is published only after logits allocation succeeds,
+so failed decode readback can retry against the previous cache generation.
+
+Before native execution, an admitted runtime keeps only KV consumed by the
+selected phase and rebuilds its semantic index using slot-owned liveness marks.
+After successful logits readback/allocation it replaces that input generation
+with the new outputs. Historical phase identities cannot accumulate beyond the
+admitted per-phase input/output peak. All native Execute inputs are explicitly
+non-donatable, including duplicate references to one retained buffer; may-alias
+executables cannot consume the old generation needed by a failed decode retry.
+The enclosing resource envelope configures unified-device ceilings. Metadata
+suballocations reuse that stable policy and retain batched physical-pressure
+checks, avoiding a fresh OS limit probe for each parser allocation.
+
+Standalone discovery evaluates parameter modes in priority order. It streams a
+compact header before parsing a candidate's shapes or bindings at every file
+size, and releases an incomplete mode's catalog before considering fallback.
+Lower-priority large sidecars and small JSON files with large metadata expansion
+cannot force full parsing while a complete preferred mode is selected. Package
+and standalone lookup still share parsed metadata within the active mode;
+ambiguity and selected-chain identity/deserialization errors remain errors.
+Native upload helpers share one ownership guard for returned buffers and
+completion events. Completion failure destroys the buffer that cannot be handed
+to the caller. The standalone upload regression checks successful and failed
+ownership transfers without suppressing production native-error diagnostics.

@@ -399,10 +399,9 @@ fn executeModelForwardViaDefinition(
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        var selected = (try @import("pjrt_artifact_selection.zig").find(allocator, io, directory, .{ .model_dir = model_dir, .seq_len = shape.seq_len, .query_seq_len = shape.query_seq_len, .attention_mode = shape.attention_mode, .decode_steps = policy.decode_steps_limit })) orelse return error.PjrtLoadOnlyArtifactsRequired;
+        var selected = (try @import("pjrt_artifact_selection.zig").findAdmitted(allocator, io, directory, .{ .model_dir = model_dir, .seq_len = shape.seq_len, .query_seq_len = shape.query_seq_len, .attention_mode = shape.attention_mode, .decode_steps = policy.decode_steps_limit }, policy)) orelse return error.PjrtLoadOnlyArtifactsRequired;
         defer selected.deinit();
-        const artifacts = try selected.values(allocator);
-        defer allocator.free(artifacts);
+        const artifacts = selected.manifests.?;
         const executor = try pjrt_artifact_executor_mod.createAdmittedModelExecutorFromManifests(allocator, artifacts, graph, context.cb, policy, plugin);
         entry.compiled_model_executor = .{ .ptr = executor, .deinit = &pjrt_executor_mod.deinitModelExecutorPtr };
         entry.compiled_model_status = .ready;
