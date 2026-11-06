@@ -53,7 +53,12 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 [ -n "$destination" ] || exit 1
-mkdir -p "$destination/lib" "$destination/completions"
+mkdir -p "$destination/lib/pkgconfig" "$destination/completions" \
+  "$destination/include" "$destination/share/antfly/antfarm/assets"
+cp "$TEST_PKGCONFIG_TEMPLATE" "$destination/lib/pkgconfig/libantfly.pc"
+printf 'header\n' >"$destination/include/antfly.h"
+printf 'dashboard\n' >"$destination/share/antfly/antfarm/index.html"
+printf 'dashboard bundle\n' >"$destination/share/antfly/antfarm/assets/app.js"
 printf '#!/bin/sh\nprintf "antfly test binary\\n"\n' >"$destination/antfly"
 printf 'library\n' >"$destination/lib/libantfly.so"
 printf 'completion\n' >"$destination/completions/antfly.bash"
@@ -119,8 +124,12 @@ cat >"$test_root/bin/mv" <<'EOF'
 if [ "${TEST_FAIL_ACTIVATION:-}" = "1" ] &&
     [ "$#" -eq 2 ] &&
     case "$1" in *.antfly-new.*) true ;; *) false ;; esac &&
-    case "$2" in */bash-completion/completions/antfly) true ;; *) false ;; esac; then
-  printf 'injected completion activation failure\n' >&2
+    case "${TEST_FAIL_TARGET:-completion}:$2" in
+      header:*/include/antfly.h|assets:*/share/antfly/antfarm|completion:*/bash-completion/completions/antfly) true ;;
+      *) false ;;
+    esac; then
+  printf '%s:%s\n' "$TEST_FAIL_TARGET" "$2" >"$TEST_FAILURE_MARKER"
+  printf 'injected activation failure\n' >&2
   exit 98
 fi
 exec /bin/mv "$@"
@@ -133,15 +142,23 @@ run_installer() {
   local stderr_file="$3"
   local libc="${4:-auto}"
   local glibc_version="${5:-2.28}"
+  local install_home="${TEST_INSTALL_HOME:-$test_root/home}"
   CURL_ARGUMENTS_FILE="$arguments_file" \
     TEST_CHECKSUM="$checksum" \
+    TEST_PKGCONFIG_TEMPLATE="$repo_root/zig/pkg/antfly-embedded/libantfly.pc.in" \
+    TEST_FAIL_TARGET="${TEST_FAIL_TARGET:-completion}" \
+    TEST_FAILURE_MARKER="${TEST_FAILURE_MARKER:-$test_root/unexpected-failure}" \
     TEST_ACTUAL_CHECKSUM="${TEST_ACTUAL_CHECKSUM:-$checksum}" \
     TEST_FAIL_ACTIVATION="${TEST_FAIL_ACTIVATION:-}" \
     TEST_FAIL_GNU_DOWNLOAD="${TEST_FAIL_GNU_DOWNLOAD:-}" \
     TEST_GLIBC_VERSION="$glibc_version" \
     ANTFLY_DOWNLOAD_CLASS="$class" \
     ANTFLY_LIBC="$libc" \
-    HOME="$test_root/home" \
+    HOME="$install_home" \
+    XDG_DATA_HOME="$install_home/.local/share" \
+    XDG_CONFIG_HOME="$install_home/.config" \
+    BASH_COMPLETION_USER_DIR="$install_home/.local/share/bash-completion" \
+    ZSH_COMPLETION_USER_DIR="$install_home/.local/share/zsh/site-functions" \
     PATH="$test_root/bin:/usr/bin:/bin" \
     sh "$repo_root/scripts/install.sh" v1.2.3 >/dev/null 2>"$stderr_file"
 }
@@ -176,6 +193,19 @@ assert_installed_payload() {
   test -x "$test_root/home/.local/bin/antfly"
   grep -Fq 'library' "$test_root/home/.local/lib/antfly/libantfly.so"
   grep -Fq 'completion' "$test_root/home/.local/share/bash-completion/completions/antfly"
+  grep -Fxq 'header' "$test_root/home/.local/include/antfly.h"
+  grep -Fxq 'dashboard' "$test_root/home/.local/share/antfly/antfarm/index.html"
+  grep -Fxq 'dashboard bundle' "$test_root/home/.local/share/antfly/antfarm/assets/app.js"
+  test ! -e "$test_root/home/.local/share/antfly/antfarm/stale.js"
+  grep -Fxq 'unrelated version' "$test_root/home/.local/share/antfly/versions/keep"
+
+  local metadata="$test_root/home/.local/lib/antfly/pkgconfig/libantfly.pc"
+  # Compare all metadata, including the unchanged include and rpath expressions.
+  # shellcheck disable=SC2016 # pkg-config expands these variables, not the shell.
+  sed -e 's|^prefix=.*|prefix=${pcfiledir}/../../..|' \
+      -e 's|^libdir=.*|libdir=${prefix}/lib/antfly|' \
+      "$repo_root/zig/pkg/antfly-embedded/libantfly.pc.in" >"$test_root/expected.pc"
+  cmp "$test_root/expected.pc" "$metadata"
 }
 
 assert_checksum_failure_preserves_install() {
@@ -195,23 +225,96 @@ assert_checksum_failure_preserves_install() {
   grep -Fq 'previous library' "$test_root/home/.local/lib/antfly/libantfly.so"
 }
 
-assert_activation_failure_rolls_back() {
-  printf 'previous binary\n' >"$test_root/home/.local/bin/antfly"
-  chmod +x "$test_root/home/.local/bin/antfly"
-  printf 'previous library\n' >"$test_root/home/.local/lib/antfly/libantfly.so"
-  printf 'previous completion\n' >"$test_root/home/.local/share/bash-completion/completions/antfly"
+assert_no_installer_paths() {
+  local install_home="$1"
+  # Capture the complete result so pipefail cannot hide matches behind SIGPIPE.
+  local leftovers
+  leftovers="$(find "$install_home" -name '*.antfly-*' -print)"
+  if [ -n "$leftovers" ]; then
+    printf 'installer left staging or backup paths:\n%s\n' "$leftovers" >&2
+    exit 1
+  fi
+}
 
-  local arguments_file="$test_root/curl-activation-failure.txt"
-  local stderr_file="$test_root/stderr-activation-failure.txt"
-  if TEST_FAIL_ACTIVATION=1 run_installer external "$arguments_file" "$stderr_file"; then
-    echo "installer unexpectedly survived an injected activation failure" >&2
+assert_activation_failure_rolls_back() {
+  local target="$1"
+  local mode="$2"
+  local install_home="$test_root/home"
+  if [ "$mode" = fresh ]; then
+    # Each failure starts with its own empty prefix; earlier cases cannot seed it.
+    install_home="$test_root/fresh-$target"
+    mkdir -p "$install_home"
+  else
+    printf 'previous binary\n' >"$install_home/.local/bin/antfly"
+    chmod +x "$install_home/.local/bin/antfly"
+    printf 'previous library\n' >"$install_home/.local/lib/antfly/libantfly.so"
+    printf 'previous completion\n' >"$install_home/.local/share/bash-completion/completions/antfly"
+    printf 'previous header\n' >"$install_home/.local/include/antfly.h"
+    printf 'previous dashboard\n' >"$install_home/.local/share/antfly/antfarm/index.html"
+    printf 'previous bundle\n' >"$install_home/.local/share/antfly/antfarm/assets/app.js"
+    printf 'previous metadata\n' >"$install_home/.local/lib/antfly/pkgconfig/libantfly.pc"
+    printf 'stale asset\n' >"$install_home/.local/share/antfly/antfarm/stale.js"
+  fi
+
+  local expected_target
+  case "$target" in
+    header) expected_target="$install_home/.local/include/antfly.h" ;;
+    assets) expected_target="$install_home/.local/share/antfly/antfarm" ;;
+    completion) expected_target="$install_home/.local/share/bash-completion/completions/antfly" ;;
+    *) echo "unknown failure target: $target" >&2; exit 1 ;;
+  esac
+  local arguments_file="$test_root/curl-activation-$mode-$target.txt"
+  local stderr_file="$test_root/stderr-activation-$mode-$target.txt"
+  local marker="$test_root/failure-$mode-$target.txt"
+  local exit_code
+  if TEST_FAIL_ACTIVATION=1 TEST_FAIL_TARGET="$target" \
+      TEST_FAILURE_MARKER="$marker" TEST_INSTALL_HOME="$install_home" \
+      run_installer external "$arguments_file" "$stderr_file"; then
+    echo "installer unexpectedly survived $mode $target activation failure" >&2
+    exit 1
+  else
+    exit_code=$?
+  fi
+  if [ "$exit_code" -ne 98 ]; then
+    printf 'expected injected failure status 98, got %s (%s %s)\n' \
+      "$exit_code" "$mode" "$target" >&2
+    cat "$stderr_file" >&2
+    exit 1
+  fi
+  # Confirm the intended rename was reached, rather than accepting an earlier error.
+  if ! grep -Fxq "$target:$expected_target" "$marker"; then
+    printf 'expected activation failure at %s (%s)\n' "$expected_target" "$mode" >&2
+    cat "$stderr_file" >&2
     exit 1
   fi
   grep -Fq 'restoring the previous Antfly installation' "$stderr_file"
-  grep -Fq 'previous binary' "$test_root/home/.local/bin/antfly"
-  grep -Fq 'previous library' "$test_root/home/.local/lib/antfly/libantfly.so"
-  grep -Fq 'previous completion' "$test_root/home/.local/share/bash-completion/completions/antfly"
+  assert_no_installer_paths "$install_home"
+
+  if [ "$mode" = fresh ]; then
+    local remaining_files
+    remaining_files="$(find "$install_home" \( -type f -o -type l \) -print)"
+    if [ -n "$remaining_files" ]; then
+      printf 'failed fresh install left payload files:\n%s\n' "$remaining_files" >&2
+      exit 1
+    fi
+  else
+    grep -Fxq 'previous binary' "$install_home/.local/bin/antfly"
+    grep -Fxq 'previous library' "$install_home/.local/lib/antfly/libantfly.so"
+    grep -Fxq 'previous completion' "$install_home/.local/share/bash-completion/completions/antfly"
+    grep -Fxq 'previous header' "$install_home/.local/include/antfly.h"
+    grep -Fxq 'previous dashboard' "$install_home/.local/share/antfly/antfarm/index.html"
+    grep -Fxq 'previous bundle' "$install_home/.local/share/antfly/antfarm/assets/app.js"
+    grep -Fxq 'previous metadata' "$install_home/.local/lib/antfly/pkgconfig/libantfly.pc"
+    grep -Fxq 'stale asset' "$install_home/.local/share/antfly/antfarm/stale.js"
+    grep -Fxq 'unrelated version' "$install_home/.local/share/antfly/versions/keep"
+  fi
 }
+
+# An upgrade must replace its dashboard leaf while preserving sibling runtimes.
+mkdir -p "$test_root/home/.local/share/antfly/antfarm" \
+  "$test_root/home/.local/share/antfly/versions"
+printf 'stale asset\n' >"$test_root/home/.local/share/antfly/antfarm/stale.js"
+printf 'unrelated version\n' >"$test_root/home/.local/share/antfly/versions/keep"
 
 employee_files="$(run_case employee)"
 employee_arguments="$(printf '%s\n' "$employee_files" | sed -n '1p')"
@@ -270,7 +373,11 @@ assert_no_audience_header "$invalid_arguments"
 grep -Fq "Ignoring invalid ANTFLY_DOWNLOAD_CLASS" "$invalid_stderr"
 
 assert_installed_payload
-assert_activation_failure_rolls_back
+assert_no_installer_paths "$test_root/home"
+for target in header assets completion; do
+  assert_activation_failure_rolls_back "$target" upgrade
+  assert_activation_failure_rolls_back "$target" fresh
+done
 assert_checksum_failure_preserves_install
 
 echo "install download, checksum, and transaction tests passed"

@@ -1717,6 +1717,13 @@ pub extern fn antfly_storage_context_attach_inference_provider(
 pub extern fn antfly_storage_context_configure_secrets(context: ?*anyopaque, store: ?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_storage_context_configure_native_queries(context: ?*anyopaque, setup: BorrowedBytes) callconv(.c) Status;
 
+/// Copies the node-level default inference endpoint and credential that
+/// storage-owned enrichment inherits when an index names neither. The key is
+/// kept as given (normally a `${secret:...}` reference) and resolved through
+/// the configured secret facade per request. Configure before opening any
+/// table owner; empty values clear the defaults.
+pub extern fn antfly_storage_context_configure_inference_defaults(context: ?*anyopaque, api_url: BorrowedBytes, api_key: BorrowedBytes) callconv(.c) Status;
+
 /// Replaces the context-owned remote-content security snapshot before any
 /// table owner opens. The payload is a ContentSecurityConfig JSON object.
 pub extern fn antfly_storage_context_configure_remote_content_security(

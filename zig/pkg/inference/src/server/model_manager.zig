@@ -35,6 +35,138 @@ const model_compatibility = @import("../models/compatibility.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
 const gliner_specialty = @import("../models/gliner_specialty_qualification.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
+const PublishedArtifacts = @import("../registry/published_artifacts.zig").PublishedArtifacts;
+const ResolvedModel = @import("../registry/model_selection.zig").ResolvedModel;
+
+/// One cold construction owns its publication fence. Bundle callers can lend
+/// their verifier to share checksum proofs across graphs and backend retries.
+const ComponentConstruction = struct {
+    io: std.Io,
+    lease: @import("../registry/publication_lease.zig").Lease,
+    owned: ?PublishedArtifacts,
+    borrowed: ?*PublishedArtifacts,
+
+    fn init(a: std.mem.Allocator, io: std.Io, selected: ResolvedModel, control: ?InferenceExecutionControl, borrowed: ?*PublishedArtifacts) !ComponentConstruction {
+        if (control) |active| {
+            try active.check();
+            if (active.model_selection) |expected| {
+                if (!expected.matches(selected.path) or !std.meta.eql(expected.publication, selected.publication)) return error.ModelArtifactsChanging;
+            }
+        }
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(a, io, selected.path);
+        errdefer lease.deinit(io);
+        if (borrowed) |provided| {
+            if (!std.mem.eql(u8, provided.root, selected.path) or !std.meta.eql(provided.publication, selected.publication)) return error.ModelArtifactsChanging;
+            try selected.verify(a, io);
+            return .{ .io = io, .lease = lease, .owned = null, .borrowed = provided };
+        }
+        return .{ .io = io, .lease = lease, .owned = try PublishedArtifacts.init(a, io, selected.path, .{ .publication = selected.publication }), .borrowed = null };
+    }
+    fn artifacts(self: *ComponentConstruction) *PublishedArtifacts {
+        return self.borrowed orelse &self.owned.?;
+    }
+    fn verifyPath(self: *ComponentConstruction, path: []const u8) !void {
+        if (std.mem.endsWith(u8, path, ".onnx")) {
+            try self.artifacts().verifyOnnx(path);
+        } else if (std.mem.endsWith(u8, path, ".gguf") or std.mem.endsWith(u8, path, ".safetensors")) {
+            try self.artifacts().verifyPath(path);
+        }
+    }
+    fn verifyDirectory(self: *ComponentConstruction, path: []const u8, backend: backends.BackendType) !void {
+        if (self.artifacts().receipt == null or (try std.Io.Dir.cwd().statFile(self.io, path, .{})).kind != .directory) return;
+        // Directory components may select an ONNX primary too. Preserve
+        // native-format preference rather than authenticating an unused graph.
+        var man = try manifest_mod.loadFromDir(self.artifacts().allocator, path);
+        defer man.deinit();
+        if (backend == .wasm or !manifestHasNativeAssets(man)) {
+            if (man.onnx_path) |onnx| try self.artifacts().verifyOnnx(onnx);
+            return;
+        }
+        switch (man.nativeWeightArtifactKind().?) {
+            .gguf => try self.artifacts().verifyPath(man.gguf_path.?),
+            .safetensors, .sharded_safetensors => {
+                // Authenticate the index before interpreting shard names, and
+                // retain proof for every shard the native importer can open.
+                if (man.safetensors_path == null) try self.artifacts().verifyPath(man.safetensors_index_path.?);
+                var dependencies = try safetensors_mod.inspectArtifactDependencies(self.artifacts().allocator, man.safetensors_path, man.safetensors_index_path);
+                defer dependencies.deinit();
+                for (dependencies.paths) |dependency| try self.artifacts().verifyPath(dependency);
+            },
+        }
+        for ([_]?[]const u8{ man.gguf_projector_path, man.gliner_head_gguf_path, man.gliner_head_safetensors_path }) |maybe_path| {
+            if (maybe_path) |native_path| try self.artifacts().verifyPath(native_path);
+        }
+    }
+    fn finish(self: *ComponentConstruction) !void {
+        try self.artifacts().verify();
+    }
+    fn deinit(self: *ComponentConstruction) void {
+        if (self.owned) |*owned| owned.deinit();
+        self.lease.deinit(self.io);
+    }
+};
+
+/// Receipt membership is immutable within a publication. Cache positive and
+/// negative answers without retaining request memory or walking weight files
+/// on warm hits. Unmanaged directories deliberately bypass this cache.
+const MergedDecoderMembershipCache = struct {
+    const capacity = 128;
+    const Location = enum {
+        absent,
+        root,
+        onnx,
+        fn relative(self: Location) ?[]const u8 {
+            return switch (self) {
+                .absent => null,
+                .root => "decoder_model_merged.onnx",
+                .onnx => "onnx/decoder_model_merged.onnx",
+            };
+        }
+    };
+    const Entry = struct { key: [32]u8, location: Location, used: u64 };
+    const Lookup = union(enum) { miss, hit: Location };
+    mutex: std.atomic.Mutex = .unlocked,
+    builders: [8]std.atomic.Mutex = @splat(.unlocked),
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    clock: u64 = 0,
+
+    fn keyFor(selected: ResolvedModel) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&selected.binding().directory);
+        hash.update(&selected.publication.?);
+        return hash.finalResult();
+    }
+    fn get(self: *MergedDecoderMembershipCache, key: [32]u8) Lookup {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, &entry.key, &key)) {
+            self.clock +|= 1;
+            entry.used = self.clock;
+            return .{ .hit = entry.location };
+        };
+        return .miss;
+    }
+    fn put(self: *MergedDecoderMembershipCache, a: std.mem.Allocator, key: [32]u8, location: Location) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        self.clock +|= 1;
+        const next = Entry{ .key = key, .location = location, .used = self.clock };
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, &entry.key, &key)) {
+            entry.* = next;
+            return;
+        };
+        if (self.entries.items.len < capacity) return self.entries.append(a, next);
+        var oldest: usize = 0;
+        for (self.entries.items, 0..) |entry, i| if (entry.used < self.entries.items[oldest].used) {
+            oldest = i;
+        };
+        self.entries.items[oldest] = next;
+    }
+    fn deinit(self: *MergedDecoderMembershipCache, a: std.mem.Allocator) void {
+        self.entries.deinit(a);
+    }
+};
+
 const safetensors_mod = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
@@ -1631,7 +1763,17 @@ fn loadLegacyWordPieceTokenizer(
     config_path: ?[]const u8,
     special_path: ?[]const u8,
 ) !*hf_tokenizer.HfTokenizer {
-    const vocab_bytes = try c_file.readFile(allocator, vocab_path);
+    return loadLegacyWordPieceTokenizerWithArtifacts(allocator, vocab_path, config_path, special_path, null);
+}
+
+fn loadLegacyWordPieceTokenizerWithArtifacts(
+    allocator: std.mem.Allocator,
+    vocab_path: []const u8,
+    config_path: ?[]const u8,
+    special_path: ?[]const u8,
+    artifacts: ?*PublishedArtifacts,
+) !*hf_tokenizer.HfTokenizer {
+    const vocab_bytes = if (artifacts) |source| try source.readPath(vocab_path, std.math.maxInt(usize)) else try c_file.readFile(allocator, vocab_path);
     defer allocator.free(vocab_bytes);
     var meta = LegacyWordPieceMeta{};
     defer meta.deinit(allocator);
@@ -1641,7 +1783,7 @@ fn loadLegacyWordPieceTokenizer(
     };
     for ([_]?[]const u8{ config_path, special_path }, 0..) |path, i| {
         if (path) |selected| {
-            const bytes = c_file.readFile(allocator, selected) catch continue;
+            const bytes = if (artifacts) |source| try source.readPath(selected, std.math.maxInt(usize)) else c_file.readFile(allocator, selected) catch continue;
             metadata_bytes[i] = bytes;
             applyLegacyTokenizerJson(&meta, bytes, allocator);
         }
@@ -1744,15 +1886,22 @@ pub fn loadHuggingFaceTokenizerFromDirOrGguf(
 }
 
 fn loadHuggingFaceTokenizerFromManifest(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest) !*hf_tokenizer.HfTokenizer {
+    return loadHuggingFaceTokenizerFromManifestWithArtifacts(allocator, man, null);
+}
+
+fn loadHuggingFaceTokenizerFromManifestWithArtifacts(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest, artifacts: ?*PublishedArtifacts) !*hf_tokenizer.HfTokenizer {
     if (man.tokenizer_json_path) |path| {
-        const bytes = try c_file.readFile(allocator, path);
+        const bytes = if (artifacts) |source| try source.readPath(path, std.math.maxInt(usize)) else try c_file.readFile(allocator, path);
         defer allocator.free(bytes);
         return hf_tokenizer.HfTokenizer.loadFromBytes(allocator, bytes);
     }
     if (man.vocab_txt_path) |path| {
-        return loadLegacyWordPieceTokenizer(allocator, path, man.tokenizer_config_path, man.special_tokens_map_path);
+        return loadLegacyWordPieceTokenizerWithArtifacts(allocator, path, man.tokenizer_config_path, man.special_tokens_map_path, artifacts);
     }
-    if (man.gguf_path) |path| return loadHuggingFaceTokenizerFromGguf(allocator, path);
+    if (man.gguf_path) |path| {
+        if (artifacts) |source| try source.verifyPath(path);
+        return loadHuggingFaceTokenizerFromGguf(allocator, path);
+    }
     return error.NoTokenizerFound;
 }
 
@@ -2062,6 +2211,57 @@ pub fn loadSentencePieceTokenizerFromDirOrGguf(
     const resolved_gguf_path = gguf_path orelse return error.NoTokenizerFound;
     sp.* = try loadSentencePieceTokenizerFromGguf(allocator, resolved_gguf_path);
     return sp;
+}
+
+/// Only receipt-listed optional sidecars participate in managed construction.
+/// A listed sidecar that disappears or fails IO/integrity checks is an error.
+fn readOptionalTokenizerSidecar(artifacts: *const PublishedArtifacts, relative: []const u8) !?[]u8 {
+    const path = (try artifacts.resolve(relative)) orelse return null;
+    defer artifacts.allocator.free(path);
+    return try artifacts.readPath(path, std.math.maxInt(usize));
+}
+
+fn tokenizerGemmaCompat(man: manifest_mod.ModelManifest, model_dir: []const u8) bool {
+    // Configuration was selected and parsed by the bound manifest loader.
+    // Reopening it here duplicates parsing before tokenizer admission and can
+    // select metadata from an unrelated export at the installation root.
+    return std.mem.indexOf(u8, model_dir, "gemma") != null or
+        std.mem.startsWith(u8, man.config_model_arch, "gemma") or man.gguf_generator_gemma4;
+}
+
+fn tokenizerKindWithArtifacts(man: manifest_mod.ModelManifest, artifacts: *const PublishedArtifacts, gemma_compat: bool) !manifest_mod.TokenizerType {
+    if (gemma_compat) {
+        if (try artifacts.resolve("tokenizer.model")) |path| {
+            artifacts.allocator.free(path);
+            return .sentencepiece;
+        }
+    }
+    return man.tokenizer_type orelse error.NoTokenizerFound;
+}
+
+fn loadSentencePieceTokenizerWithArtifacts(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest, artifacts: *PublishedArtifacts) !*sentencepiece.Processor {
+    const sp = try allocator.create(sentencepiece.Processor);
+    errdefer allocator.destroy(sp);
+    if (try readOptionalTokenizerSidecar(artifacts, "tokenizer.model")) |bytes| {
+        defer artifacts.allocator.free(bytes);
+        sp.* = try sentencepiece.Processor.init(allocator, bytes);
+    } else {
+        const path = man.gguf_path orelse return error.NoTokenizerFound;
+        try artifacts.verifyPath(path);
+        sp.* = try loadSentencePieceTokenizerFromGguf(allocator, path);
+    }
+    return sp;
+}
+
+fn loadSentencePieceAddedTokensWithArtifacts(allocator: std.mem.Allocator, sp: *sentencepiece.Processor, artifacts: *const PublishedArtifacts) !void {
+    if (try readOptionalTokenizerSidecar(artifacts, "added_tokens.json")) |bytes| {
+        defer artifacts.allocator.free(bytes);
+        try loadSentencePieceAddedTokenMap(allocator, bytes, sp);
+    }
+    if (try readOptionalTokenizerSidecar(artifacts, "tokenizer.json")) |bytes| {
+        defer artifacts.allocator.free(bytes);
+        try loadSentencePieceAddedTokenArray(allocator, bytes, sp);
+    }
 }
 
 fn adoptAndConfigureSentencePieceTokenizer(
@@ -2406,9 +2606,24 @@ const LegacyArtifactDigestCache = struct {
 /// Stable identity before loading weights. Managed receipts use relative paths
 /// and pinned content digests, so copying/restoring a model preserves reuse.
 pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
-    var receipt = try managed_receipt.loadValidated(a, io, model_dir);
-    defer if (receipt) |*validated| validated.deinit();
-    if (receipt) |*validated| {
+    return modelIdentityWithArtifacts(a, io, model_dir, manifest, null);
+}
+
+/// Cold construction shares its receipt and checksum proofs with tokenizer
+/// preparation instead of hashing a large embedded-tokenizer GGUF twice.
+fn modelIdentityWithArtifacts(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest, published: ?*PublishedArtifacts) ![32]u8 {
+    var owned: ?managed_receipt.ValidatedReceipt = null;
+    defer if (owned) |*validated| validated.deinit();
+    const receipt: ?*managed_receipt.ValidatedReceipt = if (published) |source|
+        if (source.receipt) |*validated| validated else null
+    else blk: {
+        const receipt_root = try managed_receipt.publicationRootAlloc(a, io, model_dir);
+        defer a.free(receipt_root);
+        const standalone = std.mem.endsWith(u8, model_dir, ".gguf") and std.mem.eql(u8, model_dir, receipt_root);
+        owned = if (standalone) null else try managed_receipt.loadValidated(a, io, receipt_root);
+        break :blk if (owned) |*validated| validated else null;
+    };
+    if (receipt) |validated| {
         const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
         defer a.free(artifacts);
         std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
@@ -2418,7 +2633,15 @@ pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, ma
         }.less);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         for (artifacts) |artifact| {
-            const decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+            var decoded: [32]u8 = undefined;
+            if (published) |source| {
+                try source.verifyFile(artifact.path);
+                if (artifact.sha256) |digest| {
+                    // verifyFile authenticated this digest against the actual
+                    // file and retained its complete construction stamp.
+                    _ = std.fmt.hexToBytes(&decoded, digest) catch return error.InvalidManagedDownload;
+                } else decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+            } else decoded = try LegacyArtifactDigestCache.digest(io, artifact);
             if (artifact.sha256) |digest| {
                 if (digest.len != 64) return error.InvalidManagedDownload;
                 var expected: [32]u8 = undefined;
@@ -2682,6 +2905,7 @@ pub const LoadedModel = struct {
     florence_reader_config: ?vision_config.RuntimeConfig = null,
     chat_tmpl: ?*ChatTemplate = null,
     whisper_prompt_cache: ?whisper_prompt.PromptCache = null,
+    whisper_prompt_admission: ?runtime.tier.memory.AdmissionLease = null,
     /// The model shipped a chat template that we could not parse, so chat requests fall
     /// back to raw prompting. Distinct from `chat_tmpl == null` with no template at all.
     chat_template_failed: bool = false,
@@ -3036,6 +3260,8 @@ pub const LoadedModel = struct {
             shared_ctx,
             &session_manager,
             control,
+            .{ .path = self.model_dir, .publication = self.managed_publication },
+            null,
         );
         defer loaded.deinit();
         try self.verifyOwnerPublication(control);
@@ -3587,6 +3813,7 @@ pub const LoadedModel = struct {
         if (self.visual_projection_resource_lease) |*lease| lease.release();
         if (self.audio_projection_resource_lease) |*lease| lease.release();
         if (self.whisper_prompt_cache) |*cache| cache.deinit();
+        if (self.whisper_prompt_admission) |*lease| lease.release();
         if (self.shared_moe_cache) |cache| {
             cache.deinit();
             self.allocator.destroy(cache);
@@ -4748,11 +4975,12 @@ pub const ModelManager = struct {
         defer publication_lease.deinit(io);
         try self.verifyArtifactPublication(model_dir, man);
         try self.ensureResourceOwnerReady();
-        const kind = if (shouldPreferSentencePieceOverride(man.*, model_dir, self.allocator))
-            manifest_mod.TokenizerType.sentencepiece
-        else
-            man.tokenizer_type orelse return error.NoTokenizerFound;
-        const plan = try tokenizerLoadAdmissionPlan(self.allocator, model_dir, man, kind);
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = man.managed_publication });
+        defer artifacts.deinit();
+        artifacts.verification_cache = &self.verified_artifacts;
+        const gemma_compat = tokenizerGemmaCompat(man.*, model_dir);
+        const kind = try tokenizerKindWithArtifacts(man.*, &artifacts, gemma_compat);
+        const plan = try tokenizerLoadAdmissionPlanWithArtifacts(self.allocator, model_dir, man, kind, &artifacts);
         var lease = try self.acquireTokenizerAdmission(plan);
         errdefer if (lease) |*active| active.release();
         const domain = self.resource_domain.?;
@@ -4763,15 +4991,15 @@ pub const ModelManager = struct {
         // lease separate until all parsing and cache configuration succeeds.
         switch (kind) {
             .huggingface => {
-                assets.hf_tok = try loadHuggingFaceTokenizerFromManifest(self.allocator, man);
+                assets.hf_tok = try loadHuggingFaceTokenizerFromManifestWithArtifacts(self.allocator, man, &artifacts);
                 try assets.hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
                 try assets.hf_tok.?.configureParallelBpe(self.tokenizer_parallel_bpe_config);
             },
             .sentencepiece => {
-                assets.sp_tok = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
-                if (shouldEnableGemmaSentencePieceCompat(man.*, model_dir, self.allocator))
+                assets.sp_tok = try loadSentencePieceTokenizerWithArtifacts(self.allocator, man, &artifacts);
+                if (gemma_compat)
                     assets.sp_tok.?.setPreserveInlineSpecialsAfterLiteralBos(true);
-                try loadSentencePieceAddedTokens(model_dir, self.allocator, assets.sp_tok.?);
+                try loadSentencePieceAddedTokensWithArtifacts(self.allocator, assets.sp_tok.?, &artifacts);
             },
         }
         if (man.chat_template) |source| {
@@ -4780,10 +5008,62 @@ pub const ModelManager = struct {
             ct.* = try generation.ChatTemplate.init(self.allocator, source, man.bos_token, man.eos_token, man.unk_token, man.pad_token);
             assets.chat_tmpl = ct;
         }
+        try artifacts.verify();
         try self.verifyArtifactPublication(model_dir, man);
         if (lease) |*active| try active.retain(plan.resident);
         assets.lease = lease;
         return assets;
+    }
+
+    const ManagedWhisperPrompt = struct {
+        cache: whisper_prompt.PromptCache,
+        admission: ?runtime.tier.memory.AdmissionLease,
+        fn deinit(self: *ManagedWhisperPrompt) void {
+            self.cache.deinit();
+            if (self.admission) |*lease| lease.release();
+        }
+    };
+
+    fn loadNativeWhisperPrompt(self: *ModelManager, man: *const manifest_mod.ModelManifest, artifacts: *PublishedArtifacts, tokenizer: tokenizer_mod.Tokenizer) !ManagedWhisperPrompt {
+        const config_fallback = if (man.config_path == null) try artifacts.resolve("config.json") else null;
+        defer if (config_fallback) |path| self.allocator.free(path);
+        const config_path = man.config_path orelse config_fallback;
+        const generation_path = try artifacts.resolve("generation_config.json");
+        defer if (generation_path) |path| self.allocator.free(path);
+        const max_bytes = 16 * 1024 * 1024;
+        var encoded: usize = 0;
+        var read_limits: [2]usize = .{ 0, 0 };
+        for ([_]?[]const u8{ config_path, generation_path }, 0..) |maybe_path, i| if (maybe_path) |path| {
+            const size = (try std.Io.Dir.cwd().statFile(artifacts.io, path, .{})).size;
+            if (size > max_bytes) return error.FileTooLarge;
+            read_limits[i] = @intCast(size);
+            encoded = std.math.add(usize, encoded, read_limits[i]) catch return error.ResourceLimitExceeded;
+        };
+        // JSON value trees can greatly exceed compact integer-list encodings.
+        // Reserve their parse peak before reading, then retain only owned IDs.
+        var admission = if (self.admission_enabled)
+            try self.acquireAmountsWithEviction(
+                .cpu,
+                self.admissionLimitsForBackend(.{ .backend = .native }),
+                .{ .host_weight_bytes = try checkedScaledBytes(encoded, 32, 1024 * 1024) },
+            )
+        else
+            null;
+        errdefer if (admission) |*lease| lease.release();
+        var cache = blk: {
+            const config = if (config_path) |path| try artifacts.readPath(path, read_limits[0]) else null;
+            defer if (config) |bytes| self.allocator.free(bytes);
+            const generation_config = if (generation_path) |path| try artifacts.readPath(path, read_limits[1]) else null;
+            defer if (generation_config) |bytes| self.allocator.free(bytes);
+            break :blk try whisper_prompt.PromptCache.initFromBytes(self.allocator, generation_config, config, tokenizer);
+        };
+        errdefer cache.deinit();
+        const resident = @sizeOf(whisper_prompt.PromptCache) +
+            cache.automatic_ids.len * @sizeOf(whisper_prompt.ForcedDecoderId) +
+            cache.language_tokens.len * @sizeOf(whisper_prompt.LanguageToken) +
+            (cache.decode.suppress_tokens.len + cache.decode.begin_suppress_tokens.len) * @sizeOf(i32);
+        if (admission) |*lease| try lease.retain(.{ .host_weight_bytes = resident });
+        return .{ .cache = cache, .admission = admission };
     }
 
     /// Load only the admitted backend session. Artifact callers already own
@@ -5037,6 +5317,9 @@ pub const ModelManager = struct {
     process_memory_limit_bytes: usize = 0,
     process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     forced_run_admission_denials_for_testing: usize = 0,
+    /// Test-only stable-limit provider, allowing unified-CUDA coverage without
+    /// opening a driver or adding per-allocation instrumentation in production.
+    test_unified_limit_probe: if (builtin.is_test) ?*const fn (usize, usize) usize else void = if (builtin.is_test) null else {},
     resource_ownership: ResourceOwnership = .local,
     tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
@@ -5079,6 +5362,8 @@ pub const ModelManager = struct {
         *ComponentPlanCacheEntry,
     ) = .empty,
     component_plan_cache_lock: std.atomic.Mutex = .unlocked,
+    merged_decoder_membership: MergedDecoderMembershipCache = .{},
+    verified_artifacts: @import("../registry/published_artifacts.zig").VerificationCache = .{},
     unhealthy_backend_lock: std.atomic.Mutex = .unlocked,
     unhealthy_model_backends: std.AutoHashMapUnmanaged(ModelBackendHealthKey, u64) = .empty,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
@@ -5224,6 +5509,17 @@ pub const ModelManager = struct {
         pub fn deinit(self: @This()) void {
             self.domain.release();
         }
+
+        /// Metadata allocations participate in the same process-wide ledger.
+        /// The allocator separately reserves batched physical headroom, so
+        /// every byte participates without a kernel probe per parser node.
+        pub fn acquireMetadata(self: @This(), limits: runtime.tier.memory.Limits, bytes: usize) !runtime.tier.memory.AdmissionLease {
+            return self.domain.admission.tryAcquire(.cpu, limits, .{ .host_weight_bytes = bytes }, false);
+        }
+
+        pub fn reserveMetadataCapacity(self: @This(), bytes: usize) !runtime.tier.memory.LiveReservation {
+            return self.domain.admission.reserveLiveCapacity(bytes);
+        }
     };
 
     pub fn retainResourceLifetime(self: *ModelManager) !ResourceLifetime {
@@ -5284,7 +5580,10 @@ pub const ModelManager = struct {
     pub fn admitHostWeights(self: *ModelManager, peak_bytes: usize) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true);
+        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true) catch |err| {
+            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(peak_bytes) == 0) return err;
+            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_weight_bytes = peak_bytes }, true);
+        };
     }
 
     /// Exact admission ownership held by the live Hugging Face tokenizer
@@ -6014,6 +6313,7 @@ pub const ModelManager = struct {
         const lease_slots = [_]*const ?runtime.tier.memory.AdmissionLease{
             &model.resource_lease,
             &model.tokenizer_resource_lease,
+            &model.whisper_prompt_admission,
             &model.vision_resource_lease,
             &model.audio_resource_lease,
             &model.text_projection_resource_lease,
@@ -6165,6 +6465,10 @@ pub const ModelManager = struct {
     }
 
     fn tightenUnifiedDeviceAdmission(self: *const ModelManager) void {
+        if (builtin.is_test) if (self.test_unified_limit_probe) |probe| {
+            self.admissionController().tightenUnifiedLimit(probe(self.process_memory_limit_bytes, self.admission_limit_overrides.combined_limit_bytes));
+            return;
+        };
         if (backends.cudaUsesUnifiedMemory())
             self.admissionController().tightenUnifiedLimit(unifiedDeviceAdmissionLimit(self.process_memory_limit_bytes, self.admission_limit_overrides.combined_limit_bytes));
     }
@@ -6180,9 +6484,36 @@ pub const ModelManager = struct {
         requested_limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
     ) !runtime.tier.memory.AdmissionLease {
+        return self.acquireAmountsWithEvictionMode(backend_class, requested_limits, amounts, true);
+    }
+
+    pub fn acquireMetadataAmounts(self: *ModelManager, limits: runtime.tier.memory.Limits, bytes: usize) !runtime.tier.memory.AdmissionLease {
+        return self.acquireAmountsWithEvictionMode(.cpu, limits, .{ .host_weight_bytes = bytes }, false);
+    }
+
+    pub fn reserveMetadataCapacity(self: *ModelManager, bytes: usize) !runtime.tier.memory.LiveReservation {
+        try self.ensureResourceOwnerReady();
+        return self.admissionController().reserveLiveCapacity(bytes) catch |err| {
+            if (err != error.ResourceTemporarilyUnavailable) return err;
+            spinLock(&self.eviction_lock);
+            defer self.eviction_lock.unlock();
+            while (true) {
+                if (self.admissionController().reserveLiveCapacity(bytes)) |reservation| return reservation else |retry| {
+                    if (retry != error.ResourceTemporarilyUnavailable) return retry;
+                }
+                if (!self.reclaimOneForAdmission(.live_host)) return error.ResourceTemporarilyUnavailable;
+            }
+        };
+    }
+
+    fn acquireAmountsWithEvictionMode(self: *ModelManager, backend_class: runtime.tier.memory.BackendClass, requested_limits: runtime.tier.memory.Limits, amounts: runtime.tier.memory.AdmissionAmounts, check_live: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const limits = self.physicalRunLimits(backend_class, requested_limits);
-        self.tightenUnifiedDeviceAdmission();
+        // Metadata is a suballocation of an enclosing, already configured
+        // envelope (Budget.create acquires one with check_live=true). Avoid
+        // repeating stable-limit OS probes for every parser node; live physical
+        // capacity is checked separately by metadata's batched reservations.
+        if (check_live) self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         const requests = [_]runtime.tier.memory.AdmissionRequest{.{
             .backend_class = backend_class,
@@ -6193,7 +6524,7 @@ pub const ModelManager = struct {
             backend_class,
             limits,
             amounts,
-            true,
+            check_live,
             &pressure,
         ) catch |first_err| switch (first_err) {
             error.ResourceTemporarilyUnavailable => {
@@ -6204,7 +6535,7 @@ pub const ModelManager = struct {
                         backend_class,
                         limits,
                         amounts,
-                        true,
+                        check_live,
                         &pressure,
                     )) |lease| return lease else |retry_err| switch (retry_err) {
                         error.ResourceTemporarilyUnavailable => {},
@@ -6421,11 +6752,34 @@ pub const ModelManager = struct {
         const PathDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
         manager: *ModelManager,
+        // Inline storage survives loader copies and heap-owned session pools.
+        owner_path: [std.fs.max_path_bytes]u8 = undefined,
+        owner_path_len: usize = 0,
+        owner_publication: ?[32]u8 = null,
+        borrowed_artifacts: ?*PublishedArtifacts = null,
         validated_generation: ?ComponentPlanKey = null,
         allowed_backends: [7]backends.BackendType = undefined,
         allowed_backend_count: usize = 0,
         component_path_digests: [max_component_paths]PathDigest = undefined,
         component_path_count: usize = 0,
+
+        fn bindOwner(self: *ComponentLoader, path: []const u8, publication: ?[32]u8) !void {
+            if (path.len > self.owner_path.len) return error.NameTooLong;
+            @memcpy(self.owner_path[0..path.len], path);
+            self.owner_path_len = path.len;
+            self.owner_publication = publication;
+        }
+        fn selection(self: *const ComponentLoader) !ResolvedModel {
+            if (self.owner_path_len == 0) return error.UnvalidatedModelComponent;
+            return .{ .path = self.owner_path[0..self.owner_path_len], .publication = self.owner_publication };
+        }
+        /// Synchronous bundle construction may reuse its artifact proofs.
+        /// sessionPoolLoader() drops this borrow before extending plan lifetime.
+        pub fn withArtifacts(self: ComponentLoader, artifacts: *PublishedArtifacts) ComponentLoader {
+            var result = self;
+            result.borrowed_artifacts = artifacts;
+            return result;
+        }
 
         pub fn preferredBackends(self: *const ComponentLoader) []const backends.BackendType {
             return self.allowed_backends[0..self.allowed_backend_count];
@@ -6477,6 +6831,8 @@ pub const ModelManager = struct {
                 self.preferredBackends(),
                 null,
                 null,
+                try self.selection(),
+                self.borrowed_artifacts,
             );
         }
 
@@ -6491,6 +6847,8 @@ pub const ModelManager = struct {
                 self.preferredBackends(),
                 null,
                 control,
+                try self.selection(),
+                self.borrowed_artifacts,
             );
         }
 
@@ -6505,6 +6863,8 @@ pub const ModelManager = struct {
                 self.preferredBackends(),
                 shared_backend_ctx,
                 null,
+                try self.selection(),
+                self.borrowed_artifacts,
             );
         }
 
@@ -6514,7 +6874,12 @@ pub const ModelManager = struct {
             self: *const ComponentLoader,
             tokenizer_path: []const u8,
         ) !ManagedHfTokenizer {
-            return self.manager.loadManagedHfTokenizerFile(tokenizer_path);
+            var proof = try ComponentConstruction.init(self.manager.allocator, self.manager.session_manager.io orelse std.Options.debug_io, try self.selection(), null, self.borrowed_artifacts);
+            defer proof.deinit();
+            var tokenizer = try self.manager.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, proof.artifacts());
+            errdefer tokenizer.deinit();
+            try proof.finish();
+            return tokenizer;
         }
 
         /// Adapter for SessionPool's lazy factory. The pool takes ownership of
@@ -6526,6 +6891,8 @@ pub const ModelManager = struct {
                 .allocator = self.manager.allocator,
                 .loader = self.*,
             };
+            // A pool can outlive the resolver that produced this plan.
+            context.loader.borrowed_artifacts = null;
             return .{
                 .context = context,
                 .load_fn = loadForSessionPool,
@@ -6692,6 +7059,7 @@ pub const ModelManager = struct {
         if (loader.component_path_count == 0) return error.IncompleteModelBundle;
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         defer man.deinit();
+        try loader.bindOwner(model_dir, man.managed_publication);
         const allowed = if (self.serving_policy) |policy| blk: {
             const key = componentPlanKey(
                 model_dir,
@@ -6830,6 +7198,8 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         control: ?InferenceExecutionControl,
+        selected: ResolvedModel,
+        borrowed: ?*PublishedArtifacts,
     ) !ManagedSession {
         return self.loadManagedSessionWithAdmissionUsingManager(
             model_path,
@@ -6837,6 +7207,8 @@ pub const ModelManager = struct {
             shared_backend_ctx,
             &self.session_manager,
             control,
+            selected,
+            borrowed,
         );
     }
 
@@ -6847,8 +7219,15 @@ pub const ModelManager = struct {
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         source_session_manager: *const backends.SessionManager,
         control: ?InferenceExecutionControl,
+        selected: ResolvedModel,
+        borrowed: ?*PublishedArtifacts,
     ) !ManagedSession {
         if (control) |active| try active.update(.loading_model, 0, 1);
+        const io = if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io;
+        var construction_proof = try ComponentConstruction.init(self.allocator, io, selected, control, borrowed);
+        defer construction_proof.deinit();
+        if (construction_proof.owned != null) construction_proof.artifacts().verification_cache = &self.verified_artifacts;
+        try construction_proof.verifyPath(model_path);
         var device_order_scratch: backends.BackendOrderBuffer = undefined;
         const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
         var required_backend_scratch: [1]backends.BackendType = undefined;
@@ -6866,6 +7245,7 @@ pub const ModelManager = struct {
         for (effective_backends) |backend| {
             if (control) |active| try active.check();
             if (!backend.supportsDirectSessionLoad()) continue;
+            try construction_proof.verifyDirectory(model_path, backend);
             if (shared_backend_ctx) |shared| {
                 if (shared.backendType() != backend) continue;
             }
@@ -6968,6 +7348,7 @@ pub const ModelManager = struct {
                         self,
                     );
                 }
+                try construction_proof.finish();
                 return loaded.take();
             } else |err| {
                 rememberPreferredLoadError(&first_err, err);
@@ -6980,6 +7361,14 @@ pub const ModelManager = struct {
         self: *ModelManager,
         tokenizer_path: []const u8,
     ) !ManagedHfTokenizer {
+        return self.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, null);
+    }
+
+    fn loadManagedHfTokenizerFileWithArtifacts(
+        self: *ModelManager,
+        tokenizer_path: []const u8,
+        artifacts: ?*const PublishedArtifacts,
+    ) !ManagedHfTokenizer {
         const plan = try tokenizerFileAdmissionPlan(
             self.allocator,
             tokenizer_path,
@@ -6988,7 +7377,10 @@ pub const ModelManager = struct {
         var resource_lease = try self.acquireTokenizerAdmission(plan);
         errdefer if (resource_lease) |*lease| lease.release();
 
-        const tok_bytes = try c_file.readFile(self.allocator, tokenizer_path);
+        const tok_bytes = if (artifacts) |verified|
+            try verified.readPath(tokenizer_path, std.math.maxInt(usize))
+        else
+            try c_file.readFile(self.allocator, tokenizer_path);
         defer self.allocator.free(tok_bytes);
         const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(
             self.allocator,
@@ -7448,6 +7840,8 @@ pub const ModelManager = struct {
         var component_plan_it = self.component_plan_cache.iterator();
         while (component_plan_it.next()) |entry| entry.value_ptr.*.release();
         self.component_plan_cache.deinit(self.allocator);
+        self.merged_decoder_membership.deinit(self.allocator);
+        self.verified_artifacts.deinit(self.allocator);
         self.unhealthy_model_backends.deinit(self.allocator);
         var composite_assets_it = self.composite_assets.iterator();
         while (composite_assets_it.next()) |entry| {
@@ -7827,23 +8221,34 @@ pub const ModelManager = struct {
         var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, publication_io, model_dir);
         defer publication_lease.deinit(publication_io);
         const publication = try self.publicationForRequest(model_dir, control);
+        var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(self.allocator, publication_io, model_dir, .{ .publication = publication });
+        defer artifacts.deinit();
+        for (component_paths) |path| {
+            if (std.mem.endsWith(u8, path, ".onnx")) {
+                try artifacts.verifyOnnx(path);
+            } else try artifacts.verifyPath(path);
+        }
         var sidecars = try self.resolveWhisperSidecars(model_dir);
         defer sidecars.deinit();
         if (publication != null and !std.meta.eql(publication, sidecars.managed_publication)) return error.ModelArtifactsChanging;
 
-        var managed_tokenizer = try self.loadManagedHfTokenizerFile(sidecars.tokenizer_path);
+        var managed_tokenizer = try self.loadManagedHfTokenizerFileWithArtifacts(sidecars.tokenizer_path, &artifacts);
         errdefer managed_tokenizer.deinit();
-        var prompt_cache: ?whisper_prompt.PromptCache = if (kind == .seq2seq) null else try whisper_prompt.PromptCache.initFromPaths(
+        const config_bytes = try artifacts.readPath(sidecars.config_path, 16 * 1024 * 1024);
+        defer self.allocator.free(config_bytes);
+        const generation_bytes = if (kind != .seq2seq and sidecars.generation_config_path != null)
+            try artifacts.readPath(sidecars.generation_config_path.?, 16 * 1024 * 1024)
+        else
+            null;
+        defer if (generation_bytes) |bytes| self.allocator.free(bytes);
+        var prompt_cache: ?whisper_prompt.PromptCache = if (kind == .seq2seq) null else try whisper_prompt.PromptCache.initFromBytes(
             self.allocator,
-            sidecars.generation_config_path,
-            sidecars.config_path,
+            generation_bytes,
+            config_bytes,
             managed_tokenizer.tokenizer.tokenizer(),
         );
         errdefer if (prompt_cache) |*cache| cache.deinit();
-        const decoder_config = try encoder_decoder.loadDecoderConfigFile(
-            self.allocator,
-            sidecars.config_path,
-        );
+        const decoder_config = try encoder_decoder.parseDecoderConfig(config_bytes);
         var encoder: ?ManagedSession = null;
         errdefer if (encoder) |*managed| managed.deinit();
         var decoder: ?ManagedSession = null;
@@ -7863,7 +8268,7 @@ pub const ModelManager = struct {
                 const selected = [_][]const u8{ component_paths[0], component_paths[2] };
                 // Optional graph support must not constrain fallback placement.
                 const loaded = blk: {
-                    var loader = self.componentLoaderForPaths(model_dir, preferred_backends, &selected) catch |err| break :blk err;
+                    var loader = (self.componentLoaderForPaths(model_dir, preferred_backends, &selected) catch |err| break :blk err).withArtifacts(&artifacts);
                     encoder = (if (control) |active| loader.loadWithControl(selected[0], active) else loader.load(selected[0])) catch |err| break :blk err;
                     var strict = loader.restrictToBackend(encoder.?.session.backend()) catch |err| break :blk err;
                     decoder = (if (control) |active| strict.loadWithControl(selected[1], active) else strict.load(selected[1])) catch |err| break :blk err;
@@ -7882,12 +8287,13 @@ pub const ModelManager = struct {
                 }
             }
             if (decoder == null) {
-                var loader = try self.componentLoaderForPaths(model_dir, preferred_backends, component_paths[0..2]);
+                var loader = (try self.componentLoaderForPaths(model_dir, preferred_backends, component_paths[0..2])).withArtifacts(&artifacts);
                 encoder = if (control) |active| try loader.loadWithControl(component_paths[0], active) else try loader.load(component_paths[0]);
                 var strict = try loader.restrictToBackend(encoder.?.session.backend());
                 decoder = if (control) |active| try strict.loadWithControl(component_paths[1], active) else try strict.load(component_paths[1]);
             }
         }
+        try artifacts.verify();
         const verified_generation = try self.compositeRuntimeKey(
             model_dir,
             component_paths,
@@ -8149,26 +8555,90 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !CompositeAssetsHandle {
         if (control) |active| try active.check();
+        const publication = try self.publicationForRequest(model_dir, control);
         if (kind != .whisper_metadata and component_paths.len == 2 and std.mem.endsWith(u8, component_paths[1], ".onnx")) {
-            if (try encoder_decoder.findMergedDecoder(self.allocator, model_dir)) |candidate| {
+            if (try self.findMergedDecoderCached(model_dir, control)) |candidate| {
                 defer self.allocator.free(candidate);
                 if (!std.mem.eql(u8, candidate, component_paths[1])) {
                     const planned = [_][]const u8{ component_paths[0], component_paths[1], candidate };
                     // The runtime single-flight pins metadata-only selection.
                     // Artifact identity includes the optional graph; backend
                     // policy is applied only to the selected executable pair.
-                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, preferred_backends, model_type, kind, control) catch |err| switch (err) {
-                        error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => return self.acquireCompositeRuntimePlanned(model_dir, component_paths, preferred_backends, model_type, kind, control),
+                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, preferred_backends, model_type, kind, control, publication) catch |err| switch (err) {
+                        error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => {
+                            // Planning can reject a graph before its constructor
+                            // runs. Compatibility fallback must not conceal a
+                            // corrupt receipt-listed graph or external tensor.
+                            try self.verifyOptionalOnnxForFallback(model_dir, candidate, control);
+                            return self.acquireCompositeRuntimePlanned(model_dir, component_paths, preferred_backends, model_type, kind, control, publication);
+                        },
                         else => return err,
                     };
                 }
             }
         }
-        return self.acquireCompositeRuntimePlanned(model_dir, component_paths, preferred_backends, model_type, kind, control);
+        return self.acquireCompositeRuntimePlanned(model_dir, component_paths, preferred_backends, model_type, kind, control, publication);
     }
 
-    fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, preferred_backends: []const backends.BackendType, model_type: manifest_mod.ModelType, kind: CompositeKind, control: ?InferenceExecutionControl) !CompositeAssetsHandle {
-        const publication = try self.publicationForRequest(model_dir, control);
+    fn findMergedDecoderCached(self: *ModelManager, model_dir: []const u8, supplied: ?InferenceExecutionControl) !?[]const u8 {
+        const io = if (supplied) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io;
+        const control = supplied orelse InferenceExecutionControl{ .io = io };
+        try control.check();
+        const selected = ResolvedModel{ .path = model_dir, .publication = try self.publicationForRequest(model_dir, supplied) };
+        const key: ?[32]u8 = if (selected.publication != null) MergedDecoderMembershipCache.keyFor(selected) else null;
+        var builder: ?*std.atomic.Mutex = null;
+        defer if (builder) |mutex| mutex.unlock();
+        if (key) |value| {
+            switch (self.merged_decoder_membership.get(value)) {
+                .hit => |location| return self.mergedDecoderPath(model_dir, location),
+                .miss => {},
+            }
+            const mutex = &self.merged_decoder_membership.builders[value[0] % self.merged_decoder_membership.builders.len];
+            try control.lockWithPoll(mutex, 100 * std.time.ns_per_us);
+            builder = mutex;
+            switch (self.merged_decoder_membership.get(value)) {
+                .hit => |location| return self.mergedDecoderPath(model_dir, location),
+                .miss => {},
+            }
+        }
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer lease.deinit(io);
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = selected.publication });
+        defer artifacts.deinit();
+        var location: MergedDecoderMembershipCache.Location = .absent;
+        for ([_]MergedDecoderMembershipCache.Location{ .root, .onnx }) |candidate| {
+            if (try artifacts.resolve(candidate.relative().?)) |path| {
+                self.allocator.free(path);
+                location = candidate;
+                break;
+            }
+        }
+        try artifacts.verify();
+        try control.check();
+        if (key) |value| self.merged_decoder_membership.put(self.allocator, value, location) catch {};
+        return self.mergedDecoderPath(model_dir, location);
+    }
+
+    fn mergedDecoderPath(self: *ModelManager, root: []const u8, location: MergedDecoderMembershipCache.Location) !?[]const u8 {
+        const relative = location.relative() orelse return null;
+        // Keep the logical path. The constructor resolves it under the current
+        // installation fence, so an alias retarget cannot leave a stale target
+        // cached even when both installations have the same receipt digest.
+        return try std.fs.path.join(self.allocator, &.{ root, relative });
+    }
+
+    fn verifyOptionalOnnxForFallback(self: *ModelManager, model_dir: []const u8, path: []const u8, control: ?InferenceExecutionControl) !void {
+        const io = if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io;
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer lease.deinit(io);
+        var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = try self.publicationForRequest(model_dir, control) });
+        defer artifacts.deinit();
+        try artifacts.verifyOnnx(path);
+        try artifacts.verify();
+    }
+
+    fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, preferred_backends: []const backends.BackendType, model_type: manifest_mod.ModelType, kind: CompositeKind, control: ?InferenceExecutionControl, publication: ?[32]u8) !CompositeAssetsHandle {
+        if (!std.meta.eql(publication, try self.publicationForRequest(model_dir, control))) return error.ModelArtifactsChanging;
         var handle = try self.acquireCompositeRuntimePlannedInner(model_dir, component_paths, preferred_backends, model_type, kind, control, publication);
         errdefer handle.release();
         if (!std.meta.eql(publication, handle.get().managed_publication)) return error.ModelArtifactsChanging;
@@ -8262,7 +8732,8 @@ pub const ModelManager = struct {
     ) !void {
         const assets = handle.get();
         const current = if (assets.considered_merged_decoder and component_paths.len == 2) blk: {
-            const candidate = try encoder_decoder.findMergedDecoder(self.allocator, model_dir) orelse return error.ModelArtifactsChanging;
+            const selected = ResolvedModel{ .path = model_dir, .publication = assets.managed_publication };
+            const candidate = try self.findMergedDecoderCached(model_dir, selected.bind(InferenceExecutionControl{ .io = self.session_manager.io orelse std.Options.debug_io })) orelse return error.ModelArtifactsChanging;
             defer self.allocator.free(candidate);
             break :blk try self.compositeRuntimeKey(model_dir, &.{ component_paths[0], component_paths[1], candidate }, assets.kind, assets.preferred_backends, assets.model_type);
         } else try self.compositeRuntimeKey(model_dir, component_paths, assets.kind, assets.preferred_backends, assets.model_type);
@@ -8892,10 +9363,14 @@ pub const ModelManager = struct {
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
         if (publication != null and !std.meta.eql(publication, man.managed_publication)) return error.ModelArtifactsChanging;
-        const revision = try self.modelIdentityForManifest(model_dir, man);
+        var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = man.managed_publication });
+        defer artifacts.deinit();
+        artifacts.verification_cache = &self.verified_artifacts;
+        const revision = try modelIdentityWithArtifacts(self.allocator, io, model_dir, man, &artifacts);
         const planning = try chunkPlanningSnapshotWithControl(self.allocator, io, man, revision, control);
-        const kind = if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) manifest_mod.TokenizerType.sentencepiece else man.tokenizer_type orelse return error.NoTokenizerFound;
-        const plan = try tokenizerLoadAdmissionPlan(self.allocator, model_dir, &man, kind);
+        const gemma_compat = tokenizerGemmaCompat(man, model_dir);
+        const kind = try tokenizerKindWithArtifacts(man, &artifacts, gemma_compat);
+        const plan = try tokenizerLoadAdmissionPlanWithArtifacts(self.allocator, model_dir, &man, kind, &artifacts);
         var lease = try self.acquireTokenizerAdmission(plan);
         errdefer if (lease) |*active| active.release();
         var hf: ?*hf_tokenizer.HfTokenizer = null;
@@ -8907,14 +9382,14 @@ pub const ModelManager = struct {
         };
         switch (kind) {
             .huggingface => {
-                hf = try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
+                hf = try loadHuggingFaceTokenizerFromManifestWithArtifacts(self.allocator, &man, &artifacts);
                 try hf.?.configureBpeCache(self.tokenizer_cache_config);
                 try hf.?.configureParallelBpe(self.tokenizer_parallel_bpe_config);
             },
             .sentencepiece => {
-                sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
-                if (shouldEnableGemmaSentencePieceCompat(man, model_dir, self.allocator)) sp.?.setPreserveInlineSpecialsAfterLiteralBos(true);
-                try loadSentencePieceAddedTokens(model_dir, self.allocator, sp.?);
+                sp = try loadSentencePieceTokenizerWithArtifacts(self.allocator, &man, &artifacts);
+                if (gemma_compat) sp.?.setPreserveInlineSpecialsAfterLiteralBos(true);
+                try loadSentencePieceAddedTokensWithArtifacts(self.allocator, sp.?, &artifacts);
             },
         }
         const identity = if (man.embedding_style == .embedding_gemma2)
@@ -8925,6 +9400,7 @@ pub const ModelManager = struct {
         else
             std.fmt.bytesToHex(revision, .lower);
         if (lease) |*active| try active.retain(plan.resident);
+        try artifacts.verify();
         _ = try self.publicationForRequest(model_dir, control);
         try control.check();
         return .{ .model_dir = model_dir, .identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, io, model_dir, man.safetensors_path.?) else null, .allocator = self.allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
@@ -8996,8 +9472,11 @@ pub const ModelManager = struct {
             defer files.deinit();
             break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
         };
+        var tokenizer_artifacts = try PublishedArtifacts.init(self.allocator, publication_io, model_dir, .{ .publication = man.managed_publication });
+        defer tokenizer_artifacts.deinit();
+        tokenizer_artifacts.verification_cache = &self.verified_artifacts;
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
-        const resolution_revision = try modelIdentity(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man);
+        const resolution_revision = try modelIdentityWithArtifacts(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man, &tokenizer_artifacts);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -9023,23 +9502,22 @@ pub const ModelManager = struct {
             }
         }
 
+        // One receipt acquisition covers tokenizer admission, parsing and
+        // final adoption. Optional legacy siblings never override membership.
+        const gemma_compat = tokenizerGemmaCompat(man, model_dir);
         // Load tokenizer
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
         var sp_tok: ?*sentencepiece.Processor = null;
         var gliner_span_tokenizer_digest: ?gliner_decide_qualification.Digest = null;
 
-        const tokenizer_type = blk: {
-            if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) {
-                break :blk manifest_mod.TokenizerType.sentencepiece;
-            }
-            break :blk man.tokenizer_type orelse return error.NoTokenizerFound;
-        };
+        const tokenizer_type = try tokenizerKindWithArtifacts(man, &tokenizer_artifacts, gemma_compat);
         const tokenizer_admission_plan: ?ModelLoadAdmissionPlan = if (self.admission_enabled)
-            try tokenizerLoadAdmissionPlan(
+            try tokenizerLoadAdmissionPlanWithArtifacts(
                 self.allocator,
                 model_dir,
                 &man,
                 tokenizer_type,
+                &tokenizer_artifacts,
             )
         else
             null;
@@ -9061,7 +9539,7 @@ pub const ModelManager = struct {
             .huggingface => {
                 hf_tok = if (man.gliner_architecture == .boundary) blk: {
                     const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
-                    const bytes = try c_file.readFileMax(self.allocator, path, 32 * 1024 * 1024);
+                    const bytes = try tokenizer_artifacts.readPath(path, 32 * 1024 * 1024);
                     defer self.allocator.free(bytes);
                     // Parse the same bytes that pass the receipt check. A
                     // separate pathname check leaves a replacement window.
@@ -9069,7 +9547,7 @@ pub const ModelManager = struct {
                     break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
                 } else if (man.gliner_architecture == .span and (man.gliner_span_declared or man.gliner_specialty_profile != null)) blk: {
                     const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
-                    const bytes = try c_file.readFileMax(self.allocator, path, 32 * 1024 * 1024);
+                    const bytes = try tokenizer_artifacts.readPath(path, 32 * 1024 * 1024);
                     defer self.allocator.free(bytes);
                     const digest = gliner_decide_qualification.Digest.of(bytes);
                     if (man.gliner_span_tokenizer_digest) |expected| {
@@ -9081,22 +9559,22 @@ pub const ModelManager = struct {
                     });
                     gliner_span_tokenizer_digest = digest;
                     break :blk tokenizer;
-                } else try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
+                } else try loadHuggingFaceTokenizerFromManifestWithArtifacts(self.allocator, &man, &tokenizer_artifacts);
                 try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
                 try hf_tok.?.configureParallelBpe(
                     self.tokenizer_parallel_bpe_config,
                 );
             },
             .sentencepiece => {
-                const sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                const sp = try loadSentencePieceTokenizerWithArtifacts(self.allocator, &man, &tokenizer_artifacts);
                 errdefer {
                     sp.deinit();
                     self.allocator.destroy(sp);
                 }
-                if (shouldEnableGemmaSentencePieceCompat(man, model_dir, self.allocator)) {
+                if (gemma_compat) {
                     sp.setPreserveInlineSpecialsAfterLiteralBos(true);
                 }
-                try loadSentencePieceAddedTokens(model_dir, self.allocator, sp);
+                try loadSentencePieceAddedTokensWithArtifacts(self.allocator, sp, &tokenizer_artifacts);
                 sp_tok = sp;
             },
         }
@@ -9125,15 +9603,13 @@ pub const ModelManager = struct {
         if (gliner_span_tokenizer_digest) |digest|
             try session_factory.sealGlinerDecisionTokenizerDigest(session, digest);
 
-        var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
-            try whisper_prompt.PromptCache.init(
-                self.allocator,
-                model_dir,
-                if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer(),
-            )
+        var managed_whisper_prompt: ?ManagedWhisperPrompt = if (session_factory.getWhisperConfig(session) != null)
+            try self.loadNativeWhisperPrompt(&man, &tokenizer_artifacts, if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer())
         else
             null;
-        errdefer if (whisper_prompt_cache) |*cache| cache.deinit();
+        errdefer if (managed_whisper_prompt) |*prompt| prompt.deinit();
+
+        try tokenizer_artifacts.verify();
 
         // Embedding checkpoints can ship their decoder backbone's chat
         // template, but embedding execution never uses it. Qwen rerankers use
@@ -9263,7 +9739,8 @@ pub const ModelManager = struct {
             .executor_io = self.session_manager.io,
             .florence_reader_config = florence_reader_config,
             .chat_tmpl = chat_tmpl,
-            .whisper_prompt_cache = whisper_prompt_cache,
+            .whisper_prompt_cache = if (managed_whisper_prompt) |prompt| prompt.cache else null,
+            .whisper_prompt_admission = if (managed_whisper_prompt) |prompt| prompt.admission else null,
             .chat_template_failed = chat_template_failed,
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
@@ -9295,7 +9772,7 @@ pub const ModelManager = struct {
         sp_tok = null;
         tokenizer_resource_lease = null;
         chat_tmpl = null;
-        whisper_prompt_cache = null;
+        managed_whisper_prompt = null;
         shared_moe_cache = null;
         shared_prefetch = null;
         native_generate_coordinator = null;
@@ -9950,6 +10427,7 @@ fn admissionEvictionTestModel(last_used_ns: u64) LoadedModel {
     model.retired = false;
     model.resource_lease = null;
     model.tokenizer_resource_lease = null;
+    model.whisper_prompt_admission = null;
     model.vision_resource_lease = null;
     model.audio_resource_lease = null;
     model.text_projection_resource_lease = null;
@@ -10667,6 +11145,17 @@ fn tokenizerLoadAdmissionPlan(
     man: *const manifest_mod.ModelManifest,
     tokenizer_type: manifest_mod.TokenizerType,
 ) !ModelLoadAdmissionPlan {
+    return tokenizerLoadAdmissionPlanWithArtifacts(allocator, model_dir, man, tokenizer_type, null);
+}
+
+fn tokenizerLoadAdmissionPlanWithArtifacts(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    tokenizer_type: manifest_mod.TokenizerType,
+    artifacts: ?*PublishedArtifacts,
+) !ModelLoadAdmissionPlan {
+    var sentencepiece_sidecar_bytes: usize = 0;
     // Admission and loading must inspect the same catalog-selected artifacts,
     // including export-local vocabularies and root metadata fallbacks.
     if (tokenizer_type == .huggingface) {
@@ -10690,9 +11179,12 @@ fn tokenizerLoadAdmissionPlan(
             "added_tokens.json",
         };
         for (sidecars) |name| {
-            const path = try std.fs.path.join(allocator, &.{ model_dir, name });
+            const path = if (artifacts) |source|
+                (try source.resolve(name)) orelse continue
+            else
+                try std.fs.path.join(allocator, &.{ model_dir, name });
             defer allocator.free(path);
-            if (!c_file.fileExists(allocator, path)) continue;
+            if (artifacts == null and !c_file.fileExists(allocator, path)) continue;
             const size = std.math.cast(
                 usize,
                 try c_file.fileSize(allocator, path),
@@ -10706,8 +11198,10 @@ fn tokenizerLoadAdmissionPlan(
         if (found_sentencepiece) {
             return tokenizerAdmissionPlan(encoded, .sentencepiece);
         }
+        sentencepiece_sidecar_bytes = encoded;
     }
     if (man.gguf_path) |path| {
+        if (artifacts) |source| try source.verifyPath(path);
         var region = try c_file.MmapRegion.init(allocator, path);
         defer region.deinit();
         const encoded = try gguf_format.encodedMetadataBytesWithPrefix(
@@ -10716,7 +11210,7 @@ fn tokenizerLoadAdmissionPlan(
         );
         if (encoded == 0) return error.NoTokenizerFound;
         var plan = try tokenizerAdmissionPlan(
-            encoded,
+            std.math.add(usize, encoded, sentencepiece_sidecar_bytes) catch return error.ResourceLimitExceeded,
             if (tokenizer_type == .huggingface)
                 .huggingface
             else
@@ -11290,6 +11784,9 @@ fn loadSessionForPreferredBackends(
     control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
     if (control) |active| try active.check();
+    var proof: ?ComponentConstruction = null;
+    defer if (proof) |*construction| construction.deinit();
+    var verified_onnx_path: ?[]const u8 = null;
     var device_order_scratch: backends.BackendOrderBuffer = undefined;
     const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
     var required_backend_scratch: [1]backends.BackendType = undefined;
@@ -11340,6 +11837,22 @@ fn loadSessionForPreferredBackends(
         if (source_session_manager.kernel_jit.mode.failClosed() and
             !backend.supportsKernelJitSession()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        if (std.mem.endsWith(u8, candidate_path, ".onnx") and
+            (verified_onnx_path == null or !std.mem.eql(u8, verified_onnx_path.?, candidate_path)))
+        {
+            if (proof == null) proof = try ComponentConstruction.init(
+                manager.allocator,
+                if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io,
+                .{ .path = model_dir, .publication = man.managed_publication },
+                control,
+                null,
+            );
+            proof.?.artifacts().verification_cache = &manager.verified_artifacts;
+            // Integrity failures terminate the load rather than selecting a
+            // different backend that would reopen the same unauthenticated data.
+            try proof.?.verifyPath(candidate_path);
+            verified_onnx_path = candidate_path;
+        }
         if (control) |active| try active.updateDetail(
             .preparing_weights,
             0,
@@ -11471,6 +11984,7 @@ fn loadSessionForPreferredBackends(
             // keeping the construction peak leased until preparation drains.
             try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
             try session_factory.prepareLayaResident(loaded.session, control);
+            if (proof) |*construction| try construction.finish();
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             return loaded.take();
         } else |err| {
@@ -11947,7 +12461,7 @@ test "optional session adoption owns rollback and transfers admission exactly on
         manager.configureServingPolicy(.{ .allow_unknown = true });
         manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
         try manager.ensureResourceOwnerReady();
-        var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null);
+        var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null);
         defer primary.deinit();
         const baseline = manager.admissionController().snapshot();
         var model: LoadedModel = undefined;
@@ -12006,11 +12520,11 @@ test "component construction arms cancellation before backend entry and releases
     };
     var boundary = Boundary{ .manager = &manager };
     for (0..3) |_| {
-        try std.testing.expectError(error.ProcessIsolationRequired, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{}));
+        try std.testing.expectError(error.ProcessIsolationRequired, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{}, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null));
         try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
         try std.testing.expectError(error.OutOfMemory, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{
             .hard_cancellation = .{ .ptr = &boundary, .arm_fn = Boundary.arm, .disarm_fn = Boundary.disarm },
-        }));
+        }, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null));
         try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
     }
     try std.testing.expectEqual(@as(usize, 3), boundary.arms);
@@ -12036,7 +12550,7 @@ test "managed constructors retain cooperative fallback without a process boundar
     defer man.deinit();
     for ([_]bool{ false, true }) |component| {
         var loaded = if (component)
-            try manager.loadManagedSessionWithAdmission(root, &.{ .metal, .native }, null, .{})
+            try manager.loadManagedSessionWithAdmission(root, &.{ .metal, .native }, null, .{}, .{ .path = root, .publication = try managed_receipt.publicationGeneration(allocator, std.testing.io, root) }, null)
         else
             try loadSessionForPreferredBackends(&manager, &.{ .metal, .native }, root, man, &manager.session_manager, .{});
         try std.testing.expectEqual(backends.BackendType.native, loaded.session.backend());
@@ -12046,6 +12560,9 @@ test "managed constructors retain cooperative fallback without a process boundar
 }
 
 test "preferred load attempt releases admission on cancellation and guard failure" {
+    // This exercises Metal's process-required construction contract, which
+    // cannot be entered when Metal is excluded from the build.
+    if (!backends.BackendType.metal.available()) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
@@ -16470,7 +16987,7 @@ test "model selection lazy optional component retains primary publication" {
     sm.preferred_backends = &.{.native};
     var manager = ModelManager.init(a, sm);
     defer manager.deinit();
-    var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null);
+    var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null, .{ .path = root, .publication = try managed_receipt.publicationGeneration(a, std.testing.io, root) }, null);
     defer primary.deinit();
     var model: LoadedModel = undefined;
     model.managed_publication = publication_a;
@@ -16562,5 +17079,1170 @@ test "shared model load admission artifact sessions do not construct a second to
         try std.testing.expect(manager.currentAdmissionAmounts().hostTotalBytes() > 0);
         try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
     }
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+}
+
+test "model selection composite ignores unlisted merged decoders and preserves listed optimization" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const left = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try builder.tensorConst(&.{ 1, 1, 1, 1 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.add(left, bias));
+    const ordinary = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(ordinary);
+    for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = ordinary });
+    var merged = ml.graph.Graph.init(a);
+    defer merged.deinit();
+    var b = ml.graph.Builder.init(&merged);
+    const ids = try b.parameter("input_ids", ml.graph.Shape.init(.i64, &.{ 1, -1 }));
+    const encoder = try b.parameter("encoder_hidden_states", ml.graph.Shape.init(.f32, &.{ 1, -1, 4 }));
+    const branch = try b.parameter("use_cache_branch", ml.graph.Shape.init(.bool_, &.{1}));
+    const past = try b.parameter("past_key_values.0.decoder.key", ml.graph.Shape.init(.f32, &.{ 1, 1, -1, 4 }));
+    const ids_sum = try b.reduceSum(try b.convertDtype(ids, .f32), &.{ 0, 1 });
+    const branch_sum = try b.reduceSum(try b.convertDtype(branch, .f32), &.{0});
+    const logits = try b.add(encoder, try b.add(ids_sum, branch_sum));
+    const present = try b.add(past, past);
+    try merged.markOutput(logits);
+    try merged.markOutput(present);
+    const merged_bytes = try onnx_graph.exportGraph(a, &merged, .{ .node_name_overrides = &.{ .{ .node_id = logits, .name = "logits" }, .{ .node_id = present, .name = "present.0.decoder.key" } } });
+    defer a.free(merged_bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "decoder_model_merged.onnx", .data = merged_bytes });
+    const config = "{\"model_type\":\"t5\",\"vocab_size\":4,\"d_model\":4,\"decoder_start_token_id\":0}";
+    const tokenizer = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0},\"merges\":[]}}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "seq2seq", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "encoder_model.onnx", .size = ordinary.len }, .{ .path = "decoder_model.onnx", .size = ordinary.len }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    try std.testing.expect((try artifacts.resolve("decoder_model_merged.onnx")) == null);
+    try std.testing.expect((try encoder_decoder.findMergedDecoder(a, root)) == null);
+    const raw = try tmp.dir.realPathFileAlloc(io, "decoder_model_merged.onnx", a);
+    defer a.free(raw);
+    var signature_arena = std.heap.ArenaAllocator.init(a);
+    defer signature_arena.deinit();
+    const signature = try backends.imported_onnx_session.inspectSignature(signature_arena.allocator(), raw);
+    try std.testing.expect(@import("../pipelines/seq2seq_decode.zig").qualifiedSignature(signature.inputs, signature.outputs));
+    const paths = try encoder_decoder.findEncoderDecoderPaths(a, root);
+    defer a.free(paths.encoder);
+    defer a.free(paths.decoder);
+    var sessions = backends.SessionManager.initWithIo(a, io);
+    sessions.preferred_backends = &.{.native};
+    sessions.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    const selected = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = artifacts.publication };
+    var handle = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, selected.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process }));
+    defer handle.release();
+    try std.testing.expectEqual(.full_prefix, handle.get().decoder_execution);
+    try std.testing.expect(!handle.get().considered_merged_decoder);
+    try manager.validateCompositeAssetsCurrent(&handle, root, &.{ paths.encoder, paths.decoder });
+    // Publishing a receipt that includes the optional graph enables it.
+    var merged_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(merged_bytes, &merged_digest, .{});
+    const expanded = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "seq2seq", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "encoder_model.onnx", .size = ordinary.len }, .{ .path = "decoder_model.onnx", .size = ordinary.len }, .{ .path = "decoder_model_merged.onnx", .size = merged_bytes.len, .sha256 = std.fmt.bytesToHex(merged_digest, .lower) }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(expanded);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = expanded });
+    const included = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    var optimized = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, included.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process }));
+    defer optimized.release();
+    try std.testing.expectEqual(.merged_kv, optimized.get().decoder_execution);
+    try manager.validateCompositeAssetsCurrent(&optimized, root, &.{ paths.encoder, paths.decoder });
+    // A listed but corrupt optional graph must fail closed, not silently fall
+    // back to an ordinary decoder under the same receipt.
+    const corrupt = try a.dupe(u8, merged_bytes);
+    defer a.free(corrupt);
+    corrupt[0] ^= 1;
+    try @import("../registry/download.zig").writeFileAtomically(a, io, raw, corrupt);
+    try std.testing.expectError(error.ChecksumMismatch, manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, included.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process })));
+}
+
+test "host admission reclaims idle VAD residency but preserves active owners" {
+    const a = std.testing.allocator;
+    var node = try @import("server.zig").Node.init(a, .{});
+    defer node.deinit();
+    const silero = @import("../pipelines/silero_vad.zig");
+    const owner = try a.create(silero.SharedWeights);
+    owner.* = .{ .allocator = a, .weights = .{ .allocator = a, .stft_basis = &.{}, .encoder = @splat(.{ .weight = &.{}, .bias = &.{}, .in_channels = 0, .out_channels = 0, .stride = 1 }), .lstm_w = &.{}, .lstm_r = &.{}, .lstm_b = &.{}, .decoder_weight = &.{}, .decoder_bias = 0 } };
+    const resident = silero.residentWeightBytes(&owner.weights);
+    const limit = resident * 2;
+    node.model_manager.configureAdmissionLimits(.{ .host_limit_bytes = limit });
+    try node.model_manager.ensureResourceOwnerReady();
+    owner.admission = try node.model_manager.admissionController().tryAcquire(.cpu, node.model_manager.resource_domain.?.admission_limits, .{ .host_weight_bytes = resident }, false);
+    try node.host_caches.silero_weights.entries.append(a, .{ .path = try a.dupe(u8, "model"), .publication = null, .owner = owner, .used = 0 });
+    try std.testing.expectEqual(@as(usize, 1), owner.refs.load(.acquire));
+    // An active request/streaming session prevents reclamation.
+    owner.retain();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, node.model_manager.admitHostPreflightChecked(limit, false));
+    owner.release();
+    // Admission callbacks must not wait on a concurrent cache user.
+    try std.testing.expect(node.host_caches.silero_weights_lock.tryLock());
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, node.model_manager.admitHostPreflightChecked(limit, false));
+    node.host_caches.silero_weights_lock.unlock();
+    var retry = try node.model_manager.admitHostPreflightChecked(limit, false);
+    retry.release();
+    try std.testing.expectEqual(@as(usize, 0), node.host_caches.silero_weights.entries.items.len);
+}
+
+test "model selection unchanged preparation permits warm execution metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    var dir = try tmp.dir.openDir(io, "model", .{ .iterate = true });
+    defer dir.close(io);
+    try writeCancellationTestModel(dir, a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const Artifact = struct { path: []const u8, size: u64 };
+    var files: std.ArrayListUnmanaged(Artifact) = .empty;
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        try files.append(alloc, .{ .path = try alloc.dupe(u8, entry.name), .size = (try dir.statFile(io, entry.name, .{})).size });
+    }
+    const receipt = try std.json.Stringify.valueAlloc(alloc, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "gguf", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = files.items }, .{});
+    try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try tmp.dir.realPathFileAlloc(io, "model", a);
+    defer a.free(path);
+    var node = try @import("server.zig").Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    node.model_manager.session_manager.preferred_backends = &.{.native};
+    const selected = @import("../registry/model_selection.zig").ResolvedModel{ .path = path, .publication = try managed_receipt.publicationGeneration(a, io, path) };
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process });
+    var model = try node.model_manager.acquireFromDirWithControl(path, control);
+    defer model.release();
+    var before = try node.manifestForSelection(a, selected);
+    before.deinit();
+    var publication = try @import("../registry/catalog_publication.zig").Publication.prepare(a, io, root, "model");
+    defer publication.deinit();
+    try std.testing.expect(!publication.started);
+    _ = try @import("../registry/catalog_publication.zig").read(a, io, root);
+    var warm = (try node.model_manager.acquireLoadedModelWithControl(path, control)).?;
+    defer warm.release();
+    try std.testing.expect(warm.get() == model.get());
+    var during = try node.manifestForSelection(a, selected);
+    defer during.deinit();
+    try std.testing.expectEqual(selected.publication, during.managed_publication);
+}
+
+test "model selection primary ONNX requires receipted external weights and verifies their checksum" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const weight = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.add(input, weight));
+    const values = [_]f32{ 1, 2, 3, 4 };
+    var exported = try onnx_graph.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&values) } }} }, "weights.data");
+    defer exported.deinit(a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = exported.model_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = exported.external_data.?.bytes });
+    const config = "{\"model_type\":\"bert\",\"hidden_size\":4,\"num_attention_heads\":1,\"vocab_size\":4}";
+    const tokenizer = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0},\"merges\":[]}}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.onnx", .size = exported.model_bytes.len }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    try std.testing.expect((try artifacts.resolve("weights.data")) == null);
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    const selected = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = artifacts.publication };
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process });
+    try std.testing.expectError(error.InvalidManagedDownload, manager.acquireFromDirWithControl(root, control));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(exported.external_data.?.bytes, &digest, .{});
+    const expanded = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.onnx", .size = exported.model_bytes.len }, .{ .path = "weights.data", .size = exported.external_data.?.bytes.len, .sha256 = std.fmt.bytesToHex(digest, .lower) }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(expanded);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = expanded });
+    const included = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const included_control = included.bind(InferenceExecutionControl{ .io = io, .request_owned = false, .native_call_policy = .in_process });
+    // A fresh manager ensures the success path performs cold construction.
+    var verified_manager = ModelManager.init(a, sm);
+    defer verified_manager.deinit();
+    verified_manager.configureServingPolicy(.{ .allow_unknown = true });
+    var handle = try verified_manager.acquireFromDirWithControl(root, included_control);
+    defer handle.release();
+    var tensor = try backends.Tensor.initFloat32(a, "input", &.{4}, &.{ 0, 0, 0, 0 });
+    defer tensor.deinit();
+    const outputs = try handle.get().session.runWithControl(&.{tensor}, a, included_control);
+    defer {
+        for (outputs) |*output| output.deinit();
+        a.free(outputs);
+    }
+    try std.testing.expectEqualSlices(f32, &values, outputs[0].asFloat32());
+    const corrupt = try a.dupe(u8, exported.external_data.?.bytes);
+    defer a.free(corrupt);
+    corrupt[0] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = corrupt });
+    var corrupt_manager = ModelManager.init(a, sm);
+    defer corrupt_manager.deinit();
+    corrupt_manager.configureServingPolicy(.{ .allow_unknown = true });
+    try std.testing.expectError(error.ChecksumMismatch, corrupt_manager.acquireFromDirWithControl(root, included_control));
+}
+
+test "model selection lazy ONNX sessions enforce graph and external tensor receipts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const weight = try b.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.add(input, weight));
+    const values = [_]f32{ 2, 4, 6, 8 };
+    var exported = try onnx_graph.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&values) } }} }, "unlisted.data");
+    defer exported.deinit(a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "optional.onnx", .data = exported.model_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "unlisted.data", .data = exported.external_data.?.bytes });
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "gguf", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.gguf", .size = (try tmp.dir.statFile(io, "model.gguf", .{})).size }, .{ .path = "optional.onnx", .size = exported.model_bytes.len } } }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const optional = try tmp.dir.realPathFileAlloc(io, "optional.onnx", a);
+    defer a.free(optional);
+    const selected = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process });
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, control, selected, null);
+    defer primary.deinit();
+    var model: LoadedModel = undefined;
+    model.managed_publication = selected.publication;
+    model.model_dir = root;
+    model.allocator = a;
+    model.session = primary.session;
+    model.session_manager = &manager.session_manager;
+    model.model_manager = &manager;
+    model.kernel_jit_profile_bundle = null;
+    var slot: ?backends.Session = null;
+    var lease: ?runtime.tier.memory.AdmissionLease = null;
+    defer if (lease) |*held| held.release();
+    defer if (slot) |session| session.close();
+    const before = manager.currentAdmissionAmounts();
+    for ([_]DeclaredOptionalSessionKind{ .vision, .audio, .text_projection, .visual_projection, .audio_projection }) |kind| {
+        try std.testing.expectError(error.InvalidManagedDownload, model.ensureOptionalSessionWithControl(kind, &slot, &lease, optional, control));
+        try std.testing.expect(slot == null and lease == null);
+        try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(exported.external_data.?.bytes, &digest, .{});
+    const complete = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "gguf", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.gguf", .size = (try tmp.dir.statFile(io, "model.gguf", .{})).size }, .{ .path = "optional.onnx", .size = exported.model_bytes.len }, .{ .path = "unlisted.data", .size = exported.external_data.?.bytes.len, .sha256 = std.fmt.bytesToHex(digest, .lower) } } }, .{});
+    defer a.free(complete);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = complete });
+    try std.testing.expectError(error.ModelArtifactsChanging, model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, optional, control));
+    const current = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const current_control = current.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process });
+    var current_primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, current_control, current, null);
+    defer current_primary.deinit();
+    model.managed_publication = current.publication;
+    model.session = current_primary.session;
+    try std.testing.expect(try model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, optional, current_control));
+    var tensor = try backends.Tensor.initFloat32(a, "input", &.{4}, &.{ 0, 0, 0, 0 });
+    defer tensor.deinit();
+    const outputs = try slot.?.runWithControl(&.{tensor}, a, current_control);
+    defer {
+        for (outputs) |*output| output.deinit();
+        a.free(outputs);
+    }
+    try std.testing.expectEqualSlices(f32, &values, outputs[0].asFloat32());
+    // Bundle loaders reuse checksum proofs across component construction.
+    const Opens = struct {
+        var count: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.endsWith(u8, path, "unlisted.data")) count += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var table = io.vtable.*;
+    Opens.original = table.dirOpenFile;
+    table.dirOpenFile = Opens.open;
+    const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+    {
+        var published = try PublishedArtifacts.init(a, counted, root, .{ .publication = current.publication });
+        defer published.deinit();
+        const plan = (try manager.componentLoaderForPaths(root, &.{.native}, &.{optional})).withArtifacts(&published);
+        Opens.count = 0;
+        for (0..2) |_| {
+            var loaded = try plan.loadWithControl(optional, current_control);
+            loaded.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), Opens.count);
+    }
+    // A lazy pool owns the path/proof and cannot retain a transient resolver.
+    var pool_loader = blk: {
+        const transient_root = try a.dupe(u8, root);
+        defer a.free(transient_root);
+        var published = try PublishedArtifacts.init(a, io, root, .{ .publication = current.publication });
+        defer published.deinit();
+        const plan = (try manager.componentLoaderForPaths(transient_root, &.{.native}, &.{optional})).withArtifacts(&published);
+        break :blk try plan.sessionPoolLoader();
+    };
+    defer pool_loader.deinit();
+    var pooled = try pool_loader.load(optional);
+    defer pooled.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "unlisted.onnx", .data = exported.model_bytes });
+    const unlisted = try tmp.dir.realPathFileAlloc(io, "unlisted.onnx", a);
+    defer a.free(unlisted);
+    var absent: ?backends.Session = null;
+    var absent_lease: ?runtime.tier.memory.AdmissionLease = null;
+    try std.testing.expectError(error.InvalidManagedDownload, model.ensureOptionalSessionWithControl(.vision, &absent, &absent_lease, unlisted, current_control));
+    try std.testing.expect(absent == null and absent_lease == null);
+    const corrupt = try a.dupe(u8, exported.external_data.?.bytes);
+    defer a.free(corrupt);
+    corrupt[0] ^= 1;
+    const external_path = try tmp.dir.realPathFileAlloc(io, "unlisted.data", a);
+    defer a.free(external_path);
+    try @import("../registry/download.zig").writeFileAtomically(a, io, external_path, corrupt);
+    // The already materialized generation stays usable; a new cold component
+    // cannot adopt bytes that disagree with that generation's receipt.
+    try std.testing.expect(!try model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, optional, current_control));
+    var fresh: ?backends.Session = null;
+    var fresh_lease: ?runtime.tier.memory.AdmissionLease = null;
+    try std.testing.expectError(error.ChecksumMismatch, model.ensureOptionalSessionWithControl(.vision, &fresh, &fresh_lease, optional, current_control));
+    try std.testing.expect(fresh == null and fresh_lease == null);
+    const replacement = try a.dupe(u8, complete);
+    defer a.free(replacement);
+    const pin = std.mem.indexOf(u8, replacement, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").?;
+    @memset(replacement[pin..][0..40], 'b');
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = replacement });
+    try std.testing.expectError(error.ModelArtifactsChanging, pool_loader.load(optional));
+}
+
+test "model selection warm merged membership has constant filesystem work and tracks receipts" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Probe = struct {
+        var count: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirStatFile") = undefined;
+        fn stat(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+            count += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var small_count: ?usize = null;
+    for ([_]usize{ 8, 512 }) |count| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const Artifact = struct { path: []const u8, size: u64 = 4 };
+        const entries = try alloc.alloc(Artifact, count);
+        for (entries, 0..) |*entry, i| {
+            const name = if (i == 0) "encoder_model.onnx" else try std.fmt.allocPrint(alloc, "aux-{d}.bin", .{i});
+            entry.* = .{ .path = name };
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "data" });
+        }
+        const receipt = try std.json.Stringify.valueAlloc(alloc, .{ .version = @as(u32, 2), .artifacts = entries }, .{});
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+        var table = io.vtable.*;
+        Probe.original = table.dirStatFile;
+        table.dirStatFile = Probe.stat;
+        const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+        var sm = backends.SessionManager.initWithIo(a, counted);
+        sm.preferred_backends = &.{.native};
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+        Probe.count = 0;
+        for (0..10) |_| try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+        if (small_count) |expected| {
+            try std.testing.expectEqual(expected, Probe.count);
+        } else small_count = Probe.count;
+        std.debug.print("warm merged membership artifacts={d} stat_calls={d}\n", .{ count, Probe.count });
+        // Adding an unlisted file must not change a cached negative answer.
+        try tmp.dir.writeFile(io, .{ .sub_path = "decoder_model_merged.onnx", .data = "data" });
+        try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+        const expanded = try alloc.alloc(Artifact, entries.len + 1);
+        @memcpy(expanded[0..entries.len], entries);
+        expanded[entries.len] = .{ .path = "decoder_model_merged.onnx" };
+        const complete = try std.json.Stringify.valueAlloc(alloc, .{ .version = @as(u32, 2), .artifacts = expanded }, .{});
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = complete });
+        const path = (try manager.findMergedDecoderCached(root, null)).?;
+        defer a.free(path);
+        try std.testing.expect(std.mem.endsWith(u8, path, "decoder_model_merged.onnx"));
+        Probe.count = 0;
+        const warm = (try manager.findMergedDecoderCached(root, null)).?;
+        a.free(warm);
+        try std.testing.expectEqual(small_count.? / 10, Probe.count);
+        try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+    }
+}
+
+test "model selection merged membership remains bounded and legacy misses remain discoverable" {
+    const a = std.testing.allocator;
+    var cache: MergedDecoderMembershipCache = .{};
+    defer cache.deinit(a);
+    for (0..MergedDecoderMembershipCache.capacity * 2) |i| {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(std.mem.asBytes(&i));
+        try cache.put(a, hash.finalResult(), if (i % 2 == 0) .root else .absent);
+    }
+    try std.testing.expectEqual(@as(usize, MergedDecoderMembershipCache.capacity), cache.entries.items.len);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "decoder_model_merged.onnx", .data = "data" });
+    const found = (try manager.findMergedDecoderCached(root, null)).?;
+    defer a.free(found);
+    try std.testing.expectEqual(@as(usize, 0), manager.merged_decoder_membership.entries.items.len);
+}
+
+test "model selection merged membership cancellation releases its cold builder gate" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_model.onnx", .data = "data" });
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data =
+        \\{"version":2,"artifacts":[{"path":"encoder_model.onnx","size":4}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const key = MergedDecoderMembershipCache.keyFor(selected);
+    const builder = &manager.merged_decoder_membership.builders[key[0] % manager.merged_decoder_membership.builders.len];
+    try std.testing.expect(builder.tryLock());
+    const Cancel = struct {
+        var calls: usize = 0;
+        fn check(_: ?*anyopaque) !void {
+            calls += 1;
+            if (calls > 1) return error.Canceled;
+        }
+    };
+    Cancel.calls = 0;
+    try std.testing.expectError(error.Canceled, manager.findMergedDecoderCached(root, selected.bind(InferenceExecutionControl{ .io = io, .check_fn = Cancel.check })));
+    builder.unlock();
+    try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
+    try std.testing.expect(builder.tryLock());
+    builder.unlock();
+}
+test "model selection conflicting canonical aliases cannot substitute external tensor checksums" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const weight = try b.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.add(input, weight));
+    const intended = [_]f32{ 1, 1, 1, 1 };
+    const other = [_]f32{ 2, 2, 2, 2 };
+    var exported = try onnx_graph.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&intended) } }} }, "weights.data");
+    defer exported.deinit(a);
+    try std.testing.expectEqual(exported.external_data.?.bytes.len, std.mem.asBytes(&other).len);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = exported.model_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = exported.external_data.?.bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "alternate.data", .data = std.mem.asBytes(&other) });
+    const config = "{\"model_type\":\"bert\",\"hidden_size\":4,\"num_attention_heads\":1,\"vocab_size\":4}";
+    const tokenizer = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0},\"merges\":[]}}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(exported.external_data.?.bytes, &expected, .{});
+    var alternate: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.asBytes(&other), &alternate, .{});
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.onnx", .size = exported.model_bytes.len }, .{ .path = "weights.data", .size = exported.external_data.?.bytes.len, .sha256 = std.fmt.bytesToHex(expected, .lower) }, .{ .path = "alternate.data", .size = std.mem.asBytes(&other).len, .sha256 = std.fmt.bytesToHex(alternate, .lower) }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    try tmp.dir.deleteFile(io, "weights.data");
+    try tmp.dir.symLink(io, "alternate.data", "weights.data", .{});
+    const requested = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(requested);
+    try std.testing.expectError(error.InvalidManagedDownload, PublishedArtifacts.init(a, io, root, .{ .publication = selected.publication }));
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    try std.testing.expectError(error.InvalidManagedDownload, manager.componentLoaderForPaths(root, &.{.native}, &.{requested}));
+}
+
+test "model selection merged membership follows identical-receipt installation aliases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try b.tensorConst(&.{ 1, 1, 1, 1 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.add(input, bias));
+    const bytes = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    const config = "{\"model_type\":\"t5\",\"vocab_size\":4,\"d_model\":4,\"decoder_start_token_id\":0}";
+    const tokenizer = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0},\"merges\":[]}}";
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "encoder_model.onnx", .size = bytes.len }, .{ .path = "decoder_model.onnx", .size = bytes.len }, .{ .path = "decoder_model_merged.onnx", .size = bytes.len }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(receipt);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "installed-a", "installed-b" }) |directory| {
+        try tmp.dir.createDirPath(io, directory);
+        var dir = try tmp.dir.openDir(io, directory, .{});
+        defer dir.close(io);
+        for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx", "decoder_model_merged.onnx" }) |name| try dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+        try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    }
+    try tmp.dir.symLink(io, "installed-a", "current", .{ .is_directory = true });
+    const parent = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(parent);
+    const root = try std.fs.path.join(a, &.{ parent, "current" });
+    defer a.free(root);
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process, .request_owned = false });
+    const before = try encoder_decoder.findEncoderDecoderPaths(a, root);
+    defer a.free(before.encoder);
+    defer a.free(before.decoder);
+    var first = try manager.acquireCompositeRuntime(root, &.{ before.encoder, before.decoder }, .seq2seq, control);
+    first.release();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "installed-b", "current", .{ .is_directory = true });
+    try selected.verify(a, io);
+    const current = try encoder_decoder.findEncoderDecoderPaths(a, root);
+    defer a.free(current.encoder);
+    defer a.free(current.decoder);
+    try std.testing.expect(!std.mem.eql(u8, before.encoder, current.encoder));
+    var retry = try manager.acquireCompositeRuntime(root, &.{ current.encoder, current.decoder }, .seq2seq, control);
+    defer retry.release();
+}
+
+test "model selection composite metadata rejects declared checksum mismatches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try b.tensorConst(&.{ 1, 1, 1, 1 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.add(input, bias));
+    const bytes = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    const config = "{\"model_type\":\"t5\",\"vocab_size\":4,\"d_model\":4,\"decoder_start_token_id\":0}";
+    const tokenizer = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0},\"merges\":[]}}";
+    const generation_json = "{\"eos_token_id\":0}";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(config, &digest, .{});
+    var tokenizer_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tokenizer, &tokenizer_digest, .{});
+    var generation_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(generation_json, &generation_digest, .{});
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "encoder_model.onnx", .size = bytes.len }, .{ .path = "decoder_model.onnx", .size = bytes.len }, .{ .path = "config.json", .size = config.len, .sha256 = std.fmt.bytesToHex(digest, .lower) }, .{ .path = "tokenizer.json", .size = tokenizer.len, .sha256 = std.fmt.bytesToHex(tokenizer_digest, .lower) }, .{ .path = "generation_config.json", .size = generation_json.len, .sha256 = std.fmt.bytesToHex(generation_digest, .lower) } } }, .{});
+    defer a.free(receipt);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = generation_json });
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const replacement = try a.dupe(u8, config);
+    defer a.free(replacement);
+    const tag = "\"decoder_start_token_id\":0";
+    const at = std.mem.indexOf(u8, replacement, tag).?;
+    replacement[at + tag.len - 1] = '1';
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = replacement });
+    var artifacts = try PublishedArtifacts.init(a, io, root, .{ .publication = selected.publication });
+    defer artifacts.deinit();
+    try std.testing.expectError(error.ChecksumMismatch, artifacts.verifyFile("config.json"));
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    const paths = try encoder_decoder.findEncoderDecoderPaths(a, root);
+    defer a.free(paths.encoder);
+    defer a.free(paths.decoder);
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process, .request_owned = false });
+    try std.testing.expectError(error.ChecksumMismatch, manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, control));
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    var valid = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, control);
+    defer valid.release();
+    try std.testing.expectEqual(@as(i32, 0), valid.get().decoder_config.decoder_start_token_id);
+    try std.testing.expectEqual(selected.publication, valid.get().managed_publication);
+    const bad_tokenizer = try a.dupe(u8, tokenizer);
+    defer a.free(bad_tokenizer);
+    const token_at = std.mem.indexOf(u8, bad_tokenizer, "<unk>").?;
+    bad_tokenizer[token_at + 1] = 'x';
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = bad_tokenizer });
+    try std.testing.expectError(error.ChecksumMismatch, manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, control));
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    const bad_generation = try a.dupe(u8, generation_json);
+    defer a.free(bad_generation);
+    bad_generation[bad_generation.len - 2] = '1';
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = bad_generation });
+    try std.testing.expectError(error.ChecksumMismatch, manager.acquireCompositeRuntime(root, &.{}, .whisper_metadata, control));
+}
+
+fn writeArtifactIdentityTestReceipt(dir: std.Io.Dir, names: []const []const u8) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const files = try alloc.alloc(managed_receipt.ArtifactReceipt, names.len);
+    for (names, files) |name, *file| {
+        const bytes = try dir.readFileAlloc(io, name, alloc, .limited(1024 * 1024));
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        file.* = .{ .path = name, .size = bytes.len, .sha256 = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower)) };
+    }
+    const receipt = try std.json.Stringify.valueAlloc(alloc, managed_receipt.DownloadReceipt{ .version = 2, .artifacts = files }, .{});
+    try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+}
+
+test "model selection native directory constructors reject corrupt GGUF and retain valid loading" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "aaaa" });
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "config.json", "tokenizer.json", "model.onnx" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "bbbb" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const original = try tmp.dir.readFileAlloc(io, "model.gguf", a, .limited(1024 * 1024));
+    defer a.free(original);
+    const changed = try a.dupe(u8, original);
+    defer a.free(changed);
+    std.mem.writeInt(u32, changed[changed.len - 4 ..][0..4], @bitCast(@as(f32, 7.0)), .little);
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process, .request_owned = false });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = changed });
+    try std.testing.expectError(error.ChecksumMismatch, manager.loadManagedSessionWithAdmission(root, &.{.native}, null, control, selected, null));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = original });
+    var loaded = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, control, selected, null);
+    defer loaded.deinit();
+    try std.testing.expectEqual(backends.BackendType.native, loaded.session.backend());
+}
+
+test "model selection native directory proof authenticates single and sharded safetensors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |sharded| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const payload = if (sharded) "shard.safetensors" else "model.safetensors";
+        try tmp.dir.writeFile(io, .{ .sub_path = payload, .data = "aaaa" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"shard.safetensors\"}}" });
+        try writeArtifactIdentityTestReceipt(tmp.dir, if (sharded) &.{ payload, "model.safetensors.index.json" } else &.{payload});
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+        var proof = try ComponentConstruction.init(a, io, selected, null, null);
+        defer proof.deinit();
+        try proof.verifyDirectory(root, .native);
+        try proof.finish();
+        try tmp.dir.writeFile(io, .{ .sub_path = payload, .data = "bbbb" });
+        try std.testing.expectError(error.ChecksumMismatch, proof.verifyDirectory(root, .native));
+        if (sharded) {
+            try tmp.dir.writeFile(io, .{ .sub_path = payload, .data = "aaaa" });
+            try tmp.dir.writeFile(io, .{ .sub_path = "unused.onnx", .data = "data" });
+            try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.safetensors.index.json", "unused.onnx" });
+            var incomplete = try ComponentConstruction.init(a, io, .{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) }, null, null);
+            defer incomplete.deinit();
+            try std.testing.expectError(error.InvalidManagedDownload, incomplete.verifyDirectory(root, .native));
+        }
+    }
+}
+
+test "model selection tokenizer-only preparation authenticates consumed JSON" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    const tokenizer = try tmp.dir.readFileAlloc(io, "tokenizer.json", a, .limited(1024 * 1024));
+    defer a.free(tokenizer);
+    const changed = try a.dupe(u8, tokenizer);
+    defer a.free(changed);
+    const at = std.mem.indexOf(u8, changed, "\"a\":0").?;
+    changed[at + 1] = 'x';
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = changed });
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    try std.testing.expectError(error.ChecksumMismatch, manager.loadGenerationTokenizerAssets(root, &man));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    var assets = try manager.loadGenerationTokenizerAssets(root, &man);
+    defer assets.deinit();
+    try std.testing.expect(assets.hf_tok != null);
+}
+
+test "model selection WordPiece preparation verifies vocabulary and metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const names = [_][]const u8{ "model.onnx", "vocab.txt", "tokenizer_config.json", "special_tokens_map.json" };
+    const contents = [_][]const u8{ "data", "a\n[UNK]\n", "{\"do_lower_case\":true}", "{\"unk_token\":\"[UNK]\"}" };
+    for (names, contents) |name, bytes| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+    try writeArtifactIdentityTestReceipt(tmp.dir, &names);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    {
+        var valid = try manager.loadGenerationTokenizerAssets(root, &man);
+        defer valid.deinit();
+        try std.testing.expect(valid.hf_tok != null);
+    }
+    for (names[1..], contents[1..]) |name, original| {
+        const changed = try a.dupe(u8, original);
+        defer a.free(changed);
+        changed[1] ^= 1;
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = changed });
+        try std.testing.expectError(error.ChecksumMismatch, manager.loadGenerationTokenizerAssets(root, &man));
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = original });
+    }
+}
+
+test "model selection unlisted SentencePiece override cannot replace an admitted tokenizer" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "gemma");
+    var dir = try tmp.dir.openDir(io, "gemma", .{});
+    defer dir.close(io);
+    try writeCancellationTestModel(dir, a);
+    try writeArtifactIdentityTestReceipt(dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+    // Both a stale override and a large stale sidecar must be absent from
+    // selection and from its admission envelope.
+    try dir.writeFile(io, .{ .sub_path = "tokenizer.model", .data = "not a tokenizer" });
+    try dir.writeFile(io, .{ .sub_path = "added_tokens.json", .data = "not metadata" });
+    const root = try tmp.dir.realPathFileAlloc(io, "gemma", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    var assets = try manager.loadGenerationTokenizerAssets(root, &man);
+    defer assets.deinit();
+    try std.testing.expect(assets.hf_tok != null and assets.sp_tok == null);
+    const selected = ResolvedModel{ .path = root, .publication = man.managed_publication };
+    var primary = try manager.acquireFromDirWithControl(root, selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process, .request_owned = false }));
+    defer primary.release();
+    try std.testing.expect(primary.get().hf_tok != null);
+}
+
+test "model selection embedded SentencePiece accounts and verifies independent overlays" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const weights = try buildTestGgufWithT5Tokenizer(a);
+    defer a.free(weights);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = weights });
+    const overlay = "{\"added_tokens\":[{\"content\":\"<extra>\",\"id\":10}]}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = overlay });
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "tokenizer.json" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    man.tokenizer_type = .sentencepiece;
+    const Probe = struct {
+        var opens: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.endsWith(u8, path, "model.gguf")) opens += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var table = io.vtable.*;
+    Probe.original = table.dirOpenFile;
+    table.dirOpenFile = Probe.open;
+    const counted_io = std.Io{ .userdata = io.userdata, .vtable = &table };
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, counted_io));
+    defer manager.deinit();
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    const plan = try tokenizerLoadAdmissionPlanWithArtifacts(a, root, &man, .sentencepiece, &artifacts);
+    const encoded = try gguf_format.encodedMetadataBytesWithPrefix(weights, "tokenizer.");
+    const expected = try tokenizerAdmissionPlan(encoded + overlay.len, .sentencepiece);
+    try std.testing.expectEqualDeep(expected.resident, plan.resident);
+    {
+        Probe.opens = 0;
+        var valid = try manager.loadGenerationTokenizerAssets(root, &man);
+        defer valid.deinit();
+        try std.testing.expectEqual(@as(?i32, 10), valid.sp_tok.?.extra_reserved_map.get("<extra>"));
+        try std.testing.expectEqual(@as(usize, 1), Probe.opens);
+    }
+    {
+        var shared = try PublishedArtifacts.init(a, counted_io, root, null);
+        defer shared.deinit();
+        Probe.opens = 0;
+        _ = try modelIdentityWithArtifacts(a, counted_io, root, man, &shared);
+        _ = try tokenizerLoadAdmissionPlanWithArtifacts(a, root, &man, .sentencepiece, &shared);
+        const tokenizer = try loadSentencePieceTokenizerWithArtifacts(a, &man, &shared);
+        defer {
+            tokenizer.deinit();
+            a.destroy(tokenizer);
+        }
+        try shared.verify();
+        try std.testing.expectEqual(@as(usize, 1), Probe.opens);
+    }
+    const changed = try a.dupe(u8, overlay);
+    defer a.free(changed);
+    changed[std.mem.indexOf(u8, changed, "extra").?] = 'x';
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = changed });
+    try std.testing.expectError(error.ChecksumMismatch, manager.loadGenerationTokenizerAssets(root, &man));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = overlay });
+    weights[std.mem.indexOf(u8, weights, "hello").?] = 'j';
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = weights });
+    try std.testing.expectError(error.ChecksumMismatch, manager.loadGenerationTokenizerAssets(root, &man));
+}
+
+test "model selection managed and standalone direct GGUF tokenizer paths preserve publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const weights = try buildTestGgufWithGpt2Tokenizer(a);
+    defer a.free(weights);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = weights });
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{"model.gguf"});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const gguf = try tmp.dir.realPathFileAlloc(io, "model.gguf", a);
+    defer a.free(gguf);
+    var man = try manifest_mod.loadFromDir(a, gguf);
+    defer man.deinit();
+    try std.testing.expect(man.managed_publication != null);
+    try std.testing.expectEqual(man.managed_publication, try managed_receipt.publicationGeneration(a, io, gguf));
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    var direct = try manager.loadGenerationTokenizerAssets(gguf, &man);
+    defer direct.deinit();
+    try std.testing.expect(direct.hf_tok != null);
+    var directory_man = try manifest_mod.loadFromDir(a, root);
+    defer directory_man.deinit();
+    var valid = try manager.loadGenerationTokenizerAssets(root, &directory_man);
+    defer valid.deinit();
+    try std.testing.expect(valid.hf_tok != null);
+    try tmp.dir.deleteFile(io, managed_receipt.complete_filename);
+    var standalone_man = try manifest_mod.loadFromDir(a, gguf);
+    defer standalone_man.deinit();
+    try std.testing.expect(standalone_man.managed_publication == null);
+    var standalone = try manager.loadGenerationTokenizerAssets(gguf, &standalone_man);
+    defer standalone.deinit();
+    try std.testing.expect(standalone.hf_tok != null);
+}
+
+test "model selection HF tokenizer admission does not inspect unrelated config" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    const Probe = struct {
+        var config_reads: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.endsWith(u8, path, "/config.json")) config_reads += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var table = io.vtable.*;
+    Probe.original = table.dirOpenFile;
+    table.dirOpenFile = Probe.open;
+    const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, counted));
+    defer manager.deinit();
+    try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1, .combined_limit_bytes = 1 } }).configure(&manager);
+    const result = manager.loadGenerationTokenizerAssets(root, &man);
+    if (result) |loaded| {
+        var unexpected = loaded;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expect(err == error.ResourceTemporarilyUnavailable or err == error.ResourceLimitExceeded);
+    try std.testing.expectEqual(@as(usize, 0), Probe.config_reads);
+}
+
+test "model selection tokenizer quota rejects before configuration allocation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const Probe = struct {
+        var failing_state: *std.testing.FailingAllocator = undefined;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            const file = try original(raw, dir, path, options);
+            if (std.mem.endsWith(u8, path, "/config.json")) failing_state.fail_index = failing_state.alloc_index;
+            return file;
+        }
+    };
+    var table = io.vtable.*;
+    Probe.original = table.dirOpenFile;
+    Probe.failing_state = &failing;
+    table.dirOpenFile = Probe.open;
+    const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+    var manager = ModelManager.init(failing.allocator(), backends.SessionManager.initWithIo(failing.allocator(), counted));
+    defer manager.deinit();
+    try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1, .combined_limit_bytes = 1 } }).configure(&manager);
+    if (manager.loadGenerationTokenizerAssets(root, &man)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expect(err == error.ResourceTemporarilyUnavailable or err == error.ResourceLimitExceeded);
+    try std.testing.expect(!failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+}
+
+test "model selection repeated chunk planning reuses stamped checkpoint proofs" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    _ = try modelIdentity(a, io, root, man);
+    const Probe = struct {
+        var weight_opens: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.endsWith(u8, path, "/model.gguf")) weight_opens += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var table = io.vtable.*;
+    Probe.original = table.dirOpenFile;
+    table.dirOpenFile = Probe.open;
+    const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+    _ = try modelIdentity(a, counted, root, man);
+    try std.testing.expectEqual(@as(usize, 0), Probe.weight_opens);
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, counted));
+    defer manager.deinit();
+    for (0..2) |_| {
+        var planning = try manager.loadChunkPlanningAssets(root, counted, .{ .io = counted });
+        defer planning.deinit();
+        try planning.verify();
+    }
+    // The first acquisition authenticates the bytes; later acquisitions only
+    // revalidate stamps, including when the legacy identity cache was warm.
+    try std.testing.expectEqual(@as(usize, 1), Probe.weight_opens);
+    const original = try tmp.dir.readFileAlloc(io, "model.gguf", a, .limited(1024 * 1024));
+    defer a.free(original);
+    const changed = try a.dupe(u8, original);
+    defer a.free(changed);
+    changed[changed.len - 1] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = changed });
+    try std.testing.expectError(error.ChecksumMismatch, manager.loadChunkPlanningAssets(root, counted, .{ .io = counted }));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = original });
+    var restored = try manager.loadChunkPlanningAssets(root, counted, .{ .io = counted });
+    defer restored.deinit();
+    try restored.verify();
+    try std.testing.expectEqual(@as(usize, 3), Probe.weight_opens);
+}
+
+test "model selection native Whisper consumes only authenticated prompt sidecars" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(tmp.dir, a, "model.safetensors");
+    const cfg = "{\"model_type\":\"whisper\",\"d_model\":4,\"encoder_layers\":1,\"decoder_layers\":1,\"encoder_attention_heads\":1,\"decoder_attention_heads\":1,\"encoder_ffn_dim\":8,\"decoder_ffn_dim\":8,\"vocab_size\":14,\"num_mel_bins\":4}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
+    const tok = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"},{\"id\":10,\"content\":\"<|en|>\"},{\"id\":12,\"content\":\"<|transcribe|>\"},{\"id\":13,\"content\":\"<|notimestamps|>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0,\"<|en|>\":10,\"<|transcribe|>\":12,\"<|notimestamps|>\":13},\"merges\":[]}}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tok });
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.safetensors", "config.json", "tokenizer.json" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = "{\"eos_token_id\":7}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var published = try PublishedArtifacts.init(a, io, root, null);
+    defer published.deinit();
+    try std.testing.expect((try published.resolve("generation_config.json")) == null);
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .combined_limit_bytes = 128 * 1024 * 1024 } }).configure(&manager);
+    var loaded = try manager.acquireFromDirWithControl(root, .{ .io = io, .request_owned = false, .native_call_policy = .in_process });
+    defer loaded.release();
+    try std.testing.expectEqual(@as(i32, 50257), loaded.get().whisper_prompt_cache.?.decode.eot_id);
+    try std.testing.expect(loaded.get().whisper_prompt_admission != null);
+    const first_runtime = loaded.get().runtime_id;
+    loaded.release();
+    try std.testing.expectEqual(UnloadRuntimeResult.unloaded, manager.unloadRuntime(first_runtime));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.safetensors", "config.json", "tokenizer.json", "generation_config.json" });
+    var listed = try manager.acquireFromDirWithControl(root, .{ .io = io, .request_owned = false, .native_call_policy = .in_process });
+    defer listed.release();
+    try std.testing.expectEqual(@as(i32, 7), listed.get().whisper_prompt_cache.?.decode.eot_id);
+    const listed_runtime = listed.get().runtime_id;
+    listed.release();
+    try std.testing.expectEqual(UnloadRuntimeResult.unloaded, manager.unloadRuntime(listed_runtime));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = "{\"eos_token_id\":8}" });
+    try std.testing.expectError(error.ChecksumMismatch, manager.acquireFromDirWithControl(root, .{ .io = io, .request_owned = false, .native_call_policy = .in_process }));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    // Authorized but malformed settings fail parsing and refund the temporary
+    // prompt envelope as well as the already constructed tokenizer/session.
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = "{" });
+    try writeArtifactIdentityTestReceipt(tmp.dir, &.{ "model.safetensors", "config.json", "tokenizer.json", "generation_config.json" });
+    try std.testing.expectError(error.InvalidWhisperDecoderConfig, manager.acquireFromDirWithControl(root, .{ .io = io, .request_owned = false, .native_call_policy = .in_process }));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    var metadata = try manifest_mod.loadFromDir(a, root);
+    defer metadata.deinit();
+    var prompt_artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer prompt_artifacts.deinit();
+    const prompt_tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(a, tok);
+    defer prompt_tokenizer.deinitSelf();
+    var constrained = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer constrained.deinit();
+    try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1, .combined_limit_bytes = 1 } }).configure(&constrained);
+    if (constrained.loadNativeWhisperPrompt(&metadata, &prompt_artifacts, prompt_tokenizer.tokenizer())) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expect(err == error.ResourceTemporarilyUnavailable or err == error.ResourceLimitExceeded);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, constrained.currentAdmissionAmounts());
+}
+
+test "model selection legacy Whisper metadata growth cannot exceed its admission" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    const original = "{\"eos_token_id\":7}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = original });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const grown = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(grown);
+    @memset(grown, ' ');
+    @memcpy(grown[0..original.len], original);
+    const Probe = struct {
+        var original_open: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        var fixture_dir: std.Io.Dir = undefined;
+        var replacement: []const u8 = undefined;
+        var grow = true;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (grow and std.mem.endsWith(u8, path, "/generation_config.json")) {
+                grow = false;
+                fixture_dir.writeFile(std.testing.io, .{ .sub_path = "generation_config.json", .data = replacement }) catch return error.Unexpected;
+            }
+            return original_open(raw, dir, path, options);
+        }
+    };
+    var table = io.vtable.*;
+    Probe.original_open = table.dirOpenFile;
+    Probe.fixture_dir = tmp.dir;
+    Probe.replacement = grown;
+    Probe.grow = true;
+    table.dirOpenFile = Probe.open;
+    const growing_io = std.Io{ .userdata = io.userdata, .vtable = &table };
+    var artifacts = try PublishedArtifacts.init(a, growing_io, root, null);
+    defer artifacts.deinit();
+    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(a,
+        \\{"version":"1.0","added_tokens":[{"id":0,"content":"<|transcribe|>"},{"id":1,"content":"<|notimestamps|>"}],"model":{"type":"BPE","vocab":{"<|transcribe|>":0,"<|notimestamps|>":1},"merges":[]}}
+    );
+    defer tokenizer.deinitSelf();
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, growing_io));
+    defer manager.deinit();
+    try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .combined_limit_bytes = 128 * 1024 * 1024 } }).configure(&manager);
+    const man = manifest_mod.ModelManifest{ .allocator = a };
+    try std.testing.expectError(error.FileTooLarge, manager.loadNativeWhisperPrompt(&man, &artifacts, tokenizer.tokenizer()));
+    try std.testing.expect(!Probe.grow);
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
 }
