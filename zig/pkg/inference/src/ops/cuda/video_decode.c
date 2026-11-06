@@ -17,6 +17,7 @@
 #include "video_headers/dynlink_nvcuvid.h"
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <stdint.h>
 
 // The callback borrows an NV12 or P016 surface on the caller's CUDA context/stream.
@@ -95,7 +96,7 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
              : ((matrix != 1 && matrix != 2 && matrix != 5 && matrix != 6) ||
                 (primaries != 1 && primaries != 2 && primaries != 5 && primaries != 6) ||
                 (transfer != 1 && transfer != 2 && transfer != 6 && transfer != 13))) ||
-        !f->min_num_decode_surfaces || f->min_num_decode_surfaces > 32) { d->failed = 2; return 0; }
+        !f->min_num_decode_surfaces || f->min_num_decode_surfaces > 32) { fprintf(stderr,"NVSEQ reject w=%u h=%u ew=%u eh=%u m=%u p=%u t=%u fr=%u depth=%u/%u prog=%d dar=%d:%d surf=%u\n",w,h,d->expected_width,d->expected_height,matrix,primaries,transfer,full_range,f->bit_depth_luma_minus8,f->bit_depth_chroma_minus8,f->progressive_sequence,f->display_aspect_ratio.x,f->display_aspect_ratio.y,f->min_num_decode_surfaces); d->failed = 2; return 0; }
     // Never silently reinterpret a stream whose geometry or color changes.
     int compatible = d->codec == f->codec && d->width == w && d->height == h && d->coded_width == f->coded_width &&
         d->coded_height == f->coded_height && d->surfaces >= f->min_num_decode_surfaces && d->bit_depth == bit_depth &&

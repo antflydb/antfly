@@ -1028,6 +1028,36 @@ test "video CUDA preprocessing matches CPU RGB resize and planar patches" {
     };
 }
 
+test "NVDEC decodes Main 10 HDR and rotated HEVC with its display metadata" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const Expected = struct { name: []const u8, high: u32, tone: u32, rotation: u32 };
+    const Seen = struct {
+        expected: Expected,
+        frames: usize = 0,
+        fn consume(raw: *anyopaque, frame: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.expected.high, frame.high_depth);
+            try std.testing.expectEqual(self.expected.tone, frame.tone);
+            try std.testing.expect(frame.rotation % 2 == self.expected.rotation % 2);
+            self.frames += 1;
+        }
+    };
+    inline for ([_]Expected{
+        .{ .name = "hevc-10bit.mp4", .high = 1, .tone = 0, .rotation = 0 },
+        .{ .name = "hevc-hlg.mp4", .high = 1, .tone = 2, .rotation = 0 },
+        .{ .name = "hevc-pq.mp4", .high = 1, .tone = 1, .rotation = 0 },
+        .{ .name = "hevc-rot90.mp4", .high = 0, .tone = 0, .rotation = 3 },
+        .{ .name = "hevc-hlg-rot90.mp4", .high = 1, .tone = 2, .rotation = 3 },
+    }) |expected| {
+        var seen = Seen{ .expected = expected };
+        _ = try decodeMp4(a, &compute.ctx, @embedFile("../../testdata/video/codecs/" ++ expected.name), .{ .context = &seen, .consume = Seen.consume });
+        try std.testing.expect(seen.frames != 0);
+    }
+}
+
 test "video PTX matches its checked source" {
     const source = @embedFile("video_preprocess.cu");
     var digest: [32]u8 = undefined;
