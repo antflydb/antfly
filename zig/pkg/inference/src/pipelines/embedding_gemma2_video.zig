@@ -784,7 +784,7 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
     if (matrix == .gbr_identity and (tone != .none or (primaries != 1 and primaries != 2))) return error.UnsupportedVideoColor;
     if (tone != .none) {
         // Require explicit consistent primaries; never guess an HDR gamut.
-        if (track.codec != .avc or !((matrix == .bt2020_ncl and primaries == 9) or (matrix == .bt709 and primaries == 1))) return error.UnsupportedVideoColor;
+        if ((track.codec != .avc and track.codec != .hevc) or !((matrix == .bt2020_ncl and primaries == 9) or (matrix == .bt709 and primaries == 1))) return error.UnsupportedVideoColor;
     } else if (matrix == .bt2020_ncl or (primaries != 2 and primaries != 1 and primaries != 5 and primaries != 6)) return error.UnsupportedVideoColor;
     const g = projector.embeddingGemma2VideoGeometry(display.width, display.height);
     // Apply SAR through target aspect; a single separable resample avoids an
@@ -831,7 +831,7 @@ pub const PacketInput = struct {
             });
             return .{ .reader = normalized.reader, .snapshot = normalized.snapshot };
         }
-        return .{ .reader = try media.mp4.Reader.init(a, source, .{}) };
+        return .{ .reader = try media.mp4.Reader.init(a, source, video.mp4_coded.limits) };
     }
     pub fn deinit(self: *PacketInput) void {
         self.reader.deinit();
@@ -1230,6 +1230,11 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
     if (metal and reader.track.codec == .avc and !reader.track.inband_parameter_sets and try compatibleApple(a, reader.track.avcc)) {
         plan.apple_surface_bytes = std.math.cast(usize, try video.apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, selected.len)) orelse return error.ResourceLimitExceeded;
         if (plan.apple_surface_bytes > 512 * 1024 * 1024) plan.apple_surface_bytes = 0;
+    }
+    if (metal and reader.track.codec == .hevc and video.apple_hevc.hasParameterSets(reader.track.codec_config)) {
+        if (video.apple_hevc.surfaceBytes(reader.track)) |bytes| {
+            if (bytes <= video.apple_hevc.max_surface_bytes) plan.apple_surface_bytes = std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded;
+        } else |_| {}
     }
     for (selected) |index| {
         try control.check();
@@ -2204,6 +2209,18 @@ fn decodeAppleH264(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
     capture.decoder.record(if (batch.hardware) .apple_hardware else .apple_software);
     return true;
 }
+fn decodeAppleHevc(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, capture: *Capture) !bool {
+    if (!appleAllowed(capture.decoder)) return false;
+    const receipt = video.apple_hevc.decodeTo(a, reader, selected, .{
+        .pool = capture.pool,
+        .device_surfaces = capture.metal != null,
+    }, .{ .context = capture, .accept = Capture.publishAppleHevc }) catch |err| {
+        try appleUnavailable(capture, err);
+        return false;
+    };
+    capture.decoder.record(if (receipt.hardware) .apple_hardware else .apple_software);
+    return true;
+}
 fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !video.apple_webm.Receipt {
     if (input) |bound| if (bound.apple_continuation) |owner| {
         if (try owner.decode(reader, indexed, selected, capture)) |value| return value;
@@ -2243,6 +2260,11 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, requested: [
     var slots: [32]usize = undefined;
     const original_slots = capture.decode_slots;
     defer capture.decode_slots = original_slots;
+    if (reader.track.codec == .hevc) {
+        if (capture.prefetch) |producer| try producer.waitForDecoder();
+        if (try decodeAppleHevc(a, reader, selected, capture)) return;
+        return error.UnsupportedVideoCodec;
+    }
     if (reader.track.codec == .mjpeg) {
         if (capture.prefetch) |producer| try producer.waitForDecoder();
         if (capture.decoder.policy == .apple) return error.UnsupportedVideoProfile;
@@ -2994,6 +3016,21 @@ const Capture = struct {
             if (self.resident == null) @memcpy(self.output[slot * 140 * 512 ..][0..n], self.output[first * 140 * 512 ..][0..n]);
             self.frame_tokens[slot] = self.frame_tokens[first];
         };
+    }
+    fn publishAppleHevc(raw: *anyopaque, id: usize, surface: *const video.apple.Surface) !void {
+        const self: *Capture = @ptrCast(@alignCast(raw));
+        self.apple_published += 1;
+        const slot = std.mem.indexOfScalar(usize, self.selected, id) orelse return error.InvalidPacketIndex;
+        if (self.copyDuplicate(slot)) return;
+        var options = try policy(self.track, surface.width, surface.height);
+        options.admission_pool = self.pool;
+        if (try self.observe(slot, .{ .surface = surface }, options)) return;
+        if (self.metal) |metal| {
+            const prepared = try metal.submit(self.a, surface, options, self.control);
+            return self.projectGpu(slot, prepared, options);
+        }
+        const patches = try video.preparation.reference(self.a, surface, options, self.control);
+        try self.projectOwned(slot, patches, options, self.a);
     }
     fn publishDecoded(raw: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));

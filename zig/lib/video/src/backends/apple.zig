@@ -56,7 +56,7 @@ pub const Format = enum(u32) {
         return if (self.bitDepth() == 10) 6 else 0;
     }
 };
-pub const Codec = enum(u32) { h264 = 0x61766331, vp9 = 0x76703039, av1 = 0x61763031 };
+pub const Codec = enum(u32) { h264 = 0x61766331, vp9 = 0x76703039, av1 = 0x61763031, hevc = 0x68766331 };
 pub fn hardwareSupported(codec: Codec) bool {
     return supported and av_decoder_supports(@backingInt(codec)) != 0;
 }
