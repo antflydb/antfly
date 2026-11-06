@@ -18,13 +18,17 @@
 //! artifacts are revalidated on the execution path. No model weights are read.
 const std = @import("std");
 const registry = @import("registry.zig");
+pub const ResolvedModel = @import("model_selection.zig").ResolvedModel;
 
 pub const tasks = [_][]const u8{ "embedders", "rerankers", "chunkers", "generators", "extractors", "deciders", "rewriters", "readers", "transcribers", "classifiers" };
 
 pub fn scopes(task: []const u8) []const []const u8 {
     if (std.mem.eql(u8, task, "readers")) return &.{ "readers", "transcribers", "generators" };
-    if (std.mem.eql(u8, task, "deciders")) return &.{"extractors"};
+    if (std.mem.eql(u8, task, "deciders")) return &.{ "extractors", "embedders" };
     return &.{}; // Other task categories use their own physical scope.
+}
+pub fn firstScopeWins(task: []const u8) bool {
+    return std.mem.eql(u8, task, "deciders");
 }
 
 const Owner = struct { path: ?[]const u8, priority: u2 = 0 };
@@ -182,6 +186,7 @@ pub const Inventory = struct {
                 var iterator = local.iterator();
                 while (iterator.next()) |candidate| {
                     const owner = try owners.getOrPut(a, candidate.key_ptr.*);
+                    if (owner.found_existing and firstScopeWins(task)) continue;
                     if (!owner.found_existing) owner.value_ptr.* = candidate.value_ptr.* else if (owner.value_ptr.path == null or candidate.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, candidate.value_ptr.path.?)) owner.value_ptr.path = null;
                 }
             }
@@ -338,7 +343,11 @@ pub const Cache = struct {
         return lease.slot.inventory.clone(allocator);
     }
 
+    // Path-only adapter for metadata inspection and existing registry tooling.
     pub fn resolve(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8) !?[]u8 {
+        return if (try self.resolveSelection(allocator, io, root, requested, task)) |selected| @constCast(selected.path) else null;
+    }
+    pub fn resolveSelection(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8) !?ResolvedModel {
         const path = blk: {
             const lease = try self.acquire(io, root);
             defer lease.release();
@@ -348,9 +357,11 @@ pub const Cache = struct {
         errdefer allocator.free(path);
         var temporary = std.heap.ArenaAllocator.init(allocator);
         defer temporary.deinit();
-        const names = try registry.managedModelSelectorsAlloc(temporary.allocator(), io, path);
-        for (names) |name| if (std.mem.eql(u8, name, requested)) return path;
-        if (names.len == 0 and std.mem.indexOfAny(u8, requested, ":@") == null) return path;
+        const proof = try registry.managedModelSelectionAlloc(temporary.allocator(), io, path);
+        if (!proof.rejected) {
+            for (proof.names) |name| if (std.mem.eql(u8, name, requested)) return .{ .path = path, .publication = proof.publication };
+            if (proof.names.len == 0 and std.mem.indexOfAny(u8, requested, ":@") == null) return .{ .path = path, .publication = proof.publication };
+        }
         allocator.free(path);
         self.invalidate(io);
         return null;

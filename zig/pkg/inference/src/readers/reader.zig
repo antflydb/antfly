@@ -320,6 +320,21 @@ pub const LoadedReader = union(enum) {
         model_manager: *model_manager_mod.ModelManager,
         control: ?InferenceExecutionControl,
     ) !LoadedReader {
+        const io = if (control) |active| active.io orelse session_manager.io orelse std.Options.debug_io else session_manager.io orelse std.Options.debug_io;
+        if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
+        var result = try loadSelectedReader(allocator, model_path, session_manager, model_manager, control);
+        errdefer result.deinit();
+        if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
+        return result;
+    }
+
+    fn loadSelectedReader(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !LoadedReader {
         if (try multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
             return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDirWithControl(
                 allocator,

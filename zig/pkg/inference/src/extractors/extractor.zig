@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const selection_mod = @import("../registry/model_selection.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
@@ -397,6 +399,13 @@ pub const Extractor = union(enum) {
     /// Concrete model selected by the resolver. Executor-boundary admission
     /// uses this path to derive the same manifest contract published in model
     /// discovery before any task-specific inference begins.
+    pub fn modelSelection(self: *const Extractor) selection_mod.ResolvedModel {
+        return switch (self.*) {
+            .extractor => |value| .{ .path = value.model_path, .publication = value.publication },
+            .reader => |value| .{ .path = value.model_path, .publication = value.publication },
+        };
+    }
+
     pub fn modelPath(self: *const Extractor) []const u8 {
         return switch (self.*) {
             .extractor => |extractor| extractor.model_path,
@@ -453,6 +462,7 @@ pub fn resolve(ctx: Context, model_name: []const u8, wants_images: bool) !Extrac
 }
 
 const GlinerExtractor = struct {
+    publication: ?selection_mod.Generation = null,
     model_path: []const u8,
     model_name: []const u8,
 
@@ -470,17 +480,16 @@ const GlinerExtractor = struct {
     ) ![]extraction_mod.ExtractionResult {
         if (ctx.text_admission) |admission|
             try admission.validate(admission.ptr, texts);
-        var model_handle = if (ctx.execution_control) |control|
-            try ctx.model_manager.acquireFromDirWithControl(self.model_path, control)
-        else
-            try ctx.model_manager.acquireFromDir(self.model_path);
+        const selected = selection_mod.ResolvedModel{ .path = self.model_path, .publication = self.publication };
+        const control = selected.bind(ctx.execution_control orelse InferenceExecutionControl{ .request_owned = false });
+        var model_handle = try ctx.model_manager.acquireFromDirWithControl(self.model_path, control);
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
         var gliner = if (ctx.gliner_pipeline_factory) |factory| factory.create(factory.ptr, ctx.allocator, model) else model.glinerPipeline(ctx.allocator);
-        gliner.execution_control = ctx.execution_control;
+        gliner.execution_control = control;
         var extraction_config = config;
         extraction_config.cleanup_model = try model.getCleanupHead();
         return extraction_mod.extractBatch(ctx.allocator, &gliner, texts, schemas, extraction_config);
@@ -504,6 +513,7 @@ const GlinerExtractor = struct {
 };
 
 const ReaderExtractor = struct {
+    publication: ?selection_mod.Generation = null,
     model_path: []const u8,
 
     pub fn deinit(self: *ReaderExtractor, allocator: std.mem.Allocator) void {
@@ -518,12 +528,14 @@ const ReaderExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
+        const selected = selection_mod.ResolvedModel{ .path = self.model_path, .publication = self.publication };
+        const control = selected.bind(ctx.execution_control orelse InferenceExecutionControl{ .request_owned = false });
         var reader = try readers_mod.LoadedReader.loadFromDirWithControl(
             ctx.allocator,
             self.model_path,
             ctx.session_manager,
             ctx.model_manager,
-            ctx.execution_control,
+            control,
         );
         defer reader.deinit();
 
@@ -533,7 +545,7 @@ const ReaderExtractor = struct {
         }
 
         var controlled_options = read_options;
-        controlled_options.execution_control = ctx.execution_control;
+        controlled_options.execution_control = control;
         const results = try reader.readBatch(image_datas, controlled_options);
         defer {
             for (results) |*result| result.deinit();
@@ -545,34 +557,50 @@ const ReaderExtractor = struct {
     }
 };
 
+fn selectedManifest(ctx: Context, selected: selection_mod.ResolvedModel) !manifest_mod.ModelManifest {
+    const control = selected.bind(ctx.execution_control orelse InferenceExecutionControl{ .request_owned = false });
+    try control.verifyModelSelection(ctx.allocator, ctx.io, selected.path);
+    const publication = selected.publication;
+    var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, selected.path);
+    errdefer manifest.deinit();
+    if (publication != null and !std.meta.eql(publication, manifest.managed_publication)) return error.ModelArtifactsChanging;
+    return manifest;
+}
+
 fn tryResolveGlinerExtractor(ctx: Context, model_name: []const u8) !?Extractor {
-    const path = resolveNamedModelPath(ctx, model_name, "extractors") catch |err| switch (err) {
+    const selected = resolveNamedModelSelection(ctx, model_name, "extractors") catch |err| switch (err) {
         error.ModelNotFound => return null,
         else => return err,
     };
+    const path = selected.path;
     defer ctx.allocator.free(path);
 
-    var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, path);
+    var manifest = try selectedManifest(ctx, selected);
     defer manifest.deinit();
     if (!model_caps.modelSupportsCapability("extractor", manifest.gliner_model_type, manifest.capabilities, "extraction")) return null;
     if (!model_caps.modelAcceptsInput(&manifest, "text")) return null;
 
-    return try Extractor.initExtractor(ctx.allocator, path, model_name);
+    var result = try Extractor.initExtractor(ctx.allocator, path, model_name);
+    result.extractor.publication = selected.publication;
+    return result;
 }
 
 fn tryResolveReader(ctx: Context, model_name: []const u8) !?Extractor {
-    const path = resolveNamedModelPath(ctx, model_name, "readers") catch |err| switch (err) {
+    const selected = resolveNamedModelSelection(ctx, model_name, "readers") catch |err| switch (err) {
         error.ModelNotFound => return null,
         else => return err,
     };
+    const path = selected.path;
     defer ctx.allocator.free(path);
 
-    var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, path);
+    var manifest = try selectedManifest(ctx, selected);
     defer manifest.deinit();
     if (!model_caps.modelSupportsCapability("reader", manifest.gliner_model_type, manifest.capabilities, "extraction")) return null;
     if (!model_caps.modelAcceptsInput(&manifest, "image")) return null;
 
-    return try Extractor.initReader(ctx.allocator, path);
+    var result = try Extractor.initReader(ctx.allocator, path);
+    result.reader.publication = selected.publication;
+    return result;
 }
 
 fn readTextsForExtraction(
@@ -591,7 +619,14 @@ fn readTextsForExtraction(
         };
         defer ctx.allocator.free(model_path);
 
-        return readTextsWithSelectedReader(ctx, model_path, image_datas, read_options) catch |err| {
+        const selected = if (platform.env.getenv("TERMITE_EXTRACT_DEFAULT_READER_MODEL")) |override|
+            try resolveNamedModelSelection(ctx, override, "readers")
+        else
+            try selection_mod.fromDirectory(ctx.allocator, ctx.io, try ctx.allocator.dupe(u8, model_path));
+        defer ctx.allocator.free(selected.path);
+        var selected_ctx = ctx;
+        selected_ctx.execution_control = selected.bind(ctx.execution_control orelse InferenceExecutionControl{ .request_owned = false });
+        return readTextsWithSelectedReader(selected_ctx, selected.path, image_datas, read_options) catch |err| {
             if (!fallback_enabled or !shouldInvalidateReaderSelection(err)) return err;
             try ctx.reader_resolver.?.markCandidateFailure(ctx.io, model_path);
             last_candidate_error = err;
@@ -804,7 +839,28 @@ fn resolveSelector(ctx: Context, requested: []const u8, task: []const u8) !?[]u8
     return registry_mod.resolveInstalledModelSelector(ctx.allocator, ctx.io, ctx.models_dir, requested, task);
 }
 
+fn resolveNamedModelSelection(ctx: Context, requested_name: []const u8, task_type: []const u8) !selection_mod.ResolvedModel {
+    const resolved = registry_mod.resolveFriendlyRef(requested_name) orelse requested_name;
+    const normalized = if (std.mem.startsWith(u8, resolved, "hf:")) resolved[3..] else resolved;
+    if (registry_mod.ModelRef.parse(normalized)) |ref| {
+        const variant = try registry_mod.download.parseVariantRevision(ref.variant);
+        if (variant.revision != null or !std.mem.eql(u8, variant.variant, "auto")) {
+            if (ctx.selector_cache) |cache| return (try cache.resolveSelection(ctx.allocator, ctx.io, ctx.models_dir, normalized, task_type)) orelse error.ModelNotFound;
+            var cache = @import("../registry/selection.zig").Cache.init(ctx.allocator);
+            defer cache.deinit();
+            return (try cache.resolveSelection(ctx.allocator, ctx.io, ctx.models_dir, normalized, task_type)) orelse error.ModelNotFound;
+        }
+    } else |_| {}
+    const path = try resolveNamedModelDirectory(ctx, requested_name, task_type);
+    errdefer ctx.allocator.free(path);
+    return selection_mod.fromDirectory(ctx.allocator, ctx.io, path);
+}
+
 fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []const u8) ![]const u8 {
+    return (try resolveNamedModelSelection(ctx, requested_name, task_type)).path;
+}
+
+fn resolveNamedModelDirectory(ctx: Context, requested_name: []const u8, task_type: []const u8) ![]const u8 {
     const resolved_ref = registry_mod.resolveFriendlyRef(requested_name) orelse requested_name;
     const normalized = if (std.mem.startsWith(u8, resolved_ref, "hf:")) resolved_ref[3..] else resolved_ref;
     if (registry_mod.ModelRef.parse(normalized)) |ref| {
@@ -943,7 +999,7 @@ test "resolve prefers reader for image extraction when both exist" {
 
     var extractor = try resolve(.{
         .allocator = allocator,
-        .io = undefined,
+        .io = std.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -988,7 +1044,7 @@ test "resolveNamedReaderPath supports flat default model layout" {
 
     const path = try resolveNamedReaderPath(.{
         .allocator = allocator,
-        .io = undefined,
+        .io = std.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1746,7 +1802,7 @@ test "resolve prefers extractor for text extraction when both exist" {
 
     var extractor = try resolve(.{
         .allocator = allocator,
-        .io = undefined,
+        .io = std.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1763,7 +1819,7 @@ test "reader extractor does not accept text input" {
 
     try std.testing.expectError(error.UnsupportedInput, extractor.extractText(.{
         .allocator = allocator,
-        .io = undefined,
+        .io = std.testing.io,
         .models_dir = ".",
         .session_manager = undefined,
         .model_manager = undefined,

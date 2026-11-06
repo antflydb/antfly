@@ -302,6 +302,7 @@ pub const listing_compatibility_sidecars = [_][]const u8{
 
 /// Resolved model configuration loaded from a model directory.
 pub const ModelManifest = struct {
+    managed_publication: ?[32]u8 = null,
     allocator: std.mem.Allocator,
 
     // Identity
@@ -1462,7 +1463,7 @@ fn validateGlinerSpecialtySidecars(manifest: *const ModelManifest) !void {
 
 fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !ModelManifest {
     const model_dir_path = catalog.model_dir_path;
-    var manifest = ModelManifest{ .allocator = allocator };
+    var manifest = ModelManifest{ .allocator = allocator, .managed_publication = if (catalog.receipt) |value| value.publication_generation else null };
     errdefer manifest.deinit();
     manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
@@ -1634,6 +1635,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     var catalog = try ArtifactCatalog.initPublished(allocator, model_dir_path);
     defer catalog.deinit();
+    manifest.managed_publication = if (catalog.receipt) |value| value.publication_generation else null;
     manifest.gliner_specialty_artifact_hint = try catalog.specialtyArtifactHint();
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {

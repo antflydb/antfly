@@ -4086,6 +4086,7 @@ test "load flight retirement reservations exclude the manager task" {
 }
 
 const CompositeAssetsLoadFlight = struct {
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     model_dir: ?[]u8 = null,
     kind: CompositeKind = .whisper_metadata,
@@ -4371,6 +4372,7 @@ pub const CompositeKind = enum { whisper_metadata, whisper, seq2seq };
 /// One immutable publication pinned across tokenization, encode and decode.
 /// Component sessions keep their resident admission and backend ownership.
 pub const CompositeAssets = struct {
+    managed_publication: ?[32]u8 = null,
     runtime_id: RuntimeId = 0,
     allocator: std.mem.Allocator = std.heap.page_allocator,
     model_dir: []u8 = &.{},
@@ -6791,7 +6793,21 @@ pub const ModelManager = struct {
         return modelCacheHasPublicationCapacity(self.loaded.count(), self.max_loaded_models);
     }
 
+    pub fn publicationForRequest(self: *ModelManager, model_dir: []const u8, control: ?InferenceExecutionControl) !?[32]u8 {
+        if (control) |active| try active.check();
+        const current = try managed_receipt.publicationGeneration(self.allocator, if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io, model_dir);
+        if (control) |active| if (active.model_selection) |selected| {
+            if (!selected.matches(model_dir) or !std.meta.eql(selected.publication, current)) return error.ModelArtifactsChanging;
+        };
+        return current;
+    }
+
     pub fn acquireLoadedModel(self: *ModelManager, model_dir: []const u8) ?ModelHandle {
+        return self.acquireLoadedModelWithControl(model_dir, .{}) catch null;
+    }
+
+    pub fn acquireLoadedModelWithControl(self: *ModelManager, model_dir: []const u8, control: InferenceExecutionControl) !?ModelHandle {
+        const expected = try self.publicationForRequest(model_dir, control);
         self.lockLoadedModels();
         const model = self.loaded.get(model_dir) orelse self.loaded_aliases.get(model_dir) orelse {
             self.unlockLoadedModels();
@@ -6800,11 +6816,7 @@ pub const ModelManager = struct {
         model.active_handles += 1;
         self.unlockLoadedModels();
         var handle: ModelHandle = .{ .manager = self, .model = model };
-        const publication = managed_receipt.publicationGeneration(self.allocator, self.session_manager.io orelse std.Options.debug_io, model_dir) catch {
-            handle.releaseWithUsage(false);
-            return null;
-        };
-        self.requireManagedPublication(&handle, publication) catch return null;
+        try self.requireManagedPublication(&handle, expected);
         return handle;
     }
 
@@ -6812,7 +6824,11 @@ pub const ModelManager = struct {
     /// including required-backend and A4B policy keys. Never load cold assets
     /// or join a load flight while reading request-admission metadata.
     pub fn acquireCachedFromDir(self: *ModelManager, model_dir: []const u8) !?ModelHandle {
-        const publication = try managed_receipt.publicationGeneration(self.allocator, self.session_manager.io orelse std.Options.debug_io, model_dir);
+        return self.acquireCachedFromDirWithControl(model_dir, .{});
+    }
+
+    pub fn acquireCachedFromDirWithControl(self: *ModelManager, model_dir: []const u8, control: InferenceExecutionControl) !?ModelHandle {
+        const publication = try self.publicationForRequest(model_dir, control);
         const defaults = self.defaultModelLoadPolicy(model_dir);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
@@ -6850,7 +6866,11 @@ pub const ModelManager = struct {
     /// owner through execution or integrity recovery. Cold paths still inspect
     /// the manifest before loading assets.
     pub fn copyCachedQwenEmbeddingManifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        return self.copyCachedQwenEmbeddingManifestWithControl(allocator, model_dir, .{});
+    }
+
+    pub fn copyCachedQwenEmbeddingManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
         defer handle.release();
         const model = handle.get();
         if (model.manifest.embedding_style != .qwen3_embedding or model.session.backend() != .metal) return null;
@@ -6862,7 +6882,11 @@ pub const ModelManager = struct {
     /// generation before consuming input. Explicit retirement/reload publishes
     /// a different manifest instead of reparsing the tokenizer per request.
     pub fn copyCachedEmbeddingGemma2Manifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        return self.copyCachedEmbeddingGemma2ManifestWithControl(allocator, model_dir, .{});
+    }
+
+    pub fn copyCachedEmbeddingGemma2ManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
         defer handle.release();
         const model = handle.get();
         if (model.manifest.embedding_style != .embedding_gemma2) return null;
@@ -6873,7 +6897,11 @@ pub const ModelManager = struct {
     /// Clone under a short cache pin so invalid requests and slow media uploads
     /// do not prevent eviction or recovery. Execution rechecks its own manifest.
     pub fn copyCachedGenerationManifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        return self.copyCachedGenerationManifestWithControl(allocator, model_dir, .{});
+    }
+
+    pub fn copyCachedGenerationManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
         defer handle.release();
         const model = handle.get();
         if (model.manifest.model_type != .generator) return null;
@@ -7386,7 +7414,7 @@ pub const ModelManager = struct {
         const manager = task.manager;
         defer manager.releaseCompositeAssetsLoadFlight(task.key, task.flight);
         var active = LoadFlightControl{ .flight = &task.flight.load_state };
-        const assets = manager.loadCompositeAssetsUncached(task.model_dir, task.paths, task.preferred_backends, task.key, task.flight.runtime_id, task.flight.model_type, task.kind, active.control()) catch |err| {
+        const assets = manager.loadCompositeAssetsUncached(task.model_dir, task.paths, task.preferred_backends, task.key, task.flight.runtime_id, task.flight.model_type, task.kind, (@import("../registry/model_selection.zig").ResolvedModel{ .path = task.model_dir, .publication = task.flight.managed_publication }).bind(active.control())) catch |err| {
             manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
             return;
         };
@@ -7396,6 +7424,12 @@ pub const ModelManager = struct {
             manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
             return;
         };
+        if (!std.meta.eql(assets.managed_publication, task.flight.managed_publication)) {
+            assets.deinit();
+            manager.allocator.destroy(assets);
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, error.ModelArtifactsChanging);
+            return;
+        }
         var handle = manager.publishCompositeAssets(task.key, assets) catch |err| {
             manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
             return;
@@ -7409,6 +7443,7 @@ pub const ModelManager = struct {
         tokenizer_path: []u8,
         config_path: []u8,
         generation_config_path: ?[]u8,
+        managed_publication: ?[32]u8,
 
         pub fn deinit(self: *ResolvedWhisperSidecars) void {
             self.allocator.free(self.tokenizer_path);
@@ -7461,6 +7496,7 @@ pub const ModelManager = struct {
             .tokenizer_path = owned_tokenizer_path,
             .config_path = owned_config_path,
             .generation_config_path = generation_config_path,
+            .managed_publication = manifest.managed_publication,
         };
     }
 
@@ -7540,8 +7576,10 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !*CompositeAssets {
         if (control) |active| try active.check();
+        const publication = try self.publicationForRequest(model_dir, control);
         var sidecars = try self.resolveWhisperSidecars(model_dir);
         defer sidecars.deinit();
+        if (publication != null and !std.meta.eql(publication, sidecars.managed_publication)) return error.ModelArtifactsChanging;
 
         var managed_tokenizer = try self.loadManagedHfTokenizerFile(sidecars.tokenizer_path);
         errdefer managed_tokenizer.deinit();
@@ -7616,7 +7654,9 @@ pub const ModelManager = struct {
         errdefer self.allocator.free(owned_model_dir);
         const owned_preferred_backends = try self.allocator.dupe(backends.BackendType, preferred_backends);
         errdefer self.allocator.free(owned_preferred_backends);
+        if (!std.meta.eql(publication, try managed_receipt.publicationGeneration(self.allocator, self.session_manager.io orelse std.Options.debug_io, model_dir))) return error.ModelArtifactsChanging;
         assets.* = .{
+            .managed_publication = publication,
             .runtime_id = runtime_id,
             .allocator = self.allocator,
             .model_dir = owned_model_dir,
@@ -7727,6 +7767,7 @@ pub const ModelManager = struct {
         const generation_key = try self.compositeAssetGenerationSignature(model_dir, paths);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(&generation_key);
+        if (try managed_receipt.publicationGeneration(self.allocator, self.session_manager.io orelse std.Options.debug_io, model_dir)) |publication| hash.update(&publication);
         hash.update(@tagName(kind));
         hash.update(@tagName(model_type));
         for (preferred_backends) |backend| {
@@ -7877,6 +7918,14 @@ pub const ModelManager = struct {
     }
 
     fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, preferred_backends: []const backends.BackendType, model_type: manifest_mod.ModelType, kind: CompositeKind, control: ?InferenceExecutionControl) !CompositeAssetsHandle {
+        const publication = try self.publicationForRequest(model_dir, control);
+        var handle = try self.acquireCompositeRuntimePlannedInner(model_dir, component_paths, preferred_backends, model_type, kind, control, publication);
+        errdefer handle.release();
+        if (!std.meta.eql(publication, handle.get().managed_publication)) return error.ModelArtifactsChanging;
+        return handle;
+    }
+
+    fn acquireCompositeRuntimePlannedInner(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, preferred_backends: []const backends.BackendType, model_type: manifest_mod.ModelType, kind: CompositeKind, control: ?InferenceExecutionControl, publication: ?[32]u8) !CompositeAssetsHandle {
         const asset_generation = try self.compositeRuntimeKey(
             model_dir,
             component_paths,
@@ -7914,6 +7963,7 @@ pub const ModelManager = struct {
             return err;
         };
         flight.* = .{
+            .managed_publication = publication,
             .runtime_id = self.nextRuntimeIdLocked(),
             .model_dir = flight_model_dir,
             .kind = kind,
@@ -7938,7 +7988,7 @@ pub const ModelManager = struct {
             return err;
         };
         self.unlockLoadedModels();
-        if (control != null) {
+        if (control != null and control.?.request_owned) {
             self.load_group.concurrent(coordination_io, runCompositeLoadTask, .{task}) catch |err| {
                 self.finishCompositeAssetsLoadFlight(flight, null, err);
                 task.deinit();
@@ -8006,6 +8056,10 @@ pub const ModelManager = struct {
     /// Explicit GLiNER precision is immutable and part of both the resident
     /// variant and in-flight load identity. Later ordinary requests may reuse
     /// the default alias published by this startup preload.
+    pub fn acquireFromDirWithGlinerCudaPrecisionAndControl(self: *ModelManager, model_dir: []const u8, precision: session_factory.GlinerCudaPrecision, control: InferenceExecutionControl) !ModelHandle {
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = &.{.cuda}, .gliner_cuda_precision = precision }, true, control);
+    }
+
     pub fn acquireFromDirWithGlinerCudaPrecision(self: *ModelManager, model_dir: []const u8, precision: session_factory.GlinerCudaPrecision) !ModelHandle {
         return self.acquireResolvedModel(model_dir, .{ .preferred_backends = &.{.cuda}, .gliner_cuda_precision = precision }, true, null);
     }
@@ -8057,6 +8111,24 @@ pub const ModelManager = struct {
     /// Compatibility API for offline tools that keep a raw model pointer. Such
     /// callers explicitly pin the model because their pointer lifetime cannot
     /// be observed by the cache.
+    pub fn loadFromDirWithControl(self: *ModelManager, path: []const u8, control: InferenceExecutionControl) !*LoadedModel {
+        var handle = try self.acquireFromDirWithControl(path, control);
+        handle.pin();
+        const model = handle.get();
+        handle.release();
+        return model;
+    }
+    pub fn loadFromDirWithPreferredBackendsAndControl(self: *ModelManager, path: []const u8, backends_: []const backends.BackendType, cache_default_alias: bool, control: InferenceExecutionControl) !*LoadedModel {
+        var handle = try self.acquireFromDirWithPreferredBackendsAndControl(path, backends_, cache_default_alias, control);
+        handle.pin();
+        const model = handle.get();
+        handle.release();
+        return model;
+    }
+    pub fn acquireCompositeAssetsWithControl(self: *ModelManager, path: []const u8, components: []const []const u8, control: InferenceExecutionControl) !CompositeAssetsHandle {
+        return self.acquireCompositeRuntime(path, components, .whisper_metadata, control);
+    }
+
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
         var handle = try self.acquireFromDir(model_dir);
         handle.pin();
@@ -8227,7 +8299,7 @@ pub const ModelManager = struct {
             task.cache_default_alias,
             task.a4b_request,
             task.flight.runtime_id,
-            load_control.control(),
+            (@import("../registry/model_selection.zig").ResolvedModel{ .path = task.model_dir, .publication = task.managed_publication }).bind(load_control.control()),
         ) catch |err| {
             manager.finishLoadFlight(task.flight, null, err);
             return;
@@ -8411,7 +8483,7 @@ pub const ModelManager = struct {
             &required_backend_scratch,
         );
         var checked_policy = policy;
-        checked_policy.managed_publication = try managed_receipt.publicationGeneration(self.allocator, self.session_manager.io orelse std.Options.debug_io, model_dir);
+        checked_policy.managed_publication = try self.publicationForRequest(model_dir, control);
         const flight_key = try self.loadFlightKey(
             model_dir,
             effective_backends,
@@ -8541,7 +8613,7 @@ pub const ModelManager = struct {
             return err;
         };
         self.unlockLoadedModels();
-        if (control != null) {
+        if (control != null and control.?.request_owned) {
             self.load_group.concurrent(coordination_io, runLoadTask, .{task}) catch |err| {
                 // `Group.async` is allowed to execute eagerly when its async pool is
                 // saturated. A request-scoped cold load must never run on the request
@@ -8563,9 +8635,11 @@ pub const ModelManager = struct {
     }
 
     pub fn loadChunkPlanningAssets(self: *ModelManager, model_dir: []const u8, io: std.Io, control: InferenceExecutionControl) !ChunkPlanningAssets {
+        const publication = try self.publicationForRequest(model_dir, control);
         try control.check();
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
+        if (publication != null and !std.meta.eql(publication, man.managed_publication)) return error.ModelArtifactsChanging;
         const revision = try self.modelIdentityForManifest(model_dir, man);
         const planning = try chunkPlanningSnapshotWithControl(self.allocator, io, man, revision, control);
         const kind = if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) manifest_mod.TokenizerType.sentencepiece else man.tokenizer_type orelse return error.NoTokenizerFound;
@@ -8599,6 +8673,7 @@ pub const ModelManager = struct {
         else
             std.fmt.bytesToHex(revision, .lower);
         if (lease) |*active| try active.retain(plan.resident);
+        _ = try self.publicationForRequest(model_dir, control);
         try control.check();
         return .{ .model_dir = model_dir, .identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, io, model_dir, man.safetensors_path.?) else null, .allocator = self.allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
     }
@@ -8618,11 +8693,12 @@ pub const ModelManager = struct {
     ) !ModelHandle {
         if (control) |active| try active.update(.loading_model, 0, 4);
 
-        const managed_publication = try managed_receipt.publicationGeneration(self.allocator, sm.io orelse std.Options.debug_io, model_dir);
+        const managed_publication = try self.publicationForRequest(model_dir, control);
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         var man_owned = true;
         errdefer if (man_owned) man.deinit();
+        if (managed_publication != null and !std.meta.eql(managed_publication, man.managed_publication)) return error.ModelArtifactsChanging;
         if (control) |active| try active.update(.loading_model, 1, 4);
         var policy_backend_scratch: [7]backends.BackendType = undefined;
         if (self.serving_policy) |policy| {

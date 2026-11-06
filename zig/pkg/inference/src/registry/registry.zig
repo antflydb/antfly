@@ -345,18 +345,27 @@ pub fn managedModelRequestNameAlloc(
 /// must reject names shared by different installations before advertising them.
 /// The immutable revision comes from the resolved commit, never a moving ref.
 /// All returned memory belongs to allocator (normally a request arena).
+pub const ManagedSelection = struct {
+    names: []const []const u8 = &.{},
+    publication: ?[32]u8 = null,
+    rejected: bool = false,
+};
 pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) ![]const []const u8 {
+    return (try managedModelSelectionAlloc(allocator, io, model_dir)).names;
+}
+pub fn managedModelSelectionAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) !ManagedSelection {
     var receipt = (managed_receipt.loadValidated(allocator, io, model_dir) catch |err| {
         // Candidate-local publication failures must not hide healthy models.
         // Allocation and operational I/O failures remain actionable.
-        if (manifest_mod.isListingCandidateRejection(err)) return &.{};
+        if (manifest_mod.isListingCandidateRejection(err)) return .{ .rejected = true };
         return err;
-    }) orelse return &.{};
+    }) orelse return .{};
     defer receipt.deinit();
-    if (receipt.parsed.value.version != 2) return &.{};
-    const source = receipt.parsed.value.source orelse return &.{};
-    if (!hubRepoComponentIsSafe(source.owner) or !hubRepoComponentIsSafe(source.name) or !modelVariantIsSafe(source.variant)) return &.{};
-    const selection = download.parseVariantRevision(source.variant) catch return &.{};
+    const publication = receipt.publication_generation;
+    if (receipt.parsed.value.version != 2) return .{ .publication = publication };
+    const source = receipt.parsed.value.source orelse return .{ .publication = publication };
+    if (!hubRepoComponentIsSafe(source.owner) or !hubRepoComponentIsSafe(source.name) or !modelVariantIsSafe(source.variant)) return .{ .rejected = true };
+    const selection = download.parseVariantRevision(source.variant) catch return .{ .rejected = true };
     var names = std.ArrayListUnmanaged([]const u8).empty;
     const base = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
     try names.append(allocator, base);
@@ -368,7 +377,7 @@ pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_di
             if (!std.mem.eql(u8, base, qualified)) try names.append(allocator, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ base, revision }));
         }
     }
-    return names.toOwnedSlice(allocator);
+    return .{ .names = try names.toOwnedSlice(allocator), .publication = publication };
 }
 fn immutableHubRevision(revision: []const u8) bool {
     if (revision.len != 40) return false;

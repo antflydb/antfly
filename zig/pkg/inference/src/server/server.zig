@@ -45,6 +45,7 @@ const session_factory = @import("../architectures/session_factory.zig");
 const qwen35_execution = @import("../architectures/qwen35_execution.zig");
 const registry_mod = @import("../registry/registry.zig");
 const selection_mod = @import("../registry/selection.zig");
+const ResolvedModel = selection_mod.ResolvedModel;
 const extractors_mod = @import("../extractors/extractor.zig");
 const cache_mod = @import("../cache/cache.zig");
 pub const model_manager = @import("model_manager.zig");
@@ -4922,6 +4923,28 @@ pub const Node = struct {
         self.model_manager.detachPromptCacheResourceUsageObserver();
     }
 
+    fn bindModelSelection(self: *Node, selected: ResolvedModel, supplied: ?InferenceExecutionControl) InferenceExecutionControl {
+        return selected.bind(self.bindExecutionControl(null, supplied orelse .{ .request_owned = false }));
+    }
+
+    pub fn manifestForSelection(self: *Node, allocator: std.mem.Allocator, selected: ResolvedModel) !manifest_mod.ModelManifest {
+        return self.loadBoundManifest(allocator, selected.path, false, self.bindModelSelection(selected, null));
+    }
+
+    fn loadBoundManifest(self: *Node, allocator: std.mem.Allocator, path: []const u8, comptime listing: bool, control: InferenceExecutionControl) !manifest_mod.ModelManifest {
+        const publication = try self.model_manager.publicationForRequest(path, control);
+        var manifest = if (listing) try manifest_mod.loadListingFromDir(allocator, path) else try manifest_mod.loadFromDir(allocator, path);
+        errdefer manifest.deinit();
+        if (publication != null and !std.meta.eql(publication, manifest.managed_publication)) return error.ModelArtifactsChanging;
+        return manifest;
+    }
+
+    fn embeddingManifestSelected(self: *Node, allocator: std.mem.Allocator, selected: ResolvedModel, supplied: ?InferenceExecutionControl) !manifest_mod.ModelManifest {
+        const control = self.bindModelSelection(selected, supplied);
+        if (try self.model_manager.copyCachedEmbeddingGemma2ManifestWithControl(allocator, selected.path, control)) |manifest| return manifest;
+        return self.loadBoundManifest(allocator, selected.path, false, control);
+    }
+
     /// Clone warm generation metadata without reparsing the model directory.
     fn embeddingManifest(self: *Node, allocator: std.mem.Allocator, path: []const u8) !manifest_mod.ModelManifest {
         if (try self.model_manager.copyCachedEmbeddingGemma2Manifest(allocator, path)) |manifest| return manifest;
@@ -4935,9 +4958,10 @@ pub const Node = struct {
         for (vectors) |vector| {
             if (vector.len != dimensions) break;
         } else return;
-        const path = try self.resolveModelPath(io, model_name, "embedders");
+        const path_selection = try self.resolveModelSelection(io, model_name, "embedders");
+        const path = path_selection.path;
         defer self.allocator.free(path);
-        var manifest = try self.embeddingManifest(allocator, path);
+        var manifest = try self.embeddingManifestSelected(allocator, path_selection, null);
         defer manifest.deinit();
         if (manifest.embedding_style == .embedding_gemma2 and !@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
         try resizeDenseEmbeddingBatch(allocator, vectors, dimensions, manifest.normalize);
@@ -5028,9 +5052,11 @@ pub const Node = struct {
         instruction: ?[]const u8,
         expected_revision: ?[32]u8,
     ) ![][]f32 {
-        const control = self.bindExecutionControl(io, supplied_control);
+        var control = self.bindExecutionControl(io, supplied_control);
         try control.check();
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        const model_path_selection = try self.resolveModelSelection(io, if (model_name.len > 0) model_name else null, "embedders");
+        const model_path = model_path_selection.path;
+        control = model_path_selection.bind(control);
         defer self.allocator.free(model_path);
         return self.embedDenseTextsFromPathWithExecutionControlAndTaskRevision(
             allocator,
@@ -5245,7 +5271,7 @@ pub const Node = struct {
         texts: []const []const u8,
         supplied_control: InferenceExecutionControl,
     ) ![]DirectSparseEmbedding {
-        const control = self.bindExecutionControl(null, supplied_control);
+        var control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
         try self.acquireAdmissionUnits(1);
@@ -5257,9 +5283,13 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        const model_path_selection = try self.resolveModelSelection(io, if (model_name.len > 0) model_name else null, "embedders");
+
+        const model_path = model_path_selection.path;
+
+        control = model_path_selection.bind(control);
         defer self.allocator.free(model_path);
-        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "embed");
+        const executor_contract = try resolvedSelectedExecutorContract(self, allocator, model_path_selection, "embed", control);
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, 0, 0, 0);
         const Attempt = struct {
             allocator: std.mem.Allocator,
@@ -5349,10 +5379,12 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const request_io = self.inferenceIo(allocator, io, &owned_io);
 
-        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "rerankers");
+        const model_path_selection = try self.resolveModelSelection(request_io, if (model_name.len > 0) model_name else null, "rerankers");
+
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "rerank");
+        const executor_contract = try resolvedSelectedExecutorContract(self, allocator, model_path_selection, "rerank", null);
         try validateTextExecutorInvocation(executor_contract, 1, documents, query.len, 0, documents.len, 0);
         const DeadlineControl = struct {
             deadline_ns: ?u64,
@@ -5365,14 +5397,14 @@ pub const Node = struct {
             }
         };
         var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
-        const execution_control = self.bindExecutionControl(request_io, .{
+        const execution_control = model_path_selection.bind(self.bindExecutionControl(request_io, .{
             .io = if (upstream_control) |control| control.io else null,
             .deadline_ns = deadline_ns,
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
             .hard_cancellation = if (upstream_control) |control| control.hard_cancellation else null,
-        });
-        var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
+        }));
+        var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control));
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = self.createRerankingPipeline(allocator, model);
@@ -5453,21 +5485,17 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "rewriters");
+        const model_path_selection = try self.resolveModelSelection(io, if (model_name.len > 0) model_name else null, "rewriters");
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
-        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "rewrite");
+        const executor_contract = try resolvedSelectedExecutorContract(self, allocator, model_path_selection, "rewrite", null);
         try validateTextExecutorInvocation(executor_contract, inputs.len, inputs, 0, 0, 0, 0);
 
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const paths = try enc_dec_mod.findEncoderDecoderPaths(allocator, model_path);
         defer allocator.free(paths.encoder);
         defer allocator.free(paths.decoder);
-        var runtime_handle = try self.model_manager.acquireCompositeRuntime(
-            model_path,
-            &.{ paths.encoder, paths.decoder },
-            .seq2seq,
-            null,
-        );
+        var runtime_handle = try self.model_manager.acquireCompositeRuntime(model_path, &.{ paths.encoder, paths.decoder }, .seq2seq, self.bindModelSelection(model_path_selection, null));
         defer runtime_handle.release();
         const assets = runtime_handle.get();
         const dec_config = assets.decoder_config;
@@ -5532,13 +5560,14 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const requested = if (model_name.len > 0) model_name else null;
-        const classifier_path = self.resolveModelPath(io, requested, "classifiers") catch |err| switch (requestModelResolutionErrorKind(err)) {
+        const classifier_path = self.resolveModelSelection(io, requested, "classifiers") catch |err| switch (requestModelResolutionErrorKind(err)) {
             .missing => null,
             .invalid, .ambiguous, .internal => return err,
         };
-        const model_path = classifier_path orelse try self.resolveModelPath(io, requested, "extractors");
+        const model_path_selection = classifier_path orelse try self.resolveModelSelection(io, requested, "extractors");
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
-        var listing = try manifest_mod.loadListingFromDir(allocator, model_path);
+        var listing = try self.loadBoundManifest(allocator, model_path, true, self.bindModelSelection(model_path_selection, null));
         defer listing.deinit();
         if (requiresQualifiedSpanClassification(listing)) {
             if (hypothesis_template != null) return error.UnsupportedDecisionHypothesisTemplate;
@@ -5550,7 +5579,7 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         if (classifier_path != null) {
-            const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
+            const executor_contract = try resolvedSelectedExecutorContract(self, allocator, model_path_selection, "extract", null);
             const hypothesis = hypothesis_template orelse "This example is {}.";
             const additional_text_bytes = std.math.add(usize, maxTextBytes(labels), hypothesis.len) catch
                 return error.InferenceTextBytesExceeded;
@@ -5563,7 +5592,7 @@ pub const Node = struct {
                 labels.len,
                 0,
             );
-            var model_handle = try self.model_manager.acquireFromDir(model_path);
+            var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, null));
             defer model_handle.release();
             const model = model_handle.get();
             try requireLegacyClassification(model.manifest);
@@ -5598,7 +5627,7 @@ pub const Node = struct {
             return try copyDirectClassificationResults(allocator, results);
         }
 
-        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
+        const executor_contract = try resolvedSelectedExecutorContract(self, allocator, model_path_selection, "extract", null);
         try validateTextExecutorInvocation(
             executor_contract,
             texts.len,
@@ -5608,7 +5637,7 @@ pub const Node = struct {
             labels.len,
             0,
         );
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, null));
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsClassification()) return error.UnsupportedClassifierProvider;
@@ -6124,7 +6153,7 @@ pub const Node = struct {
     ) !DirectGenerateOutput {
         var synchronized = executor_microbatch.SynchronizedAllocator{ .child = caller_allocator };
         const allocator = synchronized.allocator();
-        const execution_control = self.bindExecutionControl(null, supplied_control);
+        var execution_control = self.bindExecutionControl(null, supplied_control);
         try execution_control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
 
@@ -6132,13 +6161,17 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
-        const model_path = self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators") catch |err| {
+        const model_path_selection = self.resolveModelSelection(io, if (model_name.len > 0) model_name else null, "generators") catch |err| {
             std.log.err("direct generator resolve failed model={s}: {s}", .{ model_name, @errorName(err) });
             return err;
         };
+
+        const model_path = model_path_selection.path;
+
+        execution_control = model_path_selection.bind(execution_control);
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
-        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        var admission_manifest = try self.loadBoundManifest(allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control));
         defer admission_manifest.deinit();
         const executor_contract = try resolvedGenerateExecutorContract(self, &admission_manifest);
         const decoded_pixels = try measureDirectGenerateDecodedPixels(&admission_manifest, messages);
@@ -6160,19 +6193,13 @@ pub const Node = struct {
         });
         var model_handle = if (a4b_request) |request|
             if (preferred_backends) |backends|
-                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
-                    model_path,
-                    backends,
-                    cache_default_alias,
-                    request,
-                    execution_control,
-                )
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(model_path, backends, cache_default_alias, request, self.bindModelSelection(model_path_selection, execution_control))
             else
-                try self.model_manager.acquireFromDirWithA4bRequestAndControl(model_path, request, execution_control)
+                try self.model_manager.acquireFromDirWithA4bRequestAndControl(model_path, request, self.bindModelSelection(model_path_selection, execution_control))
         else if (preferred_backends) |backends|
-            try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, backends, cache_default_alias, execution_control)
+            try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, backends, cache_default_alias, self.bindModelSelection(model_path_selection, execution_control))
         else
-            try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
+            try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control));
         defer model_handle.release();
         const model = model_handle.get();
         if (preflight.expected_model_revision) |expected| {
@@ -6592,7 +6619,8 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
+        const model_path_selection = try self.resolveModelSelection(io, model.name, warmModelTaskDir(model.kind));
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
         try self.model_manager.setStartupLoadPolicy(model_path, .{
             .backend = if (model.cuda_precision != null) .cuda else model.backend,
@@ -6621,9 +6649,10 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
+        const model_path_selection = try self.resolveModelSelection(io, model.name, warmModelTaskDir(model.kind));
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
-        var manifest = try self.embeddingManifest(allocator, model_path);
+        var manifest = try self.embeddingManifestSelected(allocator, model_path_selection, null);
         defer manifest.deinit();
         const gguf_path = manifest.gguf_path orelse return error.A4bPrefetchRequiresGguf;
         const workers = model.load_workers orelse ops.A4bInferenceConfig.default_load_workers;
@@ -6650,23 +6679,25 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
+        const model_path_selection = try self.resolveModelSelection(io, model.name, warmModelTaskDir(model.kind));
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
         const a4b_request = model.a4bRequest();
         var loaded_handle = if (a4b_request) |request|
             if (model.backend) |backend|
-                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
                     model_path,
                     singleBackendPreference(backend),
                     true,
                     request,
+                    self.bindModelSelection(model_path_selection, null),
                 )
             else
-                try self.model_manager.acquireFromDirWithA4bRequest(model_path, request)
+                try self.model_manager.acquireFromDirWithA4bRequestAndControl(model_path, request, self.bindModelSelection(model_path_selection, null))
         else if (model.backend) |backend|
-            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
+            try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, singleBackendPreference(backend), true, self.bindModelSelection(model_path_selection, null))
         else
-            try self.model_manager.acquireFromDir(model_path);
+            try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, null));
         defer loaded_handle.release();
         const loaded = loaded_handle.get();
 
@@ -6741,9 +6772,10 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, model_name, "embedders");
+        const model_path_selection = try self.resolveModelSelection(io, model_name, "embedders");
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
-        const control = self.bindExecutionControl(io, .{});
+        const control = model_path_selection.bind(self.bindExecutionControl(io, .{}));
         const Attempt = struct {
             allocator: std.mem.Allocator,
             texts: []const []const u8,
@@ -6811,11 +6843,12 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, model_name, "rerankers");
+        const model_path_selection = try self.resolveModelSelection(io, model_name, "rerankers");
+        const model_path = model_path_selection.path;
         var model_handle = if (backend) |value|
-            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+            try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, singleBackendPreference(value), false, self.bindModelSelection(model_path_selection, null))
         else
-            try self.model_manager.acquireFromDir(model_path);
+            try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, null));
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
@@ -6833,14 +6866,15 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, model.name, task_dir);
+        const model_path_selection = try self.resolveModelSelection(io, model.name, task_dir);
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
         var model_handle = if (model.cuda_precision) |precision|
-            try self.model_manager.acquireFromDirWithGlinerCudaPrecision(model_path, precision)
+            try self.model_manager.acquireFromDirWithGlinerCudaPrecisionAndControl(model_path, precision, self.bindModelSelection(model_path_selection, null))
         else if (model.backend) |backend|
-            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
+            try self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, singleBackendPreference(backend), false, self.bindModelSelection(model_path_selection, null))
         else
-            try self.model_manager.acquireFromDir(model_path);
+            try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, null));
         defer model_handle.release();
         if (model.pin) model_handle.pin();
         std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
@@ -6851,7 +6885,8 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const resolved_path = try self.resolveModelPath(io, model.name, "transcribers");
+        const resolved_path_selection = try self.resolveModelSelection(io, model.name, "transcribers");
+        const resolved_path = resolved_path_selection.path;
         defer self.allocator.free(resolved_path);
         // Requests use canonical paths, including when models_dir is relative
         // or the installed artifact is reached through a symlink.
@@ -6894,13 +6929,15 @@ pub const Node = struct {
 
     /// Keep the exact pinned generation alive across a linked provider call.
     pub fn pinEmbeddingModelIdentity(self: *Node, a: std.mem.Allocator, io: std.Io, model_name: []const u8, expected: []const u8, control: InferenceExecutionControl) !model_manager_mod.ModelHandle {
-        const path = try self.resolveRequestModelPath(a, io, model_name, "embedders");
+        const path_selection = try self.resolveRequestModelSelection(a, io, model_name, "embedders");
+        const path = path_selection.path;
+        const path_selection_control = path_selection.bind(self.bindExecutionControl(null, control));
         defer a.free(path);
-        var handle = try self.model_manager.acquireFromDirWithControl(path, self.bindExecutionControl(io, control));
+        var handle = try self.model_manager.acquireFromDirWithControl(path, self.bindModelSelection(path_selection, self.bindExecutionControl(io, path_selection_control)));
         errdefer handle.release();
         const actual = if (handle.get().embedding_identity) |*identity| identity else return error.InvalidEmbeddingIdentity;
         if (!std.mem.eql(u8, expected, actual)) return error.EmbeddingIdentityMismatch;
-        try handle.get().verifyEmbeddingIdentityWithControl(self.bindExecutionControl(io, control));
+        try handle.get().verifyEmbeddingIdentityWithControl(self.bindExecutionControl(io, path_selection_control));
         return handle;
     }
 
@@ -6921,10 +6958,12 @@ pub const Node = struct {
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        const model_path_selection = try self.resolveModelSelection(io, if (model_name.len > 0) model_name else null, "embedders");
+
+        const model_path = model_path_selection.path;
         defer self.allocator.free(model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var admission_manifest = try self.embeddingManifest(allocator, model_path);
+        var admission_manifest = try self.embeddingManifestSelected(allocator, model_path_selection, null);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
@@ -7053,7 +7092,7 @@ pub const Node = struct {
         instruction: ?[]const u8,
         expected_revision: ?[32]u8,
     ) ![][]f32 {
-        const control = self.bindExecutionControl(io, supplied_control);
+        var control = self.bindExecutionControl(io, supplied_control);
         if (parts.len == 0) return try allocator.alloc([]f32, 0);
         try control.check();
 
@@ -7087,10 +7126,14 @@ pub const Node = struct {
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        const model_path_selection = try self.resolveModelSelection(io, if (model_name.len > 0) model_name else null, "embedders");
+
+        const model_path = model_path_selection.path;
+
+        control = model_path_selection.bind(control);
         defer self.allocator.free(model_path);
         try control.update(.loading_model, 0, 1);
-        var admission_manifest = try self.embeddingManifest(allocator, model_path);
+        var admission_manifest = try self.embeddingManifestSelected(allocator, model_path_selection, control);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
@@ -7142,7 +7185,7 @@ pub const Node = struct {
         model_name: []const u8,
         rasters: []const readers_api.RasterImage,
     ) ![][]f32 {
-        const control = self.bindExecutionControl(io, supplied_control);
+        var control = self.bindExecutionControl(io, supplied_control);
         try control.check();
         if (rasters.len == 0) return try allocator.alloc([]f32, 0);
         if (rasters.len > executorMaxImages("embed")) return error.EmbeddingBatchTooLarge;
@@ -7172,9 +7215,13 @@ pub const Node = struct {
         self.metrics.incRequest("embed.local.raster");
         defer self.metrics.decActive();
 
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        const model_path_selection = try self.resolveModelSelection(io, if (model_name.len > 0) model_name else null, "embedders");
+
+        const model_path = model_path_selection.path;
+
+        control = model_path_selection.bind(control);
         defer self.allocator.free(model_path);
-        var manifest = try self.embeddingManifest(allocator, model_path);
+        var manifest = try self.embeddingManifestSelected(allocator, model_path_selection, control);
         defer manifest.deinit();
         if (manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &manifest);
@@ -9838,7 +9885,7 @@ pub const Node = struct {
         request: readers_api.Request,
         supplied_control: InferenceExecutionControl,
     ) ![]readers_api.Result {
-        const control = self.bindExecutionControl(null, supplied_control);
+        var control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         if (request.audio) |audio| {
             if (request.images.len > 0 or request.documents.len > 0) return error.InvalidDocumentSource;
@@ -9889,9 +9936,13 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
-        const model_path = try self.resolveReadModelPath(io, if (model_name.len > 0) model_name else null);
+        const model_path_selection = try self.resolveReadModelSelection(io, if (model_name.len > 0) model_name else null);
+
+        const model_path = model_path_selection.path;
+
+        control = model_path_selection.bind(control);
         defer self.allocator.free(model_path);
-        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        var admission_manifest = try self.loadBoundManifest(allocator, model_path, false, self.bindModelSelection(model_path_selection, control));
         defer admission_manifest.deinit();
         const is_qwen3vl = isGenerativeReadModel(&admission_manifest);
 
@@ -10115,8 +10166,10 @@ pub const Node = struct {
         const io = self.inferenceIo(allocator, null, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
         var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
-        const execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
-        const model_path = try self.resolveReadModelPath(io, if (model_name.len > 0) model_name else null);
+        var execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
+        const model_path_selection = try self.resolveReadModelSelection(io, if (model_name.len > 0) model_name else null);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer self.allocator.free(model_path);
         try execution_control.check();
 
@@ -10124,7 +10177,7 @@ pub const Node = struct {
         // generation path as HTTP /read. They do not use the Florence broker
         // or the encoder-decoder reader loader.
         {
-            var manifest = try manifest_mod.loadListingFromDir(allocator, model_path);
+            var manifest = try self.loadBoundManifest(allocator, model_path, true, self.bindModelSelection(model_path_selection, execution_control));
             defer manifest.deinit();
             if (isGenerativeReadModel(&manifest)) {
                 const prompt = try resolveGenerativeReadPrompt(&manifest, request.prompt);
@@ -10428,8 +10481,10 @@ pub const Node = struct {
         const io = self.inferenceIo(allocator, null, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
         var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
-        const execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
-        const model_path = try self.resolveReadModelPath(io, if (model_name.len > 0) model_name else null);
+        var execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
+        const model_path_selection = try self.resolveReadModelSelection(io, if (model_name.len > 0) model_name else null);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer self.allocator.free(model_path);
         try execution_control.check();
 
@@ -11251,16 +11306,18 @@ pub const Node = struct {
     /// download or container decode and shares the standalone Whisper settings.
     pub fn transcribePcmDirectWithControl(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, pcm: @import("../pipelines/audio.zig").PcmAudio, request: transcribing_api.Request, supplied_control: InferenceExecutionControl) !transcribing_api.Response {
         if (pcm.sample_rate == 0 or pcm.samples.len == 0) return error.UnsupportedAudioInput;
-        const control = self.bindExecutionControl(null, supplied_control);
+        var control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         try self.acquireAdmissionUnits(1);
         defer self.releaseAdmission();
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveModelPath(io, model_name, "transcribers");
+        const model_path_selection = try self.resolveModelSelection(io, model_name, "transcribers");
+        const model_path = model_path_selection.path;
+        control = model_path_selection.bind(control);
         defer self.allocator.free(model_path);
-        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        var manifest = try self.loadBoundManifest(allocator, model_path, false, self.bindModelSelection(model_path_selection, control));
         defer manifest.deinit();
         const contract = try resolvedInferenceExecutorContract(self, "transcribe", &manifest);
         try validateInferenceExecutorInvocation(contract, .{ .item_count = 1, .media_parts_per_item = 1, .has_audio = true });
@@ -11702,13 +11759,15 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(scratch, null, &owned_io);
-        const path = self.resolveRequestModelPath(scratch, io, name.string, "extractors") catch |err| switch (err) {
-            error.ModelNotFound => self.resolveRequestModelPath(scratch, io, name.string, "embedders") catch |fallback| switch (fallback) {
+        const path_selection = self.resolveRequestModelSelection(scratch, io, name.string, "extractors") catch |err| switch (err) {
+            error.ModelNotFound => self.resolveRequestModelSelection(scratch, io, name.string, "embedders") catch |fallback| switch (fallback) {
                 error.ModelNotFound => return null,
                 else => return fallback,
             },
             else => return err,
         };
+        const path = path_selection.path;
+        const path_selection_control: ?InferenceExecutionControl = path_selection.bind(self.bindExecutionControl(null, control orelse .{}));
         defer scratch.free(path);
         // Probe only model_type here. Parsing another architecture's listing
         // would move its model checks ahead of its established schema gate.
@@ -11735,10 +11794,9 @@ pub const Node = struct {
         if (config_json.value != .object) return null;
         const architecture = config_json.value.object.get("model_type") orelse return null;
         if (architecture != .string or !@import("../architectures/embedding_gemma2.zig").isModel(architecture.string)) return null;
-        var listing = try manifest_mod.loadListingFromDir(scratch, path);
+        var listing = try self.loadBoundManifest(scratch, path, true, self.bindModelSelection(path_selection, path_selection_control));
         defer listing.deinit();
         if (listing.embedding_style != .embedding_gemma2) return null;
-        _ = control;
         _ = response_limit;
         return error.UnsupportedExtractionModel;
     }
@@ -11774,10 +11832,12 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(scratch, null, &owned_io);
-        const path = self.resolveRequestModelPath(scratch, io, name.string, "extractors") catch |err| switch (err) {
+        const path_selection = self.resolveRequestModelSelection(scratch, io, name.string, "extractors") catch |err| switch (err) {
             error.ModelNotFound => return null,
             else => return err,
         };
+        const path = path_selection.path;
+        const path_selection_control: ?InferenceExecutionControl = path_selection.bind(self.bindExecutionControl(null, control orelse .{}));
         defer scratch.free(path);
         // A listing load reads architecture sidecars before capabilities. That
         // would run GLiNER model preflight too early, before its schema checks
@@ -11789,7 +11849,7 @@ pub const Node = struct {
         if (!is_laya) return null;
         // The span decision checkpoint also declares typed_decisions. Its
         // extraction path is the GLiNER classifier, not the Laya pipeline.
-        var listing = try manifest_mod.loadListingFromDir(scratch, path);
+        var listing = try self.loadBoundManifest(scratch, path, true, self.bindModelSelection(path_selection, path_selection_control));
         defer listing.deinit();
         if (!listing.laya_declared) return null;
         if (!decision_execution) return error.UnsupportedExtractionModel;
@@ -11798,11 +11858,11 @@ pub const Node = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         const request = try laya.parse(allocator, parsed.value);
-        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, path, "decide");
+        const contract = try resolvedSelectedExecutorContract(self, allocator, path_selection, "decide", path_selection_control);
         try validateLayaExecutorInvocation(allocator, contract, request);
-        const effective = control orelse InferenceExecutionControl{};
+        const effective = path_selection_control orelse InferenceExecutionControl{};
         try effective.check();
-        var handle = try self.model_manager.acquireFromDirWithControl(path, effective);
+        var handle = try self.model_manager.acquireFromDirWithControl(path, self.bindModelSelection(path_selection, effective));
         defer handle.release();
         const loaded = handle.get();
         const config = session_factory.getLayaConfig(loaded.session) orelse return error.UnsupportedExtractionModel;
@@ -11875,29 +11935,31 @@ pub const Node = struct {
         const io = self.inferenceIo(scratch, null, &owned_io);
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
-        const model_path = if (resolved_span_path) |path|
-            try scratch.dupe(u8, path)
+        const model_path_selection = if (resolved_span_path) |path|
+            try @import("../registry/model_selection.zig").fromDirectory(scratch, io, try scratch.dupe(u8, path))
         else
-            try self.resolveRequestModelPath(scratch, io, request.model, "extractors");
+            try self.resolveRequestModelSelection(scratch, io, request.model, "extractors");
+        const model_path = model_path_selection.path;
+        const model_path_selection_control: ?InferenceExecutionControl = model_path_selection.bind(self.bindExecutionControl(null, control orelse .{}));
         defer scratch.free(model_path);
         // Only architecture/configuration and capability are needed here.
         // Full tokenizer JSON materialization belongs to the admitted managed
         // loader; repeating it per request can exceed the request heap before
         // this gate, even for an otherwise small extraction request.
-        var manifest = try manifest_mod.loadListingFromDir(scratch, model_path);
+        var manifest = try self.loadBoundManifest(scratch, model_path, true, self.bindModelSelection(model_path_selection, model_path_selection_control));
         defer manifest.deinit();
         if (resolved_span_path != null and !requiresQualifiedSpanClassification(manifest)) return error.UnsupportedClassificationExtraction;
         // Declared SpanExtractor wrappers use the schema-v2 classifier route
         // on every qualified backend. The legacy decision executor below is
         // reserved for non-span label-marker bundles.
         if (usesDeclaredSpanV2Route(manifest))
-            return self.extractV2Span(scratch, model_path, &request, resolved_span_path != null, classification_compatibility, control, failure, response_limit, budget, working_bytes, allocation_failure, observer, null, manifest.gliner_specialty_profile);
+            return self.extractV2Span(scratch, model_path, &request, resolved_span_path != null, classification_compatibility, model_path_selection_control, failure, response_limit, budget, working_bytes, allocation_failure, observer, null, manifest.gliner_specialty_profile);
         if (manifest.gliner_classification_head == .label_marker_mlp) {
             try decision_executor.preflight(&request);
             failure.* = .{ .stage = "model" };
             observer.emit(.{ .phase = .model });
             allocation_failure.clear();
-            var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
+            var handle = self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, model_path_selection_control orelse .{})) catch |err| {
                 allocation_failure.clear();
                 return err;
             };
@@ -11906,7 +11968,7 @@ pub const Node = struct {
             const backend = loaded.session.backend();
             if (backend != .native and backend != .cuda) return error.UnsupportedDecisionBackend;
             var pipeline = createGlinerPipeline(self, scratch, loaded);
-            return decision_executor.execute(scratch, &pipeline, &request, execution_options.max_response_bytes, control);
+            return decision_executor.execute(scratch, &pipeline, &request, execution_options.max_response_bytes, model_path_selection_control);
         }
         // Only a declared gliner2 2.x span checkpoint has the upstream
         // classifier head and processor contract this route executes; other
@@ -11923,7 +11985,7 @@ pub const Node = struct {
         // a declared request limit. The real loader still validates all model
         // and tokenizer bytes before publishing a managed session.
         allocation_failure.clear();
-        var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
+        var handle = self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, model_path_selection_control orelse .{})) catch |err| {
             allocation_failure.clear();
             return err;
         };
@@ -11942,7 +12004,7 @@ pub const Node = struct {
                 .metal => .metal,
                 .cuda => .cuda,
                 else => .native,
-            }, &request, execution_options.pipeline, control);
+            }, &request, execution_options.pipeline, model_path_selection_control);
         }
         // This pass uses the held immutable tokenizer and exact prepared items
         // and windows under the existing request heap. Observe its real CPU
@@ -11970,14 +12032,14 @@ pub const Node = struct {
             break :bytes planned;
         } else null;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
-        const effective = control orelse InferenceExecutionControl{};
+        const effective = model_path_selection_control orelse InferenceExecutionControl{};
         // A waiting GPU boundary request cannot use the session workspace
         // yet. Admit its device ceiling only when it reaches the front of the
         // model queue; otherwise concurrent waiters reserve duplicate device
         // capacity and fail before the already-serialized execution can drain.
         // This is distinct from the execution/provider lock: admission may
         // evict other models and must remain outside those locks.
-        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(control orelse .{}) else null;
+        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(model_path_selection_control orelse .{}) else null;
         defer if (gliner_turn) |turn| turn.release();
         const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try effective.lock(mutex);
@@ -12042,12 +12104,12 @@ pub const Node = struct {
             if (execution_mutex) |mutex| try effective.lock(mutex);
             defer if (execution_mutex) |mutex| mutex.unlock();
             var managed = if (workspace_plan) |plan|
-                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
+                session_factory.getManagedGlinerBoundaryComputeBackend(loaded.session, scratch, budget, model_path_selection_control, plan, if (workspace_permit) |*permit| permit else null) catch |err| {
                     if (err == error.GlinerBoundaryWorkspacePlanChanged) continue;
                     return err;
                 }
             else
-                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
+                try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, model_path_selection_control);
             defer managed.deinit();
             const json = if (test_qualification)
                 try boundary_executor.execute(&managed.backend, scratch, &config, loaded.getTokenizer(), &request, request_options)
@@ -12444,7 +12506,7 @@ pub const Node = struct {
         // extractText/extractImages below.
         var extractor = try extractors_mod.resolve(extractor_ctx, model_name, media_shape.image_count > 0);
         defer extractor.deinit(allocator);
-        var admission_manifest = try manifest_mod.loadFromDir(allocator, extractor.modelPath());
+        var admission_manifest = try self.manifestForSelection(allocator, extractor.modelSelection());
         defer admission_manifest.deinit();
         const extraction_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
         var text_admission = ExtractionTextAdmission{ .contract = extraction_contract, .schema_bytes = request.schema_json.len };
@@ -12578,9 +12640,11 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveRequestModelPath(allocator, io, model_name, "extractors");
+        const model_path_selection = try self.resolveRequestModelSelection(allocator, io, model_name, "extractors");
+        const model_path = model_path_selection.path;
+        const model_path_selection_control: ?InferenceExecutionControl = model_path_selection.bind(self.bindExecutionControl(null, execution_control orelse .{}));
         defer allocator.free(model_path);
-        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
+        const executor_contract = try resolvedSelectedExecutorContract(self, allocator, model_path_selection, "extract", model_path_selection_control);
         const schema_json = try std.json.Stringify.valueAlloc(allocator, schema, .{});
         defer allocator.free(schema_json);
         try validateTextExecutorInvocation(
@@ -12603,21 +12667,21 @@ pub const Node = struct {
                 texts,
                 want_relations,
                 &failure_stage,
-                execution_control,
+                model_path_selection_control,
             );
         }
 
-        var model_handle = if (execution_control) |control|
-            try self.model_manager.acquireFromDirWithControl(model_path, control)
+        var model_handle = if (model_path_selection_control) |control|
+            try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, control))
         else
-            try self.model_manager.acquireFromDir(model_path);
+            try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, model_path_selection_control));
         defer model_handle.release();
         const model = model_handle.get();
         try validateTextEntityExtractionManifest(&model.manifest);
 
         if (model.isGlinerModel()) {
             var pipeline = createGlinerPipeline(self, allocator, model);
-            pipeline.execution_control = execution_control;
+            pipeline.execution_control = model_path_selection_control;
             pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
             pipeline.config.flat_ner = options.flat_ner orelse pipeline.config.flat_ner;
             const labels: ?[]const []const u8 = if (schema.entities) |values|
@@ -12692,7 +12756,7 @@ pub const Node = struct {
         if (want_relations) return error.UnsupportedRelationExtraction;
         var pipeline = model.nerPipeline(allocator);
         pipeline.batch_dispatch = self.tensorBatchDispatch(.extract);
-        pipeline.execution_control = execution_control;
+        pipeline.execution_control = model_path_selection_control;
         pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
         const input_tokens = try maxNerInputTokens(&pipeline, texts);
         try validateTextExecutorInvocation(
@@ -12730,9 +12794,11 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
-        const model_path = try self.resolveClassificationRequestModelPath(allocator, io, model_name);
+        const model_path_selection = try self.resolveClassificationSelection(allocator, io, model_name);
+        const model_path = model_path_selection.path;
+        const model_path_selection_control: ?InferenceExecutionControl = model_path_selection.bind(self.bindExecutionControl(null, execution_control orelse .{}));
         defer allocator.free(model_path);
-        const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
+        const executor_contract = try resolvedSelectedExecutorContract(self, allocator, model_path_selection, "extract", model_path_selection_control);
         const schema_json = try std.json.Stringify.valueAlloc(allocator, schema, .{});
         defer allocator.free(schema_json);
         var max_candidates: usize = 0;
@@ -12742,11 +12808,11 @@ pub const Node = struct {
             schema_text_bytes = @max(schema_text_bytes, maxTextBytes(classification_schema.labels));
         }
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, schema_text_bytes, 0, max_candidates, schema_json.len);
-        if (execution_control) |control| try control.check();
-        var model_handle = if (execution_control) |control|
-            try self.model_manager.acquireFromDirWithControl(model_path, control)
+        if (model_path_selection_control) |control| try control.check();
+        var model_handle = if (model_path_selection_control) |control|
+            try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, control))
         else
-            try self.model_manager.acquireFromDir(model_path);
+            try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, model_path_selection_control));
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.supportsClassification()) return error.UnsupportedClassificationExtraction;
@@ -12767,7 +12833,7 @@ pub const Node = struct {
                 if (model.manifest.gliner_classification_head == .label_marker_mlp and classification_schema.hypothesis_template != null)
                     return error.UnsupportedDecisionHypothesisTemplate;
                 var pipeline = createGlinerPipeline(self, allocator, model);
-                pipeline.execution_control = execution_control;
+                pipeline.execution_control = model_path_selection_control;
                 const input_tokens = try pipeline.maxClassificationInputTokens(texts, classification_schema.labels);
                 try validateTextExecutorInvocation(
                     executor_contract,
@@ -12803,7 +12869,7 @@ pub const Node = struct {
                 .multi_label = classification_schema.multi_label orelse false,
                 .entailment_index = nliEntailmentIndex(model.manifest.id2label),
             });
-            pipeline.execution_control = execution_control;
+            pipeline.execution_control = model_path_selection_control;
             var prepared = try pipeline.prepareInputs(texts, classification_schema.labels);
             defer prepared.deinit();
             try validateTextExecutorInvocation(
@@ -12841,44 +12907,44 @@ pub const Node = struct {
 
     /// Returns a newly allocated canonical path. The caller must free it with
     /// the allocator passed to this function.
-    fn resolveRequestModelPath(
+    fn resolveRequestModelSelection(
         self: *Node,
         allocator: std.mem.Allocator,
         io: std.Io,
         name: ?[]const u8,
         task_type: ?[]const u8,
-    ) ![]const u8 {
+    ) !ResolvedModel {
         if (comptime builtin.is_test) request_work_test_counters.model_resolution_attempts += 1;
         if (name) |raw| try validateRequestModelIdentifier(raw);
-        const resolved = try self.resolveModelPath(io, name, task_type);
-        defer self.allocator.free(resolved);
+        const resolved = try self.resolveModelSelection(io, name, task_type);
+        defer self.allocator.free(resolved.path);
 
         const root = try realPathExistingAlloc(allocator, io, self.config.models_dir);
         defer allocator.free(root);
-        const canonical = try realPathExistingAlloc(allocator, io, resolved);
+        const canonical = try realPathExistingAlloc(allocator, io, resolved.path);
         errdefer allocator.free(canonical);
         if (!pathHasComponentPrefix(canonical, root)) return error.ModelOutsideModelsDir;
-        return canonical;
+        return resolved.withPath(canonical);
     }
 
-    fn resolveReadRequestModelPath(
+    fn resolveReadRequestModelSelection(
         self: *Node,
         allocator: std.mem.Allocator,
         io: std.Io,
         name: ?[]const u8,
-    ) ![]const u8 {
-        return self.resolveReadingPath(allocator, io, name, true);
+    ) !ResolvedModel {
+        return self.resolveReadingSelection(allocator, io, name, true);
     }
 
-    pub fn resolveReadModelPath(
+    pub fn resolveReadModelSelection(
         self: *Node,
         io: std.Io,
         name: ?[]const u8,
-    ) ![]const u8 {
-        return self.resolveReadingPath(self.allocator, io, name, false);
+    ) !ResolvedModel {
+        return self.resolveReadingSelection(self.allocator, io, name, false);
     }
 
-    fn resolveReadingPath(self: *Node, allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8, comptime checked: bool) ![]const u8 {
+    fn resolveReadingSelection(self: *Node, allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8, comptime checked: bool) !ResolvedModel {
         // The selector inventory already joins all read execution scopes.
         // Constrained selectors need one lookup and one receipt verification.
         if (name) |raw| {
@@ -12886,21 +12952,22 @@ pub const Node = struct {
             if (registry_mod.ModelRef.parse(friendly)) |ref| {
                 const selection = try registry_mod.download.parseVariantRevision(ref.variant);
                 if (selection.revision != null or !std.mem.eql(u8, selection.variant, "auto")) {
-                    return if (checked) self.resolveRequestModelPath(allocator, io, raw, "readers") else self.resolveModelPath(io, raw, "readers");
+                    return if (checked) self.resolveRequestModelSelection(allocator, io, raw, "readers") else self.resolveModelSelection(io, raw, "readers");
                 }
             } else |_| {}
         }
         // A bare identity must not pick a model architecture by search order.
         // Qualified storage identities still resolve through the exact path.
-        var selected: ?[]const u8 = null;
-        errdefer if (selected) |path| allocator.free(path);
-        const scopes = [_][]const u8{ "readers", "transcribers", "generators" };
+        var selected: ?ResolvedModel = null;
+        errdefer if (selected) |path| allocator.free(path.path);
+        const scopes = selection_mod.scopes("readers");
         for (scopes) |scope| {
-            const resolved = if (checked) self.resolveRequestModelPath(allocator, io, name, scope) else self.resolveModelPath(io, name, scope);
+            const resolved = if (checked) self.resolveRequestModelSelection(allocator, io, name, scope) else self.resolveModelSelection(io, name, scope);
             if (resolved) |path| {
                 if (selected) |prior| {
-                    defer allocator.free(path);
-                    if (!std.mem.eql(u8, prior, path)) return error.AmbiguousModelIdentifier;
+                    defer allocator.free(path.path);
+                    if (!std.mem.eql(u8, prior.path, path.path)) return error.AmbiguousModelIdentifier;
+                    if (!std.meta.eql(prior.publication, path.publication)) return error.ModelArtifactsChanging;
                 } else selected = path;
             } else |err| switch (requestModelResolutionErrorKind(err)) {
                 .missing => continue,
@@ -12908,6 +12975,27 @@ pub const Node = struct {
             }
         }
         return selected orelse error.ModelNotFound;
+    }
+
+    fn resolveRequestModelPath(self: *Node, a: std.mem.Allocator, io: std.Io, name: ?[]const u8, task: ?[]const u8) ![]const u8 {
+        if (!builtin.is_test) @compileError("execution must retain a ResolvedModel");
+        return (try self.resolveRequestModelSelection(a, io, name, task)).path;
+    }
+    fn resolveModelPath(self: *Node, io: std.Io, name: ?[]const u8, task: ?[]const u8) ![]const u8 {
+        if (!builtin.is_test) @compileError("execution must retain a ResolvedModel");
+        return (try self.resolveModelSelection(io, name, task)).path;
+    }
+    fn resolveReadRequestModelPath(self: *Node, a: std.mem.Allocator, io: std.Io, name: ?[]const u8) ![]const u8 {
+        if (!builtin.is_test) @compileError("execution must retain a ResolvedModel");
+        return (try self.resolveReadRequestModelSelection(a, io, name)).path;
+    }
+    fn resolveReadModelPath(self: *Node, io: std.Io, name: ?[]const u8) ![]const u8 {
+        if (!builtin.is_test) @compileError("execution must retain a ResolvedModel");
+        return (try self.resolveReadModelSelection(io, name)).path;
+    }
+    fn resolveReadingPath(self: *Node, a: std.mem.Allocator, io: std.Io, name: ?[]const u8, comptime checked: bool) ![]const u8 {
+        if (!builtin.is_test) @compileError("execution must retain a ResolvedModel");
+        return (try self.resolveReadingSelection(a, io, name, checked)).path;
     }
 
     fn requestModelResolutionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -12938,7 +13026,37 @@ pub const Node = struct {
     /// Matches Go inference's resolveModel: exact match → re-scan → variant resolution.
     /// When task_type is provided (e.g. "embedders"), also searches models_dir/task_type/.
     /// Always returns memory owned by `self.allocator`; the caller must free it.
-    pub fn resolveModelPath(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8) ![]const u8 {
+    pub fn resolveModelSelection(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8) !ResolvedModel {
+        if (task_type) |task| if (selection_mod.firstScopeWins(task)) {
+            for (selection_mod.scopes(task)) |physical| {
+                if (self.resolveModelSelection(io, name, physical)) |selected| return selected else |err| switch (requestModelResolutionErrorKind(err)) {
+                    .missing => continue,
+                    else => return err,
+                }
+            }
+            return error.ModelNotFound;
+        };
+        if (name) |raw| {
+            const friendly = registry_mod.resolveFriendlyRef(raw) orelse raw;
+            const normalized = if (std.mem.startsWith(u8, friendly, "hf:")) friendly[3..] else friendly;
+            if (registry_mod.ModelRef.parse(normalized)) |ref| {
+                const requested = try registry_mod.download.parseVariantRevision(ref.variant);
+                if (requested.revision != null or !std.mem.eql(u8, requested.variant, "auto")) {
+                    if (self.selector_cache) |cache| return (try cache.resolveSelection(self.allocator, io, self.config.models_dir, normalized, task_type)) orelse error.ModelNotFound;
+                    var temporary = selection_mod.Cache.init(self.allocator);
+                    defer temporary.deinit();
+                    return (try temporary.resolveSelection(self.allocator, io, self.config.models_dir, normalized, task_type)) orelse error.ModelNotFound;
+                }
+            } else |_| {
+                if (std.mem.indexOfAny(u8, normalized, ":@") != null) return error.InvalidModelIdentifier;
+            }
+        }
+        const path = try self.resolveModelDirectory(io, name, task_type);
+        errdefer self.allocator.free(path);
+        return @import("../registry/model_selection.zig").fromDirectory(self.allocator, io, path);
+    }
+
+    fn resolveModelDirectory(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8) ![]const u8 {
         if (name) |raw| {
             // Resolve qualified production aliases before deriving the stable
             // variant install path, then strip the optional Hub prefix.
@@ -13561,7 +13679,7 @@ pub const Node = struct {
     pub fn createEmbedding(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const tracing = platform.env.getenv("ANTFLY_EMBED_TRACE_DIR") != null;
         const trace_started = if (tracing) embedding_trace.now() else 0;
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const uses_attachment_envelope = if (ctx.header("Content-Type")) |content_type| blk: {
             const separator = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
@@ -13641,20 +13759,22 @@ pub const Node = struct {
         // Read only the lightweight manifest first so media can be admitted
         // before loading tokenizer, weights, or accelerator sessions.
         const model_name: ?[]const u8 = if (request.model.len > 0) request.model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "embedders") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "embedders") catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
 
         // Copy the warm publication's small metadata while briefly pinning it.
         // Request validation never scans its GGUF tokenizer arrays, and the
         // failed runtime can be reclaimed before a recovery replacement loads.
         const cached_manifest = if (metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
-            self.model_manager.copyCachedQwenEmbeddingManifest(ctx.allocator, model_path) catch |err|
+            self.model_manager.copyCachedQwenEmbeddingManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
                 return modelLoadFailureResponse(ctx, err)
         else
             null;
         var owned_admission_manifest = cached_manifest orelse
-            self.embeddingManifest(ctx.allocator, model_path) catch |err|
+            self.embeddingManifestSelected(ctx.allocator, model_path_selection, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer owned_admission_manifest.deinit();
         const admission_manifest = &owned_admission_manifest;
@@ -14161,7 +14281,8 @@ pub const Node = struct {
         return .{ .summary = summary, .model_identity = resolved.identity, .model_revision = resolved.revision, .dimensions = 0, .failure = failure };
     }
 
-    fn embedMediaOutput(self: *Node, a: std.mem.Allocator, control: InferenceExecutionControl, resolved: *const MediaOutputExecution.Resolved, target: lib_chunker.outputs.Target, payload: @import("../pipelines/media_chunking.zig").Payload, prepared_frames: ?[]const @import("../pipelines/embedding_gemma2_video.zig").PreparedFrame) !@import("../pipelines/media_chunking.zig").Output {
+    fn embedMediaOutput(self: *Node, a: std.mem.Allocator, supplied_control: InferenceExecutionControl, resolved: *const MediaOutputExecution.Resolved, target: lib_chunker.outputs.Target, payload: @import("../pipelines/media_chunking.zig").Payload, prepared_frames: ?[]const @import("../pipelines/embedding_gemma2_video.zig").PreparedFrame) !@import("../pipelines/media_chunking.zig").Output {
+        const control = resolved.bind(supplied_control);
         // Use the canonical path captured with the receipt. Resolving an alias
         // again here could execute a different generation from that receipt.
         var handle = try self.model_manager.acquireFromDirWithControl(resolved.path, control);
@@ -14228,7 +14349,7 @@ pub const Node = struct {
         if (request.max_working_bytes == 0 or request.max_chunks > request.limits.max_chunks) return error.InvalidChunkPolicy;
         const chunks = @import("../pipelines/media_chunking.zig");
         const grouped = @import("../pipelines/embedding_gemma2.zig");
-        const control = self.bindExecutionControl(io, supplied);
+        var control = self.bindExecutionControl(io, supplied);
         try control.check();
         if (request.input == .source) {
             const reference = request.input.source;
@@ -14280,12 +14401,14 @@ pub const Node = struct {
         if (request.transcribe_boundary) return self.chunkTranscribeBoundary(a, io, control, request, target, sink);
         if (target.model.len == 0 or (target.dimensions != null and target.dimensions.? == 0)) return error.InvalidChunkModel;
         const task = parseEmbeddingTaskType(target.task_type) orelse return error.UnsupportedEmbeddingTask;
-        const path = try self.resolveRequestModelPath(a, io, target.model, "embedders");
+        const path_selection = try self.resolveRequestModelSelection(a, io, target.model, "embedders");
+        const path = path_selection.path;
+        control = path_selection.bind(control);
         defer a.free(path);
-        var handle: ?model_manager_mod.ModelHandle = if (request.execute) try self.model_manager.acquireFromDirWithControl(path, control) else self.model_manager.acquireLoadedModel(path);
+        var handle: ?model_manager_mod.ModelHandle = if (request.execute) try self.model_manager.acquireFromDirWithControl(path, self.bindModelSelection(path_selection, control)) else try self.model_manager.acquireLoadedModelWithControl(path, self.bindModelSelection(path_selection, control));
         defer if (handle) |*active| active.release();
         const loaded = if (handle) |*active| active.get() else null;
-        var planning_assets: ?model_manager_mod.ChunkPlanningAssets = if (loaded == null) try self.model_manager.loadChunkPlanningAssets(path, io, control) else null;
+        var planning_assets: ?model_manager_mod.ChunkPlanningAssets = if (loaded == null) try self.model_manager.loadChunkPlanningAssets(path, io, self.bindModelSelection(path_selection, control)) else null;
         defer if (planning_assets) |*assets| assets.deinit();
         const manifest = if (loaded) |model| &model.manifest else &planning_assets.?.manifest;
         if (manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
@@ -14592,10 +14715,12 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (requested_model.len > 0) requested_model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        const model_path_selection_control = model_path_selection.bind(self.bindExecutionControl(null, execution_control));
         defer ctx.allocator.free(model_path);
-        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+        var admission_manifest = self.loadBoundManifest(ctx.allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
         const executor_contract = resolvedInferenceExecutorContract(self, "rerank", &admission_manifest) catch |err|
@@ -14630,7 +14755,7 @@ pub const Node = struct {
                 ctx.allocator,
                 doc,
                 &media_budget,
-                .{ .io = ctx.io, .control = execution_control },
+                .{ .io = ctx.io, .control = model_path_selection_control },
                 attachments,
             ) catch |err| switch (err) {
                 error.InvalidImageDataUri => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid image data URI" }),
@@ -14682,7 +14807,7 @@ pub const Node = struct {
             .has_image = image_count > 0,
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
-        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, model_path_selection_control)) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -14698,7 +14823,7 @@ pub const Node = struct {
             // restarting the worker for every abandoned search would evict
             // the model for the next one.
             pipeline.config.batch_size = @min(pipeline.config.batch_size, cancellable_rerank_batch_size);
-            pipeline.execution_control = execution_control;
+            pipeline.execution_control = model_path_selection_control;
             var prepared = pipeline.prepareInputs(query, flat_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer prepared.deinit();
@@ -14764,11 +14889,11 @@ pub const Node = struct {
             // accelerator runtime. Serialize their complete lifetime while
             // leaving request parsing and media admission outside the lane.
             const execution_mutex = model.targetInferenceExecutionMutex();
-            if (execution_mutex) |mutex| execution_control.lock(mutex) catch |err|
+            if (execution_mutex) |mutex| model_path_selection_control.lock(mutex) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer if (execution_mutex) |mutex| mutex.unlock();
 
-            var compute = session_factory.getComputeBackendWithControl(model.session, ctx.allocator, execution_control) catch |err|
+            var compute = session_factory.getComputeBackendWithControl(model.session, ctx.allocator, model_path_selection_control) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer compute.deinit();
             var qwen_pipeline = qwen3vl_multimodal_reranker.Pipeline.init(
@@ -14789,11 +14914,11 @@ pub const Node = struct {
             defer ctx.allocator.free(scores);
             var prompt_tokens: usize = 0;
             for (parsed_docs.items, 0..) |doc, idx| {
-                execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
+                model_path_selection_control.check() catch |err| return inferenceFailureResponse(ctx, err);
                 if (doc.images.len == 0) {
                     var text_pipeline = model.rerankingPipeline(ctx.allocator);
                     text_pipeline.execution_lock = null;
-                    text_pipeline.execution_control = execution_control;
+                    text_pipeline.execution_control = model_path_selection_control;
                     const text_scores = text_pipeline.rerank(query, &.{doc.text}) catch |err|
                         return inferenceFailureResponse(ctx, err);
                     defer ctx.allocator.free(text_scores);
@@ -14842,7 +14967,7 @@ pub const Node = struct {
 
         std.debug.assert(image_executor == .native_late_interaction_reranking);
 
-        model.ensureVisionSessionWithControl(execution_control) catch |err|
+        model.ensureVisionSessionWithControl(model_path_selection_control) catch |err|
             return inferenceFailureResponse(ctx, err);
         const vision_session = model.vision_session;
         const gpt_cfg = session_factory.getGptConfig(model.session) orelse
@@ -14858,11 +14983,11 @@ pub const Node = struct {
         // complete lifetime; request parsing and image preparation remain
         // outside it.
         const execution_mutex = model.targetInferenceExecutionMutex();
-        if (execution_mutex) |mutex| execution_control.lock(mutex) catch |err|
+        if (execution_mutex) |mutex| model_path_selection_control.lock(mutex) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer if (execution_mutex) |mutex| mutex.unlock();
 
-        var compute = session_factory.getComputeBackendWithControl(model.session, ctx.allocator, execution_control) catch |err|
+        var compute = session_factory.getComputeBackendWithControl(model.session, ctx.allocator, model_path_selection_control) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer compute.deinit();
 
@@ -14877,7 +15002,7 @@ pub const Node = struct {
             model.manifest.add_bos_token,
             .{ .distributed = runtime.distributed.configFromEnv() },
         );
-        mm_pipeline.execution_control = execution_control;
+        mm_pipeline.execution_control = model_path_selection_control;
 
         var input_tokens_for_limit: usize = 0;
         for (parsed_docs.items) |doc| {
@@ -14913,7 +15038,7 @@ pub const Node = struct {
                 var text_pipeline = model.rerankingPipeline(ctx.allocator);
                 // This request already owns the non-reentrant model lane.
                 text_pipeline.execution_lock = null;
-                text_pipeline.execution_control = execution_control;
+                text_pipeline.execution_control = model_path_selection_control;
                 const text_scores = text_pipeline.rerank(query, &.{doc.text}) catch |err|
                     return inferenceFailureResponse(ctx, err);
                 defer ctx.allocator.free(text_scores);
@@ -15056,7 +15181,7 @@ pub const Node = struct {
     }
 
     pub fn prepareChatContext(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const control = httpInferenceExecutionControl(self, ctx);
+        var control = httpInferenceExecutionControl(self, ctx);
         control.check() catch |err| return contextRequestFailure(ctx, err);
         const bytes = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         var parsed = std.json.parseFromSlice(api.ContextPrepareRequest, ctx.allocator, bytes, .{}) catch
@@ -15091,11 +15216,13 @@ pub const Node = struct {
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("context.prepare");
         defer self.metrics.decActive();
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, if (body.model.len > 0) body.model else null, "generators") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, if (body.model.len > 0) body.model else null, "generators") catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        control = model_path_selection.bind(control);
         defer ctx.allocator.free(model_path);
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-        var handle = self.model_manager.acquireFromDirWithControl(model_path, control) catch |err| return modelLoadFailureResponse(ctx, err);
+        var handle = self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, control)) catch |err| return modelLoadFailureResponse(ctx, err);
         defer handle.release();
         const model = handle.get();
         const config = session_factory.getGptConfig(model.session) orelse return ctx.status(400).json(.{ .@"error" = "INCOMPATIBLE_MODEL", .message = "context preparation requires a native decoder" });
@@ -15383,7 +15510,7 @@ pub const Node = struct {
         defer if (admission_started) |started| {
             std.debug.print("native_request_timing_ms: scope_total={d}\n", .{@divTrunc(std.Io.Clock.awake.now(ctx.io).nanoseconds - started, std.time.ns_per_ms)});
         };
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const uses_attachment_envelope = native_transfer == null and requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -15506,19 +15633,21 @@ pub const Node = struct {
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "generators") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "generators") catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
         const manifest_started: ?i96 = if (admission_started != null) std.Io.Clock.awake.now(ctx.io).nanoseconds else null;
         // The default route can inspect its resident generation without parsing
         // GGUF tokenizer arrays on every request. Explicit backend requests keep
         // artifact preflight until their selected publication is acquired below.
         const cached_manifest = if (body.backend == null)
-            self.model_manager.copyCachedGenerationManifest(ctx.allocator, model_path) catch |err|
+            self.model_manager.copyCachedGenerationManifestWithControl(ctx.allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
                 return modelLoadFailureResponse(ctx, err)
         else
             null;
-        var admission_manifest = cached_manifest orelse manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+        var admission_manifest = cached_manifest orelse self.loadBoundManifest(ctx.allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
         if (manifest_started) |started| {
@@ -15990,9 +16119,9 @@ pub const Node = struct {
         var model_handle = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
-            break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, execution_control) catch |err|
+            break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
                 return modelLoadFailureResponse(ctx, err);
-        } else self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
+        } else self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -16296,11 +16425,13 @@ pub const Node = struct {
         }
 
         var resolved_draft_model_path: ?[]const u8 = null;
+        var resolved_draft_selection: ?ResolvedModel = null;
         var draft_was_discovered = false;
         if (effective_draft_model_name) |draft_model_name| {
             if (shouldResolveDraftModel(config.speculation_policy)) {
-                const draft_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
+                const draft_model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
                     return requestModelResolutionError(ctx, err);
+                const draft_model_path = draft_model_path_selection.path;
                 draft_model_path_storage = draft_model_path;
                 if (std.mem.eql(u8, draft_model_path, model_path)) {
                     return ctx.status(400).json(.{
@@ -16309,6 +16440,7 @@ pub const Node = struct {
                     });
                 }
                 resolved_draft_model_path = draft_model_path;
+                resolved_draft_selection = draft_model_path_selection;
             }
         } else if (auto_draft_sibling) |sibling| {
             // Ownership moves to the request-scoped draft path storage;
@@ -16322,10 +16454,11 @@ pub const Node = struct {
         }
         var draft_degraded = false;
         if (resolved_draft_model_path) |draft_model_path| draft_setup: {
+            const draft_model_path_selection = resolved_draft_selection orelse try @import("../registry/model_selection.zig").fromDirectory(ctx.allocator, ctx.io, draft_model_path);
             config.draft_model = draft_model_path;
             var load_draft_backend = true;
             if (config.speculation_policy == .auto) {
-                var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err| {
+                var draft_manifest = self.loadBoundManifest(ctx.allocator, draft_model_path, false, self.bindModelSelection(draft_model_path_selection, execution_control)) catch |err| {
                     if (draft_was_discovered) {
                         draft_degraded = true;
                         break :draft_setup;
@@ -16349,14 +16482,14 @@ pub const Node = struct {
                 draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
                     var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                     configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                    break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(draft_model_path, request_session_manager.preferred_backends, false, execution_control) catch |err| {
+                    break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(draft_model_path, request_session_manager.preferred_backends, false, self.bindModelSelection(draft_model_path_selection, execution_control)) catch |err| {
                         if (draft_was_discovered) {
                             draft_degraded = true;
                             break :draft_setup;
                         }
                         return modelLoadFailureResponse(ctx, err);
                     };
-                } else self.model_manager.acquireFromDirWithControl(draft_model_path, execution_control) catch |err| {
+                } else self.model_manager.acquireFromDirWithControl(draft_model_path, self.bindModelSelection(draft_model_path_selection, execution_control)) catch |err| {
                     if (draft_was_discovered) {
                         draft_degraded = true;
                         break :draft_setup;
@@ -17982,6 +18115,7 @@ pub const Node = struct {
     };
 
     const PreparedGenerateBatchModel = struct {
+        selection: ResolvedModel,
         requested_model: []u8,
         model_path: []const u8,
         manifest: manifest_mod.ModelManifest,
@@ -18127,7 +18261,7 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -18246,7 +18380,7 @@ pub const Node = struct {
                 }
             }
             if (prepared_model == null) {
-                const model_path = self.resolveRequestModelPath(
+                const model_path_selection = self.resolveRequestModelSelection(
                     ctx.allocator,
                     ctx.io,
                     item.body.model,
@@ -18256,9 +18390,11 @@ pub const Node = struct {
                     pending[idx] = false;
                     continue;
                 };
+                const model_path = model_path_selection.path;
+                execution_control = model_path_selection.bind(execution_control);
                 var model_path_owned = true;
                 defer if (model_path_owned) ctx.allocator.free(model_path);
-                var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err| {
+                var admission_manifest = self.loadBoundManifest(ctx.allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err| {
                     results[idx].@"error" = batchModelLoadError(err);
                     pending[idx] = false;
                     continue;
@@ -18274,6 +18410,7 @@ pub const Node = struct {
                 errdefer ctx.allocator.free(requested_model);
                 try prepared_models.append(ctx.allocator, .{
                     .requested_model = requested_model,
+                    .selection = model_path_selection,
                     .model_path = model_path,
                     .manifest = admission_manifest,
                     .executor_contract = executor_contract,
@@ -18327,6 +18464,7 @@ pub const Node = struct {
                 return error.InvalidInferenceCapabilities;
             };
             const model_path = prepared_model.model_path;
+            const model_path_selection = prepared_model.selection;
             const provisional_contract = prepared_model.executor_contract;
             const selection = parseGenerateBackendSelection(first_body.backend, first_body.mode, first_body.compiled_target) catch {
                 results[first_idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "unsupported backend", .retryable = false };
@@ -18533,14 +18671,14 @@ pub const Node = struct {
             var model_handle = if (selection.native_choice != .auto) blk: {
                 var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                 configureGenerateBackendPreference(&request_session_manager, selection);
-                break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, execution_control) catch |err| {
+                break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err| {
                     for (group_indices.items) |idx| {
                         results[idx].@"error" = batchModelLoadError(err);
                         pending[idx] = false;
                     }
                     continue;
                 };
-            } else self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err| {
+            } else self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err| {
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = batchModelLoadError(err);
                     pending[idx] = false;
@@ -20344,13 +20482,15 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "extractors") catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
-        const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "extract") catch |err|
+        const executor_contract = resolvedSelectedExecutorContract(self, ctx.allocator, model_path_selection, "extract", execution_control) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         const entity_candidates = @max(
             if (body.labels) |labels| labels.len else 0,
@@ -20373,7 +20513,7 @@ pub const Node = struct {
             return self.extractRebel(ctx, model_path, executor_contract, body, texts, want_relations);
         }
 
-        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -20737,7 +20877,7 @@ pub const Node = struct {
     }
 
     pub fn classifyDocument(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -20749,8 +20889,10 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "classifiers") catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
 
         const prefix = body.prefix orelse document_classification.default_prefix;
@@ -20842,7 +20984,7 @@ pub const Node = struct {
     }
 
     pub fn classifyDocumentTokens(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentTokenClassificationRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -20854,8 +20996,10 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "classifiers") catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
 
         const prefix = body.prefix orelse document_token_classification.default_prefix;
@@ -20991,7 +21135,7 @@ pub const Node = struct {
     }
 
     pub fn rewriteText(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.RewriteRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -21006,10 +21150,12 @@ pub const Node = struct {
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rewriters") catch |err|
+        const model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "rewriters") catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
-        const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "rewrite") catch |err|
+        const executor_contract = resolvedSelectedExecutorContract(self, ctx.allocator, model_path_selection, "rewrite", execution_control) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         validateTextExecutorInvocation(executor_contract, body.inputs.len, body.inputs, 0, 0, 0, 0) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
@@ -21024,12 +21170,7 @@ pub const Node = struct {
         defer ctx.allocator.free(paths.encoder);
         defer ctx.allocator.free(paths.decoder);
 
-        var runtime_handle = self.model_manager.acquireCompositeRuntime(
-            model_path,
-            &.{ paths.encoder, paths.decoder },
-            .seq2seq,
-            execution_control,
-        ) catch |err| return modelLoadFailureResponse(ctx, err);
+        var runtime_handle = self.model_manager.acquireCompositeRuntime(model_path, &.{ paths.encoder, paths.decoder }, .seq2seq, self.bindModelSelection(model_path_selection, execution_control)) catch |err| return modelLoadFailureResponse(ctx, err);
         defer runtime_handle.release();
         const assets = runtime_handle.get();
         const encoder_session = assets.encoder.?.session;
@@ -21311,12 +21452,14 @@ pub const Node = struct {
             .extract => "extractors",
             .decide => "deciders",
         };
-        const resolved = if (operation == .read) self.resolveReadRequestModelPath(a, io, name) else self.resolveRequestModelPath(a, io, name, scope);
-        const path = resolved catch |err| switch (err) {
+        const resolved = if (operation == .read) self.resolveReadRequestModelSelection(a, io, name) else self.resolveRequestModelSelection(a, io, name, scope);
+        const selected = resolved catch |err| switch (err) {
             error.ModelNotFound => return null,
             else => return err,
         };
+        const path = selected.path;
         defer a.free(path);
+        try selected.verify(a, io);
         const file = try std.fs.path.join(a, &.{ path, "document_agent.json" });
         defer a.free(file);
         const canonical_file = realPathExistingAlloc(a, io, file) catch |err| switch (err) {
@@ -21325,10 +21468,13 @@ pub const Node = struct {
         };
         defer a.free(canonical_file);
         if (!pathHasComponentPrefix(canonical_file, path)) return error.ModelOutsideModelsDir;
-        return @import("../util/c_file.zig").readFileMax(a, canonical_file, 1024 * 1024) catch |err| switch (err) {
-            error.FileNotFound => null,
+        const bytes = @import("../util/c_file.zig").readFileMax(a, canonical_file, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return null,
             else => return err,
         };
+        errdefer a.free(bytes);
+        try selected.verify(a, io);
+        return bytes;
     }
 
     pub fn documentResolveBinding(self: *Node, a: std.mem.Allocator, binding: document_contract.Binding) !document_contract.Snapshot {
@@ -21348,8 +21494,10 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*owned| owned.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
-        const path = if (binding.operation == .read) try self.resolveReadRequestModelPath(a, io, binding.model) else try self.resolveRequestModelPath(a, io, binding.model, if (binding.operation == .decide) "deciders" else "extractors");
-        var manifest = try manifest_mod.loadListingFromDir(a, path);
+        const selected = if (binding.operation == .read) try self.resolveReadRequestModelSelection(a, io, binding.model) else try self.resolveRequestModelSelection(a, io, binding.model, if (binding.operation == .decide) "deciders" else "extractors");
+        const path = selected.path;
+        errdefer a.free(path);
+        var manifest = try self.loadBoundManifest(a, path, true, self.bindModelSelection(selected, null));
         defer manifest.deinit();
         switch (binding.operation) {
             .read => {
@@ -21892,7 +22040,7 @@ pub const Node = struct {
                 }
             }
         }
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
@@ -21993,10 +22141,12 @@ pub const Node = struct {
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveReadRequestModelPath(ctx.allocator, ctx.io, model_name) catch |err|
+        const model_path_selection = self.resolveReadRequestModelSelection(ctx.allocator, ctx.io, model_name) catch |err|
             return requestModelResolutionError(ctx, err);
+        const model_path = model_path_selection.path;
+        execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
-        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+        var admission_manifest = self.loadBoundManifest(ctx.allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
         const is_qwen3vl = isGenerativeReadModel(&admission_manifest);
@@ -22382,6 +22532,7 @@ pub const Node = struct {
         node: *Node,
         allocator: std.mem.Allocator,
         model_path: ?[]const u8 = null,
+        model_selection: ?@import("../registry/model_selection.zig").Constraint = null,
         manifest: ?manifest_mod.ModelManifest = null,
         composite_handle: ?model_manager_mod.CompositeAssetsHandle = null,
         model_handle: ?model_manager_mod.ModelHandle = null,
@@ -22465,18 +22616,22 @@ pub const Node = struct {
         stage: *WhisperRuntimeStage,
     ) !void {
         stage.* = .resolve;
-        whisper.model_path = try self.resolveRequestModelPath(whisper.allocator, io, model_name, "transcribers");
+        const selected = try self.resolveRequestModelSelection(whisper.allocator, io, model_name, "transcribers");
+        whisper.model_path = selected.path;
+        whisper.model_selection = selected.binding();
         try self.loadWhisperRuntime(whisper, declared_mime, encoded_media_bytes, control, stage);
     }
 
     /// One loader for native and encoder/decoder Whisper bundles, shared by
     /// document reading, direct PCM consumers, dictation and sessions.
-    fn loadWhisperRuntime(self: *Node, whisper: *WhisperRuntime, declared_mime: ?[]const u8, encoded_media_bytes: usize, control: InferenceExecutionControl, stage: *WhisperRuntimeStage) !void {
+    fn loadWhisperRuntime(self: *Node, whisper: *WhisperRuntime, declared_mime: ?[]const u8, encoded_media_bytes: usize, supplied_control: InferenceExecutionControl, stage: *WhisperRuntimeStage) !void {
+        var control = supplied_control;
+        if (whisper.model_selection) |selection| control.model_selection = selection;
         const allocator = whisper.allocator;
         errdefer whisper.deinit();
         const model_path = whisper.model_path orelse return error.ModelNotFound;
         stage.* = .manifest;
-        whisper.manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        whisper.manifest = try self.loadBoundManifest(allocator, model_path, false, control);
         const manifest = &whisper.manifest.?;
         stage.* = .contract;
         const executor_contract = try resolvedInferenceExecutorContract(self, "transcribe", manifest);
@@ -22691,7 +22846,7 @@ pub const Node = struct {
     }
 
     pub fn dictate(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
@@ -22919,8 +23074,10 @@ pub const Node = struct {
         reserved_units = required_units;
         self.prepareDirectGenerateMessages(&messages, preflight, preflight.decoded_media_bytes, &reserved_units) catch |err|
             return inferenceFailureResponse(ctx, err);
-        const cleanup_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, cleanup_model, "generators") catch |err|
+        const cleanup_model_path_selection = self.resolveRequestModelSelection(ctx.allocator, ctx.io, cleanup_model, "generators") catch |err|
             return requestModelResolutionError(ctx, err);
+        const cleanup_model_path = cleanup_model_path_selection.path;
+        execution_control = cleanup_model_path_selection.bind(execution_control);
         defer ctx.allocator.free(cleanup_model_path);
         if (try rejectDisallowedModel(self, ctx, cleanup_model_path)) |response| return response;
 
@@ -23075,11 +23232,16 @@ pub const Node = struct {
         stage: *SileroModelStage,
     ) !*const silero_vad_mod.Weights {
         stage.* = .resolve;
-        const model_path = try self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers");
+        const model_path_selection = try self.resolveRequestModelSelection(ctx.allocator, ctx.io, model_name, "classifiers");
+        const model_path = model_path_selection.path;
         defer ctx.allocator.free(model_path);
+        const publication_hex = if (model_path_selection.publication) |value| std.fmt.bytesToHex(value, .lower) else @as([64]u8, @splat('-'));
+        const cache_key = try std.fmt.allocPrint(ctx.allocator, "{s}#{s}", .{ model_path, publication_hex });
+        defer ctx.allocator.free(cache_key);
+        try model_path_selection.verify(ctx.allocator, ctx.io);
         spinLock(&self.silero_weights_lock);
         defer self.silero_weights_lock.unlock();
-        if (self.silero_weights.get(model_path)) |weights| return weights;
+        if (self.silero_weights.get(cache_key)) |weights| return weights;
         stage.* = .load;
         const candidates = [_][]const u8{ "onnx/model.onnx", "model.onnx", "silero_vad.onnx" };
         var loaded: ?silero_vad_mod.Weights = null;
@@ -23091,10 +23253,11 @@ pub const Node = struct {
         }
         var weights = loaded orelse return error.InvalidSileroModel;
         errdefer weights.deinit();
+        try model_path_selection.verify(ctx.allocator, ctx.io);
         const owned = try self.allocator.create(silero_vad_mod.Weights);
         errdefer self.allocator.destroy(owned);
         owned.* = weights;
-        const key = try self.allocator.dupe(u8, model_path);
+        const key = try self.allocator.dupe(u8, cache_key);
         errdefer self.allocator.free(key);
         try self.silero_weights.put(self.allocator, key, owned);
         return owned;
@@ -23816,8 +23979,8 @@ pub const Node = struct {
         var arena = std.heap.ArenaAllocator.init(platform.allocator.processAllocator(std.heap.smp_allocator));
         defer arena.deinit();
         const scratch = arena.allocator();
-        const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
-        var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
+        const selected = self.resolveRequestModelSelection(scratch, io, model_name, "extractors") catch return false;
+        var manifest = self.loadBoundManifest(scratch, selected.path, true, self.bindModelSelection(selected, null)) catch return false;
         defer manifest.deinit();
         specialty.* = manifest.gliner_specialty_profile != null;
         return manifest.gliner_architecture == .boundary or manifest.gliner_classification_head == .label_marker_mlp or
@@ -23833,8 +23996,8 @@ pub const Node = struct {
         var arena = std.heap.ArenaAllocator.init(platform.allocator.processAllocator(std.heap.smp_allocator));
         defer arena.deinit();
         const scratch = arena.allocator();
-        const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
-        var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
+        const selected = self.resolveRequestModelSelection(scratch, io, model_name, "extractors") catch return false;
+        var manifest = self.loadBoundManifest(scratch, selected.path, true, self.bindModelSelection(selected, null)) catch return false;
         defer manifest.deinit();
         return usesDeclaredSpanV2Route(manifest) and (!qualified_only or requiresQualifiedSpanClassification(manifest));
     }
@@ -24086,15 +24249,15 @@ pub const Node = struct {
     /// Resolve a public classification model by stable request ID before
     /// consulting legacy task directories. The model manifest, not its cache
     /// bucket, decides which classification pipeline runs.
-    fn resolveClassificationRequestModelPath(
+    fn resolveClassificationSelection(
         self: *Node,
         allocator: std.mem.Allocator,
         io: std.Io,
         model_name: []const u8,
-    ) ![]const u8 {
+    ) !ResolvedModel {
         const lookup_scopes = [_]?[]const u8{ null, "classifiers", "extractors" };
         for (lookup_scopes) |scope| {
-            if (self.resolveRequestModelPath(allocator, io, model_name, scope)) |path| {
+            if (self.resolveRequestModelSelection(allocator, io, model_name, scope)) |path| {
                 return path;
             } else |err| switch (requestModelResolutionErrorKind(err)) {
                 .missing => continue,
@@ -24110,16 +24273,20 @@ pub const Node = struct {
         body: extraction_api.ExtractionRequest,
         texts: []const []const u8,
     ) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         if (try self.acquireSlot(ctx)) |resp| return resp;
         defer self.releaseSlot();
         self.metrics.incRequest("extract");
         defer self.metrics.decActive();
 
-        const model_path = self.resolveClassificationRequestModelPath(ctx.allocator, ctx.io, body.model) catch |err|
+        const model_path_selection = self.resolveClassificationSelection(ctx.allocator, ctx.io, body.model) catch |err|
             return requestModelResolutionError(ctx, err);
+
+        const model_path = model_path_selection.path;
+
+        execution_control = model_path_selection.bind(execution_control);
         defer ctx.allocator.free(model_path);
-        const executor_contract = resolvedInferenceExecutorContractFromDir(self, ctx.allocator, model_path, "extract") catch |err|
+        const executor_contract = resolvedSelectedExecutorContract(self, ctx.allocator, model_path_selection, "extract", execution_control) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         const schema_json = try std.json.Stringify.valueAlloc(ctx.allocator, body.schema, .{});
         defer ctx.allocator.free(schema_json);
@@ -24136,7 +24303,7 @@ pub const Node = struct {
         validateTextExecutorInvocation(executor_contract, texts.len, texts, schema_text_bytes, 0, max_candidates, schema_json.len) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
+        var model_handle = self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
@@ -24275,15 +24442,14 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
-        const path = self.resolveRequestModelPath(a, io, request.model, "extractors") catch |err| switch (err) {
-            error.ModelNotFound => try self.resolveRequestModelPath(a, io, request.model, "embedders"),
-            else => return err,
-        };
-        var manifest = try manifest_mod.loadListingFromDir(a, path);
+        const selected = try self.resolveRequestModelSelection(a, io, request.model, "deciders");
+        const path = selected.path;
+        const selected_control = self.bindModelSelection(selected, control);
+        var manifest = try self.loadBoundManifest(a, path, true, selected_control);
         defer manifest.deinit();
         if (manifest.embedding_style == .embedding_gemma2) {
             if (request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
-            return self.decideEmbeddingSimilarity(allocator, a, path, public_request, control);
+            return self.decideEmbeddingSimilarity(allocator, a, path, public_request, selected_control);
         }
         if (request.model_identity != null) return error.UnsupportedDecideModel;
         for (public_request.policies) |policy| if (policy.embedding_configured or policy.kind == .multi_choice) return error.UnsupportedDecideModel;
@@ -24302,7 +24468,7 @@ pub const Node = struct {
             .{ .decide_span = .{ .request = public_request, .envelope = extraction_input.value, .resolved_path = path } }
         else
             .{ .json = try std.json.Stringify.valueAlloc(a, extraction_input.value, .{}) };
-        var extraction = try self.extractV2WithAdmission(a, input, owner, control, &failure, null, "decide");
+        var extraction = try self.extractV2WithAdmission(a, input, owner, selected_control, &failure, null, "decide");
         defer extraction.deinit();
         const response_json = if (typed_span) extraction.json else try decision_api.trainedResponse(a, public_request, extraction.json, decision_contract);
         return allocator.dupe(u8, response_json);
@@ -24393,8 +24559,9 @@ pub const Node = struct {
         defer parsed.deinit();
         try parsed.value.validate();
         if (parsed.value.provider != .antfly or parsed.value.url.len != 0 or parsed.value.tools_json != null or parsed.value.tool_choice_json != null or parsed.value.rate_limit != null or parsed.value.api_key != null) return error.UnsupportedConstrainedOutput;
-        const path = try self.resolveRequestModelPath(a, io, parsed.value.model, "generators");
-        var manifest = try manifest_mod.loadListingFromDir(a, path);
+        const path_selection = try self.resolveRequestModelSelection(a, io, parsed.value.model, "generators");
+        const path = path_selection.path;
+        var manifest = try self.loadBoundManifest(a, path, true, self.bindModelSelection(path_selection, null));
         defer manifest.deinit();
         const native = resolvedExecutorKind("generate", &manifest) == .native_generation;
         const contract = try resolvedInferenceExecutorContract(self, "generate", &manifest);
@@ -24719,15 +24886,17 @@ pub const Node = struct {
     /// Ordered groups for linked callers. Media uses the same bounded fetch
     /// and decode policy as the HTTP endpoint; returned vectors are owned.
     pub fn embedDenseGroupsDirectWithControl(self: *Node, a: std.mem.Allocator, io: std.Io, model_name: []const u8, input: std.json.Value, options: @import("../pipelines/embedding_gemma2.zig").Options, supplied: InferenceExecutionControl) ![][]f32 {
-        const control = self.bindExecutionControl(io, supplied);
+        var control = self.bindExecutionControl(io, supplied);
         try control.check();
         const admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(input));
         try self.acquireAdmissionUnits(admission.units);
         var reserved_units = admission.units;
         defer self.releaseAdmissionUnits(reserved_units);
-        const path = try self.resolveModelPath(io, model_name, "embedders");
+        const path_selection = try self.resolveModelSelection(io, model_name, "embedders");
+        const path = path_selection.path;
+        control = path_selection.bind(control);
         defer self.allocator.free(path);
-        var manifest = try manifest_mod.loadFromDir(a, path);
+        var manifest = try self.loadBoundManifest(a, path, false, self.bindModelSelection(path_selection, control));
         defer manifest.deinit();
         const contract = try resolvedInferenceExecutorContract(self, "embed", &manifest);
         return self.embedGroupsFromPath(a, io, path, &manifest, contract, input, options, control, .{ .media = admission, .reserved_units = &reserved_units });
@@ -25230,16 +25399,18 @@ pub const Node = struct {
             });
         }
 
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const model_path = if (request.task == .reader)
-            self.resolveReadRequestModelPath(ctx.allocator, ctx.io, request.model)
+            self.resolveReadRequestModelSelection(ctx.allocator, ctx.io, request.model)
         else
-            self.resolveRequestModelPath(ctx.allocator, ctx.io, request.model, runtimeTaskDir(request.task));
-        const resolved_path = model_path catch |err| return requestModelResolutionError(ctx, err);
+            self.resolveRequestModelSelection(ctx.allocator, ctx.io, request.model, runtimeTaskDir(request.task));
+        const selected = model_path catch |err| return requestModelResolutionError(ctx, err);
+        const resolved_path = selected.path;
         defer ctx.allocator.free(resolved_path);
+        execution_control = selected.bind(execution_control);
 
-        var manifest = manifest_mod.loadFromDir(ctx.allocator, resolved_path) catch |err|
+        var manifest = self.loadBoundManifest(ctx.allocator, resolved_path, false, execution_control) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer manifest.deinit();
         if (!manifestMatchesModelListingTask(runtimeListingTask(request.task), @tagName(manifest.model_type), &manifest)) {
@@ -25323,12 +25494,13 @@ pub const Node = struct {
             var catalog = try std.json.parseFromSlice(std.json.Value, ctx.allocator, json_body, .{});
             defer catalog.deinit();
             if (catalog.value == .object) if (catalog.value.object.getPtr(category)) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
-                const path = try self.resolveRequestModelPath(ctx.allocator, ctx.io, name, category);
+                const path_selection = try self.resolveRequestModelSelection(ctx.allocator, ctx.io, name, category);
+                const path = path_selection.path;
                 defer ctx.allocator.free(path);
-                var manifest = try manifest_mod.loadFromDir(ctx.allocator, path);
+                var manifest = try self.loadBoundManifest(ctx.allocator, path, false, self.bindModelSelection(path_selection, null));
                 defer manifest.deinit();
                 var dense_output = manifest.denseEmbeddingOutput();
-                const revision = if (self.model_manager.acquireLoadedModel(path)) |cached| loaded: {
+                const revision = if (try self.model_manager.acquireLoadedModelWithControl(path, self.bindModelSelection(path_selection, null))) |cached| loaded: {
                     var handle = cached;
                     defer handle.release();
                     // Geometry and revision must describe the same serving generation.
@@ -30030,6 +30202,12 @@ fn resolvedInferenceExecutorContract(
             manifest.native_arch_hint == .florence) or
             (std.mem.eql(u8, resolved_task, "embed") and modalities.image),
     };
+}
+
+fn resolvedSelectedExecutorContract(node: *Node, allocator: std.mem.Allocator, selected: ResolvedModel, task: []const u8, control: ?InferenceExecutionControl) !ResolvedInferenceExecutorContract {
+    var manifest = try node.loadBoundManifest(allocator, selected.path, false, node.bindModelSelection(selected, control));
+    defer manifest.deinit();
+    return resolvedInferenceExecutorContract(node, task, &manifest);
 }
 
 fn resolvedInferenceExecutorContractFromDir(
@@ -47535,7 +47713,24 @@ const MediaOutputExecution = struct {
     };
     const chunks = @import("../pipelines/media_chunking.zig");
     const outputs = lib_chunker.outputs;
-    const Resolved = struct { speaker_path: ?[]const u8 = null, speaker_revision: [64]u8 = @splat(0), path: []const u8, identity: [64]u8, revision: [64]u8, recipe_id: [64]u8, max_audio_ns: i64 = 30 * std.time.ns_per_s, failure: ?anyerror = null, uses_audio: bool = false, uses_video: bool = false, classifier_profile: ?@import("../models/media_classifier_profile.zig").Profile = null };
+    const Resolved = struct {
+        publication: ?[32]u8 = null,
+
+        speaker_path: ?[]const u8 = null,
+        speaker_revision: [64]u8 = @splat(0),
+        path: []const u8,
+        identity: [64]u8,
+        revision: [64]u8,
+        recipe_id: [64]u8,
+        max_audio_ns: i64 = 30 * std.time.ns_per_s,
+        failure: ?anyerror = null,
+        uses_audio: bool = false,
+        uses_video: bool = false,
+        classifier_profile: ?@import("../models/media_classifier_profile.zig").Profile = null,
+        fn bind(self: *const @This(), control: InferenceExecutionControl) InferenceExecutionControl {
+            return (ResolvedModel{ .path = self.path, .publication = self.publication }).bind(control);
+        }
+    };
     node: *Node,
     io: std.Io,
     control: InferenceExecutionControl,
@@ -48045,12 +48240,14 @@ const MediaOutputExecution = struct {
             errdefer a.free(speaker_path);
             return .{ .path = path, .identity = revision, .revision = revision, .recipe_id = try target.speakerRecipeIdentity(a, &revision, &revision, &revision), .speaker_path = speaker_path, .speaker_revision = revision, .uses_audio = true };
         }
-        const path = try self.node.resolveRequestModelPath(a, self.io, target.model, switch (target.kind) {
+        const selected = try self.node.resolveRequestModelSelection(a, self.io, target.model, switch (target.kind) {
             .embedding => "embedders",
             .transcribe => "transcribers",
             .diarize => unreachable,
             .classify => "classifiers",
         });
+        const path = selected.path;
+        const selected_control = selected.bind(self.control);
         errdefer a.free(path);
         var identity: [64]u8 = undefined;
         var revision: [64]u8 = undefined;
@@ -48059,7 +48256,7 @@ const MediaOutputExecution = struct {
         var uses_video = false;
         var classifier_profile: ?@import("../models/media_classifier_profile.zig").Profile = null;
         if (target.kind == .embedding) {
-            var assets = try self.node.model_manager.loadChunkPlanningAssets(path, self.io, self.control);
+            var assets = try self.node.model_manager.loadChunkPlanningAssets(path, self.io, selected_control);
             defer assets.deinit();
             identity = assets.identity;
             var has_audio = false;
@@ -48072,7 +48269,7 @@ const MediaOutputExecution = struct {
             uses_video = has_video and assets.manifest.embedding_style == .embedding_gemma2;
             revision = std.fmt.bytesToHex(assets.revision, .lower);
         } else {
-            var manifest = try manifest_mod.loadFromDir(a, path);
+            var manifest = try self.node.loadBoundManifest(a, path, false, selected_control);
             defer manifest.deinit();
             if (target.kind == .transcribe) {
                 const contract = try resolvedInferenceExecutorContract(self.node, "transcribe", &manifest);
@@ -48089,7 +48286,7 @@ const MediaOutputExecution = struct {
             identity = revision;
         }
         if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, &identity)) return error.EmbeddingIdentityMismatch;
-        var value = Resolved{ .path = path, .identity = identity, .revision = revision, .max_audio_ns = max_audio_ns, .recipe_id = try target.recipeIdentity(a, &identity, &revision), .uses_audio = uses_audio, .uses_video = uses_video, .classifier_profile = classifier_profile };
+        var value = Resolved{ .publication = selected.publication, .path = path, .identity = identity, .revision = revision, .max_audio_ns = max_audio_ns, .recipe_id = try target.recipeIdentity(a, &identity, &revision), .uses_audio = uses_audio, .uses_video = uses_video, .classifier_profile = classifier_profile };
         if (target.hasDiarization()) {
             const speaker_path = try self.node.resolveChunkSpeakerPath(a, target.speakerModel());
             errdefer a.free(speaker_path);
@@ -48337,7 +48534,7 @@ const MediaOutputExecution = struct {
             };
             frames[slot] = pixels orelse return null;
         }
-        var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
+        var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, resolved.bind(self.control));
         defer handle.release();
         const loaded = handle.get();
         try validateLoadedMediaRevision(resolved.revision, loaded.resolution_revision);
@@ -48349,7 +48546,7 @@ const MediaOutputExecution = struct {
             }
             a.free(rows);
         }
-        var manifest = try manifest_mod.loadFromDir(a, resolved.path);
+        var manifest = try self.node.loadBoundManifest(a, resolved.path, false, resolved.bind(self.control));
         defer manifest.deinit();
         const after = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, manifest), .lower);
         if (!std.mem.eql(u8, &after, &resolved.revision)) return error.ModelConfigurationChanged;
@@ -48358,12 +48555,12 @@ const MediaOutputExecution = struct {
     fn runFrame(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target, resolved: *const Resolved, prepared: ?[]const f32, failure: ?anyerror, value: *outputs.Result) !void {
         if (failure) |err| return err;
         const pixels = prepared orelse return error.MissingPreparedFrame;
-        var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
+        var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, resolved.bind(self.control));
         defer handle.release();
         const loaded = handle.get();
         try validateLoadedMediaRevision(resolved.revision, loaded.resolution_revision);
         value.labels = try @import("../pipelines/media_classification.zig").classifyPrepared(a, loaded.session, resolved.classifier_profile.?, loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier, pixels, target.top_k, self.control);
-        var manifest = try manifest_mod.loadFromDir(a, resolved.path);
+        var manifest = try self.node.loadBoundManifest(a, resolved.path, false, resolved.bind(self.control));
         defer manifest.deinit();
         const after = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, manifest), .lower);
         if (!std.mem.eql(u8, &after, &resolved.revision)) return error.ModelConfigurationChanged;
@@ -48438,7 +48635,7 @@ const MediaOutputExecution = struct {
             },
             .transcribe => {
                 if (payload != .pcm) return error.ModelDoesNotSupportAudioInput;
-                const response = try self.node.transcribeDecodedPcmFromPathPinned(a, resolved.path, .{ .url = "", .language = target.language, .timestamps = true, .diarization = false }, payload.pcm, self.control, self.node.config.chunking_limits.max_working_bytes, resolved.revision);
+                const response = try self.node.transcribeDecodedPcmFromPathPinned(a, resolved.path, .{ .url = "", .language = target.language, .timestamps = true, .diarization = false }, payload.pcm, resolved.bind(self.control), self.node.config.chunking_limits.max_working_bytes, resolved.revision);
                 var spans = std.ArrayList(outputs.Span).empty;
                 const origin = value.start_ns orelse return error.InvalidChunkCoordinates;
                 const end = value.end_ns orelse return error.InvalidChunkCoordinates;
@@ -48458,7 +48655,7 @@ const MediaOutputExecution = struct {
                 if (target.hasDiarization()) value.speaker_scope = .source;
             },
             .classify => {
-                var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
+                var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, resolved.bind(self.control));
                 defer handle.release();
                 const loaded = handle.get();
                 try validateLoadedMediaRevision(resolved.revision, loaded.resolution_revision);
@@ -48473,7 +48670,7 @@ const MediaOutputExecution = struct {
             },
         }
         // Publication never accepts an output from a different model generation.
-        var manifest = try manifest_mod.loadFromDir(a, resolved.path);
+        var manifest = try self.node.loadBoundManifest(a, resolved.path, false, resolved.bind(self.control));
         defer manifest.deinit();
         const actual = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, manifest), .lower);
         if (!std.mem.eql(u8, &actual, &resolved.revision)) return error.ModelConfigurationChanged;
@@ -50566,4 +50763,110 @@ test "model selection catalogs coalesce and warm readers bypass a backstop refre
     const path = (try cache.resolve(a, io, root, "acme/demo:gguf:Q4_0@0123456789abcdef0123456789abcdef01234567", "generators")).?;
     a.free(path);
     try std.testing.expectEqual(@as(usize, 1), cache.rebuilds);
+}
+
+test "model selection pins survive receipt rollback before acquisition" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const old_pin = "0123456789abcdef0123456789abcdef01234567";
+    const new_pin = "ffffffffffffffffffffffffffffffffffffffff";
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/model", "gguf:Q4_0", old_pin);
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    const prior = try node.resolveModelPath(io, "acme/demo:gguf:Q4_0@" ++ old_pin, "generators");
+    defer a.free(prior);
+    const Probe = struct {
+        fn run(_: *anyopaque, _: []const backends_mod.Tensor, alloc: std.mem.Allocator) ![]backends_mod.Tensor {
+            return alloc.alloc(backends_mod.Tensor, 0);
+        }
+        fn controlled(ptr: *anyopaque, inputs: []const backends_mod.Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]backends_mod.Tensor {
+            try control.check();
+            return run(ptr, inputs, alloc);
+        }
+        fn info(_: *anyopaque) []const backends_mod.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends_mod.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const table: backends_mod.Session.VTable = .{ .run = run, .runWithControl = controlled, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    var probe: u8 = 0;
+    var loaded: model_manager_mod.LoadedModel = undefined;
+    loaded.model_dir = prior;
+    loaded.managed_publication = try @import("../registry/managed_receipt.zig").publicationGeneration(a, io, prior);
+    loaded.session = .{ .ptr = &probe, .vtable = &Probe.table };
+    loaded.runtime_id = 41;
+    loaded.active_handles = 0;
+    loaded.retired = false;
+    const key = try a.dupe(u8, prior);
+    try node.model_manager.loaded_aliases.put(a, key, &loaded);
+    defer {
+        _ = node.model_manager.loaded_aliases.remove(key);
+        a.free(key);
+    }
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/model", "gguf:Q4_0", new_pin);
+    const selected = try node.resolveModelSelection(io, "acme/demo:gguf:Q4_0@" ++ new_pin, "generators");
+    defer a.free(selected.path);
+    // Publication rolls back after B is verified but before acquisition.
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/model", "gguf:Q4_0", old_pin);
+    const bound = node.bindModelSelection(selected, null);
+    try std.testing.expectError(error.ModelArtifactsChanging, node.model_manager.acquireFromDirWithControl(selected.path, bound));
+    try std.testing.expectError(error.ModelArtifactsChanging, node.model_manager.acquireLoadedModelWithControl(selected.path, bound));
+    try std.testing.expectError(error.ModelArtifactsChanging, node.manifestForSelection(a, selected));
+    try std.testing.expectError(error.ModelArtifactsChanging, node.model_manager.acquireCompositeRuntime(selected.path, &.{}, .whisper_metadata, bound));
+    try std.testing.expectError(error.ModelArtifactsChanging, readers_mod.LoadedReader.loadFromDirWithControl(a, selected.path, &node.session_manager, &node.model_manager, bound));
+    // Nested dispatch cannot replace B's proof with A after re-resolution.
+    const current = try node.resolveModelSelection(io, "acme/demo:gguf:Q4_0@" ++ old_pin, "generators");
+    defer a.free(current.path);
+    try std.testing.expectError(error.ModelArtifactsChanging, node.model_manager.acquireFromDirWithControl(current.path, current.bind(bound)));
+}
+
+test "model selection Decide embedding aliases follow ordered execution scopes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const leaf = "models/embedders/acme/decide";
+    try tmp.dir.createDirPath(io, leaf);
+    const config = @embedFile("../architectures/embedding_gemma2_config.json");
+    const metadata = "{\"type\":\"embedder\",\"embedding_style\":\"embedding_gemma2\",\"tasks\":[\"embed\",\"decide\"],\"inputs\":[\"text\"],\"capabilities\":[\"embedding_similarity\"]}";
+    inline for (.{ .{ "config.json", config }, .{ "model_manifest.json", metadata }, .{ "model.safetensors", "\x02\x00\x00\x00\x00\x00\x00\x00{}" } }) |file| {
+        const path = try std.fs.path.join(a, &.{ leaf, file[0] });
+        defer a.free(path);
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = file[1] });
+    }
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const receipt = try std.json.Stringify.valueAlloc(a, .{
+        .version = @as(u32, 2),
+        .source = .{ .owner = "acme", .name = "demo", .variant = "safetensors", .resolved_revision = revision },
+        .artifacts = .{ .{ .path = "model.safetensors", .size = 10 }, .{ .path = "config.json", .size = config.len }, .{ .path = "model_manifest.json", .size = metadata.len } },
+    }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = leaf ++ "/.antfly-download-complete.json", .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    const body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    for ([_][]const u8{ "acme/demo", "acme/demo:safetensors", "acme/demo:safetensors@" ++ revision, "acme/demo@" ++ revision }) |selector| {
+        try std.testing.expect(parsed.value.object.get("deciders").?.object.contains(selector));
+        const selected = try node.resolveRequestModelSelection(a, io, selector, "deciders");
+        defer a.free(selected.path);
+        try std.testing.expect(std.mem.endsWith(u8, selected.path, "/embedders/acme/decide"));
+    }
+    // The same selector in the extractor scope takes precedence, matching
+    // Decide execution. Cross-scope duplicates do not hide its aliases.
+    try installModelSelectionFixture(tmp.dir, "models/extractors/acme/first", "safetensors", revision);
+    const preferred = try node.resolveRequestModelSelection(a, io, "acme/demo:safetensors@" ++ revision, "deciders");
+    defer a.free(preferred.path);
+    try std.testing.expect(std.mem.endsWith(u8, preferred.path, "/extractors/acme/first"));
 }

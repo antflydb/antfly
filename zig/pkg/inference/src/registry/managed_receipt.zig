@@ -50,6 +50,7 @@ pub const ValidatedArtifact = struct {
 };
 
 pub const ValidatedReceipt = struct {
+    publication_generation: [32]u8 = @splat(0),
     allocator: std.mem.Allocator,
     parsed: std.json.Parsed(DownloadReceipt),
     artifacts: []ValidatedArtifact,
@@ -368,7 +369,10 @@ fn loadValidatedSource(
         },
     }
 
+    var publication_generation: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(receipt_json, &publication_generation, .{});
     return .{
+        .publication_generation = publication_generation,
         .allocator = allocator,
         .parsed = parsed,
         .artifacts = artifacts,
