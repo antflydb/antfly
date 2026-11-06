@@ -1048,6 +1048,83 @@ pub const PositionedEmbeddingBatchItem = struct {
     sequence_length: usize,
 };
 
+/// One borrowed positioned-prefix request. Queue work and its prefix remain
+/// stack-owned until the existing wait protocol publishes ready or drains it.
+/// Physical execution never borrows a task pipeline or tokenizer.
+pub const PositionedRequest = struct {
+    item: PositionedEmbeddingBatchItem,
+    prefix: graph_mod.decoder_work.Prefix,
+    scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+    lease: *runtime.scheduler.native_generate.Lease,
+    io: std.Io,
+    control: ?control.InferenceExecutionControl,
+    continuation: control.InferenceExecutionControl,
+    chunk_rows: usize,
+    wants_greedy: bool,
+    executor: graph_mod.decoder_step_executor.Executor,
+    publication: graph_mod.decoder_step_executor.Executor.Publication,
+
+    pub fn runScheduled(self: *@This()) !Output {
+        const state = self.item.state;
+        const seq = self.item.sequence_length;
+        const wants_greedy = self.wants_greedy;
+
+        const scheduler = self.scheduler;
+        const lease = self.lease;
+        const io = self.io;
+        if (!self.item.model.hasQwen35VisionArchitectureContract() or state.total_tokens != 0 or self.item.geometry_tokens != seq or self.item.deepstack_layer_count != 0) return error.InvalidPreparedPrompt;
+        const chunk_rows = if (self.chunk_rows == 0) seq else @min(seq, self.chunk_rows);
+        var processed: usize = 0;
+        scheduler.notePrefillProgress(lease, 0, seq);
+        while (processed < seq) {
+            try self.continuation.check();
+            const query = @min(chunk_rows, seq - processed);
+            const end = processed + query;
+            const final = end == seq;
+            var decode_runtime = BorrowedDecodeStateRuntime.init(state);
+            const context = decode_runtime.makeDecodeContext(end, query);
+            var work = graph_mod.decoder_work.Prefill{ .allocator = self.item.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prefix = self.prefix };
+            defer if (work.logits) |logits| work.allocator.free(logits);
+            try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), end, query, context.kv_sequence_len, context.kv_position_offset, graph_mod.decoder_work.pendingOptions(state, query));
+            defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
+            var driver = Driver{ .request = self, .work = &work };
+            try @import("../runtime/scheduler/step_wait.zig").run(self.item.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, null, &driver);
+            if (work.failure) |err| return err;
+            // The forward reserved exactly this prefix before mutating its KV
+            // and recurrent histories. Never restart a partially consumed prefix.
+            if (state.total_tokens != end) return error.InvalidBatchDecodeState;
+            scheduler.notePrefillProgress(lease, end, seq);
+            if (final) {
+                if (work.greedy_token) |token| {
+                    if (!wants_greedy or work.logits != null or token >= self.item.model.vocab_size) return error.InvalidBatchDecodeState;
+                    return .{ .greedy_token = token };
+                }
+                const logits = work.logits orelse return error.InvalidBatchDecodeState;
+                work.logits = null;
+                return .{ .last_logits = logits };
+            }
+            processed = end;
+        }
+        return error.InvalidPreparedPrompt;
+    }
+    const Driver = struct {
+        request: *PositionedRequest,
+        work: *graph_mod.decoder_work.Prefill,
+        pub fn checkControl(self: *@This()) !void {
+            if (self.request.control) |active| try active.check();
+        }
+        pub fn isReady(self: *const @This()) bool {
+            return self.work.ready.load(.acquire);
+        }
+        pub fn stepBudget(self: *const @This()) runtime.scheduler.native_generate.StepBudget {
+            return graph_mod.decoder_work.stepBudget(self.request.scheduler, self.work.decode_state);
+        }
+        pub fn execute(self: *@This(), scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator, _: *runtime.scheduler.native_generate.Lease, claimed: []const runtime.scheduler.native_generate.StepItem) void {
+            self.request.executor.execute(claimed, scheduler.usesStepEvents(), self.request.publication);
+        }
+    };
+};
+
 pub fn forwardPositionedEmbeddingBatch(items: []const PositionedEmbeddingBatchItem) ![][]f32 {
     if (items.len == 0) return forwardPositionedEmbeddingBatchUnobserved(items);
     const observation = @import("shared_batch_observation.zig");
@@ -2180,4 +2257,60 @@ test "Metal prompt replacement materializes a real foreign source before its des
 test "CUDA streaming prompt replacement preserves rows scale held outputs and no intermediate export" {
     const helper = @import("../ops/media_residency_test.zig");
     try helper.onCuda(helper.noWeights, checkPromptReplacementRows);
+}
+
+test "positioned request cancellation preserves actual Native prefix and state before queue publication" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Case = struct {
+        fn cancelled(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+        fn publish(raw: *anyopaque, _: []const runtime.scheduler.native_generate.StepItem, _: anyerror!graph_mod.decoder_step_executor.Result) void {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+        }
+        fn run(cb: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+            const a = std.testing.allocator;
+            const cfg = try @import("../models/gpt.zig").parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
+            const rows = 2;
+            const values = try a.alloc(f32, rows * cfg.hidden_size);
+            defer a.free(values);
+            @memset(values, 0.25);
+            var prefix: ?ops.CT = try cb.fromFloat32Shape(values, &.{ rows, @intCast(cfg.hidden_size) });
+            defer if (prefix) |value| cb.free(value);
+            const original = prefix.?;
+            const positions = [_]u32{ 0, 1, 0, 1, 0, 1 };
+            var state = graph_mod.decode_state_runtime.NativeDecodeState.initContiguous(a);
+            defer state.deinit();
+            var scheduler = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a);
+            defer scheduler.deinit();
+            var lease = try scheduler.acquire(.{ .requested_units = 1, .prompt_bytes = rows, .max_tokens = 1 });
+            defer scheduler.release(lease);
+            var publications: usize = 0;
+            var request = PositionedRequest{
+                .item = .{ .allocator = a, .backend = &cb, .model = &cfg, .state = &state, .embeddings_owner = &prefix, .geometry_tokens = rows, .position_ids = &positions, .deepstack_layer_count = 0, .sequence_length = rows },
+                .prefix = .{ .token_count = rows, .positions = &positions, .embeddings = prefix },
+                .scheduler = &scheduler,
+                .lease = &lease,
+                .io = std.testing.io,
+                .control = null,
+                .continuation = .{ .check_fn = cancelled },
+                .chunk_rows = 1,
+                .wants_greedy = false,
+                .executor = .{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } },
+                .publication = .{ .ptr = &publications, .publish_fn = publish },
+            };
+            try std.testing.expectError(error.Cancelled, request.runScheduled());
+            try std.testing.expectEqual(@as(usize, 0), publications);
+            try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+            try std.testing.expect(prefix.? == original);
+            const retained = try cb.toFloat32(prefix.?, a);
+            defer a.free(retained);
+            try std.testing.expectEqualSlices(f32, values, retained);
+            try std.testing.expectEqual(@as(u64, 0), request.executor.lighton_graph_attempts);
+            try std.testing.expectEqual(@as(usize, 0), request.executor.tail_steps);
+        }
+    };
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(helper.noWeights, Case.run);
 }

@@ -2441,7 +2441,7 @@ pub const PreEncodedPrompt = struct {
 /// Runs autoregressive decoding: tokenize → loop(gpt_arch.forward → sample → append).
 pub const QwenPrefillBatchHook = struct {
     ptr: *anyopaque,
-    run_fn: *const fn (*anyopaque, *NativeGenerationPipeline, *qwen3vl_projector.PreparedPrompt, usize, *NativeDecodeState, bool) anyerror!NativeGenerationPipeline.PrefillOutput,
+    run_fn: *const fn (*anyopaque, *decoder_prefill.PositionedRequest) anyerror!decoder_prefill.Output,
 };
 
 pub const QwenVisionBatchHook = struct {
@@ -4857,22 +4857,14 @@ pub const NativeGenerationPipeline = struct {
     /// The caller owns the shared provider step, independent page state, a
     /// complete group device envelope and the group's CPU scratch permit.
     /// No combined device tensor escapes; returned host rows are independent.
+    fn positionedBatchItem(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize) decoder_prefill.PositionedEmbeddingBatchItem {
+        return .{ .diagnostics_binding = if (self.session) |session| session.invocation_diagnostics else null, .request_id = if (self.scheduler_lease) |lease| lease.request_id else null, .allocator = self.allocator, .backend = &self.cb, .model = &self.gpt_config, .state = state, .embeddings_owner = &prepared.input_embeddings, .geometry_tokens = prepared.plan.tokenCount(), .position_ids = prepared.plan.mrope_positions, .deepstack_layer_count = prepared.deepstack_layer_count, .sequence_length = seq };
+    }
+
     pub fn forwardPreparedQwenPrefillBatch(items: []const PreparedQwenPrefillItem) ![][]f32 {
         if (items.len > max_prepared_qwen_prefill_items) return error.InvalidBatchDecodeState;
         var requests: [max_prepared_qwen_prefill_items]decoder_prefill.PositionedEmbeddingBatchItem = undefined;
-        for (items, requests[0..items.len]) |item, *request| request.* = .{
-            .diagnostics_binding = if (item.pipeline.session) |session| session.invocation_diagnostics else null,
-            .request_id = if (item.pipeline.scheduler_lease) |lease| lease.request_id else null,
-            .allocator = item.pipeline.allocator,
-            .backend = &item.pipeline.cb,
-            .model = &item.pipeline.gpt_config,
-            .state = item.state,
-            .embeddings_owner = &item.prepared.input_embeddings,
-            .geometry_tokens = item.prepared.plan.tokenCount(),
-            .position_ids = item.prepared.plan.mrope_positions,
-            .deepstack_layer_count = item.prepared.deepstack_layer_count,
-            .sequence_length = item.seq_len,
-        };
+        for (items, requests[0..items.len]) |item, *request| request.* = item.pipeline.positionedBatchItem(item.prepared, item.state, item.seq_len);
         return decoder_prefill.forwardPositionedEmbeddingBatch(requests[0..items.len]);
     }
 
@@ -4891,7 +4883,10 @@ pub const NativeGenerationPipeline = struct {
         var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
         try numerical.resetRecurrentPrompt();
         if (self.qwen_prefill_batch) |hook| if (prepared.deepstack_layer_count == 0) {
-            return hook.run_fn(hook.ptr, self, prepared, seq_len, decode_state, wants_greedy);
+            var publication = StepPublication{ .scheduler = self.scheduler orelse return error.InvalidBatchDecodeState, .lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState, .vocab_size = self.gpt_config.vocab_size };
+            var request = try self.positionedRequest(prepared, decode_state, seq_len, wants_greedy, publication.interface());
+            defer self.mergeStepExecutor(&request.executor);
+            return hook.run_fn(hook.ptr, &request);
         };
         var direct_prefill_turn_acquired = false;
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
@@ -7871,44 +7866,26 @@ pub const NativeGenerationPipeline = struct {
 
     /// Queue a resident visual prefix alongside ordinary decode work. The
     /// scheduler owns the stack-backed work until it publishes completion.
+    fn positionedRequest(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize, wants_greedy: bool, publication: graph_mod.decoder_step_executor.Executor.Publication) !decoder_prefill.PositionedRequest {
+        return .{
+            .item = self.positionedBatchItem(prepared, state, seq),
+            .prefix = preparedPrefix(prepared),
+            .scheduler = self.scheduler orelse return error.InvalidBatchDecodeState,
+            .lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState,
+            .io = self.io orelse return error.MissingIo,
+            .control = self.execution_control,
+            .continuation = self.continuationControl(),
+            .chunk_rows = self.prepared_qwen_prefill_chunk_rows,
+            .wants_greedy = wants_greedy,
+            .executor = self.stepExecutor(),
+            .publication = publication,
+        };
+    }
     pub fn runScheduledPreparedQwenPrefill(self: *NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, state: *NativeDecodeState, seq: usize, wants_greedy: bool) !PrefillOutput {
-        const scheduler = self.scheduler orelse return error.InvalidBatchDecodeState;
-        const lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState;
-        const io = self.io orelse return error.MissingIo;
-        if (!self.gpt_config.hasQwen35VisionArchitectureContract() or state.total_tokens != 0 or prepared.plan.tokenCount() != seq or prepared.deepstack_layer_count != 0) return error.InvalidPreparedPrompt;
-        const chunk_rows = if (self.prepared_qwen_prefill_chunk_rows == 0) seq else @min(seq, self.prepared_qwen_prefill_chunk_rows);
-        var processed: usize = 0;
-        scheduler.notePrefillProgress(lease, 0, seq);
-        while (processed < seq) {
-            try self.checkPreparedQwenContinuation();
-            const query = @min(chunk_rows, seq - processed);
-            const end = processed + query;
-            const final = end == seq;
-            var decode_runtime = BorrowedDecodeStateRuntime.init(state);
-            const context = decode_runtime.makeDecodeContext(end, query);
-            var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prefix = preparedPrefix(prepared) };
-            defer if (work.logits) |logits| work.allocator.free(logits);
-            try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), end, query, context.kv_sequence_len, context.kv_position_offset, pendingWorkOptionsFromState(state, query));
-            defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
-            var driver = PrefillStepDriver{ .pipeline = self, .scheduler = scheduler, .work = &work, .decode_state = state };
-            try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, null, &driver);
-            if (work.failure) |err| return err;
-            // The forward reserved exactly this prefix before mutating its KV
-            // and recurrent histories. Never restart a partially consumed prefix.
-            if (state.total_tokens != end) return error.InvalidBatchDecodeState;
-            scheduler.notePrefillProgress(lease, end, seq);
-            if (final) {
-                if (work.greedy_token) |token| {
-                    if (!wants_greedy or work.logits != null or token >= self.gpt_config.vocab_size) return error.InvalidBatchDecodeState;
-                    return .{ .greedy_token = token };
-                }
-                const logits = work.logits orelse return error.InvalidBatchDecodeState;
-                work.logits = null;
-                return .{ .last_logits = logits };
-            }
-            processed = end;
-        }
-        return error.InvalidPreparedPrompt;
+        var publication = StepPublication{ .scheduler = self.scheduler orelse return error.InvalidBatchDecodeState, .lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState, .vocab_size = self.gpt_config.vocab_size };
+        var request = try self.positionedRequest(prepared, state, seq, wants_greedy, publication.interface());
+        defer self.mergeStepExecutor(&request.executor);
+        return request.runScheduled();
     }
 
     /// Output of a successful step forward pass: the heap-allocated logits row
@@ -8062,14 +8039,16 @@ pub const NativeGenerationPipeline = struct {
         }
     };
 
+    fn mergeStepExecutor(self: *NativeGenerationPipeline, executor: *const graph_mod.decoder_step_executor.Executor) void {
+        self.lighton_graph_attempts += executor.lighton_graph_attempts;
+        for (&self.lighton_graph_declines, executor.lighton_graph_declines) |*sum, count| sum.* += count;
+        decoder_runtime_debug_stats.replay_last_logits_fallbacks += executor.replay_last_logits_fallbacks;
+        self.executor_tail_steps += executor.tail_steps;
+    }
+
     pub fn executeClaimedStep(self: *NativeGenerationPipeline, scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator, lease: *runtime.scheduler.native_generate.Lease, claimed: []const runtime.scheduler.native_generate.StepItem) void {
         var executor = self.stepExecutor();
-        defer {
-            self.lighton_graph_attempts += executor.lighton_graph_attempts;
-            for (&self.lighton_graph_declines, executor.lighton_graph_declines) |*sum, count| sum.* += count;
-            decoder_runtime_debug_stats.replay_last_logits_fallbacks += executor.replay_last_logits_fallbacks;
-            self.executor_tail_steps += executor.tail_steps;
-        }
+        defer self.mergeStepExecutor(&executor);
         var publication = StepPublication{ .scheduler = scheduler, .lease = lease, .vocab_size = self.gpt_config.vocab_size };
         executor.execute(claimed, scheduler.usesStepEvents(), publication.interface());
     }
@@ -8263,96 +8242,7 @@ pub const NativeGenerationPipeline = struct {
 /// - `fn stepBudget(self) StepBudget`  — recomputed each iteration
 /// - `fn execute(self, scheduler, lease, claimed)` — dispatch a claimed step
 /// - `fn preStep(self) void`           — optional, runs before each claim
-fn runStepLoop(
-    allocator: std.mem.Allocator,
-    scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
-    lease: *runtime.scheduler.native_generate.Lease,
-    leader_work_ptr: *anyopaque,
-    leader_phase: runtime.scheduler.native_generate.Phase,
-    io: std.Io,
-    initial_wait_error: ?anyerror,
-    driver: anytype,
-) !void {
-    const DriverInfo = @typeInfo(@TypeOf(driver));
-    const DriverChild = DriverInfo.pointer.child;
-
-    var step = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
-    defer step.deinit(allocator);
-    var wait_error = initial_wait_error;
-    const poll_wait_us = scheduler.stepPollWaitUs();
-    const events = scheduler.usesStepEvents();
-    const dedicated = scheduler.hasExecutor();
-    const Ready = struct {
-        fn check(raw: *anyopaque) bool {
-            const typed: @TypeOf(driver) = @ptrCast(@alignCast(raw));
-            return typed.isReady();
-        }
-    };
-    var waiter: runtime.scheduler.native_generate.NativeGenerateCoordinator.Waiter = .{ .io = io, .ready_ptr = driver, .ready_fn = Ready.check };
-    if (events) scheduler.attachWaiter(&waiter);
-    defer if (events) scheduler.detachWaiter(&waiter);
-
-    while (!driver.isReady()) {
-        if (events) scheduler.prepareWait(&waiter);
-        if (wait_error == null) {
-            if (@hasDecl(DriverChild, "checkControl")) {
-                driver.checkControl() catch |err| {
-                    wait_error = err;
-                };
-            }
-        }
-        if (wait_error) |err| {
-            // Cancellation cannot drop a stack-backed work pointer while a
-            // peer may own it. Remove idle work immediately; otherwise wait
-            // for the claimed step to publish ready before returning.
-            if (events) scheduler.markDraining(&waiter);
-            if (scheduler.cancelPendingWorkIfIdle(leader_work_ptr, leader_phase)) return err;
-            if (events) {
-                if (!driver.isReady()) waiter.event.waitUncancelable(io);
-            } else platform.time.yieldBriefly();
-            continue;
-        }
-        if (dedicated) {
-            if (!driver.isReady()) {
-                if (@hasDecl(DriverChild, "checkControl")) {
-                    // Application deadlines do not cancel the I/O event wait.
-                    // Poll them while preserving the claimed-work drain path.
-                    waiter.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
-                        error.Timeout => {},
-                        else => wait_error = err,
-                    };
-                } else waiter.event.wait(io) catch |err| {
-                    wait_error = err;
-                };
-            }
-            continue;
-        }
-        if (@hasDecl(DriverChild, "preStep")) driver.preStep();
-        const budget = driver.stepBudget();
-        const claimed = scheduler.claimStep(allocator, lease, leader_work_ptr, leader_phase, budget, &step) catch |err| {
-            // A peer may already own this request's stack-backed work pointer.
-            // Enter the same drain-or-cancel path as I/O cancellation instead
-            // of unwinding it while a claimed step can still publish to it.
-            wait_error = err;
-            continue;
-        };
-        if (claimed) {
-            driver.execute(scheduler, lease, step.items);
-        } else {
-            if (events) {
-                // Ready may have been published before this iteration reset
-                // its event. Recheck the predicate before parking.
-                if (!driver.isReady()) waiter.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMicroseconds(scheduler.eventWaitUs()), .clock = .awake } }) catch |err| switch (err) {
-                    error.Timeout => {},
-                    else => wait_error = err,
-                };
-            } else io.sleep(std.Io.Duration.fromMicroseconds(poll_wait_us), .awake) catch |err| {
-                wait_error = err;
-            };
-        }
-    }
-    if (wait_error) |err| return err;
-}
+const runStepLoop = @import("../runtime/scheduler/step_wait.zig").run;
 
 const DecodeStepDriver = struct {
     pipeline: *NativeGenerationPipeline,
@@ -8364,11 +8254,11 @@ const DecodeStepDriver = struct {
         if (self.pipeline.execution_control) |control| try control.check();
     }
 
-    fn isReady(self: *const DecodeStepDriver) bool {
+    pub fn isReady(self: *const DecodeStepDriver) bool {
         return self.work.ready.load(.acquire);
     }
 
-    fn stepBudget(self: *const DecodeStepDriver) runtime.scheduler.native_generate.StepBudget {
+    pub fn stepBudget(self: *const DecodeStepDriver) runtime.scheduler.native_generate.StepBudget {
         return stepBudgetFromState(self.scheduler, self.decode_state);
     }
 
@@ -8377,7 +8267,7 @@ const DecodeStepDriver = struct {
         self.pipeline.cb.drainPrefetchBudget(NativeGenerationPipeline.prefetch_drain_budget_per_step);
     }
 
-    fn execute(
+    pub fn execute(
         self: *DecodeStepDriver,
         scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
         lease: *runtime.scheduler.native_generate.Lease,
@@ -8397,15 +8287,15 @@ const PrefillStepDriver = struct {
         if (self.pipeline.execution_control) |control| try control.check();
     }
 
-    fn isReady(self: *const PrefillStepDriver) bool {
+    pub fn isReady(self: *const PrefillStepDriver) bool {
         return self.work.ready.load(.acquire);
     }
 
-    fn stepBudget(self: *const PrefillStepDriver) runtime.scheduler.native_generate.StepBudget {
+    pub fn stepBudget(self: *const PrefillStepDriver) runtime.scheduler.native_generate.StepBudget {
         return stepBudgetFromState(self.scheduler, self.decode_state);
     }
 
-    fn execute(
+    pub fn execute(
         self: *PrefillStepDriver,
         scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
         lease: *runtime.scheduler.native_generate.Lease,
@@ -8420,16 +8310,7 @@ const PrefillStepDriver = struct {
 /// `max_kv_blocks` stays unset and the scheduler treats the pool as
 /// unbounded. When a cap is configured, we shave a single-block safety margin
 /// so a step never admits the very last block under contention.
-fn stepBudgetFromState(
-    scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
-    decode_state: *NativeDecodeState,
-) runtime.scheduler.native_generate.StepBudget {
-    var budget = scheduler.defaultStepBudget();
-    const avail = decode_state.availableKvBlocks() orelse return budget;
-    const safety: usize = 1;
-    budget.max_kv_blocks = if (avail > safety) avail - safety else 0;
-    return budget;
-}
+const stepBudgetFromState = graph_mod.decoder_work.stepBudget;
 
 /// Tag the just-enqueued pending work with its KV-block cost so the scheduler
 /// can apply per-step KV admission against pool headroom. A no-op when the
@@ -8445,15 +8326,7 @@ fn notePendingKvBlocksFromState(
     scheduler.notePendingKvBlocks(work_ptr, phase, est);
 }
 
-fn pendingWorkOptionsFromState(
-    decode_state: *NativeDecodeState,
-    additional_tokens: usize,
-) runtime.scheduler.native_generate.PendingWorkOptions {
-    return .{
-        .exclusive_step = decode_state.requiresExclusiveStep(),
-        .kv_blocks_estimate = decode_state.estimateAdditionalKvBlocks(additional_tokens) orelse 0,
-    };
-}
+const pendingWorkOptionsFromState = graph_mod.decoder_work.pendingOptions;
 
 fn notePendingExclusiveStepFromState(
     scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -9761,11 +9634,11 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
         last_claim_size: usize = 0,
         prestep_calls: usize = 0,
 
-        fn isReady(self: *const @This()) bool {
+        pub fn isReady(self: *const @This()) bool {
             return self.ready;
         }
 
-        fn stepBudget(self: *@This()) runtime.scheduler.native_generate.StepBudget {
+        pub fn stepBudget(self: *@This()) runtime.scheduler.native_generate.StepBudget {
             self.budget_calls += 1;
             return self.coordinator.defaultStepBudget();
         }
@@ -9774,7 +9647,7 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
             self.prestep_calls += 1;
         }
 
-        fn execute(
+        pub fn execute(
             self: *@This(),
             scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
             lease_ptr: *runtime.scheduler.native_generate.Lease,
@@ -9824,13 +9697,13 @@ test "generation deadline cancels queued steps in inline and dedicated execution
                 self.checks += 1;
                 if (self.checks > self.allowed_checks) return error.Timeout;
             }
-            fn isReady(_: *const @This()) bool {
+            pub fn isReady(_: *const @This()) bool {
                 return false;
             }
-            fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
+            pub fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
                 unreachable;
             }
-            fn execute(_: *@This(), _: *Coordinator, _: *runtime.scheduler.native_generate.Lease, _: []const runtime.scheduler.native_generate.StepItem) void {
+            pub fn execute(_: *@This(), _: *Coordinator, _: *runtime.scheduler.native_generate.Lease, _: []const runtime.scheduler.native_generate.StepItem) void {
                 unreachable;
             }
         };
@@ -9861,15 +9734,15 @@ test "runStepLoop cancellation removes idle stack work without executing it" {
     try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_byte), 5, 5, 0, .{});
 
     const StubDriver = struct {
-        fn isReady(_: *const @This()) bool {
+        pub fn isReady(_: *const @This()) bool {
             return false;
         }
 
-        fn stepBudget(_: *@This()) runtime.scheduler.native_generate.StepBudget {
+        pub fn stepBudget(_: *@This()) runtime.scheduler.native_generate.StepBudget {
             unreachable;
         }
 
-        fn execute(
+        pub fn execute(
             _: *@This(),
             _: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
             _: *runtime.scheduler.native_generate.Lease,
@@ -9920,16 +9793,16 @@ test "runStepLoop yields when no step is currently claimable" {
         ready_after: usize,
         cycles: usize = 0,
 
-        fn isReady(self: *@This()) bool {
+        pub fn isReady(self: *@This()) bool {
             self.cycles += 1;
             return self.cycles > self.ready_after;
         }
 
-        fn stepBudget(_: *@This()) runtime.scheduler.native_generate.StepBudget {
+        pub fn stepBudget(_: *@This()) runtime.scheduler.native_generate.StepBudget {
             return .{ .max_items = 8, .max_query_tokens = 64 };
         }
 
-        fn execute(
+        pub fn execute(
             _: *@This(),
             _: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
             _: *runtime.scheduler.native_generate.Lease,
@@ -9984,15 +9857,15 @@ test "runStepLoop drains a multi-item step from a stub driver" {
         ready: bool = false,
         observed_size: usize = 0,
 
-        fn isReady(self: *const @This()) bool {
+        pub fn isReady(self: *const @This()) bool {
             return self.ready;
         }
 
-        fn stepBudget(self: *const @This()) runtime.scheduler.native_generate.StepBudget {
+        pub fn stepBudget(self: *const @This()) runtime.scheduler.native_generate.StepBudget {
             return self.coordinator.defaultStepBudget();
         }
 
-        fn execute(
+        pub fn execute(
             self: *@This(),
             scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
             lease_ptr: *runtime.scheduler.native_generate.Lease,
@@ -13404,13 +13277,13 @@ test "LightOnOCR3 dedicated executor publishes without request-side execution" {
     try coordinator.enqueueDecodeWork(lease, &ready, 5, 4, 0, .{});
     const Driver = struct {
         ready: *std.atomic.Value(bool),
-        fn isReady(self: *const @This()) bool {
+        pub fn isReady(self: *const @This()) bool {
             return self.ready.load(.acquire);
         }
-        fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
+        pub fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
             unreachable;
         }
-        fn execute(_: *@This(), _: *Coordinator, _: *Lease, _: []const StepItem) void {
+        pub fn execute(_: *@This(), _: *Coordinator, _: *Lease, _: []const StepItem) void {
             unreachable;
         }
     };
@@ -13444,13 +13317,13 @@ test "LightOnOCR3 dedicated executor cancels idle stack work without executing i
     var work: u8 = 0;
     try coordinator.enqueueDecodeWork(lease, &work, 5, 4, 0, .{});
     const Driver = struct {
-        fn isReady(_: *const @This()) bool {
+        pub fn isReady(_: *const @This()) bool {
             return false;
         }
-        fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
+        pub fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
             unreachable;
         }
-        fn execute(_: *@This(), _: *Coordinator, _: *runtime.scheduler.native_generate.Lease, _: []const runtime.scheduler.native_generate.StepItem) void {
+        pub fn execute(_: *@This(), _: *Coordinator, _: *runtime.scheduler.native_generate.Lease, _: []const runtime.scheduler.native_generate.StepItem) void {
             unreachable;
         }
     };
@@ -13492,16 +13365,16 @@ test "LightOnOCR3 dedicated cancellation drains an unrelated claimed turn" {
         io: std.Io,
         draining: *std.Io.Event,
         checks: std.atomic.Value(usize) = .init(0),
-        fn isReady(self: *const @This()) bool {
+        pub fn isReady(self: *const @This()) bool {
             // The second predicate check follows markDraining and the failed
             // idle-cancel attempt. Release the unrelated owner at that point.
             if (@constCast(&self.checks).fetchAdd(1, .monotonic) == 1) self.draining.set(self.io);
             return false;
         }
-        fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
+        pub fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
             unreachable;
         }
-        fn execute(_: *@This(), _: *Coordinator, _: *Lease, _: []const StepItem) void {
+        pub fn execute(_: *@This(), _: *Coordinator, _: *Lease, _: []const StepItem) void {
             unreachable;
         }
     };

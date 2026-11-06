@@ -26079,6 +26079,32 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return gqaPagedAttentionIntoOp(ctx, Q, K, V, attn_bias, attention, batch, num_heads, num_kv_heads, head_dim, null);
     }
 
+    /// Installed ordinary decoder consumer of the existing cold layer owner.
+    /// Format2 never selects split-GQA (the original selector requires format3)
+    /// and <=1024 pages uses original setBytes rather than new SDK table roots.
+    fn tryPreparedPagedDecode(self: *MetalCompute, q: MetalTensor, attention: ops.AttentionContext, num_heads: usize, num_kv_heads: usize, head_dim: usize, destination: ?MetalTensor) !?CT {
+        if (disableRuntimeAttentionF32() or getenvBool("TERMITE_METAL_DISABLE_PAGED_SLOT_ATTENTION") or !q.isDevice() or q.dtype != .f32 or q.ndim() != 2) return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        // This ordinary callback borrows its ORIGINAL execution/KV owner.
+        // No new roots, capability, capture or complete-Frame credit is granted.
+        const storage = attention.kv_storage orelse return null;
+        const recipe = (try @import("../backends/metal_kv_storage.zig").MetalKvStorage.prepareDecodeAttention(storage, runtime, attention, num_heads, num_kv_heads, head_dim)) orelse return null;
+        const width = try std.math.mul(usize, num_heads, head_dim);
+        if (q.dim(0) != 1 or q.elemCount() != width or q.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return null;
+        if (destination) |target| {
+            if (!target.isDevice() or target.dtype != .f32 or target.isReadOnlyPhysical() or target.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or target.elemCount() != width or target.deviceByteLen() != width * @sizeOf(f32)) return error.InvalidAttentionShape;
+            if (target.deviceHandle() == recipe.keys or target.deviceHandle() == recipe.values or (target.deviceHandle() == q.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(target.deviceByteOffset()), target.deviceByteLen(), @intCast(q.deviceByteOffset()), q.deviceByteLen()))) return error.InvalidAssignedAlias;
+        }
+        const request = .{ .destination = destination, .q = q, .slot = recipe.layer.slot, .format = recipe.layer.format, .block_token_offsets = recipe.offsets, .page_size = @as(usize, recipe.layer.page_size_tokens), .kv_tokens = attention.kv_sequence_len, .key_positions = @as(?[]const u32, null), .num_heads = num_heads, .num_kv_heads = num_kv_heads, .head_dim = head_dim, .key_row_bytes = recipe.layer.key_row_bytes, .base_key_row_bytes = recipe.layer.base_key_row_bytes, .query_position = attention.total_sequence_len - 1, .query_position_offset = attention.total_sequence_len - 1, .kv_position_offset = @as(usize, 0), .sliding_window = @as(usize, 0) };
+        const result = if (metal_runtime.hasActiveFrame(runtime) and activePagedSlotAttentionDeferredEnabled(self.data.a4b_inference != null or self.qwen35_ocr_deferred_attention))
+            try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(self.provider_impl, request)
+        else
+            try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlot(self.provider_impl, request);
+        // A validated native entry may already have submitted/encoded work.
+        // Failure is terminal for this invocation; never replay old attention.
+        return self.ctFromOwnedMetalTensor(result orelse return error.PreparedPagedAttentionFailed);
+    }
+
     fn gqaPagedAttentionIntoOp(
         ctx: *anyopaque,
         Q: CT,
@@ -26280,6 +26306,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 @intCast(head_dim),
             );
             if (device_written and !attention.skip_kv_write and attention.attn_or_mask == null) {
+                if (attn_bias == null and !has_attention_sink) if (try self.tryPreparedPagedDecode(q_mt, attention, num_heads, num_kv_heads, head_dim, destination)) |output| return output;
                 if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
                     const provider_runtime: ?*anyopaque = if (self.provider_impl.raw_decode_runtime) |runtime|
                         @ptrCast(runtime)
@@ -26608,6 +26635,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     );
                 }
                 if (device_written and attention.attn_or_mask == null) {
+                    if (attn_bias == null and !has_attention_sink) if (try self.tryPreparedPagedDecode(q_mt, attention, num_heads, num_kv_heads, head_dim, destination)) |output| return output;
                     if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
                         if (traceQuantBlockRequested()) std.debug.print(
                             "metal-gqa-paged-slot layer={d} format={d} supported={} tokens={d}\n",

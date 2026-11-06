@@ -478,6 +478,49 @@ pub const MetalKvStorage = struct {
         };
     }
 
+    /// Borrowed synchronous recipe from this actual sequence/layer binding.
+    /// All offset storage was reserved by ColdKvBank BEFORE numerical entry.
+    /// Native setBytes copies <=4096 table bytes while encoding; no host slice
+    /// survives this call, no per-token plan, table allocation or quota credit.
+    pub const PreparedDecodeAttention = struct {
+        layer: storage_runtime.DevicePagedKvLayer,
+        offsets: []const u32,
+        keys: *anyopaque,
+        values: *anyopaque,
+    };
+    pub fn prepareDecodeAttention(storage: *storage_runtime.KvStorageRuntime, expected_runtime: *metal_runtime.RawMetalDecodeRuntime, attention: @import("../graph/backend_contracts.zig").AttentionContext, num_heads: usize, num_kv_heads: usize, head_dim: usize) !?PreparedDecodeAttention {
+        const hook = storage.device_write_hook orelse return null;
+        // Header attestation before opaque context. Custom/copied hooks keep
+        // their original callback and never grant this owned recipe.
+        if (hook.vtable != &hook_vtable) return null;
+        const self: *MetalKvStorage = @ptrCast(@alignCast(hook.ctx));
+        if (self.runtime != expected_runtime or self.format != .raw_f32 or self.page_size_tokens == 0 or num_heads == 0 or num_kv_heads == 0 or num_heads % num_kv_heads != 0) return null;
+        const bank = self.cold_bank orelse return null;
+        if (!bank.adopted or !bank.published or bank.store != self or bank.adopted_storage_ptr != storage.storage.ptr or bank.adopted_storage_vtable != @as(*const anyopaque, @ptrCast(storage.storage.vtable))) return null;
+        if (attention.kv_storage != storage or attention.query_sequence_len != 1 or attention.mode != .paged_decode or attention.kv_batch != null or attention.attn_or_mask != null or attention.attention_sink.hasMetadata() or attention.skip_kv_write or attention.sliding_window != 0 or attention.kv_position_offset != 0 or attention.total_sequence_len == 0 or attention.kv_sequence_len != attention.total_sequence_len) return null;
+        const kv = attention.kv_cache orelse return null;
+        if (kv.kv_storage != storage or kv.allow_swa_ring or kv.position_offset != 0) return null;
+        if (kv.pool_id != storage.poolId()) return error.InvalidPoolId;
+        try self.requirePreparedLayout(attention.layer_index, std.math.cast(u32, num_kv_heads) orelse return null, std.math.cast(u32, head_dim) orelse return null);
+        const binding = self.slot_map.get(.{ .sequence_id = kv.sequence_id, .layer_index = std.math.cast(u32, attention.layer_index) orelse return null }) orelse return null;
+        if (binding.ring_page_count != 0 or binding.selected_positions != null or binding.position_offset != 0 or !binding.covers(attention.total_sequence_len)) return null;
+        const table = storage.blockTable(kv.sequence_id) orelse return error.InvalidSequenceId;
+        const page = self.page_size_tokens;
+        if (storage.storage.config.page_size_tokens != page or table.tokenCount(page) != attention.total_sequence_len or kv.tail_tokens != table.tail_tokens) return error.InvalidPagedKvState;
+        const blocks = try std.math.divCeil(usize, attention.total_sequence_len, page);
+        if (blocks == 0 or blocks > 1024 or blocks > self.cyclic_page_table_cache.mapped_limit or blocks > self.cyclic_page_table_cache.offsets.capacity or table.blocks.items.len < blocks or kv.logical_block_count < blocks) return null;
+        const info = try self.slotInfo(binding.slot);
+        const layout = self.rowLayout(@intCast(num_kv_heads), @intCast(head_dim));
+        if (info.key_row_bytes != layout.key_row_bytes or info.v_row_stride != layout.v_row_stride) return error.DeviceKvCapacityLayoutChanged;
+        for (table.blocks.items[0..blocks]) |id| {
+            const end = try std.math.mul(usize, try std.math.add(usize, id, 1), page);
+            if (try std.math.mul(usize, end, layout.key_row_bytes) > info.encoded_key_capacity or try std.math.mul(usize, end, layout.v_row_stride * @sizeOf(f32)) > info.v_capacity) return error.KvCapacityTooSmall;
+        }
+        const layer = try self.pagedLayerKvDevice(.{ .sequence_id = kv.sequence_id, .layer_index = attention.layer_index, .token_count = attention.total_sequence_len, .num_kv_heads = @intCast(num_kv_heads), .head_dim = @intCast(head_dim) });
+        const offsets = try self.pageTokenOffsets(table.blocks.items, blocks, page, 0);
+        return .{ .layer = layer, .offsets = offsets.values(), .keys = info.encoded_key_handle orelse return error.InvalidSlot, .values = info.v_handle orelse return error.InvalidSlot };
+    }
+
     fn traceKvGather() bool {
         // Cached: this runs per KV write/read in the decode inner loop.
         const S = struct {
@@ -1506,6 +1549,9 @@ pub const MetalKvStorage = struct {
         adopted: bool = false,
         published: bool = false,
         active_sequences: [128]?storage_runtime.SequenceId = @splat(null),
+        // Stable actual storage owner, not the movable KvStorageRuntime address.
+        adopted_storage_ptr: ?*anyopaque = null,
+        adopted_storage_vtable: ?*const anyopaque = null,
 
         const Budget = struct {
             reservation: ?storage_admission.Reservation,
@@ -1734,6 +1780,8 @@ pub const MetalKvStorage = struct {
             // Caller must install only into an empty, already-built runtime.
             if (runtime.device_write_hook != null or runtime.sequences.items.len != 0 or runtime.storage.config.dtype != self.dtype or runtime.storage.config.page_size_tokens != self.window.page_size) return error.PreparedKvBankTargetNotEmpty;
             runtime.setDeviceWriteHook(self.store.?.deviceWriteHook());
+            self.adopted_storage_ptr = runtime.storage.ptr;
+            self.adopted_storage_vtable = @ptrCast(runtime.storage.vtable);
             self.adopted = true;
         }
         pub fn abortOutsideLanes(self: *ColdKvBank, epoch: *const sink.Epoch) void {
@@ -2935,6 +2983,71 @@ test "Metal cold KV bank prefunds sparse planes failure atomically and reuses ac
         try runtime.appendTokens(longest, 8);
         const retained_source = storage_runtime.DeviceKvRef{ .handle = input.?, .byte_offset = 0, .byte_len = @sizeOf(@TypeOf(values)) };
         for (geometry) |layer| try runtime.writeLayerKvSuffixDevice(.{ .sequence_id = longest, .layer_index = layer.index, .total_token_count = 8, .suffix_token_count = 8, .position_offset = 0, .num_kv_heads = 1, .head_dim = 64 }, retained_source, retained_source);
+        {
+            const attention = @import("../graph/backend_contracts.zig").AttentionContext{
+                .mode = .paged_decode,
+                .query_sequence_len = 1,
+                .kv_sequence_len = 8,
+                .total_sequence_len = 8,
+                .layer_index = geometry[0].index,
+                .kv_storage = &runtime,
+                .kv_cache = .{ .sequence_id = longest, .pool_id = runtime.poolId(), .logical_block_count = runtime.blockTable(longest).?.blocks.items.len, .tail_tokens = runtime.blockTable(longest).?.tail_tokens, .kv_storage = &runtime },
+            };
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            const old_allocator = bank.store.?.allocator;
+            bank.store.?.allocator = failing.allocator();
+            defer bank.store.?.allocator = old_allocator;
+            const prepared_attention = (try MetalKvStorage.prepareDecodeAttention(&runtime, raw, attention, 1, 1, 64)) orelse return error.MissingPreparedAttention;
+            var foreign = runtime; // Non-owning metadata copy, never deinitialized.
+            foreign.storage.ptr = @ptrFromInt(16);
+            var foreign_attention = attention;
+            foreign_attention.kv_storage = &foreign;
+            foreign_attention.kv_cache.?.kv_storage = &foreign;
+            // Genuine canonical hook + identical sequence IDs cannot attest an
+            // unrelated host owner. Reject before table/host callback access.
+            try std.testing.expect((try MetalKvStorage.prepareDecodeAttention(&foreign, raw, foreign_attention, 1, 1, 64)) == null);
+            var wrong_pool = attention;
+            wrong_pool.kv_cache.?.pool_id = runtime.poolId() + 1;
+            try std.testing.expectError(error.InvalidPoolId, MetalKvStorage.prepareDecodeAttention(&runtime, raw, wrong_pool, 1, 1, 64));
+            var moved = runtime; // Same stable host storage remains valid.
+            var moved_attention = attention;
+            moved_attention.kv_storage = &moved;
+            moved_attention.kv_cache.?.kv_storage = &moved;
+            try std.testing.expect((try MetalKvStorage.prepareDecodeAttention(&moved, raw, moved_attention, 1, 1, 64)) != null);
+            try std.testing.expect(prepared_attention.offsets.ptr == bank.store.?.cyclic_page_table_cache.offsets.items.ptr);
+            const ids = runtime.blockTable(longest).?.blocks.items;
+            for (prepared_attention.offsets, ids) |offset, id| try std.testing.expectEqual(@as(u32, id * 2), offset);
+            var malformed = attention;
+            malformed.kv_sequence_len = 9;
+            try std.testing.expect((try MetalKvStorage.prepareDecodeAttention(&runtime, raw, malformed, 1, 1, 64)) == null);
+            var copied = hook_vtable;
+            std.mem.doNotOptimizeAway(&copied);
+            try std.testing.expect(@as(*const anyopaque, @ptrCast(&copied)) != @as(*const anyopaque, @ptrCast(&hook_vtable)));
+            const real_hook = runtime.device_write_hook;
+            runtime.device_write_hook = .{ .ctx = @ptrFromInt(16), .vtable = &copied };
+            defer runtime.device_write_hook = real_hook;
+            try std.testing.expect((try MetalKvStorage.prepareDecodeAttention(&runtime, raw, attention, 1, 1, 64)) == null);
+            runtime.device_write_hook = real_hook;
+            // The genuine public operation consumes the prepared layer. Zero
+            // queries make the exact independent oracle the mean of eight rows.
+            const q_values: [64]f32 = @splat(0);
+            const q = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&q_values, &.{ 1, 64 }));
+            defer backend.free(q);
+            const k = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(values[7 * 64 ..], &.{ 1, 64 }));
+            defer backend.free(k);
+            const v = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(values[7 * 64 ..], &.{ 1, 64 }));
+            defer backend.free(v);
+            const result = try backend.gqaPagedAttention(q, k, v, null, attention, 1, 1, 1, 64);
+            defer backend.free(result);
+            const actual = try backend.toFloat32(result, a);
+            defer a.free(actual);
+            for (actual, 0..) |got, column| {
+                var expected: f64 = 0;
+                for (0..8) |row| expected += values[row * 64 + column];
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected / 8)), got, 0.0001);
+            }
+            try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        }
         for (0..64) |_| {
             const sequence = try runtime.attachSequence(runtime.poolId());
             try runtime.appendTokens(sequence, 8);

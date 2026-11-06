@@ -317,10 +317,9 @@ pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
     }
     if (head.count == 2 and head.linears[0].operation.linear.out_dim != head.linears[1].operation.linear.out_dim) return null;
     if (head.count == 3 and head.linears[1].operation.linear.out_dim != head.linears[2].operation.linear.out_dim) return null;
-    for (graph.nodes.items, 0..) |node, id| {
-        if (node.op == .parameter) continue;
-        if (std.mem.indexOfScalar(ml.graph.NodeId, head.covered[0..head.covered_count], @intCast(id)) == null) return null;
-    }
+    // Every requested output and all its dependencies were checked above.
+    // Unreachable nodes, including Builder's training-only VJP alternatives,
+    // are not executable work and must not disable the original row route.
     return head;
 }
 
@@ -651,6 +650,19 @@ test "semantic projection heads retain optimizer pair and grouped QKV source out
         try std.testing.expect(projectionHead(&optimized.graph) == null);
         std.mem.swap(ml.graph.NodeId, &optimized.graph.outputs.items[0], &optimized.graph.outputs.items[1]);
         try std.testing.expect(projectionHead(&optimized.graph) != null);
+        const dead = try optimized.graph.addNode(.{
+            .op = .neg,
+            .output_shape = optimized.graph.node(head.input).output_shape,
+            .inputs = .{ head.input, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+            .num_inputs = 1,
+        });
+        const with_dead = projectionHead(&optimized.graph) orelse return error.UnreachableNodeDisabledProjectionHead;
+        try std.testing.expectEqual(head.covered_count, with_dead.covered_count);
+        try std.testing.expectEqualSlices(ml.graph.NodeId, head.outputs[0..head.count], with_dead.outputs[0..with_dead.count]);
+        const producer = if (count == 2) head.outputs[0] else optimized.graph.node(head.outputs[0]).inputs[0];
+        optimized.graph.nodes.items[producer].inputs[0] = dead;
+        try std.testing.expect(projectionHead(&optimized.graph) == null);
+        optimized.graph.nodes.items[producer].inputs[0] = head.input;
         if (count == 3) {
             const first_slice = optimized.graph.node(head.outputs[0]);
             const linear = first_slice.inputs[0];

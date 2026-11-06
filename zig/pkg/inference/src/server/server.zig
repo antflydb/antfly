@@ -9105,21 +9105,24 @@ pub const Node = struct {
     };
 
     const LightOnPrefillPayload = struct {
-        item: generation.NativeGenerationPipeline.PreparedQwenPrefillItem,
+        item: @import("../execution/decoder_prefill.zig").PositionedEmbeddingBatchItem,
+        lease: *runtime.scheduler.native_generate.Lease,
+        io: std.Io,
     };
-    fn batchLightOnPreparedPrefill(raw: *anyopaque, pipeline: *generation.NativeGenerationPipeline, prepared: *qwen3vl_projector.PreparedPrompt, seq: usize, state: *generation.NativeDecodeState, wants_greedy: bool) !generation.NativeGenerationPipeline.PrefillOutput {
+    fn batchLightOnPreparedPrefill(raw: *anyopaque, positioned: *@import("../execution/decoder_prefill.zig").PositionedRequest) !generation.NativeGenerationPipeline.PrefillOutput {
         const request: *LightOnVisionRequest = @ptrCast(@alignCast(raw));
         try request.control.check();
-        const lease = pipeline.scheduler_lease orelse return error.InvalidBatchDecodeState;
+        const lease = positioned.lease;
+        const seq = positioned.item.sequence_length;
         if (request.ctx.features.packed_mixed) {
-            const output = try pipeline.runScheduledPreparedQwenPrefill(prepared, state, seq, wants_greedy);
-            errdefer if (output.last_logits) |logits| pipeline.allocator.free(logits);
+            const output = try positioned.runScheduled();
+            errdefer if (output.last_logits) |logits| positioned.item.allocator.free(logits);
             try request.control.check();
             request.ctx.coordinator.beginDecode(lease, seq);
             return output;
         }
         // Collection stays waiting until the broker seals its group.
-        const payload = LightOnPrefillPayload{ .item = .{ .pipeline = pipeline, .prepared = prepared, .seq_len = seq, .state = state } };
+        const payload = LightOnPrefillPayload{ .item = positioned.item, .lease = lease, .io = positioned.io };
         const Cancel = struct {
             fn check(ptr: *const anyopaque) bool {
                 const control: *const InferenceExecutionControl = @ptrCast(@alignCast(ptr));
@@ -9129,13 +9132,13 @@ pub const Node = struct {
         };
         const queued_phase = request.ctx.beginQueuedPhase(false);
         defer if (queued_phase) request.ctx.finishPhaseWait();
-        const batch_items = try generation.NativeGenerationPipeline.preparedQwenPrefillBatchLimitForBackend(pipeline.cb.kind(), request.ctx.features.prefill_batch_items, seq);
-        const result = try request.ctx.prefill_broker.submitControlled(LightOnPrefillPayload, []f32, request.io, pipeline.allocator, .{ .model = request.ctx.model.model_dir, .generation = request.ctx.execution_id, .task = .read, .transform = "lighton-prefill", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = batch_items, .max_items = batch_items, .max_tokens = std.math.mul(usize, batch_items, seq) catch return error.ResourceLimitExceeded, .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US") orelse 5000, 1000000) }, .{ .geometry_key = @intCast(seq), .tokens = seq }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, request.ctx, executeLightOnPrefillBatch);
+        const batch_items = try generation.NativeGenerationPipeline.preparedQwenPrefillBatchLimitForBackend(positioned.item.backend.kind(), request.ctx.features.prefill_batch_items, seq);
+        const result = try request.ctx.prefill_broker.submitControlled(LightOnPrefillPayload, []f32, request.io, positioned.item.allocator, .{ .model = request.ctx.model.model_dir, .generation = request.ctx.execution_id, .task = .read, .transform = "lighton-prefill", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = batch_items, .max_items = batch_items, .max_tokens = std.math.mul(usize, batch_items, seq) catch return error.ResourceLimitExceeded, .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US") orelse 5000, 1000000) }, .{ .geometry_key = @intCast(seq), .tokens = seq }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, request.ctx, executeLightOnPrefillBatch);
         const logits = switch (result.result) {
             .value => |value| value,
             .item_error => |failure| return failure.cause,
         };
-        errdefer pipeline.allocator.free(logits);
+        errdefer positioned.item.allocator.free(logits);
         try request.control.check();
         // No manual prefill work remains while the caller samples its first token.
         request.ctx.coordinator.beginDecode(lease, seq);
@@ -9162,26 +9165,20 @@ pub const Node = struct {
         }
         var group = executor_microbatch.ExecutionControl{ .items = items };
         const control = lightOnMicrobatchExecutionControl(&group);
-        var batch: [generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items]generation.NativeGenerationPipeline.PreparedQwenPrefillItem = undefined;
+        var batch: [generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items]@import("../execution/decoder_prefill.zig").PositionedEmbeddingBatchItem = undefined;
         for (items, 0..) |item, index| batch[index] = item.payloadAs(LightOnPrefillPayload).item;
         control.check() catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
-        const output_allocator = batch[0].pipeline.allocator;
+        const output_allocator = batch[0].allocator;
         // Only the sealed group's leader is a runnable manual turn. Its
         // followers remain waiting until their shared prefill completes, so
         // the existing event waiter cannot deadlock on a follower's turn.
         // This also avoids polling every group member at 100-us intervals.
-        const leader = batch[0].pipeline.scheduler_lease orelse {
-            for (items) |item| item.slot.fail(error.InvalidBatchDecodeState);
-            return;
-        };
-        const io = batch[0].pipeline.io orelse {
-            for (items) |item| item.slot.fail(error.MissingIo);
-            return;
-        };
-        ctx.coordinator.notePrefillProgress(leader, 0, batch[0].seq_len);
+        const leader = items[0].payloadAs(LightOnPrefillPayload).lease;
+        const io = items[0].payloadAs(LightOnPrefillPayload).io;
+        ctx.coordinator.notePrefillProgress(leader, 0, batch[0].sequence_length);
         ctx.coordinator.awaitTurnControlled(leader, .prefill, io, @as(?InferenceExecutionControl, control)) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
@@ -9196,7 +9193,7 @@ pub const Node = struct {
         defer ctx.unlockStep();
         ctx.prefill_await_groups += 1;
         ctx.prefill_await_events = ctx.coordinator.usesStepEvents();
-        const host_scratch_bytes = generation.NativeGenerationPipeline.preparedQwenPrefillHostScratchForBackend(ctx.cb.?.kind(), items.len, batch[0].seq_len, ctx.cfg.vocab_size) catch |err| {
+        const host_scratch_bytes = generation.NativeGenerationPipeline.preparedQwenPrefillHostScratchForBackend(ctx.cb.?.kind(), items.len, batch[0].sequence_length, ctx.cfg.vocab_size) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
@@ -9210,13 +9207,13 @@ pub const Node = struct {
             host_scratch.deinit();
             ctx.prefill_host_scratch_releases += 1;
         }
-        const output = generation.NativeGenerationPipeline.forwardPreparedQwenPrefillBatch(batch[0..items.len]) catch |err| {
+        const output = @import("../execution/decoder_prefill.zig").forwardPositionedEmbeddingBatch(batch[0..items.len]) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
         defer output_allocator.free(output);
         for (items, output) |item, logits| item.slot.setValue([]f32, logits, if (items.len > 1) .native_batch else .serial);
-        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 prefill_batch_items={d} query_tokens={d}\n", .{ items.len, batch[0].seq_len });
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 prefill_batch_items={d} query_tokens={d}\n", .{ items.len, batch[0].sequence_length });
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 prefill_batch_host_scratch_bytes={d} prefill_batch_limit={d}\n", .{ host_scratch_bytes, ctx.features.prefill_batch_items });
     }
 

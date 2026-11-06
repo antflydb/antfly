@@ -231,7 +231,12 @@ preparation API do not by themselves complete these remaining requirements:
   advancement for published burst tokens. Ordinary and scheduled prefill share
   runtime post-chunk donor maintenance before publishing their cursor.
   Generation supplies semantic eligibility, schedules turns and publishes
-  results. Native whole-model execution shares the last-logits implementation;
+  results. Positioned-prefix scheduling borrows one typed runtime request
+  rather than the generation pipeline. It retains one executor through the
+  queued chunks, shares the wait/claim/cancellation-drain protocol with ordinary
+  decode, and merges task counters once after completion. Server batching keeps
+  grouping, deadlines and publication while passing typed numerical work.
+  Native whole-model execution shares the last-logits implementation;
   retained hidden outputs point to the real backend, never the temporary adapter.
   `execution/decoder_storage.zig` owns pool geometry, metadata-only CUDA request
   pools, checkpoint geometry, route capacity and lazy reservation policy. Native,
@@ -255,6 +260,13 @@ preparation API do not by themselves complete these remaining requirements:
   prepaid workspaces before applying explicit operator limits once. Opaque
   providers and incompatible state transitions retain compatibility ownership; host-table
   retention alone does not certify every device cancellation/drain endpoint.
+  Ordinary F32 attention reuses the existing physical producer: CUDA singleton
+  batch rows write directly into their output parent, and Metal cold paged
+  layers reuse their reserved page-offset storage and supplied destinations.
+  Both validate the current canonical storage before using these routes and
+  preserve their original launches and retirement owners. These ordinary
+  optimizations grant no complete-Frame or capture credit; learned private
+  decoder/audio temporary arenas retain compatibility ownership.
 - Native decoder templates retain only backend-free placement, buffer layout and
   output-policy facts. Graph runtime and decoder preparation use the same layout
   builder; each decoder program creates fresh physical pools and revalidates the

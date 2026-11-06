@@ -84,3 +84,26 @@ pub fn copyPrefixPositions(work: *const Prefill, start: usize, output: []u32, to
     std.debug.assert(start <= full and query <= full - start);
     for (0..3) |axis| @memcpy(output[axis * total + offset ..][0..query], prefix.positions[axis * full + start ..][0..query]);
 }
+
+const runtime = @import("../runtime/root.zig");
+
+pub fn stepBudget(
+    scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+    decode_state: *State,
+) runtime.scheduler.native_generate.StepBudget {
+    var budget = scheduler.defaultStepBudget();
+    const avail = decode_state.availableKvBlocks() orelse return budget;
+    const safety: usize = 1;
+    budget.max_kv_blocks = if (avail > safety) avail - safety else 0;
+    return budget;
+}
+
+pub fn pendingOptions(
+    decode_state: *State,
+    additional_tokens: usize,
+) runtime.scheduler.native_generate.PendingWorkOptions {
+    return .{
+        .exclusive_step = decode_state.requiresExclusiveStep(),
+        .kv_blocks_estimate = decode_state.estimateAdditionalKvBlocks(additional_tokens) orelse 0,
+    };
+}

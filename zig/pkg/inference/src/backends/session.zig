@@ -3237,7 +3237,11 @@ pub const Session = struct {
         try source.enter();
         var outputs = (try source.runResident(inputs)) orelse return null;
         errdefer outputs.deinitWithBoundary(source.epoch());
-        if (!try source.handoffResident(&outputs)) return error.UnsupportedNativeResidentHandoff;
+        // Public publication retains the original physical output owner,
+        // Model and primary lease, just like the ordinary RunPermit path.
+        // Immediate resident stage consumers use handoffResident separately
+        // when they need detached dense payloads before another admission.
+        try source.releaseForConsumer();
         // The stored backend's synchronous fields were cleared by the actual
         // resident callback. Source closes B/gates; output keeps Model+lease.
         return outputs;

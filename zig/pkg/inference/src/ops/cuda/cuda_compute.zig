@@ -10158,6 +10158,9 @@ const CudaKvDeviceStorage = struct {
     revision: u64 = 0,
     match_binding: ?*AttentionMatchBinding = null,
     cold_bank: ?*ColdKvBank = null,
+    // Stable logical storage namespace; KvStorageRuntime itself may move.
+    prepared_storage_ptr: ?*anyopaque = null,
+    prepared_storage_vtable: ?*const anyopaque = null,
 
     fn create(allocator: std.mem.Allocator, compute: *CudaCompute, dtype: kv_pool_mod.KvDType) !*CudaKvDeviceStorage {
         const self = try allocator.create(CudaKvDeviceStorage);
@@ -10321,6 +10324,8 @@ const CudaKvDeviceStorage = struct {
         const layer_key = try self.layerKey(write.sequence_id, write.layer_index);
         const layer = if (self.cold_bank != null)
             (self.layers.getPtr(layer_key) orelse return error.ColdKvStorageChanged)
+        else if (self.layers.getPtr(layer_key)) |existing|
+            existing
         else blk: {
             const gop = try self.layers.getOrPut(self.allocator, layer_key);
             if (!gop.found_existing) gop.value_ptr.* = .{};
@@ -11813,6 +11818,8 @@ fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvSt
         device_storage.deinit();
         self.allocator.destroy(device_storage);
     }
+    device_storage.prepared_storage_ptr = storage.storage.ptr;
+    device_storage.prepared_storage_vtable = @ptrCast(storage.storage.vtable);
     storage.setDeviceWriteHook(device_storage.hook());
 }
 
@@ -28702,6 +28709,19 @@ fn noteGqaAttentionLaunch(self: *CudaCompute, comptime compressed_paged: bool, l
     }
 }
 
+fn launchDenseGqaRequest(self: *CudaCompute, request: *const kernels_mod.GqaAttentionRequest) !kernels_mod.GqaAttentionLaunchKind {
+    if (cudaDebugDecodeScalarsReady(self)) {
+        var scalar = request.*;
+        scalar.decode_scalars = self.debug_cuda_decode_scalars;
+        const result = self.kernels.launchGqaAttentionDecodeScalarsF32(&self.ctx, &scalar) catch |err| switch (err) {
+            error.CudaKernelUnavailable => null,
+            else => return err,
+        };
+        if (result) |kind| return kind;
+    }
+    return self.kernels.launchGqaAttentionF32(&self.ctx, request);
+}
+
 fn gqaDenseAttention(
     ctx: *anyopaque,
     q_ct: CT,
@@ -28771,55 +28791,26 @@ fn gqaDenseAttention(
     var prefill_profile_scope = beginPrefillProfile(self, .attention, q_seq_len);
     defer if (prefill_profile_scope) |*scope| scope.end();
 
-    const attention_launch = launch: {
-        if (cudaDebugDecodeScalarsReady(self)) {
-            const scalar_launch = self.kernels.launchGqaAttentionDecodeScalarsF32(&self.ctx, &.{
-                .dst = device,
-                .q = q_tensor.buffer,
-                .k = k_tensor.buffer,
-                .v = v_tensor.buffer,
-                .attn_or_mask = mask_device,
-                .bias = bias_buffer,
-                .decode_scalars = self.debug_cuda_decode_scalars,
-                .batch = batch,
-                .q_seq_len = q_seq_len,
-                .kv_seq_len = kv_seq_len,
-                .num_heads = num_heads,
-                .num_kv_heads = num_kv_heads,
-                .head_dim = head_dim,
-                .query_position_offset = query_position_offset,
-                .kv_position_offset = kv_position_offset,
-                .sliding_window = sliding_window,
-                .total_sequence_len = mask_sequence_len,
-                .mask_len = mask_len,
-                .bias_mode = bias_mode,
-            }) catch |err| switch (err) {
-                error.CudaKernelUnavailable => null,
-                else => return err,
-            };
-            if (scalar_launch) |kind| break :launch kind;
-        }
-        break :launch self.kernels.launchGqaAttentionF32(&self.ctx, &.{
-            .dst = device,
-            .q = q_tensor.buffer,
-            .k = k_tensor.buffer,
-            .v = v_tensor.buffer,
-            .attn_or_mask = mask_device,
-            .bias = bias_buffer,
-            .batch = batch,
-            .q_seq_len = q_seq_len,
-            .kv_seq_len = kv_seq_len,
-            .num_heads = num_heads,
-            .num_kv_heads = num_kv_heads,
-            .head_dim = head_dim,
-            .query_position_offset = query_position_offset,
-            .kv_position_offset = kv_position_offset,
-            .sliding_window = sliding_window,
-            .total_sequence_len = mask_sequence_len,
-            .mask_len = mask_len,
-            .bias_mode = bias_mode,
-        });
-    } catch |err| {
+    const attention_launch = launchDenseGqaRequest(self, &.{
+        .dst = device,
+        .q = q_tensor.buffer,
+        .k = k_tensor.buffer,
+        .v = v_tensor.buffer,
+        .attn_or_mask = mask_device,
+        .bias = bias_buffer,
+        .batch = batch,
+        .q_seq_len = q_seq_len,
+        .kv_seq_len = kv_seq_len,
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .query_position_offset = query_position_offset,
+        .kv_position_offset = kv_position_offset,
+        .sliding_window = sliding_window,
+        .total_sequence_len = mask_sequence_len,
+        .mask_len = mask_len,
+        .bias_mode = bias_mode,
+    }) catch |err| {
         if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
             return gqaDenseAttentionHostFallback(
                 self,
@@ -29443,49 +29434,18 @@ fn gqaPagedAttentionWithDeviceKv(
         return error.DeviceReadFallback;
     }
 
-    const k_shape = try allocShape2(self.allocator, attention.kv_sequence_len, h_kv);
-    var k_shape_owned = false;
-    errdefer if (!k_shape_owned) self.allocator.free(k_shape);
-    const v_shape = try allocShape2(self.allocator, attention.kv_sequence_len, h_kv);
-    var v_shape_owned = false;
-    errdefer if (!v_shape_owned) self.allocator.free(v_shape);
-    const k_tensor = try self.allocator.create(CudaTensor);
-    var k_tensor_owned = false;
-    errdefer if (!k_tensor_owned) self.allocator.destroy(k_tensor);
-    const q_tensor_for_ptr_type = tensorFromCt(q_ct);
-    const k_device_ptr: @TypeOf(q_tensor_for_ptr_type.buffer.ptr) = @intCast(@intFromPtr(gathered.k.handle) + gathered.k.byte_offset);
-    k_tensor.* = .{
-        .buffer = .{ .ptr = k_device_ptr, .len = gathered.k.byte_len },
-        .dtype = .f32,
-        .shape = k_shape,
-        .elem_count = kv_count,
-        .owns_buffer = false,
-    };
-    k_shape_owned = true;
-    const v_tensor = try self.allocator.create(CudaTensor);
-    var v_tensor_owned = false;
-    errdefer if (!v_tensor_owned) self.allocator.destroy(v_tensor);
-    const v_device_ptr: @TypeOf(q_tensor_for_ptr_type.buffer.ptr) = @intCast(@intFromPtr(gathered.v.handle) + gathered.v.byte_offset);
-    v_tensor.* = .{
-        .buffer = .{ .ptr = v_device_ptr, .len = gathered.v.byte_len },
-        .dtype = .f32,
-        .shape = v_shape,
-        .elem_count = kv_count,
-        .owns_buffer = false,
-    };
-    v_shape_owned = true;
-
-    k_tensor_owned = true;
-    v_tensor_owned = true;
-    defer freeTensor(self, k_tensor);
-    defer freeTensor(self, v_tensor);
+    // These are synchronous borrowed metadata views of the actual KV owner.
+    // Neither wrapper nor its two-element shape escapes gqaDenseAttention.
+    var kv_shape = [_]i64{ @intCast(attention.kv_sequence_len), @intCast(h_kv) };
+    var k_tensor = CudaTensor{ .buffer = .{ .ptr = @intCast(@intFromPtr(gathered.k.handle) + gathered.k.byte_offset), .len = gathered.k.byte_len }, .dtype = .f32, .shape = &kv_shape, .elem_count = kv_count, .owns_buffer = false };
+    var v_tensor = CudaTensor{ .buffer = .{ .ptr = @intCast(@intFromPtr(gathered.v.handle) + gathered.v.byte_offset), .len = gathered.v.byte_len }, .dtype = .f32, .shape = &kv_shape, .elem_count = kv_count, .owns_buffer = false };
 
     const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
     const result = try gqaDenseAttention(
         self,
         q_ct,
-        k_tensor,
-        v_tensor,
+        &k_tensor,
+        &v_tensor,
         attn_bias_ct,
         attention.attn_or_mask,
         batch,
@@ -29697,6 +29657,105 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     return createTensor(self, output, shape, views.len * width);
 }
 
+/// Ordinary F32 singleton into a batch parent's exact output subspan. The
+/// caller owns that parent through the same original stream/use boundary.
+/// This is not an authored Frame, capture promise, or new admission credit.
+fn tryPagedDenseInto(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT, attention: ops.AttentionContext, heads: usize, kv_heads: usize, dim: usize, parent: buffer_mod.DeviceBuffer, byte_offset: usize) !bool {
+    if ((attention.mode != .paged_decode and attention.mode != .paged_prefill) or attention.query_sequence_len != 1 or
+        attention.total_sequence_len == 0 or attention.kv_sequence_len != attention.total_sequence_len or attention.kv_position_offset != 0 or
+        attention.sliding_window != 0 or attention.attn_or_mask != null or attention.kv_batch != null or attention.attention_sink.hasMetadata() or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or cudaDebugDecodeScalarsReady(self) or cudaForceHostGqaAttention() or
+        self.kernels.gqa_attention_f32 == null or self.ctx.driver.fns.cuStreamIsCapturing == null) return false;
+    if (try self.ctx.streamCaptureActive()) return false;
+    const storage = attention.kv_storage orelse return false;
+    const kv = attention.kv_cache orelse return false;
+    if (kv.kv_storage != null and kv.kv_storage != storage) return false;
+    const hook = storage.device_write_hook orelse return false;
+    // Exact provider identity BEFORE accessing its opaque device storage.
+    if (hook.vtable != &CudaKvDeviceStorage.hook_vtable or storage.storage.config.backend != .cuda or storage.storage.config.dtype != .f32 or
+        !storage.storage.hasCanonicalHostBlockOwnership() or storage.storage.config.page_size_tokens == 0) return false;
+    const owner: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+    if (owner.compute != self or owner.prepared_storage_ptr != storage.storage.ptr or owner.prepared_storage_vtable != @as(*const anyopaque, @ptrCast(storage.storage.vtable)) or owner.dtype != .f32 or owner.match_binding != null or heads == 0 or kv_heads == 0 or dim == 0 or heads % kv_heads != 0) return false;
+    if (storage.storage.config.num_kv_heads != kv_heads or storage.storage.config.head_dim != dim or storage.storage.config.num_layers_packed <= attention.layer_index) return false;
+    if (kv.pool_id != storage.poolId()) return false;
+    const sequence = try storage.sequenceMut(kv.sequence_id);
+    if (kv.tail_tokens != sequence.block_table.tail_tokens or kv.logical_block_count != sequence.block_table.len()) return false;
+    const page = storage.storage.config.page_size_tokens;
+    if (sequence.block_table.tokenCount(page) != attention.kv_sequence_len or sequence.device_capacity_limit_tokens != 0) return false;
+    const block_count = try checkedAdd(sequence.block_table.blocks.items.len, sequence.reserved_tail_blocks.items.len);
+    if (storage.logical_blocks_with_reservations.capacity < block_count) return false;
+    if (!attention.skip_kv_write) {
+        const tail = sequence.block_table.last() orelse return false;
+        const info = storage.storage.blockInfo(tail) orelse return false;
+        if (info.refcount != 1) return false; // COW remains on original owner.
+    }
+    const key = try owner.layerKey(kv.sequence_id, attention.layer_index);
+    const layer = owner.layers.getPtr(key) orelse return false;
+    const kv_width = try checkedMul(kv_heads, dim);
+    const q_count = try checkedMul(heads, dim);
+    const row_bytes = try checkedMul(kv_width, @sizeOf(f32));
+    const bytes = try checkedMul(q_count, @sizeOf(f32));
+    const required_capacity = try uncompressedCudaKvRequiredCapacity(attention.kv_sequence_len, cudaDebugGraphPersistentReplayEnabled(self), cudaDebugGraphForcedKvReplayCapacityTokens());
+    if (layer.compressed_format != null or layer.row_width != kv_width or layer.key_row_bytes != row_bytes or layer.value_row_bytes != row_bytes or layer.position_offset != 0 or
+        layer.capacity_tokens < required_capacity or layer.token_count +| @as(usize, @intFromBool(!attention.skip_kv_write)) < attention.kv_sequence_len or
+        layer.k.len < try checkedMul(layer.capacity_tokens, row_bytes) or layer.v.len < try checkedMul(layer.capacity_tokens, row_bytes)) return false;
+    const original_k = layer.k.ptr;
+    const original_v = layer.v.ptr;
+    const capacity_epoch = owner.capacity_epoch;
+    const q = tensorFromCt(q_ct);
+    const k = tensorFromCt(k_ct);
+    const v = tensorFromCt(v_ct);
+    try ensureF32(q);
+    try ensureF32(k);
+    try ensureF32(v);
+    try ensureCount(q, q_count);
+    try ensureCount(k, kv_width);
+    try ensureCount(v, kv_width);
+    if (byte_offset > parent.len or bytes > parent.len - byte_offset or parent.ptr == 0) return error.InvalidAssignedOutputAuthority;
+    const destination = buffer_mod.DeviceBuffer{ .ptr = try std.math.add(u64, parent.ptr, byte_offset), .len = bytes };
+    for ([_]buffer_mod.DeviceBuffer{ q.buffer, k.buffer, v.buffer, layer.k, layer.v }) |source| {
+        if (kernel_geometry.byteRangesOverlap(destination.ptr, bytes, source.ptr, source.len)) return error.InvalidAssignedAlias;
+    }
+    // Bound all original kernel wire fields before the first suffix write.
+    for ([_]usize{ heads, kv_heads, dim, attention.kv_sequence_len, attention.total_sequence_len, attention.total_sequence_len - 1 }) |wire| {
+        _ = std.math.cast(u32, wire) orelse return false;
+    }
+    if (owner.revision == std.math.maxInt(u64)) return error.StaleKvCompaction;
+    self.stats.device_kv_attempts += 1;
+    if (!attention.skip_kv_write) try storage.writeLayerKvSuffixDevice(.{
+        .sequence_id = kv.sequence_id,
+        .layer_index = attention.layer_index,
+        .total_token_count = attention.kv_sequence_len,
+        .suffix_token_count = 1,
+        .position_offset = 0,
+        .num_kv_heads = @intCast(kv_heads),
+        .head_dim = @intCast(dim),
+    }, .{ .handle = @ptrFromInt(k.buffer.ptr), .byte_offset = 0, .byte_len = row_bytes }, .{ .handle = @ptrFromInt(v.buffer.ptr), .byte_offset = 0, .byte_len = row_bytes });
+    // Any failure after the real suffix submission propagates. No fallback
+    // consumes partially updated KV or repeats this operation.
+    const written = owner.layers.getPtr(key) orelse return error.InvalidPagedKvState;
+    if (owner.capacity_epoch != capacity_epoch or written.k.ptr != original_k or written.v.ptr != original_v or written.token_count < attention.kv_sequence_len) return error.InvalidPagedKvState;
+    const length = try checkedMul(attention.kv_sequence_len, row_bytes);
+    const launch = try launchDenseGqaRequest(self, &.{
+        .dst = destination,
+        .q = q.buffer,
+        .k = .{ .ptr = written.k.ptr, .len = length },
+        .v = .{ .ptr = written.v.ptr, .len = length },
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = attention.kv_sequence_len,
+        .num_heads = heads,
+        .num_kv_heads = kv_heads,
+        .head_dim = dim,
+        .query_position_offset = attention.total_sequence_len - 1,
+        .total_sequence_len = attention.total_sequence_len,
+    });
+    noteGqaAttentionLaunch(self, false, launch, dim, 1);
+    self.stats.device_kv_reads += 1;
+    self.stats.device_kv_successes += 1;
+    return true;
+}
+
 fn gqaPagedAttentionBatchWithDeviceKv(
     self: *CudaCompute,
     q_ct: CT,
@@ -29761,12 +29820,6 @@ fn gqaPagedAttentionBatchWithDeviceKv(
         const item_kv_len = view.per_item_kv_len orelse attention.kv_sequence_len;
         const item_kv_position_offset = view.per_item_kv_position_offset orelse attention.kv_position_offset;
         const row_offset = try checkedMul(batch_index, max_q_len);
-        const item_q = try sliceRows2DOp(self, q_ct, row_offset, item_q_len, h_q);
-        defer freeTensor(self, item_q);
-        const item_k = try sliceRows2DOp(self, k_ct, row_offset, item_q_len, h_kv);
-        defer freeTensor(self, item_k);
-        const item_v = try sliceRows2DOp(self, v_ct, row_offset, item_q_len, h_kv);
-        defer freeTensor(self, item_v);
 
         const item_attention = ops.AttentionContext{
             .mode = view.per_item_mode orelse attention.mode,
@@ -29785,6 +29838,32 @@ fn gqaPagedAttentionBatchWithDeviceKv(
             .skip_kv_write = attention.skip_kv_write,
             .attention_sink = attention.attention_sink,
         };
+        const item_count = try checkedMul(item_q_len, h_q);
+        const byte_offset = try checkedMul(try checkedMul(row_offset, h_q), @sizeOf(f32));
+        if (q_tensor.quant_type == null and k_tensor.quant_type == null and v_tensor.quant_type == null) {
+            const q_offset = try checkedMul(try checkedMul(row_offset, h_q), @sizeOf(f32));
+            const kv_offset = try checkedMul(try checkedMul(row_offset, h_kv), @sizeOf(f32));
+            const q_bytes = try checkedMul(item_count, @sizeOf(f32));
+            const kv_bytes = try checkedMul(try checkedMul(item_q_len, h_kv), @sizeOf(f32));
+            if (q_offset > q_tensor.buffer.len or q_bytes > q_tensor.buffer.len - q_offset or
+                kv_offset > k_tensor.buffer.len or kv_bytes > k_tensor.buffer.len - kv_offset or
+                kv_offset > v_tensor.buffer.len or kv_bytes > v_tensor.buffer.len - kv_offset) return error.InvalidShape;
+            var q_shape = [_]i64{ @intCast(item_q_len), @intCast(h_q) };
+            var kv_shape = [_]i64{ @intCast(item_q_len), @intCast(h_kv) };
+            // These never escape: parent CTs own every actual device span
+            // throughout the complete original batch invocation.
+            var q_view = CudaTensor{ .buffer = .{ .ptr = try std.math.add(u64, q_tensor.buffer.ptr, q_offset), .len = q_bytes }, .dtype = .f32, .shape = &q_shape, .elem_count = item_count, .owns_buffer = false };
+            var k_view = CudaTensor{ .buffer = .{ .ptr = try std.math.add(u64, k_tensor.buffer.ptr, kv_offset), .len = kv_bytes }, .dtype = .f32, .shape = &kv_shape, .elem_count = item_q_len * h_kv, .owns_buffer = false };
+            var v_view = CudaTensor{ .buffer = .{ .ptr = try std.math.add(u64, v_tensor.buffer.ptr, kv_offset), .len = kv_bytes }, .dtype = .f32, .shape = &kv_shape, .elem_count = item_q_len * h_kv, .owns_buffer = false };
+            if (try tryPagedDenseInto(self, &q_view, &k_view, &v_view, item_attention, num_heads, num_kv_heads, head_dim, output, byte_offset)) continue;
+        }
+        const item_q = try sliceRows2DOp(self, q_ct, row_offset, item_q_len, h_q);
+        defer freeTensor(self, item_q);
+        const item_k = try sliceRows2DOp(self, k_ct, row_offset, item_q_len, h_kv);
+        defer freeTensor(self, item_k);
+        const item_v = try sliceRows2DOp(self, v_ct, row_offset, item_q_len, h_kv);
+        defer freeTensor(self, item_v);
+
         const item_output = try gqaPagedAttentionWithDeviceKv(
             self,
             item_q,
@@ -29800,9 +29879,7 @@ fn gqaPagedAttentionBatchWithDeviceKv(
         defer freeTensor(self, item_output);
 
         const item_output_tensor = tensorFromCt(item_output);
-        const item_count = try checkedMul(item_q_len, h_q);
         try ensureCount(item_output_tensor, item_count);
-        const byte_offset = try checkedMul(try checkedMul(row_offset, h_q), @sizeOf(f32));
         const byte_len = try checkedMul(item_count, @sizeOf(f32));
         const dst = buffer_mod.DeviceBuffer{
             .ptr = output.ptr + @as(u64, @intCast(byte_offset)),
@@ -46988,6 +47065,8 @@ pub const ColdKvBank = struct {
         try self.budget.handoffToWithPurpose(&compute.ctx.device_allocations, self.bytes, .kv_state);
         storage.compute = compute;
         self.phase = .adopted;
+        storage.prepared_storage_ptr = runtime.storage.ptr;
+        storage.prepared_storage_vtable = @ptrCast(runtime.storage.vtable);
         runtime.setDeviceWriteHook(storage.hook());
     }
     /// Called synchronously by the real hook destructor after checked physical
@@ -54700,4 +54779,124 @@ test "CUDA RMSNorm ownership attests only its exact live Direct family and bound
         }
         try std.testing.expect(!ownedPayloadRoute(&compute, &altered));
     }
+}
+
+test "CUDA ordinary F32 paged batch writes parent spans without child allocations or copies" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var storage = try kv_storage_runtime.KvStorageRuntime.init(a, .{ .backend = .cuda, .dtype = .f32, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 32, .store_cpu_bytes = false });
+    defer storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&storage);
+    var views: [2]ops.KvBatchView = undefined;
+    const lengths = [_]usize{ 3, 5 };
+    var suffix_values: [64]f32 = undefined;
+    var expected: [128]f32 = undefined;
+    for (lengths, 0..) |length, index| {
+        const sequence = try storage.attachSequence(storage.poolId());
+        try storage.appendTokens(sequence, @intCast(length));
+        const keys: [5 * 32]f32 = @splat(0);
+        var values: [5 * 32]f32 = undefined;
+        for (values[0 .. length * 32], 0..) |*value, element| value.* = @as(f32, @floatFromInt(index * 8 + element / 32)) + @as(f32, @floatFromInt(element % 32)) / 32;
+        const k = try cb.fromFloat32Shape(keys[0 .. length * 32], &.{ @intCast(length), 32 });
+        defer cb.free(k);
+        const v = try cb.fromFloat32Shape(values[0 .. length * 32], &.{ @intCast(length), 32 });
+        defer cb.free(v);
+        try storage.writeLayerKvSuffixDevice(.{ .sequence_id = sequence, .layer_index = 0, .total_token_count = length, .suffix_token_count = length, .position_offset = 0, .num_kv_heads = 1, .head_dim = 32 }, .{ .handle = @ptrFromInt(tensorFromCt(k).buffer.ptr), .byte_offset = 0, .byte_len = length * 32 * 4 }, .{ .handle = @ptrFromInt(tensorFromCt(v).buffer.ptr), .byte_offset = 0, .byte_len = length * 32 * 4 });
+        _ = try storage.logicalBlocksWithReservations(sequence); // Original metadata cache capacity.
+        const table = storage.blockTable(sequence).?;
+        views[index] = .{ .kv_cache = .{ .sequence_id = sequence, .pool_id = storage.poolId(), .logical_block_count = table.len(), .tail_tokens = table.tail_tokens, .logical_blocks = table.blocks.items, .kv_storage = &storage }, .kv_storage = &storage, .per_item_query_len = 1, .per_item_total_len = length, .per_item_kv_len = length, .per_item_kv_position_offset = 0, .per_item_mode = .paged_decode };
+        @memcpy(suffix_values[index * 32 ..][0..32], values[(length - 1) * 32 ..][0..32]);
+        for (0..2) |head| for (0..32) |column| {
+            var mean: f64 = 0;
+            for (0..length) |token| mean += values[token * 32 + column];
+            expected[index * 64 + head * 32 + column] = @floatCast(mean / @as(f64, @floatFromInt(length)));
+        };
+    }
+    const q = try cb.fromFloat32Shape(&@as([128]f32, @splat(0)), &.{ 2, 64 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&@as([64]f32, @splat(0)), &.{ 2, 32 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&suffix_values, &.{ 2, 32 });
+    defer cb.free(v);
+    const context = ops.AttentionContext{ .mode = .paged_decode, .query_sequence_len = 1, .total_sequence_len = lengths[1], .kv_sequence_len = lengths[1], .kv_batch = &views, .skip_kv_write = true };
+    const before_copies = compute.stats.d2d_bytes;
+    const held = try cb.gqaPagedAttention(q, k, v, null, context, 2, 2, 1, 32);
+    defer cb.free(held);
+    try std.testing.expectEqual(before_copies, compute.stats.d2d_bytes);
+    const hook = storage.device_write_hook.?;
+    const owner: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+    const actual = try cb.toFloat32(held, a);
+    defer a.free(actual);
+    for (actual, expected) |got, want| try std.testing.expectApproxEqAbs(want, got, 0.000002);
+    // Compare the same real singleton launcher/owned KV path independently.
+    for (views, 0..) |view, index| {
+        const qi = try cb.sliceRows2D(a, q, index, 1, 64);
+        defer cb.free(qi);
+        const ki = try cb.sliceRows2D(a, k, index, 1, 32);
+        defer cb.free(ki);
+        const vi = try cb.sliceRows2D(a, v, index, 1, 32);
+        defer cb.free(vi);
+        var single = context;
+        single.kv_batch = null;
+        single.kv_cache = view.kv_cache;
+        single.kv_storage = &storage;
+        single.total_sequence_len = lengths[index];
+        single.kv_sequence_len = lengths[index];
+        const original = try gqaPagedAttentionWithDeviceKv(&compute, qi, ki, vi, null, single, 1, 2, 1, 32);
+        defer cb.free(original);
+        const gold = try cb.toFloat32(original, a);
+        defer a.free(gold);
+        try std.testing.expectEqualSlices(f32, actual[index * 64 ..][0..64], gold);
+        var parent = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 64 * 4);
+        defer parent.free(&compute.ctx);
+        // Warm buffers/metadata already exist. The new Into itself allocates
+        // neither host metadata nor device payload, including a suffix write.
+        single.skip_kv_write = false;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        compute.allocator = failing.allocator();
+        storage.allocator = failing.allocator();
+        const outcome = tryPagedDenseInto(&compute, qi, ki, vi, single, 2, 1, 32, parent, 0);
+        compute.allocator = a;
+        storage.allocator = a;
+        try std.testing.expect(try outcome);
+        const revision = owner.revision;
+        try std.testing.expectError(error.InvalidAssignedAlias, tryPagedDenseInto(&compute, qi, ki, vi, single, 2, 1, 32, tensorFromCt(qi).buffer, 0));
+        try std.testing.expectEqual(revision, owner.revision);
+        var wrong_pool = single;
+        wrong_pool.kv_cache.?.pool_id +%= 1;
+        try std.testing.expect(!try tryPagedDenseInto(&compute, qi, ki, vi, wrong_pool, 2, 1, 32, parent, 0));
+        var stale_tail = single;
+        stale_tail.kv_cache.?.tail_tokens +%= 1;
+        try std.testing.expect(!try tryPagedDenseInto(&compute, qi, ki, vi, stale_tail, 2, 1, 32, parent, 0));
+        var stale_count = single;
+        stale_count.kv_cache.?.logical_block_count +%= 1;
+        try std.testing.expect(!try tryPagedDenseInto(&compute, qi, ki, vi, stale_count, 2, 1, 32, parent, 0));
+        try std.testing.expectEqual(revision, owner.revision);
+        var foreign_storage = storage; // Borrowed metadata copy, never deinit.
+        foreign_storage.storage.ptr = @ptrFromInt(16);
+        var foreign_attention = single;
+        foreign_attention.kv_storage = &foreign_storage;
+        foreign_attention.kv_cache.?.kv_storage = &foreign_storage;
+        try std.testing.expect(!try tryPagedDenseInto(&compute, qi, ki, vi, foreign_attention, 2, 1, 32, parent, 0));
+        try std.testing.expectEqual(revision, owner.revision);
+        var foreign_table = hook.vtable.*;
+        std.mem.doNotOptimizeAway(&foreign_table);
+        try std.testing.expect(@intFromPtr(&foreign_table) != @intFromPtr(hook.vtable));
+        storage.device_write_hook = .{ .ctx = @ptrFromInt(16), .vtable = &foreign_table };
+        const denied = tryPagedDenseInto(&compute, qi, ki, vi, single, 2, 1, 32, parent, 0);
+        storage.device_write_hook = hook;
+        try std.testing.expect(!try denied);
+        try std.testing.expectEqual(revision, owner.revision);
+    }
+    const next = try cb.gqaPagedAttention(q, k, v, null, context, 2, 2, 1, 32);
+    defer cb.free(next);
+    const retained = try cb.toFloat32(held, a);
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(f32, actual, retained);
 }
