@@ -78,6 +78,10 @@ const ComponentConstruction = struct {
         // native-format preference rather than authenticating an unused graph.
         var man = try manifest_mod.loadFromDir(self.artifacts().allocator, path);
         defer man.deinit();
+        try self.verifyManifest(man, backend);
+    }
+    fn verifyManifest(self: *ComponentConstruction, man: manifest_mod.ModelManifest, backend: backends.BackendType) !void {
+        if (self.artifacts().receipt == null) return;
         if (backend == .wasm or !manifestHasNativeAssets(man)) {
             if (man.onnx_path) |onnx| try self.artifacts().verifyOnnx(onnx);
             return;
@@ -7182,7 +7186,9 @@ pub const ModelManager = struct {
         var construction_proof = try ComponentConstruction.init(self.allocator, io, selected, control, borrowed);
         defer construction_proof.deinit();
         if (construction_proof.owned != null) construction_proof.artifacts().verification_cache = &self.verified_artifacts;
-        try construction_proof.verifyPath(model_path);
+        const construction_path = try construction_proof.artifacts().constructionPath(model_path);
+        defer self.allocator.free(construction_path);
+        try construction_proof.verifyPath(construction_path);
         var device_order_scratch: backends.BackendOrderBuffer = undefined;
         const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
         var required_backend_scratch: [1]backends.BackendType = undefined;
@@ -7192,7 +7198,7 @@ pub const ModelManager = struct {
         );
         var first_err: ?anyerror = null;
         var artifact_estimate = if (self.admission_enabled)
-            try ComponentArtifactEstimate.init(self.allocator, model_path)
+            try ComponentArtifactEstimate.init(self.allocator, construction_path)
         else
             ComponentArtifactEstimate.disabled;
         defer artifact_estimate.deinit();
@@ -7200,7 +7206,7 @@ pub const ModelManager = struct {
         for (effective_backends) |backend| {
             if (control) |active| try active.check();
             if (!backend.supportsDirectSessionLoad()) continue;
-            try construction_proof.verifyDirectory(model_path, backend);
+            try construction_proof.verifyDirectory(construction_path, backend);
             if (shared_backend_ctx) |shared| {
                 if (shared.backendType() != backend) continue;
             }
@@ -7239,7 +7245,7 @@ pub const ModelManager = struct {
                 };
                 resident_amounts = admission_plan.resident;
                 admission_limits = self.admissionLimitsForModelPath(
-                    model_path,
+                    construction_path,
                     backend_runtime,
                     admission_plan.limit_floor,
                 ) catch |err| {
@@ -7276,7 +7282,7 @@ pub const ModelManager = struct {
             };
             defer if (close_protection) |protection| protection.release();
             if (session_manager.loadModelWithImportedOnnxContext(
-                model_path,
+                construction_path,
                 shared_backend_ctx,
             )) |loaded_session| {
                 var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
@@ -9540,13 +9546,14 @@ pub const ModelManager = struct {
 
         // Plan and reserve resources before the backend begins allocating weights.
         if (control) |active| try active.update(.loading_weights, 0, 1);
-        var loaded_session = try loadSessionForPreferredBackends(
+        var loaded_session = try loadSessionForPreferredBackendsWithArtifacts(
             self,
             sm.preferred_backends,
             model_dir,
             man,
             sm,
             control,
+            &tokenizer_artifacts,
         );
         defer loaded_session.deinit();
         if (control) |active| try active.update(.loading_model, 3, 4);
@@ -11738,9 +11745,30 @@ fn loadSessionForPreferredBackends(
     source_session_manager: *const backends.SessionManager,
     control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
+    return loadSessionForPreferredBackendsWithArtifacts(manager, preferred_backends, model_dir, man, source_session_manager, control, null);
+}
+
+fn loadSessionForPreferredBackendsWithArtifacts(
+    manager: *ModelManager,
+    preferred_backends: []const backends.BackendType,
+    model_dir: []const u8,
+    man: manifest_mod.ModelManifest,
+    source_session_manager: *const backends.SessionManager,
+    control: ?InferenceExecutionControl,
+    borrowed: ?*PublishedArtifacts,
+) !LoadedSessionPlan {
     if (control) |active| try active.check();
-    var proof: ?ComponentConstruction = null;
-    defer if (proof) |*construction| construction.deinit();
+    var proof = try ComponentConstruction.init(
+        manager.allocator,
+        if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io,
+        .{ .path = model_dir, .publication = man.managed_publication },
+        control,
+        borrowed,
+    );
+    defer proof.deinit();
+    if (proof.owned != null) proof.artifacts().verification_cache = &manager.verified_artifacts;
+    const construction_root = try proof.artifacts().constructionPath(model_dir);
+    defer manager.allocator.free(construction_root);
     var verified_onnx_path: ?[]const u8 = null;
     var device_order_scratch: backends.BackendOrderBuffer = undefined;
     const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
@@ -11754,7 +11782,7 @@ fn loadSessionForPreferredBackends(
         backends.backendOrderSelectsCudaBeforeCpu(effective_backends) and
         (try session_factory.resolveCudaA4bInferenceConfigForModelListing(
             manager.allocator,
-            model_dir,
+            construction_root,
             man,
             null,
         )) != null;
@@ -11763,7 +11791,7 @@ fn loadSessionForPreferredBackends(
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
     var laya_resident_attempted = false;
-    const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, model_dir);
+    const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, construction_root);
     for (effective_backends) |backend| {
         if (source_session_manager.gliner_cuda_precision != null and backend != .cuda) continue;
         // Once opted-in Metal residency is attempted, preserve its actionable
@@ -11791,22 +11819,19 @@ fn loadSessionForPreferredBackends(
         }
         if (source_session_manager.kernel_jit.mode.failClosed() and
             !backend.supportsKernelJitSession()) continue;
-        const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
-        if (std.mem.endsWith(u8, candidate_path, ".onnx") and
-            (verified_onnx_path == null or !std.mem.eql(u8, verified_onnx_path.?, candidate_path)))
-        {
-            if (proof == null) proof = try ComponentConstruction.init(
-                manager.allocator,
-                if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io,
-                .{ .path = model_dir, .publication = man.managed_publication },
-                control,
-                null,
-            );
-            proof.?.artifacts().verification_cache = &manager.verified_artifacts;
-            // Integrity failures terminate the load rather than selecting a
-            // different backend that would reopen the same unauthenticated data.
-            try proof.?.verifyPath(candidate_path);
-            verified_onnx_path = candidate_path;
+        const selected_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        const candidate_path = try proof.artifacts().constructionPath(selected_path);
+        defer manager.allocator.free(candidate_path);
+        // Reuse the manifest and checksum proofs already acquired by the
+        // primary loader. Graph inspection is shared across backend retries.
+        if (std.mem.endsWith(u8, candidate_path, ".onnx")) {
+            if (verified_onnx_path == null or !std.mem.eql(u8, verified_onnx_path.?, selected_path)) {
+                try proof.verifyPath(candidate_path);
+                verified_onnx_path = selected_path;
+            }
+        } else {
+            try proof.verifyManifest(man, backend);
+            try proof.verifyPath(candidate_path);
         }
         if (control) |active| try active.updateDetail(
             .preparing_weights,
@@ -11818,7 +11843,7 @@ fn loadSessionForPreferredBackends(
         if (source_session_manager.kernel_jit.mode.failClosed() and
             std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
         const load_admission: ModelLoadAdmission = if (manager.model_load_preflight) |preflight|
-            preflight.check(preflight.context, model_dir, &man, backend, source_session_manager.a4b_inference_request) catch |err| {
+            preflight.check(preflight.context, construction_root, &man, backend, source_session_manager.a4b_inference_request) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             }
@@ -11848,7 +11873,7 @@ fn loadSessionForPreferredBackends(
         var serving_floor: ?runtime.tier.memory.Limits = null;
         if (managed_admission) {
             const admission_plan = estimateModelLoadAdmission(
-                model_dir,
+                construction_root,
                 man,
                 backend_runtime,
                 source_session_manager.a4b_inference_request,
@@ -11860,7 +11885,7 @@ fn loadSessionForPreferredBackends(
             resident_amounts = admission_plan.resident;
             serving_floor = admission_plan.serving_floor;
             admission_limits = manager.admissionLimitsForModelPath(
-                model_dir,
+                construction_root,
                 backend_runtime,
                 admission_plan.limit_floor,
             ) catch |err| {
@@ -11939,7 +11964,7 @@ fn loadSessionForPreferredBackends(
             // keeping the construction peak leased until preparation drains.
             try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
             try session_factory.prepareLayaResident(loaded.session, control);
-            if (proof) |*construction| try construction.finish();
+            try proof.finish();
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             return loaded.take();
         } else |err| {
@@ -18200,4 +18225,156 @@ test "model selection legacy Whisper metadata growth cannot exceed its admission
     try std.testing.expectError(error.FileTooLarge, manager.loadNativeWhisperPrompt(&man, &artifacts, tokenizer.tokenizer()));
     try std.testing.expect(!Probe.grow);
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+}
+
+test "component and primary construction reject same-receipt namespace retargets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |primary| {
+        for ([_]bool{ false, true }) |direct_file| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            for ([_][]const u8{ "first", "second" }) |name| {
+                try tmp.dir.createDirPath(io, name);
+                var dir = try tmp.dir.openDir(io, name, .{});
+                defer dir.close(io);
+                try writeCancellationTestModel(dir, a);
+            }
+            var first_dir = try tmp.dir.openDir(io, "first", .{});
+            defer first_dir.close(io);
+            try writeArtifactIdentityTestReceipt(first_dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+            const receipt = try tmp.dir.readFileAlloc(io, "first/.antfly-download-complete.json", a, .limited(1024 * 1024));
+            defer a.free(receipt);
+            try tmp.dir.writeFile(io, .{ .sub_path = "second/.antfly-download-complete.json", .data = receipt });
+            const altered = try tmp.dir.readFileAlloc(io, "second/model.gguf", a, .limited(1024 * 1024));
+            defer a.free(altered);
+            std.mem.writeInt(u32, altered[altered.len - 4 ..][0..4], @bitCast(@as(f32, 7.0)), .little);
+            try tmp.dir.writeFile(io, .{ .sub_path = "second/model.gguf", .data = altered });
+            const alias_name = if (direct_file) "current.gguf" else "current";
+            try tmp.dir.symLink(io, if (direct_file) "first/model.gguf" else "first", alias_name, .{ .is_directory = !direct_file });
+            const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+            defer a.free(root);
+            const alias = try std.fs.path.join(a, &.{ root, alias_name });
+            defer a.free(alias);
+            const Probe = struct {
+                dir: std.Io.Dir,
+                direct: bool,
+                hashed_first: bool = false,
+                switched: bool = false,
+                var current: *@This() = undefined;
+                var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+                fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+                    if (std.mem.endsWith(u8, path, "/first/model.gguf")) current.hashed_first = true;
+                    return original(raw, dir, path, options);
+                }
+                fn check(raw: ?*anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    if (self.hashed_first and !self.switched) {
+                        self.switched = true;
+                        const name = if (self.direct) "current.gguf" else "current";
+                        try self.dir.deleteFile(std.testing.io, name);
+                        try self.dir.symLink(std.testing.io, if (self.direct) "second/model.gguf" else "second", name, .{ .is_directory = !self.direct });
+                    }
+                }
+            };
+            var probe = Probe{ .dir = tmp.dir, .direct = direct_file };
+            var table = io.vtable.*;
+            Probe.current = &probe;
+            Probe.original = table.dirOpenFile;
+            table.dirOpenFile = Probe.open;
+            const counted = std.Io{ .userdata = io.userdata, .vtable = &table };
+            var sm = backends.SessionManager.initWithIo(a, counted);
+            sm.preferred_backends = &.{.native};
+            sm.native_call_policy = .in_process;
+            var manager = ModelManager.init(a, sm);
+            defer manager.deinit();
+            const selected = ResolvedModel{ .path = alias, .publication = try managed_receipt.publicationGeneration(a, io, alias) };
+            const control = selected.bind(InferenceExecutionControl{ .io = counted, .request_owned = false, .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check });
+            if (primary) {
+                var man = try manifest_mod.loadFromDir(a, alias);
+                defer man.deinit();
+                try std.testing.expectError(error.ModelArtifactsChanging, loadSessionForPreferredBackends(&manager, &.{.native}, alias, man, &manager.session_manager, control));
+            } else {
+                try std.testing.expectError(error.ModelArtifactsChanging, manager.loadManagedSessionWithAdmission(alias, &.{.native}, null, control, selected, null));
+            }
+            try std.testing.expect(probe.switched);
+            try std.testing.expectEqual(selected.publication, try managed_receipt.publicationGeneration(a, io, alias));
+            const second = try tmp.dir.realPathFileAlloc(io, "second", a);
+            defer a.free(second);
+            var actual = try PublishedArtifacts.init(a, io, second, null);
+            defer actual.deinit();
+            try std.testing.expectError(error.ChecksumMismatch, actual.verifyFile("model.gguf"));
+        }
+    }
+}
+
+test "Whisper prompt cache propagates tokenizer resource failures propagates tokenizer resource failures" {
+    const a = std.testing.allocator;
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(a,
+        \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"},{"id":10,"content":"<|en|>"},{"id":12,"content":"<|transcribe|>"},{"id":13,"content":"<|notimestamps|>"}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":10,"<|transcribe|>":12,"<|notimestamps|>":13},"merges":[]}}
+    );
+    defer tok.deinitSelf();
+    const Wrapper = struct {
+        base: tokenizer_mod.Tokenizer,
+        fail_text: ?[]const u8 = null,
+        failure: anyerror = error.OutOfMemory,
+        fn encode(raw: *anyopaque, alloc: std.mem.Allocator, text: []const u8) ![]i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_text) |fail_text| if (std.mem.eql(u8, text, fail_text)) return self.failure;
+            return self.base.encode(alloc, text);
+        }
+        fn specials(raw: *anyopaque) tokenizer_mod.SpecialTokens {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.base.specialTokens();
+        }
+        const vtable = tokenizer_mod.Tokenizer.VTable{ .encode = encode, .decode = undefined, .encodeInto = undefined, .encodeForModel = undefined, .encodeGeneration = undefined, .specialTokens = specials, .vocabSize = undefined, .deinit = undefined };
+    };
+    var wrapper = Wrapper{ .base = tok.tokenizer() };
+    const wrapped = tokenizer_mod.Tokenizer{ .ptr = &wrapper, .vtable = &Wrapper.vtable };
+    for ([_]anyerror{ error.OutOfMemory, error.Cancelled, error.ResourceLimitExceeded }) |failure| {
+        wrapper.failure = failure;
+        for ([_][]const u8{ "<|en|>", "<|transcribe|>", "<|notimestamps|>", "<|startofprev|>", "<|endoftext|>", "<|0.00|>", " -", "!", "♩", " " }) |fail_text| {
+            wrapper.fail_text = fail_text;
+            try std.testing.expectError(failure, whisper_prompt.PromptCache.initFromBytes(a, null, null, wrapped));
+        }
+    }
+    wrapper.fail_text = null;
+    var scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+    var valid = try whisper_prompt.PromptCache.initFromBytes(a, null, null, wrapped);
+    defer valid.deinit();
+    try std.testing.expectEqual(@as(usize, 1), valid.language_tokens.len);
+    const complete = try valid.resolve(&scratch, "en");
+    try std.testing.expectEqual(@as(usize, 3), complete.len);
+    try std.testing.expectEqual(@as(?i32, 10), complete[0].token_id);
+}
+
+fn whisperPromptAllocationScenario(a: std.mem.Allocator, generation_data: ?[]const u8, config: ?[]const u8) !void {
+    const Fixture = struct {
+        fn encode(_: *anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]i32 {
+            const id: i32 = if (std.mem.eql(u8, text, "<|en|>")) 10 else if (std.mem.eql(u8, text, "<|transcribe|>")) 12 else if (std.mem.eql(u8, text, "<|notimestamps|>")) 13 else 0;
+            return allocator.dupe(i32, &.{id});
+        }
+        fn specials(_: *anyopaque) tokenizer_mod.SpecialTokens {
+            return .{ .unk_id = 0 };
+        }
+        const vtable = tokenizer_mod.Tokenizer.VTable{ .encode = encode, .decode = undefined, .encodeInto = undefined, .encodeForModel = undefined, .encodeGeneration = undefined, .specialTokens = specials, .vocabSize = undefined, .deinit = undefined };
+    };
+    var context: u8 = 0;
+    const tokenizer = tokenizer_mod.Tokenizer{ .ptr = &context, .vtable = &Fixture.vtable };
+    var cache = try whisper_prompt.PromptCache.initFromBytes(a, generation_data, config, tokenizer);
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cache.language_tokens.len);
+    var scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+    const prompt = try cache.resolve(&scratch, "en");
+    try std.testing.expectEqual(@as(usize, 3), prompt.len);
+    try std.testing.expectEqual(@as(?i32, 10), prompt[0].token_id);
+}
+
+test "Whisper prompt preparation unwinds every allocation failure" {
+    const settings =
+        \\{"forced_decoder_ids":[[1,null],[2,12],[3,13]],"suppress_tokens":[1,2],"begin_suppress_tokens":[3,4]}
+    ;
+    for ([_]?[]const u8{ null, "{}", settings }) |generation_data| {
+        try platform.allocator.checkAllAllocationFailures(std.testing.allocator, whisperPromptAllocationScenario, .{ generation_data, settings });
+    }
 }

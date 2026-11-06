@@ -92,6 +92,8 @@ pub const PublishedArtifacts = struct {
     root: []const u8,
     requested_root: []u8,
     storage_root: []u8,
+    physical_root: [:0]u8,
+    physical_direct: ?[]u8 = null,
     direct_path: ?[]u8 = null,
     direct_index: ?usize = null,
     verification_cache: ?*VerificationCache = null,
@@ -108,6 +110,10 @@ pub const PublishedArtifacts = struct {
         errdefer a.free(requested_root);
         const direct_path = if (direct) try absolutePath(a, io, root) else null;
         errdefer if (direct_path) |path| a.free(path);
+        const physical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, storage_root, a);
+        errdefer a.free(physical_root);
+        const physical_direct = if (direct) try managed.resolveRegularFilePath(a, io, root) else null;
+        errdefer if (physical_direct) |path| a.free(path);
         const standalone = direct and std.mem.eql(u8, storage_root, root);
         var receipt = if (standalone) null else try managed.loadValidated(a, io, storage_root);
         errdefer if (receipt) |*value| value.deinit();
@@ -130,11 +136,13 @@ pub const PublishedArtifacts = struct {
         } else null;
         const verified = try a.alloc(?managed.ArtifactStamp, if (receipt) |value| value.artifacts.len else 0);
         @memset(verified, null);
-        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
+        return .{ .allocator = a, .io = io, .root = root, .requested_root = requested_root, .storage_root = storage_root, .physical_root = physical_root, .physical_direct = physical_direct, .direct_path = direct_path, .direct_index = direct_index, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
     }
     pub fn deinit(self: *PublishedArtifacts) void {
         self.allocator.free(self.requested_root);
         self.allocator.free(self.storage_root);
+        self.allocator.free(self.physical_root);
+        if (self.physical_direct) |path| self.allocator.free(path);
         if (self.direct_path) |path| self.allocator.free(path);
         self.allocator.free(self.verified_stamps);
         self.canonical_index.deinit(self.allocator);
@@ -261,8 +269,52 @@ pub const PublishedArtifacts = struct {
         defer graph.deinit();
         for (graph.external_paths) |external| try self.verifyPath(external);
     }
+    /// Capture the physical construction target once. Backends must never
+    /// reopen a mutable caller alias after authenticating a different target.
+    pub fn constructionPath(self: *const PublishedArtifacts, path: []const u8) ![]u8 {
+        const absolute = try absolutePath(self.allocator, self.io, path);
+        defer self.allocator.free(absolute);
+        if (self.direct_path) |direct| if (std.mem.eql(u8, absolute, direct))
+            return self.allocator.dupe(u8, self.physical_direct.?);
+        if (std.mem.eql(u8, absolute, self.physical_root)) return self.allocator.dupe(u8, self.physical_root);
+        if (std.mem.eql(u8, absolute, self.requested_root)) return self.allocator.dupe(u8, self.physical_root);
+        if (self.receipt) |receipt| {
+            if (self.indexForPath(path)) |index| {
+                return self.allocator.dupe(u8, receipt.artifacts[index].canonical_path);
+            } else |err| if (err != error.InvalidManagedDownload) return err;
+        }
+        const captured_path = if (managed.pathIsWithinRoot(self.requested_root, absolute)) blk: {
+            const offset = self.requested_root.len + @intFromBool(!std.fs.path.isSep(self.requested_root[self.requested_root.len - 1]));
+            break :blk try std.fs.path.join(self.allocator, &.{ self.physical_root, absolute[offset..] });
+        } else try self.allocator.dupe(u8, absolute);
+        defer self.allocator.free(captured_path);
+        const canonical = try std.Io.Dir.cwd().realPathFileAlloc(self.io, captured_path, self.allocator);
+        defer self.allocator.free(canonical);
+        if (!managed.pathIsWithinRoot(self.physical_root, canonical)) return error.ModelArtifactOutsideRoot;
+        // Directory importers verify their selected dependencies separately.
+        // A file must always be selected through the captured receipt above.
+        if (self.receipt != null and (try std.Io.Dir.cwd().statFile(self.io, canonical, .{})).kind != .directory) return error.InvalidManagedDownload;
+        return self.allocator.dupe(u8, canonical);
+    }
+
+    fn verifyBinding(self: *const PublishedArtifacts, path: []const u8, expected: []const u8) !void {
+        const current = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+        defer self.allocator.free(current);
+        if (!std.mem.eql(u8, current, expected)) return error.ModelArtifactsChanging;
+    }
     pub fn verify(self: *const PublishedArtifacts) !void {
+        try self.verifyBinding(self.storage_root, self.physical_root);
+        if (self.direct_path) |path| try self.verifyBinding(path, self.physical_direct.?);
         if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
+        // Native directory importers also discover members by relative names.
+        // Keep every alias of a verified member bound to its captured target.
+        if (self.receipt) |receipt| for (receipt.artifacts) |artifact| {
+            const index = self.canonical_index.get(artifact.canonical_path).?;
+            if (self.verified_stamps[index] == null) continue;
+            const path = try std.fs.path.join(self.allocator, &.{ self.physical_root, artifact.path });
+            defer self.allocator.free(path);
+            try self.verifyBinding(path, artifact.canonical_path);
+        };
         // A path verified earlier must still name those bytes when construction
         // finishes. Do not reuse a digest across replacement or in-place writes.
         for (self.verified_stamps, 0..) |maybe_stamp, index| if (maybe_stamp) |expected| {
@@ -717,4 +769,57 @@ test "model selection proof cache allocation failure does not deny authenticated
     try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
     failing.fail_index = std.math.maxInt(usize);
     try artifacts.verify();
+}
+
+test "model selection construction keeps captured root and directory targets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |managed_model| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        for ([_][]const u8{ "first", "second" }) |name| {
+            const nested = try std.fs.path.join(a, &.{ name, "encoder" });
+            defer a.free(nested);
+            try tmp.dir.createDirPath(io, nested);
+        }
+        if (managed_model) try tmp.dir.writeFile(io, .{ .sub_path = "first/.antfly-download-complete.json", .data = "{\"version\":2,\"artifacts\":[]}" });
+        try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const alias = try std.fs.path.join(a, &.{ root, "current" });
+        defer a.free(alias);
+        const component = try std.fs.path.join(a, &.{ alias, "encoder" });
+        defer a.free(component);
+        var artifacts = try PublishedArtifacts.init(a, io, alias, null);
+        defer artifacts.deinit();
+        try artifacts.verify();
+        try tmp.dir.deleteFile(io, "current");
+        try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+        const captured = try artifacts.constructionPath(component);
+        defer a.free(captured);
+        const first = try tmp.dir.realPathFileAlloc(io, "first/encoder", a);
+        defer a.free(first);
+        try std.testing.expectEqualStrings(first, captured);
+        try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
+    }
+}
+
+test "model selection final verification detects member alias retargets" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "first.gguf", .data = "aaaa" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second.gguf", .data = "bbbb" });
+    try tmp.dir.symLink(io, "first.gguf", "model.gguf", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = "{\"version\":2,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":4}]}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var artifacts = try PublishedArtifacts.init(a, io, root, null);
+    defer artifacts.deinit();
+    try artifacts.verifyFile("model.gguf");
+    try artifacts.verify();
+    try tmp.dir.deleteFile(io, "model.gguf");
+    try tmp.dir.symLink(io, "second.gguf", "model.gguf", .{});
+    try std.testing.expectError(error.ModelArtifactsChanging, artifacts.verify());
 }
