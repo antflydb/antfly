@@ -258,6 +258,16 @@ preparation API do not by themselves complete these remaining requirements:
   hidden rows resident through projection. ColQwen document and query paths
   export final scoring vectors. Complete source-plane and destination-namespace
   checks precede copies; packed or opaque sources retain the host path.
+  Qwen multimodal prompts replace image rows one producer at a time without
+  exporting supported resident embeddings. Unsupported image storage converts
+  only that source, without replaying earlier producers or assembled rows.
+  Gemma prompt entrypoints share the same ordered replacement owner; nonunit
+  embedding scales preserve their original CPU arithmetic. The extra resident
+  prompt destination receives no admission credit or reduced memory floor.
+  Native and GGUF vision weights use one patch-encoder/projector definition
+  through typed format adapters. Debug captures are optional; ordinary output
+  avoids the unused normalization readback and final host-vector duplicate.
+  Host position addition, ordered pooling and native kernel schedules remain.
 - Metal installs synchronous assigned pair/QKV regions for complete row-one F32
   projection heads through the production partition executor. Source pins,
   output leases and actual operation ownership are explicit. Mixed graphs,

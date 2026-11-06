@@ -135,6 +135,149 @@ pub const EmbeddingRows = struct {
     }
 };
 
+/// Semantic row locations stay with the task. Sources are borrowed only for
+/// the synchronous replace call; the completed prompt owns separate storage.
+pub const EmbeddingReplacement = struct {
+    offset: usize,
+    rows: usize,
+    source: union(enum) { resident: ops.CT, host: []const f32 },
+};
+
+/// Borrow a contiguous host producer without allocating an image-span array.
+pub const EmbeddingReplacements = union(enum) {
+    spans: []const EmbeddingReplacement,
+    host_chunks: struct { values: []const f32, offsets: []const usize, rows_per_chunk: usize },
+    fn count(self: @This(), width: usize) !usize {
+        return switch (self) {
+            .spans => |spans| spans.len,
+            .host_chunks => |chunks| blk: {
+                const elements = try std.math.mul(usize, try std.math.mul(usize, chunks.offsets.len, chunks.rows_per_chunk), width);
+                if (elements != chunks.values.len) return error.InvalidEmbeddingAssembly;
+                break :blk chunks.offsets.len;
+            },
+        };
+    }
+    fn at(self: @This(), index: usize, width: usize) EmbeddingReplacement {
+        return switch (self) {
+            .spans => |spans| spans[index],
+            .host_chunks => |chunks| .{ .offset = chunks.offsets[index], .rows = chunks.rows_per_chunk, .source = .{ .host = chunks.values[index * chunks.rows_per_chunk * width ..][0 .. chunks.rows_per_chunk * width] } },
+        };
+    }
+};
+
+/// A single prompt destination for streaming image producers. The base is
+/// copied once before image inference; source cleanup retains its existing
+/// backend ownership/retirement contract, rather than a completion inference.
+/// Unsupported image storage is materialized only for that source, BEFORE its
+/// copy. Already submitted producer math and assembled prefixes never replay.
+pub const PromptEmbeddingRows = struct {
+    backend: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    rows: usize,
+    width: usize,
+    storage: union(enum) { resident: EmbeddingRows, host: []f32 },
+    last_end: usize = 0,
+    finished: bool = false,
+    failed: bool = false,
+
+    pub fn init(backend: *const ComputeBackend, allocator: std.mem.Allocator, base: ops.CT, rows: usize, width: usize, scale: f32) !@This() {
+        if (rows == 0 or width == 0 or std.math.cast(i32, rows) == null or std.math.cast(i32, width) == null) return error.InvalidEmbeddingAssembly;
+        const elements = try std.math.mul(usize, rows, width);
+        // Known packed/opaque bases retain their original host route without
+        // first allocating an unsupported speculative prompt destination.
+        if (std.math.approxEqAbs(f32, scale, 1.0, 1e-6) and try EmbeddingRows.supportsSource(backend, base, rows, width)) {
+            if (try EmbeddingRows.init(backend, allocator, rows, width)) |initial| {
+                var assembly = initial;
+                errdefer assembly.deinit();
+                if (try assembly.acceptsSource(base, rows)) {
+                    try assembly.append(base, 0, rows);
+                    return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .resident = assembly } };
+                }
+                assembly.deinit();
+            }
+        }
+        const values = try backend.toFloat32(base, allocator);
+        errdefer allocator.free(values);
+        if (values.len != elements) return error.InvalidEmbeddingAssembly;
+        // Exactly the original host scaling order and approximate-one guard.
+        if (!std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) for (values) |*value| {
+            value.* *= scale;
+        };
+        return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .host = values } };
+    }
+    pub fn deinit(self: *@This()) void {
+        switch (self.storage) {
+            .resident => |*assembly| assembly.deinit(),
+            .host => |values| self.allocator.free(values),
+        }
+        self.storage = .{ .host = &.{} };
+        self.finished = true;
+    }
+    pub fn replace(self: *@This(), replacement: EmbeddingReplacement) !void {
+        if (self.finished or self.failed) return error.InvalidEmbeddingAssembly;
+        errdefer self.failed = true;
+        if (replacement.offset < self.last_end or replacement.offset > self.rows or replacement.rows > self.rows - replacement.offset) return error.InvalidEmbeddingAssembly;
+        const count = try std.math.mul(usize, replacement.rows, self.width);
+        if (replacement.source == .host and replacement.source.host.len != count) return error.InvalidEmbeddingAssembly;
+        if (count == 0) {
+            self.last_end = replacement.offset;
+            return;
+        }
+        if (self.storage == .resident and replacement.source == .resident and try self.storage.resident.acceptsSource(replacement.source.resident, replacement.rows)) {
+            // Dense same-namespace sources require no host touch or temporary.
+            const destination = self.storage.resident.tensor orelse return error.InvalidEmbeddingAssembly;
+            if (!try self.backend.copyRows2D(self.allocator, destination, replacement.offset, replacement.source.resident, 0, replacement.rows, self.width)) return error.UnsupportedBackendOp;
+        } else {
+            const values = switch (replacement.source) {
+                .host => |value| value,
+                .resident => |value| try self.backend.toFloat32(value, self.allocator),
+            };
+            defer if (replacement.source == .resident) self.allocator.free(values);
+            if (values.len != count) return error.InvalidEmbeddingAssembly;
+            switch (self.storage) {
+                .host => |target| @memcpy(target[replacement.offset * self.width ..][0..count], values),
+                .resident => |*assembly| {
+                    // One explicit compatibility conversion for this image;
+                    // no replay of vision math or earlier destination copies.
+                    const shape = [_]i32{ @intCast(replacement.rows), @intCast(self.width) };
+                    const plain = try self.backend.fromFloat32Shape(values, &shape);
+                    defer self.backend.free(plain);
+                    if (!try assembly.acceptsSource(plain, replacement.rows)) return error.UnsupportedBackendOp;
+                    if (!try self.backend.copyRows2D(self.allocator, assembly.tensor.?, replacement.offset, plain, 0, replacement.rows, self.width)) return error.UnsupportedBackendOp;
+                },
+            }
+        }
+        self.last_end = replacement.offset + replacement.rows;
+    }
+    pub fn finish(self: *@This()) !ops.CT {
+        if (self.finished or self.failed) return error.InvalidEmbeddingAssembly;
+        errdefer self.failed = true;
+        const result = switch (self.storage) {
+            .resident => |*assembly| try assembly.take(),
+            .host => |values| try self.backend.fromFloat32Shape(values, &.{ @intCast(self.rows), @intCast(self.width) }),
+        };
+        self.finished = true;
+        return result;
+    }
+};
+
+/// One-shot compatibility for genuine host producers and already available
+/// resident spans. This shares the streaming owner's original host math.
+pub fn replaceEmbeddingRows(backend: *const ComputeBackend, allocator: std.mem.Allocator, base: ops.CT, rows: usize, width: usize, scale: f32, replacements: EmbeddingReplacements) !ops.CT {
+    const count = try replacements.count(width);
+    var previous: usize = 0;
+    for (0..count) |index| {
+        const replacement = replacements.at(index, width);
+        if (replacement.offset < previous or replacement.offset > rows or replacement.rows > rows - replacement.offset) return error.InvalidEmbeddingAssembly;
+        if (replacement.source == .host and replacement.source.host.len != try std.math.mul(usize, replacement.rows, width)) return error.InvalidEmbeddingAssembly;
+        previous = replacement.offset + replacement.rows;
+    }
+    var prompt = try PromptEmbeddingRows.init(backend, allocator, base, rows, width, scale);
+    defer prompt.deinit();
+    for (0..count) |index| try prompt.replace(replacements.at(index, width));
+    return prompt.finish();
+}
+
 /// Owns decoder hidden rows on their actual backend through optional learned
 /// projections. The only host conversion is the caller's requested final rows.
 pub const ResidentHiddenRows = struct {
@@ -1808,4 +1951,181 @@ test "Metal physical embedding layout rejects an initialized foreign provider so
         }
     };
     try Helper.onMetal(Helper.noWeights, Check.run);
+}
+
+fn checkPromptReplacementRows(backend_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &backend_value;
+    const helper = @import("../ops/media_residency_test.zig");
+    var base_values: [24]f32 = undefined;
+    for (&base_values, 0..) |*value, index| value.* = @floatFromInt(index + 1);
+    const base = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&base_values, &.{ 6, 4 }));
+    defer cb.free(base);
+    const image = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 41, 42, 43, 44, 51, 52, 53, 54 }, &.{ 2, 4 }));
+    defer cb.free(image);
+    const before = helper.Transfers.snapshot(backend_value);
+    var prompt = try PromptEmbeddingRows.init(cb, a, base, 6, 4, 1);
+    defer prompt.deinit();
+    try std.testing.expect(prompt.storage == .resident);
+    try prompt.replace(.{ .offset = 1, .rows = 2, .source = .{ .resident = image } });
+    try prompt.replace(.{ .offset = 4, .rows = 2, .source = .{ .resident = image } });
+    const completed = try prompt.finish();
+    defer cb.free(completed);
+    var later = try PromptEmbeddingRows.init(cb, a, base, 6, 4, 1);
+    defer later.deinit();
+    try later.replace(.{ .offset = 0, .rows = 2, .source = .{ .resident = image } });
+    try before.expectUnchanged(backend_value);
+    const actual = try cb.toFloat32(completed, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 41, 42, 43, 44, 51, 52, 53, 54, 13, 14, 15, 16, 41, 42, 43, 44, 51, 52, 53, 54 }, actual);
+    const unchanged = try cb.toFloat32(base, a);
+    defer a.free(unchanged);
+    try std.testing.expectEqualSlices(f32, &base_values, unchanged);
+    // A rejected later write is terminal; an earlier held prompt remains valid.
+    try std.testing.expectError(error.InvalidEmbeddingAssembly, later.replace(.{ .offset = 1, .rows = 2, .source = .{ .resident = image } }));
+    try std.testing.expectError(error.InvalidEmbeddingAssembly, later.finish());
+    const held = try cb.toFloat32(completed, a);
+    defer a.free(held);
+    try std.testing.expectEqualSlices(f32, actual, held);
+    // Real host-producer compatibility preserves scale-before-image-overwrite.
+    const host_result = try replaceEmbeddingRows(cb, a, base, 6, 4, 2, .{ .host_chunks = .{ .values = &.{ 101, 102, 103, 104, 201, 202, 203, 204 }, .offsets = &.{ 1, 4 }, .rows_per_chunk = 1 } });
+    defer cb.free(host_result);
+    const host_values = try cb.toFloat32(host_result, a);
+    defer a.free(host_values);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8, 101, 102, 103, 104, 18, 20, 22, 24, 26, 28, 30, 32, 201, 202, 203, 204, 42, 44, 46, 48 }, host_values);
+}
+
+test "Native streaming prompt replacement preserves rows scale held outputs and no intermediate export" {
+    const helper = @import("../ops/media_residency_test.zig");
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try helper.onNative(helper.noWeights, checkPromptReplacementRows);
+}
+test "Metal streaming prompt replacement preserves rows scale held outputs and no intermediate export" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onMetal(helper.noWeights, checkPromptReplacementRows);
+}
+
+test "Native prompt replacement allocation failures preserve all source and output owners" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const native = @import("../ops/native_compute.zig");
+            var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            defer weights.deinitOwned();
+            var compute = native.NativeCompute.init(a, &weights, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const base = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &.{ 3, 4 });
+            defer cb.free(base);
+            const image = try cb.fromFloat32Shape(&.{ 21, 22, 23, 24 }, &.{ 1, 4 });
+            defer cb.free(image);
+            const spans = [_]EmbeddingReplacement{.{ .offset = 1, .rows = 1, .source = .{ .resident = image } }};
+            const output = try replaceEmbeddingRows(&cb, a, base, 3, 4, 1, .{ .spans = &spans });
+            defer cb.free(output);
+            const values = try cb.toFloat32(output, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 21, 22, 23, 24, 9, 10, 11, 12 }, values);
+            const scaled = try replaceEmbeddingRows(&cb, a, base, 3, 4, 2, .{ .host_chunks = .{ .values = &.{ 31, 32, 33, 34 }, .offsets = &.{1}, .rows_per_chunk = 1 } });
+            defer cb.free(scaled);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "Native packed prompt image materializes only the unsupported source without replaying earlier rows" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var dense: [64]f32 = undefined;
+    for (&dense, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index)) / 32 - 1;
+    var source = try Tensor.initFloat32(a, "source", &.{ 2, 32 }, &dense);
+    defer source.deinit();
+    var quantized = try @import("../models/weight_source.zig").quantizeDenseQ8_0(a, &source);
+    {
+        errdefer quantized.deinit();
+        const key = try a.dupe(u8, "packed.prompt");
+        errdefer a.free(key);
+        try store.resident_weights.put(a, key, .{ .tensor = .{ .name = key, .data = &.{}, .shape = &.{ 2, 32 }, .dtype = .f32, .allocator = a, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = quantized });
+    }
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const image = try cb.getWeight("packed.prompt");
+    defer cb.free(image);
+    const decoded = try cb.toFloat32(image, a);
+    defer a.free(decoded);
+    // The genuine packed source can be read through its old host ABI while
+    // every backend destination allocation is refused. The known unsupported
+    // base must never try a full speculative destination before that fallback.
+    var packed_prompt = blk: {
+        var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const original_allocator = compute.allocator;
+        compute.allocator = fail.allocator();
+        defer compute.allocator = original_allocator;
+        const prepared = try PromptEmbeddingRows.init(&cb, a, image, 2, 32, 1);
+        try std.testing.expectEqual(@as(usize, 0), fail.alloc_index);
+        break :blk prepared;
+    };
+    defer packed_prompt.deinit();
+    try std.testing.expect(packed_prompt.storage == .host);
+    const packed_output = try packed_prompt.finish();
+    defer cb.free(packed_output);
+    const packed_values = try cb.toFloat32(packed_output, a);
+    defer a.free(packed_values);
+    try std.testing.expectEqualSlices(f32, decoded, packed_values);
+    const base_values: [160]f32 = @splat(3);
+    const base = try cb.fromFloat32Shape(&base_values, &.{ 5, 32 });
+    defer cb.free(base);
+    var prompt = try PromptEmbeddingRows.init(&cb, a, base, 5, 32, 1);
+    defer prompt.deinit();
+    try std.testing.expect(prompt.storage == .resident);
+    try std.testing.expect(!try prompt.storage.resident.acceptsSource(image, 2));
+    try prompt.replace(.{ .offset = 1, .rows = 2, .source = .{ .resident = image } });
+    const output = try prompt.finish();
+    defer cb.free(output);
+    const actual = try cb.toFloat32(output, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, base_values[0..32], actual[0..32]);
+    try std.testing.expectEqualSlices(f32, decoded, actual[32..96]);
+    try std.testing.expectEqualSlices(f32, base_values[96..], actual[96..]);
+}
+
+test "Metal prompt replacement materializes a real foreign source before its destination copy" {
+    const helper = @import("../ops/media_residency_test.zig");
+    const Fixture = struct {
+        fn run(backend_value: ComputeBackend, _: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            const cb = &backend_value;
+            const metal = @import("../ops/metal_compute.zig");
+            var store = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .{} };
+            defer store.lazy_weights.deinit(a);
+            metal.initPrefetchQueue(&store, a);
+            defer metal.deinitPrefetchQueue(&store);
+            defer metal.deinitSharedNativeProvider(&store);
+            var foreign = try metal.MetalCompute.init(a, &store, null);
+            defer foreign.deinit();
+            const foreign_cb = foreign.computeBackend();
+            const image = try foreign_cb.ensureDeviceResidentOwned(try foreign_cb.fromFloat32Shape(&.{ 91, 92, 93, 94 }, &.{ 1, 4 }));
+            defer foreign_cb.free(image);
+            const base = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &.{ 3, 4 }));
+            defer cb.free(base);
+            var prompt = try PromptEmbeddingRows.init(cb, a, base, 3, 4, 1);
+            defer prompt.deinit();
+            try std.testing.expect(prompt.storage == .resident);
+            try std.testing.expect(!try prompt.storage.resident.acceptsSource(image, 1));
+            const before = helper.Transfers.snapshot(foreign_cb);
+            try prompt.replace(.{ .offset = 1, .rows = 1, .source = .{ .resident = image } });
+            const after = helper.Transfers.snapshot(foreign_cb);
+            try std.testing.expect(after.downloads > before.downloads or after.accesses > before.accesses);
+            const output = try prompt.finish();
+            defer cb.free(output);
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 91, 92, 93, 94, 9, 10, 11, 12 }, actual);
+        }
+    };
+    try helper.onMetal(helper.noWeights, Fixture.run);
 }

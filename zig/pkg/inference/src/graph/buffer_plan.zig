@@ -418,10 +418,14 @@ pub const BufferPlan = struct {
                 if (slot.allocation != try self.viewAllocation(slot)) return error.InvalidBufferPlan;
             } else if (slot.kind == .allocation) {
                 const allocation = self.allocationForSlot(slot.id) orelse return error.InvalidBufferPlan;
-                if (allocation.kind != .tensor) return error.InvalidBufferPlan;
+                switch (allocation.kind) {
+                    .tensor => if (!allocation.reusable and allocation.slot_count != 1) return error.InvalidBufferPlan,
+                    .input_binding => if (!slot.roles.runtime_input or slot.roles.constant or slot.reusable or allocation.reusable) return error.InvalidBufferPlan,
+                    .constant_binding => if (!slot.roles.constant or slot.roles.runtime_input or slot.reusable or allocation.reusable) return error.InvalidBufferPlan,
+                    else => return error.InvalidBufferPlan,
+                }
                 if (allocation.backend != slot.backend or allocation.storage != slot.storage) return error.InvalidBufferPlan;
                 if (allocation.byte_size < tensorByteSize(slot.desc.shape)) return error.InvalidBufferPlan;
-                if (!allocation.reusable and allocation.slot_count != 1) return error.InvalidBufferPlan;
             } else if (slot.allocation != invalid_allocation) {
                 return error.InvalidBufferPlan;
             }
