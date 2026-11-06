@@ -5911,19 +5911,30 @@ pub const NativeFile = struct {
         return lock;
     }
 
-    /// `reader_namespace`, opened once and reopened only if
-    /// `header.reader_epoch_namespace` has changed since it was cached (a
-    /// rebind). No syscalls when the cache already matches.
+    /// `reader_namespace`, opened once and reopened whenever it can no
+    /// longer be trusted: either `header.reader_epoch_namespace` changed
+    /// since it was cached (a rebind, e.g. `bindPrivateEpochNamespace`), or
+    /// `reader_epochs.parentUnchanged` shows the data file's parent
+    /// directory is no longer the one this cache resolved -- an external
+    /// rename/replace of that parent (a backup/restore or vacuum dance can
+    /// do this) can leave the cached directory/guard handles still valid by
+    /// inode while no longer being where a *fresh* registration would land,
+    /// so a stale cache must not go on being trusted just because its
+    /// handles still happen to work. Both checks are cheap (an in-memory
+    /// compare and one `statFile` syscall); no syscalls at all are needed
+    /// beyond that when the cache already matches.
     fn ensureReaderNamespaceCache(self: *NativeFile) !@import("reader_epochs.zig").CachedNamespace {
         const epochs = @import("reader_epochs.zig");
         const io = self.runtime();
         if (self.reader_namespace) |cached| {
-            if (std.mem.eql(u8, &self.reader_namespace_binding, &self.header.reader_epoch_namespace)) return cached;
+            if (std.mem.eql(u8, &self.reader_namespace_binding, &self.header.reader_epoch_namespace) and
+                epochs.parentUnchanged(io, self.path, cached)) return cached;
             cached.close(self.allocator, io);
             self.reader_namespace = null;
             self.reader_namespace_fingerprint = null;
         }
         const cached = try epochs.openCached(self.allocator, io, self.path, self.header.reader_epoch_namespace);
+        self.allocator_work.reader_namespace_opens +|= 1;
         self.reader_namespace = cached;
         self.reader_namespace_binding = self.header.reader_epoch_namespace;
         self.reader_namespace_fingerprint = null;
@@ -5947,6 +5958,7 @@ pub const NativeFile = struct {
         if (self.reader_namespace_fingerprint) |previous| if (previous == fp) return self.reader_frontier_cache;
         const inode = (try self.file.stat(io)).inode;
         const frontier = try epochs.scanCached(io, cached, inode);
+        self.allocator_work.reader_namespace_full_scans +|= 1;
         self.reader_frontier_cache = frontier;
         self.reader_namespace_fingerprint = try epochs.directoryFingerprint(io, cached);
         return frontier;
@@ -22725,6 +22737,83 @@ test "lite reader epoch aliases long filenames retain epoch reuse" {
     const captured = (try reader.getDocumentAlloc(a, "doc")).?;
     defer a.free(captured);
     try std.testing.expectEqualSlices(u8, &value, captured);
+}
+
+test "lite reader epoch namespace cache stays stale-safe when a reader registers between commits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cache-race.aflite");
+    defer a.free(path);
+    // No reader_coordinator on the writer: its only protection against the
+    // reader opened below is the cross-process reader_epochs.zig namespace,
+    // not any in-process Coordinator state a shared coordinator would give
+    // it -- this is the "reader in another process" scenario the cache's
+    // fingerprint fast path has to stay safe against.
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    // Build retirement backlog (repeatedly overwriting the same key) so the
+    // writer's reuse-lock path actually runs and caches its namespace while
+    // nobody is registered yet.
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    const opens_before_reader = writer.allocator_work.reader_namespace_opens;
+    try std.testing.expect(opens_before_reader >= 1);
+
+    var reader_coordinator = ReaderCoordinator.init(a, io);
+    defer reader_coordinator.deinit();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &reader_coordinator });
+    defer reader.close();
+    try std.testing.expect(reader.reader_fence.?.epoch != null);
+
+    // Nothing rebinds or moves the writer's parent here, so it keeps
+    // reusing the very same cached namespace handle (no new
+    // `reader_epochs.openCached`) -- what must change is that its next
+    // scan notices the new registration through the directory fingerprint
+    // and falls back to a real scan picking it up, rather than trusting a
+    // "nobody registered" view cached from before the reader ever existed.
+    value[0] = 'b';
+    for (0..80) |_| try writer.putDocument("doc", &value);
+    try std.testing.expectEqual(opens_before_reader, writer.allocator_work.reader_namespace_opens);
+    const captured = (try reader.getDocumentAlloc(a, "doc")).?;
+    defer a.free(captured);
+    try std.testing.expectEqual(@as(u8, 'a'), captured[0]);
+}
+
+test "lite reader epoch namespace cache keeps full scans at O(1) across many commits and registered readers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cache-o1.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    var value: [8192]u8 = @splat('a');
+    try writer.putDocument("doc", &value);
+
+    // Register several independent readers directly against the on-disk
+    // namespace, exactly as separate reader processes would (bypassing any
+    // in-process Coordinator sharing).
+    const epochs = @import("reader_epochs.zig");
+    const inode = (try writer.file.stat(writer.runtime())).inode;
+    var leases: [6]epochs.Lease = undefined;
+    var registered: usize = 0;
+    defer for (leases[0..registered]) |lease| lease.close(a, writer.runtime());
+    for (0..leases.len) |i| {
+        leases[i] = try epochs.register(a, writer.runtime(), path, writer.header.reader_epoch_namespace, inode, writer.activeCheckpoint().commit_sequence, false);
+        registered += 1;
+    }
+
+    for (0..40) |_| try writer.putDocument("doc", &value);
+    // One lifetime open (nothing rebinds or moves the parent), and a small,
+    // bounded number of real scans -- never one per commit (40) and never
+    // scaling with the registered-reader count (6): the fingerprint fast
+    // path must absorb the overwhelming majority of these 40 commits.
+    try std.testing.expectEqual(@as(u64, 1), writer.allocator_work.reader_namespace_opens);
+    try std.testing.expect(writer.allocator_work.reader_namespace_full_scans >= 1);
+    try std.testing.expect(writer.allocator_work.reader_namespace_full_scans < 10);
 }
 
 test "lite reader registration path lease close retains only escaped snapshot protection" {
