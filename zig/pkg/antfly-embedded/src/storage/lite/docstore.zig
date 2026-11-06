@@ -1341,6 +1341,11 @@ const MutationRequest = struct {
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
+    /// Never closes a group by becoming its leader, and never durable on
+    /// its own: it joins whichever group a foreground (non-ride-along)
+    /// member next forms, or `forceDrainDurable`'s forced group if none
+    /// comes (WS2 ride-along). See `Store.stageRideAlong`.
+    ride_along: bool = false,
     /// Caller-estimated size of this member's writes, used only to bound
     /// group formation (`group_max_bytes`); never required to be exact.
     estimated_bytes: usize = 0,
@@ -1530,6 +1535,19 @@ pub const Store = struct {
     /// one -- these bound the group, not any individual member.
     group_max_requests: usize = 64,
     group_max_bytes: usize = 4 * 1024 * 1024,
+    /// Ride-along bookkeeping (WS2): background work (e.g. a ride-along
+    /// write) never pays its own fsync. `ride_along_pending_bytes` and
+    /// `ride_along_last_enqueue_ns` are guarded by `commit_mutex` (updated
+    /// alongside the queue itself); the other fields manage the idle-flush
+    /// background task. See `Store.stageRideAlong`/`forceDrainDurable`.
+    ride_along_pending_bytes: usize = 0,
+    ride_along_last_enqueue_ns: i96 = 0,
+    ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
+    ride_along_byte_threshold: usize = 1024 * 1024,
+    ride_along_flush_started: std.atomic.Value(bool) = .init(false),
+    ride_along_flush_cancel: maintenance.CancelToken = .{},
+    ride_along_flush_future: ?std.Io.Future(void) = null,
+    ride_along_wake: std.Io.Event = .unset,
     writer_admission: ?WriterAdmission = null,
     writer_active: bool = false,
     writer_ticketed: bool = false,
@@ -1760,6 +1778,11 @@ pub const Store = struct {
     }
 
     pub fn close(self: *Store) void {
+        // Durability barrier (b): no ride-along write this handle accepted
+        // may be lost silently just because it never got a foreground
+        // group to ride.
+        self.forceDrainDurable();
+        self.stopRideAlongFlush();
         if (self.artifact_registry) |registry| registry.detach();
         self.stopMaintenance();
         if (self.workspace_reclaimer) |identity| self.resource_manager.?.unregisterReclaimer(identity);
@@ -2851,7 +2874,8 @@ pub const Store = struct {
         index_only: bool = false,
         artifact_lease: bool = false,
         /// Estimated size of this member's writes. Used only to bound group
-        /// formation (`group_max_bytes`); never required to be exact.
+        /// formation (`group_max_bytes`); never required to be exact. Also
+        /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
         estimated_bytes: usize = 0,
     };
 
@@ -2897,7 +2921,7 @@ pub const Store = struct {
             // group's `commitTransactionWithDurability` runs (including its
             // fsync) forms the next group, bounding flight to the applying
             // group plus the one accumulating behind it.
-            if (self.become_leader) self.store.driveMutationCoordinator();
+            if (self.become_leader) self.store.driveMutationCoordinator(false);
         }
 
         pub fn ticket(self: Staged) Ticket {
@@ -2908,15 +2932,23 @@ pub const Store = struct {
     /// Enqueue `plan` without driving the coordinator. `plan.context` must
     /// stay valid until the returned `Staged.ticket().wait()` returns.
     pub fn enqueue(self: *Store, plan: MutationPlan) !Staged {
+        return self.enqueueRequest(plan, false);
+    }
+
+    fn enqueueRequest(self: *Store, plan: MutationPlan, ride_along: bool) !Staged {
         if (self.read_only) return error.ReadOnly;
         const io = self.file.runtime();
         const request = try self.allocator.create(MutationRequest);
         request.* = .{
             .context = plan.context,
             .apply = plan.apply,
-            .durable = plan.durable,
+            // A ride-along member is never itself the reason a group
+            // becomes durable; it only ever rides a foreground member's
+            // durability, or `forceDrainDurable`'s forced one (WS2).
+            .durable = !ride_along and plan.durable,
             .index_only = plan.index_only,
             .artifact_lease = plan.artifact_lease,
+            .ride_along = ride_along,
             .estimated_bytes = plan.estimated_bytes,
         };
         errdefer self.allocator.destroy(request);
@@ -2924,11 +2956,123 @@ pub const Store = struct {
         self.commit_mutex.lockUncancelable(io);
         if (self.commit_tail) |tail| tail.next = request else self.commit_head = request;
         self.commit_tail = request;
-        const become_leader = !self.commit_draining;
+        // A ride-along request never becomes leader, even of an otherwise
+        // idle queue: it must never close a group or force a sync on its
+        // own. It waits for a foreground member to lead (folding it into
+        // that member's group), or for `forceDrainDurable` -- the idle-flush
+        // timer, an undurable-bytes threshold, Store.close, Store.sync, or
+        // WS1's reuse-frontier hook -- to lead on its behalf.
+        const become_leader = !self.commit_draining and !ride_along;
         if (become_leader) self.commit_draining = true;
+        if (ride_along) {
+            self.ride_along_pending_bytes +|= plan.estimated_bytes;
+            self.ride_along_last_enqueue_ns = std.Io.Clock.awake.now(io).nanoseconds;
+        }
         self.commit_mutex.unlock(io);
 
         return .{ .store = self, .request = request, .become_leader = become_leader };
+    }
+
+    /// Stage `plan` as a ride-along member (WS2): it joins whichever
+    /// group's native transaction next forms -- a foreground write's, or
+    /// one `forceDrainDurable` leads on its behalf -- with durability
+    /// false, so it never pays for its own fsync, page/slot, or
+    /// allocator-ledger write. It never closes a group and never extends
+    /// the coalescing window a foreground member would otherwise close on.
+    /// Ride-along members are applied in queue order like any other
+    /// member, so durability stays prefix-ordered. `plan.durable` is
+    /// ignored (always treated as non-durable); `plan.context` must stay
+    /// valid until the returned ticket resolves.
+    pub fn stageRideAlong(self: *Store, plan: MutationPlan) !Ticket {
+        const staged = try self.enqueueRequest(plan, true);
+        staged.drive(); // always a no-op: ride-along requests never lead.
+        self.ensureRideAlongFlushStarted();
+        if (self.ride_along_pending_bytes >= self.ride_along_byte_threshold) self.forceDrainDurable();
+        return staged.ticket();
+    }
+
+    /// Lead the queue right now, forcing whatever is pending (ride-along
+    /// or not) into one durable group commit, regardless of any member's
+    /// own `durable` flag. A no-op if the queue is empty or someone else
+    /// is already draining it (their group is forming or applying now,
+    /// which will pick up anything currently queued just the same).
+    /// This is the one primitive behind every ride-along durability
+    /// barrier: the idle-flush timer, the undurable-bytes threshold (both
+    /// in `stageRideAlong` above), `Store.close`, `Store.sync`, and the
+    /// hook WS1's reuse frontier calls before trusting `durableSequence()`.
+    fn forceDrainDurable(self: *Store) void {
+        const io = self.file.runtime();
+        self.commit_mutex.lockUncancelable(io);
+        const become_leader = self.commit_head != null and !self.commit_draining;
+        if (become_leader) self.commit_draining = true;
+        self.commit_mutex.unlock(io);
+        if (become_leader) self.driveMutationCoordinator(true);
+    }
+
+    /// WS1 hook: call before relying on `durableSequence()` to bound which
+    /// pages are safe to reuse, so a ride-along write still sitting in the
+    /// queue cannot silently delay reuse past when it should be eligible.
+    pub fn ensureDurableForReuse(self: *Store) void {
+        self.forceDrainDurable();
+    }
+
+    /// Durability barrier (c): force any ride-along work through, then
+    /// make sure the result (or, if nothing was pending, whatever is
+    /// already durable) is fsynced. For cross-process lease handoff: the
+    /// next owner must see every ride-along write this handle accepted.
+    pub fn sync(self: *Store) !void {
+        self.forceDrainDurable();
+        try self.syncIndexContents();
+    }
+
+    fn ensureRideAlongFlushStarted(self: *Store) void {
+        if (self.ride_along_flush_started.load(.acquire)) return;
+        if (self.read_only) return;
+        // Non-blocking, like the maintenance kicks elsewhere (WS2): a
+        // ride-along caller must never pay for someone else's in-flight
+        // commit just to start this one-time background task. If
+        // self.mutex is contended right now, skip starting it this call --
+        // the next stageRideAlong (or this same byte threshold, checked
+        // without needing self.mutex at all) gets another chance.
+        if (!self.mutex.tryLock()) return;
+        defer self.mutex.unlock();
+        if (self.ride_along_flush_started.load(.acquire)) return;
+        self.ride_along_flush_future = self.file.runtime().concurrent(rideAlongFlushLoop, .{self}) catch return;
+        self.ride_along_flush_started.store(true, .release);
+    }
+
+    fn stopRideAlongFlush(self: *Store) void {
+        self.ride_along_flush_cancel.request();
+        self.ride_along_wake.set(self.file.runtime());
+        if (self.ride_along_flush_future) |*future| future.await(self.file.runtime());
+        self.ride_along_flush_future = null;
+        self.ride_along_flush_started.store(false, .release);
+    }
+
+    /// Barrier (a): idle-flush timer. Wakes every `ride_along_idle_ns`;
+    /// once the queue has gone that long without a new ride-along enqueue
+    /// and there is still something pending (a foreground member may well
+    /// have already led and drained it in the meantime), forces a durable
+    /// flush so ride-along work left alone by foreground traffic does not
+    /// stay undurable indefinitely.
+    fn rideAlongFlushLoop(self: *Store) void {
+        const io = self.file.runtime();
+        while (!self.ride_along_flush_cancel.requested.load(.acquire)) {
+            self.ride_along_wake.waitTimeout(io, .{ .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(@intCast(self.ride_along_idle_ns / std.time.ns_per_ms)),
+                .clock = .awake,
+            } }) catch {};
+            self.ride_along_wake.reset();
+            if (self.ride_along_flush_cancel.requested.load(.acquire)) break;
+            self.commit_mutex.lockUncancelable(io);
+            const last_ns = self.ride_along_last_enqueue_ns;
+            const pending = self.ride_along_pending_bytes > 0;
+            self.commit_mutex.unlock(io);
+            if (!pending) continue;
+            const now = std.Io.Clock.awake.now(io).nanoseconds;
+            if (now -| last_ns < @as(i96, @intCast(self.ride_along_idle_ns))) continue; // not idle long enough; re-check on the next wake.
+            self.forceDrainDurable();
+        }
     }
 
     /// Enqueue `plan` and return a ticket resolved once its group is durable.
@@ -2970,15 +3114,22 @@ pub const Store = struct {
             tail = request;
             count += 1;
             bytes +|= request.estimated_bytes;
+            if (request.ride_along) self.ride_along_pending_bytes -|= request.estimated_bytes;
         }
         return batch;
     }
 
     /// Run until the pending queue is empty, applying one bounded group at a
     /// time. Only the thread that staged the first request of a newly-formed
-    /// queue (`become_leader` in `stage`) ever runs this; every other staging
-    /// thread only enqueues and waits on its own ticket.
-    fn driveMutationCoordinator(self: *Store) void {
+    /// queue (`become_leader` in `enqueue`/`forceDrainDurable`) ever runs
+    /// this; every other staging thread only enqueues and waits on its own
+    /// ticket. `force_durable` makes every batch this call drains durable
+    /// regardless of any member's own `durable` flag (`forceDrainDurable`'s
+    /// callers: the ride-along idle-flush timer and byte threshold,
+    /// `Store.close`, `Store.sync`, and WS1's reuse-frontier hook) --
+    /// otherwise a batch of ride-along-only members, all `durable = false`,
+    /// would take the deferred-publication path and never actually fsync.
+    fn driveMutationCoordinator(self: *Store, force_durable: bool) void {
         const io = self.file.runtime();
         while (true) {
             self.commit_mutex.lockUncancelable(io);
@@ -2991,7 +3142,7 @@ pub const Store = struct {
             };
             self.commit_mutex.unlock(io);
 
-            const result = self.applyMutationGroup(head);
+            const result = self.applyMutationGroup(head, force_durable);
 
             self.commit_mutex.lockUncancelable(io);
             var current: ?*MutationRequest = head;
@@ -3096,7 +3247,9 @@ pub const Store = struct {
     /// `driveMutationCoordinator`. A member whose own apply failed inside
     /// the loop below, with the group otherwise committing, keeps that
     /// specific error instead (this function then returns successfully).
-    fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
+    /// `force_durable` makes this group durable regardless of any member's
+    /// own `durable` flag; see `driveMutationCoordinator`.
+    fn applyMutationGroup(self: *Store, head: *MutationRequest, force_durable: bool) !void {
         var index_only = true;
         var artifact_lease_only = true;
         var member: ?*MutationRequest = head;
@@ -3123,7 +3276,7 @@ pub const Store = struct {
         // Detached writers release their kernel lease after this group. The
         // next owner must see its allocator and index roots on disk; a volatile
         // durable_header cannot safely survive that ownership handoff.
-        var durable = self.writer_admission != null;
+        var durable = force_durable or self.writer_admission != null;
         var admitted_any = false;
         while (current) |item| {
             durable = durable or item.durable;
@@ -6333,7 +6486,7 @@ test "lite a member failing its own apply rolls back alone inside a shared group
     var first = MutationRequest{ .context = &good, .apply = Context.apply, .next = &second };
     // The group as a whole still commits: the bad member's own apply failed
     // and was rolled back alone, but the good member's writes are durable.
-    try store.applyMutationGroup(&first);
+    try store.applyMutationGroup(&first, false);
     try first.result;
     try std.testing.expectError(error.InjectedGroupFailure, second.result);
     const doc = (try store.file.getDocumentAlloc(alloc, "doc")).?;
@@ -6401,7 +6554,7 @@ test "lite a group fsync failure sends OutcomeUnknown to every member" {
     store.commit_head = &first;
     store.commit_tail = &second;
     store.commit_draining = true;
-    store.driveMutationCoordinator();
+    store.driveMutationCoordinator(false);
     try std.testing.expectError(error.OutcomeUnknown, first.result);
     try std.testing.expectError(error.OutcomeUnknown, second.result);
 }
@@ -6753,6 +6906,65 @@ test "lite group commit pipelines at most two groups: one syncing, one accumulat
     try std.testing.expectEqualStrings("landed", try read.get("h"));
     try std.testing.expectEqualStrings("landed", try read.get("i"));
     try std.testing.expectEqualStrings("landed", try read.get("j"));
+}
+
+test "lite ride-along members never pay their own fsync: N ride-alongs plus one foreground write is one commit" {
+    // WS2: stageRideAlong members never close a group or force a sync on
+    // their own; they ride whichever group a foreground write next forms.
+    // N ride-alongs staged first, with nothing foreground yet, must sit in
+    // the queue -- never becoming durable, never even starting a native
+    // transaction -- until the one foreground write arrives and leads.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ride-along-one-commit.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+    // Long enough that the idle-flush timer cannot fire during this test's
+    // own (much faster) staging-then-foreground-commit sequence, so the
+    // single commit this test observes is unambiguously the foreground
+    // write leading the queue, not the timer forcing an earlier one.
+    store.ride_along_idle_ns = 10 * std.time.ns_per_s;
+
+    const commit_before = store.file.activeCheckpoint().commit_sequence;
+
+    const Context = struct {
+        key: []const u8,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try file.putDocument(self.key, "rode along");
+        }
+    };
+    var ride_1 = Context{ .key = "ride1" };
+    var ride_2 = Context{ .key = "ride2" };
+    var ride_3 = Context{ .key = "ride3" };
+    const ticket_1 = try store.stageRideAlong(.{ .context = &ride_1, .apply = Context.apply });
+    const ticket_2 = try store.stageRideAlong(.{ .context = &ride_2, .apply = Context.apply });
+    const ticket_3 = try store.stageRideAlong(.{ .context = &ride_3, .apply = Context.apply });
+    // Nothing foreground has arrived: no native transaction has run yet,
+    // and all three are still only queued (the ride-along idle-flush timer
+    // has not had 50ms to fire).
+    try std.testing.expectEqual(commit_before, store.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 3), queuedMutationCountForTest(&store));
+
+    var write = try store.beginWrite();
+    try write.put("foreground", "written");
+    try write.commit();
+
+    // The foreground write led the queue: all three ride-alongs and the
+    // foreground write landed in that one native transaction, one fsync.
+    try std.testing.expectEqual(commit_before + 1, store.file.activeCheckpoint().commit_sequence);
+    try ticket_1.wait();
+    try ticket_2.wait();
+    try ticket_3.wait();
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("rode along", try read.get("ride1"));
+    try std.testing.expectEqualStrings("rode along", try read.get("ride2"));
+    try std.testing.expectEqualStrings("rode along", try read.get("ride3"));
+    try std.testing.expectEqualStrings("written", try read.get("foreground"));
 }
 
 test "lite publication mutex reserves queued owners before a writer can reacquire" {
