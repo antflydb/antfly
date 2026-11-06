@@ -388,17 +388,20 @@ fn createAdmittedModelExecutorWithAllocator(
     return executor;
 }
 
-/// Compute the union once at load time. Runtimes preallocate cache entries and
-/// replace by semantic identity, even when phases use different binding names.
+/// Only one phase's outputs survive a successful execution. Size the table
+/// for the largest phase, preserving distinct layerless identities per phase.
 fn retainedCapacity(a: std.mem.Allocator, prefill: []const pjrt_executor.PjrtSemanticOutputBinding, variants: []const pjrt_executor.PjrtModelExecutor.DecodeVariant) !usize {
     const Identity = @import("pjrt_kv_identity.zig").Identity;
     var keys: std.HashMapUnmanaged(Identity, void, Identity.Context, 80) = .empty;
     defer keys.deinit(a);
     for (prefill) |binding| try keys.put(a, binding.identity(), {});
-    for (variants) |variant| for (variant.semantic_output_bindings) |binding| {
-        try keys.put(a, binding.identity(), {});
-    };
-    return keys.count();
+    var capacity = keys.count();
+    for (variants) |variant| {
+        keys.clearRetainingCapacity();
+        for (variant.semantic_output_bindings) |binding| try keys.put(a, binding.identity(), {});
+        capacity = @max(capacity, keys.count());
+    }
+    return capacity;
 }
 
 fn freeAdmittedVariant(allocator: std.mem.Allocator, variant: pjrt_executor.PjrtModelExecutor.DecodeVariant) void {

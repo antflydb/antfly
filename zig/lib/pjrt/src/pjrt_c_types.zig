@@ -294,7 +294,7 @@ pub const ExecuteOptions = extern struct {
     num_recv_ops: usize,
     launch_id: c_int,
     // 4 bytes auto-padding
-    non_donatable_input_indices: ?*const i64,
+    non_donatable_input_indices: ?[*]const i64,
     num_non_donatable_input_indices: usize,
     // Fields added in PJRT API 0.83+
     context: ?*anyopaque,

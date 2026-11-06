@@ -727,15 +727,52 @@ pub const PjrtRetainedBufferCache = struct {
         self: *const PjrtRetainedBufferCache,
         binding: PjrtSemanticInputBinding,
     ) ?*const pjrt_lib.pjrt.Buffer {
+        const index = self.semanticEntryIndex(binding) orelse return null;
+        return &self.entries.items[index].buffer;
+    }
+
+    fn semanticEntryIndex(self: *const @This(), binding: PjrtSemanticInputBinding) ?usize {
         if (self.semantic_index.len != 0) {
             const slot = self.semanticSlot(binding.name, binding.layer_index, binding.kind);
             const index = self.semantic_index[slot];
-            return if (index == 0) null else &self.entries.items[index - 1].buffer;
+            return if (index == 0) null else index - 1;
         }
-        for (self.entries.items) |*entry| {
-            if (retainedEntryMatchesSemanticInput(entry.*, binding)) return &entry.buffer;
+        for (self.entries.items, 0..) |entry, i| {
+            if (retainedEntryMatchesSemanticInput(entry, binding)) return i;
         }
         return null;
+    }
+
+    /// Keep only inputs consumed by this phase. Pruning before native Execute
+    /// bounds old residency by the phase's admitted inputs; retries retain
+    /// those same inputs until successful output publication.
+    pub fn retainSemanticInputs(self: *@This(), allocator: Allocator, bindings: []const PjrtSemanticInputBinding) !void {
+        const live = try allocator.alloc(bool, self.entries.items.len);
+        defer allocator.free(live);
+        @memset(live, false);
+        for (bindings) |binding| {
+            const index = self.semanticEntryIndex(binding) orelse return error.MissingPastKeyValue;
+            live[index] = true;
+        }
+        var count: usize = 0;
+        for (self.entries.items, live) |entry, keep| {
+            if (keep) {
+                self.entries.items[count] = entry;
+                count += 1;
+            } else {
+                var buffer = entry.buffer;
+                buffer.deinit();
+                if (entry.owns_name) self.allocator.free(entry.name);
+            }
+        }
+        self.entries.items.len = count;
+        @memset(self.semantic_index, 0);
+        if (self.semantic_index.len != 0) {
+            for (self.entries.items, 0..) |entry, i| {
+                const slot = self.semanticSlot(entry.name, entry.layer_index, entry.kind);
+                self.semantic_index[slot] = i + 1;
+            }
+        }
     }
 
     pub fn put(
@@ -859,6 +896,7 @@ pub const PjrtModelExecutor = struct {
         try workspaceArray(&bytes, pjrt_lib.pjrt.Buffer, exec.input_bindings.len);
         try workspaceArray(&bytes, bool, exec.input_bindings.len); // owned inputs
         try workspaceArray(&bytes, ?*c.PjrtBuffer, exec.input_bindings.len);
+        try workspaceArray(&bytes, i64, exec.input_bindings.len); // non-donatable indices
         try workspaceArray(&bytes, ?*c.PjrtBuffer, exec.output_node_ids.len);
         try workspaceArray(&bytes, pjrt_lib.pjrt.Buffer, exec.output_node_ids.len);
         for (exec.input_shapes_) |shape| {
@@ -879,6 +917,7 @@ pub const PjrtModelExecutor = struct {
     pub fn prepareRuntimeSlots(self: *@This(), capacity: usize) !void {
         var scratch_bytes = try phaseWorkspaceBytes(self.executor);
         for (self.decode_variants) |variant| scratch_bytes = @max(scratch_bytes, try phaseWorkspaceBytes(variant.executor));
+        try workspaceArray(&scratch_bytes, bool, self.retained_capacity); // phase liveness marks
         const slots = try self.allocator.alloc(RuntimeSlot, capacity);
         errdefer self.allocator.free(slots);
         var initialized: usize = 0;
@@ -1120,6 +1159,7 @@ const PjrtModelRuntime = struct {
             }
             if (self.runtime_slot == null) allocator.free(values);
         }
+        if (self.artifact_executor_owner != null) try self.retained_buffers.retainSemanticInputs(bookkeeping, phase.semantic_input_bindings);
         try self.materializeGraphInputs(values, phase);
         const retained = try bookkeeping.alloc(bool, phase.executor.output_node_ids.len);
         defer bookkeeping.free(retained);
@@ -1170,6 +1210,10 @@ const PjrtModelRuntime = struct {
         // A failed decode can retry against the previous cache generation.
         {
             errdefer self.retained_buffers.clear();
+            // Managed chains consume only their immediately preceding phase.
+            // Native inputs stay alive until readback succeeds, then give way
+            // to precisely the new phase outputs rather than a historical union.
+            if (self.artifact_executor_owner != null) self.retained_buffers.clear();
             for (phase.semantic_output_bindings) |binding| {
                 if (binding.output_index >= outputs.len) return error.MissingOutput;
                 if (debug) {
@@ -2180,6 +2224,21 @@ test "managed PJRT semantic index resolves collisions without allocation" {
             try std.testing.expectEqual(i + 1, @intFromPtr(buffer.handle));
         }
         try std.testing.expect(cache.getForSemanticInput(.{ .input_index = 0, .name = "absent", .layer_index = 999, .kind = .key }) == null);
+        var required: [128]PjrtSemanticInputBinding = undefined;
+        for (&required, 0..) |*binding, i| binding.* = .{ .input_index = i, .name = "past", .layer_index = @intCast(i * 2 + 1), .kind = .key };
+        var marks: [256]u8 = undefined;
+        var arena = std.heap.FixedBufferAllocator.init(&marks);
+        try cache.retainSemanticInputs(arena.allocator(), &required);
+        try std.testing.expectEqual(@as(usize, 128), cache.len());
+        for (0..256) |i| {
+            const buffer = cache.getForSemanticInput(.{ .input_index = i, .name = "past", .layer_index = @intCast(i), .kind = .key });
+            if (i % 2 == 1) try std.testing.expectEqual(i + 1, @intFromPtr(buffer.?.handle)) else try std.testing.expect(buffer == null);
+        }
+        // Missing inputs fail before pruning any live state, and the same
+        // admitted mark arena can be reused after index compaction.
+        try std.testing.expectError(error.MissingPastKeyValue, cache.retainSemanticInputs(arena.allocator(), &.{.{ .input_index = 0, .name = "missing", .layer_index = 999, .kind = .key }}));
+        try std.testing.expectEqual(@as(usize, 128), cache.len());
+        try cache.retainSemanticInputs(arena.allocator(), &required);
         cache.clear();
     }
 }

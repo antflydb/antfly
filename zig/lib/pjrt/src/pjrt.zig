@@ -426,9 +426,17 @@ pub const LoadedExecutable = struct {
         var events: [1]?*c.PjrtEvent = .{null};
         defer if (events[0]) |event| destroyEvent(self.api, event);
 
+        // Inputs remain owned by the caller, including retained KV needed if
+        // readback fails. Native may-alias executables must not donate them.
+        const non_donatable = try allocator.alloc(i64, inputs.len);
+        defer allocator.free(non_donatable);
+        for (non_donatable, 0..) |*index, i| index.* = @intCast(i);
+
         // Execute options (zeroed = defaults)
         var options: c.ExecuteOptions = std.mem.zeroes(c.ExecuteOptions);
         options.struct_size = @sizeOf(c.ExecuteOptions);
+        options.non_donatable_input_indices = non_donatable.ptr;
+        options.num_non_donatable_input_indices = non_donatable.len;
 
         var args = c.LoadedExecutableExecuteArgs{
             .struct_size = @sizeOf(c.LoadedExecutableExecuteArgs),

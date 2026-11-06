@@ -461,8 +461,8 @@ return only residency credit from their own pressure epoch.
 Construction admission uses the manager's pressure/reclamation path, including
 optional host caches, while retaining batched OS probes. Escaped metadata owners
 detach the borrowed manager and derive accounting lifetimes from retained owners.
-Loading admits and preallocates each runtime slot, including the union of
-semantic KV identities. They borrow immutable executor binding names and replace entries by
+Loading admits and preallocates each runtime slot for the largest phase's
+semantic KV set. Slots borrow immutable executor binding names and identify entries by
 (layer, kind), so phase-specific aliases do not copy names or grow the cache on
 every token. Runtime creation remains valid after manager shutdown.
 
@@ -654,3 +654,14 @@ never determines logical host size or retained-KV compatibility. KV matching
 checks native F32 type and logical dimensions (with dynamic input dimensions
 acting as wildcards). New KV is published only after logits allocation succeeds,
 so failed decode readback can retry against the previous cache generation.
+
+Before native execution, an admitted runtime keeps only KV consumed by the
+selected phase and rebuilds its semantic index using slot-owned liveness marks.
+After successful logits readback/allocation it replaces that input generation
+with the new outputs. Historical phase identities cannot accumulate beyond the
+admitted per-phase input/output peak. All native Execute inputs are explicitly
+non-donatable, including duplicate references to one retained buffer; may-alias
+executables cannot consume the old generation needed by a failed decode retry.
+The enclosing resource envelope configures unified-device ceilings. Metadata
+suballocations reuse that stable policy and retain batched physical-pressure
+checks, avoiding a fresh OS limit probe for each parser allocation.

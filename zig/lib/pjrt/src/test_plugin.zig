@@ -196,11 +196,24 @@ fn download(args: *c.BufferToHostBufferArgs) callconv(.c) ?*c.PjrtError {
 fn execute(args: *c.LoadedExecutableExecuteArgs) callconv(.c) ?*c.PjrtError {
     const kind = @as(*const u8, @ptrCast(args.executable.?)).*;
     const lists: [*][*]?*c.PjrtBuffer = @ptrCast(@alignCast(args.output_lists.?));
+    // Model a may-alias executable. A caller that allows donation loses its
+    // old KV contents during Execute, before later readback can fail.
+    var protected = args.options.?.num_non_donatable_input_indices == args.num_args;
+    if (protected and args.num_args != 0) {
+        const indices = args.options.?.non_donatable_input_indices.?[0..args.num_args];
+        for (indices, 0..) |index, i| if (index != @as(i64, @intCast(i))) {
+            protected = false;
+        };
+    }
     if (kind == 2) {
         std.debug.assert(args.num_args == 3);
         const inputs: [*][*]?*c.PjrtBuffer = @ptrCast(@alignCast(args.argument_lists.?));
-        std.debug.assert(std.mem.bytesToValue(f32, dataBuffer(inputs[0][1]).bytes[0..4]) == 1);
-        std.debug.assert(std.mem.bytesToValue(f32, dataBuffer(inputs[0][2]).bytes[0..4]) == 1);
+        const previous = std.mem.bytesToValue(f32, dataBuffer(inputs[0][1]).bytes[0..4]);
+        std.debug.assert(previous == 1 or previous == 2);
+        if (!protected) {
+            @memcpy(dataBuffer(inputs[0][1]).bytes[0..4], std.mem.sliceAsBytes(&[_]f32{99}));
+            @memcpy(dataBuffer(inputs[0][2]).bytes[0..4], std.mem.sliceAsBytes(&[_]f32{99}));
+        }
     }
     const logits = if (kind == 1) [_]f32{ 0, 1 } else [_]f32{ 1, 0 };
     lists[0][0] = newBuffer(std.mem.sliceAsBytes(&logits));

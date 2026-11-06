@@ -101,4 +101,6 @@ const size_t antfly_pjrt_arg_layouts[] = {
     offsetof(PJRT_Buffer_MemoryLayout, extension_start),
     offsetof(PJRT_Buffer_MemoryLayout, tiled),
     offsetof(PJRT_Buffer_MemoryLayout, type),
+    offsetof(PJRT_ExecuteOptions, non_donatable_input_indices),
+    offsetof(PJRT_ExecuteOptions, num_non_donatable_input_indices),
 };

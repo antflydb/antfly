@@ -5156,6 +5156,9 @@ pub const ModelManager = struct {
     process_memory_limit_bytes: usize = 0,
     process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
     forced_run_admission_denials_for_testing: usize = 0,
+    /// Test-only stable-limit provider, allowing unified-CUDA coverage without
+    /// opening a driver or adding per-allocation instrumentation in production.
+    test_unified_limit_probe: if (builtin.is_test) ?*const fn (usize, usize) usize else void = if (builtin.is_test) null else {},
     resource_ownership: ResourceOwnership = .local,
     tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
@@ -6299,6 +6302,10 @@ pub const ModelManager = struct {
     }
 
     fn tightenUnifiedDeviceAdmission(self: *const ModelManager) void {
+        if (builtin.is_test) if (self.test_unified_limit_probe) |probe| {
+            self.admissionController().tightenUnifiedLimit(probe(self.process_memory_limit_bytes, self.admission_limit_overrides.combined_limit_bytes));
+            return;
+        };
         if (backends.cudaUsesUnifiedMemory())
             self.admissionController().tightenUnifiedLimit(unifiedDeviceAdmissionLimit(self.process_memory_limit_bytes, self.admission_limit_overrides.combined_limit_bytes));
     }
@@ -6339,7 +6346,11 @@ pub const ModelManager = struct {
     fn acquireAmountsWithEvictionMode(self: *ModelManager, backend_class: runtime.tier.memory.BackendClass, requested_limits: runtime.tier.memory.Limits, amounts: runtime.tier.memory.AdmissionAmounts, check_live: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const limits = self.physicalRunLimits(backend_class, requested_limits);
-        self.tightenUnifiedDeviceAdmission();
+        // Metadata is a suballocation of an enclosing, already configured
+        // envelope (Budget.create acquires one with check_live=true). Avoid
+        // repeating stable-limit OS probes for every parser node; live physical
+        // capacity is checked separately by metadata's batched reservations.
+        if (check_live) self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
         const requests = [_]runtime.tier.memory.AdmissionRequest{.{
             .backend_class = backend_class,

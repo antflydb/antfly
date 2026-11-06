@@ -245,3 +245,31 @@ test "managed PJRT metadata admission reclaims optional host cache" {
     try std.testing.expectEqual(@as(usize, 1), cache.calls);
     try std.testing.expect(cache.bytes == null);
 }
+
+test "managed PJRT metadata reuses the configured unified ceiling across allocations" {
+    const Probe = struct {
+        var calls: usize = 0;
+        fn limit(_: usize, _: usize) usize {
+            calls += 1;
+            return 1024 * 1024 * 1024;
+        }
+    };
+    const a = std.testing.allocator;
+    var manager = Manager.init(a, @import("../backends/backends.zig").SessionManager.init(a));
+    defer manager.deinit();
+    const policy = @import("../server/model_manager.zig").ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1024 * 1024 } };
+    try policy.configure(&manager);
+    manager.test_unified_limit_probe = Probe.limit;
+    Probe.calls = 0;
+    const context = admission.Context{ .allocator = a, .manager = &manager, .policy = policy };
+    const budget = try Budget.create(a, &context);
+    defer budget.destroy();
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    const before = manager.currentAdmissionAmounts();
+    var blocks: [100][]u8 = undefined;
+    for (&blocks) |*block| block.* = try budget.allocator().alloc(u8, 1);
+    try std.testing.expect(manager.currentAdmissionAmounts().host_weight_bytes > before.host_weight_bytes);
+    for (blocks) |block| budget.allocator().free(block);
+    try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+}

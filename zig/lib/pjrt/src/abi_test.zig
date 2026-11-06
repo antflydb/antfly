@@ -18,7 +18,7 @@
 const std = @import("std");
 const c = @import("pjrt_c_types.zig");
 extern const antfly_pjrt_api_offsets: [26]usize;
-extern const antfly_pjrt_arg_layouts: [56]usize;
+extern const antfly_pjrt_arg_layouts: [58]usize;
 
 test "PJRT function slots match the upstream C header" {
     const Slot = struct { index: usize, name: []const u8 };
@@ -124,6 +124,8 @@ test "PJRT executable ownership and arity argument layouts match upstream" {
         @offsetOf(c.BufferMemoryLayout, "extension_start"),
         @offsetOf(c.BufferMemoryLayout, "layout"),
         @offsetOf(c.BufferMemoryLayout, "layout_type"),
+        @offsetOf(c.ExecuteOptions, "non_donatable_input_indices"),
+        @offsetOf(c.ExecuteOptions, "num_non_donatable_input_indices"),
     };
     try std.testing.expectEqualSlices(usize, &antfly_pjrt_arg_layouts, &layouts);
 }

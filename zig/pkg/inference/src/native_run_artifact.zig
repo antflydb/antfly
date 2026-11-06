@@ -3051,6 +3051,7 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     package.artifacts = &package_entries;
     try compiled_artifact.writePackageManifest(a, std.testing.io, package_path, package);
     try managedPrefillReuseScenario(a, prefill, plugin, count);
+    try managedKvPhaseLivenessScenario(a, prefill, decode, plugin, count);
     const closed_clients_before = count(2);
     const executions_before = count(10);
     const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromPackageManifestPath(a, std.testing.io, package_path, 16, 16, "paged_prefill", &graph, &backend, &context, plugin);
@@ -3331,4 +3332,63 @@ fn managedExecutorMetadataScenario(a: std.mem.Allocator, prefill: []const u8, pl
     }
     // An admitted immutable name is shared, not copied for each forward pass.
     try std.testing.expect(quota.peak_bytes < 24 * 1024 * 1024);
+}
+
+fn managedKvPhaseLivenessScenario(a: std.mem.Allocator, prefill: []const u8, decode: []const u8, plugin: [:0]const u8, count: *const fn (usize) callconv(.c) usize) !void {
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .kv_limit_bytes = 16 } };
+    try policy.configure(&manager);
+    const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .runtime_capacity = 1, .decode_steps_limit = 2 };
+    var first = try compiled_artifact.readManifest(a, std.testing.io, prefill);
+    defer first.deinit();
+    var next = try compiled_artifact.readManifest(a, std.testing.io, decode);
+    defer next.deinit();
+    var last = try compiled_artifact.readManifest(a, std.testing.io, decode);
+    defer last.deinit();
+    last.value.seq_len = 18;
+    for (first.value.pjrt_output_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.name = if (std.mem.eql(u8, b.kind, compiled_artifact.pjrt_binding_present_key)) "a" else "b";
+    };
+    for (next.value.pjrt_input_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.kind = compiled_artifact.pjrt_binding_past_key;
+        b.name = "a";
+    };
+    for (next.value.pjrt_output_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.name = if (std.mem.eql(u8, b.kind, compiled_artifact.pjrt_binding_present_key)) "c" else "d";
+    };
+    for (last.value.pjrt_input_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.name = if (std.mem.eql(u8, b.kind, compiled_artifact.pjrt_binding_past_key)) "c" else "d";
+    };
+    for (last.value.pjrt_output_bindings) |*b| if (compiled_artifact.pjrtBindingIsKvCache(b.*)) {
+        b.layer_index = null;
+        b.name = if (std.mem.eql(u8, b.kind, compiled_artifact.pjrt_binding_present_key)) "e" else "f";
+    };
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const id = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
+    try graph.markOutput(id);
+    var backend: ops.ComputeBackend = undefined;
+    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(a, &.{ first.value, next.value, last.value }, &graph, &backend, &context, plugin);
+    var owned = executor.modelExecutor();
+    defer owned.deinit();
+    var run = try owned.createRuntime(a);
+    defer run.deinit();
+    const ids: [16]i64 = @splat(1);
+    var output = try run.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+    output.deinit(a);
+    var out1 = try run.decode(a, .{ .token_id = 1, .position = 16 });
+    out1.deinit(a);
+    var out2 = try run.decode(a, .{ .token_id = 1, .position = 17 });
+    out2.deinit(a);
+    const admitted = manager.currentAdmissionAmounts().host_kv_bytes;
+    try std.testing.expectEqual(@as(usize, 16), admitted);
+    try std.testing.expectEqual(@as(usize, 8), count(11));
+    try std.testing.expect(count(12) <= admitted);
+    try std.testing.expectEqual(@as(usize, 2), executor.retained_capacity);
 }
