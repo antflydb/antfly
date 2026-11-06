@@ -6129,6 +6129,17 @@ pub const DB = struct {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
+        // WS6: a coalesced applied-sequence flush still pending when close
+        // starts gets exactly one more chance to run now, while the store is
+        // still fully live. `background_closing` is now true, so
+        // publishManagedProgress's status gate treats this drain as forced
+        // (deterministic status-at-close) rather than waiting on the
+        // ordinary interval. Best-effort: close must proceed even if this
+        // fails (the DB is going away either way; the next open recomputes
+        // status from progress and catalog).
+        if (executor_ready) self.flushAppliedSequencesForIdle() catch |err| {
+            std.log.warn("close-time applied-sequence flush failed err={s}", .{@errorName(err)});
+        };
         self.native_query_warming.stop(self.backend_runtime);
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
@@ -55763,16 +55774,18 @@ fn saveAppliedSequencesBatchLockedContext(
                 ) or lifecycle_completed;
             }
             // No generic consumer advanced, so there is no progress v2 record
-            // to write here; a completed dense lifecycle still deserves an
-            // immediate (not interval-gated) status refresh.
+            // to write here; a completed dense lifecycle, or this running as
+            // part of DB.close's drain, still deserves an immediate (not
+            // interval-gated) status refresh.
+            const closing_status_force = lifecycle_completed or active_async_ctx.background_closing.load(.acquire);
             try publishManagedProgress(
                 ctx.alloc,
                 ctx.store,
                 ctx.index_manager,
                 &.{},
                 false,
-                if (lifecycle_completed) enriched_updates else &.{},
-                lifecycle_completed,
+                if (closing_status_force) enriched_updates else &.{},
+                closing_status_force,
             );
         }
         return;
@@ -55793,15 +55806,17 @@ fn saveAppliedSequencesBatchLockedContext(
         // WS6: one progress commit replaces the separate legacy status
         // commit(s) that used to follow here, carrying the new v2 progress
         // record for every generic update plus (interval-gated, or forced by
-        // a completed lifecycle) a piggybacked status refresh.
+        // a completed lifecycle or a DB.close drain) a piggybacked status
+        // refresh.
+        const closing_status_force = authoritative_lifecycle_completed or active_async_ctx.background_closing.load(.acquire);
         try publishManagedProgress(
             ctx.alloc,
             ctx.store,
             ctx.index_manager,
             generic_updates.items,
             true,
-            if (authoritative_lifecycle_completed) enriched_updates else generic_updates.items,
-            authoritative_lifecycle_completed,
+            if (closing_status_force) enriched_updates else generic_updates.items,
+            closing_status_force,
         );
         return;
     }
@@ -61843,8 +61858,9 @@ fn flushFinishedDenseAppliedSequenceLocked(
         // WS6: one progress commit carries the v2 record for this consumer
         // (when it took the generic, non-HBC-authoritative path above) and a
         // piggybacked status refresh (interval-gated, or forced through by a
-        // completed lifecycle), replacing what used to be a separate status
-        // commit here.
+        // completed lifecycle or a DB.close drain), replacing what used to
+        // be a separate status commit here.
+        const closing_status_force = lifecycle_completed_now or ctx.background_closing.load(.acquire);
         const status_started = monotonicTimeNs();
         try publishManagedProgress(
             ctx.alloc,
@@ -61852,8 +61868,8 @@ fn flushFinishedDenseAppliedSequenceLocked(
             ctx.index_manager,
             if (hbc_authoritative) &.{} else enriched_updates,
             !hbc_authoritative,
-            if (!hbc_authoritative or lifecycle_completed_now) enriched_updates else &.{},
-            lifecycle_completed_now,
+            if (!hbc_authoritative or closing_status_force) enriched_updates else &.{},
+            closing_status_force,
         );
         status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
@@ -61944,8 +61960,12 @@ fn flushPendingAppliedSequencesLocked(
         // for synchronous visibility" (it fires on an ordinary write under
         // most sync levels, not only at shutdown) and must not itself force
         // a status write, or every write would defeat the status-persist
-        // interval. Only a completed lifecycle forces status through early;
-        // otherwise it rides the interval gate inside `publishManagedProgress`.
+        // interval. A completed lifecycle, or this flush running as part of
+        // DB.close's drain (`background_closing`, set before any close-time
+        // flush runs, distinct from the generic per-write `force`), forces
+        // status through deterministically; otherwise it rides the interval
+        // gate inside `publishManagedProgress`.
+        const closing_status_force = authoritative_lifecycle_completed or ctx.background_closing.load(.acquire);
         const status_started = monotonicTimeNs();
         try publishManagedProgress(
             ctx.alloc,
@@ -61954,7 +61974,7 @@ fn flushPendingAppliedSequencesLocked(
             generic_updates.items,
             generic_updates.items.len > 0,
             enriched_updates,
-            authoritative_lifecycle_completed,
+            closing_status_force,
         );
         status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
@@ -100205,6 +100225,48 @@ test "db status snapshot persists at most once per interval across a write loop 
     // per `status_persist_interval_ns`.
     try std.testing.expectEqual(@as(u64, 1), statusPersistCountForTest());
     try std.testing.expect(try db.core.loadAppliedSequence(alloc, "ft_v1") >= 1000);
+}
+
+test "db close deterministically flushes a pending status refresh (WS6)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{});
+        defer db.close();
+
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+        // An interval long enough that nothing inside this test's own
+        // duration would naturally cross it.
+        db.core.index_manager.status_persist_interval_ns = 3600 * std.time.ns_per_s;
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .full_index,
+        });
+        const first_status = (try db.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+        try std.testing.expectEqual(@as(u64, 1), first_status.doc_count);
+
+        // Within the interval: the persisted snapshot must not move yet.
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+            .sync_level = .full_index,
+        });
+        const still_stale_status = (try db.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+        try std.testing.expectEqual(@as(u64, 1), still_stale_status.doc_count);
+
+        // db.close() (via deinitWrapperState's close-time drain) must force
+        // one final status refresh through regardless of the interval, not
+        // leave the persisted snapshot stale for the next open.
+    }
+
+    var reopened = try DB.open(alloc, path_tmp.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false });
+    defer reopened.close();
+    const closed_status = (try reopened.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+    try std.testing.expectEqual(@as(u64, 2), closed_status.doc_count);
 }
 
 test "db managed projection checkpoints persist status and config identity" {
