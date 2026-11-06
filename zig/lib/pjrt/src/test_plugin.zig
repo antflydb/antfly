@@ -17,7 +17,9 @@
 //! and free; exported counters verify constructor ordering and C API ownership.
 const std = @import("std");
 const c = @import("pjrt_c_types.zig");
-var counters: [11]usize = @splat(0);
+// Slots 11/12 track live/peak bytes of the fixture's scalar F32 KV outputs.
+// Token IDs and logits use different sizes, so these measure KV specifically.
+var counters: [13]usize = @splat(0);
 var device: u8 = 0;
 var devices = [_]?*c.PjrtDevice{@ptrCast(&device)};
 const serialized = "fixture executable";
@@ -114,6 +116,10 @@ fn newBuffer(bytes: []const u8) *c.PjrtBuffer {
     const buffer = std.heap.c_allocator.create(DataBuffer) catch @panic("fixture allocation");
     buffer.bytes = std.heap.c_allocator.dupe(u8, bytes) catch @panic("fixture allocation");
     counters[8] += 1;
+    if (bytes.len == @sizeOf(f32)) {
+        counters[11] += bytes.len;
+        counters[12] = @max(counters[12], counters[11]);
+    }
     return @ptrCast(buffer);
 }
 fn upload(args: *c.ClientBufferFromHostBufferArgs) callconv(.c) ?*c.PjrtError {
@@ -125,6 +131,7 @@ fn upload(args: *c.ClientBufferFromHostBufferArgs) callconv(.c) ?*c.PjrtError {
 }
 fn destroyBuffer(args: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
     const buffer = dataBuffer(args.buffer);
+    if (buffer.bytes.len == @sizeOf(f32)) counters[11] -= buffer.bytes.len;
     std.heap.c_allocator.free(buffer.bytes);
     std.heap.c_allocator.destroy(buffer);
     counters[9] += 1;

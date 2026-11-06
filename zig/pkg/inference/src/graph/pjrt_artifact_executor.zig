@@ -251,8 +251,24 @@ pub fn createAdmittedModelExecutorFromManifestPaths(
     const artifacts = try allocator.alloc(compiled_artifact.Manifest, manifests.len);
     defer allocator.free(artifacts);
     for (manifests, artifacts) |parsed, *artifact| artifact.* = parsed.value;
+    return createAdmittedModelExecutorFromManifests(allocator, artifacts, graph, host_backend, policy, plugin);
+}
+
+/// The selector retains these parsed manifests through construction, avoiding
+/// a second read/parse of every selected decode sidecar.
+pub fn createAdmittedModelExecutorFromManifests(
+    allocator: std.mem.Allocator,
+    artifacts: []const compiled_artifact.Manifest,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    policy: *const admission_mod.Context,
+    plugin: [:0]const u8,
+) !*pjrt_executor.PjrtModelExecutor {
+    if (artifacts.len == 0) return error.MissingArtifactMetadata;
+    if (policy.decode_steps_limit) |required| if (artifacts.len - 1 != required) return error.PjrtLoadOnlyArtifactsRequired;
     for (artifacts[1..], 1..) |artifact, i| {
         if (artifact.seq_len != (std.math.add(usize, artifacts[0].seq_len, i) catch return error.ArtifactShapeMismatch) or !std.mem.eql(u8, artifact.kind, artifacts[0].kind) or !std.mem.eql(u8, artifact.artifact_role, compiled_artifact.artifact_role_decode) or artifact.query_seq_len != 1 or !std.mem.eql(u8, artifact.attention_mode, "paged_decode") or !std.mem.eql(u8, artifact.model_dir, artifacts[0].model_dir) or !std.mem.eql(u8, artifact.backend, artifacts[0].backend) or !std.mem.eql(u8, artifact.pjrt_parameter_mode, artifacts[0].pjrt_parameter_mode)) return error.ArtifactShapeMismatch;
+        if (!@import("pjrt_artifact_selection.zig").kvShapesCompatible(artifacts[i - 1], artifact)) return error.ArtifactShapeMismatch;
     }
     const graph_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
     var metadata_bytes = try std.math.add(usize, @sizeOf(ml.graph.Graph), @sizeOf(pjrt_executor.PjrtModelExecutor));
@@ -276,7 +292,7 @@ pub fn createAdmittedModelExecutorFromManifestPaths(
     owned_graph.parameters = .fromOwnedSlice(try graph_allocator.dupe(ml.graph.NodeId, graph.parameters.items));
     const prefill = try loadAdmittedVariant(graph_allocator, owned_graph, host_backend, owner, 0, artifacts[0]);
     errdefer freeAdmittedVariant(graph_allocator, prefill);
-    const variants = try graph_allocator.alloc(pjrt_executor.PjrtModelExecutor.DecodeVariant, selected_decode_paths.len);
+    const variants = try graph_allocator.alloc(pjrt_executor.PjrtModelExecutor.DecodeVariant, artifacts.len - 1);
     var loaded: usize = 0;
     errdefer {
         for (variants[0..loaded]) |variant| freeAdmittedVariant(graph_allocator, variant);
@@ -507,45 +523,7 @@ fn packageKvShapesCompatible(
     var target_parsed = try compiled_artifact.readManifest(allocator, io, target_manifest_path);
     defer target_parsed.deinit();
 
-    const source = source_parsed.value;
-    const target = target_parsed.value;
-    if (source.pjrt_output_shapes.len != source.pjrt_output_node_ids.len or
-        target.pjrt_input_shapes.len != target.pjrt_input_bindings.len)
-    {
-        return false;
-    }
-
-    for (target.pjrt_input_bindings, 0..) |input_binding, input_index| {
-        if (!pjrtBindingIsPastKv(input_binding.kind)) continue;
-        const output_index = findMatchingPresentOutputIndex(source, input_binding) orelse return false;
-        if (!std.mem.eql(i64, source.pjrt_output_shapes[output_index], target.pjrt_input_shapes[input_index])) return false;
-    }
-    return true;
-}
-
-fn pjrtBindingIsPastKv(kind: []const u8) bool {
-    return std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_past_key) or
-        std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_past_value);
-}
-
-fn pjrtBindingIsPresentKv(kind: []const u8) bool {
-    return std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_present_key) or
-        std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_present_value);
-}
-
-fn findMatchingPresentOutputIndex(
-    source: compiled_artifact.Manifest,
-    input_binding: compiled_artifact.PjrtInputBindingMeta,
-) ?usize {
-    for (source.pjrt_output_bindings, 0..) |output_binding, output_index| {
-        if (!pjrtBindingIsPresentKv(output_binding.kind)) continue;
-        if (output_binding.layer_index != input_binding.layer_index) continue;
-        if (std.mem.eql(u8, input_binding.kind, compiled_artifact.pjrt_binding_past_key) and
-            std.mem.eql(u8, output_binding.kind, compiled_artifact.pjrt_binding_present_key)) return output_index;
-        if (std.mem.eql(u8, input_binding.kind, compiled_artifact.pjrt_binding_past_value) and
-            std.mem.eql(u8, output_binding.kind, compiled_artifact.pjrt_binding_present_value)) return output_index;
-    }
-    return null;
+    return @import("pjrt_artifact_selection.zig").kvShapesCompatible(source_parsed.value, target_parsed.value);
 }
 
 fn buildInputBindings(

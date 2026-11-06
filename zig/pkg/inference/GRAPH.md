@@ -438,8 +438,16 @@ memory pressure; admission does not reduce it to a different artifact bucket.
 The native graph keeps KV page geometry without allocating duplicate CPU KV
 storage: the managed executable owns and admits that storage.
 
-Managed requests verify complete contiguous decode coverage before constructing
-the provider. A prefill-only executable never doubles as a decode executable,
+Managed requests select complete contiguous prefill/decode chains before
+constructing the provider. Mode preference applies only among compatible chains
+that cover the requested token count, so incomplete embedded packages cannot
+hide complete input-parameter packages or standalone chains. Selection caches
+request-relevant sidecar metadata, checks executable availability without reading
+its bytes, and passes the parsed manifests directly to the admitted loader.
+The loader still verifies executable/provider identity and loaded statistics;
+identity or deserialization failures do not trigger another candidate.
+
+A prefill-only executable never doubles as a decode executable,
 even for a one-token prompt. Standalone lookup prefers profiled embedded
 parameters, then profiled external inputs, and rejects duplicate matches within
 the selected mode.
@@ -450,6 +458,9 @@ KV, scratch, and host transfer envelope; code, graph metadata, and serialized
 provider copies are charged once. Runtime creation borrows a slot atomically and
 returns temporary-unavailability when all slots are occupied. Destruction frees
 retained KV before returning the slot; failed runtime allocation returns it too.
+PJRT prefill starts a fresh sequence and releases prior retained KV inside the
+runtime before allocating replacement outputs. This bound holds for direct
+runtime reuse, including an allocation failure followed by retry.
 Capacity cannot grow beyond CUDA's already admitted fixed pool. Callers needing
 concurrent runtimes set the capacity when loading the executor, allowing full
 workspace concurrency without duplicating immutable executable residency.

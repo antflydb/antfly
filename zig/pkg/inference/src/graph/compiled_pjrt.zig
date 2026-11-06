@@ -399,22 +399,11 @@ fn executeModelForwardViaDefinition(
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        const executor = if (try compiled_artifact.findManagedPjrtPackage(allocator, io, directory, "xla", model_dir, shape.seq_len, shape.query_seq_len, shape.attention_mode)) |package| found: {
-            defer allocator.free(package);
-            break :found try pjrt_artifact_executor_mod.createAdmittedModelExecutorFromPackageManifestPath(allocator, io, package, shape.seq_len, shape.query_seq_len, shape.attention_mode, graph, context.cb, policy, plugin);
-        } else found: {
-            var prefill = (compiled_artifact.findManagedPjrtPrefill(allocator, io, directory, "xla", model_dir, shape.seq_len, shape.query_seq_len, shape.attention_mode) catch |err| switch (err) {
-                error.FileNotFound => null,
-                else => return err,
-            }) orelse return error.PjrtLoadOnlyArtifactsRequired;
-            defer prefill.deinit(allocator);
-            const decode = try findMatchingPjrtWholeModelDecodeArtifacts(allocator, io, directory, prefill.manifest_path, policy.decode_steps_limit);
-            defer freePjrtArtifactMatches(allocator, decode);
-            const paths = try allocator.alloc([]const u8, decode.len);
-            defer allocator.free(paths);
-            for (decode, paths) |variant, *path| path.* = variant.manifest_path;
-            break :found try pjrt_artifact_executor_mod.createAdmittedModelExecutorFromManifestPaths(allocator, io, prefill.manifest_path, paths, graph, context.cb, policy, plugin);
-        };
+        var selected = (try @import("pjrt_artifact_selection.zig").find(allocator, io, directory, .{ .model_dir = model_dir, .seq_len = shape.seq_len, .query_seq_len = shape.query_seq_len, .attention_mode = shape.attention_mode, .decode_steps = policy.decode_steps_limit })) orelse return error.PjrtLoadOnlyArtifactsRequired;
+        defer selected.deinit();
+        const artifacts = try selected.values(allocator);
+        defer allocator.free(artifacts);
+        const executor = try pjrt_artifact_executor_mod.createAdmittedModelExecutorFromManifests(allocator, artifacts, graph, context.cb, policy, plugin);
         entry.compiled_model_executor = .{ .ptr = executor, .deinit = &pjrt_executor_mod.deinitModelExecutorPtr };
         entry.compiled_model_status = .ready;
     };
@@ -861,57 +850,7 @@ fn pjrtPackageKvShapesCompatible(
     var target_parsed = try compiled_artifact.readManifest(allocator, io, target_manifest_path);
     defer target_parsed.deinit();
 
-    const source = source_parsed.value;
-    const target = target_parsed.value;
-    if (source.pjrt_output_shapes.len != source.pjrt_output_node_ids.len or
-        target.pjrt_input_shapes.len != target.pjrt_input_bindings.len)
-    {
-        return false;
-    }
-
-    for (target.pjrt_input_bindings, 0..) |input_binding, input_index| {
-        if (!pjrtBindingIsPastKv(input_binding.kind)) continue;
-        const output_index = findMatchingPresentOutputIndex(source, input_binding) orelse return false;
-        if (!std.mem.eql(i64, target.pjrt_input_shapes[input_index], source.pjrt_output_shapes[output_index])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn pjrtBindingIsPastKv(kind: []const u8) bool {
-    return std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_past_key) or
-        std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_past_value);
-}
-
-fn pjrtPresentKindForPast(kind: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_past_key)) {
-        return compiled_artifact.pjrt_binding_present_key;
-    }
-    if (std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_past_value)) {
-        return compiled_artifact.pjrt_binding_present_value;
-    }
-    return null;
-}
-
-fn findMatchingPresentOutputIndex(
-    prefill: compiled_artifact.Manifest,
-    input_binding: compiled_artifact.PjrtInputBindingMeta,
-) ?usize {
-    const expected_kind = pjrtPresentKindForPast(input_binding.kind) orelse return null;
-    for (prefill.pjrt_output_bindings) |output_binding| {
-        if (!std.mem.eql(u8, output_binding.kind, expected_kind)) continue;
-        if (output_binding.layer_index != input_binding.layer_index) continue;
-        return findOutputNodeIndex(prefill.pjrt_output_node_ids, output_binding.node_id);
-    }
-    return null;
-}
-
-fn findOutputNodeIndex(node_ids: []const u32, node_id: u32) ?usize {
-    for (node_ids, 0..) |candidate, index| {
-        if (candidate == node_id) return index;
-    }
-    return null;
+    return @import("pjrt_artifact_selection.zig").kvShapesCompatible(source_parsed.value, target_parsed.value);
 }
 
 fn findMatchingPjrtArtifactWithKinds(

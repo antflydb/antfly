@@ -900,6 +900,10 @@ const PjrtModelRuntime = struct {
         request: model_runtime.PrefillRequest,
     ) !model_runtime.ModelOutput {
         const self: *PjrtModelRuntime = @ptrCast(@alignCast(ctx));
+        try request.check();
+        // PJRT prefill starts a fresh sequence. Release prior KV before the
+        // provider allocates replacement outputs, including direct API reuse.
+        self.retained_buffers.clear();
         return self.executeEmbeddingIds(allocator, request.input_ids, request.query_seq_len, self.prefillPhase());
     }
 

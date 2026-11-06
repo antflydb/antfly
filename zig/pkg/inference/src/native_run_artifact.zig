@@ -2983,6 +2983,9 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     try std.testing.expectEqual(@as(usize, 0), count(0));
     package.artifacts = &package_entries;
     try compiled_artifact.writePackageManifest(a, std.testing.io, package_path, package);
+    try managedPrefillReuseScenario(a, prefill, plugin, count);
+    const closed_clients_before = count(2);
+    const executions_before = count(10);
     const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromPackageManifestPath(a, std.testing.io, package_path, 16, 16, "paged_prefill", &graph, &backend, &context, plugin);
     var owned = executor.modelExecutor();
     var executor_live = true;
@@ -3024,13 +3027,13 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     graph_live = false;
     manager.deinit();
     manager_live = false;
-    try std.testing.expectEqual(@as(usize, 0), count(2));
+    try std.testing.expectEqual(closed_clients_before, count(2));
     var second = try run.decode(a, .{ .token_id = 1, .position = 16 });
     defer second.deinit(a);
     try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, try second.hostLogits(a));
     run.deinit();
     runtime_live = false;
-    try std.testing.expectEqual(@as(usize, 4), count(10));
+    try std.testing.expectEqual(executions_before + 4, count(10));
     try std.testing.expectEqual(count(1), count(2));
     try std.testing.expectEqual(count(3), count(4));
     try std.testing.expectEqual(count(8), count(9));
@@ -3059,4 +3062,39 @@ test "run-artifact runtime capacity scales execution memory and shares CPU CUDA 
     }
     try std.testing.expectError(error.ResourceLimitExceeded, pjrt_admission.Package.planExecution(&.{artifact}, 0, 0));
     try std.testing.expectError(error.Overflow, pjrt_admission.Package.planExecution(&.{artifact}, 0, std.math.maxInt(usize)));
+}
+
+fn managedPrefillReuseScenario(a: std.mem.Allocator, prefill: []const u8, plugin: [:0]const u8, count: *const fn (usize) callconv(.c) usize) !void {
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .kv_limit_bytes = 8 } };
+    try policy.configure(&manager);
+    const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .decode_steps_limit = 0 };
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const parameter = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
+    try graph.markOutput(parameter);
+    var backend: ops.ComputeBackend = undefined;
+    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{}, &graph, &backend, &context, plugin);
+    var owned = executor.modelExecutor();
+    defer owned.deinit();
+    var run = try owned.createRuntime(a);
+    defer run.deinit();
+    const admitted = manager.currentAdmissionAmounts();
+    try std.testing.expectEqual(@as(usize, 8), admitted.host_kv_bytes);
+    const ids: [16]i64 = @splat(1);
+    for (0..2) |_| {
+        var output = try run.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        defer output.deinit(a);
+        try std.testing.expectEqual(@as(usize, 8), count(11));
+        try std.testing.expectEqual(@as(usize, 8), count(12));
+    }
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, run.prefill(failure.allocator(), .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill }));
+    try std.testing.expectEqual(@as(usize, 0), count(11));
+    var retry = try run.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+    defer retry.deinit(a);
+    try std.testing.expectEqual(@as(usize, 8), count(12));
+    try std.testing.expectEqualDeep(admitted, manager.currentAdmissionAmounts());
 }
