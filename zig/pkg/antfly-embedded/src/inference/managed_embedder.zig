@@ -7196,6 +7196,11 @@ test "node default inference endpoint matching ignores the api suffix only" {
     try std.testing.expect(!sameAntflyInferenceEndpoint("http://third-party:8080/ai/v1", "http://shared:8080/ai/v1"));
     try std.testing.expect(!sameAntflyInferenceEndpoint("", "http://shared:8080"));
     try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080", null));
+    // Background embedding uses the same scoping guard: route paths stay
+    // case-sensitive and interior slashes stay significant.
+    try std.testing.expect(sameAntflyInferenceEndpoint("HTTP://Shared:8080/tenantA/ai/v1", "http://shared:8080/tenantA"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080/tenanta/ai/v1", "http://shared:8080/tenantA/ai/v1"));
+    try std.testing.expect(!sameAntflyInferenceEndpoint("http://shared:8080/tenantA//ai/v1", "http://shared:8080/tenantA/ai/v1"));
 }
 
 fn effectiveEndpointIsDefault(alloc: std.mem.Allocator, cfg: embeddings_types.Config, semantic_producer_json: ?[]const u8, inference_api_url: ?[]const u8) !bool {

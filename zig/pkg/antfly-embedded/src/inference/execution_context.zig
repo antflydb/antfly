@@ -97,11 +97,12 @@ fn sameAuthority(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+/// Mirrors transport normalization: trailing slashes are dropped and exactly
+/// one `/ai/v1` suffix is implied. Interior slashes stay significant, so
+/// `/tenantA//ai/v1` (a distinct request path) never matches `/tenantA/ai/v1`.
 fn canonicalEndpoint(raw: []const u8) []const u8 {
-    var canonical = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \t\r\n"), "/");
-    if (std.mem.endsWith(u8, canonical, "/ai/v1")) {
-        canonical = std.mem.trimEnd(u8, canonical[0 .. canonical.len - "/ai/v1".len], "/");
-    }
+    const canonical = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \t\r\n"), "/");
+    if (std.mem.endsWith(u8, canonical, "/ai/v1")) return canonical[0 .. canonical.len - "/ai/v1".len];
     return canonical;
 }
 
@@ -274,6 +275,10 @@ test "default endpoint match folds only scheme and host case" {
     try std.testing.expect(!isDefaultEndpoint("https://gateway.example:8443/tenantA/ai/v1", default_url));
     try std.testing.expect(!isDefaultEndpoint("https://User@gateway.example/x", "https://user@gateway.example/x"));
     try std.testing.expect(isDefaultEndpoint("https://user@gateway.example/x", "https://user@gateway.example/x"));
+    // Interior slashes are a distinct request path, not a spelling of the default.
+    try std.testing.expect(!isDefaultEndpoint("https://gateway.example/tenantA//ai/v1", default_url));
+    try std.testing.expect(!isDefaultEndpoint("https://gateway.example//ai/v1", "https://gateway.example"));
+    try std.testing.expect(isDefaultEndpoint("https://gateway.example/ai/v1/", "https://gateway.example/"));
 }
 
 test "routing context appends trusted table header" {
