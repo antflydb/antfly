@@ -429,7 +429,17 @@ const RowPolicyOutputCheckpoint = struct {
         try self.lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     }
 };
-const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
+/// Test-only override (see `defaultVisibilityWaitTimeoutMs`): lets a crash-
+/// consistency / latency-injection test shrink the ordinarily generous
+/// 5-minute default so a slow-sync scenario's visibility wait can time out
+/// (and be observed doing so) in a bounded test run instead of needing to
+/// actually run for minutes. Never set outside a test.
+pub var test_visibility_wait_timeout_ms: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
+
+fn defaultVisibilityWaitTimeoutMs() u64 {
+    if (comptime builtin.is_test) if (test_visibility_wait_timeout_ms) |ms| return ms;
+    return 5 * std.time.ms_per_min;
+}
 const public_schema_json_key = @import("../internal_keys.zig").public_schema_json_key;
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 // Legacy singleton keys remain readable for crash recovery across upgrades.
@@ -30784,7 +30794,7 @@ pub const DB = struct {
         const clock = self.backend_runtime.monotonicClock();
         const wait = derived_executor_mod.VisibilityWait{
             .clock = clock,
-            .deadline_ns = clock.nowRealtimeNs() +| default_visibility_wait_timeout_ms * std.time.ns_per_ms,
+            .deadline_ns = clock.nowRealtimeNs() +| defaultVisibilityWaitTimeoutMs() * std.time.ns_per_ms,
         };
         while (true) {
             try wait.check();
@@ -36647,7 +36657,7 @@ pub const DB = struct {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
-            default_visibility_wait_timeout_ms;
+            defaultVisibilityWaitTimeoutMs();
         const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
         const visibility_clock = self.backend_runtime.monotonicClock();
         const deadline_ns = visibility_clock.nowRealtimeNs() +| timeout_ns;

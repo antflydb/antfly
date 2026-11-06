@@ -147,6 +147,15 @@ pub const SimIo = struct {
     crashed: bool = false,
     crash_barrier: ?Barrier = null,
 
+    /// Latency-injection, independent of any crash plan: when non-zero,
+    /// every `fileSync` sleeps this many nanoseconds around the real
+    /// syscall before this shim does anything else with the result.
+    /// Models an ordinary slow disk under load -- no fault, no crash, just
+    /// a sync that takes longer than usual -- to make "a slow sync alone
+    /// must never corrupt durability bookkeeping" deterministically
+    /// testable instead of relying on incidental machine load.
+    sync_delay_ns: u64 = 0,
+
     /// Guards every field above. A scenario that opens a `db_mod.DB` can
     /// spawn a background maintenance task via `io.concurrent(...)`, which
     /// calls back into this shim's overridden vtable entries from a second
@@ -168,6 +177,7 @@ pub const SimIo = struct {
         self.vtable.fileSync = vtFileSync;
         self.vtable.dirRename = vtDirRename;
         self.vtable.dirRenamePreserve = vtDirRenamePreserve;
+        self.vtable.fileWritePositional = vtFileWritePositional;
         try registerSelf(real.userdata, self);
         return self;
     }
@@ -213,6 +223,13 @@ pub const SimIo = struct {
         self.crash_plan = plan;
         self.crashed = false;
         self.crash_barrier = null;
+    }
+
+    /// Sets (or clears, with 0) the per-sync latency injected by every
+    /// `fileSync` call. Independent of `crash_plan`: this models slowness
+    /// alone, never a fault.
+    pub fn setSyncDelayNs(self: *SimIo, ns: u64) void {
+        self.sync_delay_ns = ns;
     }
 
     pub fn barrierCount(self: *const SimIo) u64 {
@@ -409,8 +426,16 @@ fn selfFrom(userdata: ?*anyopaque) *SimIo {
     return registry.get(userdata).?;
 }
 
+fn simDelayNs(self: *SimIo) u64 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    return self.sync_delay_ns;
+}
+
 fn vtDirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: Dir.CreateFileOptions) File.OpenError!File {
     const self = selfFrom(userdata);
+    const delay_ns = simDelayNs(self);
+    if (delay_ns != 0) std.Io.sleep(self.real, .fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
     const file = try self.real.vtable.dirCreateFile(self.real.userdata, dir, sub_path, opts);
     self.mutex.lock();
     defer self.mutex.unlock();
@@ -420,6 +445,8 @@ fn vtDirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: 
 
 fn vtDirOpenFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: Dir.OpenFileOptions) File.OpenError!File {
     const self = selfFrom(userdata);
+    const delay_ns = simDelayNs(self);
+    if (delay_ns != 0) std.Io.sleep(self.real, .fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
     const file = try self.real.vtable.dirOpenFile(self.real.userdata, dir, sub_path, opts);
     self.mutex.lock();
     defer self.mutex.unlock();
@@ -462,9 +489,16 @@ fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
     // concurrent activity begins, so caching it here (still under the lock,
     // alongside the barrier bookkeeping above) is safe.
     const needs_snapshot = self.crash_plan != null and !self.directories.contains(path);
+    const delay_ns = self.sync_delay_ns;
     self.mutex.unlock();
     defer self.allocator.free(path);
     if (crash_before) return error.InputOutput;
+
+    // Latency injection: models an ordinary slow disk, not a fault. This
+    // must never itself produce anything other than an eventual, ordinary
+    // success -- no timeout, no cancellation, nothing that could be
+    // mistaken for a real I/O error.
+    if (delay_ns != 0) std.Io.sleep(self.real, .fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
 
     try self.real.vtable.fileSync(self.real.userdata, file);
 
@@ -496,6 +530,18 @@ fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
     self.mutex.lock();
     defer self.mutex.unlock();
     if (self.maybeArmAfter(my_sequence)) return error.InputOutput;
+}
+
+/// Latency injection only: writes are never barriers (see this file's own
+/// doc comment -- "plain writes ... are never barriers themselves"), so
+/// this never records anything or touches `crash_plan`. It only sleeps
+/// (when a delay is configured) around the real write, to model a slow
+/// disk's write path, not just its fsync path.
+fn vtFileWritePositional(userdata: ?*anyopaque, file: File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) File.WritePositionalError!usize {
+    const self = selfFrom(userdata);
+    const delay_ns = simDelayNs(self);
+    if (delay_ns != 0) std.Io.sleep(self.real, .fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
+    return self.real.vtable.fileWritePositional(self.real.userdata, file, header, data, splat, offset);
 }
 
 fn vtDirRename(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, new_dir: Dir, new_sub_path: []const u8) Dir.RenameError!void {
