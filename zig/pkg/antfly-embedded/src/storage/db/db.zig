@@ -132653,6 +132653,73 @@ test "db native snapshot rejects an external physical root before creating artif
     try std.testing.expect(!try snapshotPathExists(std.testing.io, snapshot_parent));
 }
 
+test "db external-backend reader observes a writer's latest durable progress v2 record" {
+    // searchLockedWithExecutionContextImpl's logical-value completeness
+    // check used to have a raw-storage fallback here, gated on
+    // `retained_remote_query_lease != null`: a reader attached to a
+    // retained/leased generation (an external physical root sharing the
+    // writer's backing store, exactly like this test's reader) could not
+    // trust its own ordinary read of the applied-sequence watermark. That
+    // was a v1 property, not a cross-process MVCC staleness one: v1 kept
+    // two independently written representations of the same progress (a
+    // scalar KV key, updated through the ordinary docstore write path, and
+    // an "enriched" checkpoint written only to an external file sidecar
+    // via a separate I/O path), and the two could legitimately disagree.
+    // Only the file representation was guaranteed to travel with, and
+    // match, the retained generation's physical content, so the fallback
+    // read it directly through raw storage, bypassing the docstore.
+    //
+    // Progress v2 merges both representations into one record, written
+    // and read through exactly one path (`contributeProgress`/
+    // `loadProgress`, a fresh read each call). There is no longer a second,
+    // independently timed representation that could diverge from it, so
+    // the fallback's raw-storage bypass has nothing left to reconcile.
+    // This test proves the replacement directly: a reader opened with
+    // `physical_root_mode = .external_backend` against the writer's exact
+    // backing store (the same relationship `retained_remote_query_lease`
+    // establishes) observes the writer's latest durable applied sequence
+    // through the ordinary v2 read, with no raw-storage bypass needed.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    defer cleanupTempDir(path);
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "progress-v2-external-reader" });
+    defer runtime_store.deinit();
+
+    var writer = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .primary_runtime_store = &runtime_store,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer writer.close();
+    try writer.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try writer.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+    const writer_applied = try writer.core.loadAppliedSequence(alloc, "ft_v1");
+    try std.testing.expect(writer_applied > 0);
+
+    var reader = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .primary_runtime_store = &runtime_store,
+        .physical_root_mode = .external_backend,
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reader.close();
+    const reader_observed = try apply_state.loadAppliedSequence(alloc, reader.core.store, "ft_v1");
+    try std.testing.expectEqual(writer_applied, reader_observed);
+}
+
 test "native restore backend configuration is resolved exactly once" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
