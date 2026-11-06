@@ -17679,14 +17679,7 @@ pub const DB = struct {
         var build_floor_sequence: u64 = if (resume_building)
             persisted_build_floor_sequence
         else if (resume_candidate)
-            try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                shadow_manager.generation_storage,
-                alloc,
-                shadow_manager.checkpointIo(),
-                self.core.store,
-                shadow_checkpoint_path,
-                cfg.name,
-            )
+            try apply_state.loadAppliedSequence(alloc, self.core.store, cfg.name)
         else
             0;
         var expected_snapshot_coverage: ?u64 = null;
@@ -18426,14 +18419,7 @@ pub const DB = struct {
         batch_ctx.async_context = null;
         batch_ctx.dense_bulk_session_scope = .external;
 
-        var applied = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-            shadow_manager.generation_storage,
-            alloc,
-            shadow_manager.checkpointIo(),
-            self.core.store,
-            shadow_checkpoint_path,
-            index_ref.name,
-        );
+        var applied = try apply_state.loadAppliedSequence(alloc, self.core.store, index_ref.name);
         while (applied < target_sequence) {
             try checkArtifactRepairCancelled(options);
             if (index_ref.kind == .algebraic) {
@@ -18563,6 +18549,8 @@ pub const DB = struct {
         index_ref: index_manager_mod.ManagedIndexRef,
         sequence: u64,
     ) !void {
+        _ = alloc;
+        _ = shadow_checkpoint_path;
         try shadow_manager.checkpointLsmWalForManagedIndex(index_ref);
         const update = apply_state.AppliedSequenceUpdate{
             .index_name = index_ref.name,
@@ -18572,14 +18560,7 @@ pub const DB = struct {
         const updates = [_]apply_state.AppliedSequenceUpdate{update};
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(shadow_manager, &updates);
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(shadow_manager, &updates);
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            shadow_manager.generation_storage,
-            alloc,
-            shadow_manager.checkpointIo(),
-            self.core.store,
-            shadow_checkpoint_path,
-            update,
-        );
+        try apply_state.saveAppliedSequenceUpdate(self.core.store, update);
     }
 
     fn finalizeShadowNativePostingGeneration(
@@ -36947,7 +36928,7 @@ pub const DB = struct {
             // and an empty durable native snapshot. Missing certificates and
             // unfinished generations still require ordinary materialization.
             if (checkpoint.published_count == null and checkpoint.status == .clean) {
-                const previous = apply_state.loadProjectionCheckpointWithSidecar(self.alloc, self.core.index_manager.checkpointIo(), self.core.store, self.core.applied_sequence_checkpoint_path, entry.config.name) catch null;
+                const previous = apply_state.loadProjectionCheckpoint(self.alloc, self.core.store, entry.config.name) catch null;
                 if (previous) |certificate| {
                     const native_snapshot = entry.index.nativeServingSnapshot();
                     if (certificate.status == .clean and certificate.published_count == @as(?u64, 0) and
@@ -42315,20 +42296,13 @@ pub const DB = struct {
             // lagging or partial projection exclude a newer primary value.
             if (!entry.coversPrimaryDocuments() or entry.backfill_active.load(.acquire) != 0) return error.IndexRebuilding;
             // Retained/restored owners may have a persisted checkpoint newer
-            // than a newly attached worker's in-memory observation.
+            // than a newly attached worker's in-memory observation. Progress
+            // v2 lives in the primary KV store itself, so the ordinary read
+            // above already observes it; there is no longer a separate
+            // out-of-band (raw-storage, lease-bypassing) checkpoint location
+            // to additionally consult here.
             var applied = try self.core.loadAppliedSequence(alloc, entry.config.name);
             if (self.executor.appliedSequence(entry.config.name)) |live| applied = @max(applied, live);
-            if (applied < self.core.nextDerivedSequence() and self.retained_remote_query_lease != null) {
-                if (self.primary_lsm_storage) |storage| {
-                    const checkpoint_path = try apply_state.checkpointPathAlloc(alloc, self.core.path);
-                    defer alloc.free(checkpoint_path);
-                    const retained = apply_state.loadProjectionCheckpointFromStorage(alloc, storage, checkpoint_path, entry.config.name) catch |err| switch (err) {
-                        error.FileNotFound => null,
-                        else => return err,
-                    };
-                    if (retained) |checkpoint| applied = @max(applied, checkpoint.applied_sequence);
-                }
-            }
             // The global tail also includes work for unrelated projections.
             // Match the existing readiness/debt contract: inspect replay hints
             // only on the slow path where a global sequence gap exists.
@@ -55810,14 +55784,6 @@ fn saveAppliedSequencesBatchLockedContext(
         // snapshot.
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-        try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-            ctx.index_manager.generation_storage,
-            ctx.alloc,
-            ctx.index_manager.checkpointIo(),
-            ctx.store,
-            ctx.applied_sequence_checkpoint_path,
-            generic_updates.items,
-        );
         var authoritative_lifecycle_completed = false;
         for (enriched_updates) |update| {
             const completed_now = try finalizeCoveredDenseProjectionCheckpoint(active_async_ctx, update.index_name, update.sequence);
@@ -55841,14 +55807,6 @@ fn saveAppliedSequencesBatchLockedContext(
     }
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-    try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-        ctx.index_manager.generation_storage,
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        generic_updates.items,
-    );
     try publishManagedProgress(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items, true, generic_updates.items, false);
 }
 
@@ -55921,15 +55879,17 @@ pub fn resetStatusPersistCountForTest() void {
 ///
 /// This does not replace the physical per-backend effects
 /// (`checkpointManagedProjectionEffectsForAppliedSequenceUpdates`,
-/// `savePhysicalProjectionMetadataForAppliedSequenceUpdates`) or the legacy
-/// v1 checkpoint (`apply_state.saveAppliedSequencesWithCheckpointWithStorage`,
-/// kept so existing v1 readers — serving-certificate checks, repair, restart
-/// before progress v2 — keep working unchanged). Callers must still run
-/// those first, in that order: progress v2 must never claim a boundary the
+/// `savePhysicalProjectionMetadataForAppliedSequenceUpdates`). Callers must
+/// still run those first: progress v2 must never claim a boundary the
 /// physical effects have not reached. `lsm_wal_checkpointed` records only
 /// that `checkpointLsmWalForManagedIndex` was called for `updates` in this
 /// same pass; the WAL checkpoint marker itself lives on the per-index
 /// backend's own pager and is not readable back from this KV record.
+///
+/// Progress v2 is now the sole durable record of a consumer's applied
+/// sequence/identity: there is no separate legacy checkpoint commit left to
+/// keep in sync, so this call *is* the one docstore-side commit for the
+/// flush pass that reaches it.
 fn publishManagedProgress(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -58294,7 +58254,7 @@ fn finishGraphMergeImport(db: anytype, existing_lease: ?*index_manager_mod.Index
         // The rebuild lease already owns the catalog exclusively. Publish
         // coverage without reacquiring the catalog through the generic helper.
         try entry.index.checkpointLsmWalAfterDurableBoundary();
-        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(db.alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path, .{
+        try apply_state.saveAppliedSequenceUpdate(db.core.store, .{
             .index_name = identity.name,
             .sequence = @max(applied, record.value.replay_sequence),
             .config_hash = types.indexConfigHash(entry.config),
@@ -58518,10 +58478,6 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     defer dest_indexes.deinit();
     dest_indexes.setIo(self.core.index_manager.io);
     dest_indexes.setRelaxedSplitDurability(true);
-    const dest_applied_sequence_checkpoint_path = try apply_state.checkpointPathAlloc(self.alloc, dest_dir);
-    defer self.alloc.free(dest_applied_sequence_checkpoint_path);
-    dest_indexes.setAppliedSequenceCheckpointPath(dest_applied_sequence_checkpoint_path);
-
     try clearSplitMetadataFromStore(self.alloc, dest_store);
     try clearSystemMetadataFromSplitDestination(self.alloc, dest_store);
     try copyIdentityMetadataToStore(self.alloc, self.core.store, dest_store);
@@ -58561,7 +58517,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
 
     const configs = try self.core.listIndexes(self.alloc);
     defer types.freeIndexConfigs(self.alloc, configs);
-    try registerSplitDestinationIndexesDirect(self.alloc, dest_store, dest_applied_sequence_checkpoint_path, &dest_indexes, configs, replay_floor -| 1);
+    try registerSplitDestinationIndexesDirect(self.alloc, dest_store, null, &dest_indexes, configs, replay_floor -| 1);
     const collect_skip_doc_keys = true;
     var split_handoffs = try self.core.collectSplitIndexHandoffs(
         &dest_indexes,
@@ -58667,6 +58623,7 @@ fn registerSplitDestinationIndexesDirect(
     configs: []const types.IndexConfig,
     applied_sequence: u64,
 ) !void {
+    _ = applied_sequence_checkpoint_path;
     if (configs.len == 0) return;
 
     try dest_indexes.addAllNoBackfill(dest_store, configs);
@@ -58680,13 +58637,7 @@ fn registerSplitDestinationIndexesDirect(
         };
     }
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(dest_indexes, updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
-        alloc,
-        dest_indexes.checkpointIo(),
-        dest_store,
-        applied_sequence_checkpoint_path,
-        updates,
-    );
+    try apply_state.saveAppliedSequences(dest_store, updates);
 }
 
 fn streamRangeIntoSplitDestinationDirect(
@@ -61674,15 +61625,7 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         .published_count = serving_count,
     };
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
-    try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-        ctx.index_manager.generation_storage,
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        index_name,
-        clean_checkpoint,
-    );
+    try apply_state.saveProjectionCheckpoint(ctx.store, index_name, clean_checkpoint);
     // Stable-tip finalization can race ahead of the applied-sequence flush
     // which normally refreshes this advisory restart snapshot. Persist the
     // live cardinality at the lifecycle boundary itself so a later failed
@@ -61855,7 +61798,7 @@ fn flushFinishedDenseAppliedSequenceLocked(
     const save_start_ns = monotonicTimeNs();
     var posting_publish_ns: u64 = 0;
     var projection_metadata_ns: u64 = 0;
-    var checkpoint_file_ns: u64 = 0;
+    const checkpoint_file_ns: u64 = 0;
     var status_snapshot_ns: u64 = 0;
     // Checkpointing managed projection effects reaches into live index
     // backends. Hold a shared apply lease so concurrent persistence remains
@@ -61894,16 +61837,6 @@ fn flushFinishedDenseAppliedSequenceLocked(
             const metadata_started = monotonicTimeNs();
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             projection_metadata_ns +|= elapsedSince(metadata_started);
-            const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-                ctx.index_manager.generation_storage,
-                ctx.alloc,
-                ctx.index_manager.checkpointIo(),
-                ctx.store,
-                ctx.applied_sequence_checkpoint_path,
-                enriched_updates,
-            );
-            checkpoint_file_ns +|= elapsedSince(checkpoint_started);
         }
         const lifecycle_completed_now = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
         lifecycle_completed.* = lifecycle_completed_now or lifecycle_completed.*;
@@ -61965,7 +61898,7 @@ fn flushPendingAppliedSequencesLocked(
     const sync_ns: u64 = 0;
     var posting_publish_ns: u64 = 0;
     var projection_metadata_ns: u64 = 0;
-    var checkpoint_file_ns: u64 = 0;
+    const checkpoint_file_ns: u64 = 0;
     var status_snapshot_ns: u64 = 0;
 
     const save_start_ns = monotonicTimeNs();
@@ -61994,16 +61927,6 @@ fn flushPendingAppliedSequencesLocked(
             const metadata_started = monotonicTimeNs();
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             projection_metadata_ns +|= elapsedSince(metadata_started);
-            const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-                ctx.index_manager.generation_storage,
-                ctx.alloc,
-                ctx.index_manager.checkpointIo(),
-                ctx.store,
-                ctx.applied_sequence_checkpoint_path,
-                generic_updates.items,
-            );
-            checkpoint_file_ns +|= elapsedSince(checkpoint_started);
         }
         var authoritative_lifecycle_completed = false;
         for (enriched_updates) |update| {
@@ -109684,14 +109607,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
         // count was never written for the newest source boundary.
         var missing_checkpoint = advanced_checkpoint;
         missing_checkpoint.published_count = null;
-        try apply_state.saveProjectionCheckpointWithSidecar(
-            alloc,
-            db.core.index_manager.checkpointIo(),
-            db.core.store,
-            db.core.applied_sequence_checkpoint_path,
-            cfg.name,
-            missing_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, missing_checkpoint);
         try std.testing.expect(entry.validateRecoveredNativeServingCertificate(missing_checkpoint));
         const missing_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, missing_stats);
@@ -109701,14 +109617,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
             try std.testing.expectEqual(target_before, index_stats.doc_count);
         }
         entry.recovered_native_serving_certificate = null;
-        try apply_state.saveProjectionCheckpointWithSidecar(
-            alloc,
-            db.core.index_manager.checkpointIo(),
-            db.core.store,
-            db.core.applied_sequence_checkpoint_path,
-            cfg.name,
-            advanced_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, advanced_checkpoint);
     }
     // A later live write can happen to reach the invalid certificate's
     // cardinality. Status may observe it, but only a publication boundary may
@@ -110101,14 +110010,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
     const restart_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
     var mismatched_restart_checkpoint = restart_checkpoint;
     mismatched_restart_checkpoint.published_count = target_before + 1;
-    try apply_state.saveProjectionCheckpointWithSidecar(
-        alloc,
-        db.core.index_manager.checkpointIo(),
-        db.core.store,
-        db.core.applied_sequence_checkpoint_path,
-        cfg.name,
-        mismatched_restart_checkpoint,
-    );
+    try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, mismatched_restart_checkpoint);
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{
         .start_optional_runtime_workers = false,
@@ -114121,9 +114023,11 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
             .status = .clean,
             .generation = 3,
         });
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
+        // A progress-v2 record that disagrees with HBC's own generation (a
+        // stale/foreign write, or a write from a different incarnation)
+        // must never override the native metadata that is actually serving.
         const mirrored_ahead_sequence: u64 = 1000;
-        try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx", .{
+        try apply_state.saveProjectionCheckpoint(db.core.store, "dense_idx", .{
             .applied_sequence = mirrored_ahead_sequence,
             .status = .clean,
             .generation = 99,
@@ -114168,7 +114072,7 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
     try std.testing.expectEqual(stats.indexes[0].replay_target_sequence -| checkpoint.applied_sequence, stats.indexes[0].checkpoint_replay_tail_sequence_count);
 }
 
-test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" {
+test "db dense projection checkpoint prefers hbc metadata over a corrupt progress v2 record" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -114210,11 +114114,12 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
             .denseIndex("dense_idx").?.index.experimentalPostingDurableAppliedSequence() orelse
             return error.TestUnexpectedResult;
 
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
-        try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
+        // Corrupt the progress v2 record directly (no more separate sidecar
+        // file to corrupt independently of the primary store).
+        try db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:progress:v2:dense_idx", .value = "not-a-progress-v2-record" }}, &.{});
         try std.testing.expectError(
             error.InvalidDerivedApplyState,
-            apply_state.loadProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx"),
+            apply_state.loadProjectionCheckpoint(alloc, db.core.store, "dense_idx"),
         );
     }
 
@@ -115333,7 +115238,7 @@ test "db external dense ingest finalizes an exactly covered rebuilding checkpoin
     try std.testing.expectEqual(@as(u64, 1), checkpoint.generation);
 }
 
-test "db corrupt projection sidecar degrades non-dense checkpoint and quarantines writes" {
+test "db corrupt progress v2 record degrades non-dense checkpoint and quarantines writes" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -115362,8 +115267,7 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and quarantine
             .config_hash = types.indexConfigHash(text_cfg),
         });
 
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
-        try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
+        try db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:progress:v2:ft_idx", .value = "not-a-progress-v2-record" }}, &.{});
     }
 
     {

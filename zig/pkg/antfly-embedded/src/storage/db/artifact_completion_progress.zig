@@ -583,6 +583,11 @@ pub const AdoptionRequests = struct {
 };
 
 pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, manager: *@import("catalog/index_manager.zig").IndexManager, checkpoint_path: ?[]const u8, root: u128, document: []const u8, snapshot: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot, limits: Limits, adoption: ?*AdoptionRequests) !void {
+    // Progress v2 lives in the primary KV store for every backend; there is
+    // no longer an external checkpoint-sidecar file for `checkpoint_path` to
+    // locate. The parameter stays (callers still thread a now-always-null
+    // path through) pending a broader signature cleanup.
+    _ = checkpoint_path;
     if (adoption) |requests| {
         requests.count = 0;
         requests.authority = null;
@@ -639,7 +644,7 @@ pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, 
         }
     }
     if (count == 0) return;
-    var projection = (try @import("derived/apply_state.zig").tryAcquireProjectionSnapshot(alloc, manager.checkpointIo(), store, checkpoint_path)) orelse return;
+    var projection = (try @import("derived/apply_state.zig").tryAcquireProjectionSnapshot(alloc, store)) orelse return;
     defer projection.deinit();
     if (!std.meta.eql(projection.authority, authority)) return error.ArtifactCatalogDrift;
     const deadline = if (limits.time_budget_ns) |budget| @import("antfly_platform").time.monotonicNs() +| budget else std.math.maxInt(u64);

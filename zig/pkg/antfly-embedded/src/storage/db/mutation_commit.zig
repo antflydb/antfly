@@ -4783,6 +4783,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             applied_sequence_checkpoint_path: ?[]const u8,
             index_ref: index_manager_mod.ManagedIndexRef,
         ) !u64 {
+            _ = applied_sequence_checkpoint_path;
             // A WAL-authoritative dense index carries its exact durable replay
             // boundary in the posting checkpoint/WAL commit stream. The projection
             // metadata accessor overlays that boundary on the rarer lifecycle fields.
@@ -4793,13 +4794,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return error.InvalidDerivedApplyState;
                 return checkpoint.applied_sequence;
             }
-            return try apply_state.loadAppliedSequenceWithCheckpoint(
-                alloc,
-                index_manager.checkpointIo(),
-                store,
-                applied_sequence_checkpoint_path,
-                index_ref.name,
-            );
+            return try apply_state.loadAppliedSequence(alloc, store, index_ref.name);
         }
 
         pub fn lockApply(self: anytype) void {

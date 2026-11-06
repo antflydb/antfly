@@ -1039,11 +1039,9 @@ pub const DBCore = struct {
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
             if (dense_checkpoint.config_hash != 0) return dense_checkpoint.applied_sequence;
         }
-        return apply_state.loadAppliedSequenceWithCheckpoint(
+        return apply_state.loadAppliedSequence(
             alloc,
-            self.index_manager.checkpointIo(),
             self.store,
-            self.applied_sequence_checkpoint_path,
             index_name,
         ) catch |err| switch (err) {
             error.InvalidDerivedApplyState => 0,
@@ -1055,20 +1053,18 @@ pub const DBCore = struct {
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
             if (dense_checkpoint.config_hash != 0) {
                 // HBC metadata is the authority for the physical generation.
-                // The sidecar can additionally carry a publication
+                // Progress v2 can additionally carry a publication
                 // certificate introduced after the HBC v2 layout. Merge it
                 // only when every generation identity field agrees; a stale
-                // or legacy sidecar simply falls back to the conservative
+                // record simply falls back to the conservative
                 // pre-certificate proof.
                 var checkpoint = dense_checkpoint;
-                const sidecar = apply_state.loadProjectionCheckpointWithSidecar(
+                const progress = apply_state.loadProjectionCheckpoint(
                     alloc,
-                    self.index_manager.checkpointIo(),
                     self.store,
-                    self.applied_sequence_checkpoint_path,
                     index_name,
                 ) catch null;
-                if (sidecar) |candidate| {
+                if (progress) |candidate| {
                     if (candidate.applied_sequence == checkpoint.applied_sequence and
                         candidate.generation == checkpoint.generation and
                         candidate.config_hash == checkpoint.config_hash)
@@ -1079,11 +1075,9 @@ pub const DBCore = struct {
                 return checkpoint;
             }
         }
-        return apply_state.loadProjectionCheckpointWithSidecar(
+        return apply_state.loadProjectionCheckpoint(
             alloc,
-            self.index_manager.checkpointIo(),
             self.store,
-            self.applied_sequence_checkpoint_path,
             index_name,
         ) catch |err| switch (err) {
             error.InvalidDerivedApplyState => .{
@@ -1144,21 +1138,15 @@ pub const DBCore = struct {
                 .config_hash = config_hash,
             });
         }
-        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
-            self.alloc,
-            self.index_manager.checkpointIo(),
-            self.store,
-            self.applied_sequence_checkpoint_path,
-            .{
-                .index_name = index_name,
-                .sequence = sequence,
-                .config_hash = config_hash,
-                .published_count = if (self.index_manager.denseIndex(index_name)) |entry|
-                    entry.index.servingActiveCountForCheckpoint()
-                else
-                    null,
-            },
-        );
+        try apply_state.saveAppliedSequenceUpdate(self.store, .{
+            .index_name = index_name,
+            .sequence = sequence,
+            .config_hash = config_hash,
+            .published_count = if (self.index_manager.denseIndex(index_name)) |entry|
+                entry.index.servingActiveCountForCheckpoint()
+            else
+                null,
+        });
     }
 
     pub fn saveProjectionCheckpoint(self: *DBCore, index_name: []const u8, checkpoint: apply_state.ProjectionCheckpoint) !void {
@@ -1182,14 +1170,7 @@ pub const DBCore = struct {
             });
             try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, checkpoint_with_identity);
         }
-        try apply_state.saveProjectionCheckpointWithSidecar(
-            self.alloc,
-            self.index_manager.checkpointIo(),
-            self.store,
-            self.applied_sequence_checkpoint_path,
-            index_name,
-            checkpoint_with_identity,
-        );
+        try apply_state.saveProjectionCheckpoint(self.store, index_name, checkpoint_with_identity);
     }
 
     pub fn hasArtifactCleanupMaybe(self: *const DBCore) bool {
@@ -3031,6 +3012,11 @@ pub fn openCoreResourcesFromPrimaryStore(
     root_generation: u64,
     read_only: bool,
 ) !OpenedCoreResources {
+    // Progress v2 lives in the primary KV store for every backend kind; there
+    // is no longer an external checkpoint-sidecar file this flag could ask
+    // for. The parameter stays (callers still pass it) pending a broader
+    // signature cleanup.
+    _ = external_derived_checkpoints;
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
     var owned_index_repair_checkpoint: ?IndexRepairCheckpoint = null;
@@ -3091,10 +3077,13 @@ pub fn openCoreResourcesFromPrimaryStore(
     owned_log_mutex = log_mutex;
     const path_copy = try alloc.dupe(u8, path);
     owned_path = path_copy;
-    const applied_sequence_checkpoint_path = if (external_derived_checkpoints) switch (primary_backend_kind) {
-        .lsm => try apply_state.checkpointPathAlloc(alloc, path),
-        .mem, .lsm_memory => null,
-    } else null;
+    // Progress v2 lives entirely in the primary KV store, for every backend
+    // kind; there is no longer an external checkpoint-sidecar file to
+    // locate. `applied_sequence_checkpoint_path` stays wired through the
+    // structs that still carry it (a larger, separately-scoped cleanup) but
+    // is never populated with a real path, and apply_state.zig no longer
+    // reads it.
+    const applied_sequence_checkpoint_path: ?[]u8 = null;
     owned_applied_sequence_checkpoint_path = applied_sequence_checkpoint_path;
     const index_repair_checkpoint = if (index_repair_checkpoint_storage) |storage| checkpoint_blk: {
         const checkpoint_path = try index_repair_state.checkpointPathAlloc(alloc, index_base_path);

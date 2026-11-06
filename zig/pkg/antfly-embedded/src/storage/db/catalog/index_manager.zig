@@ -6985,37 +6985,22 @@ pub const IndexManager = struct {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
-        var checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name);
+        var checkpoint = try apply_state.loadProjectionCheckpoint(self.alloc, store, entry.config.name);
         checkpoint.status = .rebuilding;
         checkpoint.generation = std.math.add(u64, checkpoint.generation, 1) catch return error.ResourceLimitExceeded;
         checkpoint.config_hash = types.indexConfigHash(entry.config);
         // A crash anywhere after this boundary leaves explicit repair debt,
         // never an old clean watermark attached to an empty physical index.
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name, checkpoint);
+        try apply_state.saveProjectionCheckpoint(store, entry.config.name, checkpoint);
         try rebuild_state.updateWithIo(self.checkpointIo(), "");
         try entry.persistent.resetAllForRebuild();
         try self.backfillTextIndex(store, entry, null);
         try entry.persistent.sync(true);
         try self.saveBackfilledAppliedSequence(store, entry.config);
-        checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            entry.config.name,
-        );
+        checkpoint = try apply_state.loadProjectionCheckpoint(self.alloc, store, entry.config.name);
         checkpoint.status = .clean;
         checkpoint.config_hash = types.indexConfigHash(entry.config);
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            entry.config.name,
-            checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(store, entry.config.name, checkpoint);
 
         const rebuilt = entry.persistent.snapshot().liveDocCount();
         const compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
@@ -9647,7 +9632,7 @@ pub const IndexManager = struct {
     pub const FullTextProjectionGuard = struct {
         alloc: Allocator,
         apply_guard: ManagedIndexApplyGuard,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         admission_key: []u8,
         index_name: []const u8,
         seal: @import("../../projection_seal.zig").Seal,
@@ -9680,7 +9665,7 @@ pub const IndexManager = struct {
     pub fn tryValidateFullTextProjection(
         self: *IndexManager,
         alloc: Allocator,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         index_name: []const u8,
         expected_generation: u64,
     ) !?FullTextProjectionGuard {
@@ -9693,7 +9678,7 @@ pub const IndexManager = struct {
     pub fn tryValidateFullTextProjectionWithAdoptionHint(
         self: *IndexManager,
         alloc: Allocator,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         index_name: []const u8,
         expected_generation: u64,
         needs_adoption: ?*bool,
@@ -9801,10 +9786,12 @@ pub const IndexManager = struct {
         checkpoint_path: ?[]const u8,
         index_name: []const u8,
     ) !void {
+        _ = alloc;
+        _ = checkpoint_path;
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         const checkpoint = self.denseProjectionCheckpointMetadata(index_name) orelse return error.InvalidDerivedApplyState;
         const certified = entry.certifiedEmptyNativeCheckpoint(checkpoint) orelse return;
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(self.generation_storage, alloc, self.checkpointIo(), store, checkpoint_path, index_name, certified);
+        try apply_state.saveProjectionCheckpoint(store, index_name, certified);
         _ = entry.validateServingCertificate(certified);
     }
 
@@ -14005,13 +13992,14 @@ pub const IndexManager = struct {
     }
 
     fn clearAppliedSequenceAfterCatalogRemoval(self: *IndexManager, store: anytype, name: []const u8) void {
+        _ = self;
         if (builtin.is_test) {
             if (test_inject_index_removal_cleanup_error) |err| {
                 std.log.warn("index removal committed with injected stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
                 return;
             }
         }
-        apply_state.clearAppliedSequenceWithCheckpointWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, name) catch |err| {
+        apply_state.clearAppliedSequence(store, name) catch |err| {
             std.log.warn("index removal committed with stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -14625,14 +14613,7 @@ pub const IndexManager = struct {
         // The durable cleanup tombstone prevents same-name admission until
         // finalization succeeds, so checkpoint and filesystem I/O need not hold
         // the catalog lock used by unrelated indexes.
-        try apply_state.clearAppliedSequenceWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            name,
-        );
+        try apply_state.clearAppliedSequence(store, name);
         // Algebraic keyspaces are drained in bounded, cursor-backed outbox
         // phases before finalization reaches this filesystem-only tail.
         if (active_path) |path| {
@@ -22166,18 +22147,12 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         sequence: u64,
     ) !void {
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            .{
-                .index_name = cfg.name,
-                .sequence = sequence,
-                .config_hash = types.indexConfigHash(cfg),
-            },
-        );
+        _ = self;
+        try apply_state.saveAppliedSequenceUpdate(store, .{
+            .index_name = cfg.name,
+            .sequence = sequence,
+            .config_hash = types.indexConfigHash(cfg),
+        });
     }
 
     /// Complete a fresh physical generation before the logical catalog makes
@@ -22256,15 +22231,7 @@ pub const IndexManager = struct {
             .generation = projection_checkpoint.generation,
             .config_hash = projection_checkpoint.config_hash,
         });
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            cfg.name,
-            projection_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(store, cfg.name, projection_checkpoint);
         try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
             self.generation_storage,
             self.alloc,
@@ -22324,7 +22291,7 @@ pub const IndexManager = struct {
         self.invalidateIndexPathCaches(canonical_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
         if (cfg.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, cfg.name);
-        try apply_state.clearAppliedSequenceWithCheckpointWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, cfg.name);
+        try apply_state.clearAppliedSequence(store, cfg.name);
     }
 
     fn invalidateIndexPathCaches(self: *const IndexManager, path: []const u8) void {
@@ -23032,18 +22999,11 @@ pub const IndexManager = struct {
         if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
             backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
         }
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            .{
-                .index_name = cfg.name,
-                .sequence = backfilled_sequence,
-                .config_hash = types.indexConfigHash(cfg),
-            },
-        );
+        try apply_state.saveAppliedSequenceUpdate(store, .{
+            .index_name = cfg.name,
+            .sequence = backfilled_sequence,
+            .config_hash = types.indexConfigHash(cfg),
+        });
     }
 
     fn storeSupportsLatestReplaySequenceForHint(comptime T: type) bool {
@@ -23602,12 +23562,9 @@ pub const IndexManager = struct {
                             return error.PostingWalMutationStoreRequiresRebuild;
                         }
                     } else {
-                        const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                            self.generation_storage,
+                        const applied_sequence = try apply_state.loadAppliedSequence(
                             self.alloc,
-                            self.checkpointIo(),
                             store,
-                            self.applied_sequence_checkpoint_path,
                             cfg.name,
                         );
                         posting_sequence = applied_sequence;
@@ -23943,14 +23900,7 @@ pub const IndexManager = struct {
                 // projection and must not turn reopen into a full rebuild.
                 const reverse_edges = entry.index.edge_count;
 
-                const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                    self.generation_storage,
-                    self.alloc,
-                    self.checkpointIo(),
-                    store,
-                    self.applied_sequence_checkpoint_path,
-                    cfg.name,
-                );
+                const applied_sequence = try apply_state.loadAppliedSequence(self.alloc, store, cfg.name);
                 const latest_replay_sequence = store.nextReplaySequence(1) -| 1;
                 const graph_replay_pending = applied_sequence < latest_replay_sequence;
                 const has_replay_history = latest_replay_sequence != 0;
