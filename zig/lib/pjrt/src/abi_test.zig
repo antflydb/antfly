@@ -17,8 +17,8 @@
 //! header. The dynamic fixture alone cannot catch a shared slot-number mistake.
 const std = @import("std");
 const c = @import("pjrt_c_types.zig");
-extern const antfly_pjrt_api_offsets: [22]usize;
-extern const antfly_pjrt_arg_layouts: [14]usize;
+extern const antfly_pjrt_api_offsets: [26]usize;
+extern const antfly_pjrt_arg_layouts: [38]usize;
 
 test "PJRT function slots match the upstream C header" {
     const Slot = struct { index: usize, name: []const u8 };
@@ -36,12 +36,16 @@ test "PJRT function slots match the upstream C header" {
         .{ .index = c.Api.FN_CLIENT_BUFFER_FROM_HOST, .name = "PJRT_Client_BufferFromHostBuffer" },
         .{ .index = c.Api.FN_EXEC_DESTROY, .name = "PJRT_Executable_Destroy" },
         .{ .index = c.Api.FN_EXEC_NUM_OUTPUTS, .name = "PJRT_Executable_NumOutputs" },
+        .{ .index = c.Api.FN_EXEC_OUTPUT_TYPES, .name = "PJRT_Executable_OutputElementTypes" },
+        .{ .index = c.Api.FN_EXEC_OUTPUT_DIMENSIONS, .name = "PJRT_Executable_OutputDimensions" },
         .{ .index = c.Api.FN_EXEC_SERIALIZE, .name = "PJRT_Executable_Serialize" },
         .{ .index = c.Api.FN_LOADED_EXEC_DESTROY, .name = "PJRT_LoadedExecutable_Destroy" },
         .{ .index = c.Api.FN_LOADED_EXEC_GET_EXECUTABLE, .name = "PJRT_LoadedExecutable_GetExecutable" },
         .{ .index = c.Api.FN_LOADED_EXEC_EXECUTE, .name = "PJRT_LoadedExecutable_Execute" },
         .{ .index = c.Api.FN_EXEC_DESERIALIZE_AND_LOAD, .name = "PJRT_Executable_DeserializeAndLoad" },
         .{ .index = c.Api.FN_BUFFER_DESTROY, .name = "PJRT_Buffer_Destroy" },
+        .{ .index = c.Api.FN_BUFFER_ELEMENT_TYPE, .name = "PJRT_Buffer_ElementType" },
+        .{ .index = c.Api.FN_BUFFER_DIMENSIONS, .name = "PJRT_Buffer_Dimensions" },
         .{ .index = c.Api.FN_BUFFER_ON_DEVICE_SIZE, .name = "PJRT_Buffer_OnDeviceSizeInBytes" },
         .{ .index = c.Api.FN_BUFFER_TO_HOST, .name = "PJRT_Buffer_ToHostBuffer" },
         .{ .index = c.Api.FN_EXEC_COMPILED_MEMORY_STATS, .name = "PJRT_Executable_GetCompiledMemoryStats" },
@@ -78,6 +82,30 @@ test "PJRT executable ownership and arity argument layouts match upstream" {
         @offsetOf(c.ExecutableNumOutputsArgs, "extension_start"),
         @offsetOf(c.ExecutableNumOutputsArgs, "executable"),
         @offsetOf(c.ExecutableNumOutputsArgs, "num_outputs"),
+        @sizeOf(c.BufferElementTypeArgs),
+        @offsetOf(c.BufferElementTypeArgs, "struct_size"),
+        @offsetOf(c.BufferElementTypeArgs, "extension_start"),
+        @offsetOf(c.BufferElementTypeArgs, "buffer"),
+        @offsetOf(c.BufferElementTypeArgs, "buffer_type"),
+        @sizeOf(c.BufferDimensionsArgs),
+        @offsetOf(c.BufferDimensionsArgs, "struct_size"),
+        @offsetOf(c.BufferDimensionsArgs, "extension_start"),
+        @offsetOf(c.BufferDimensionsArgs, "buffer"),
+        @offsetOf(c.BufferDimensionsArgs, "dims"),
+        @offsetOf(c.BufferDimensionsArgs, "num_dims"),
+        @sizeOf(c.ExecutableOutputElementTypesArgs),
+        @offsetOf(c.ExecutableOutputElementTypesArgs, "struct_size"),
+        @offsetOf(c.ExecutableOutputElementTypesArgs, "extension_start"),
+        @offsetOf(c.ExecutableOutputElementTypesArgs, "executable"),
+        @offsetOf(c.ExecutableOutputElementTypesArgs, "output_types"),
+        @offsetOf(c.ExecutableOutputElementTypesArgs, "num_output_types"),
+        @sizeOf(c.ExecutableOutputDimensionsArgs),
+        @offsetOf(c.ExecutableOutputDimensionsArgs, "struct_size"),
+        @offsetOf(c.ExecutableOutputDimensionsArgs, "extension_start"),
+        @offsetOf(c.ExecutableOutputDimensionsArgs, "executable"),
+        @offsetOf(c.ExecutableOutputDimensionsArgs, "num_outputs"),
+        @offsetOf(c.ExecutableOutputDimensionsArgs, "dims"),
+        @offsetOf(c.ExecutableOutputDimensionsArgs, "dim_sizes"),
     };
     try std.testing.expectEqualSlices(usize, &antfly_pjrt_arg_layouts, &layouts);
 }

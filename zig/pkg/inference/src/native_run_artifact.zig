@@ -2841,7 +2841,9 @@ test "run-artifact admitted PJRT packages share phase memory and refund every fa
     var outputs = [_]u32{0};
     artifact.pjrt_input_shapes = &shapes;
     artifact.pjrt_input_bindings = &bindings;
-    artifact.pjrt_output_shapes = &shapes;
+    var output_shape = [_]i64{2};
+    var output_shapes = [_][]i64{&output_shape};
+    artifact.pjrt_output_shapes = &output_shapes;
     artifact.pjrt_output_node_ids = &outputs;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("fixture executable", &digest, .{});
@@ -3143,6 +3145,22 @@ fn managedPrefillReuseScenario(a: std.mem.Allocator, prefill: []const u8, plugin
     try graph.markOutput(parameter);
     var backend: ops.ComputeBackend = undefined;
     try managedExecutorMetadataScenario(a, prefill, plugin, &graph, &backend);
+
+    // Native logits have shape [2]. A plausible sidecar [1, 1] used to
+    // truncate logits silently; reject it before publishing a runtime.
+    {
+        var parsed = try compiled_artifact.readManifest(a, std.testing.io, prefill);
+        defer parsed.deinit();
+        var bad_shape = [_]i64{ 1, 1 };
+        const original_shape = parsed.value.pjrt_output_shapes[0];
+        parsed.value.pjrt_output_shapes[0] = &bad_shape;
+        defer parsed.value.pjrt_output_shapes[0] = original_shape;
+        const before = manager.currentAdmissionAmounts();
+        try std.testing.expectError(error.PjrtApiError, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(a, &.{parsed.value}, &graph, &backend, &context, plugin));
+        try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+        try std.testing.expectEqual(count(3), count(4));
+        try std.testing.expectEqual(count(5), count(6));
+    }
 
     const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{}, &graph, &backend, &context, plugin);
     var owned = executor.modelExecutor();

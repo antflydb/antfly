@@ -348,8 +348,12 @@ pub const Api = extern struct {
     pub const FN_LOADED_EXEC_EXECUTE = 55;
     pub const FN_EXEC_DESERIALIZE_AND_LOAD = 56;
     pub const FN_BUFFER_DESTROY = 58;
+    pub const FN_BUFFER_ELEMENT_TYPE = 59;
+    pub const FN_BUFFER_DIMENSIONS = 60;
     pub const FN_BUFFER_ON_DEVICE_SIZE = 64;
     pub const FN_BUFFER_TO_HOST = 70;
+    pub const FN_EXEC_OUTPUT_TYPES = 90;
+    pub const FN_EXEC_OUTPUT_DIMENSIONS = 91;
     pub const FN_EXEC_COMPILED_MEMORY_STATS = 96;
 
     // ── Typed accessors ────────────────────────────────────────────
@@ -451,6 +455,15 @@ pub const Api = extern struct {
         return f(args);
     }
 
+    pub fn hasOutputShapes(self: *const Api) bool {
+        return self.hasOwnedExecutableAccess() and self.hasFunction(FN_EXEC_OUTPUT_TYPES) and self.hasFunction(FN_EXEC_OUTPUT_DIMENSIONS);
+    }
+    pub fn executableOutputTypes(self: *const Api, args: *ExecutableOutputElementTypesArgs) ?*PjrtError {
+        return castFn(*const fn (*ExecutableOutputElementTypesArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_OUTPUT_TYPES].?)(args);
+    }
+    pub fn executableOutputDimensions(self: *const Api, args: *ExecutableOutputDimensionsArgs) ?*PjrtError {
+        return castFn(*const fn (*ExecutableOutputDimensionsArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_OUTPUT_DIMENSIONS].?)(args);
+    }
     pub fn hasOutputCount(self: *const Api) bool {
         return self.hasOwnedExecutableAccess() and self.hasFunction(FN_EXEC_NUM_OUTPUTS);
     }
@@ -473,6 +486,18 @@ pub const Api = extern struct {
     pub fn loadedExecutableExecute(self: *const Api, args: *LoadedExecutableExecuteArgs) ?*PjrtError {
         const f = castFn(*const fn (*LoadedExecutableExecuteArgs) callconv(.c) ?*PjrtError, self._fns[FN_LOADED_EXEC_EXECUTE].?);
         return f(args);
+    }
+
+    pub fn bufferElementType(self: *const Api, args: *BufferElementTypeArgs) ?*PjrtError {
+        const f = castFn(*const fn (*BufferElementTypeArgs) callconv(.c) ?*PjrtError, self._fns[FN_BUFFER_ELEMENT_TYPE].?);
+        return f(args);
+    }
+    pub fn bufferDimensions(self: *const Api, args: *BufferDimensionsArgs) ?*PjrtError {
+        const f = castFn(*const fn (*BufferDimensionsArgs) callconv(.c) ?*PjrtError, self._fns[FN_BUFFER_DIMENSIONS].?);
+        return f(args);
+    }
+    pub fn hasBufferReadback(self: *const Api) bool {
+        return self.hasFunction(FN_BUFFER_ELEMENT_TYPE) and self.hasFunction(FN_BUFFER_DIMENSIONS) and self.hasFunction(FN_BUFFER_TO_HOST);
     }
 
     pub fn bufferDestroy(self: *const Api, args: *BufferDestroyArgs) ?*PjrtError {
@@ -499,4 +524,34 @@ pub const ExecutableNumOutputsArgs = extern struct {
     extension_start: ?*anyopaque,
     executable: *PjrtExecutable,
     num_outputs: usize,
+};
+
+pub const BufferElementTypeArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    buffer: ?*PjrtBuffer,
+    buffer_type: BufferType,
+};
+pub const BufferDimensionsArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    buffer: ?*PjrtBuffer,
+    dims: ?[*]const i64,
+    num_dims: usize,
+};
+
+pub const ExecutableOutputElementTypesArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: ?*PjrtExecutable,
+    output_types: ?[*]const BufferType,
+    num_output_types: usize,
+};
+pub const ExecutableOutputDimensionsArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: ?*PjrtExecutable,
+    num_outputs: usize,
+    dims: ?[*]const i64,
+    dim_sizes: ?[*]const usize,
 };

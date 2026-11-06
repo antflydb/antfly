@@ -384,6 +384,7 @@ fn createAdmittedModelExecutorWithAllocator(
         .semantic_output_bindings = prefill.semantic_output_bindings,
         .decode_variants = variants,
     };
+    executor.prepareOutputMappings();
     return executor;
 }
 

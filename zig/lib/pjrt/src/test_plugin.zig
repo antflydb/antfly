@@ -105,6 +105,20 @@ fn numOutputs(args: *c.ExecutableNumOutputsArgs) callconv(.c) ?*c.PjrtError {
     args.num_outputs = if (@as(*const u8, @ptrCast(args.executable)).* == 0) 1 else 3;
     return null;
 }
+const output_types = [_]c.BufferType{ .float32, .float32, .float32 };
+const output_dims = [_]i64{ 2, 1, 1 };
+const output_ranks = [_]usize{ 1, 1, 1 };
+fn outputTypes(args: *c.ExecutableOutputElementTypesArgs) callconv(.c) ?*c.PjrtError {
+    args.output_types = &output_types;
+    args.num_output_types = if (@as(*const u8, @ptrCast(args.executable.?)).* == 0) 1 else 3;
+    return null;
+}
+fn outputDimensions(args: *c.ExecutableOutputDimensionsArgs) callconv(.c) ?*c.PjrtError {
+    args.num_outputs = if (@as(*const u8, @ptrCast(args.executable.?)).* == 0) 1 else 3;
+    args.dims = &output_dims;
+    args.dim_sizes = &output_ranks;
+    return null;
+}
 fn stats(args: *c.ExecutableGetCompiledMemoryStatsArgs) callconv(.c) ?*c.PjrtError {
     args.generated_code_size_in_bytes = 64;
     args.argument_size_in_bytes = 4096;
@@ -112,13 +126,15 @@ fn stats(args: *c.ExecutableGetCompiledMemoryStatsArgs) callconv(.c) ?*c.PjrtErr
     args.temp_size_in_bytes = 128;
     return null;
 }
-const DataBuffer = struct { bytes: []u8 };
+const DataBuffer = struct { bytes: []u8, dims: []i64, kind: c.BufferType };
 fn dataBuffer(raw: ?*c.PjrtBuffer) *DataBuffer {
     return @ptrCast(@alignCast(raw.?));
 }
 fn newBuffer(bytes: []const u8) *c.PjrtBuffer {
     const buffer = std.heap.c_allocator.create(DataBuffer) catch @panic("fixture allocation");
     buffer.bytes = std.heap.c_allocator.dupe(u8, bytes) catch @panic("fixture allocation");
+    buffer.dims = std.heap.c_allocator.dupe(i64, &.{@intCast(bytes.len / 4)}) catch @panic("fixture allocation");
+    buffer.kind = .float32;
     counters[8] += 1;
     if (bytes.len == @sizeOf(f32)) {
         counters[11] += bytes.len;
@@ -130,12 +146,17 @@ fn upload(args: *c.ClientBufferFromHostBufferArgs) callconv(.c) ?*c.PjrtError {
     var bytes: usize = if (args.buffer_type == .int64) 8 else 4;
     for (args.dims.?[0..args.num_dims]) |dim| bytes *= @intCast(dim);
     args.buffer = newBuffer(@as([*]const u8, @ptrCast(args.data.?))[0..bytes]);
+    const buffer = dataBuffer(args.buffer);
+    std.heap.c_allocator.free(buffer.dims);
+    buffer.dims = std.heap.c_allocator.dupe(i64, args.dims.?[0..args.num_dims]) catch @panic("fixture allocation");
+    buffer.kind = args.buffer_type;
     args.done_with_host_buffer = null;
     return null;
 }
 fn destroyBuffer(args: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
     const buffer = dataBuffer(args.buffer);
     if (buffer.bytes.len == @sizeOf(f32)) counters[11] -= buffer.bytes.len;
+    std.heap.c_allocator.free(buffer.dims);
     std.heap.c_allocator.free(buffer.bytes);
     std.heap.c_allocator.destroy(buffer);
     counters[9] += 1;
@@ -145,8 +166,23 @@ fn bufferSize(args: *c.BufferOnDeviceSizeInBytesArgs) callconv(.c) ?*c.PjrtError
     args.on_device_size_in_bytes = dataBuffer(args.buffer).bytes.len;
     return null;
 }
+fn bufferType(args: *c.BufferElementTypeArgs) callconv(.c) ?*c.PjrtError {
+    args.buffer_type = dataBuffer(args.buffer).kind;
+    return null;
+}
+fn bufferDimensions(args: *c.BufferDimensionsArgs) callconv(.c) ?*c.PjrtError {
+    const dims = dataBuffer(args.buffer).dims;
+    args.dims = dims.ptr;
+    args.num_dims = dims.len;
+    return null;
+}
 fn download(args: *c.BufferToHostBufferArgs) callconv(.c) ?*c.PjrtError {
     const data = dataBuffer(args.src).bytes;
+    if (args.dst == null) {
+        args.dst_size = data.len;
+        args.event = null;
+        return null;
+    }
     std.debug.assert(args.dst_size >= data.len);
     @memcpy(@as([*]u8, @ptrCast(args.dst.?))[0..data.len], data);
     args.event = null;
@@ -182,6 +218,8 @@ var api: c.Api = blk: {
     value._fns[16] = @ptrCast(&addressable);
     value._fns[20] = @ptrCast(&compile);
     value._fns[22] = @ptrCast(&upload);
+    value._fns[90] = @ptrCast(&outputTypes);
+    value._fns[91] = @ptrCast(&outputDimensions);
     value._fns[44] = @ptrCast(&numOutputs);
     value._fns[40] = @ptrCast(&destroyExecutable);
     value._fns[49] = @ptrCast(&serialize);
@@ -189,6 +227,8 @@ var api: c.Api = blk: {
     value._fns[51] = @ptrCast(&executable);
     value._fns[55] = @ptrCast(&execute);
     value._fns[56] = @ptrCast(&deserialize);
+    value._fns[59] = @ptrCast(&bufferType);
+    value._fns[60] = @ptrCast(&bufferDimensions);
     value._fns[58] = @ptrCast(&destroyBuffer);
     value._fns[64] = @ptrCast(&bufferSize);
     value._fns[70] = @ptrCast(&download);

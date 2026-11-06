@@ -614,8 +614,10 @@ Near-term graph/backend work:
 
 See also: [MULTIDEVICE.md](MULTIDEVICE.md) for multi-device inference, [FINETUNING.md](finetuning/FINETUNING.md) for training support.
 
-Serialized PJRT executables are checked against the provider's native output count
-before use. A sidecar with a mismatched count, out-of-range input graph reference,
+Compiled HLO and serialized PJRT executables are checked against the provider's
+native output count before use. Executor loading also verifies native F32 output
+types and exact dimensions against the supplied shapes, before publishing a runtime.
+A sidecar with a mismatched count, out-of-range input graph reference,
 or duplicate semantic ownership of a native output is rejected during loading.
 KV identity is `(layer_index, kind)` when a layer is supplied and `(name, kind)`
 otherwise. Admitted runtime slots preallocate a semantic hash index alongside
@@ -633,3 +635,10 @@ names may differ. A phase cannot give two outputs ownership of one logical KV
 state. Semantic input bindings are canonicalized by input position when cloned.
 Execution validates this ordering and traverses sparse bindings alongside inputs
 in linear time, without creating an index or copying names on each step.
+
+Logits output positions are resolved once for each phase before publication;
+decode phase selection uses binary search over the sorted sequence lengths.
+F32 readback queries the provider's host-transfer size rather than physical device
+storage, validates element type, logical dimensions, and checked byte count before
+allocation, and releases completion events on failures. Whole-model readback also
+checks runtime dimensions against the admitted logits shape before slicing.

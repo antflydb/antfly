@@ -377,47 +377,17 @@ pub fn createExecutor(
     var executable = try client.compile(result.hlo_bytes, result.output_node_ids.len);
     errdefer executable.deinit();
 
-    // 3. Collect shapes from graph nodes
-    const num_inputs = result.input_bindings.len;
-    const num_outputs = result.output_node_ids.len;
-
-    const input_shapes = try allocator.alloc([]i64, num_inputs);
-    errdefer {
-        for (input_shapes[0..num_inputs]) |s| allocator.free(s);
-        allocator.free(input_shapes);
-    }
-    for (result.input_shapes, 0..) |shape, i| input_shapes[i] = try allocator.dupe(i64, shape);
-
-    const output_shapes = try allocator.alloc([]i64, num_outputs);
-    errdefer {
-        for (output_shapes[0..num_outputs]) |s| allocator.free(s);
-        allocator.free(output_shapes);
-    }
-    for (result.output_shapes, 0..) |shape, i| output_shapes[i] = try allocator.dupe(i64, shape);
-
-    // 4. Take ownership of node IDs
-    const input_node_ids = try allocator.dupe(NodeId, result.input_node_ids);
-    errdefer allocator.free(input_node_ids);
-    const input_bindings = try allocator.dupe(compiler.InputBinding, result.input_bindings);
-    errdefer allocator.free(input_bindings);
-    const output_node_ids = try allocator.dupe(NodeId, result.output_node_ids);
-    errdefer allocator.free(output_node_ids);
-
-    // 5. Create executor
-    const exec = try allocator.create(PjrtExecutor);
-    exec.* = .{
-        .allocator = allocator,
-        .executable = executable,
-        .client = client,
-        .host_backend = host_backend,
-        .input_node_ids = input_node_ids,
-        .input_bindings = input_bindings,
-        .output_node_ids = output_node_ids,
-        .output_shapes = output_shapes,
-        .input_shapes_ = input_shapes,
-    };
-    exec.pe = .{ .ptr = exec, .vtable = &PjrtExecutor.vtable };
-    return exec;
+    return createExecutorFromLoadedExecutable(
+        allocator,
+        graph,
+        executable,
+        result.input_bindings,
+        result.output_node_ids,
+        result.input_shapes,
+        result.output_shapes,
+        host_backend,
+        client,
+    );
 }
 
 pub fn createExecutorFromHlo(
@@ -604,6 +574,8 @@ fn createExecutorFromLoadedExecutable(
         };
         output_shapes_initialized += 1;
     }
+
+    try executable.validateOutputShapes(output_shapes);
 
     var input_node_ids_list = std.ArrayListUnmanaged(NodeId).empty;
     errdefer input_node_ids_list.deinit(allocator);
@@ -849,14 +821,24 @@ pub const PjrtModelExecutor = struct {
     semantic_input_bindings: []PjrtSemanticInputBinding = &.{},
     semantic_output_bindings: []PjrtSemanticOutputBinding = &.{},
     decode_variants: []DecodeVariant = &.{},
+    logits_index: ?usize = null,
 
     pub const DecodeVariant = struct {
+        logits_index: ?usize = null,
         seq_len: usize,
         executor: *PjrtExecutor,
         input_materialization: PjrtInputMaterialization,
         semantic_input_bindings: []PjrtSemanticInputBinding,
         semantic_output_bindings: []PjrtSemanticOutputBinding,
     };
+
+    /// Resolve immutable output mappings once, before publishing the executor.
+    pub fn prepareOutputMappings(self: *@This()) void {
+        self.logits_index = primaryGraphOutputIndex(self.graph, self.executor.output_node_ids, self.semantic_output_bindings);
+        for (self.decode_variants) |*variant| {
+            variant.logits_index = primaryGraphOutputIndex(self.graph, variant.executor.output_node_ids, variant.semantic_output_bindings);
+        }
+    }
 
     const RuntimeSlot = struct {
         busy: std.atomic.Value(bool) = .init(false),
@@ -914,6 +896,7 @@ pub const PjrtModelExecutor = struct {
         runtime_ctx.* = .{
             .allocator = allocator,
             .runtime_slot = selected,
+            .logits_index = self.logits_index,
             .graph = self.graph,
             .executor = self.executor,
             .host_backend = self.host_backend,
@@ -965,6 +948,7 @@ pub fn deinitModelExecutorPtr(ctx: *anyopaque) void {
 }
 
 const PjrtModelRuntime = struct {
+    logits_index: ?usize = null,
     execution_lease: ?@import("pjrt_admission.zig").Package.RuntimeLease = null,
     artifact_executor_owner: ?*PjrtModelExecutor = null,
     allocator: Allocator,
@@ -1039,6 +1023,7 @@ const PjrtModelRuntime = struct {
     }
 
     const Phase = struct {
+        logits_index: ?usize,
         executor: *PjrtExecutor,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
         semantic_output_bindings: []const PjrtSemanticOutputBinding,
@@ -1047,16 +1032,25 @@ const PjrtModelRuntime = struct {
     fn prefillPhase(self: *const PjrtModelRuntime) Phase {
         return .{
             .executor = self.executor,
+            .logits_index = self.logits_index,
             .semantic_input_bindings = self.semantic_input_bindings,
             .semantic_output_bindings = self.semantic_output_bindings,
         };
     }
 
     fn decodePhaseForSeqLen(self: *const PjrtModelRuntime, seq_len: usize) ?Phase {
-        for (self.decode_variants) |variant| {
-            if (variant.seq_len != seq_len) continue;
-            return .{
+        var low: usize = 0;
+        var high = self.decode_variants.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const variant = self.decode_variants[middle];
+            if (variant.seq_len < seq_len) {
+                low = middle + 1;
+            } else if (variant.seq_len > seq_len) {
+                high = middle;
+            } else return .{
                 .executor = variant.executor,
+                .logits_index = variant.logits_index,
                 .semantic_input_bindings = variant.semantic_input_bindings,
                 .semantic_output_bindings = variant.semantic_output_bindings,
             };
@@ -1127,7 +1121,7 @@ const PjrtModelRuntime = struct {
             retained[binding.output_index] = true;
         }
 
-        const logits_index = primaryGraphOutputIndex(self.graph, phase.executor.output_node_ids, phase.semantic_output_bindings) orelse return error.MissingOutput;
+        const logits_index = phase.logits_index orelse return error.MissingOutput;
         if (debug) {
             const size_bytes = try outputs[logits_index].onDeviceSizeInBytes();
             std.log.info(
@@ -1136,7 +1130,7 @@ const PjrtModelRuntime = struct {
             );
         }
         const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
-        const output_f32 = try outputs[logits_index].toFloat32(staging_allocator);
+        const output_f32 = try outputs[logits_index].toFloat32WithShape(staging_allocator, phase.executor.output_shapes[logits_index]);
         defer staging_allocator.free(output_f32);
         if (debug) std.log.info("PJRT ModelRuntime logits read floats={d}", .{output_f32.len});
         const logits = try sliceLastLogits(allocator, output_f32, phase.executor.output_shapes[logits_index], query_seq_len);
@@ -1217,6 +1211,7 @@ pub fn createModelExecutor(
         .semantic_input_bindings = &.{},
         .semantic_output_bindings = &.{},
     };
+    exec.prepareOutputMappings();
     return exec;
 }
 
@@ -1257,6 +1252,7 @@ pub fn createModelExecutorFromHlo(
         .semantic_input_bindings = owned_semantic_input_bindings,
         .semantic_output_bindings = owned_semantic_output_bindings,
     };
+    exec.prepareOutputMappings();
     return exec;
 }
 
@@ -1375,6 +1371,7 @@ pub fn createModelExecutorFromHloPackages(
         .semantic_output_bindings = owned_prefill_semantic_output_bindings,
         .decode_variants = decode_variants,
     };
+    exec.prepareOutputMappings();
     return exec;
 }
 
@@ -1482,6 +1479,7 @@ pub fn createModelExecutorFromExecutablePackages(
         .semantic_output_bindings = owned_prefill_semantic_output_bindings,
         .decode_variants = decode_variants,
     };
+    exec.prepareOutputMappings();
     return exec;
 }
 
@@ -2210,4 +2208,37 @@ test "managed PJRT KV identity hashing agrees with equality" {
     try std.testing.expectEqual(a.hash(), b.hash());
     try std.testing.expect(!(KvIdentity{ .name = "a", .layer_index = null, .kind = .key }).eql(.{ .name = "b", .layer_index = null, .kind = .key }));
     try std.testing.expect(!a.eql(.{ .name = "prefill", .layer_index = 0, .kind = .value }));
+}
+
+test "PJRT whole-model caches permuted logits mappings and finds sparse decode phases" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{2}));
+    const logits = try builder.parameter("logits", ml.graph.Shape.init(.f32, &.{2}));
+    try graph.markOutput(logits);
+    var prefill_ids = [_]NodeId{ input, logits, logits };
+    var decode_ids = [_]NodeId{ logits, input };
+    var prefill: PjrtExecutor = undefined;
+    prefill.output_node_ids = &prefill_ids;
+    var decode: PjrtExecutor = undefined;
+    decode.output_node_ids = &decode_ids;
+    var bindings = [_]PjrtSemanticOutputBinding{.{ .output_index = 2, .name = "present", .layer_index = 0, .kind = .key }};
+    var variants = [_]PjrtModelExecutor.DecodeVariant{
+        .{ .seq_len = 3, .executor = &decode, .input_materialization = .host_assisted_graph_inputs, .semantic_input_bindings = &.{}, .semantic_output_bindings = &.{} },
+        .{ .seq_len = 16, .executor = &decode, .input_materialization = .host_assisted_graph_inputs, .semantic_input_bindings = &.{}, .semantic_output_bindings = &.{} },
+        .{ .seq_len = 128, .executor = &decode, .input_materialization = .host_assisted_graph_inputs, .semantic_input_bindings = &.{}, .semantic_output_bindings = &.{} },
+    };
+    var model = PjrtModelExecutor{ .allocator = a, .graph = &graph, .executor = &prefill, .host_backend = undefined, .semantic_output_bindings = &bindings, .decode_variants = &variants };
+    model.prepareOutputMappings();
+    try std.testing.expectEqual(@as(?usize, 1), model.logits_index);
+    var runtime: PjrtModelRuntime = undefined;
+    runtime.decode_variants = &variants;
+    for ([_]usize{ 3, 16, 128 }) |seq_len| {
+        const phase = runtime.decodePhaseForSeqLen(seq_len).?;
+        try std.testing.expectEqual(&decode, phase.executor);
+        try std.testing.expectEqual(@as(?usize, 0), phase.logits_index);
+    }
+    for ([_]usize{ 0, 2, 4, 127, 129 }) |seq_len| try std.testing.expect(runtime.decodePhaseForSeqLen(seq_len) == null);
 }
