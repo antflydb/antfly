@@ -5170,10 +5170,14 @@ pub const ModelManager = struct {
         }
 
         /// Metadata allocations participate in the same process-wide ledger.
-        /// Probe physical pressure for bulk allocations; tiny parser nodes are
-        /// still charged exactly without a kernel probe for each JSON field.
+        /// The allocator separately reserves batched physical headroom, so
+        /// every byte participates without a kernel probe per parser node.
         pub fn acquireMetadata(self: @This(), limits: runtime.tier.memory.Limits, bytes: usize) !runtime.tier.memory.AdmissionLease {
-            return self.domain.admission.tryAcquire(.cpu, limits, .{ .host_weight_bytes = bytes }, bytes >= 64 * 1024);
+            return self.domain.admission.tryAcquire(.cpu, limits, .{ .host_weight_bytes = bytes }, false);
+        }
+
+        pub fn reserveMetadataCapacity(self: @This(), bytes: usize) !runtime.tier.memory.LiveReservation {
+            return self.domain.admission.reserveLiveCapacity(bytes);
         }
     };
 

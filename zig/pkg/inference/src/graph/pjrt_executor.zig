@@ -776,6 +776,7 @@ fn retainedEntryMatchesSemanticInput(
 pub const PjrtModelExecutor = struct {
     references: std.atomic.Value(usize) = .init(1),
     owned_graph: ?*Graph = null,
+    metadata_budget: ?*@import("pjrt_metadata.zig").Budget = null,
     artifact_owner: ?*@import("pjrt_admission.zig").Package = null,
     allocator: Allocator,
     graph: *const Graph,
@@ -843,7 +844,9 @@ pub const PjrtModelExecutor = struct {
             allocator.destroy(graph);
         }
         if (self.artifact_owner) |owner| owner.deinit();
+        const metadata = self.metadata_budget;
         allocator.destroy(self);
+        if (metadata) |budget| budget.destroy();
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor deinit complete", .{});
     }
 };

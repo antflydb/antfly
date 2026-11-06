@@ -451,6 +451,13 @@ peaks; file growth or truncation during the read is rejected. Temporary metadata
 uses a reclaiming allocator even when the request allocator is an arena. Explicit
 path-based loaders and `run-artifact` use the same accounting, sharing the
 invocation domain with tokenizer and executable residency.
+Executor-owned graph copies, shapes, binding names, and variant structures use
+an admission allocator retained through the last runtime's destruction. Package
+bookkeeping is admitted before allocation. Every metadata allocation consumes
+physical headroom, including small parser allocations: a bounded pending-credit
+batch amortizes OS probes, with an exact-size fallback under pressure. Unused
+headroom is returned before handing off construction and after loading; frees
+return only residency credit from their own pressure epoch.
 The loader still verifies executable/provider identity and loaded statistics;
 identity or deserialization failures do not trigger another candidate.
 

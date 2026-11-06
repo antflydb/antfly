@@ -480,6 +480,7 @@ fn runArtifactPromptWithMetadata(
 
         var parsed = try compiled_artifact.readManifest(metadata, io, manifest_path);
         defer parsed.deinit();
+        @import("graph/pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
         return runParsedArtifactPrompt(
             allocator,
             io,
@@ -499,6 +500,7 @@ fn runArtifactPromptWithMetadata(
 
     var parsed = try compiled_artifact.readManifest(metadata, io, manifest_path);
     defer parsed.deinit();
+    @import("graph/pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
     return runParsedArtifactPrompt(
         allocator,
         io,
@@ -582,6 +584,7 @@ fn tryRunMatchingArtifactWithMetadata(
         "paged_prefill",
     )) |package_manifest_path| {
         defer metadata.free(package_manifest_path);
+        @import("graph/pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
         return try runArtifactPromptWithContext(
             allocator,
             io,
@@ -620,6 +623,7 @@ fn tryRunMatchingArtifactWithMetadata(
     if (artifact.seq_len != prompt_tokens or artifact.query_seq_len != prompt_tokens) {
         return null;
     }
+    @import("graph/pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
     return try runArtifactPromptWithContext(
         allocator,
         io,
@@ -2798,7 +2802,7 @@ fn admittedPjrtPackageScenario(a: std.mem.Allocator, root: []const u8, prefill: 
     try std.testing.expectEqual(@as(usize, 1), executor.decode_variants.len);
     // Code is retained twice, argument buffers are shared across phases, and
     // both provider-owned serialized representations remain charged.
-    try std.testing.expectEqual(before.host_weight_bytes + 2 * 64 + 4096 + 2 * "fixture executable".len + executor.artifact_owner.?.metadata_bytes, context.manager.currentAdmissionAmounts().host_weight_bytes);
+    try std.testing.expectEqual(before.host_weight_bytes + 2 * 64 + 4096 + 2 * "fixture executable".len + executor.artifact_owner.?.metadata_bytes + executor.metadata_budget.?.live_bytes, context.manager.currentAdmissionAmounts().host_weight_bytes);
 }
 
 test "run-artifact admitted PJRT packages share phase memory and refund every failed allocation" {
@@ -3122,6 +3126,8 @@ fn managedPrefillReuseScenario(a: std.mem.Allocator, prefill: []const u8, plugin
     const parameter = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
     try graph.markOutput(parameter);
     var backend: ops.ComputeBackend = undefined;
+    try managedExecutorMetadataScenario(a, prefill, plugin, &graph, &backend);
+
     const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{}, &graph, &backend, &context, plugin);
     var owned = executor.modelExecutor();
     defer owned.deinit();
@@ -3177,4 +3183,48 @@ test "run-artifact admits bootstrap package and sidecar JSON before model lookup
         const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1024 * 1024, .combined_limit_bytes = 1024 * 1024 } };
         try std.testing.expectError(error.ResourceLimitExceeded, runArtifactPrompt(a, io, path, "a", false, true, true, policy));
     }
+}
+
+fn managedExecutorMetadataScenario(a: std.mem.Allocator, prefill: []const u8, plugin: [:0]const u8, graph: *const ml.graph.Graph, backend: *const ops.ComputeBackend) !void {
+    var parsed = try compiled_artifact.readManifest(a, std.testing.io, prefill);
+    defer parsed.deinit();
+    const large_name = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(large_name);
+    @memset(large_name, 'k');
+    for (parsed.value.pjrt_output_bindings) |*binding| {
+        if (std.mem.eql(u8, binding.kind, compiled_artifact.pjrt_binding_present_key)) {
+            binding.name = large_name;
+            break;
+        }
+    }
+    var quota = platform.allocator.reclamation.Quota.init(a, 64 * 1024 * 1024);
+    defer quota.deinit();
+    {
+        var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer manager.deinit();
+        const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 8 * 1024 * 1024 } };
+        try policy.configure(&manager);
+        const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .decode_steps_limit = 0 };
+        const before = manager.currentAdmissionAmounts();
+        try std.testing.expectError(error.ResourceLimitExceeded, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(quota.allocator(), &.{parsed.value}, graph, backend, &context, plugin));
+        try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+        try std.testing.expectEqual(@as(usize, 0), quota.live_bytes);
+        try std.testing.expect(quota.peak_bytes < large_name.len);
+    }
+    // With enough capacity, every retained executor allocation remains charged
+    // after loading and after the manager and source metadata have gone away.
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 64 * 1024 * 1024 } };
+    try policy.configure(&manager);
+    const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .decode_steps_limit = 0 };
+    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(quota.allocator(), &.{parsed.value}, graph, backend, &context, plugin);
+    var owned = executor.modelExecutor();
+    defer owned.deinit();
+    try std.testing.expect(quota.live_bytes > large_name.len);
+    try std.testing.expect(manager.currentAdmissionAmounts().hostTotalBytes() >= quota.live_bytes);
+    try std.testing.expect(executor.metadata_budget.?.capacity == null);
+    manager.deinit();
+    manager_live = false;
 }

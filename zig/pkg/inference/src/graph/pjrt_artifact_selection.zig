@@ -229,6 +229,7 @@ pub fn findAdmitted(allocator: std.mem.Allocator, io: std.Io, directory: []const
     errdefer selection.deinit();
     selection.manifests = selection.values(budget.allocator()) catch |err| return budget.translate(err);
     selection.budget = budget;
+    budget.releaseCapacity();
     transferred = true;
     return selection;
 }

@@ -230,6 +230,7 @@ fn createAdmittedModelExecutorFromPackageManifestPathWithMetadata(
     );
     defer metadata.free(decode_manifest_paths);
 
+    @import("pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
     return createAdmittedModelExecutorFromManifestPaths(
         allocator,
         io,
@@ -285,12 +286,31 @@ fn createAdmittedModelExecutorFromManifestPathsWithMetadata(
     const artifacts = try metadata.alloc(compiled_artifact.Manifest, manifests.len);
     defer metadata.free(artifacts);
     for (manifests, artifacts) |parsed, *artifact| artifact.* = parsed.value;
+    @import("pjrt_metadata.zig").Budget.releaseUnusedCapacity(metadata);
     return createAdmittedModelExecutorFromManifests(allocator, artifacts, graph, host_backend, policy, plugin);
 }
 
 /// The selector retains these parsed manifests through construction, avoiding
 /// a second read/parse of every selected decode sidecar.
 pub fn createAdmittedModelExecutorFromManifests(
+    allocator: std.mem.Allocator,
+    artifacts: []const compiled_artifact.Manifest,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    policy: *const admission_mod.Context,
+    plugin: [:0]const u8,
+) !*pjrt_executor.PjrtModelExecutor {
+    const metadata = try @import("pjrt_metadata.zig").Budget.create(allocator, policy);
+    errdefer metadata.destroy();
+    const executor = createAdmittedModelExecutorWithAllocator(metadata.allocator(), artifacts, graph, host_backend, policy, plugin) catch |err| return metadata.translate(err);
+    executor.metadata_budget = metadata;
+    // Retained executor metadata keeps its individual residency; unconsumed
+    // construction headroom must not remain pinned for the executor's lifetime.
+    metadata.releaseCapacity();
+    return executor;
+}
+
+fn createAdmittedModelExecutorWithAllocator(
     allocator: std.mem.Allocator,
     artifacts: []const compiled_artifact.Manifest,
     graph: *const ml.graph.Graph,
@@ -305,18 +325,14 @@ pub fn createAdmittedModelExecutorFromManifests(
         if (!@import("pjrt_artifact_selection.zig").kvShapesCompatible(artifacts[i - 1], artifact)) return error.ArtifactShapeMismatch;
     }
     const graph_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
-    var metadata_bytes = try std.math.add(usize, @sizeOf(ml.graph.Graph), @sizeOf(pjrt_executor.PjrtModelExecutor));
-    metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, graph.nodes.items.len, @sizeOf(ml.graph.Node)));
-    metadata_bytes = try std.math.add(usize, metadata_bytes, graph.constant_pool.items.len);
-    metadata_bytes = try std.math.add(usize, metadata_bytes, graph.string_table.items.len);
-    metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, try std.math.add(usize, graph.outputs.items.len, graph.parameters.items.len), @sizeOf(u32)));
-    const owner = try admission_mod.Package.init(policy, artifacts, plugin, metadata_bytes);
+    const owner = try admission_mod.Package.init(policy, artifacts, plugin, 0);
     errdefer owner.deinit();
     const owned_graph = try graph_allocator.create(ml.graph.Graph);
     errdefer graph_allocator.destroy(owned_graph);
     owned_graph.* = ml.graph.Graph.init(graph_allocator);
     errdefer owned_graph.deinit();
-    // Exact-capacity copies keep the admitted graph byte count authoritative.
+    // All copies, including shapes and binding names, use the retained
+    // admission allocator; transient constructor copies are charged at peak.
     owned_graph.nodes = .fromOwnedSlice(try graph_allocator.dupe(ml.graph.Node, graph.nodes.items));
     const constants = try graph_allocator.alignedAlloc(u8, .@"8", graph.constant_pool.items.len);
     @memcpy(constants, graph.constant_pool.items);
@@ -608,9 +624,11 @@ fn buildSemanticInputBindings(
         else
             return error.MissingArtifactMetadata;
         if (binding.name.len == 0) return error.MissingArtifactMetadata;
-        try out.append(allocator, .{
+        try out.ensureUnusedCapacity(allocator, 1);
+        const name = try allocator.dupe(u8, binding.name);
+        out.appendAssumeCapacity(.{
             .input_index = input_index,
-            .name = try allocator.dupe(u8, binding.name),
+            .name = name,
             .layer_index = binding.layer_index,
             .kind = kind,
         });
@@ -640,9 +658,11 @@ fn buildSemanticOutputBindings(
             return error.MissingArtifactMetadata;
         if (binding.name.len == 0) return error.MissingArtifactMetadata;
         const output_index = findOutputBindingIndex(output_node_ids, binding.node_id) orelse return error.MissingArtifactMetadata;
-        try out.append(allocator, .{
+        try out.ensureUnusedCapacity(allocator, 1);
+        const name = try allocator.dupe(u8, binding.name);
+        out.appendAssumeCapacity(.{
             .output_index = output_index,
-            .name = try allocator.dupe(u8, binding.name),
+            .name = name,
             .layer_index = binding.layer_index,
             .kind = kind,
         });
@@ -870,4 +890,29 @@ test "PJRT package selectors resolve prefill and contiguous decode chain" {
     try std.testing.expectEqual(@as(usize, 2), decode_paths.len);
     try std.testing.expectEqualStrings(decode3_manifest_path, decode_paths[0]);
     try std.testing.expectEqualStrings(decode4_manifest_path, decode_paths[1]);
+}
+
+test "managed PJRT semantic binding builders refund names at every allocation failure" {
+    const Scenario = struct {
+        fn inputs(a: std.mem.Allocator) !void {
+            const bindings = [_]compiled_artifact.PjrtInputBindingMeta{
+                .{ .kind = compiled_artifact.pjrt_binding_past_key, .node_id = 1, .layer_index = 0, .name = "past.0.key" },
+                .{ .kind = compiled_artifact.pjrt_binding_past_value, .node_id = 2, .layer_index = 0, .name = "past.0.value" },
+            };
+            const result = try buildSemanticInputBindings(a, &bindings);
+            defer freeSemanticInputBindings(a, result);
+            try std.testing.expectEqual(@as(usize, 2), result.len);
+        }
+        fn outputs(a: std.mem.Allocator) !void {
+            const bindings = [_]compiled_artifact.PjrtOutputBindingMeta{
+                .{ .kind = compiled_artifact.pjrt_binding_present_key, .node_id = 1, .layer_index = 0, .name = "present.0.key" },
+                .{ .kind = compiled_artifact.pjrt_binding_present_value, .node_id = 2, .layer_index = 0, .name = "present.0.value" },
+            };
+            const result = try buildSemanticOutputBindings(a, &.{ 1, 2 }, &bindings);
+            defer freeSemanticOutputBindings(a, result);
+            try std.testing.expectEqual(@as(usize, 2), result.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.inputs, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.outputs, .{});
 }
