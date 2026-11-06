@@ -16,6 +16,36 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 
+/// A load-only artifact's compiler footprint, bound to its bytes and provider.
+/// HLO remains exportable/inspectable offline, but execution must not compile
+/// unknown native code inside a supposedly bounded inference invocation.
+pub const PjrtMemoryPlan = struct {
+    version: u32 = 1,
+    platform: enum { cpu, cuda },
+    artifact_sha256: [32]u8,
+    plugin_sha256: [32]u8,
+    memory: PjrtMemoryStats,
+};
+
+pub const PjrtMemoryStats = struct {
+    code: usize = 0,
+    arguments: usize = 0,
+    outputs: usize = 0,
+    temporary: usize = 0,
+    host_code: usize = 0,
+    host_arguments: usize = 0,
+    host_outputs: usize = 0,
+    host_temporary: usize = 0,
+    peak: usize = 0,
+    total: usize = 0,
+
+    pub fn fromCompiler(stats: anytype) @This() {
+        var result: @This() = .{};
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| @field(result, name) = @field(stats, name);
+        return result;
+    }
+};
+
 pub const Manifest = struct {
     version: u32 = 1,
     kind: []const u8,
@@ -38,6 +68,7 @@ pub const Manifest = struct {
     pjrt_output_bindings: []PjrtOutputBindingMeta = &.{},
     pjrt_input_shapes: [][]i64 = &.{},
     pjrt_output_shapes: [][]i64 = &.{},
+    pjrt_memory_plan: ?PjrtMemoryPlan = null,
 };
 
 pub const PackageArtifactEntry = struct {
@@ -591,6 +622,7 @@ test "writeManifest and readManifest roundtrip" {
         .attention_mode = "paged_prefill",
         .raw_prompt = true,
         .chat_template_applied = false,
+        .pjrt_memory_plan = .{ .platform = .cuda, .artifact_sha256 = @splat(17), .plugin_sha256 = @splat(42), .memory = .{ .code = 1024, .temporary = 2048 } },
     };
     try writeManifest(allocator, io, manifest_path, manifest);
 
@@ -601,6 +633,7 @@ test "writeManifest and readManifest roundtrip" {
     try std.testing.expectEqual(@as(usize, 64), parsed.value.seq_len);
     try std.testing.expect(parsed.value.raw_prompt);
     try std.testing.expect(!parsed.value.chat_template_applied);
+    try std.testing.expectEqualDeep(manifest.pjrt_memory_plan.?, parsed.value.pjrt_memory_plan.?);
 }
 
 test "writePackageManifest and readPackageManifest roundtrip" {

@@ -50,7 +50,21 @@ pub fn createModelExecutorFromArtifact(
     host_backend: *const ops.ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
 ) !*pjrt_executor.PjrtModelExecutor {
-    return createModelExecutorFromArtifacts(allocator, io, artifact, &.{}, graph, host_backend, client);
+    return createModelExecutorFromArtifacts(allocator, io, artifact, &.{}, graph, host_backend, client, null);
+}
+
+/// The caller retains a verified, admitted buffer through executable loading.
+/// Avoid a second full-file allocation hidden inside the executor factory.
+pub fn createModelExecutorFromArtifactBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    artifact: compiled_artifact.Manifest,
+    bytes: []const u8,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    client: *pjrt_lib.pjrt.Client,
+) !*pjrt_executor.PjrtModelExecutor {
+    return createModelExecutorFromArtifacts(allocator, io, artifact, &.{}, graph, host_backend, client, bytes);
 }
 
 pub fn createModelExecutorFromManifestPaths(
@@ -87,6 +101,7 @@ pub fn createModelExecutorFromManifestPaths(
         graph,
         host_backend,
         client,
+        null,
     );
 }
 
@@ -153,6 +168,7 @@ fn createModelExecutorFromArtifacts(
     graph: *const ml.graph.Graph,
     host_backend: *const ops.ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
+    provided_prefill_bytes: ?[]const u8,
 ) !*pjrt_executor.PjrtModelExecutor {
     if (prefill_artifact.pjrt_input_bindings.len == 0 or prefill_artifact.pjrt_output_node_ids.len == 0) {
         return error.MissingArtifactMetadata;
@@ -188,8 +204,8 @@ fn createModelExecutorFromArtifacts(
     const prefill_output_node_ids = try cloneOutputNodeIds(allocator, prefill_artifact.pjrt_output_node_ids);
     defer allocator.free(prefill_output_node_ids);
 
-    const prefill_artifact_bytes = try std.Io.Dir.cwd().readFileAlloc(io, prefill_artifact.artifact_path, allocator, .limited(std.math.maxInt(usize)));
-    defer allocator.free(prefill_artifact_bytes);
+    const prefill_artifact_bytes = provided_prefill_bytes orelse try std.Io.Dir.cwd().readFileAlloc(io, prefill_artifact.artifact_path, allocator, .limited(std.math.maxInt(usize)));
+    defer if (provided_prefill_bytes == null) allocator.free(prefill_artifact_bytes);
     if (prefill_artifact_bytes.len == 0) return error.InvalidArtifact;
 
     const decode_packages = try allocator.alloc(pjrt_executor.DecodePackageSpec, decode_artifacts.len);

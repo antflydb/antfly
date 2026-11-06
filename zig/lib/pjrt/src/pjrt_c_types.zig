@@ -85,6 +85,22 @@ pub const PluginInitializeArgs = extern struct {
     extension_start: ?*anyopaque,
 };
 
+pub const NamedValue = extern struct {
+    struct_size: usize = @sizeOf(NamedValue),
+    extension_start: ?*anyopaque = null,
+    name: [*]const u8,
+    name_size: usize,
+    type: enum(c_int) { string = 0, int64 = 1, int64_list = 2, float = 3, boolean = 4 },
+    value: extern union {
+        string_value: [*]const u8,
+        int64_value: i64,
+        int64_array_value: [*]const i64,
+        float_value: f32,
+        bool_value: bool,
+    },
+    value_size: usize = 1,
+};
+
 pub const ClientCreateArgs = extern struct {
     struct_size: usize,
     extension_start: ?*anyopaque,
@@ -203,7 +219,13 @@ pub const LoadedExecutableGetExecutableArgs = extern struct {
     struct_size: usize,
     extension_start: ?*anyopaque,
     loaded_executable: ?*PjrtLoadedExecutable,
-    executable: ?*PjrtExecutable, // out, not owned
+    executable: ?*PjrtExecutable, // out, caller owns via Executable_Destroy
+};
+
+pub const ExecutableDestroyArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: ?*PjrtExecutable,
 };
 
 pub const LoadedExecutableExecuteArgs = extern struct {
@@ -318,6 +340,7 @@ pub const Api = extern struct {
     const FN_CLIENT_ADDRESSABLE_DEVICES = 16;
     const FN_CLIENT_COMPILE = 20;
     const FN_CLIENT_BUFFER_FROM_HOST = 22;
+    const FN_EXEC_DESTROY = 41;
     const FN_EXEC_SERIALIZE = 49;
     const FN_LOADED_EXEC_DESTROY = 50;
     const FN_LOADED_EXEC_GET_EXECUTABLE = 51;
@@ -340,7 +363,16 @@ pub const Api = extern struct {
     }
 
     pub fn hasCompiledMemoryStats(self: *const Api) bool {
-        return self.hasFunction(FN_EXEC_COMPILED_MEMORY_STATS) and self.hasFunction(FN_LOADED_EXEC_GET_EXECUTABLE);
+        return self.hasFunction(FN_EXEC_COMPILED_MEMORY_STATS) and self.hasOwnedExecutableAccess();
+    }
+
+    pub fn hasOwnedExecutableAccess(self: *const Api) bool {
+        return self.hasFunction(FN_LOADED_EXEC_GET_EXECUTABLE) and self.hasFunction(FN_EXEC_DESTROY);
+    }
+
+    pub fn executableDestroy(self: *const Api, args: *ExecutableDestroyArgs) ?*PjrtError {
+        const f = castFn(*const fn (*ExecutableDestroyArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_DESTROY].?);
+        return f(args);
     }
 
     pub fn executableGetCompiledMemoryStats(self: *const Api, args: *ExecutableGetCompiledMemoryStatsArgs) ?*PjrtError {
@@ -404,9 +436,8 @@ pub const Api = extern struct {
     }
 
     pub fn hasExecutableSerialization(self: *const Api) bool {
-        return self._fns[FN_EXEC_SERIALIZE] != null and
-            self._fns[FN_LOADED_EXEC_GET_EXECUTABLE] != null and
-            self._fns[FN_EXEC_DESERIALIZE_AND_LOAD] != null;
+        return self.hasFunction(FN_EXEC_SERIALIZE) and self.hasOwnedExecutableAccess() and
+            self.hasFunction(FN_EXEC_DESERIALIZE_AND_LOAD);
     }
 
     pub fn loadedExecutableDestroy(self: *const Api, args: *LoadedExecutableDestroyArgs) ?*PjrtError {

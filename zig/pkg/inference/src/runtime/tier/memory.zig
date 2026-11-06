@@ -248,6 +248,10 @@ pub fn maxCompositeLimits(a: Limits, b: Limits) Limits {
 pub const SharedAdmissionLimits = struct {
     host_limit_bytes: usize = 0,
     unified_limit_bytes: usize = 0,
+    /// Explicit invocation quotas span host/device allocations even when the
+    /// physical pools and automatic workload policies are independent.
+    kv_limit_bytes: usize = 0,
+    scratch_limit_bytes: usize = 0,
 };
 
 pub const SystemMemoryInfo = struct {
@@ -784,6 +788,8 @@ pub const ReservedGenerationWorkspace = struct {
 pub const AdmissionPressure = union(enum) {
     shared_host,
     shared_unified,
+    shared_kv,
+    shared_scratch,
     domain_host: BackendClass,
     domain_backend: BackendClass,
     domain_combined: BackendClass,
@@ -942,6 +948,13 @@ pub const AdmissionController = struct {
             @min(self.shared_limits.unified_limit_bytes, bytes);
     }
 
+    pub fn tightenInvocationQuotas(self: *AdmissionController, limits: Limits) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.shared_limits.kv_limit_bytes = intersectAdmissionLimit(self.shared_limits.kv_limit_bytes, limits.kv_limit_bytes);
+        self.shared_limits.scratch_limit_bytes = intersectAdmissionLimit(self.shared_limits.scratch_limit_bytes, limits.scratch_limit_bytes);
+    }
+
     pub fn configureProcessMemoryLimit(
         self: *AdmissionController,
         limit_bytes: usize,
@@ -1028,7 +1041,8 @@ pub const AdmissionController = struct {
 
     /// Atomically acquire one or more CPU/GPU resource domains. Requests in the
     /// same domain are merged under the strictest non-zero limit, while requests
-    /// in different domains are checked independently. Aggregate bytes continue
+    /// in different domains retain separate limits plus invocation-wide quotas.
+    /// Aggregate bytes continue
     /// to be reserved once against the process-owner resource budget.
     pub fn tryAcquireRequests(
         self: *AdmissionController,
@@ -1069,6 +1083,8 @@ pub const AdmissionController = struct {
 
         const request_host = amounts.hostTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_backend = amounts.backendTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const request_kv = amounts.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const request_scratch = amounts.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_combined = std.math.add(usize, request_host, request_backend) catch
             return error.ResourceLimitExceeded;
 
@@ -1093,6 +1109,8 @@ pub const AdmissionController = struct {
             // the accounting lock, before testing aggregate occupancy.
             try checkAdmissionLimit(request_host, request_host, self.shared_limits.host_limit_bytes);
             try checkAdmissionLimit(request_combined, request_combined, self.shared_limits.unified_limit_bytes);
+            try checkAdmissionLimit(request_kv, request_kv, self.shared_limits.kv_limit_bytes);
+            try checkAdmissionLimit(request_scratch, request_scratch, self.shared_limits.scratch_limit_bytes);
 
             const next = addAdmissionAmounts(self.admitted, amounts) orelse
                 return error.ResourceLimitExceeded;
@@ -1102,8 +1120,10 @@ pub const AdmissionController = struct {
                 return error.ResourceLimitExceeded;
             _ = std.math.add(usize, next_global_host, next_global_backend) catch
                 return error.ResourceLimitExceeded;
-            _ = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
-            _ = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            const next_shared_kv = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            const next_shared_scratch = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            try checkAdmissionLimitWithPressure(request_kv, next_shared_kv, self.shared_limits.kv_limit_bytes, .shared_kv, pressure);
+            try checkAdmissionLimitWithPressure(request_scratch, next_shared_scratch, self.shared_limits.scratch_limit_bytes, .shared_scratch, pressure);
 
             // CPU work and CUDA staging/cache allocations consume the same host
             // RAM. Enforce that physical domain before backend-local policies so
@@ -4773,4 +4793,30 @@ test "permanent admission limits win over unrelated host contention" {
     var recovered = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 30 }, false);
     recovered.release();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "shared invocation quotas aggregate CPU and GPU KV and scratch atomically" {
+    inline for (.{ true, false }) |kv| {
+        var controller = AdmissionController{};
+        controller.tightenInvocationQuotas(if (kv) .{ .kv_limit_bytes = 8 } else .{ .scratch_limit_bytes = 8 });
+        // A later, wider consumer cannot relax the invocation's policy.
+        controller.tightenInvocationQuotas(.{ .kv_limit_bytes = 80, .scratch_limit_bytes = 80 });
+        const cpu = if (kv) AdmissionAmounts{ .host_kv_bytes = 6 } else AdmissionAmounts{ .host_scratch_bytes = 6 };
+        const gpu = if (kv) AdmissionAmounts{ .backend_kv_bytes = 6 } else AdmissionAmounts{ .backend_scratch_bytes = 6 };
+        var first = try controller.tryAcquire(.cpu, .{}, cpu, false);
+        defer first.release();
+        var pressure: ?AdmissionPressure = null;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquireWithPressure(.gpu, .{}, gpu, false, &pressure));
+        try std.testing.expectEqualDeep(cpu, controller.snapshot());
+        try std.testing.expectEqual(if (kv) AdmissionPressure.shared_kv else AdmissionPressure.shared_scratch, pressure.?);
+        first.release();
+        var second = try controller.tryAcquire(.gpu, .{}, gpu, false);
+        second.release();
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{
+            .{ .backend_class = .cpu, .limits = .{}, .amounts = cpu },
+            .{ .backend_class = .gpu, .limits = .{}, .amounts = gpu },
+        }, false));
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    }
 }

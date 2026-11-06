@@ -4615,6 +4615,7 @@ pub const ModelLoadPolicy = struct {
         // compatibility policy. Include tokenizer construction and metadata,
         // not just weights, in the invocation's retained resource domain.
         manager.admission_enabled = true;
+        (try manager.ensureResourceDomain()).admission.tightenInvocationQuotas(self.limits);
         if (self.limits.combined_limit_bytes != 0)
             (try manager.ensureResourceDomain()).admission.tightenUnifiedLimit(self.limits.combined_limit_bytes);
     }
@@ -4634,6 +4635,7 @@ pub const ModelManager = struct {
             var policy = ModelManager.init(allocator, backends.SessionManager.init(allocator));
             policy.admission_limit_overrides = limits;
             policy.configureAdmissionController(domain);
+            domain.admission.tightenInvocationQuotas(limits);
             // An invocation cap spans CPU tokenizers, GPU sessions and host
             // staging even on discrete-memory systems. Physical topology only
             // determines the automatic limit, never an explicit operator cap.
@@ -5157,6 +5159,13 @@ pub const ModelManager = struct {
         self: *const ModelManager,
     ) *runtime.tier.memory.AdmissionController {
         return &self.resource_domain.?.admission;
+    }
+
+    /// A provider discovered after tokenizer construction can tighten the
+    /// shared physical envelope without replacing any outstanding leases.
+    pub fn tightenUnifiedDeviceCapacity(self: *ModelManager, bytes: usize) !void {
+        try self.ensureResourceOwnerReady();
+        self.admissionController().tightenUnifiedLimit(bytes);
     }
 
     /// Read the physical admission ledger without holding model/catalog locks.
@@ -5901,6 +5910,8 @@ pub const ModelManager = struct {
         return switch (pressure) {
             .shared_host => amounts.hostTotalBytes() > 0,
             .shared_unified => admissionAmountsPresent(amounts),
+            .shared_kv => amounts.kvTotalBytes() > 0,
+            .shared_scratch => amounts.scratchTotalBytes() > 0,
             .live_host => amounts.hostTotalBytes() > 0 or
                 (builtin.os.tag == .macos and amounts.backendTotalBytes() > 0),
             .domain_host => |backend_class| amounts_by_backend[@backingInt(backend_class)].hostTotalBytes() > 0,
@@ -5993,7 +6004,7 @@ pub const ModelManager = struct {
         return switch (pressure) {
             .shared_host, .shared_unified, .external_budget, .live_host => true,
             .domain_host, .domain_combined => true,
-            .domain_backend, .domain_kv, .domain_scratch => false,
+            .domain_backend, .domain_kv, .domain_scratch, .shared_kv, .shared_scratch => false,
         };
     }
 

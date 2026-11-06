@@ -25,6 +25,7 @@ const runtime = @import("runtime/root.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const ops = @import("ops/ops.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
+const c_file = @import("util/c_file.zig");
 
 const print = std.debug.print;
 const BackendChoice = native_backend_choice.Choice;
@@ -350,6 +351,7 @@ fn writeCompiledArtifact(
     var pjrt_output_bindings: []compiled_artifact.PjrtOutputBindingMeta = &.{};
     var pjrt_input_shapes: [][]i64 = &.{};
     var pjrt_output_shapes: [][]i64 = &.{};
+    var pjrt_memory_plan: ?compiled_artifact.PjrtMemoryPlan = null;
     const attention_bindings = try buildAttentionBindingMeta(allocator, graph, &selection.part);
     defer allocator.free(attention_bindings);
     defer {
@@ -394,14 +396,14 @@ fn writeCompiledArtifact(
                         .sub_path = output_path,
                         .data = result.hlo_bytes,
                     }),
-                    .executable => writePjrtExecutableArtifact(
+                    .executable => pjrt_memory_plan = writePjrtExecutableArtifact(
                         allocator,
                         io,
                         output_path,
                         result.hlo_bytes,
                         result.output_node_ids.len,
                         selection.is_partial_artifact,
-                    ) catch |err| {
+                    ) catch |err| fallback: {
                         if (!implicit_whole_model_xla_executable) return err;
                         switch (err) {
                             error.OutOfMemory, error.MissingPjrtPluginPath => {
@@ -430,6 +432,7 @@ fn writeCompiledArtifact(
                             },
                             else => return err,
                         }
+                        break :fallback null;
                     },
                 }
             } else {
@@ -469,6 +472,7 @@ fn writeCompiledArtifact(
             .pjrt_output_bindings = pjrt_output_bindings,
             .pjrt_input_shapes = pjrt_input_shapes,
             .pjrt_output_shapes = pjrt_output_shapes,
+            .pjrt_memory_plan = pjrt_memory_plan,
         },
     );
     const refreshed_package = if (!selection.is_partial_artifact and opts.backend == .xla)
@@ -1575,7 +1579,8 @@ fn pjrtLoadOnlyExecutableArtifactsSupported(allocator: std.mem.Allocator) !bool 
     const pjrt_lib = @import("pjrt");
     var client = pjrt_lib.pjrt.Client.init(plugin_path) catch return false;
     defer client.deinit();
-    return client.executableArtifactSupport().loadOnlyExecutableArtifacts();
+    return client.executableArtifactSupport().loadOnlyExecutableArtifacts() and client.api.hasCompiledMemoryStats() and
+        ((try client.isCpu()) or std.ascii.eqlIgnoreCase(try client.platformName(), "cuda"));
 }
 
 fn writePjrtExecutableArtifact(
@@ -1585,7 +1590,7 @@ fn writePjrtExecutableArtifact(
     hlo_bytes: []const u8,
     output_count: usize,
     is_partial_artifact: bool,
-) !void {
+) !compiled_artifact.PjrtMemoryPlan {
     try guardPjrtExecutableExportBudget(is_partial_artifact, hlo_bytes.len);
     if (!build_options.enable_pjrt) return error.BackendUnavailable;
     const pjrt_lib = @import("pjrt");
@@ -1593,14 +1598,37 @@ fn writePjrtExecutableArtifact(
     defer allocator.free(plugin_path);
     var client = try pjrt_lib.pjrt.Client.init(plugin_path);
     defer client.deinit();
+    return writePjrtExecutableWithClient(allocator, io, output_path, hlo_bytes, output_count, &client, plugin_path);
+}
+
+fn writePjrtExecutableWithClient(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output_path: []const u8,
+    hlo_bytes: []const u8,
+    output_count: usize,
+    client: *@import("pjrt").pjrt.Client,
+    plugin_path: [:0]const u8,
+) !compiled_artifact.PjrtMemoryPlan {
     var executable = try client.compile(hlo_bytes, output_count);
     defer executable.deinit();
+    const stats = try executable.compiledMemoryStats();
+    const cpu = try client.isCpu();
+    if (!cpu and !std.ascii.eqlIgnoreCase(try client.platformName(), "cuda")) return error.UnsupportedPjrtFeature;
     const serialized = try executable.serialize(allocator);
     defer allocator.free(serialized);
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = output_path,
         .data = serialized,
     });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(serialized, &digest, .{});
+    return .{
+        .platform = if (cpu) .cpu else .cuda,
+        .artifact_sha256 = digest,
+        .plugin_sha256 = try c_file.sha256File(allocator, plugin_path),
+        .memory = compiled_artifact.PjrtMemoryStats.fromCompiler(stats),
+    };
 }
 
 fn resolveXlaArtifactKind(
@@ -2162,4 +2190,33 @@ test "PJRT binding metadata marks semantic KV cache nodes" {
     try std.testing.expectEqualStrings("present.2.key", outputs[1].name);
     try std.testing.expectEqualStrings(compiled_artifact.pjrt_binding_present_value, outputs[2].kind);
     try std.testing.expectEqualStrings("present.2.value", outputs[2].name);
+}
+
+test "native compile load-only export binds compiler memory to executable and provider bytes" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plugin", .data = @import("pjrt_admission_fixture").bytes });
+    const plugin = try std.fmt.allocPrintSentinel(a, "{s}/plugin", .{root}, 0);
+    defer a.free(plugin);
+    const output = try std.fs.path.join(a, &.{ root, "artifact.exec" });
+    defer a.free(output);
+    var client = try @import("pjrt").pjrt.Client.init(plugin);
+    defer client.deinit();
+    const plan = try writePjrtExecutableWithClient(a, std.testing.io, output, "fixture HLO", 1, &client, plugin);
+    try std.testing.expectEqual(.cpu, plan.platform);
+    try std.testing.expectEqual(@as(usize, 64), plan.memory.code);
+    try std.testing.expectEqual(@as(usize, 4096), plan.memory.arguments);
+    try std.testing.expectEqual(@as(usize, 128), plan.memory.temporary);
+    try std.testing.expectEqualSlices(u8, &try c_file.sha256File(a, output), &plan.artifact_sha256);
+    try std.testing.expectEqualSlices(u8, &try c_file.sha256File(a, plugin), &plan.plugin_sha256);
+    const bytes = try c_file.readFileMax(a, output, 1024);
+    defer a.free(bytes);
+    var loaded = try client.deserializeExecutable(bytes, 1);
+    defer loaded.deinit();
+    const stats = try loaded.compiledMemoryStats();
+    try std.testing.expectEqualDeep(plan.memory, compiled_artifact.PjrtMemoryStats.fromCompiler(stats));
 }

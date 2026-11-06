@@ -118,6 +118,23 @@ fn awaitAndDestroyEvent(api: *const c.Api, event: *c.PjrtEvent) PjrtError!void {
     destroyEvent(api, event);
 }
 
+fn cudaClientOptions(capacity: usize, device: usize, visible: []const i64) PjrtError![6]c.NamedValue {
+    if (capacity == 0 or device == 0 or capacity > device) return error.InvalidMemoryStats;
+    const ratio = @as(f64, @floatFromInt(capacity)) / @as(f64, @floatFromInt(device));
+    // Round down: converting to f32 must never widen an operator's byte cap.
+    var fraction: f32 = @floatCast(ratio);
+    if (@as(f64, fraction) > ratio) fraction = @bitCast(@as(u32, @bitCast(fraction)) - 1);
+    if (fraction <= 0) return error.InvalidMemoryStats;
+    return .{
+        .{ .name = "allocator", .name_size = "allocator".len, .type = .string, .value = .{ .string_value = "bfc" }, .value_size = 3 },
+        .{ .name = "memory_fraction", .name_size = "memory_fraction".len, .type = .float, .value = .{ .float_value = fraction } },
+        .{ .name = "preallocate", .name_size = "preallocate".len, .type = .boolean, .value = .{ .bool_value = false } },
+        .{ .name = "collective_memory_size", .name_size = "collective_memory_size".len, .type = .int64, .value = .{ .int64_value = 0 } },
+        .{ .name = "visible_devices", .name_size = "visible_devices".len, .type = .int64_list, .value = .{ .int64_array_value = visible.ptr }, .value_size = visible.len },
+        .{ .name = "should_stage_host_to_device_transfers", .name_size = "should_stage_host_to_device_transfers".len, .type = .boolean, .value = .{ .bool_value = false } },
+    };
+}
+
 // ── Buffer ─────────────────────────────────────────────────────────
 
 pub const Buffer = struct {
@@ -171,21 +188,40 @@ pub const Buffer = struct {
 
 // ── LoadedExecutable ───────────────────────────────────────────────
 
+/// GetExecutable constructs an independently owned wrapper, including when
+/// the loaded executable remains alive. Always release it before plugin close.
+const Executable = struct {
+    api: *const c.Api,
+    handle: *c.PjrtExecutable,
+
+    fn deinit(self: *@This()) void {
+        var args = c.ExecutableDestroyArgs{ .struct_size = @sizeOf(c.ExecutableDestroyArgs), .extension_start = null, .executable = self.handle };
+        _ = self.api.executableDestroy(&args);
+    }
+};
+
 pub const LoadedExecutable = struct {
     api: *const c.Api,
     handle: *c.PjrtLoadedExecutable,
     device: *c.PjrtDevice,
     num_outputs: usize,
 
+    fn executable(self: *const LoadedExecutable) PjrtError!Executable {
+        if (!self.api.hasOwnedExecutableAccess()) return error.UnsupportedPjrtFeature;
+        var args = std.mem.zeroes(c.LoadedExecutableGetExecutableArgs);
+        args.struct_size = @sizeOf(@TypeOf(args));
+        args.loaded_executable = self.handle;
+        try checkError(self.api, self.api.loadedExecutableGetExecutable(&args));
+        return .{ .api = self.api, .handle = args.executable orelse return error.PjrtApiError };
+    }
+
     pub fn compiledMemoryStats(self: *const LoadedExecutable) PjrtError!CompiledMemoryStats {
         if (!self.api.hasCompiledMemoryStats()) return error.UnsupportedPjrtFeature;
-        var get = std.mem.zeroes(c.LoadedExecutableGetExecutableArgs);
-        get.struct_size = @sizeOf(@TypeOf(get));
-        get.loaded_executable = self.handle;
-        try checkError(self.api, self.api.loadedExecutableGetExecutable(&get));
+        var owned = try self.executable();
+        defer owned.deinit();
         var stats = std.mem.zeroes(c.ExecutableGetCompiledMemoryStatsArgs);
         stats.struct_size = @sizeOf(@TypeOf(stats));
-        stats.executable = get.executable orelse return error.InvalidMemoryStats;
+        stats.executable = owned.handle;
         try checkError(self.api, self.api.executableGetCompiledMemoryStats(&stats));
         return .{
             .code = std.math.cast(usize, stats.generated_code_size_in_bytes) orelse return error.InvalidMemoryStats,
@@ -215,18 +251,13 @@ pub const LoadedExecutable = struct {
     pub fn serialize(self: *const LoadedExecutable, allocator: std.mem.Allocator) ![]u8 {
         if (!self.api.hasExecutableSerialization()) return PjrtError.UnsupportedPjrtFeature;
 
-        var get_args = c.LoadedExecutableGetExecutableArgs{
-            .struct_size = @sizeOf(c.LoadedExecutableGetExecutableArgs),
-            .extension_start = null,
-            .loaded_executable = self.handle,
-            .executable = null,
-        };
-        try checkError(self.api, self.api.loadedExecutableGetExecutable(&get_args));
+        var owned = try self.executable();
+        defer owned.deinit();
 
         var serialize_args = c.ExecutableSerializeArgs{
             .struct_size = @sizeOf(c.ExecutableSerializeArgs),
             .extension_start = null,
-            .executable = get_args.executable orelse return PjrtError.PjrtApiError,
+            .executable = owned.handle,
             .serialized_bytes = null,
             .serialized_bytes_size = 0,
             .serialized_executable = null,
@@ -306,16 +337,33 @@ pub const Client = struct {
     device: *c.PjrtDevice,
     lib: std.DynLib,
 
-    pub fn isCpu(self: *const Client) PjrtError!bool {
+    pub fn platformName(self: *const Client) PjrtError![]const u8 {
         var args = std.mem.zeroes(c.ClientPlatformNameArgs);
         args.struct_size = @sizeOf(@TypeOf(args));
         args.client = self.handle;
         try checkError(self.api, self.api.clientPlatformName(&args));
         const name = (args.platform_name orelse return error.PjrtApiError)[0..args.platform_name_size];
+        return name;
+    }
+
+    pub fn isCpu(self: *const Client) PjrtError!bool {
+        const name = try self.platformName();
         return std.ascii.eqlIgnoreCase(name, "cpu") or std.ascii.eqlIgnoreCase(name, "host");
     }
 
     pub fn init(plugin_path: [:0]const u8) PjrtError!Client {
+        return initWithMemoryPolicy(plugin_path, null);
+    }
+
+    /// Load-only inference supplies a verified platform and an already leased
+    /// allocator capacity. Never let CUDA's default preallocation policy spend
+    /// unrelated VRAM before the executable's first budget check.
+    pub const MemoryPolicy = union(enum) {
+        cpu,
+        cuda: struct { capacity_bytes: usize, device_bytes: usize },
+    };
+
+    pub fn initWithMemoryPolicy(plugin_path: [:0]const u8, policy: ?MemoryPolicy) PjrtError!Client {
         // Load plugin shared library
         var lib = std.DynLib.open(plugin_path) catch return PjrtError.PluginLoadFailed;
         errdefer lib.close();
@@ -337,9 +385,23 @@ pub const Client = struct {
         // Create client (empty options = defaults)
         var create_args: c.ClientCreateArgs = std.mem.zeroes(c.ClientCreateArgs);
         create_args.struct_size = @sizeOf(c.ClientCreateArgs);
+        var visible = [_]i64{0};
+        var options: [6]c.NamedValue = undefined;
+        if (policy) |bounded| switch (bounded) {
+            .cpu => {},
+            .cuda => |limit| {
+                options = try cudaClientOptions(limit.capacity_bytes, limit.device_bytes, &visible);
+                create_args.create_options = @ptrCast(&options);
+                create_args.num_options = options.len;
+            },
+        };
         try checkError(api, api.clientCreate(&create_args));
 
         const client_handle = create_args.client orelse return PjrtError.PjrtApiError;
+        errdefer {
+            var destroy_args = c.ClientDestroyArgs{ .struct_size = @sizeOf(c.ClientDestroyArgs), .extension_start = null, .client = client_handle };
+            _ = api.clientDestroy(&destroy_args);
+        }
 
         // Get first addressable device
         var devices_args = c.ClientAddressableDevicesArgs{
@@ -846,6 +908,11 @@ test "executable artifact support default reports HLO compile only" {
 test "compiled memory statistics honor API extent and reject unknown sizes" {
     const Fake = struct {
         var unknown: bool = false;
+        var destroyed: usize = 0;
+        fn destroy(_: *c.ExecutableDestroyArgs) callconv(.c) ?*c.PjrtError {
+            destroyed += 1;
+            return null;
+        }
         fn get(args: *c.LoadedExecutableGetExecutableArgs) callconv(.c) ?*c.PjrtError {
             args.executable = @ptrFromInt(1);
             return null;
@@ -864,17 +931,21 @@ test "compiled memory statistics honor API extent and reject unknown sizes" {
     };
     var api = std.mem.zeroes(c.Api);
     api.struct_size = @sizeOf(c.Api);
+    api._fns[41] = @ptrCast(&Fake.destroy);
     api._fns[51] = @ptrCast(&Fake.get);
     api._fns[96] = @ptrCast(&Fake.stats);
     const executable = LoadedExecutable{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .num_outputs = 1 };
     Fake.unknown = false;
+    Fake.destroyed = 0;
     const stats = try executable.compiledMemoryStats();
     try std.testing.expectEqual(@as(usize, 32), stats.arguments);
     try std.testing.expectEqual(@as(usize, 128), stats.temporary);
     try std.testing.expectEqual(@as(usize, 256), stats.host_temporary);
     try std.testing.expectEqual(@as(usize, 512), stats.peak);
+    try std.testing.expectEqual(@as(usize, 1), Fake.destroyed);
     Fake.unknown = true;
     try std.testing.expectError(error.InvalidMemoryStats, executable.compiledMemoryStats());
+    try std.testing.expectEqual(@as(usize, 2), Fake.destroyed);
     Fake.unknown = false;
     // A non-null slot outside the advertised ABI extent must not be read.
     api.struct_size = @offsetOf(c.Api, "_fns") + 96 * @sizeOf(?*const anyopaque);
@@ -902,4 +973,69 @@ test "compiled memory CPU placement follows the PJRT platform" {
     try std.testing.expect(try client.isCpu());
     Fake.cpu = false;
     try std.testing.expect(!try client.isCpu());
+}
+
+test "bounded CUDA client options never widen the leased device capacity" {
+    const visible = [_]i64{0};
+    for ([_]usize{ 1, 3, 1234567, 8000000001 }) |capacity| {
+        const device: usize = 16000000003;
+        const options = try cudaClientOptions(capacity, device, &visible);
+        try std.testing.expectEqualStrings("bfc", options[0].value.string_value[0..options[0].value_size]);
+        const fraction = options[1].value.float_value;
+        try std.testing.expect(@as(f64, fraction) * @as(f64, @floatFromInt(device)) <= @as(f64, @floatFromInt(capacity)));
+        try std.testing.expect(!options[2].value.bool_value);
+        try std.testing.expectEqual(@as(i64, 0), options[3].value.int64_value);
+        try std.testing.expectEqual(@as(usize, 1), options[4].value_size);
+        try std.testing.expectEqual(@as(i64, 0), options[4].value.int64_array_value[0]);
+        try std.testing.expect(!options[5].value.bool_value);
+    }
+    try std.testing.expectError(error.InvalidMemoryStats, cudaClientOptions(0, 1, &visible));
+    try std.testing.expectError(error.InvalidMemoryStats, cudaClientOptions(2, 1, &visible));
+}
+
+test "serialize releases both caller-owned PJRT handles on allocation failure" {
+    const Fake = struct {
+        var owned: usize = 0;
+        var serialized: usize = 0;
+        fn destroy(_: *c.ExecutableDestroyArgs) callconv(.c) ?*c.PjrtError {
+            owned -= 1;
+            return null;
+        }
+        fn get(args: *c.LoadedExecutableGetExecutableArgs) callconv(.c) ?*c.PjrtError {
+            owned += 1;
+            args.executable = @ptrFromInt(1);
+            return null;
+        }
+        fn delete(_: ?*c.PjrtSerializedExecutable) callconv(.c) void {
+            serialized -= 1;
+        }
+        fn serialize(args: *c.ExecutableSerializeArgs) callconv(.c) ?*c.PjrtError {
+            serialized += 1;
+            args.serialized_bytes = "executable";
+            args.serialized_bytes_size = 10;
+            args.serialized_executable = @ptrFromInt(1);
+            args.serialized_executable_deleter = &delete;
+            return null;
+        }
+        fn deserialize(_: *c.ExecutableDeserializeAndLoadArgs) callconv(.c) ?*c.PjrtError {
+            return null;
+        }
+        fn scenario(a: std.mem.Allocator, executable: LoadedExecutable) !void {
+            const bytes = try executable.serialize(a);
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings("executable", bytes);
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[41] = @ptrCast(&Fake.destroy);
+    api._fns[51] = @ptrCast(&Fake.get);
+    api._fns[49] = @ptrCast(&Fake.serialize);
+    api._fns[56] = @ptrCast(&Fake.deserialize);
+    const executable = LoadedExecutable{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .num_outputs = 1 };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fake.scenario, .{executable});
+    try std.testing.expectEqual(@as(usize, 0), Fake.owned);
+    try std.testing.expectEqual(@as(usize, 0), Fake.serialized);
+    api._fns[41] = null;
+    try std.testing.expectError(error.UnsupportedPjrtFeature, executable.serialize(std.testing.allocator));
 }

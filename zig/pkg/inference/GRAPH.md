@@ -386,6 +386,41 @@ Offline artifacts are currently exact shape buckets. A different prompt can use 
 
 For PJRT whole-graph artifacts, `run-artifact --compare-host` compares artifact outputs against traced native graph captures for the same rendered prompt shape. The compare summary includes top-1 agreement plus last-logit and graph-output diffs, so a "sensible output" smoke test can be upgraded into an exact-shape correctness check.
 
+### Artifact memory admission
+
+Offline generation, draft models, tokenizer assets, and artifact execution share
+one invocation ledger. Explicit host, backend, combined, KV, and scratch caps
+apply across its CPU and GPU work. A request exceeding a cap rejects before
+provider construction; temporary occupancy remains retryable.
+
+PJRT execution requires a load-only executable exported with a versioned
+`pjrt_memory_plan`. Export records compiler residency/workspace statistics and
+SHA-256 identities for both executable bytes and the provider library. Re-export
+legacy executables after upgrading, and re-export when changing the provider.
+HLO export and `--validate` inspection remain available; managed execution of
+HLO or unprofiled executables returns `UnsupportedPjrtFeature` because compiling
+unknown native code cannot be admitted from encoded file size.
+
+The loader admits host serialized staging and the compiler footprint before
+initializing PJRT or creating a client. It reads executable bytes once, verifies
+both identities, deserializes the same buffer, and checks loaded statistics
+against the profile without increasing its lease. Staging allows an input copy
+and a provider copy; the input is freed after load, and the provider copy stays
+charged until client destruction. Profiles describe provider-reported compiled
+memory, not an OS isolation boundary for arbitrary third-party plugin code.
+
+This loader supports CPU and CUDA profiles. CUDA uses the first visible device, checks
+its physical capacity before client creation, and configures a bounded BFC pool
+with preallocation, collective reservation, and extra transfer staging disabled.
+The pool's alignment/fragmentation headroom is also charged. Unified CUDA devices
+share the host envelope. Other providers must supply an admission contract before
+this loader can execute their artifacts.
+
+Full recomputation reserves no host KV. Native paged partition materialization
+owns one host cache. Whole-model tracing retains page geometry without CPU KV
+storage; `--compare-host` acquires one reference cache and frees it before PJRT
+execution.
+
 ### Debug Artifacts
 
 Node-level artifacts are now part of the correctness workflow:
