@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const abi = @import("runtime_failure_abi");
+pub const Status = abi.Status;
 
 const Mapping = struct {
     status: abi.Status,
@@ -30,6 +31,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .raft_apply_writer_unavailable, .err = error.RaftApplyWriterUnavailable },
     .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
     .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
     .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },
@@ -1154,4 +1156,17 @@ test "reader failures and scoped GCS failures retain exact storage boundary iden
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
         try std.testing.expectError(expected, statusToError(failure.status));
     }
+}
+
+test "privacy committed Raft contention survives the active storage owner ABI" {
+    for ([_]anyerror{ error.WriterLocked, error.RaftApplyWriterUnavailable }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expect(value != .internal);
+        try std.testing.expectError(err, statusToError(value));
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(value, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+    try std.testing.expect(statusFromError(error.WriterLocked) != statusFromError(error.RaftApplyWriterUnavailable));
+    try std.testing.expectEqual(@as(u32, 848), @backingInt(statusFromError(error.RaftApplyWriterUnavailable)));
 }
