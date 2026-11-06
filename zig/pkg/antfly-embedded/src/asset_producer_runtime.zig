@@ -692,12 +692,17 @@ pub const Runtime = struct {
     }
 
     fn routeGeneratorConfig(self: *const Runtime, alloc: Allocator, cfg: *generating_runtime.GeneratorConfig) !void {
-        if (cfg.provider != .antfly or cfg.url.len > 0 or self.linkedGeneratorAvailable()) return;
-        const endpoint = ProducerRouting.init(self.execution, self.antfly_provider).generatorEndpoint(null) orelse return;
-        cfg.url = try alloc.dupe(u8, endpoint);
-        // The generation backend resolves this reference through the secret
-        // store per request; the routed config is request-scoped.
-        if (cfg.api_key == null) if (self.defaultInferenceCredentialReference(endpoint)) |reference| {
+        if (cfg.provider != .antfly) return;
+        if (cfg.url.len == 0) {
+            if (self.linkedGeneratorAvailable()) return;
+            const endpoint = ProducerRouting.init(self.execution, self.antfly_provider).generatorEndpoint(null) orelse return;
+            cfg.url = try alloc.dupe(u8, endpoint);
+        }
+        // Inherited or named explicitly, the effective URL decides: only the
+        // default endpoint gets the default credential. The generation backend
+        // resolves this reference through the secret store per request; the
+        // routed config is request-scoped.
+        if (cfg.api_key == null) if (self.defaultInferenceCredentialReference(cfg.url)) |reference| {
             cfg.api_key = try alloc.dupe(u8, reference);
         };
     }
@@ -714,13 +719,17 @@ pub const Runtime = struct {
             cfg.bearer_token = null;
             return;
         }
-        if (cfg.provider != .antfly or cfg.resolvedUrl() != null or self.linkedExtractorAvailable()) return;
-        const endpoint = ProducerRouting.init(self.execution, self.antfly_provider).extractorEndpoint(null) orelse return;
-        cfg.url = try alloc.dupe(u8, endpoint);
+        if (cfg.provider != .antfly) return;
+        if (cfg.resolvedUrl() == null) {
+            if (self.linkedExtractorAvailable()) return;
+            const endpoint = ProducerRouting.init(self.execution, self.antfly_provider).extractorEndpoint(null) orelse return;
+            cfg.url = try alloc.dupe(u8, endpoint);
+        }
         // `extracting` sends `api_key` verbatim, so resolve the default
-        // reference for this request-scoped config only.
+        // reference for this request-scoped config only, and only when the
+        // effective URL (inherited or explicit) is the default endpoint.
         if (cfg.api_key == null and cfg.bearer_token == null)
-            cfg.api_key = try self.resolveDefaultInferenceCredential(alloc, endpoint);
+            cfg.api_key = try self.resolveDefaultInferenceCredential(alloc, cfg.resolvedUrl());
     }
 
     pub fn producer(self: *Runtime) asset_producer.Producer {
@@ -6886,6 +6895,71 @@ test "asset producer runtime sends the default inference credential only to the 
     defer extractor.deinit(alloc);
     try runtime.routeExtractorConfig(alloc, &extractor);
     try std.testing.expectEqualStrings("node-default-key", extractor.api_key.?);
+}
+
+test "asset producer runtime scopes the default credential by an explicit producer url" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+
+    const runtime = try Runtime.createOwned(alloc, io_impl.io(), .{
+        .inference_api_url = "http://shared.example/ai/v1",
+        .inference_api_key = "node-default-key",
+    });
+    defer {
+        runtime.deinit();
+        alloc.destroy(runtime);
+    }
+
+    // Naming the default endpoint explicitly is still the default endpoint.
+    var explicit_default = generating_runtime.GeneratorConfig{
+        .provider = .antfly,
+        .model = try alloc.dupe(u8, "gen"),
+        .url = try alloc.dupe(u8, "http://shared.example/"),
+    };
+    defer explicit_default.deinit(alloc);
+    try runtime.routeGeneratorConfig(alloc, &explicit_default);
+    try std.testing.expectEqualStrings("http://shared.example/", explicit_default.url);
+    try std.testing.expectEqualStrings("node-default-key", explicit_default.api_key.?);
+
+    // An explicit task credential wins over the node default.
+    var own_key = generating_runtime.GeneratorConfig{
+        .provider = .antfly,
+        .model = try alloc.dupe(u8, "gen"),
+        .url = try alloc.dupe(u8, "http://shared.example/ai/v1"),
+        .api_key = try alloc.dupe(u8, "task-key"),
+    };
+    defer own_key.deinit(alloc);
+    try runtime.routeGeneratorConfig(alloc, &own_key);
+    try std.testing.expectEqualStrings("task-key", own_key.api_key.?);
+
+    // A third-party URL never inherits it.
+    var third_party = generating_runtime.GeneratorConfig{
+        .provider = .antfly,
+        .model = try alloc.dupe(u8, "gen"),
+        .url = try alloc.dupe(u8, "http://third.example/ai/v1"),
+    };
+    defer third_party.deinit(alloc);
+    try runtime.routeGeneratorConfig(alloc, &third_party);
+    try std.testing.expect(third_party.api_key == null);
+
+    var extractor_default = extracting.Config{
+        .provider = .antfly,
+        .model = try alloc.dupe(u8, "ext"),
+        .url = try alloc.dupe(u8, "http://SHARED.example/ai/v1"),
+    };
+    defer extractor_default.deinit(alloc);
+    try runtime.routeExtractorConfig(alloc, &extractor_default);
+    try std.testing.expectEqualStrings("node-default-key", extractor_default.api_key.?);
+
+    var extractor_third = extracting.Config{
+        .provider = .antfly,
+        .model = try alloc.dupe(u8, "ext"),
+        .url = try alloc.dupe(u8, "http://third.example/ai/v1"),
+    };
+    defer extractor_third.deinit(alloc);
+    try runtime.routeExtractorConfig(alloc, &extractor_third);
+    try std.testing.expect(extractor_third.api_key == null);
 }
 
 test "asset producer runtime external inference endpoint is canonical and authoritative" {
