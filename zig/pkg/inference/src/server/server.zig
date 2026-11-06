@@ -6299,7 +6299,7 @@ pub const Node = struct {
             admitted_prefill_chunk,
             kv_capacity_policy,
         );
-        var admission_amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(resource_estimate);
+        var admission_amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(resource_estimate);
         if (generation.messagesHaveImages(messages) or generation.messagesHaveAudio(messages)) {
             admission_amounts = try admission_amounts.merge(
                 try model_manager_mod.projectorRunAdmissionAmounts(
@@ -9337,7 +9337,7 @@ pub const Node = struct {
         // still owns its complete original host envelope. Only one GPU gate
         // owner can retain the additional grouped-block host working sets.
         vision_amounts.backend_scratch_bytes = try std.math.mul(usize, vision_amounts.backend_scratch_bytes, features.visionRetainedBlocks());
-        try memory.add(cfg, estimate.token_count, @intCast(max_tokens), runtime.tier.memory.AdmissionAmounts.fromEstimate(resource), vision_amounts);
+        try memory.add(cfg, estimate.token_count, @intCast(max_tokens), try runtime.tier.memory.AdmissionAmounts.fromEstimate(resource), vision_amounts);
         const vision_batch_enabled = features.vision_batch_items > 1;
         // Exactly one GPU gate owner can encode vision, with at most four
         // images in that batch. Keep host/history/output reservations additive;
@@ -9821,7 +9821,7 @@ pub const Node = struct {
             var page_budget = runtime.tier.memory.RunBudget.init(limits);
             const chunk = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(if (backend == .cuda) &page_budget else &budget, &components, estimate.token_count, @intCast(payload.max_tokens), @min(estimate.token_count, 2048));
             const resource = try runtime.tier.memory.estimateGptGeneration(backend, kv_dtype, cfg, estimate.token_count, @intCast(payload.max_tokens), chunk);
-            try memory.add(cfg, estimate.token_count, @intCast(payload.max_tokens), runtime.tier.memory.AdmissionAmounts.fromEstimate(resource), try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, backend, estimate.media_admission));
+            try memory.add(cfg, estimate.token_count, @intCast(payload.max_tokens), try runtime.tier.memory.AdmissionAmounts.fromEstimate(resource), try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, backend, estimate.media_admission));
             task.* = .{ .pipeline = undefined, .payload = payload, .item = item, .lease = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = payload.prompt.len, .prompt_tokens = estimate.token_count, .prefill_chunk_limit = chunk, .max_tokens = payload.max_tokens }), .image = .{payload.image}, .parts = .{ .{ .image = 0 }, .{ .text = payload.prompt } }, .start = undefined };
             initialized += 1;
         }
@@ -16984,7 +16984,7 @@ pub const Node = struct {
             .resources = .{
                 .backend_class = target_backend_class,
                 .limits = target_admission_limits,
-                .amounts = .fromEstimate(resource_estimate),
+                .amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(resource_estimate),
             },
         };
         const native_resume = if (native_transfer) |transfer| transfer.resume_request != null else false;
@@ -17013,7 +17013,7 @@ pub const Node = struct {
                             self.defaultGenerationLimits(draft_backend_class),
                         ),
                     ),
-                    .amounts = .fromEstimate(estimate),
+                    .amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate),
                 },
             };
             break :blk 2;
@@ -18476,6 +18476,9 @@ pub const Node = struct {
             .kv_tier = existing.kv_tier,
             .scratch_bytes = @max(existing.scratch_bytes, next.scratch_bytes),
             .scratch_tier = existing.scratch_tier,
+            // shared_serial closes each state and its task arena before the
+            // next task (see task loop below), so host metadata shares a peak.
+            .host_metadata_bytes = @max(existing.host_metadata_bytes, next.host_metadata_bytes),
         };
     }
 
@@ -18484,6 +18487,7 @@ pub const Node = struct {
         std.debug.assert(total.kv_tier == next.kv_tier and total.scratch_tier == next.scratch_tier);
         total.kv_bytes +|= next.kv_bytes;
         total.scratch_bytes +|= next.scratch_bytes;
+        total.host_metadata_bytes +|= next.host_metadata_bytes;
         total.prompt_tokens +|= next.prompt_tokens;
         total.retained_tokens +|= next.retained_tokens;
         return total;
@@ -18505,7 +18509,7 @@ pub const Node = struct {
                 .resources = .{
                     .backend_class = backend_class,
                     .limits = limits,
-                    .amounts = .fromEstimate(estimate),
+                    .amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate),
                 },
             }}),
             .estimate = estimate,
@@ -19405,7 +19409,7 @@ pub const Node = struct {
                                 mergeCoordinatedBatchEstimate(combined, estimate)
                             else
                                 mergeSerialBatchEstimate(combined, estimate);
-                            const pressure = estimate.kv_bytes +| estimate.scratch_bytes;
+                            const pressure = estimate.kv_bytes +| estimate.scratch_bytes +| estimate.host_metadata_bytes;
                             if (largest_pos == null or pressure > largest_pressure) {
                                 largest_pos = pos;
                                 largest_pressure = pressure;
@@ -33007,13 +33011,14 @@ test "coordinated Metal batch retains model ownership with an independent step m
 }
 
 test "coordinated batch admission reserves all live KV caches and scratch" {
-    const first = runtime.tier.memory.Estimate{ .prompt_tokens = 100, .retained_tokens = 120, .kv_bytes = 900, .kv_tier = .backend, .scratch_bytes = 200, .scratch_tier = .backend };
-    const second = runtime.tier.memory.Estimate{ .prompt_tokens = 300, .retained_tokens = 320, .kv_bytes = 400, .kv_tier = .backend, .scratch_bytes = 700, .scratch_tier = .backend };
+    const first = runtime.tier.memory.Estimate{ .prompt_tokens = 100, .retained_tokens = 120, .kv_bytes = 900, .kv_tier = .backend, .scratch_bytes = 200, .scratch_tier = .backend, .host_metadata_bytes = 31 };
+    const second = runtime.tier.memory.Estimate{ .prompt_tokens = 300, .retained_tokens = 320, .kv_bytes = 400, .kv_tier = .backend, .scratch_bytes = 700, .scratch_tier = .backend, .host_metadata_bytes = 79 };
     const merged = Node.mergeCoordinatedBatchEstimate(first, second);
     try std.testing.expectEqual(@as(usize, 400), merged.prompt_tokens);
     try std.testing.expectEqual(@as(usize, 440), merged.retained_tokens);
     try std.testing.expectEqual(@as(usize, 1300), merged.kv_bytes);
     try std.testing.expectEqual(@as(usize, 900), merged.scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 110), merged.host_metadata_bytes);
 }
 
 test "serial batch admission covers each request without summing them" {
@@ -33024,6 +33029,7 @@ test "serial batch admission covers each request without summing them" {
         .kv_tier = .backend,
         .scratch_bytes = 200,
         .scratch_tier = .backend,
+        .host_metadata_bytes = 31,
     };
     const second = runtime.tier.memory.Estimate{
         .prompt_tokens = 300,
@@ -33032,12 +33038,14 @@ test "serial batch admission covers each request without summing them" {
         .kv_tier = .backend,
         .scratch_bytes = 700,
         .scratch_tier = .backend,
+        .host_metadata_bytes = 79,
     };
     const merged = Node.mergeSerialBatchEstimate(first, second);
     try std.testing.expectEqual(@as(usize, 300), merged.prompt_tokens);
     try std.testing.expectEqual(@as(usize, 320), merged.retained_tokens);
     try std.testing.expectEqual(@as(usize, 900), merged.kv_bytes);
     try std.testing.expectEqual(@as(usize, 700), merged.scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 79), merged.host_metadata_bytes);
 }
 
 test "direct generation admission owns capacity exactly once" {
@@ -36742,7 +36750,7 @@ test "generation prefill planning excludes serialized waiters and preserves isol
         .position_encoding = .rope,
     };
     const smaller = try runtime.tier.memory.estimateGptGeneration(.cuda, .f16, cfg, 31289, 128, 256);
-    var budget = runtime.tier.memory.RunBudget.init(.{ .scratch_limit_bytes = smaller.scratch_bytes });
+    var budget = runtime.tier.memory.RunBudget.init(.{ .scratch_limit_bytes = try std.math.add(usize, smaller.scratch_bytes, smaller.host_metadata_bytes) });
     const bounded = try runtime.tier.memory.reserveGptGenerationPrefill(&budget, &.{.{
         .backend = .cuda,
         .kv_dtype = .f16,
@@ -47382,7 +47390,7 @@ test "LightOnOCR3 chunk groups retain complete pages and admit both bounded work
     const cfg = gpt_model_mod.Config{ .family = .qwen3_5, .hidden_size = 2560, .vocab_size = 248320, .num_attention_heads = 16, .num_key_value_heads = 4, .num_hidden_layers = 32, .qwen35_has_linear_attention = true, .compact_qwen35_kv = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 16, .qwen35_linear_num_value_heads = 32, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4 };
     for ([_]usize{ 432, 554, 662 }) |prompt| {
         const full = try memory.estimateGptGeneration(.metal, .f16, cfg, prompt, 256, prompt);
-        const decoder = memory.AdmissionAmounts.fromEstimate(full);
+        const decoder = try memory.AdmissionAmounts.fromEstimate(full);
         const vision = memory.AdmissionAmounts{ .host_scratch_bytes = 9012, .backend_scratch_bytes = 3456 };
         var whole = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .packed_mixed = true, .decoder_rows = 64, .max_prefill_batch_items = 4 };
         try whole.add(cfg, prompt, 256, decoder, vision);
@@ -49694,7 +49702,7 @@ test "LightOnOCR3 serial and cohort CUDA admission charge persistent recurrent s
     cfg.qwen35_device_only_state = true;
     const memory = runtime.tier.memory;
     const estimate = try memory.estimateGptGeneration(.cuda, .f16, cfg, 128, 64, 128);
-    const decoder = memory.AdmissionAmounts.fromEstimate(estimate);
+    const decoder = try memory.AdmissionAmounts.fromEstimate(estimate);
     var serial = Node.LightOnCohortMemory{ .backend = .cuda };
     try serial.add(cfg, 128, 64, decoder, .{});
     try std.testing.expectEqual(decoder.backend_scratch_bytes + 128 * cfg.hidden_size * @sizeOf(f32), serial.amounts.backend_scratch_bytes);
@@ -51689,7 +51697,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
             try std.testing.expect(@import("../ops/cuda/paged_attention_bf16.zig").geometrySupported(cfg.num_attention_heads, cfg.effectiveKVHeads(), cfg.headDim()));
             const dtype = session_factory.recommendedKvDTypeForSession(session, .cuda);
             const estimate = try runtime.tier.memory.estimateGptGeneration(.cuda, dtype, cfg, prefix_tokens, tokens_per_page, prefix_tokens);
-            const amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate);
+            const amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate);
             // Use the actual resolved production cadence for both profiles.
             const features = Context.ExecutionFeatures.resolveWithPolicy(cfg, .cuda, true, 2);
             var factory = Context.Factory{ .node = &node, .model = &model, .cfg = cfg, .limits = limits, .physical_rows_limit = 2, .cuda_batch_enabled = true, .features = features, .control = .{ .native_call_policy = .in_process, .deadline_ns = platform.time.monotonicNs() + 60 * std.time.ns_per_s }, .creator_page = .{ .amounts = amounts, .peak = null, .host_peak = 0 } };
@@ -52328,7 +52336,7 @@ test "CUDA actual standalone generation original admission and optional attentio
             const dtype = session_factory.recommendedKvDTypeForSession(session, .cuda);
             const estimate = try runtime.tier.memory.estimateGptGeneration(.cuda, dtype, cfg, 4, 1, 4);
             var primary: ?runtime.tier.memory.AdmissionLease = if (managed)
-                try domain.controller.tryAcquire(.gpu, limits, runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate), false)
+                try domain.controller.tryAcquire(.gpu, limits, try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate), false)
             else
                 null;
             defer if (primary) |*lease| lease.release();
@@ -52481,7 +52489,7 @@ test "Native generation cold recurrent state uses same additive primary actual F
             defer domain.release();
             const control = InferenceExecutionControl{ .native_call_policy = .in_process };
             const estimate = try runtime.tier.memory.estimateGptGeneration(.native, .f32, cfg, 4, 1, 4);
-            const amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate);
+            const amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate);
             const limits = runtime.tier.memory.Limits{ .host_limit_bytes = 1024 * 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 * 1024 };
             var primary: ?runtime.tier.memory.AdmissionLease = null;
             defer if (primary) |*value| value.release();

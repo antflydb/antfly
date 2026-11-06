@@ -2082,7 +2082,7 @@ pub const ModelManager = struct {
         return self.acquireRunResourceAmounts(
             backend_class,
             limits,
-            .fromEstimate(estimate),
+            try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate),
         );
     }
 
@@ -6194,7 +6194,8 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
         defer manager.deinit();
         try manager.ensureResourceOwnerReady();
         const controller = manager.admissionController();
-        // No physical GPU allocation or host-capacity dependency in this test.
+        // No physical GPU allocation: the independent host metadata bound
+        // still belongs to the request, outside the credited GPU workspace.
         controller.configureSharedLimits(.{});
         var model_lease = try controller.tryAcquire(.gpu, plan.limit_floor, plan.peak, false);
         defer model_lease.release();
@@ -6205,8 +6206,12 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
         };
         defer workspace.borrowed.deinit();
         const session = backends.Session{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
-        const limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = 1024, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
-        try std.testing.expectEqual(@as(usize, 1024), limits.host_limit_bytes);
+        const strict_host_limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = 1024, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
+        try std.testing.expectEqual(@as(usize, 1024), strict_host_limits.host_limit_bytes);
+        const host_metadata = try @import("../runtime/kv/view_metadata.zig").hostBytes(@max(@as(usize, 2049), platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0), memory.generation_kv_page_size_tokens, false);
+        const operator_host_limit = @max(@as(usize, 1024), host_metadata);
+        const limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = operator_host_limit, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
+        try std.testing.expectEqual(operator_host_limit, limits.host_limit_bytes);
         try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), limits.backend_limit_bytes);
         try std.testing.expectEqual(limits.host_limit_bytes + limits.backend_limit_bytes, limits.combined_limit_bytes);
         // Plan a real long prompt before borrowing. The generic scratch cap
@@ -6236,12 +6241,24 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
         try std.testing.expect(prefill.max_chunk_rows < 2048);
         const estimate = try memory.estimateGptGeneration(.cuda, .f16, gpt_config, 2048, 1, prefill.max_chunk_rows);
         try std.testing.expect(estimate.scratch_bytes <= workspace.capacity.backend_scratch_bytes);
+        // The old strict operator cap remains strict: actual mandatory host
+        // metadata cannot be paid by the precharged device workspace.
+        try std.testing.expect(host_metadata > strict_host_limits.host_limit_bytes);
+        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&.{.{
+            .session = session,
+            .resources = .{ .backend_class = .gpu, .limits = strict_host_limits, .amounts = try memory.AdmissionAmounts.fromEstimate(estimate) },
+        }}));
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
         var prompt_lease = try manager.acquireGenerationResources(&.{.{
             .session = session,
-            .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .fromEstimate(estimate) },
+            .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate) },
         }});
-        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+        try std.testing.expectEqual(host_metadata, estimate.host_metadata_bytes);
+        const with_request_host = try plan.resident.merge(.{ .host_scratch_bytes = estimate.host_metadata_bytes });
+        try std.testing.expectEqualDeep(with_request_host, controller.snapshot());
         prompt_lease.release();
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
         const one_byte = memory.AdmissionAmounts{ .backend_scratch_bytes = 1 };
         // AJ's reproduction: preserving the floor alone still double-charges.

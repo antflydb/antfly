@@ -973,6 +973,24 @@ pub const KvStorageRuntime = struct {
     pub fn appendTokens(self: *KvStorageRuntime, sequence_id: SequenceId, count: u16) !void {
         return self.appendTokensWithCleanup(sequence_id, count, .{});
     }
+    pub fn canPrepareGeneratedAppend(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize) bool {
+        if (count == 0) return false;
+        const state = self.sequenceMut(sequence_id) catch return false;
+        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy } else null else null;
+        return writable.canPrepareAppend(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.device_write_hook == null, provider);
+    }
+    pub fn prepareGeneratedAppendWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize, reserve_to: usize, current: Cleanup) !writable.PreparedAppend {
+        if (!self.canPrepareGeneratedAppend(sequence_id, count)) return error.SharedKvWriteUnsupported;
+        const state = try self.sequenceMut(sequence_id);
+        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy, .cleanup = current } else null else null;
+        var prepared = try writable.prepareAppend(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, count, reserve_to, if (state.compacted) null else self.storage.config.sliding_window_size, sequence_id, self.device_write_hook == null, provider);
+        errdefer prepared.abort();
+        // Front retirement/reuse may invalidate a real device capture owner.
+        // Authorize and drain that mutation with the actual current B before
+        // infallible commit. Ordinary tail appends query no hook or SDK state.
+        if (prepared.drop_pages != 0) if (self.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
+        return prepared;
+    }
     pub fn appendTokensWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: u16, current: Cleanup) !void {
         var remaining = count;
         const sequence_state = try self.sequenceMut(sequence_id);
@@ -1985,4 +2003,42 @@ test "page token offsets share bounded scratch across mapped identity and cyclic
     try std.testing.expectEqualSlices(u32, &.{ 0, 2, 0, 2 }, old.values());
     try std.testing.expectEqual(@as(usize, 2), legacy.ring_page_count);
     try std.testing.expectEqual(@as(usize, 2), legacy.page_size_tokens);
+}
+
+test "prepared generated storage append authorizes front retirement before publication and skips ordinary tail hook" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn prepare(raw: *anyopaque, implementation: *const anyopaque, _: Cleanup) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (implementation != &table) return error.ForeignMutationHook;
+            self.calls += 1;
+            return error.FrontMutationRefused;
+        }
+        fn write(_: *anyopaque, _: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) !void {
+            return error.UnexpectedNumericalWrite;
+        }
+        fn close(_: *anyopaque, _: std.mem.Allocator) void {}
+        const table: DeviceWriteHook.VTable = .{ .prepareMutationWithCleanup = prepare, .writeLayerKvSuffix = write, .deinit = close };
+    };
+    const a = std.testing.allocator;
+    var storage = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 1, .sliding_window_size = 4 });
+    defer storage.deinit();
+    const sequence = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(sequence, 1);
+    var probe: Probe = .{};
+    storage.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &Probe.table });
+    {
+        var prepared = try storage.prepareGeneratedAppendWithCleanup(sequence, 1, 0, .{});
+        defer prepared.abort();
+        prepared.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(@as(usize, 2), storage.tokenCount(sequence).?);
+    try storage.appendTokens(sequence, 5);
+    const before = try a.dupe(block.KvBlockId, (try storage.sequenceMut(sequence)).block_table.blocks.items);
+    defer a.free(before);
+    try std.testing.expectError(error.FrontMutationRefused, storage.prepareGeneratedAppendWithCleanup(sequence, 1, 0, .{}));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 7), storage.tokenCount(sequence).?);
+    try std.testing.expectEqualSlices(block.KvBlockId, before, (try storage.sequenceMut(sequence)).block_table.blocks.items);
 }

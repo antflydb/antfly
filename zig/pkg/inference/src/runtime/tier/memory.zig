@@ -335,6 +335,9 @@ pub const Estimate = struct {
     kv_tier: ResidencyTier,
     scratch_bytes: usize,
     scratch_tier: ResidencyTier,
+    /// Independently retained host metadata, even for a backend-resident run.
+    /// This is additive to the original KV and execution scratch estimates.
+    host_metadata_bytes: usize = 0,
 };
 
 pub const EstimateError = error{
@@ -363,6 +366,8 @@ pub const RunBudget = struct {
         try self.tryReserve(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         errdefer self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         try self.tryReserve(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
+        errdefer self.release(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
+        try self.tryReserve(.{ .kind = .scratch, .tier = .host, .bytes = estimate.host_metadata_bytes });
     }
 
     /// Roll back a previously successful reserveEstimate call. Batch admission
@@ -370,6 +375,7 @@ pub const RunBudget = struct {
     /// per-run reservation, so one rejected request cannot consume the local
     /// budget of later requests in the same batch.
     pub fn releaseEstimate(self: *RunBudget, estimate: Estimate) void {
+        self.release(.{ .kind = .scratch, .tier = .host, .bytes = estimate.host_metadata_bytes });
         self.release(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
         self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
     }
@@ -607,7 +613,7 @@ pub const AdmissionAmounts = struct {
         return addSaturating(self.host_scratch_bytes, self.backend_scratch_bytes);
     }
 
-    pub fn fromEstimate(estimate: Estimate) @This() {
+    pub fn fromEstimate(estimate: Estimate) !@This() {
         var amounts: @This() = .{};
         switch (estimate.kv_tier) {
             .disk => {},
@@ -619,6 +625,7 @@ pub const AdmissionAmounts = struct {
             .host => amounts.host_scratch_bytes = estimate.scratch_bytes,
             .backend => amounts.backend_scratch_bytes = estimate.scratch_bytes,
         }
+        amounts.host_scratch_bytes = std.math.add(usize, amounts.host_scratch_bytes, estimate.host_metadata_bytes) catch return error.ResourceLimitExceeded;
         return amounts;
     }
 
@@ -3208,7 +3215,14 @@ pub fn estimateGptGenerationForKvPolicy(
         ) catch return error.ResourceLimitExceeded,
     ) catch return error.ResourceLimitExceeded;
 
+    const replay_capacity = if (kv_dtype == .f16 or kv_dtype == .polar4 or kv_dtype == .turbo3)
+        platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0
+    else
+        0;
+    const host_metadata_bytes = @import("../kv/view_metadata.zig").hostBytes(@max(total_tokens, replay_capacity), generation_kv_page_size_tokens, false) catch return error.ResourceLimitExceeded;
+
     return .{
+        .host_metadata_bytes = host_metadata_bytes,
         .prompt_tokens = prompt_tokens,
         .retained_tokens = retained_tokens,
         .kv_bytes = kv_bytes,
@@ -4645,10 +4659,9 @@ test "generation budget downshifts target and draft together" {
         200,
     );
     try std.testing.expectEqual(@as(usize, 64), selected);
-    try std.testing.expectEqual(
-        2 * (try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 64)).scratch_bytes,
-        budget.scratchTotalBytes(),
-    );
+    const selected_component = try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 64);
+    const selected_total = try std.math.add(usize, selected_component.scratch_bytes, selected_component.host_metadata_bytes);
+    try std.testing.expectEqual(try std.math.mul(usize, 2, selected_total), budget.scratchTotalBytes());
 }
 
 test "cuda Gemma4 prefill rejects unsafe 2051 row physical envelope" {
@@ -4766,10 +4779,12 @@ test "generation budget respects each workspace and stricter operator caps" {
     // The larger target allowance must not hide the draft's smaller workspace.
     var budget = RunBudget.init(.{});
     try std.testing.expectEqual(@as(usize, 64), try reserveGptGenerationAtLargestChunk(&budget, &components, 512, 1, 512));
-    try std.testing.expectEqual(small.scratch_bytes * 2, budget.scratchTotalBytes());
+    const small_total = try std.math.add(usize, small.scratch_bytes, small.host_metadata_bytes);
+    try std.testing.expectEqual(try std.math.mul(usize, 2, small_total), budget.scratchTotalBytes());
     // Explicit request caps still constrain the sum of both components.
     const minimum = try estimateGptGeneration(.cuda, .f16, cfg, 512, 1, 32);
-    budget = RunBudget.init(.{ .scratch_limit_bytes = minimum.scratch_bytes * 2 });
+    const minimum_total = try std.math.add(usize, minimum.scratch_bytes, minimum.host_metadata_bytes);
+    budget = RunBudget.init(.{ .scratch_limit_bytes = try std.math.mul(usize, 2, minimum_total) });
     try std.testing.expectEqual(@as(usize, 32), try reserveGptGenerationAtLargestChunk(&budget, &components, 512, 1, 512));
     // Zero credit is a hard bound, unlike zero in the process-wide Limits.
     components[1].workspace_capacity.?.backend_scratch_bytes = 0;
@@ -4799,7 +4814,8 @@ test "generation budget rolls back all components when the minimum chunk fails" 
         .{ .backend = .native, .kv_dtype = .f16, .config = cfg },
         .{ .backend = .native, .kv_dtype = .f16, .config = cfg },
     };
-    const one_component_scratch = (try estimateGptGeneration(.native, .f16, cfg, 200, 1, 32)).scratch_bytes;
+    const one_component = try estimateGptGeneration(.native, .f16, cfg, 200, 1, 32);
+    const one_component_scratch = try std.math.add(usize, one_component.scratch_bytes, one_component.host_metadata_bytes);
     var budget = RunBudget.init(.{ .scratch_limit_bytes = one_component_scratch + 1 });
 
     try std.testing.expectError(
@@ -4881,7 +4897,7 @@ test "admission rejects aggregate overflow across backend domains" {
 }
 
 test "combined target and draft estimates are admitted atomically" {
-    const target = AdmissionAmounts.fromEstimate(.{
+    const target = try AdmissionAmounts.fromEstimate(.{
         .prompt_tokens = 8,
         .retained_tokens = 16,
         .kv_bytes = 40,
@@ -4889,7 +4905,7 @@ test "combined target and draft estimates are admitted atomically" {
         .scratch_bytes = 10,
         .scratch_tier = .host,
     });
-    const draft = AdmissionAmounts.fromEstimate(.{
+    const draft = try AdmissionAmounts.fromEstimate(.{
         .prompt_tokens = 8,
         .retained_tokens = 16,
         .kv_bytes = 30,
@@ -4989,11 +5005,12 @@ test "LightOnOCR3 automatic CUDA recurrent state has serial admission and rollba
     try std.testing.expect(retained > 0);
     try std.testing.expectEqual(host_state.scratch_bytes + retained, device_state.scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), try gptRecurrentBackendStateBytes(.native, cfg));
-    var budget = RunBudget.init(.{ .scratch_limit_bytes = host_state.scratch_bytes });
+    const host_scratch = try std.math.add(usize, host_state.scratch_bytes, host_state.host_metadata_bytes);
+    var budget = RunBudget.init(.{ .scratch_limit_bytes = host_scratch });
     try std.testing.expectError(error.MemoryBudgetExceeded, budget.reserveEstimate(device_state));
     try std.testing.expectEqual(@as(usize, 0), budget.backend_kv_bytes);
     try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
-    budget.limits.scratch_limit_bytes = device_state.scratch_bytes;
+    budget.limits.scratch_limit_bytes = try std.math.add(usize, device_state.scratch_bytes, device_state.host_metadata_bytes);
     try budget.reserveEstimate(device_state);
     budget.releaseEstimate(device_state);
     try std.testing.expectEqual(@as(usize, 0), budget.backend_kv_bytes);
@@ -5572,9 +5589,11 @@ test "Native generation independently declares recurrent host state without borr
     const state_bytes = try @import("../../execution/recurrent_state_admission.zig").NativeHostState.requiredBytes(cfg);
     try std.testing.expectEqual(base.kv_bytes, owned.kv_bytes);
     try std.testing.expectEqual(base.scratch_bytes + state_bytes, owned.scratch_bytes);
-    var below = RunBudget.init(.{ .scratch_limit_bytes = owned.scratch_bytes - 1 });
+    try std.testing.expectEqual(base.host_metadata_bytes, owned.host_metadata_bytes);
+    const complete_scratch = try std.math.add(usize, owned.scratch_bytes, owned.host_metadata_bytes);
+    var below = RunBudget.init(.{ .scratch_limit_bytes = complete_scratch - 1 });
     try std.testing.expectError(error.MemoryBudgetExceeded, below.reserveEstimate(owned));
-    var exact = RunBudget.init(.{ .scratch_limit_bytes = owned.scratch_bytes });
+    var exact = RunBudget.init(.{ .scratch_limit_bytes = complete_scratch });
     try exact.reserveEstimate(owned);
 }
 
@@ -5588,8 +5607,33 @@ test "Native generation header-only Qwen cache remains an exact independent prim
     try std.testing.expect(required > 0);
     try std.testing.expectEqual(base.kv_bytes, actual.kv_bytes);
     try std.testing.expectEqual(base.scratch_bytes + required, actual.scratch_bytes);
-    var below = RunBudget.init(.{ .scratch_limit_bytes = actual.scratch_bytes - 1 });
+    try std.testing.expectEqual(base.host_metadata_bytes, actual.host_metadata_bytes);
+    const complete_scratch = try std.math.add(usize, actual.scratch_bytes, actual.host_metadata_bytes);
+    var below = RunBudget.init(.{ .scratch_limit_bytes = complete_scratch - 1 });
     try std.testing.expectError(error.MemoryBudgetExceeded, below.reserveEstimate(actual));
-    var exact = RunBudget.init(.{ .scratch_limit_bytes = actual.scratch_bytes });
+    var exact = RunBudget.init(.{ .scratch_limit_bytes = complete_scratch });
     try exact.reserveEstimate(actual);
+}
+
+test "generation host metadata remains independent checked host scratch across budget and controller amounts" {
+    const estimate = Estimate{ .prompt_tokens = 1, .retained_tokens = 2, .kv_bytes = 40, .kv_tier = .backend, .scratch_bytes = 50, .scratch_tier = .backend, .host_metadata_bytes = 10 };
+    const amounts = try AdmissionAmounts.fromEstimate(estimate);
+    try std.testing.expectEqualDeep(AdmissionAmounts{ .backend_kv_bytes = 40, .backend_scratch_bytes = 50, .host_scratch_bytes = 10 }, amounts);
+    var below = RunBudget.init(.{ .host_limit_bytes = 9 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, below.reserveEstimate(estimate));
+    try std.testing.expectEqual(@as(usize, 0), below.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), below.backendTotalBytes());
+    var exact = RunBudget.init(.{ .host_limit_bytes = 10, .backend_limit_bytes = 90, .combined_limit_bytes = 100 });
+    try exact.reserveEstimate(estimate);
+    try std.testing.expectEqual(@as(usize, 10), exact.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 50), exact.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 40), exact.backend_kv_bytes);
+    exact.releaseEstimate(estimate);
+    try std.testing.expectEqual(@as(usize, 0), exact.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), exact.backendTotalBytes());
+    var native = estimate;
+    native.scratch_tier = .host;
+    try std.testing.expectEqual(@as(usize, 60), (try AdmissionAmounts.fromEstimate(native)).host_scratch_bytes);
+    native.scratch_bytes = std.math.maxInt(usize);
+    try std.testing.expectError(error.ResourceLimitExceeded, AdmissionAmounts.fromEstimate(native));
 }

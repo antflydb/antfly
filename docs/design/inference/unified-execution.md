@@ -235,8 +235,17 @@ preparation API do not by themselves complete these remaining requirements:
   Metal and generation reuse it while explicitly preserving architectural versus
   compact stored-layer layouts and host-mirror choices. Remaining specialized
   task transitions and compatibility arenas retain their explicit owners.
-  Generated-token append still spans manager/storage allocation and trimming;
-  failure atomicity across those owners requires a prepared state transaction.
+  Already-attached canonical KV owners prepare generated-token page growth,
+  shared-tail copies, window trimming, replay reservations and view metadata
+  before committing either owner. The unchanged-ID path preserves the existing
+  table without allocation or a history copy. Grown host tables retain their
+  allocating owner through state teardown; generation admission declares their
+  checked host footprint separately from device scratch. Serial batches take
+  the peak after request-state death; coordinated participants add their live
+  metadata. Metadata synchronization failures propagate before publishing a new
+  view. Detached attachment, opaque providers and other state transitions retain
+  compatibility ownership and still need transaction migration; host-table
+  retention alone does not certify every device cancellation/drain endpoint.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU
