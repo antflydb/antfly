@@ -27,6 +27,7 @@ and a restart rebuilds them from current runtime config rather than from
 anything persisted with the index.
 """
 
+import base64
 import json
 import os
 import threading
@@ -278,3 +279,252 @@ def test_default_inference_api_key_authenticates_background_enrichment(
         _assert_only(shared_inference, API_KEY)
     finally:
         server.stop()
+
+
+# --- Remote task families --------------------------------------------------
+#
+# Every remote task family that inherits the node default endpoint inherits
+# its credential too: in-table chunkers, readers, generators, extractors and
+# transcribers (storage-owned background work) and query-time rerankers. An
+# index or producer that names its own endpoint never receives it.
+
+TASK_MODELS = {
+    "chunkers": "shared/chunker",
+    "rerankers": "shared/reranker",
+    "readers": "shared/reader",
+    "generators": "shared/generator",
+    "extractors": "shared/extractor",
+    "transcribers": "shared/transcriber",
+}
+ZIG_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _data_uri(mime_type: str, relative: str) -> str:
+    raw = (ZIG_ROOT / relative).read_bytes()
+    return f"data:{mime_type};base64," + base64.b64encode(raw).decode("ascii")
+
+
+class _TaskInference(ThreadingHTTPServer):
+    """Antfly inference stand-in that records Authorization per task."""
+
+    daemon_threads = True
+
+    def __init__(self, api_key: str, enforce: bool) -> None:
+        super().__init__(("127.0.0.1", 0), _TaskInferenceHandler)
+        self.lock = threading.Lock()
+        self.api_key = api_key
+        self.enforce = enforce
+        self.seen: list[tuple[str, str | None]] = []
+
+    @property
+    def api_url(self) -> str:
+        return f"http://127.0.0.1:{self.server_address[1]}/ai/v1"
+
+    def tasks(self) -> set[str]:
+        with self.lock:
+            return {task for task, _ in self.seen}
+
+    def authorizations(self) -> set[str | None]:
+        with self.lock:
+            return {authorization for _, authorization in self.seen}
+
+    def requests(self) -> list[tuple[str, str | None]]:
+        with self.lock:
+            return list(self.seen)
+
+
+class _TaskInferenceHandler(BaseHTTPRequestHandler):
+    server: _TaskInference
+
+    def log_message(self, *_args) -> None:
+        pass
+
+    def _reply(self, status: int, body: dict) -> None:
+        raw = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _admit(self, task: str) -> bool:
+        authorization = self.headers.get("Authorization")
+        with self.server.lock:
+            self.server.seen.append((task, authorization))
+        if self.server.enforce and authorization != f"Bearer {self.server.api_key}":
+            self._reply(401, {"error": "missing or invalid API key"})
+            return False
+        return True
+
+    def do_GET(self) -> None:
+        if not self.path.split("?", 1)[0].endswith("/ai/v1/models"):
+            self._reply(404, {"error": "not found"})
+            return
+        if self._admit("models"):
+            catalog = {
+                family: {model: {"inputs": ["text", "image", "audio"]}}
+                for family, model in TASK_MODELS.items()
+            }
+            catalog["embedders"] = {MODEL: {"dimensions": DIMENSIONS}}
+            self._reply(200, catalog)
+
+    def do_POST(self) -> None:
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        task = self.path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if task not in ("embed", "chunk", "rerank", "read", "generate", "extract", "transcribe"):
+            self._reply(404, {"error": "not found"})
+            return
+        if not self._admit(task):
+            return
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            body = {}
+        if task == "embed":
+            inputs = body.get("input")
+            count = len(inputs) if isinstance(inputs, list) else 1
+            self._reply(200, {"data": [{"embedding": [0.5, 0.25, 0.125, 0.0625]}] * count})
+        elif task == "chunk":
+            text = str(body.get("input", ""))
+            self._reply(200, {"object": "list", "data": [
+                {"id": 0, "mime_type": "text/plain", "text": text, "start_char": 0, "end_char": len(text)}
+            ]})
+        elif task == "rerank":
+            count = len(body.get("documents") or body.get("prompts") or [])
+            self._reply(200, {"scores": [1.0 - i / 100 for i in range(count)]})
+        elif task == "read":
+            count = max(1, len(body.get("images") or []))
+            self._reply(200, {"object": "list", "data": [
+                {"object": "read_result", "index": i, "text": "read text"} for i in range(count)
+            ]})
+        elif task == "generate":
+            self._reply(200, {"choices": [{"message": {"role": "assistant", "content": "generated"}, "finish_reason": "stop"}]})
+        else:
+            self._reply(200, {"text": "", "data": []})
+
+
+def _task_server(api_key: str, enforce: bool):
+    server = _TaskInference(api_key, enforce)
+    return server, start_http_server(server)
+
+
+# Families that must reach the shared endpoint from background enrichment
+# (storage-owned). Generator producers are covered by unit tests: a remote
+# generator producer currently aborts the server after its first response
+# (reproduces on main with an explicit generator url), independent of auth.
+BACKGROUND_TASKS = {"chunk", "read", "extract", "transcribe"}
+
+
+@pytest.mark.parametrize("storage_engine", ["local", "lite"])
+def test_default_inference_api_key_reaches_remote_tasks_only_at_default_endpoint(
+    tmp_path, storage_engine
+):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not Path(binary).is_file():
+        pytest.skip("Antfly binary unavailable")
+    shared, shared_thread = _task_server(API_KEY, enforce=False)
+    third_party, third_thread = _task_server("third-party-key", enforce=False)
+    config_path = _write_config(tmp_path, shared.api_url)
+    server = StandaloneAntflyServer(
+        binary,
+        "127.0.0.1",
+        0,
+        config_path=config_path,
+        storage_engine=None if storage_engine == "local" else storage_engine,
+    )
+    try:
+        api_url = server.api_url
+        table = "remote_tasks"
+        embedder = {"provider": "antfly", "model": MODEL}
+        created = requests.post(
+            f"{api_url}/tables/{table}",
+            json={
+                "indexes": {
+                    "chunked": {
+                        "type": "embeddings",
+                        "field": "text",
+                        "dimension": DIMENSIONS,
+                        "embedder": embedder,
+                        "chunker": {
+                            "provider": "antfly",
+                            "model": TASK_MODELS["chunkers"],
+                            "text": {"target_tokens": 8},
+                        },
+                    },
+                    # Names its own endpoint and no key: never sent the node key.
+                    "third_party": {
+                        "type": "embeddings",
+                        "field": "text",
+                        "dimension": DIMENSIONS,
+                        "embedder": {**embedder, "api_url": third_party.api_url},
+                    },
+                }
+            },
+            timeout=60,
+        )
+        assert created.status_code == 200, created.text
+        producers = {
+            "ocr": ("img", {"type": "reader", "config": {"provider": "antfly", "model": TASK_MODELS["readers"]}}),
+            "entities": ("text", {"type": "extractor", "config": {"provider": "antfly", "model": TASK_MODELS["extractors"], "entity_definitions": {"person": "A person"}}}),
+            "speech": ("audio", {"type": "transcriber", "config": {"provider": "antfly", "model": TASK_MODELS["transcribers"]}}),
+        }
+        for name, (field, producer) in producers.items():
+            response = requests.put(
+                f"{api_url}/tables/{table}/artifacts/{name}/enrichment",
+                json={"kind": "asset", "field": field, "content_type": "text/plain", "producer": producer},
+                timeout=30,
+            )
+            assert response.status_code in (200, 201), response.text
+
+        def insert(start: int) -> None:
+            rows = {
+                f"doc{n}": {
+                    "text": f"Ada Lovelace wrote shared inference row {n}",
+                    "img": _data_uri("image/jpeg", "testdata/image/jpeg/baseline/white-2x1.jpg"),
+                    "audio": _data_uri("audio/wav", "lib/audio/testdata/tone.wav"),
+                }
+                for n in range(start, start + 2)
+            }
+            response = requests.post(f"{api_url}/tables/{table}/batch", json={"inserts": rows}, timeout=30)
+            response.raise_for_status()
+
+        def background_reached(server_obj: _TaskInference, wanted: set[str], since: int = 0) -> None:
+            seen = wait_until(
+                lambda: {task for task, _ in server_obj.requests()[since:]},
+                timeout_s=60,
+                interval_s=0.5,
+                ready_when=lambda tasks: tasks is not None and wanted <= tasks,
+            )
+            assert seen is not None, (wanted, server_obj.requests()[since:])
+
+        insert(1)
+        background_reached(shared, BACKGROUND_TASKS)
+        background_reached(third_party, {"embed"})
+
+        reranked = requests.post(
+            f"{api_url}/tables/{table}/query",
+            json={
+                "full_text_search": {"query": "Lovelace"},
+                "limit": 2,
+                "reranker": {"provider": "antfly", "model": TASK_MODELS["rerankers"], "field": "text"},
+            },
+            timeout=30,
+        )
+        assert reranked.status_code == 200, reranked.text
+        assert "rerank" in shared.tasks()
+
+        # Reopen: storage-owned producers are rebuilt from runtime config.
+        server.restart()
+        api_url = server.api_url
+        before = len(shared.requests())
+        insert(3)
+        background_reached(shared, BACKGROUND_TASKS, before)
+
+        assert shared.authorizations() == {f"Bearer {API_KEY}"}, shared.requests()
+        assert third_party.authorizations() == {None}, third_party.requests()
+    finally:
+        server.stop()
+        for srv, thread in ((shared, shared_thread), (third_party, third_thread)):
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)
