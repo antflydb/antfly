@@ -36220,9 +36220,17 @@ test "reader bounded metadata resolution keeps encryption registry mutations loc
     var budget = DecodeBudgetAllocator.init(a, 0, 1024 * 1024);
     const context = StructureResolverContext{ .reader = &parsed, .budget = &budget };
     const raw = syntax.Object{ .obj_ref = .{ .id = 10, .gen = 0 } };
-    var object = try StructureResolverContext.resolve(&context, budget.allocator(), &raw);
-    try std.testing.expect(object == .stream);
-    object.deinit(budget.allocator());
+    // Metadata resolution has no payload range. Explicit full reads must
+    // still isolate their temporary encrypted-stream registry from the source.
+    inline for (.{ syntax.Projection.structure_metadata, .full }) |projection| {
+        var object = if (projection == .full)
+            try context.resolveProjected(budget.allocator(), &raw, .full)
+        else
+            try StructureResolverContext.resolve(&context, budget.allocator(), &raw);
+        defer object.deinit(budget.allocator());
+        try std.testing.expect(if (projection == .full) object == .stream else object == .stream_header);
+        if (projection != .full) try std.testing.expectError(error.NotAStream, parsed.readRawStreamData(&object));
+    }
     try std.testing.expectEqual(@as(u64, 0), parsed.encrypted_stream_generation);
     try std.testing.expectEqual(@as(usize, 0), parsed.encrypted_streams.count());
     try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
