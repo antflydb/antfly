@@ -240,7 +240,11 @@ pub const PromptEmbeddingRows = struct {
                     // One explicit compatibility conversion for this image;
                     // no replay of vision math or earlier destination copies.
                     const shape = [_]i32{ @intCast(replacement.rows), @intCast(self.width) };
-                    const plain = try self.backend.fromFloat32Shape(values, &shape);
+                    // A host F32 wrapper need not advertise a physical plane.
+                    // Upload through the real current provider before applying
+                    // the unchanged destination namespace/readability proof.
+                    // Owned upload consumes the host wrapper on every path.
+                    const plain = try self.backend.ensureDeviceResidentOwned(try self.backend.fromFloat32Shape(values, &shape));
                     defer self.backend.free(plain);
                     if (!try assembly.acceptsSource(plain, replacement.rows)) return error.UnsupportedBackendOp;
                     if (!try self.backend.copyRows2D(self.allocator, assembly.tensor.?, replacement.offset, plain, 0, replacement.rows, self.width)) return error.UnsupportedBackendOp;
@@ -1987,6 +1991,14 @@ fn checkPromptReplacementRows(backend_value: ComputeBackend, _: ComputeBackend) 
     const held = try cb.toFloat32(completed, a);
     defer a.free(held);
     try std.testing.expectEqualSlices(f32, actual, held);
+    // Unit-scale host producers still need an explicit current-provider
+    // upload before joining an already resident prompt. This exercises the
+    // genuine host-chunks ABI shared by all three Gemma entrypoints.
+    const unit_host = try replaceEmbeddingRows(cb, a, base, 6, 4, 1, .{ .host_chunks = .{ .values = &.{ 101, 102, 103, 104, 201, 202, 203, 204 }, .offsets = &.{ 1, 4 }, .rows_per_chunk = 1 } });
+    defer cb.free(unit_host);
+    const unit_values = try cb.toFloat32(unit_host, a);
+    defer a.free(unit_values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 101, 102, 103, 104, 9, 10, 11, 12, 13, 14, 15, 16, 201, 202, 203, 204, 21, 22, 23, 24 }, unit_values);
     // Real host-producer compatibility preserves scale-before-image-overwrite.
     const host_result = try replaceEmbeddingRows(cb, a, base, 6, 4, 2, .{ .host_chunks = .{ .values = &.{ 101, 102, 103, 104, 201, 202, 203, 204 }, .offsets = &.{ 1, 4 }, .rows_per_chunk = 1 } });
     defer cb.free(host_result);
@@ -2025,6 +2037,11 @@ test "Native prompt replacement allocation failures preserve all source and outp
             const values = try cb.toFloat32(output, a);
             defer a.free(values);
             try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 21, 22, 23, 24, 9, 10, 11, 12 }, values);
+            const unit_host = try replaceEmbeddingRows(&cb, a, base, 3, 4, 1, .{ .host_chunks = .{ .values = &.{ 31, 32, 33, 34 }, .offsets = &.{1}, .rows_per_chunk = 1 } });
+            defer cb.free(unit_host);
+            const unit_values = try cb.toFloat32(unit_host, a);
+            defer a.free(unit_values);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 31, 32, 33, 34, 9, 10, 11, 12 }, unit_values);
             const scaled = try replaceEmbeddingRows(&cb, a, base, 3, 4, 2, .{ .host_chunks = .{ .values = &.{ 31, 32, 33, 34 }, .offsets = &.{1}, .rows_per_chunk = 1 } });
             defer cb.free(scaled);
         }

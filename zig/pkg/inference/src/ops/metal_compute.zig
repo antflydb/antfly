@@ -54138,8 +54138,22 @@ const PreparedDenseRegionFixture = struct {
         const selected = (try pool.prepareRoutesWithProfile(&.{activation}, .select_regions, profile.profile)) orelse return error.MissingPreparedRoutes;
         defer selected.release();
         try std.testing.expectEqual(@as(usize, 1), selected.pool.regions.len);
-        var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
+        // Raw execution cannot invent payload ownership after admission. Model
+        // preparation obtains these claims before its quota handoff as well.
+        try std.testing.expectError(error.PreparedRegionClaimRequired, executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden }));
+        // The rejected public invocation drains/releases its owned scope.
+        // A subsequent invocation must obtain its own fresh profile authority.
+        try std.testing.expect(!profile.held);
+        profile = (try @import("../execution/region_execution_profile.zig").acquire(cb, graph)) orelse return error.MissingMetalRegionProfile;
+        var claims = switch (try selected.claimRegions(a, null, &.{activation})) {
+            .ready => |owned| owned,
+            .no_regions, .reprepare => return error.MissingPreparedRegionClaims,
+        };
+        defer claims.releaseUnsubmitted();
+        try selected.validateWithClaims(&.{activation}, &claims);
+        var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_claims = &claims, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
         defer result.deinit(&executable.runtime);
+        try std.testing.expect(claims.closed);
         // This counter increments at the real Frame.executeRegion seam, and
         // the synchronous executor returns before legacy node/fusion dispatch.
         try std.testing.expectEqual(@as(u64, 1), result.stats.runtime_region_plan_dispatches);
