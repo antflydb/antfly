@@ -884,7 +884,7 @@ test "lite allocator v4 small checkpoints bound counter and queue boundary growt
     try std.testing.expect(file.test_page_writes.load(.monotonic) - writes <= 5);
     try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.root.deltas);
     try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.root.build_limit);
-    try file.publishCheckpoint(checkpoint);
+    try file.publishCheckpoint(checkpoint, false);
     file.invalidateLedger();
     try std.testing.expect((try file.check()).valid);
 }
@@ -917,7 +917,7 @@ test "lite allocator v4 owner checkpoints bound metadata work across reopen and 
         checkpoint.commit_sequence += 1;
         checkpoint.free_map_root_page = try pages.allocate();
         try file.persistAllocator(&pages, &checkpoint);
-        try file.publishCheckpoint(checkpoint);
+        try file.publishCheckpoint(checkpoint, false);
         const writes = file.test_page_writes.load(.monotonic);
         _ = try file.reclaimPages(1);
         try std.testing.expect(file.ledger.?.root.build_limit != 0);
@@ -1470,14 +1470,14 @@ test "lite coordinator publication cancellation never performs fallible notifica
     }
     Fault.writes = 0;
     Fault.cancel_stat = true;
-    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint));
+    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint, false));
     try std.testing.expectEqual(@as(usize, 0), Fault.writes);
     try std.testing.expectEqualDeep(before, file.header);
     try std.testing.expect(!file.checkpoint_publication_uncertain);
     Fault.cancel_stat = false;
     Fault.cancel_write = true;
     // Cancellation inside the uncertain window reports an unknown outcome.
-    try std.testing.expectError(error.OutcomeUnknown, file.publishCheckpoint(checkpoint));
+    try std.testing.expectError(error.OutcomeUnknown, file.publishCheckpoint(checkpoint, false));
     try std.testing.expect(file.checkpoint_publication_uncertain);
     try std.testing.expectEqualDeep(before, file.header);
     Fault.cancel_stat = false;
@@ -1488,7 +1488,7 @@ test "lite coordinator publication cancellation never performs fallible notifica
     // Cancellation after the active-slot write cannot undo a committed result
     // or make its coordinator notification abort the process.
     Fault.cancel_after_commit = true;
-    try file.publishCheckpoint(checkpoint);
+    try file.publishCheckpoint(checkpoint, false);
     try std.testing.expect(!file.checkpoint_publication_uncertain);
     try std.testing.expectEqual(checkpoint, file.activeCheckpoint());
     Fault.cancel_after_commit = false;
@@ -1682,7 +1682,7 @@ test "lite allocator v4 rejects a durable free bit for a live page" {
     checkpoint.commit_sequence += 1;
     checkpoint.free_map_root_page = try pages.allocate();
     try file.persistAllocator(&pages, &checkpoint);
-    try file.publishCheckpoint(checkpoint);
+    try file.publishCheckpoint(checkpoint, false);
     const report = try file.check();
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("invalid_allocator", report.issue.?);
@@ -5715,7 +5715,7 @@ pub const NativeFile = struct {
         try self.writePage(record, .catalog, encoded.items);
         // Stage the root in memory. The ordinary commit supplies the single
         // data durability barrier before publishing the checkpoint slots.
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         self.allocator_certificate_staged = true;
     }
 
@@ -6630,7 +6630,7 @@ pub const NativeFile = struct {
         next.free_map_root_page = try pages.allocate();
         try self.persistAllocator(&pages, &next);
         try self.syncIfRequired();
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         if (cancel) |token| try token.check();
         // No cancellation checks after checkpoint publication begins: preserve
         // the usual uncertain-outcome fencing across the durability boundary.
@@ -6775,7 +6775,7 @@ pub const NativeFile = struct {
         try self.persistAllocator(&page_allocator, &next);
         try self.syncIfRequired();
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         return page_id;
     }
 
@@ -7003,7 +7003,7 @@ pub const NativeFile = struct {
         try pages.flush();
         try self.persistAllocator(pages, &next);
         try self.syncIfRequired();
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     pub fn appendIndexCatalogRecord(self: *NativeFile, key: []const u8, suffix: []const u8) !void {
@@ -7199,7 +7199,7 @@ pub const NativeFile = struct {
             try self.syncIfRequired();
         }
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     fn transactionCatalogEntry(self: *NativeFile, root: CatalogRoot, key: []const u8, scratch: *[65536]u8) !?CatalogEntry {
@@ -7383,7 +7383,7 @@ pub const NativeFile = struct {
         try self.persistAllocator(&page_allocator, &next);
         try self.syncIfRequired();
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
@@ -7462,7 +7462,7 @@ pub const NativeFile = struct {
         try self.persistAllocator(&page_allocator, &next);
         try self.syncIfRequired();
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
@@ -8623,7 +8623,7 @@ pub const NativeFile = struct {
             try self.syncIfRequired();
         }
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         if (directory.indexed) {
             deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
             self.namespace_directory_cache = .empty;
@@ -8719,7 +8719,7 @@ pub const NativeFile = struct {
             try self.persistAllocator(pages, &next);
             try self.syncIfRequired();
         }
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     fn decodeKey(payload: []const u8) ![]const u8 {
@@ -11260,7 +11260,14 @@ pub const NativeFile = struct {
         errdefer free_pages.deinit(self.allocator);
 
         const max_entries = maxFreeMapEntries(self.header.page_size);
-        var page_id: u64 = 1;
+        // Pages [0, reserved_header_pages) are the header and the two
+        // dedicated checkpoint slot pages, never part of any reachable
+        // catalog/document/free-map chain and so never caught by the
+        // `reachable_pages` check below. Starting at 1 (correct for v3/v7,
+        // which reserved only page 0) would otherwise offer a live slot
+        // page up for reuse as an ordinary data page the moment this free
+        // map's covered range needs one.
+        var page_id: u64 = reserved_header_pages;
         while (page_id < next.page_count and free_pages.items.len < max_entries) : (page_id += 1) {
             if (!reachable_pages.contains(page_id)) {
                 try free_pages.append(self.allocator, page_id);
@@ -11928,8 +11935,17 @@ pub const NativeFile = struct {
         next.free_map_root_page = try writes.pages.allocate();
         next.page_count = writes.pages.next_page_id;
         try writes.pages.flush();
+        // Reserve a page for a possible commit manifest before
+        // persistAllocator finalizes page_count, so -- if this commit turns
+        // out to be manifest-eligible -- that page is already part of the
+        // free-map/ledger's own covered range rather than a count bumped on
+        // after the fact. Skipped once this commit is already too big to
+        // qualify, so an always-large commit never pays for an unused page.
+        if (self.transaction_manifest) |builder| {
+            if (!self.no_sync and !builder.overflowed) builder.reserved_page = try writes.pages.allocate();
+        }
         try self.persistAllocator(&writes.pages, &next);
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         self.transaction_writes = null;
         writes.deinit(self.allocator);
     }
@@ -11996,10 +12012,35 @@ pub const NativeFile = struct {
         defer self.artifact_lease_transaction = false;
         defer self.allocator_certificate_staged = false;
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
+        // A deferred (non-durable) commit never calls publishCheckpoint or
+        // tryBuildCommitManifest below -- it only stages `next` into
+        // self.header and returns, with no durability barrier at all. A
+        // page flushTransactionWrites reserved for a manifest would then
+        // never be consumed (not even by tryBuildCommitManifest's own
+        // placeholder-filler fallback, since that function never runs), yet
+        // persistAllocator would already have folded it into page_count:
+        // the file's physical length would then fall short of what a later
+        // durable commit, inheriting this staged `next`, claims. Known
+        // before flushTransactionWrites runs (durable/no_sync/
+        // externally_locked never depend on what this transaction wrote),
+        // so the manifest-tracking window opens only when it could matter.
+        const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
+        // Tracks every page PageWriteBatch physically writes from here until
+        // just before publishCheckpoint, so a commit that stays within
+        // max_single_sync_pages can publish with one fsync (a manifest page
+        // recovery re-verifies) instead of the historical presync-then-slot-
+        // sync order. Scoped to this function, never to a mid-transaction
+        // flushTransactionWrites: those neither durability-barrier nor
+        // publish anything, so there is nothing for a manifest to cover.
+        var manifest_builder: ManifestBuilder = .{};
+        if (!deferred_publication and manifest_commits_enabled) self.transaction_manifest = &manifest_builder;
+        defer {
+            self.transaction_manifest = null;
+            manifest_builder.deinit(self.allocator);
+        }
         try self.flushTransactionWrites();
         var next = self.activeCheckpoint();
         const changed = next.commit_sequence != previous.checkpoints[previous.active_checkpoint].commit_sequence;
-        const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
         if (changed and !deferred_publication and self.allocator_certificate_on_commit and
             self.header.indexed_reclamation and self.free_pages_verified and self.durable_header == null and
             !self.checkpoint_publication_uncertain)
@@ -12029,9 +12070,100 @@ pub const NativeFile = struct {
             return;
         }
         if (changed) {
-            try self.syncIfRequired();
-            try self.publishCheckpoint(next);
+            const manifest_prepared = try self.tryBuildCommitManifest(&manifest_builder, &next);
+            if (!manifest_prepared) try self.syncIfRequired();
+            try self.publishCheckpoint(next, manifest_prepared);
         } else try self.sync();
+    }
+
+    /// WS1(b) single-fsync commits are disabled pending further
+    /// investigation: a large bulk-indexed commit (20,000 documents, one
+    /// transaction) was measured allocating ~41,000 pages but only 31 of
+    /// them ever reached `ManifestBuilder.note` (confirmed via
+    /// `note_calls == entries.count()`, i.e. not an overflow cap -- `note`
+    /// is simply never called for the other ~40,970). Every direct
+    /// production write path was audited (`PageAllocator.writePage`,
+    /// `PageWriteBatch.appendPage`/`appendValue`, `NativeFile.writePage`,
+    /// ledger/metadata writes via `writeLedgerPage`, `appendPageToFile`'s
+    /// one production caller in `DocumentIndexBulkBuilder.appendNode` which
+    /// is gated by `self.pages != null` and so already routes through the
+    /// tracked `writeDocumentIndexNode` path for a real commit) and each
+    /// appeared to flow through the hook -- the actual bypass was not
+    /// found. Because this commit's tracked entry count (31) stayed under
+    /// `max_single_sync_pages`, it would otherwise have published a
+    /// `presynced = false` slot whose manifest lists a small fraction of
+    /// the pages the commit actually wrote: a crash tearing any of the
+    /// other ~40,970 pages would verify as fine, since nothing in the
+    /// manifest names them. That is a crash-consistency hole the design's
+    /// non-negotiable "every acknowledged commit must survive power loss"
+    /// rule cannot tolerate while the gap is unexplained, so the feature
+    /// is switched off here rather than shipped partially working. The
+    /// verification/recovery side (`verifyManifest`, `recoverActiveCheckpoint`,
+    /// the v8 slot/manifest page formats) is unaffected and stays covered
+    /// by its own tests; flipping this back to `true` once the tracking
+    /// gap is found and fixed is the only change needed to re-enable it.
+    const manifest_commits_enabled = false;
+
+    /// Builds and writes a `.commit_manifest` page covering every page this
+    /// commit's `PageWriteBatch` touched (documents, catalog/index pages,
+    /// allocator/free-map ledger pages, value chains, and any certificate
+    /// re-stamp from `sealAllocatorCheckpoint`), if the commit stayed within
+    /// `max_single_sync_pages` pages and `flushTransactionWrites` reserved a
+    /// page for it (see `ManifestBuilder.reserved_page`'s doc comment for
+    /// why that page's id is never retrofitted onto `page_count` here). On
+    /// success `next` gets `manifest_page`/`manifest_crc`/`manifest_page_count`
+    /// and `presynced = false`; `publishCheckpoint`'s own sync, issued right
+    /// after it writes the slot page, becomes the single barrier covering
+    /// the data pages, this manifest page, and the slot together.
+    ///
+    /// `next` starts as a copy of the *previous* checkpoint (see
+    /// `commitTransactionWithDurability`), so it arrives already carrying
+    /// that generation's `manifest_page`/`manifest_crc`/`manifest_page_count`/
+    /// `presynced` -- those must never survive into a commit that did not
+    /// itself rebuild a manifest, or recovery would verify an entry list
+    /// some unrelated, possibly already-overwritten earlier commit wrote.
+    /// This function clears all four to the safe presynced default
+    /// unconditionally before anything else, so every early return here (no
+    /// reservation, no entries, too many entries, or the encoded manifest
+    /// would not fit one page) falls back to the historical
+    /// presync-then-slot-sync order with a clean slot, not a stale one.
+    fn tryBuildCommitManifest(self: *NativeFile, builder: *ManifestBuilder, next: *CheckpointSlot) !bool {
+        next.manifest_page = 0;
+        next.manifest_crc = 0;
+        next.manifest_page_count = 0;
+        next.presynced = true;
+        const manifest_page_id = builder.reserved_page orelse return false;
+        var used = false;
+        defer if (!used) {
+            var filler_buf: [max_page_size]u8 = undefined;
+            const filler = filler_buf[0..self.header.page_size];
+            encodePage(filler, .commit_manifest, &[4]u8{ 0, 0, 0, 0 });
+            self.file.writePositionalAll(self.runtimeIo(), filler, manifest_page_id * @as(u64, self.header.page_size)) catch {};
+        };
+        if (builder.overflowed) return false;
+        const count = builder.entries.count();
+        if (count == 0 or count > max_single_sync_pages) return false;
+        const entries = try self.allocator.alloc(ManifestEntry, count);
+        defer self.allocator.free(entries);
+        var i: usize = 0;
+        var it = builder.entries.iterator();
+        while (it.next()) |kv| {
+            entries[i] = .{ .page_id = kv.key_ptr.*, .crc = kv.value_ptr.* };
+            i += 1;
+        }
+        const payload = try encodeManifestPayloadAlloc(self.allocator, entries);
+        defer self.allocator.free(payload);
+        if (payload.len > self.maxPagePayloadBytes()) return false;
+        var page_buf: [max_page_size]u8 = undefined;
+        const page = page_buf[0..self.header.page_size];
+        encodePage(page, .commit_manifest, payload);
+        try self.file.writePositionalAll(self.runtimeIo(), page, manifest_page_id * @as(u64, self.header.page_size));
+        next.manifest_page = manifest_page_id;
+        next.manifest_crc = std.mem.readInt(u32, page[page_crc_offset..][0..4], .little);
+        next.manifest_page_count = @intCast(count);
+        next.presynced = false;
+        used = true;
+        return true;
     }
 
     /// The allocator root is already private to this transaction. Sealing it
@@ -12051,8 +12183,24 @@ pub const NativeFile = struct {
         try self.writePage(next.free_map_root_page, .free_map, &root);
     }
 
-    fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot) !void {
+    /// `manifest_prepared` must be `true` only when the caller itself just
+    /// built and wrote a commit manifest for `proposed` (currently only
+    /// `commitTransactionWithDurability`, via `tryBuildCommitManifest`).
+    /// Every other caller builds `proposed` by copying the previous
+    /// checkpoint and touching only a few fields, which would otherwise
+    /// carry that previous generation's `manifest_page`/`manifest_crc`/
+    /// `manifest_page_count`/`presynced` forward unexamined -- recovery
+    /// would then re-verify a stale entry list an unrelated, possibly
+    /// already-overwritten commit wrote. `false` resets all four to the
+    /// safe presynced default before anything else.
+    fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot, manifest_prepared: bool) !void {
         var checkpoint = proposed;
+        if (!manifest_prepared) {
+            checkpoint.presynced = true;
+            checkpoint.manifest_page = 0;
+            checkpoint.manifest_crc = 0;
+            checkpoint.manifest_page_count = 0;
+        }
         try self.stampLogicalGenerations(&checkpoint);
         if (self.transaction_header != null) {
             self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
@@ -12140,7 +12288,7 @@ pub const NativeFile = struct {
         if (!self.checkpoint_publication_uncertain and self.durable_header == null)
             if (self.last_synced_header) |synced| if (std.meta.eql(synced, self.header)) return;
         try self.syncIfRequired();
-        if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint());
+        if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint(), false);
         self.last_synced_header = self.header;
     }
 
@@ -13012,6 +13160,15 @@ const ManifestEntry = struct { page_id: u64, crc: u32 };
 const ManifestBuilder = struct {
     entries: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     overflowed: bool = false,
+    /// A page id `flushTransactionWrites` reserves through the transaction's
+    /// own `PageAllocator` before `persistAllocator` finalizes
+    /// `checkpoint.page_count`, so the eventual manifest page is counted by
+    /// the free-map/ledger's own bookkeeping exactly like every other page
+    /// this commit wrote. `page_count` is never retroactively bumped after
+    /// that bookkeeping already settled -- `decodeFreeMapAlloc` and the
+    /// allocator ledger both cross-check their own covered-page count
+    /// against it.
+    reserved_page: ?u64 = null,
 
     fn deinit(self: *ManifestBuilder, allocator: Allocator) void {
         self.entries.deinit(allocator);
@@ -13921,6 +14078,18 @@ test "lite native recovery falls back past a torn higher-sequence slot" {
     for (0..40) |_| try file.putDocument("doc", "settled");
     try std.testing.expect((try file.check()).valid);
 }
+
+// Two regression tests for the stale-manifest-field and deferred-commit
+// reservation-leak bugs (both found and fixed while wiring the manifest
+// path into commitTransactionWithDurability) lived here. Both bugs are
+// real and the fixes (tryBuildCommitManifest resetting manifest_page/
+// manifest_crc/manifest_page_count/presynced unconditionally before any
+// early return; flushTransactionWrites skipping the page reservation for
+// a deferred commit) stay in place, but with manifest_commits_enabled =
+// false (see its doc comment) neither path is reachable through a normal
+// commit right now, so the tests were removed rather than left asserting
+// behavior the feature flag makes dead. Re-add equivalents once the
+// feature is re-enabled.
 
 test "lite native create writes inspectable aflite file" {
     const allocator = std.testing.allocator;
@@ -18160,7 +18329,7 @@ test "lite document index coverage accepts legacy tombstones and rejects missing
         try file.file.writePositionalAll(std.testing.io, &page, live.document_index_root_page * default_page_size);
         file.page_cache.clear(a);
         deleted.commit_sequence += 1;
-        try file.publishCheckpoint(deleted);
+        try file.publishCheckpoint(deleted, false);
         try std.testing.expect((try file.check()).valid);
     }
     var file = try NativeFile.open(a, path, false);
@@ -18574,7 +18743,7 @@ fn legacyNamespaceDirectoryForTest(file: *NativeFile) !CheckpointSlot {
     next.commit_sequence += 1;
     try pages.flush();
     try file.writeFreeMapPage(next.free_map_root_page, next.page_count, pages.remainingFreePages());
-    try file.publishCheckpoint(next);
+    try file.publishCheckpoint(next, false);
     return next;
 }
 
@@ -18702,7 +18871,7 @@ fn linkedValueForTest(file: *NativeFile, value: []const u8) !NativeFile.IndexVal
     checkpoint.commit_sequence += 1;
     try pages.flush();
     try file.writeFreeMapPage(checkpoint.free_map_root_page, checkpoint.page_count, pages.remainingFreePages());
-    try file.publishCheckpoint(checkpoint);
+    try file.publishCheckpoint(checkpoint, false);
     return .{ .root = root, .length = value.len };
 }
 
@@ -19966,7 +20135,7 @@ test "lite grouped snapshots preserve allocator ownership pinned values and mixe
         var pinned = file.activeCheckpoint();
         pinned.document_index_root_page = original.document_index_root_page;
         pinned.commit_sequence += 1;
-        try file.publishCheckpoint(pinned);
+        try file.publishCheckpoint(pinned, false);
         try std.testing.expect((try file.check()).valid);
         try file.putDocument("a", "new");
         try file.deleteDocument("b");
