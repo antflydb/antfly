@@ -1,9 +1,7 @@
 # @antfly/ai-sdk
 
-Antfly provider, tools and chat history persistence for the Vercel AI SDK
-(`ai` v7). Requires Node 24+. This is the first PR for this package
-(antfly#1505): the asset/source-reference flow (file parts, `providerReference`,
-uploads) is out of scope here and lands separately.
+Antfly provider, tools, chat history persistence and the asset flow for the
+Vercel AI SDK (`ai` v7). Requires Node 24+.
 
 ```ts
 import { createAntfly, createMemoryTools, createSearchTool, createSqlTool } from "@antfly/ai-sdk";
@@ -33,10 +31,72 @@ requires the method to exist. It also exposes `.client` (`AntflyClient`) and
 
 Known limitations, documented rather than silently handled: `stopSequences`
 and `seed` have no server-side equivalent and are reported as call warnings;
-`supportedUrls` is empty, so non-image file parts must be inline bytes, not
-remote URLs (see the asset-flow note above). Gateway errors (e.g. local
+`supportedUrls` is empty, so non-image file parts must be inline bytes or an
+asset reference (below), not a remote URL. Gateway errors (e.g. local
 Gemma 4's one-video-per-request limit) surface as `InferenceAPIError` /
 `InferenceCapacityError` from `@antfly/sdk`, not swallowed.
+
+## Asset flow (antfly#1505)
+
+A `FilePart`/`FileUIPart` can carry `providerReference: { antfly: <id> }`
+instead of bytes or a URL. The `<id>` is an opaque, base64url-encoded
+reference built by `assetProviderReference({ table, key })`; resolving it
+always goes through an authenticated `AntflyClient`, so a browser or model
+never gets to choose what gets fetched.
+
+```ts
+import { assetProviderReference, createAntfly } from "@antfly/ai-sdk";
+import { generateText } from "ai";
+
+const antfly = createAntfly({ baseUrl: "http://localhost:8080" });
+const reference = assetProviderReference({ table: "files", key: "<catalog row id>" });
+
+const result = await generateText({
+  model: antfly.languageModel("ggml-org/gemma-4-e2b-it-gguf"), // client passed by createAntfly
+  messages: [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "Describe this video." },
+        { type: "file", mediaType: "video/mp4", data: { type: "reference", reference } },
+      ],
+    },
+  ],
+});
+```
+
+- **To Antfly itself** (`AntflyChatLanguageModel`, constructed with a
+  `client`): the reference resolves natively into the typed `source` content
+  part. The gateway fetches and inlines the pinned bytes server-side, so the
+  source companion's capability URL never appears in the request this
+  package builds.
+- **To an external model**: wrap it with `withAssetMiddleware(model, { client })`
+  (or `createAssetMiddleware` + `wrapLanguageModel`). It fetches the asset
+  with `If-Match` and inlines it by default. Set `allowVendorUpload: true`
+  and `files: <that provider's files API>` to upload once per provider and
+  cache by content digest instead -- off by default, because revoking
+  access in Antfly does not remove a vendor's own copy.
+- **Uploading a new asset**: `uploadFile({ client, sources, sourceId,
+  localRoot, table, data, mimeType })` writes the bytes under a registered
+  source's local content-addressed store and triggers a per-source sync run,
+  waiting for `waitFor: "published"` (default) or `"searchable"` (a
+  best-effort poll -- publishing the catalog row is not the same as being
+  enrichment-indexed, and the server has no durable signal for the latter).
+  Only the `local` antfly-sources provider is implemented; a bucket-backed
+  connection needs the equivalent provider-specific PUT. `FilesV4` is not
+  implemented for Antfly: an existing object can't be re-registered through
+  a generic files API, only through source registration.
+- **Displaying an asset in a browser**: `createAssetDisplayHandler({ client,
+  authorize, referenceId })` builds a plain `Request -> Response` handler
+  for a route in your own app (the pattern settled on antfly#1491).
+  `FileUIPart.url` points at that route; the capability URL never reaches
+  the browser, and Antfly never fetches through it.
+- **Known codes**: `src/asset/errors.ts` exports guards
+  (`isVideoCodecUnavailable`, `isOneVideoPerRequest`,
+  `isContextManagementWithMedia`, `isRetryableCapacityError`, ...) over the
+  codes this flow can see, verified by reading
+  `zig/pkg/antfly/src/api/httpx_handler.zig` and
+  `zig/pkg/inference/src/server/server.zig` rather than guessed.
 
 ## Tools
 
