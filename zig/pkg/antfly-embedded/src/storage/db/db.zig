@@ -34575,16 +34575,30 @@ pub const DB = struct {
 
     pub fn runExplicitReplayDrainTurn(self: *DB, state: *GroupSourceMaintenanceState, producer_after: u64) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runExplicitReplayDrainTurn", .{ self, state, producer_after });
-        const pending = self.runBackgroundTurnWithState(.none, .replay, state) catch |err| switch (err) {
+        const before = self.core.nextDerivedSequence();
+        var pressure_pending = false;
+        _ = self.runBackgroundTurnWithState(.none, .replay, state) catch |err| switch (err) {
             error.TextMergeBackpressureTimeout => blk: {
                 _ = try self.runBackgroundTurnWithState(.none, .pressure_artifacts, state);
+                pressure_pending = true;
                 break :blk true;
             },
             else => return err,
         };
+        // A replacement is runnable debt too. A foreground owner cannot
+        // retain admission waiting for a detached shadow to publish. Reuse the
+        // bounded construction/cutover protocol, including its finite escalation
+        // budget, and return to the namespace cohort after this quantum.
+        if (self.hasPendingGraphReplacements()) _ = try self.advanceGraphReplacementForIdentityUntil(
+            monotonicTimeNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns,
+            null,
+            .cutover,
+        );
         if (self.enrichment_runtime) |runtime| try runtime.requireDrainSuccessfulThrough(producer_after, runtime.stats().applied_sequence);
+        if (self.run_until_idle_no_progress_timeout_ns != 0)
+            try self.checkTargetAdvanceNoProgress(self.run_until_idle_no_progress_timeout_ns);
         const retirement_pending = try self.runBackgroundTurnWithState(.none, .retirement, state);
-        return pending or retirement_pending;
+        return pressure_pending or self.replayWorkPending(before, false) or retirement_pending;
     }
 
     /// A connection's explicit drain borrows the same cursor/lease identity as
@@ -34794,16 +34808,7 @@ pub const DB = struct {
             try truncateReplayJournalIfSafe(self);
         }
         try self.saveAllLiveIndexStatusSnapshotsWithMode(self.alloc, true);
-        if (phase == .replay) {
-            const enrichment_pending = if (self.enrichment_runtime) |runtime| pending: {
-                const runtime_stats = runtime.stats();
-                break :pending runtime_stats.applied_sequence < runtime_stats.target_sequence or runtime_stats.retrying;
-            } else false;
-            return enrichment_pending or self.core.nextDerivedSequence() > before or
-                self.executor.snapshotStats().workers_with_replay_debt != 0 or
-                self.resolutionStageStats().catch_up_required or self.promotionStageStats().catch_up_required or
-                self.hasPendingGraphReplacements();
-        }
+        if (phase == .replay) return self.replayWorkPending(before, true);
         const finalized = try self.finalizeDenseProjectionLifecycleForIdle();
         // Primary LSM/source maintenance still belongs to the source phase.
         // Deferring only index work must not strand this lane at idle.
@@ -34815,6 +34820,20 @@ pub const DB = struct {
         return finalized or enrichment_pending or self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
             self.resolutionStageStats().catch_up_required or self.promotionStageStats().catch_up_required or
             self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
+    }
+
+    fn replayWorkPending(self: *DB, before: u64, comptime wait_for_blocked_resolvers: bool) bool {
+        const enrichment_pending = if (self.enrichment_runtime) |runtime| pending: {
+            const runtime_stats = runtime.stats();
+            break :pending runtime_stats.applied_sequence < runtime_stats.target_sequence or runtime_stats.retrying;
+        } else false;
+        // A detached scheduler retains blocked debt for a future wake. An
+        // explicit drain completes after runnable consumers settle, preserving
+        // the existing blocked-outcome contract instead of spinning forever.
+        const resolver_pending = (self.resolutionStageStats().catch_up_required or self.promotionStageStats().catch_up_required) and
+            (wait_for_blocked_resolvers or !self.resolverReplayBlockedAfterRunnableDrain());
+        return enrichment_pending or self.core.nextDerivedSequence() > before or
+            self.executor.snapshotStats().workers_with_replay_debt != 0 or resolver_pending or self.hasPendingGraphReplacements();
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
@@ -80783,6 +80802,15 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
 }
 
 test "db does not materialize review-band resolution as canonical mention edges" {
+    try testReviewBandResolutionEdges(false);
+}
+
+test "background enrichment turn explicit native drain preserves blocked promotion and review edges" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    try testReviewBandResolutionEdges(true);
+}
+
+fn testReviewBandResolutionEdges(comptime native: bool) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -80790,10 +80818,33 @@ test "db does not materialize review-band resolution as canonical mention edges"
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    // Keep production workers enabled: this is the regression for the original
-    // race between background resolver catch-up and the runUntilIdle fence.
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    const lite = @import("../lite/backend.zig");
+    var native_path: ?[]u8 = null;
+    defer if (native_path) |value| alloc.free(value);
+    var native_host: ?background_runtime_mod.BackendRuntimeHandle = null;
+    defer if (native_host) |*host| host.deinit();
+    var native_backend: ?lite.Handle = null;
+    defer if (native_backend) |*backend| backend.deinit();
+    var options: OpenOptions = .{};
+    if (native) {
+        native_path = try std.fmt.allocPrint(alloc, "{s}/blocked.aflite", .{std.mem.span(path)});
+        native_host = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+        options.backend_runtime = native_host.?.ptr();
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, std.mem.span(path));
+        native_backend = try lite.Handle.createWithOptions(alloc, native_path.?, .{ .exclusive = true, .externally_locked = true, .no_sync = true, .io = std.testing.io });
+        native_backend.?.native_docstore.?.maintenance_start_suppressed = true;
+        options.executor = .{ .backend = .manual };
+        options.start_index_workers = false;
+        options.start_optional_runtime_workers = false;
+        options.start_independent_maintenance = false;
+        try native_backend.?.configureDbOpenOptions(&options);
+    }
+    // The original case retains production workers for the resolver/fence
+    // race. The native case proves that an explicit bounded owner can finish
+    // independent graph work while promotion remains durably blocked.
+    var db = try DB.open(alloc, native_path orelse std.mem.span(path), options);
     defer db.close();
+    if (native) try std.testing.expect(db.core.store.runtime_store.capabilities().bounded_replay_admission);
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -80842,6 +80893,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
         .sync_level = .enrichments,
     });
     try db.runUntilIdle();
+    if (native) try std.testing.expect(db.promotionStageStats().blocked);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);

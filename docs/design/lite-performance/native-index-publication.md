@@ -99,3 +99,10 @@ while holding its writer publication gate. A refused continuation borrow unwinds
 all runtime-local work, releases admission, and yields before reacquiring and
 refreshing the foreground runtime. Durable progress remains authoritative across
 that handoff; callers never replay a document mutation to resolve this wait.
+
+A fair explicit round also advances pending graph replacement construction and
+cutover using their existing finite work budgets. Merely reporting a pending
+replacement would prevent idle finalization from ever servicing it. Background
+scheduling retains blocked resolver debt for a later wake; explicit drains finish
+after runnable consumers settle and leave the blocked outcome visible. The
+configured stuck-index diagnostic is checked between explicit rounds as well.
