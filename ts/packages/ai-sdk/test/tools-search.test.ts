@@ -54,4 +54,29 @@ describe("createSearchTool", () => {
     expect(body.semantic_search).toBeUndefined();
     expect(body.indexes).toBeUndefined();
   });
+
+  it("treats maxResults as a ceiling on the model's limit", async () => {
+    const bodies: { limit?: number }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request =
+          input instanceof Request && init === undefined ? input : new Request(input, init);
+        bodies.push(await request.json());
+        return new Response(JSON.stringify({ responses: [{ status: 200, hits: { hits: [] } }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      })
+    );
+    const { antfly_search } = createSearchTool({
+      client: new AntflyClient({ baseUrl: "http://x" }),
+      table: "docs",
+      maxResults: 5,
+    });
+    const options = { toolCallId: "t1", messages: [] } as never;
+    await antfly_search.execute?.({ query: "q", limit: 100 }, options);
+    await antfly_search.execute?.({ query: "q", limit: 2 }, options);
+    expect(bodies.map((body) => body.limit)).toEqual([5, 2]);
+  });
 });

@@ -14,7 +14,7 @@ export interface AntflySearchToolOptions {
   indexes?: string[];
   /** Fields to project. Defaults to the server's default projection. */
   fields?: string[];
-  /** Default 10. */
+  /** Most rows a search can return, whatever limit the model asks for. Default 10. */
   maxResults?: number;
 }
 
@@ -26,6 +26,7 @@ export interface AntflySearchToolOptions {
  * `specs/openapi/antfly/metadata.yaml`.
  */
 export function createSearchTool(options: AntflySearchToolOptions): Record<string, Tool> {
+  const maxResults = options.maxResults ?? 10;
   const search = tool({
     description: `Search the Antfly table '${options.table}' for documents relevant to a query${
       options.indexes?.length ? " (hybrid full-text + semantic search)" : " (full-text search)"
@@ -41,7 +42,7 @@ export function createSearchTool(options: AntflySearchToolOptions): Record<strin
         full_text_search: { query },
         ...(options.indexes?.length ? { semantic_search: query, indexes: options.indexes } : {}),
         fields: options.fields,
-        limit: limit ?? options.maxResults ?? 10,
+        limit: Math.min(limit ?? maxResults, maxResults),
       });
       return response;
     },

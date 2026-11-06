@@ -12,7 +12,7 @@ export interface AntflyMemoryToolsOptions {
   namespace?: string;
   /** Memory branch. Defaults to the server's default (`""`, the trunk). */
   branch?: string;
-  /** Default 20, matching the server's own default. */
+  /** Most memories a recall can return. Default: the server's own default of 20. */
   recallLimit?: number;
 }
 
@@ -52,6 +52,12 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
     ...(options.branch !== undefined ? { "X-Antfly-Memory-Branch": options.branch } : {}),
   });
 
+  // The configured limit is a ceiling; the model can only ask for fewer.
+  const boundedLimit = (limit: number | undefined) =>
+    options.recallLimit === undefined
+      ? limit
+      : Math.min(limit ?? options.recallLimit, options.recallLimit);
+
   const recall = tool({
     description: `Recall relevant memories from the Antfly memory space '${options.space}' by free-text query, optionally narrowed by kind. Returns the most relevant memories with their supporting evidence.`,
     inputSchema: z
@@ -66,7 +72,7 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
         "/memory/v1/spaces/{space}/recall",
         {
           params: { path: { space: options.space }, header: header() },
-          body: { query, kind, limit: limit ?? options.recallLimit },
+          body: { query, kind, limit: boundedLimit(limit) },
         }
       );
       if (!response.ok) throw new Error(`Antfly memory recall failed: ${JSON.stringify(error)}`);

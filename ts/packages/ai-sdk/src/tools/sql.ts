@@ -36,14 +36,42 @@ const READ_ONLY_LEADING_KEYWORDS = new Set([
   "values",
 ]);
 
-/** Best-effort, NOT a security boundary -- see `AntflySqlToolOptions.readOnly`. */
+const MUTATING_KEYWORDS = new Set([
+  "insert",
+  "update",
+  "delete",
+  "merge",
+  "drop",
+  "alter",
+  "create",
+  "truncate",
+  "grant",
+  "revoke",
+  "copy",
+  "call",
+  "into",
+]);
+
+/** Removes comments and quoted text, so only SQL keywords and identifiers remain. */
+function sqlCode(statement: string): string {
+  return statement.replace(
+    /\/\*[\s\S]*?\*\/|--[^\n]*|'(?:[^']|'')*'|"(?:[^"]|"")*"|\$([a-zA-Z_]*)\$[\s\S]*?\$\1\$/g,
+    " "
+  );
+}
+
+/**
+ * Best-effort, NOT a security boundary -- see `AntflySqlToolOptions.readOnly`.
+ * It errs towards refusing: `WITH x AS (DELETE ...)`, `SELECT ... INTO`, `EXPLAIN
+ * ANALYZE DELETE` and a second statement after `;` are all rejected, as is an
+ * unquoted identifier that happens to be one of these keywords.
+ */
 function looksReadOnly(statement: string): boolean {
-  const withoutComments = statement
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/--[^\n]*/g, " ")
-    .trimStart();
-  const match = /^([a-zA-Z]+)/.exec(withoutComments);
-  return !!match && READ_ONLY_LEADING_KEYWORDS.has(match[1].toLowerCase());
+  const code = sqlCode(statement).trim().replace(/;\s*$/, "");
+  if (code.includes(";")) return false;
+  const words = code.toLowerCase().match(/[a-z_][a-z0-9_]*/g) ?? [];
+  if (!words.length || !READ_ONLY_LEADING_KEYWORDS.has(words[0])) return false;
+  return !words.some((word) => MUTATING_KEYWORDS.has(word));
 }
 
 /**

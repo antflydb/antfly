@@ -21,6 +21,40 @@ async function bodyOf(request: Request | undefined): Promise<any> {
 }
 
 describe("createSqlTool", () => {
+  it.each([
+    "WITH gone AS (DELETE FROM t RETURNING id) SELECT * FROM gone",
+    "SELECT 1; DROP TABLE t",
+    "SELECT * INTO copy_of_t FROM t",
+    "EXPLAIN ANALYZE DELETE FROM t",
+    "/* select */ DELETE FROM t",
+    "SELECT 1 /* ; */; INSERT INTO t VALUES (1)",
+  ])("refuses a write dressed as a read: %s", async (statement) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const { antfly_sql } = createSqlTool({ client: new AntflyClient({ baseUrl: "http://x" }) });
+    await expect(antfly_sql.execute?.({ statement }, toolOptions())).rejects.toThrow("read-only");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "SELECT 'DROP TABLE t; DELETE' AS note FROM t;",
+    'SELECT "update" FROM t -- delete',
+    "WITH a AS (SELECT 1) SELECT * FROM a",
+  ])("allows a read that only mentions a keyword in text: %s", async (statement) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ columns: [], rows: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+      )
+    );
+    const { antfly_sql } = createSqlTool({ client: new AntflyClient({ baseUrl: "http://x" }) });
+    await expect(antfly_sql.execute?.({ statement }, toolOptions())).resolves.toBeDefined();
+  });
+
   it("executes a SELECT statement against the fixed database/namespace", async () => {
     let captured: Request | undefined;
     vi.stubGlobal(
