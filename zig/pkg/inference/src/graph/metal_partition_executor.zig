@@ -22906,7 +22906,13 @@ fn executeSynchronousPhysicalRegions(allocator: std.mem.Allocator, graph: *const
         var inputs: [binding.max_inputs]CT = undefined;
         const count = installed.owner.input_nodes.len;
         try frame.pool.regionExecutionFacts(installed.owner, facts[0..count]);
-        for (installed.owner.input_nodes, inputs[0..count]) |input, *value| value.* = values[input] orelse return error.MissingValue;
+        for (installed.owner.input_nodes, facts[0..count], inputs[0..count]) |input, fact, *value| {
+            // Immutable facts own their exact retained source CT. Consuming
+            // this capability avoids replacing it with a fresh parameter
+            // wrapper from ordinary materialization. Runtime activation facts
+            // still consume this invocation's actual values table.
+            value.* = if (fact == .tensor) fact.tensor.value else values[input] orelse return error.MissingValue;
+        }
         for (installed.outputs) |output| if (values[output.slot.node] != null) return error.PreparedRegionOutputMismatch;
         var produced = try frame.executeRegion(installed, facts[0..count], inputs[0..count]);
         defer produced.deinit();

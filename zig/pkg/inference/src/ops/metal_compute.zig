@@ -11638,6 +11638,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const backend = ops.ComputeBackend{ .ptr = self, .vtable = &vtable_impl };
         return coverage == .complete and check.valid and check.primary == 1 and check.backing_count == 1 + check.mirrors and @import("../execution/assigned_kernel_route.zig").bindingDense(backend, binding, logical);
     }
+    /// Retain only an attested dense immutable physical source. The ordinary
+    /// reshape constructor deliberately creates a NEW semantic value identity;
+    /// model preparation instead retains this SAME value/version and SDK root.
+    /// No host payload, conversion, slot preparation or upload is born here.
+    fn retainImmutableTensorOp(ctx: *anyopaque, value: CT) !?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const source = toBuf(value);
+        const dimensions = source.logical_shape orelse return null;
+        if (dimensions.len > 8) return null;
+        const shape = ml.graph.Shape.init(.f32, dimensions);
+        const binding = @import("../execution/kernel_route.zig").Binding{ .tensor = .{ .value = value, .implementation = .{ .context = ctx, .table = &vtable_impl } } };
+        if (!try ownedPayloadInput(ctx, binding, shape)) return null;
+        var logical: [8]i32 = undefined;
+        for (dimensions, 0..) |dimension, axis| {
+            if (dimension <= 0) return null;
+            logical[axis] = std.math.cast(i32, dimension) orelse return null;
+        }
+        const physical = source.metal_tensor.?;
+        var retained = try physical.retainedView(0, physical.deviceByteLen(), logical[0..dimensions.len]);
+        const result = self.ctFromOwnedMetalTensor(retained) catch |err| {
+            self.retireTemporaryWorkspaceValue(&retained);
+            return err;
+        };
+        const target = toBuf(result);
+        target.cache_identity = source.cache_identity;
+        target.canonical_zero_bias = source.canonical_zero_bias;
+        target.immutable_cached_source = true;
+        return result;
+    }
+
     fn ownedPayloadRoute(ctx: *anyopaque, owned: *const @import("../execution/kernel_route.zig").Owned) bool {
         if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
         const req = owned.requirements;
@@ -39616,7 +39646,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return descriptor.operation == .slice and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -54034,6 +54064,35 @@ const PreparedDenseRegionFixture = struct {
         defer selected.deinit();
         try std.testing.expectEqual(@as(usize, 1), selected.items.len);
     }
+    fn retainWithAllocator(a: std.mem.Allocator, cb: ops.ComputeBackend, source: CT) !void {
+        const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const physical = MetalCompute.toBuf(source).metal_tensor.?;
+        const references = physical.device.?.ref.ref_count.load(.acquire);
+        const identity = MetalCompute.parameterIdentity(MetalCompute.toBuf(source));
+        const previous_allocator = compute.allocator;
+        compute.allocator = a;
+        defer compute.allocator = previous_allocator;
+        // Only the actual retain hook's receiving Buf/shape allocations see
+        // this allocator. Its existing SDK Ref/Lease and source are untouched.
+        const retained = cb.vtable.kernels.?.retainImmutableTensor.?(cb.ptr, source) catch |err| {
+            try std.testing.expectEqual(references, physical.device.?.ref.ref_count.load(.acquire));
+            try std.testing.expectEqualDeep(identity, MetalCompute.parameterIdentity(MetalCompute.toBuf(source)));
+            return err;
+        };
+        const value = retained orelse return error.MissingImmutableMetalRetention;
+        var live = true;
+        defer if (live) cb.free(value);
+        try std.testing.expect(value != source);
+        try std.testing.expectEqual(references + 1, physical.device.?.ref.ref_count.load(.acquire));
+        try std.testing.expectEqualDeep(identity, MetalCompute.parameterIdentity(MetalCompute.toBuf(value)));
+        try std.testing.expectEqualDeep(identity, MetalCompute.parameterIdentity(MetalCompute.toBuf(source)));
+        // The receiving allocator remains alive and installed until its owned
+        // header is retired, including the successful sweep iteration.
+        cb.free(value);
+        live = false;
+        try std.testing.expectEqual(references, physical.device.?.ref.ref_count.load(.acquire));
+        try std.testing.expectEqualDeep(identity, MetalCompute.parameterIdentity(MetalCompute.toBuf(source)));
+    }
     fn runInstalled(cb: ops.ComputeBackend, graph: *const ml.graph.Graph, nodes: []const ml.graph.NodeId, values: []const CT, expected: []const []f32) !void {
         const a = std.testing.allocator;
         const interpreter = @import("../graph/interpreter.zig");
@@ -54137,6 +54196,22 @@ const PreparedDenseRegionFixture = struct {
         var copied = cb.vtable.*;
         const foreign = route.Binding{ .tensor = .{ .value = @ptrFromInt(16), .implementation = .{ .context = cb.ptr, .table = &copied } } };
         try std.testing.expect(!try functions.ownedPayloadServices.?.input(cb.ptr, foreign, shape));
+        const retained_source = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&x, &.{ 1, 64 }));
+        var retained_source_live = true;
+        defer if (retained_source_live) cb.free(retained_source);
+        const retained_identity_snapshot = MetalCompute.parameterIdentity(MetalCompute.toBuf(retained_source));
+        try retainWithAllocator(a, cb, retained_source);
+        try std.testing.checkAllAllocationFailures(a, retainWithAllocator, .{ cb, retained_source });
+        const retained_value = (try cb.retainImmutableTensor(retained_source, a)) orelse return error.MissingImmutableMetalRetention;
+        defer cb.free(retained_value);
+        try std.testing.expect(retained_value != retained_source);
+        try std.testing.expectEqualDeep(retained_identity_snapshot, MetalCompute.parameterIdentity(MetalCompute.toBuf(retained_value)));
+        try std.testing.expectEqual(MetalCompute.toBuf(retained_source).metal_tensor.?.deviceHandle(), MetalCompute.toBuf(retained_value).metal_tensor.?.deviceHandle());
+        cb.free(retained_source);
+        retained_source_live = false;
+        const retained_values = try cb.toFloat32(retained_value, a);
+        defer a.free(retained_values);
+        try std.testing.expectEqualSlices(f32, &x, retained_values);
         const input_buf = MetalCompute.toBuf(values[0]);
         input_buf.mutable_state = true;
         const mutable_result = functions.ownedPayloadServices.?.input(cb.ptr, input_fact, shape);
