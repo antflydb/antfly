@@ -705,7 +705,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             if (try @import("antfly_local_sources").storage_db_artifact_native_stream.advance(alloc, db.core.store, db.root_incarnation, "historic", plan.plan()) == .closed) break;
         } else return error.TestExpectedHistoricNativeClosure;
         const completion = @import("antfly_local_sources").storage_db_artifact_completion_progress;
-        try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.core.applied_sequence_checkpoint_path, db.root_incarnation, "historic", plan.plan(), .{ .time_budget_ns = null });
+        try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.root_incarnation, "historic", plan.plan(), .{ .time_budget_ns = null });
         {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
@@ -3692,14 +3692,12 @@ test "db ordered artifact inventory full text replay publishes physical coverage
             {
                 var busy = (try apply_state.tryAcquireProjectionSnapshot(alloc, db.core.store)).?;
                 defer busy.deinit();
-                try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.core.applied_sequence_checkpoint_path, db.root_incarnation, "doc", plan.plan(), .{});
+                try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.root_incarnation, "doc", plan.plan(), .{});
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
                 try std.testing.expect(try certificates.load(&read, &certificates.key("text")) == null);
             }
-            try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.core.applied_sequence_checkpoint_path, db.root_incarnation, "doc", plan.plan(), .{});
-            // Covered pages must not need a sidecar file at all.
-            try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, "missing-parent/no-sidecar", db.root_incarnation, "doc", plan.plan(), .{});
+            try completion.refreshProjections(alloc, db.core.store, db.core.index_manager, db.root_incarnation, "doc", plan.plan(), .{});
             var complete = blk: {
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();

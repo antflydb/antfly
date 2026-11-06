@@ -3408,7 +3408,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .alloc = ctx.alloc,
                         .io = ctx.io,
                         .store = ctx.store,
-                        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
                         .index_manager = ctx.index_manager,
                         .apply_mutex = ctx.apply_mutex,
                         .snapshot_replay_admission = ctx.snapshot_replay_admission,

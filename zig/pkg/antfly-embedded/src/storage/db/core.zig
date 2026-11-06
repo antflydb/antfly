@@ -365,7 +365,6 @@ pub const IndexRepairCheckpoint = struct {
 pub const OpenedCoreResources = struct {
     path: []u8,
     root_generation: u64,
-    applied_sequence_checkpoint_path: ?[]u8,
     index_repair_checkpoint: ?IndexRepairCheckpoint,
     store: *docstore_mod.DocStore,
     primary_store_owner: PrimaryStoreOwner,
@@ -403,7 +402,6 @@ pub const OpenedCoreResources = struct {
         self.store.close();
         alloc.destroy(self.store);
         self.primary_store_owner.close(alloc);
-        if (self.applied_sequence_checkpoint_path) |checkpoint_path| alloc.free(checkpoint_path);
         if (self.index_repair_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         alloc.free(self.path);
         self.* = undefined;
@@ -412,7 +410,6 @@ pub const OpenedCoreResources = struct {
 
 pub const AsyncResources = struct {
     store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
@@ -422,7 +419,6 @@ pub const AsyncResources = struct {
 
 pub const BatchExecutionResources = struct {
     store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location,
     shard_manager: *shard_mod.ShardManager,
     change_journal: *change_journal_mod.Journal,
@@ -497,7 +493,6 @@ pub const DBCore = struct {
     alloc: Allocator,
     path: []u8,
     root_generation: u64,
-    applied_sequence_checkpoint_path: ?[]u8,
     index_repair_checkpoint: ?IndexRepairCheckpoint,
     store: *docstore_mod.DocStore,
     /// Retired immutable generations release caches without backend publication.
@@ -562,7 +557,6 @@ pub const DBCore = struct {
             .alloc = alloc,
             .path = opened.path,
             .root_generation = opened.root_generation,
-            .applied_sequence_checkpoint_path = opened.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = opened.index_repair_checkpoint,
             .store = opened.store,
             .primary_store_owner = opened.primary_store_owner,
@@ -612,7 +606,6 @@ pub const DBCore = struct {
         self.store.close();
         self.alloc.destroy(self.store);
         self.primary_store_owner.close(self.alloc);
-        if (self.applied_sequence_checkpoint_path) |checkpoint_path| self.alloc.free(checkpoint_path);
         if (self.index_repair_checkpoint) |*checkpoint| checkpoint.deinit(self.alloc);
         self.alloc.free(self.path);
         self.* = undefined;
@@ -629,7 +622,6 @@ pub const DBCore = struct {
     pub fn asyncResources(self: *DBCore) AsyncResources {
         return .{
             .store = self.store,
-            .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = if (self.index_repair_checkpoint) |*checkpoint| checkpoint.location() else null,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
@@ -641,7 +633,6 @@ pub const DBCore = struct {
     pub fn batchExecutionResources(self: *DBCore) BatchExecutionResources {
         return .{
             .store = self.store,
-            .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = if (self.index_repair_checkpoint) |*checkpoint| checkpoint.location() else null,
             .shard_manager = self.shard_manager,
             .change_journal = self.change_journal,
@@ -1105,7 +1096,7 @@ pub const DBCore = struct {
                 // mutation-free target advance may publish coverage here, but
                 // must never consume a newer transaction it does not own.
                 try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
-                try self.index_manager.preserveCertifiedEmptyDenseCheckpoint(self.alloc, self.store, self.applied_sequence_checkpoint_path, index_name);
+                try self.index_manager.preserveCertifiedEmptyDenseCheckpoint(self.store, index_name);
                 // Native WAL remains the applied-sequence authority. Nonempty
                 // ingestion needs lifecycle metadata only when its status,
                 // generation or config identity changes.
@@ -3018,7 +3009,6 @@ pub fn openCoreResourcesFromPrimaryStore(
     // signature cleanup.
     _ = external_derived_checkpoints;
     var owned_path: ?[]u8 = null;
-    var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
     var owned_index_repair_checkpoint: ?IndexRepairCheckpoint = null;
     var owned_store: ?*docstore_mod.DocStore = null;
     var owned_primary_store_owner = opened_primary.owner;
@@ -3044,7 +3034,6 @@ pub fn openCoreResourcesFromPrimaryStore(
             alloc.destroy(ptr);
         }
         owned_primary_store_owner.close(alloc);
-        if (owned_applied_sequence_checkpoint_path) |buf| alloc.free(buf);
         if (owned_index_repair_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         if (owned_path) |buf| alloc.free(buf);
     }
@@ -3079,12 +3068,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     owned_path = path_copy;
     // Progress v2 lives entirely in the primary KV store, for every backend
     // kind; there is no longer an external checkpoint-sidecar file to
-    // locate. `applied_sequence_checkpoint_path` stays wired through the
-    // structs that still carry it (a larger, separately-scoped cleanup) but
-    // is never populated with a real path, and apply_state.zig no longer
-    // reads it.
-    const applied_sequence_checkpoint_path: ?[]u8 = null;
-    owned_applied_sequence_checkpoint_path = applied_sequence_checkpoint_path;
+    // locate.
     const index_repair_checkpoint = if (index_repair_checkpoint_storage) |storage| checkpoint_blk: {
         const checkpoint_path = try index_repair_state.checkpointPathAlloc(alloc, index_base_path);
         errdefer alloc.free(checkpoint_path);
@@ -3142,7 +3126,6 @@ pub fn openCoreResourcesFromPrimaryStore(
         index_base_path,
         index_backends,
     );
-    index_manager.setAppliedSequenceCheckpointPath(applied_sequence_checkpoint_path);
     index_manager.updateRange(shard_manager.getByteRange());
 
     const schema = try schema_mod.loadSchema(store, alloc);
@@ -3150,7 +3133,6 @@ pub fn openCoreResourcesFromPrimaryStore(
     const table_catalog = try loadTableCatalogForSchema(alloc, store, schema);
 
     owned_path = null;
-    owned_applied_sequence_checkpoint_path = null;
     owned_index_repair_checkpoint = null;
     owned_store = null;
     owned_primary_store_owner = .none;
@@ -3166,7 +3148,6 @@ pub fn openCoreResourcesFromPrimaryStore(
     return .{
         .path = path_copy,
         .root_generation = root_generation,
-        .applied_sequence_checkpoint_path = applied_sequence_checkpoint_path,
         .index_repair_checkpoint = index_repair_checkpoint,
         .store = store,
         .primary_store_owner = opened_primary.owner,

@@ -201,7 +201,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return .{
                 .alloc = S.ownerField(self, "alloc").*,
                 .store = resources.store,
-                .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
                 .index_repair_checkpoint = resources.index_repair_checkpoint,
                 .shard_manager = resources.shard_manager,
                 .change_journal = resources.change_journal,
@@ -4364,7 +4363,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .io = S.ownerField(self, "backend_runtime").*.io(),
                 .store = async_resources.store,
                 .relational_base_rows = relationalColumns(self) != null,
-                .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
                 .index_manager = shadow.manager,
                 .apply_mutex = async_resources.apply_mutex,
                 .snapshot_replay_admission = async_resources.snapshot_replay_admission,
@@ -4780,10 +4778,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             alloc: Allocator,
             index_manager: *const index_manager_mod.IndexManager,
             store: anytype,
-            applied_sequence_checkpoint_path: ?[]const u8,
             index_ref: index_manager_mod.ManagedIndexRef,
         ) !u64 {
-            _ = applied_sequence_checkpoint_path;
             // A WAL-authoritative dense index carries its exact durable replay
             // boundary in the posting checkpoint/WAL commit stream. The projection
             // metadata accessor overlays that boundary on the rarer lifecycle fields.
@@ -5136,7 +5132,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     ctx.alloc,
                     ctx.index_manager,
                     ctx.store,
-                    ctx.applied_sequence_checkpoint_path,
                     index_ref,
                 );
                 min_applied = @min(min_applied, applied);

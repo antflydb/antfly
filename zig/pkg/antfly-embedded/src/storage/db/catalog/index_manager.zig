@@ -1441,7 +1441,6 @@ pub const IndexManager = struct {
     // publication admission; explicit stable lifecycle fences do not consult
     // it. The backend outlives IndexManager in DBCore.
     primary_lsm_backend: ?*lsm_backend_mod.Backend = null,
-    applied_sequence_checkpoint_path: ?[]const u8,
     /// Gate for how often the applied-sequence/progress write path also
     /// persists a derived `IndexStatusSnapshot`. Status is cheap to recompute
     /// from live state and is not needed for recovery (progress v2 is), so
@@ -3321,7 +3320,6 @@ pub const IndexManager = struct {
             .dense_native_candidate_build_authorized = opts.dense_native_candidate_build_authorized,
             .primary_store = null,
             .relational_base_rows = false,
-            .applied_sequence_checkpoint_path = null,
             .vector_block_generation = null,
             .load_parallelism = null,
             .full_text_pending_bytes_accounted = 0,
@@ -3339,10 +3337,6 @@ pub const IndexManager = struct {
 
     pub fn setRelaxedSplitDurability(self: *IndexManager, enabled: bool) void {
         self.relaxed_split_durability = enabled;
-    }
-
-    pub fn setAppliedSequenceCheckpointPath(self: *IndexManager, path: ?[]const u8) void {
-        self.applied_sequence_checkpoint_path = path;
     }
 
     fn allocIndexApplyMutex(self: *IndexManager) !*std.atomic.Mutex {
@@ -9788,13 +9782,9 @@ pub const IndexManager = struct {
     /// reads never mint certificates or inspect the live mutable cardinality.
     pub fn preserveCertifiedEmptyDenseCheckpoint(
         self: *IndexManager,
-        alloc: Allocator,
         store: anytype,
-        checkpoint_path: ?[]const u8,
         index_name: []const u8,
     ) !void {
-        _ = alloc;
-        _ = checkpoint_path;
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         const checkpoint = self.denseProjectionCheckpointMetadata(index_name) orelse return error.InvalidDerivedApplyState;
         const certified = entry.certifiedEmptyNativeCheckpoint(checkpoint) orelse return;

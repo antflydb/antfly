@@ -1034,7 +1034,6 @@ const EnrichmentAppendContext = struct {
     artifact_publication_dispatcher: ?ArtifactPublicationDispatcher = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
@@ -1061,7 +1060,6 @@ const EnrichmentAppendContext = struct {
         return .{
             .alloc = self.alloc,
             .store = self.store,
-            .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = self.index_repair_checkpoint,
             .shard_manager = self.shard_manager,
             .change_journal = self.change_journal,
@@ -5349,7 +5347,6 @@ pub const DB = struct {
             .resource_manager = resource_manager,
             .store = async_resources.store,
             .relational_base_rows = relationalColumns(self) != null,
-            .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
@@ -5596,7 +5593,6 @@ pub const DB = struct {
             .read_only = openModeRequiresReadOnlyBackends(self.open_mode),
             .clock = runtime_cfg.clock orelse self.backend_runtime.clock(),
             .store = resources.store,
-            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
@@ -5765,7 +5761,6 @@ pub const DB = struct {
             .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
             .store = resources.store,
-            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
@@ -5841,7 +5836,6 @@ pub const DB = struct {
                 .alloc = self.runtime_alloc,
                 .io = self.backend_runtime.io(),
                 .store = batch_resources.store,
-                .applied_sequence_checkpoint_path = batch_resources.applied_sequence_checkpoint_path,
                 .shard_manager = batch_resources.shard_manager,
                 .change_journal = batch_resources.change_journal,
                 .replay_source = batch_resources.replay_source,
@@ -17579,8 +17573,6 @@ pub const DB = struct {
         // may keep index data in a separate namespace and need not create
         // this filesystem directory as a side effect of opening an index.
         try self.core.index_manager.createGenerationDirectory(shadow_index_path);
-        const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
-        defer alloc.free(shadow_checkpoint_path);
         if (options.capacity_check) |check| try check.bindCandidateRoot(shadow_base);
         if (resume_requires_ready_manifest) {
             _ = index_generation_manifest.validateReadyWithStorage(
@@ -17633,7 +17625,6 @@ pub const DB = struct {
         // Otherwise their native base build silently recreates payload copies.
         shadow_manager.source_payload_store = self.core.index_manager.source_payload_store;
         shadow_manager.setIo(self.backend_runtime.io());
-        shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
             shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |transfer_err| {
                 std.log.warn("failed to preserve unopened shadow LSM clone attribution index={s} err={s}", .{
@@ -17676,7 +17667,6 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .store = self.core.store,
             .relational_base_rows = relationalColumns(self) != null,
-            .applied_sequence_checkpoint_path = shadow_checkpoint_path,
             .index_manager = &shadow_manager,
             .apply_mutex = self.async_context.apply_mutex,
             .dense_bulk_session_scope = .external,
@@ -17880,7 +17870,7 @@ pub const DB = struct {
         }
         if (completed_snapshot_build) {
             try checkArtifactRepairCancelled(options);
-            try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
+            try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, index_ref, build_floor_sequence);
             if (options.capacity_check) |check| {
                 try check.current(try repairCandidateStorageBytes(alloc, cfg, &shadow_manager, shadow_base));
             }
@@ -17908,7 +17898,6 @@ pub const DB = struct {
         const initial_catch_up = try self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
-            shadow_checkpoint_path,
             index_ref,
             initial_catch_up_target,
             options,
@@ -17998,7 +17987,6 @@ pub const DB = struct {
             const convergence_catch_up = try self.catchUpShadowReplacementUntil(
                 alloc,
                 &shadow_manager,
-                shadow_checkpoint_path,
                 index_ref,
                 convergence_target,
                 options,
@@ -18173,7 +18161,6 @@ pub const DB = struct {
         const activation_catch_up = self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
-            shadow_checkpoint_path,
             index_ref,
             final_target,
             options,
@@ -18412,7 +18399,6 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         shadow_manager: *index_manager_mod.IndexManager,
-        shadow_checkpoint_path: ?[]const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         target_sequence: u64,
         options: types.ArtifactRepairRunOptions,
@@ -18426,7 +18412,6 @@ pub const DB = struct {
         const cooperative = deadline_ns == null and options.yield_check != null;
         var batch_ctx = self.batchContext();
         batch_ctx.index_manager = shadow_manager;
-        batch_ctx.applied_sequence_checkpoint_path = shadow_checkpoint_path;
         batch_ctx.async_context = null;
         batch_ctx.dense_bulk_session_scope = .external;
 
@@ -18502,7 +18487,7 @@ pub const DB = struct {
                 break :blk applied;
             };
             if (advanced <= applied) return .{ .applied_sequence = applied };
-            try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
+            try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, index_ref, advanced);
             applied = advanced;
             if (cooperative and applied < target_sequence and options.yield_check.?.requested()) {
                 return .{ .applied_sequence = applied, .yielded = true };
@@ -18556,12 +18541,10 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         shadow_manager: *index_manager_mod.IndexManager,
-        shadow_checkpoint_path: ?[]const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         sequence: u64,
     ) !void {
         _ = alloc;
-        _ = shadow_checkpoint_path;
         try shadow_manager.checkpointLsmWalForManagedIndex(index_ref);
         const update = apply_state.AppliedSequenceUpdate{
             .index_name = index_ref.name,
@@ -33067,7 +33050,7 @@ pub const DB = struct {
     fn refreshArtifactProjections(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, limits: @import("artifact_completion_progress.zig").Limits) !void {
         const completion = @import("artifact_completion_progress.zig");
         var requests: completion.AdoptionRequests = .{};
-        try completion.refreshProjectionsWithAdoption(scratch, self.core.store, self.core.index_manager, self.core.applied_sequence_checkpoint_path, self.root_incarnation, document, plan, limits, &requests);
+        try completion.refreshProjectionsWithAdoption(scratch, self.core.store, self.core.index_manager, self.root_incarnation, document, plan, limits, &requests);
         if (requests.count == 0) return;
         // Use the revision-tracked scheduler directory for O(1) deduplication,
         // not a checkpoint-file scan per document. Creation still performs its
@@ -48637,7 +48620,7 @@ fn acquireNeighborContextGraphSource(ptr: *anyopaque, index_name: []const u8) !e
         return error.GraphMaintenanceInProgress;
     const entry = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
     const tip = ctx.store.lastReplaySequence(0);
-    const applied = try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, ref);
+    const applied = try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ref);
     const from = @max(@max(applied, entry.neighbor_source_sequence), try entry.index.artifactRebuildSequence());
     if (entry.neighbor_refresh.sequence != 0 and entry.neighbor_refresh.sequence <= from)
         entry.clearNeighborRefresh();
@@ -52871,7 +52854,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
         defer replay_snapshot.abort();
         break :blk try ctx.store.lastReplaySequenceFromTxn(&replay_snapshot, 0);
     };
-    const source_applied = loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, .{ .name = candidate.index_name, .kind = .graph }) catch |err| switch (err) {
+    const source_applied = loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, .{ .name = candidate.index_name, .kind = .graph }) catch |err| switch (err) {
         error.InvalidDerivedApplyState => 0,
         else => return err,
     };
@@ -55576,7 +55559,6 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             ctx.alloc,
             ctx.index_manager,
             ctx.store,
-            ctx.applied_sequence_checkpoint_path,
             index_ref,
         );
         const target_sequence = try ctx.replay_source.latestMatchingSequence(
@@ -55645,7 +55627,6 @@ fn canAdvanceDerivedReplayTargetContext(
         .io = ctx.io,
         .store = ctx.store,
         .relational_base_rows = ctx.relational_base_rows,
-        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .snapshot_replay_admission = ctx.snapshot_replay_admission,
@@ -55678,7 +55659,6 @@ fn applyDerivedBatchToIndexReplayContext(
         .alloc = ctx.alloc,
         .io = ctx.io,
         .store = ctx.store,
-        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .snapshot_replay_admission = ctx.snapshot_replay_admission,
@@ -55758,7 +55738,7 @@ fn saveAppliedSequencesBatchLockedContext(
             // Only an already-certified empty publication may carry its zero
             // count across a source-only native commit. Ordinary native
             // ingest keeps the count-sidecar optimization.
-            try ctx.index_manager.preserveCertifiedEmptyDenseCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, update.index_name);
+            try ctx.index_manager.preserveCertifiedEmptyDenseCheckpoint(ctx.store, update.index_name);
         } else {
             generic_updates.appendAssumeCapacity(update);
         }
@@ -56299,7 +56279,6 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
         .io = self.backend_runtime.io(),
         .store = resources.store,
         .relational_base_rows = relationalColumns(self) != null,
-        .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .snapshot_replay_admission = resources.snapshot_replay_admission,
@@ -57558,7 +57537,6 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .io = self.backend_runtime.io(),
         .store = resources.store,
         .relational_base_rows = relationalColumns(self) != null,
-        .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .snapshot_replay_admission = resources.snapshot_replay_admission,
@@ -58532,7 +58510,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
 
     const configs = try self.core.listIndexes(self.alloc);
     defer types.freeIndexConfigs(self.alloc, configs);
-    try registerSplitDestinationIndexesDirect(self.alloc, dest_store, null, &dest_indexes, configs, replay_floor -| 1);
+    try registerSplitDestinationIndexesDirect(self.alloc, dest_store, &dest_indexes, configs, replay_floor -| 1);
     const collect_skip_doc_keys = true;
     var split_handoffs = try self.core.collectSplitIndexHandoffs(
         &dest_indexes,
@@ -58633,12 +58611,10 @@ fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, 
 fn registerSplitDestinationIndexesDirect(
     alloc: Allocator,
     dest_store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     dest_indexes: *index_manager_mod.IndexManager,
     configs: []const types.IndexConfig,
     applied_sequence: u64,
 ) !void {
-    _ = applied_sequence_checkpoint_path;
     if (configs.len == 0) return;
 
     try dest_indexes.addAllNoBackfill(dest_store, configs);
@@ -60501,7 +60477,6 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
         ctx.alloc,
         ctx.index_manager,
         ctx.store,
-        ctx.applied_sequence_checkpoint_path,
         index_ref,
     );
     if (persisted_applied >= target_sequence) {
@@ -119582,7 +119557,7 @@ test "db graph ttl source retirement ignores abandoned replay reservations witho
         break :blk try db.core.store.lastReplaySequenceFromTxn(&txn, 0);
     };
     try std.testing.expect(committed_tip > 0);
-    try std.testing.expectEqual(committed_tip, try loadManagedAppliedSequenceContext(alloc, db.core.index_manager, db.core.store, batch_ctx.applied_sequence_checkpoint_path, .{ .name = "relations_graph", .kind = .graph }));
+    try std.testing.expectEqual(committed_tip, try loadManagedAppliedSequenceContext(alloc, db.core.index_manager, db.core.store, .{ .name = "relations_graph", .kind = .graph }));
     // A mutation can reserve its sequence and fail before the primary commit.
     // With no workers, no executor can certify this nonexistent replay debt.
     const abandoned = db.core.store.reserveNextReplaySequence(1);
