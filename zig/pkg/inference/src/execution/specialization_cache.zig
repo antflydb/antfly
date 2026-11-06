@@ -117,6 +117,13 @@ pub fn PinnedSlot(comptime Value: type, comptime Key: type, comptime keyOf: fn (
         mutex: std.atomic.Mutex = .unlocked,
         value: ?Value = null,
         stats: Stats = .{},
+        /// One owned cumulative cache observation, including concurrent cold
+        /// constructors. Busy is unavailable, never a zero or invocation delta.
+        pub fn trySnapshot(self: *@This()) ?Stats {
+            if (!self.mutex.tryLock()) return null;
+            defer self.mutex.unlock();
+            return self.stats;
+        }
         pub fn acquire(self: *@This(), key: Key) ?Value {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();

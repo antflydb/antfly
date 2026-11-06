@@ -86,19 +86,29 @@ pub const PendingInterval = struct {
     counters_scope: enum { synchronous_phase_only } = .synchronous_phase_only,
     whole_interval_counters: enum { unavailable } = .unavailable,
 };
-pub const PublicationScope = enum { program_execution, session_numerical_dispatch, shared_batch_numerical_dispatch };
+pub const PublicationScope = enum { program_execution, session_numerical_dispatch, shared_batch_numerical_dispatch, session_preparation };
 
-/// Copied from the actual retaining Runtime Definition. These are cumulative
-/// successful constructor publications; NEVER this invocation's template hits.
+/// Copied from the actual retaining owner. The default counts successful
+/// Runtime constructor publications. Whisper's distinct scope samples its
+/// Model cache lifetime at construction, including concurrent constructors;
+/// neither scope represents this invocation's template hits.
 pub const NativeDefinitionTemplates = struct {
-    scope: enum { retained_definition_lifetime_successful_constructor_publications } = .retained_definition_lifetime_successful_constructor_publications,
+    scope: enum { retained_definition_lifetime_successful_constructor_publications, model_whisper_cache_lifetime_at_constructor_observation } = .retained_definition_lifetime_successful_constructor_publications,
     availability: enum { sampled, busy } = .busy,
     stats: ?Specializations = null,
 };
 pub const NativeProgramConstruction = struct {
-    scope: enum { retained_runtime_constructor_result } = .retained_runtime_constructor_result,
-    outcome: enum { not_attempted, declined, prepared },
+    scope: enum { retained_runtime_constructor_result, whisper_cold_preparation_result } = .retained_runtime_constructor_result,
+    producer: enum { decoder_runtime, whisper_single_token_schedule } = .decoder_runtime,
+    outcome: enum { not_attempted, declined, prepared, failed },
     error_name: ?Text = null,
+    /// Actual independently held admission, copied while the cold owner lives.
+    /// These are distinct lifetime reservations, not new grants or memory peaks.
+    metadata: ?struct {
+        scope: enum { retained_cold_owner_admission_snapshot } = .retained_cold_owner_admission_snapshot,
+        private_host_scratch_bytes: usize,
+        shared_definition_host_scratch_bytes: ?usize = null,
+    } = null,
 };
 pub const Snapshot = struct {
     native_program_construction: ?NativeProgramConstruction = null,

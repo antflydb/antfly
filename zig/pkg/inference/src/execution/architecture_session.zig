@@ -5164,11 +5164,70 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     return true;
 }
 
-fn optionalColdNativeWhisper(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder) !?*ColdNativeWhisper {
-    return prepareColdNativeWhisper(session, allocator, control, config, geometry, base, encoder) catch |err| switch (err) {
-        error.UnsupportedDenseSchedule, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => null,
-        else => return err,
+const WhisperConstructionObservation = struct {
+    const diagnostics = @import("diagnostics.zig");
+    program: diagnostics.NativeProgramConstruction = .{ .scope = .whisper_cold_preparation_result, .producer = .whisper_single_token_schedule, .outcome = .not_attempted },
+    templates: ?diagnostics.NativeDefinitionTemplates = null,
+    numerical_observation_entered: bool = false,
+    fn enabled(session: Session) bool {
+        const capability = session.invocation_diagnostics orelse return false;
+        return capability.diagnostics.isEnabled();
+    }
+    fn sampleTemplates(self: *@This(), session: Session) void {
+        if (!enabled(session) or session.vtable != &arch_vtable) return;
+        const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        if (owner.backend_type != .native or owner.arch_config != .whisper) return;
+        const stats = owner.whisper_definitions.trySnapshot();
+        self.templates = .{ .scope = .model_whisper_cache_lifetime_at_constructor_observation, .availability = if (stats != null) .sampled else .busy, .stats = stats };
+    }
+    fn prepared(self: *@This(), session: Session, cold: ?*ColdNativeWhisper) void {
+        self.program.outcome = if (cold != null) .prepared else .declined;
+        if (enabled(session)) if (cold) |owner| if (owner.metadata.session.run_admission != null) {
+            const definition = owner.program.?.schedule.definition;
+            self.program.metadata = .{
+                .private_host_scratch_bytes = owner.metadata.admittedAmounts().host_scratch_bytes,
+                .shared_definition_host_scratch_bytes = if (definition.shared) |shared| shared.admittedAmounts().host_scratch_bytes else null,
+            };
+        };
+        self.sampleTemplates(session);
+    }
+    fn binding(self: *const @This(), session: Session) ?incremental_observation.Binding {
+        var selected = session.invocation_diagnostics orelse return null;
+        if (!selected.diagnostics.isEnabled()) return selected;
+        selected.native_program_construction = self.program;
+        selected.native_definition_templates = self.templates;
+        return selected;
+    }
+    fn failure(self: *@This(), session: Session, err: anyerror) void {
+        if (!enabled(session) or self.numerical_observation_entered) return;
+        self.sampleTemplates(session);
+        publishFailure(self, session, err);
+    }
+    noinline fn publishFailure(self: *const @This(), session: Session, err: anyerror) void {
+        // This is cold preparation, not an entered numerical interval. Never
+        // sample an independently active backend or replay its last program.
+        const selected = session.invocation_diagnostics.?;
+        selected.diagnostics.publish(.{ .scope = .session_preparation, .operation = .decoder_init, .outcome = .failed, .error_name = diagnostics.Text.init(@errorName(err)), .native_program_construction = self.program, .native_definition_templates = self.templates, .batch = if (selected.batch) |batch| batch.* else null, .pending_interval = if (selected.pending_interval) |pending| pending.* else null });
+    }
+};
+
+fn optionalColdNativeWhisper(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, observation: *WhisperConstructionObservation) !?*ColdNativeWhisper {
+    const cold = prepareColdNativeWhisper(session, allocator, control, config, geometry, base, encoder) catch |err| {
+        observation.program.error_name = @import("diagnostics.zig").Text.init(@errorName(err));
+        switch (err) {
+            error.UnsupportedDenseSchedule, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => {
+                observation.program.outcome = .declined;
+                observation.sampleTemplates(session);
+                return null;
+            },
+            else => {
+                observation.program.outcome = .failed;
+                return err;
+            },
+        }
     };
+    observation.prepared(session, cold);
+    return cold;
 }
 
 fn finishColdNativeWhisper(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, cold: *ColdNativeWhisper, config: whisper_mod.Config, rows: usize, base: @import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, destination_model: ?*Session.ModelLifetime, source_resources: ?Session.ModelLifetime.ResourcePin, cleanup: *const ReceiverCleanup) !WhisperNativeDecoder {
@@ -5234,6 +5293,14 @@ fn incrementalCachePermitForAmounts(session: Session, base: *const @import("../b
 }
 
 fn createResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, source: RetainedEncoderSource) !WhisperNativeDecoder {
+    var observation = WhisperConstructionObservation{};
+    return createResidentIncrementalDecoderObserved(session, allocator, control, source, &observation) catch |err| {
+        observation.failure(session, err);
+        return err;
+    };
+}
+
+fn createResidentIncrementalDecoderObserved(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, source: RetainedEncoderSource, construction_observation: *WhisperConstructionObservation) !WhisperNativeDecoder {
     var cleanup: ?ReceiverCleanup = null;
     var transferred = false;
     defer if (!transferred) if (cleanup) |*owner| owner.finish();
@@ -5264,7 +5331,7 @@ fn createResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocat
     cleanup = try ReceiverCleanup.beginForOwnedGate(session);
     var base = try incrementalBasePermit(session, config, geometry, true, foreign_cuda);
     errdefer base.deinit();
-    var cold = try optionalColdNativeWhisper(session, allocator, control, config, geometry, &base, .{ .resident = source.value });
+    var cold = try optionalColdNativeWhisper(session, allocator, control, config, geometry, &base, .{ .resident = source.value }, construction_observation);
     defer if (cold) |prepared| prepared.destroy(.{ .boundary = if (cleanup) |*owner| owner.boundary() else null });
     // Source authority precedes BOTH the destination lane and its older
     // compute/provider acquisition path. Raw sessions with no published lane
@@ -5311,12 +5378,14 @@ fn createResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocat
         if (control) |active| try active.lock(mutex) else while (!mutex.tryLock()) std.atomic.spinLoopHint();
     }
     errdefer if (gate) |mutex| mutex.unlock();
-    const binding = session.invocation_diagnostics;
-    const decoder = if (cold) |prepared| result: {
+    const binding = construction_observation.binding(session);
+    construction_observation.numerical_observation_entered = true;
+    var decoder = if (cold) |prepared| result: {
         const value = try incremental_observation.callOperation(binding, .decoder_init, finishColdNativeWhisper, .{ session, allocator, control, prepared, config, rows, base, gate, destination_model, @as(?Session.ModelLifetime.ResourcePin, source.resources), &cleanup.? });
         cold = null;
         break :result value;
     } else try incremental_observation.callOperation(binding, .decoder_init, finishResidentIncrementalDecoder, .{ session, allocator, control, source, config, rows, geometry, base, gate, destination_model, if (foreign_copy) |*copy| copy else null, if (cleanup) |*owner| owner else null });
+    decoder.diagnostics_binding = binding;
     transferred = true;
     return decoder;
 }
@@ -5409,6 +5478,21 @@ fn createHostIncrementalDecoder(
     encoder_hidden: []const f32,
     enc_seq: usize,
 ) !?WhisperNativeDecoder {
+    var observation = WhisperConstructionObservation{};
+    return createHostIncrementalDecoderObserved(session, allocator, control, encoder_hidden, enc_seq, &observation) catch |err| {
+        observation.failure(session, err);
+        return err;
+    };
+}
+
+fn createHostIncrementalDecoderObserved(
+    session: Session,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+    encoder_hidden: []const f32,
+    enc_seq: usize,
+    construction_observation: *WhisperConstructionObservation,
+) !?WhisperNativeDecoder {
     if (session.vtable != &arch_vtable) return null;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const cfg = switch (self.arch_config) {
@@ -5425,18 +5509,21 @@ fn createHostIncrementalDecoder(
     const geometry = try whisper_arch.CacheGeometry.init(cfg, enc_seq);
     var base_permit = try incrementalBasePermit(session, cfg, geometry, false, false);
     errdefer base_permit.deinit();
-    var cold = try optionalColdNativeWhisper(session, allocator, control, cfg, geometry, &base_permit, .{ .host = encoder_hidden });
+    var cold = try optionalColdNativeWhisper(session, allocator, control, cfg, geometry, &base_permit, .{ .host = encoder_hidden }, construction_observation);
     defer if (cold) |prepared| prepared.destroy(.{ .boundary = cleanup.boundary() });
     const gate = session.execution_gate;
     if (gate) |mutex| {
         if (control) |active| try active.lock(mutex) else while (!mutex.tryLock()) std.atomic.spinLoopHint();
     }
     errdefer if (gate) |mutex| mutex.unlock();
-    const result = if (cold) |prepared| ready: {
-        const value = try incremental_observation.callOperation(session.invocation_diagnostics, .decoder_init, finishColdNativeWhisper, .{ session, allocator, control, prepared, cfg, enc_seq, base_permit, gate, destination_model, @as(?Session.ModelLifetime.ResourcePin, null), &cleanup });
+    const binding = construction_observation.binding(session);
+    construction_observation.numerical_observation_entered = true;
+    var result = if (cold) |prepared| ready: {
+        const value = try incremental_observation.callOperation(binding, .decoder_init, finishColdNativeWhisper, .{ session, allocator, control, prepared, cfg, enc_seq, base_permit, gate, destination_model, @as(?Session.ModelLifetime.ResourcePin, null), &cleanup });
         cold = null;
         break :ready value;
-    } else try incremental_observation.callOperation(session.invocation_diagnostics, .decoder_init, finishHostIncrementalDecoder, .{ session, allocator, control, encoder_hidden, enc_seq, cfg, geometry, base_permit, gate, destination_model, &cleanup });
+    } else try incremental_observation.callOperation(binding, .decoder_init, finishHostIncrementalDecoder, .{ session, allocator, control, encoder_hidden, enc_seq, cfg, geometry, base_permit, gate, destination_model, &cleanup });
+    result.diagnostics_binding = binding;
     transferred = true;
     return result;
 }
@@ -18823,6 +18910,9 @@ test "Native Whisper optional metadata quota declines cold and preserves the exa
     var session = try IncrementalFixture.session(a);
     defer session.close();
     try session.installOwnedExecutionGate(a);
+    var constructor_diagnostics = @import("diagnostics.zig").Diagnostics{};
+    constructor_diagnostics.configure(true);
+    session.invocation_diagnostics = .{ .diagnostics = &constructor_diagnostics };
     session.model_lifetime.?.admission_domain = domain.pin();
     session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
     const cfg = @import("testing/incremental_encoder_decoder.zig").config;
@@ -18845,6 +18935,10 @@ test "Native Whisper optional metadata quota declines cold and preserves the exa
     var decoder_open = true;
     defer if (decoder_open) decoder.deinit();
     try std.testing.expect(decoder.cache.native_program == null and decoder.program_permit == null and decoder.cold_metadata == null);
+    const declined = constructor_diagnostics.snapshot().?.report.?.native_program_construction.?;
+    try std.testing.expectEqual(.declined, declined.outcome);
+    try std.testing.expectEqualStrings("ResourceLimitExceeded", declined.error_name.?.view());
+    try std.testing.expect(declined.metadata == null);
     try std.testing.expectEqualDeep(original, domain.controller.snapshot());
     const first = try decoder.step(&.{ 0, 1 });
     defer a.free(first);
@@ -18875,10 +18969,20 @@ test "Native Whisper late required layer weight failure retires all cold owners 
     var session = try IncrementalFixture.session(a);
     defer session.close();
     try session.installOwnedExecutionGate(a);
+    var constructor_diagnostics = @import("diagnostics.zig").Diagnostics{};
+    constructor_diagnostics.configure(true);
+    session.invocation_diagnostics = .{ .diagnostics = &constructor_diagnostics };
     const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
     owner.arch_config.whisper.decoder_layers = 2; // genuine fixture has only layer zero
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
     try std.testing.expectError(error.MissingWeight, whisperNativeDecoder(session, a, null, &hidden, 2));
+    const failed = constructor_diagnostics.snapshot().?;
+    try std.testing.expectEqual(.session_preparation, failed.scope);
+    try std.testing.expectEqual(.unavailable, failed.context_runtime_scope);
+    try std.testing.expect(failed.context_backend == null and failed.execution == null);
+    try std.testing.expectEqual(.failed, failed.native_program_construction.?.outcome);
+    try std.testing.expectEqualStrings("MissingWeight", failed.native_program_construction.?.error_name.?.view());
+    try std.testing.expect(failed.native_program_construction.?.metadata == null);
     try std.testing.expect(session.execution_gate.?.tryLock());
     session.execution_gate.?.unlock();
 }
@@ -18888,6 +18992,9 @@ test "Native Whisper preserves unknown arena and bounded allocator compatibility
     const a = std.testing.allocator;
     var session = try IncrementalFixture.session(a);
     defer session.close();
+    var constructor_diagnostics = @import("diagnostics.zig").Diagnostics{};
+    constructor_diagnostics.configure(true);
+    session.invocation_diagnostics = .{ .diagnostics = &constructor_diagnostics };
     // A genuinely raw Session keeps compatibility; publishing its actual
     // affiliated Model gate then isolates the allocator-contract negatives.
     try std.testing.expect(session.execution_gate == null);
@@ -18897,6 +19004,9 @@ test "Native Whisper preserves unknown arena and bounded allocator compatibility
         var raw = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
         defer raw.deinit();
         try std.testing.expect(raw.cache.native_program == null and raw.cold_metadata == null);
+        const plain_decline = constructor_diagnostics.snapshot().?.report.?.native_program_construction.?;
+        try std.testing.expectEqual(.declined, plain_decline.outcome);
+        try std.testing.expect(plain_decline.error_name == null and plain_decline.metadata == null);
     }
     try session.installOwnedExecutionGate(a);
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
@@ -18937,6 +19047,9 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     var session_open = true;
     defer if (session_open) session.close();
     try session.installOwnedExecutionGate(std.testing.allocator);
+    var constructor_diagnostics = @import("diagnostics.zig").Diagnostics{};
+    constructor_diagnostics.configure(true);
+    session.invocation_diagnostics = .{ .diagnostics = &constructor_diagnostics };
     session.model_lifetime.?.admission_domain = domain.pin();
     session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
     const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -19004,6 +19117,16 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     var decoder_open = true;
     defer if (decoder_open) decoder.deinit();
     const public_definition = decoder.cache.native_program.?.schedule.definition;
+    const held_constructor_report = constructor_diagnostics.snapshot().?.report.?;
+    const held_constructor = held_constructor_report.native_program_construction.?;
+    try std.testing.expectEqual(.whisper_single_token_schedule, held_constructor.producer);
+    try std.testing.expectEqual(.whisper_cold_preparation_result, held_constructor.scope);
+    try std.testing.expectEqual(.prepared, held_constructor.outcome);
+    try std.testing.expect(held_constructor.error_name == null);
+    try std.testing.expectEqual(decoder.cold_metadata.?.admittedAmounts().host_scratch_bytes, held_constructor.metadata.?.private_host_scratch_bytes);
+    try std.testing.expectEqual(public_definition.shared.?.admittedAmounts().host_scratch_bytes, held_constructor.metadata.?.shared_definition_host_scratch_bytes.?);
+    try std.testing.expectEqual(.model_whisper_cache_lifetime_at_constructor_observation, held_constructor_report.native_definition_templates.?.scope);
+    const initial_cache_stats = held_constructor_report.native_definition_templates.?.stats.?;
     try std.testing.expect(public_definition.shared != null);
     const first_result = try decoder.step(&.{ 0, 1 });
     defer a.free(first_result);
@@ -19017,6 +19140,10 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     var repeated_open = true;
     defer if (repeated_open) repeated.deinit();
     try std.testing.expect(repeated.cache.native_program.?.schedule.definition == public_definition);
+    const hit_report = constructor_diagnostics.snapshot().?.report.?;
+    try std.testing.expectEqual(.prepared, hit_report.native_program_construction.?.outcome);
+    try std.testing.expect(hit_report.native_definition_templates.?.stats.?.hits > initial_cache_stats.hits);
+    try std.testing.expectEqual(held_constructor.metadata.?.shared_definition_host_scratch_bytes, hit_report.native_program_construction.?.metadata.?.shared_definition_host_scratch_bytes);
     const repeated_result = try repeated.step(&.{ 0, 1 });
     defer a.free(repeated_result);
     try std.testing.expectEqualSlices(f32, held, repeated_result);
@@ -19040,6 +19167,11 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     changed.deinit();
     changed_open = false;
     try std.testing.expectEqualSlices(f32, held, first_result);
+    // Owned copied constructor observations survive Model/cache destruction;
+    // neither scope claims a live post-close counter or invocation memory peak.
+    try std.testing.expectEqual(.prepared, held_constructor_report.native_program_construction.?.outcome);
+    try std.testing.expectEqualDeep(initial_cache_stats, held_constructor_report.native_definition_templates.?.stats.?);
+    try std.testing.expect(held_constructor_report.native_program_construction.?.metadata.?.shared_definition_host_scratch_bytes.? > 0);
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
 }
 
@@ -19107,4 +19239,39 @@ test "Native Whisper shared cache uses only stable Model backing and retains pri
     try std.testing.expect(decoder.cache.native_program.?.schedule.definition.shared == null);
     const actual = try decoder.step(&.{ 0, 1 });
     defer decorator.allocator().free(actual);
+}
+
+test "Native Whisper constructor diagnostics distinguish cancelled and unattempted preparation without backend sampling" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var session = try IncrementalFixture.session(a);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    var diagnostics = @import("diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    session.invocation_diagnostics = .{ .diagnostics = &diagnostics };
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    const control = InferenceExecutionControl{ .check_fn = Cancel.check, .native_call_policy = .in_process };
+    try std.testing.expectError(error.Cancelled, whisperNativeDecoder(session, a, control, &hidden, 2));
+    const cancelled = diagnostics.snapshot().?;
+    try std.testing.expectEqual(.session_preparation, cancelled.scope);
+    try std.testing.expectEqual(.decoder_init, cancelled.operation);
+    try std.testing.expectEqual(.failed, cancelled.outcome);
+    try std.testing.expectEqual(.failed, cancelled.native_program_construction.?.outcome);
+    try std.testing.expectEqualStrings("Cancelled", cancelled.native_program_construction.?.error_name.?.view());
+    try std.testing.expect(cancelled.context_backend == null and cancelled.execution == null and cancelled.report.?.transfers == null);
+    try std.testing.expectError(error.InvalidInputShape, whisperNativeDecoder(session, a, null, &.{1}, 2));
+    const unattempted = diagnostics.snapshot().?;
+    try std.testing.expectEqual(.not_attempted, unattempted.native_program_construction.?.outcome);
+    try std.testing.expect(unattempted.native_program_construction.?.error_name == null and unattempted.native_program_construction.?.metadata == null);
+    try std.testing.expectEqualStrings("InvalidInputShape", unattempted.error_name.?.view());
+    // Enabling observation cannot manufacture a stale constructor after disable.
+    diagnostics.configure(false);
+    try std.testing.expectError(error.InvalidInputShape, whisperNativeDecoder(session, a, null, &.{1}, 2));
+    try std.testing.expect(diagnostics.snapshot() == null);
 }
