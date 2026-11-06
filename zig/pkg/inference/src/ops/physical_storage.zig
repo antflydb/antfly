@@ -38,10 +38,22 @@ pub const LiteralInitializer = struct {
 /// One canonical allocation policy. KernelBackend.accepts must be checked
 /// before invoking any callback, including metadata-only reservation queries.
 pub const Policy = struct {
+    /// Guaranteed base alignment for this provider's physical allocations.
+    /// Pure metadata, never a promise about arbitrary external tensor views.
+    minimum_alignment: u32 = 1,
     allocate: *const fn (*anyopaque, Request) anyerror!?ops.CT,
     reservation_bytes: ?*const fn (*anyopaque, Request) anyerror!usize = null,
     mark_admitted: ?*const fn (*anyopaque, ops.CT) anyerror!void = null,
 };
+pub fn minimumAlignment(backend: ops.ComputeBackend) !u32 {
+    const functions = backend.vtable.kernels orelse return 1;
+    if (!functions.accepts(backend.vtable)) return error.UnsupportedPhysicalStoragePolicy;
+    const policy = functions.physical_storage_policy orelse return 1;
+    const alignment = policy.minimum_alignment;
+    if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.InvalidPhysicalStorageAlignment;
+    return alignment;
+}
+
 pub fn reservationBytes(backend: ops.ComputeBackend, request: Request) !usize {
     const functions = backend.vtable.kernels orelse return if (request.usage == .ordinary) request.byte_size else error.UnsupportedPhysicalStorageUsage;
     if (!functions.accepts(backend.vtable)) return error.UnsupportedPhysicalStoragePolicy;

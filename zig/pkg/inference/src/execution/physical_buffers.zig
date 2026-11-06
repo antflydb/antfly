@@ -2694,6 +2694,9 @@ pub const Frame = struct {
         for (kernel.auxiliaries) |maybe_auxiliary| {
             const auxiliary = maybe_auxiliary orelse break;
             const allocation = (try self.storageFor(cb, index, auxiliary.allocation)) orelse return error.AuxiliaryStorageUnavailable;
+            if (auxiliary.requirement.role == .bf16_mirror) if (self.pool.selection) |*selection| {
+                try allocation.bindAllocationSlot(auxiliary.allocation, selection.epoch, @intCast(self.pool.plan.allocations[auxiliary.allocation].byte_size));
+            };
             const tensor = try self.viewForShape(cb, allocation, auxiliary.requirement.shape);
             auxiliary_bindings[auxiliary_count] = .{ .role = auxiliary.requirement.role, .tensor = tensor };
             auxiliary_count += 1;

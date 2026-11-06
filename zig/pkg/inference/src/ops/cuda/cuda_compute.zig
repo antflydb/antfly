@@ -36811,7 +36811,7 @@ fn cudaTensorReadOnly(tensor: *const CudaTensor) bool {
     }
 }
 
-const physical_storage_policy: ops.physical_storage.Policy = .{ .allocate = allocatePhysicalRequest };
+const physical_storage_policy: ops.physical_storage.Policy = .{ .minimum_alignment = buffer_mod.DeviceBuffer.allocation_alignment, .allocate = allocatePhysicalRequest };
 fn allocatePhysicalRequest(ctx: *anyopaque, request: ops.physical_storage.Request) anyerror!?CT {
     // Existing Native/CUDA input banks have the same storage representation.
     return allocatePhysicalStorageOp(ctx, request.byte_size);
@@ -42752,6 +42752,74 @@ const PreparedCudaProjection = struct {
     // Pure algorithm recipe, no SDK descriptors or caller token retained.
     // Actual per-frame descriptors are bound only after storage admission.
     cold_dense_recipe: ?Dense.DenseRecipe = null,
+    /// Address-free plan facts. Actual current Frame leases are proved again
+    /// before descriptor binding or numerical entry; this is no payload pin.
+    planned_mirror: ?PlannedMirror = null,
+    const PlannedMirror = struct { epoch: u64, alignment: u32 };
+
+    fn plannedMirror(self: *CudaCompute, binding: route.Binding, expected: Shape) ?PlannedMirror {
+        const value = switch (binding) {
+            .planned => |value| value,
+            else => return null,
+        };
+        if (!shapeEqual(value.logical, expected)) return null;
+        const alignment = ops.physical_storage.minimumAlignment(self.computeBackend()) catch return null;
+        if (alignment != buffer_mod.DeviceBuffer.allocation_alignment) return null;
+        const elements = expected.numElements() orelse return null;
+        if (elements <= 0) return null;
+        const bytes = std.math.mul(usize, @intCast(elements), 2) catch return null;
+        var result: ?PlannedMirror = null;
+        for (value.planes) |plane| {
+            if (plane.role != .bf16_mirror) continue;
+            if (result != null or plane.backing != null or plane.writable != null or plane.byte_offset != 0 or plane.base_alignment != alignment or plane.logical_bytes != bytes or plane.readable_bytes < bytes) return null;
+            var shape = expected;
+            shape.dtype = .bf16;
+            const descriptor = plane.descriptor;
+            const strides = backend_contracts.TensorStrides.dense(shape);
+            if (!shapeEqual(descriptor.shape, shape) or descriptor.current_backend != .cuda or descriptor.resident_backend != .cuda or descriptor.storage != .cuda_buffer or descriptor.quant_format != null or descriptor.attention_kv_format != null or descriptor.attention_storage != null or !std.meta.eql(descriptor.strides, strides)) return null;
+            const epoch = plane.storage_epoch orelse return null;
+            if (epoch == 0) return null;
+            result = .{ .epoch = epoch, .alignment = alignment };
+        }
+        return result;
+    }
+
+    /// The canonical RMSNorm producer attaches this exact auxiliary Lease to
+    /// its F32 result. Check both slot owners, not an unpinned mirror address.
+    fn assignedMirror(self: *CudaCompute, input: *const CudaTensor, expected: ?PlannedMirror, current: bool) !u32 {
+        const primary = input.physical_lease orelse return error.PreparedKernelBindingChanged;
+        if (primary.backend.ptr != @as(*anyopaque, @ptrCast(self)) or !acceptsPhysicalImplementation(primary.backend.vtable)) return error.PreparedKernelBindingChanged;
+        const primary_slot = primary.slot_authority orelse return error.PreparedKernelBindingChanged;
+        if (input.resident_parent != null or input.buffer.ptr != tensorFromCt(primary.tensor).buffer.ptr) return error.PreparedKernelBindingChanged;
+        const bytes = try checkedMul(input.elem_count, 2);
+        if (input.bf16_mirror.ptr == 0 or input.bf16_mirror.len != bytes or input.owns_bf16_mirror) return error.PreparedKernelBindingChanged;
+        var matched: ?*ops.physical_storage.Lease = null;
+        for (input.auxiliary_leases) |maybe| {
+            const lease = maybe orelse continue;
+            if (lease.backend.ptr != @as(*anyopaque, @ptrCast(self)) or !acceptsPhysicalImplementation(lease.backend.vtable)) return error.PreparedKernelBindingChanged;
+            const root = tensorFromCt(lease.tensor);
+            if (root.buffer.ptr != input.bf16_mirror.ptr) continue;
+            if (matched != null or !root.physical_storage_base or root.buffer.borrowed or bytes > lease.byte_size or bytes > root.buffer.len) return error.PreparedKernelBindingChanged;
+            matched = lease;
+        }
+        const lease = matched orelse return error.PreparedKernelBindingChanged;
+        const slot = lease.slot_authority orelse return error.PreparedKernelBindingChanged;
+        if (slot.epoch == 0 or slot.epoch != primary_slot.epoch or slot.allocation == primary_slot.allocation or bytes > slot.byte_size) return error.PreparedKernelBindingChanged;
+        const alignment: u32 = @intCast(@as(u64, 1) << @min(@as(u6, 8), @as(u6, @intCast(@ctz(input.bf16_mirror.ptr)))));
+        if (expected) |plan| if (slot.epoch != plan.epoch or alignment < plan.alignment) return error.PreparedKernelBindingChanged;
+        if (current) {
+            const storages = self.physical_execution_storage orelse return error.MissingPhysicalExecutionScope;
+            if (slot.allocation >= storages.len or primary_slot.allocation >= storages.len or storages[slot.allocation] != lease or storages[primary_slot.allocation] != primary) return error.ForeignPhysicalExecutionScope;
+            const cleanup = self.physical_execution_cleanup orelse return error.MissingPhysicalExecutionScope;
+            if (cleanup.boundary) |epoch| if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            if ((lease.retirement_owner != null or primary.retirement_owner != null) and cleanup.boundary == null) return error.MissingCurrentCleanupEpoch;
+            if (cleanup.operation != null) {
+                const backend = self.computeBackend();
+                _ = try cleanup.operationFor(&backend);
+            }
+        }
+        return alignment;
+    }
 
     fn shapeEqual(a: Shape, b: Shape) bool {
         return a.dtype == b.dtype and a.rank() == b.rank() and std.mem.eql(i64, a.dims[0..a.rank()], b.dims[0..b.rank()]);
@@ -42944,9 +43012,18 @@ const PreparedCudaProjection = struct {
         if (request.output.node != self.slot.node or request.output.allocation != self.slot.allocation or !shapeEqual(request.output.logical, self.descriptor.output_shape)) return false;
         const current = (select(self.compute, &self.descriptor, request.inputs) catch return false) orelse return false;
         if (!equivalent(self.profile, current)) return false;
+        if (self.planned_mirror) |expected| {
+            if (request.inputs[0] == .planned) {
+                const plan = plannedMirror(self.compute, request.inputs[0], self.descriptor.input_shapes[0]) orelse return false;
+                if (!std.meta.eql(plan, expected)) return false;
+            } else {
+                const input = tensorFact(self.compute, request.inputs[0]) orelse return false;
+                _ = assignedMirror(self.compute, input, expected, false) catch return false;
+            }
+        }
         if (self.cold_dense_recipe) |*recipe| {
             const blas = if (self.compute.cublaslt) |*value| value else return false;
-            const layout = coldProjectionLayout(self.compute, request.inputs, current) orelse return false;
+            const layout = coldProjectionLayout(self.compute, request.inputs, current, self.planned_mirror) orelse return false;
             if (recipe.owner != blas or !recipe.matchesLayout(layout)) return false;
         }
         return true;
@@ -42987,6 +43064,7 @@ const PreparedCudaProjection = struct {
         if (invocation.inputs.len != self.descriptor.input_count) return error.InvalidShape;
         const input = tensorFromCt(invocation.inputs[0]);
         if (input.dtype != .f32 or input.quant_type != null or input.elem_count != self.profile.geometry.rows * self.profile.geometry.width) return error.PreparedKernelBindingChanged;
+        if (self.planned_mirror) |expected| _ = try assignedMirror(self.compute, input, expected, true);
         const workspace = try self.scratch(invocation);
         const p = self.profile;
         const activation: buffer_mod.DeviceBuffer = if (p.family == .vendor_f32) input.buffer else if (p.activation_mirror) input.bf16_mirror else .{ .ptr = workspace.ptr + p.activation_offset, .len = p.conversion_bytes };
@@ -43006,6 +43084,7 @@ const PreparedCudaProjection = struct {
             const source = tensorFromCt(value).buffer;
             if (kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, source.ptr, source.len)) return error.InvalidAssignedAlias;
         };
+        if (p.activation_mirror and workspace.len != 0 and kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, activation.ptr, activation.len)) return error.InvalidAssignedAlias;
         if (workspace.len != 0 and (kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, output.ptr, output.len) or kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, input.buffer.ptr, input.buffer.len) or kernel_geometry.byteRangesOverlap(workspace.ptr, p.workspace_bytes, p.weight.ptr, p.weight.len))) return error.InvalidAssignedAlias;
         return .{ .dst = if (p.rounded_output_bytes != 0) .{ .ptr = workspace.ptr + p.rounded_output_offset, .len = p.rounded_output_bytes } else output, .input = activation, .weight = if (p.transpose_bytes != 0) .{ .ptr = workspace.ptr, .len = p.transpose_bytes } else if (p.dequant_weight_bytes == 0) p.weight else .{ .ptr = workspace.ptr, .len = p.dequant_weight_bytes }, .workspace = if (p.vendor_bytes == 0) .{} else .{ .ptr = workspace.ptr + p.vendor_offset, .len = p.vendor_bytes }, .bias = if (p.fused_bias) tensorFromCt(invocation.inputs[2]).buffer else null };
     }
@@ -43179,19 +43258,24 @@ const PreparedCudaProjection = struct {
     }
 };
 
-fn coldProjectionLayout(self: *CudaCompute, inputs: []const @import("../../execution/kernel_route.zig").Binding, profile: PreparedCudaProjection.Profile) ?cublaslt_mod.CublasLt.DenseLayout {
+fn coldProjectionLayout(self: *CudaCompute, inputs: []const @import("../../execution/kernel_route.zig").Binding, profile: PreparedCudaProjection.Profile, expected_planned: ?PreparedCudaProjection.PlannedMirror) ?cublaslt_mod.CublasLt.DenseLayout {
     var input_alignment: u32 = buffer_mod.DeviceBuffer.allocation_alignment;
     if (profile.activation_mirror) {
-        // Only actual stable tensor-plane addresses can supply a mirror's
-        // exact alignment here. Unqualified planned/foreign mirrors retain
-        // their compatibility path; never force conversion to earn credit.
-        const input = PreparedCudaProjection.tensorFact(self, inputs[0]) orelse return null;
-        var root = input;
-        while (root.resident_parent) |parent| root = parent;
-        if (!root.owns_bf16_mirror or root.bf16_mirror.borrowed or root.bf16_mirror.ptr != input.bf16_mirror.ptr or root.bf16_mirror.allocation_bytes < input.bf16_mirror.len) return null;
-        const pointer = input.bf16_mirror.ptr;
-        if (pointer == 0) return null;
-        input_alignment = @intCast(@as(u64, 1) << @min(@as(u6, 8), @as(u6, @intCast(@ctz(pointer)))));
+        if (PreparedCudaProjection.plannedMirror(self, inputs[0], @import("ml").graph.Shape.init(.f32, &.{ @intCast(profile.geometry.rows), @intCast(profile.geometry.width) }))) |planned| {
+            input_alignment = planned.alignment;
+        } else {
+            const input = PreparedCudaProjection.tensorFact(self, inputs[0]) orelse return null;
+            var root = input;
+            while (root.resident_parent) |parent| root = parent;
+            if (root.owns_bf16_mirror and !root.bf16_mirror.borrowed and root.bf16_mirror.ptr == input.bf16_mirror.ptr and root.bf16_mirror.allocation_bytes >= input.bf16_mirror.len) {
+                const pointer = input.bf16_mirror.ptr;
+                if (pointer == 0) return null;
+                input_alignment = @intCast(@as(u64, 1) << @min(@as(u6, 8), @as(u6, @intCast(@ctz(pointer)))));
+            } else {
+                const expected = expected_planned orelse return null;
+                input_alignment = PreparedCudaProjection.assignedMirror(self, input, expected, false) catch return null;
+            }
+        }
     }
     return .{ .request = .{ .precision = .bf16, .output_precision = if (profile.rounded_output_bytes != 0) .bf16 else .f32, .rows = profile.physical_rows, .in_dim = profile.geometry.width, .out_dim = profile.geometry.columns, .tuning = profile.tuning }, .workspace_bytes = profile.vendor_bytes, .alignments = .{ buffer_mod.DeviceBuffer.allocation_alignment, input_alignment, buffer_mod.DeviceBuffer.allocation_alignment, buffer_mod.DeviceBuffer.allocation_alignment } };
 }
@@ -43202,7 +43286,8 @@ fn qualifyColdProjection(self: *CudaCompute, request: @import("../../execution/k
     // Exact live nonce/table/provider authority, not an ambient SDK context.
     try authority.validate(.{ .implementation = .{ .context = implementation.context, .table = implementation.table }, .program = null, .mode = .metadata });
     if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
-    const layout = coldProjectionLayout(self, request.inputs, profile) orelse return null;
+    if (profile.activation_mirror and request.inputs[0] == .planned and !request.inputs_witnessed[0]) return null;
+    const layout = coldProjectionLayout(self, request.inputs, profile, null) orelse return null;
     const blas = if (self.cublaslt) |*value| value else return null;
     return blas.prepareDenseLayout(&self.ctx, layout) catch |err| switch (err) {
         error.CublasLtUnsupported => null,
@@ -43229,7 +43314,14 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
     if (PreparedCudaProjection.geometry(request.descriptor) == null) {
         // RMS auxiliary mirrors depend on live environment/provider readiness.
         // Preserve their per-invocation policy checks even with dense inputs.
-        if (request.descriptor.operation == .norm and request.descriptor.operation.norm.kind == .rms) return @import("../../execution/assigned_kernel_route.zig").prepare(.{ .ptr = self, .vtable = table }, request, directCudaRouteSupported);
+        if (request.descriptor.operation == .norm and request.descriptor.operation.norm.kind == .rms) {
+            var selected = (try @import("../../execution/assigned_kernel_route.zig").prepare(.{ .ptr = self, .vtable = table }, request, directCudaRouteSupported)) orelse return null;
+            // This canonical producer writes dense F32 into its assigned slot
+            // and attaches only its declared mirrors. Its model gamma remains
+            // live invocation-validated; it grants no source payload credit.
+            selected.output_plane_metadata = .assigned_dense;
+            return selected;
+        }
         return @import("../../execution/assigned_kernel_route.zig").prepareImmutable(.{ .ptr = self, .vtable = table }, request, directCudaRouteSupported);
     }
     const profile = (try PreparedCudaProjection.select(self, request.descriptor, request.inputs)) orelse return null;
@@ -43238,7 +43330,7 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
     else
         null;
     const owner = try request.allocator.create(PreparedCudaProjection);
-    owner.* = .{ .allocator = request.allocator, .compute = self, .descriptor = request.descriptor.*, .slot = request.output, .profile = profile, .cold_dense_recipe = cold_recipe };
+    owner.* = .{ .allocator = request.allocator, .compute = self, .descriptor = request.descriptor.*, .slot = request.output, .profile = profile, .cold_dense_recipe = cold_recipe, .planned_mirror = if (profile.activation_mirror and cold_recipe != null) PreparedCudaProjection.plannedMirror(self, request.inputs[0], request.descriptor.input_shapes[0]) else null };
     const key_fields = [8]u64{ @intCast(profile.geometry.rows), @intCast(profile.geometry.width), @intCast(profile.geometry.columns), @intCast(profile.weight.ptr), @backingInt(profile.family), @intCast(profile.primary_bytes), @intCast(profile.workspace_bytes), @intFromBool(profile.fused_bias) | (@as(u64, @intFromBool(profile.activation_mirror)) << 1) | (@as(u64, @intFromBool(profile.dequant_weight_bytes != 0)) << 2) | (@as(u64, @intFromBool(profile.transpose_bytes != 0)) << 3) | (@as(u64, @intFromBool(profile.rounded_output_bytes != 0)) << 4) | (if (profile.quantized) |quantized| @as(u64, @backingInt(quantized.kind)) << 8 else @as(u64, 0)) };
     const key = std.hash.Wyhash.hash(0, std.mem.asBytes(&key_fields));
     // Every selected Projection writes F32 into the explicitly assigned dense
@@ -43604,7 +43696,7 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                     if (format == .q4_0_vendor) try std.testing.expectEqual(width * columns * 2, program.profile.dequant_weight_bytes);
                     if (format == .bf16_rounded) {
                         try std.testing.expectEqual(program.profile.physical_rows * columns * 2, program.profile.rounded_output_bytes);
-                        try std.testing.expectEqual(cublaslt_mod.CublasLt.DensePrecision.bf16, coldProjectionLayout(&compute, facts[0..descriptor.input_count], program.profile).?.request.output_precision);
+                        try std.testing.expectEqual(cublaslt_mod.CublasLt.DensePrecision.bf16, coldProjectionLayout(&compute, facts[0..descriptor.input_count], program.profile, null).?.request.output_precision);
                         try std.testing.expect(selected.requirements.capture == .unsupported);
                     }
                     try std.testing.expect(selected.requirements.probe_output == .none);
@@ -48369,7 +48461,7 @@ fn qualifyCompleteCudaProgram(comptime format: CompleteCudaProgramFormat, compti
     return qualifyCompleteCudaProgramRecipe(format, qualified_f32, activation_aliases, .ordinary);
 }
 
-fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, comptime qualified_f32: bool, comptime activation_aliases: bool, comptime recipe: enum { ordinary, rows_w8, dequant_vendor }) !void {
+fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, comptime qualified_f32: bool, comptime activation_aliases: bool, comptime recipe: enum { ordinary, rows_w8, dequant_vendor, rounded_mirror }) !void {
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const a = std.testing.allocator;
     const shared = @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
@@ -48394,6 +48486,12 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     if (recipe == .dequant_vendor and (compute.kernels.dequant_q4_0_bf16 == null or compute.kernels.f32_to_bf16 == null)) return error.SkipZigTest;
     compute.tuned_route_gates.linear_q8_1_tile4_w8 = recipe == .rows_w8;
     compute.tuned_route_gates.linear_q8_1_tile4_w8_min_in_dim = 0;
+    if (recipe == .rounded_mirror) {
+        if (!cudaCublasLtEnabled() or !cudaRmsNormBf16MirrorEnabled() or compute.kernels.rms_norm_f32_bf16 == null) return error.SkipZigTest;
+        compute.capability_profile = .lightonocr3;
+        compute.lighton_bf16_projection_outputs = true;
+        compute.cublaslt_bf16_tuning_profile = .off;
+    }
     const cb = shared.computeBackend();
     const width = if (format == .q4_0) 256 else 64;
     const rows = if (recipe == .rows_w8) 3 else 128;
@@ -48407,7 +48505,9 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     var builder = ml.graph.Builder.init(&graph);
     const x = try builder.parameter("x", Shape.init(.f32, &.{ rows, width }));
     const w = try builder.parameter("w", Shape.init(.f32, &.{ width, width }));
-    const first = try builder.linearNoBias(x, w, rows, width, width);
+    const gamma_node = if (recipe == .rounded_mirror) try builder.parameter("gamma", Shape.init(.f32, &.{width})) else ml.graph.null_node;
+    const normalized = if (recipe == .rounded_mirror) try builder.rmsNorm(x, gamma_node, width, 1e-6) else x;
+    const first = try builder.linearNoBias(normalized, w, rows, width, width);
     const activation_input = if (activation_aliases) try builder.reshape(first, Shape.init(.f32, &.{rows * width})) else first;
     const activated = try builder.absOp(activation_input);
     const projection_input = if (activation_aliases) try builder.reshape(activated, Shape.init(.f32, &.{ rows, width })) else activated;
@@ -48415,7 +48515,12 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     for (0..8) |_| out = try builder.add(out, x);
     if (activation_aliases) out = try builder.reshape(out, Shape.init(.f32, &.{rows * width}));
     try graph.markOutput(out);
-    var program = try Program.init(a, &graph, &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "w", .node_id = w, .kind = .weight }, .{ .name = "out", .node_id = out, .kind = .output } });
+    if (recipe == .rounded_mirror) try graph.markOutput(normalized);
+    const semantic_bindings: []const @import("../../execution/program.zig").Binding = if (recipe == .rounded_mirror)
+        &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "w", .node_id = w, .kind = .weight }, .{ .name = "gamma", .node_id = gamma_node, .kind = .weight }, .{ .name = "out", .node_id = out, .kind = .output } }
+    else
+        &.{ .{ .name = "x", .node_id = x, .kind = .input }, .{ .name = "w", .node_id = w, .kind = .weight }, .{ .name = "out", .node_id = out, .kind = .output } };
+    var program = try Program.init(a, &graph, semantic_bindings);
     defer program.deinit();
     var identity: [width * width]f32 = @splat(0);
     // Q4_0 has an asymmetric signed range: -1 is exact while +1 rounds
@@ -48451,8 +48556,14 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     if (encoded_weight) |value| try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, value, &decoded) else @memcpy(&decoded, &identity);
     try std.testing.expectEqualSlices(f32, &identity, &decoded);
     const implementation = @import("../../execution/kernel_route.zig").Implementation{ .context = compute, .table = cb.vtable };
-    const facts = [_]@import("../../execution/kernel_route.zig").InputBinding{.{ .node_id = program.id_map[w], .value = .{ .tensor = .{ .value = weight, .implementation = implementation } } }};
-    var executable = try executable_mod.prepareWithOptions(a, &program, &cb, .partitioned, .{ .immutable_input_bindings = &facts });
+    const gamma_values: [width]f32 = @splat(1);
+    const gamma = if (recipe == .rounded_mirror) try cb.fromFloat32Shape(&gamma_values, &.{width}) else null;
+    defer if (gamma) |value| cb.free(value);
+    var fact_storage: [2]@import("../../execution/kernel_route.zig").InputBinding = undefined;
+    fact_storage[0] = .{ .node_id = program.id_map[w], .value = .{ .tensor = .{ .value = weight, .implementation = implementation } } };
+    if (gamma) |value| fact_storage[1] = .{ .node_id = program.id_map[gamma_node], .value = .{ .tensor = .{ .value = value, .implementation = implementation } } };
+    const facts = fact_storage[0..if (recipe == .rounded_mirror) 2 else 1];
+    var executable = try executable_mod.prepareWithOptions(a, &program, &cb, .partitioned, .{ .immutable_input_bindings = facts });
     var executable_live = true;
     defer if (executable_live) executable.deinitWithCleanup(if (budget) |*value| value.cleanup() else .{});
     const input_node = program.id_map[x];
@@ -48484,6 +48595,57 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         try std.testing.expectEqual(compute.runtime_policy.workspace_bytes, selected_program.profile.vendor_bytes);
         try std.testing.expect(first_projection.requirements.probe_output == .none);
     }
+    if (recipe == .rounded_mirror) {
+        try std.testing.expect(selected_program.planned_mirror != null and selected_program.cold_dense_recipe != null);
+        try std.testing.expect(selected_program.profile.activation_mirror);
+        try std.testing.expectEqual(@as(usize, 0), selected_program.profile.conversion_bytes);
+        try std.testing.expectEqual(rows * width * 2, selected_program.profile.rounded_output_bytes);
+        try std.testing.expect(first_projection.requirements.capture == .unsupported);
+        try std.testing.expect(plane_selection.planes_witnessed[program.id_map[normalized]]);
+        const norm_route = plane_selection.routes[program.id_map[normalized]] orelse return error.MissingRmsMirrorRoute;
+        try std.testing.expect(norm_route.validation_scope == .invocation and norm_route.output_plane_metadata == .assigned_dense);
+        const planes = plane_selection.planes[program.id_map[normalized]][0..plane_selection.plane_counts[program.id_map[normalized]]];
+        const planned_input = @import("../../execution/kernel_route.zig").Binding{ .planned = .{ .logical = program.graph.node(program.id_map[normalized]).output_shape, .planes = planes } };
+        try std.testing.expect(PreparedCudaProjection.plannedMirror(compute, planned_input, program.graph.node(program.id_map[normalized]).output_shape) != null);
+        try std.testing.expectEqual(@as(u32, buffer_mod.DeviceBuffer.allocation_alignment), selected_program.planned_mirror.?.alignment);
+        var metadata = try @import("../../execution/backend_operation.zig").enter(cb, &program.graph, null, .metadata);
+        defer metadata.deinitChecked() catch unreachable;
+        var cold_inputs = [_]@import("../../execution/kernel_route.zig").Binding{ planned_input, facts[0].value };
+        var request = @import("../../execution/kernel_route.zig").Prepare{ .allocator = a, .metadata_authority = metadata.token(), .implementation = implementation, .descriptor = &selected_program.descriptor, .inputs = &cold_inputs, .output = selected_program.slot };
+        // No claimed predecessor witness means no new cold rounded route.
+        var unwitnessed = try prepareKernelRouteOp(compute, request);
+        defer if (unwitnessed) |*owner| owner.deinit();
+        try std.testing.expect(unwitnessed == null);
+        request.inputs_witnessed[0] = true;
+        var copied_planes: [4]@import("../../execution/storage_ownership.zig").Plane = undefined;
+        try std.testing.expect(planes.len <= copied_planes.len);
+        @memcpy(copied_planes[0..planes.len], planes);
+        var mirror_index: usize = 0;
+        for (planes, 0..) |plane, index| if (plane.role == .bf16_mirror) {
+            mirror_index = index;
+        };
+        for (0..5) |changed| {
+            @memcpy(copied_planes[0..planes.len], planes);
+            switch (changed) {
+                0 => copied_planes[mirror_index].base_alignment = 1,
+                1 => copied_planes[mirror_index].storage_epoch = null,
+                2 => copied_planes[mirror_index].byte_offset = 2,
+                3 => copied_planes[mirror_index].backing = .{ .kind = .cuda, .base = 16, .context = @ptrCast(compute) },
+                4 => copied_planes[mirror_index].descriptor.current_backend = .native,
+                else => unreachable,
+            }
+            cold_inputs[0] = .{ .planned = .{ .logical = planned_input.planned.logical, .planes = copied_planes[0..planes.len] } };
+            var declined = try prepareKernelRouteOp(compute, request);
+            defer if (declined) |*owner| owner.deinit();
+            try std.testing.expect(declined == null);
+        }
+        cold_inputs[0] = planned_input;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        request.allocator = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, prepareKernelRouteOp(compute, request));
+        try std.testing.expect(failing.has_induced_failure);
+        try metadata.finish();
+    }
     if (recipe == .rows_w8) {
         try std.testing.expect(selected_program.profile.quantized != null);
         try std.testing.expectEqual(kernels_mod.KernelModule.Q4_0Q8_1Recipe.Family.tile4_w8, selected_program.profile.quantized.?.activation_recipe.?.family);
@@ -48499,7 +48661,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
             try std.testing.expectEqual(@import("../../execution/kernel_route.zig").ValidationScope.prepared_program, activation.validation_scope);
         }
     };
-    try std.testing.expect(routes.pool.replay_backend != null);
+    if (recipe == .rounded_mirror) try std.testing.expect(routes.pool.replay_backend == null) else try std.testing.expect(routes.pool.replay_backend != null);
     {
         var numeric = try @import("../../execution/backend_operation.zig").enter(cb, &program.graph, null, .managed);
         defer numeric.deinitChecked() catch unreachable;
@@ -48518,7 +48680,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         };
         try std.testing.expect(has_nonzero);
     }
-    budget = try CompleteCudaProgramBudget.init(routes.pool, rows * width * @sizeOf(f32), compute);
+    budget = try CompleteCudaProgramBudget.initForIO(routes.pool, rows * width * @sizeOf(f32), (if (recipe == .rounded_mirror) @as(usize, 2) else 1) * rows * width * @sizeOf(f32), compute);
     const initial_banks = compute.ctx.device_allocations.snapshot();
     var values: [rows * width]f32 = undefined;
     for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 9)) - 4)) / 8;
@@ -48526,7 +48688,10 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     var input_live = true;
     defer if (input_live) input.deinit();
     const host = [_]@import("../../execution/host_ingress.zig").Input{.{ .node_id = input_node, .value = &input }};
-    const weights = [_]@import("../../graph/interpreter.zig").RuntimeInput{.{ .node_id = program.id_map[w], .value = weight, .source_backend = &cb }};
+    var weight_inputs: [2]@import("../../graph/interpreter.zig").RuntimeInput = undefined;
+    weight_inputs[0] = .{ .node_id = program.id_map[w], .value = weight, .source_backend = &cb };
+    if (gamma) |value| weight_inputs[1] = .{ .node_id = program.id_map[gamma_node], .value = value, .source_backend = &cb };
+    const weights = weight_inputs[0..if (recipe == .rounded_mirror) 2 else 1];
     const ordinal_before = compute.temp_trace_seq;
     const learned_before = compute.temp_arena_planner.observations;
     var held: ?@import("../../graph/runtime.zig").Result = null;
@@ -48537,7 +48702,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         for (input.asFloat32Mut(), 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 9)) - 4 + @as(i32, @intCast(iteration)))) / 8;
         var audit = @import("../../execution/transfer_audit.zig").Audit{ .forbid_device_host_access = true };
         try @import("../../execution/transfer_audit.zig").begin(&audit);
-        var result = executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability(), .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+        var result = executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability(), .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
             @import("../../execution/transfer_audit.zig").end();
             return err;
         };
@@ -48551,18 +48716,41 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         if (iteration == 0) try std.testing.expect(result.stats.assigned_kernel_dispatches >= 3);
         const actual = try cb.toFloat32(result.outputs[0], a);
         defer a.free(actual);
+        if (recipe == .rounded_mirror) {
+            const native_expected = try roundedMirrorNativeExpected(a, input.asFloat32(), rows, width);
+            defer a.free(native_expected);
+            for (actual, native_expected) |got, expected| try std.testing.expectApproxEqAbs(expected, got, 0.002);
+            try std.testing.expectEqual(@as(usize, 2), result.outputs.len);
+            const norm = tensorFromCt(result.outputs[1]);
+            try std.testing.expectEqual(@as(u32, buffer_mod.DeviceBuffer.allocation_alignment), try PreparedCudaProjection.assignedMirror(compute, norm, selected_program.planned_mirror, false));
+            // Published output from a finished Frame is a valid held source,
+            // but it cannot mint a new same-Frame binding for this plan.
+            try std.testing.expectError(error.MissingPhysicalExecutionScope, PreparedCudaProjection.assignedMirror(compute, norm, selected_program.planned_mirror, true));
+            const actual_facts = [_]@import("../../execution/kernel_route.zig").Binding{
+                .{ .tensor = .{ .value = result.outputs[1], .implementation = implementation } },
+                .{ .tensor = .{ .value = weight, .implementation = implementation } },
+            };
+            try std.testing.expect(coldProjectionLayout(compute, &actual_facts, selected_program.profile, null) == null);
+            try std.testing.expect(coldProjectionLayout(compute, &actual_facts, selected_program.profile, selected_program.planned_mirror) != null);
+        }
         // The original Q4 route quantizes activations to Q8_1 twice. With
         // unit-range samples, their combined rounding bound is 1/127;
         // ordinary/reduced identity kernels retain the tighter tolerance.
         const tolerance: f32 = if (format == .q4_0 and recipe != .dequant_vendor) 1.0 / 127.0 + 0.002 else 0.002;
-        for (actual, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(projection_sign * @abs(original) + 8 * original, value, tolerance);
+        for (actual, input.asFloat32(), 0..) |value, original, index| try std.testing.expectApproxEqAbs(completeCudaRecipeExpected(recipe == .rounded_mirror, input.asFloat32(), index, original, projection_sign, width), value, tolerance);
         if (iteration == 4) {
             held = result;
             result_live = false;
         }
     }
-    try std.testing.expectEqual(@as(u64, 1), captures);
-    try std.testing.expect(replays >= 2);
+    if (recipe == .rounded_mirror) {
+        try std.testing.expectEqual(@as(u64, 0), captures);
+        try std.testing.expectEqual(@as(u64, 0), replays);
+        try std.testing.expect(compute.stats.rms_norm_bf16_mirror_hits >= 5 and compute.stats.bf16_cublaslt_activation_mirror_hits >= 5);
+    } else {
+        try std.testing.expectEqual(@as(u64, 1), captures);
+        try std.testing.expect(replays >= 2);
+    }
     try std.testing.expectEqual(ordinal_before, compute.temp_trace_seq);
     try std.testing.expectEqual(learned_before, compute.temp_arena_planner.observations);
     try std.testing.expectEqual(@as(usize, 0), compute.cublaslt_workspace_scratch.buffer.len);
@@ -48570,7 +48758,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     try std.testing.expect(bounded.physical_peak <= @max(initial_banks.physical_peak, initial_banks.physical_live + budget.?.physical.backend_scratch_bytes));
     // The existing frame is pinned by a real public output. A second frame may
     // not consume already-moved tokens or silently invoke a producer/SDK alloc.
-    if (executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+    if (executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
         var owned = unexpected;
         owned.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
         return error.ExpectedPerFormatHeldOutputBankRefusal;
@@ -48579,14 +48767,14 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     try std.testing.expect(budget.?.domain.controller.snapshot().backend_scratch_bytes >= budget.?.physical.backend_scratch_bytes);
     held.?.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
     held = null;
-    var recovery = try executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() });
+    var recovery = try executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() });
     var recovery_live = true;
     defer if (recovery_live) recovery.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
     {
         const recovery_values = try cb.toFloat32(recovery.outputs[0], a);
         defer a.free(recovery_values);
         const recovery_tolerance: f32 = if (format == .q4_0 and recipe != .dequant_vendor) 1.0 / 127.0 + 0.002 else 0.002;
-        for (recovery_values, input.asFloat32()) |value, original| try std.testing.expectApproxEqAbs(projection_sign * @abs(original) + 8 * original, value, recovery_tolerance);
+        for (recovery_values, input.asFloat32(), 0..) |value, original, index| try std.testing.expectApproxEqAbs(completeCudaRecipeExpected(recipe == .rounded_mirror, input.asFloat32(), index, original, projection_sign, width), value, recovery_tolerance);
         // One exact CUDA device is already proved by the witness. Keep its actual
         // process-owned backend value for output cleanup after Runtime teardown.
         recovery.owner_backend = cb;
@@ -48609,7 +48797,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
 
         compute.resident_training_cache = true;
         defer compute.resident_training_cache = false;
-        if (executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+        if (executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
             var cleanup = unexpected;
             cleanup.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
             return error.ExpectedPreparedPolicyRefusal;
@@ -48620,7 +48808,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         if (recipe == .dequant_vendor) {
             compute.tuned_route_gates.q4_0_cublas_prefill = false;
             defer compute.tuned_route_gates.q4_0_cublas_prefill = true;
-            if (executable.run(a, .{ .runtime_inputs = &weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+            if (executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
                 var cleanup = unexpected;
                 cleanup.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
                 return error.ExpectedDequantVendorPolicyRefusal;
@@ -54315,4 +54503,94 @@ test "CUDA rounded projection declares reduced output separately and refuses col
     compute.debug_cuda_graph_capture_active = false;
     compute.auxiliaryCache(.rounded_bf16_output).device = .{ .ptr = 65536, .len = profile.rounded_output_bytes - 1 };
     try std.testing.expect((try PreparedCudaProjection.select(&compute, &descriptor, &bindings)) == null);
+}
+
+fn completeCudaRecipeExpected(comptime rounded_mirror: bool, values: []const f32, index: usize, original: f32, sign: f32, width: usize) f32 {
+    if (!rounded_mirror) return sign * @abs(original) + 8 * original;
+    const row = index / width;
+    var squared: f64 = 0;
+    for (values[row * width ..][0..width]) |value| squared += @as(f64, value) * value;
+    const normed: f32 = @floatCast(@as(f64, original) / @sqrt(squared / @as(f64, @floatFromInt(width)) + 1e-6));
+    const bits: u32 = @bitCast(normed);
+    const rounded: f32 = @bitCast((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000);
+    return @abs(rounded) + 8 * original;
+}
+
+test "complete CUDA rounded first projection consumes planned RMSNorm mirror with exact current Frame ownership and no capture" {
+    if (comptime !cuda_enabled or !@import("build_options").enable_native) return error.SkipZigTest;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const name = "ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR";
+    const a = std.testing.allocator;
+    const previous = if (platform.env.getenv(name)) |value| try a.dupeSentinel(u8, value, 0) else null;
+    defer if (previous) |value| a.free(value);
+    defer {
+        if (previous) |value| _ = Env.setenv(name, value.ptr, 1) else _ = Env.unsetenv(name);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(name, "1", 1));
+    try qualifyCompleteCudaProgramRecipe(.bf16, false, false, .rounded_mirror);
+}
+
+fn roundedMirrorNativeExpected(allocator: std.mem.Allocator, values: []const f32, rows: usize, width: usize) ![]f32 {
+    const native = @import("../native_compute.zig");
+    var weights = native.WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const input = try backend.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(width) });
+    defer backend.free(input);
+    const gamma_values = try allocator.alloc(f32, width);
+    defer allocator.free(gamma_values);
+    @memset(gamma_values, 1);
+    const gamma = try backend.fromFloat32Shape(gamma_values, &.{@intCast(width)});
+    defer backend.free(gamma);
+    const norm = try backend.rmsNorm(input, gamma, width, 1e-6);
+    defer backend.free(norm);
+    const result = try backend.toFloat32(norm, allocator);
+    errdefer allocator.free(result);
+    for (result, values) |*value, original| {
+        const bits: u32 = @bitCast(value.*);
+        const rounded: f32 = @bitCast((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000);
+        value.* = @abs(rounded) + 8 * original;
+    }
+    return result;
+}
+
+test "CUDA planned mirror alignment is canonical allocator metadata and rejects missing offset stale and foreign planes without SDK work" {
+    const Shape = @import("ml").graph.Shape;
+    const ownership = @import("../../execution/storage_ownership.zig");
+    const route = @import("../../execution/kernel_route.zig");
+    var compute: CudaCompute = undefined;
+    initPreparedCudaMetadataFixture(&compute);
+    const backend = compute.computeBackend();
+    try std.testing.expectEqual(@as(u32, buffer_mod.DeviceBuffer.allocation_alignment), try ops.physical_storage.minimumAlignment(backend));
+    var copied = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(backend.vtable));
+    try std.testing.expectError(error.UnsupportedPhysicalStoragePolicy, ops.physical_storage.minimumAlignment(.{ .ptr = @ptrFromInt(16), .vtable = &copied }));
+    const logical = Shape.init(.f32, &.{ 3, 64 });
+    const reduced = Shape.init(.bf16, &.{ 3, 64 });
+    var desc = backend_contracts.TensorDesc.init(reduced, .cuda_buffer);
+    desc.current_backend = .cuda;
+    desc.resident_backend = .cuda;
+    var plane = ownership.Plane{ .descriptor = desc, .role = .bf16_mirror, .byte_offset = 0, .base_alignment = buffer_mod.DeviceBuffer.allocation_alignment, .storage_epoch = 9, .logical_bytes = 3 * 64 * 2, .readable_bytes = 3 * 64 * 2 };
+    const input = route.Binding{ .planned = .{ .logical = logical, .planes = @as(*const ownership.Plane, &plane)[0..1] } };
+    try std.testing.expectEqualDeep(PreparedCudaProjection.PlannedMirror{ .epoch = 9, .alignment = 256 }, PreparedCudaProjection.plannedMirror(&compute, input, logical).?);
+    const original = plane;
+    for (0..6) |changed| {
+        plane = original;
+        switch (changed) {
+            0 => plane.base_alignment = 1,
+            1 => plane.storage_epoch = null,
+            2 => plane.byte_offset = 2,
+            3 => plane.backing = .{ .kind = .cuda, .context = &compute, .base = 16 },
+            4 => plane.descriptor.current_backend = .metal,
+            5 => plane.readable_bytes -= 1,
+            else => unreachable,
+        }
+        try std.testing.expect(PreparedCudaProjection.plannedMirror(&compute, input, logical) == null);
+    }
 }

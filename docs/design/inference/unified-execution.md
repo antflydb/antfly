@@ -291,6 +291,10 @@ preparation API do not by themselves complete these remaining requirements:
   preparation loads the original widening program; dispatch retains the
   original GEMM and widening order. This ordinary-only route preserves the
   existing capture restriction and declines separate mutable mirror planes.
+  A witnessed RMSNorm BF16 auxiliary can supply activation rows without another
+  conversion. Allocator alignment is explicit metadata; SDK binding rechecks
+  the actual primary and auxiliary leases against the current frame. External
+  mirrors, offsets and unknown alignment retain compatibility ownership.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU

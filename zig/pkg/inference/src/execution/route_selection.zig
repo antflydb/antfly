@@ -227,7 +227,9 @@ pub const Selection = struct {
         return result;
     }
 
-    fn densePlane(shape: ml.graph.Shape, kind: ops.BackendKind, role: @FieldType(ownership.Plane, "role"), epoch: u64) !ownership.Plane {
+    fn densePlane(shape: ml.graph.Shape, backend: ops.ComputeBackend, role: @FieldType(ownership.Plane, "role"), epoch: u64) !ownership.Plane {
+        const alignment = try @import("../ops/physical_storage.zig").minimumAlignment(backend);
+        const kind = backend.kind();
         const elements = shape.numElements() orelse return error.InvalidPreparedKernelShape;
         if (elements <= 0) return error.InvalidPreparedKernelShape;
         const bytes = try std.math.mul(usize, @intCast(elements), shape.dtype.byteSize());
@@ -239,13 +241,13 @@ pub const Selection = struct {
         });
         descriptor.current_backend = kind;
         descriptor.resident_backend = kind;
-        return .{ .descriptor = descriptor, .role = role, .storage_epoch = epoch, .byte_offset = 0, .logical_bytes = bytes, .readable_bytes = bytes };
+        return .{ .descriptor = descriptor, .role = role, .storage_epoch = epoch, .byte_offset = 0, .base_alignment = alignment, .logical_bytes = bytes, .readable_bytes = bytes };
     }
 
     fn select(self: *Selection, pool: *physical.Pool, authority: ?@import("backend_operation.zig").Borrowed) !void {
         if (pool.literal_store) |store| for (store.literals, 0..) |literal, index| {
             if (!self.literal_enabled[index]) continue;
-            self.planes[literal.node][0] = try densePlane(literal.shape, store.backends[literal.backend_index].kind(), .primary, self.epoch);
+            self.planes[literal.node][0] = try densePlane(literal.shape, store.backends[literal.backend_index], .primary, self.epoch);
             self.plane_counts[literal.node] = 1;
             self.planes_witnessed[literal.node] = true;
         };
@@ -279,14 +281,14 @@ pub const Selection = struct {
             const required = owned.requirements;
             if (required.auxiliaries.count > ops.kernel_descriptor.max_auxiliaries) return error.InvalidPreparedKernelRequirements;
             const logical = kernel.descriptor.output_shape;
-            const primary = try densePlane(logical, backend.kind(), .primary, self.epoch);
+            const primary = try densePlane(logical, backend, .primary, self.epoch);
             if ((logical.dtype != .f32 and logical.dtype != .i32 and logical.dtype != .i64) or required.primary_bytes < primary.logical_bytes or required.primary_alignment == 0 or !std.math.isPowerOfTwo(required.primary_alignment)) return error.InvalidPreparedKernelRequirements;
             if (owned.implementation.context != backend.ptr or owned.implementation.table != @as(*const anyopaque, backend.vtable)) return error.InvalidPreparedKernelImplementation;
             self.planes[node][0] = primary;
             var count: u8 = 1;
             for (required.auxiliaries.items()) |auxiliary| {
                 if (count == max_planes) return error.InvalidPreparedKernelRequirements;
-                self.planes[node][count] = try densePlane(auxiliary.shape, backend.kind(), switch (auxiliary.role) {
+                self.planes[node][count] = try densePlane(auxiliary.shape, backend, switch (auxiliary.role) {
                     .bf16_mirror => .bf16_mirror,
                     .mean => .mean,
                     .inverse_std => .inverse_std,
@@ -348,7 +350,7 @@ pub const Selection = struct {
             const candidate = if (binding_value == .imported_host) imported: {
                 const host = binding_value.imported_host;
                 if (host.target != backend.kind() or !host.logical.eq(source_slot.desc.shape)) break :imported null;
-                break :imported try densePlane(host.logical, backend.kind(), .primary, self.epoch);
+                break :imported try densePlane(host.logical, backend, .primary, self.epoch);
             } else try @import("dense_alias.zig").primary(binding_value, backend, source_slot.desc.shape);
             const primary = candidate orelse continue;
             const alias = @import("dense_alias.zig").reshapePlane(primary, source_slot.desc.shape, output_slot.desc.shape, backend.kind(), source) orelse continue;

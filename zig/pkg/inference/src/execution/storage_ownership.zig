@@ -56,6 +56,10 @@ pub const Plane = struct {
     /// binding requires a canonical backing identity before ownership credit.
     backing: ?Identity = null,
     byte_offset: usize,
+    /// Minimum alignment of the allocation BASE, not this view's address.
+    /// Planned facts come from the accepted physical allocator policy; unknown
+    /// observed/custom storage stays at one. Consumers account for byte_offset.
+    base_alignment: u32 = 1,
     logical_bytes: usize,
     /// Initialized readable data for the selected physical representation.
     readable_bytes: usize,
