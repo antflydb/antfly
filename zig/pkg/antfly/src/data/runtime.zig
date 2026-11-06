@@ -24385,6 +24385,10 @@ pub const DataServer = struct {
                 storage_kernel_context = context;
                 try storage_kernel_context.?.configureRemoteContent(cfg.api_server_cfg.remote_content);
                 try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
+                try storage_kernel_context.?.configureInferenceDefaults(
+                    if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null,
+                    cfg.api_server_cfg.inference_api_key,
+                );
                 if (cfg.api_server_cfg.node_config != null and cfg.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
                     const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg.api_server_cfg.node_config, cfg.api_server_cfg.deployment_mode, cfg.api_server_cfg.native_lake_artifact_base_dir);
                     defer alloc.free(retained_setup);
@@ -31419,6 +31423,7 @@ pub fn runFromIterator(
         process_storage_kernel_context = context;
         try process_storage_kernel_context.?.configureRemoteContent(remote_content);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
+        if (loaded_config) |*cfg| try process_storage_kernel_context.?.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
         if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
             const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);
             defer alloc.free(retained_setup);

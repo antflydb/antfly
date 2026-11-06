@@ -148,6 +148,11 @@ pub const StorageOwnerContext = struct {
     // An unconfigured facade denies destinations; acquisition errors propagate.
     remote_content: scraping.RemoteContentConfig = .{ .security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} } },
     secret_store: ?*common_secrets.FileStore = null,
+    /// Node-level default inference endpoint and unresolved credential
+    /// reference. Storage-owned enrichment inherits them exactly as the API
+    /// server does; the key resolves through `secret_store` per request.
+    inference_api_url: ?[]u8 = null,
+    inference_api_key: ?[]u8 = null,
     lite_backend: ?lite_backend.Handle = null,
     auth_backend: ?antfly.lsm_backend.BackendHandle = null,
     auth_users_store: ?antfly.storage_backend_erased.Store = null,
@@ -177,6 +182,17 @@ pub const StorageOwnerContext = struct {
         return inference_provider.inferenceBoundaryProvider(lifetime);
     }
 
+    pub fn inferenceDefaults(self: *const StorageOwnerContext) local_write.InferenceDefaults {
+        return .{ .api_url = self.inference_api_url, .api_key = self.inference_api_key };
+    }
+
+    fn clearInferenceDefaults(self: *StorageOwnerContext) void {
+        if (self.inference_api_url) |value| self.alloc.free(value);
+        if (self.inference_api_key) |value| self.alloc.free(value);
+        self.inference_api_url = null;
+        self.inference_api_key = null;
+    }
+
     pub fn remoteContent(self: *const StorageOwnerContext) ?*const scraping.RemoteContentConfig {
         return if (self.remote_content_security != null or self.remote_content_source != null) &self.remote_content else null;
     }
@@ -194,6 +210,7 @@ pub const StorageOwnerContext = struct {
         if (self.auth_backend) |*backend| backend.close();
         if (self.lite_backend) |*backend| backend.deinit();
         if (self.remote_content_security) |*parsed| parsed.deinit();
+        self.clearInferenceDefaults();
         if (self.native_queries) |repository| {
             self.backend_runtime.ptr().query_cut_repository = null;
             repository.deinit();
@@ -876,6 +893,28 @@ pub fn storageOwnerContextConfigureSecrets(context: ?*anyopaque, store: ?*anyopa
     defer owner_context.mutex.unlock();
     if (owner_context.active_owners != 0) return .busy;
     owner_context.secret_store = if (store) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    return .ok;
+}
+
+/// Copies the node-level default inference endpoint and credential reference.
+/// Empty values clear them. Configure before opening any table owner.
+pub fn storageOwnerContextConfigureInferenceDefaults(
+    context: ?*anyopaque,
+    api_url: kernel_owner_abi.BorrowedBytes,
+    api_key: kernel_owner_abi.BorrowedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    owner_context.lock();
+    defer owner_context.mutex.unlock();
+    if (owner_context.active_owners != 0) return .busy;
+    const next_url: ?[]u8 = if (api_url.slice().len == 0) null else owner_context.alloc.dupe(u8, api_url.slice()) catch |err| return storageOwnerStatusFromError(err);
+    const next_key: ?[]u8 = if (api_key.slice().len == 0) null else owner_context.alloc.dupe(u8, api_key.slice()) catch |err| {
+        if (next_url) |value| owner_context.alloc.free(value);
+        return storageOwnerStatusFromError(err);
+    };
+    owner_context.clearInferenceDefaults();
+    owner_context.inference_api_url = next_url;
+    owner_context.inference_api_key = next_key;
     return .ok;
 }
 
@@ -3609,6 +3648,7 @@ pub fn storageOwnerOpen(
             if (owner_context) |context| context.antflyProvider() else null,
             if (owner_context) |context| context.secret_store else null,
             if (owner_context) |context| context.remoteContent() else null,
+            if (owner_context) |context| context.inferenceDefaults() else .{},
             &handle.storage_owner_managed_config,
             request.historical_raft_apply != 0,
         ) catch |err| return storageOwnerStatusFromError(err);
@@ -3656,6 +3696,7 @@ pub fn storageOwnerConfigure(
         if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.antflyProvider() else null,
         if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.secret_store else null,
         if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.remoteContent() else null,
+        if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.inferenceDefaults() else .{},
         &handle.storage_owner_managed_config,
     ) catch |err| {
         std.log.err("storage owner configure failed table={s} err={s}", .{
@@ -3719,6 +3760,7 @@ pub fn storageOwnerReconcile(
             request.advance_index_repair != 0,
             if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.backend_runtime.ptr() else null,
             if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.antflyProvider() else null,
+            if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.inferenceDefaults() else .{},
             &handle.storage_owner_managed_config,
         ) catch |err| return storageOwnerStatusFromError(err);
     out_result.* = .{
@@ -4760,6 +4802,7 @@ pub fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareRe
         null,
         null,
         null,
+        .{},
         null,
     );
 

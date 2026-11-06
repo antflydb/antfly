@@ -5431,6 +5431,7 @@ pub fn runFromIterator(
         });
         try storage_kernel_context.configureRemoteContent(remote_content);
         try storage_kernel_context.configureSecrets(&secret_store);
+        if (loaded_config) |*cfg| try storage_kernel_context.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
         const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, if (loaded_config) |*cfg| cfg else null, .standalone, data_dir);
         defer alloc.free(retained_setup);
         try storage_kernel_context.configureNativeQueries(retained_setup);

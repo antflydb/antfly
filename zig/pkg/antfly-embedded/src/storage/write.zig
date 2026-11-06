@@ -1692,6 +1692,16 @@ pub fn freeOwnerSchemaBeforeIndexLoad(alloc: std.mem.Allocator, prepared: ?db_mo
     if (prepared) |schema| storage_schema.freeSchema(alloc, schema.runtime_schema);
 }
 
+/// Node-level default inference endpoint and credential for storage-owned
+/// enrichment. Both are borrowed for the call and stay unresolved: `api_key`
+/// is normally a `${secret:...}` reference that managed embedders resolve
+/// through the secret store on each request, so it is never persisted with
+/// an index and stored-secret rotation reaches running workers.
+pub const InferenceDefaults = struct {
+    api_url: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+};
+
 pub fn configureStorageKernelOwnerDb(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -1702,10 +1712,11 @@ pub fn configureStorageKernelOwnerDb(
     antfly_provider: ?managed_embedder.AntflyProvider,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    inference: InferenceDefaults,
     installed: ?*OwnerManagedConfig,
 ) !void {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed });
-    _ = try configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, false);
+    if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed });
+    _ = try configureStorageKernelOwnerDbAtOpen(alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, false);
 }
 
 /// A pinned Raft descriptor is write-admission history, not current catalog
@@ -1721,10 +1732,11 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     antfly_provider: ?managed_embedder.AntflyProvider,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    inference: InferenceDefaults,
     installed: ?*OwnerManagedConfig,
     historical_ordered_apply: bool,
 ) !bool {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDbAtOpen", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, historical_ordered_apply });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDbAtOpen", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, historical_ordered_apply });
     if (historical_ordered_apply) {
         const stored = try loadOwnerCatalogContract(alloc, db);
         defer if (stored) |value| alloc.free(value);
@@ -1734,7 +1746,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             // the physical index catalog. "1" is the prior marker format;
             // the next current-catalog acquisition upgrades it to JSON.
             if (!std.mem.eql(u8, value, "1") and backend_runtime != null) {
-                try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, null, null, table_name, secret_store, remote_content);
+                try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, inference.api_url, inference.api_key, table_name, secret_store, remote_content);
                 try db.resumeEnrichmentRuntimeAfterReconfigure("historical owner reopen", "*");
                 if (installed) |state| state.publish(value);
             }
@@ -1784,8 +1796,8 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             backend_runtime,
             antfly_provider,
             null,
-            null,
-            null,
+            inference.api_url,
+            inference.api_key,
             table_name,
             secret_store,
             remote_content,
@@ -1814,7 +1826,7 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(alloc, schema_json);
-    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, old_indexes, null, null, null, null, null, false)));
+    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, old_indexes, null, null, null, null, .{}, null, false)));
     try std.testing.expect(db.hasIndex("old"));
     const catalog = try db.core.store.get(alloc, @import("db/relational_integrity_catalog.zig").key);
     defer alloc.free(catalog);
@@ -1830,12 +1842,12 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
         .catalog_digest = catalog_digest,
     };
     try db.batch(.{ .relational_topology = .{ .action = .begin, .fence = fence } });
-    try std.testing.expect(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, "{}", null, null, null, null, null, false));
+    try std.testing.expect(try configureStorageKernelOwnerDbAtOpen(alloc, &db, "rows", schema_json, "{}", null, null, null, null, .{}, null, false));
     try std.testing.expect(db.hasIndex("old"));
     const pinned_contract = (try loadOwnerCatalogContract(alloc, &db)).?;
     defer alloc.free(pinned_contract);
     try std.testing.expectEqualStrings(old_indexes, pinned_contract);
-    try std.testing.expectEqual(contract.StorageKernelReconcileState.busy, (try reconcileStorageKernelOwnerDb(alloc, &db, "rows", schema_json, "{}", null, false, null, null, null)).state);
+    try std.testing.expectEqual(contract.StorageKernelReconcileState.busy, (try reconcileStorageKernelOwnerDb(alloc, &db, "rows", schema_json, "{}", null, false, null, null, .{}, null)).state);
     const transition: @import("db/relational_integrity_generation_admission.zig").Transition = .{
         .child_table_id = 17,
         .child_table_name = "rows",
@@ -1846,7 +1858,7 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
         .decision_digest = @splat(3),
     };
     try db.batch(.{ .relational_topology = .{ .action = .cancel, .fence = fence, .child_generations = &.{transition} } });
-    const reconciled = try reconcileStorageKernelOwnerDb(alloc, &db, "rows", schema_json, "{}", null, false, null, null, null);
+    const reconciled = try reconcileStorageKernelOwnerDb(alloc, &db, "rows", schema_json, "{}", null, false, null, null, .{}, null);
     try std.testing.expect(reconciled.state != .busy);
     try std.testing.expect(!db.hasIndex("old"));
     const installed_contract = (try loadOwnerCatalogContract(alloc, &db)).?;
@@ -1894,7 +1906,7 @@ pub fn repairStorageKernelRestoreDb(
     cancellation: db_mod.types.CancellationToken,
 ) !void {
     if (comptime storage_engine.enabled) return storage_engine.call("writeRepairStorageKernelRestoreDb", .{ alloc, db, group_id, schema_json, indexes_json, cancellation });
-    try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null, null, null);
+    try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null, null, .{}, null);
     const io = db.backend_runtime.filesystemIo() orelse std.Io.Threaded.global_single_threaded.io();
     var repair_cancellation = db_mod.types.RepairCancellation{ .token = cancellation };
     var attempts: usize = 0;
@@ -1947,9 +1959,10 @@ pub fn reconcileStorageKernelOwnerDb(
     advance_index_repair: bool,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    inference: InferenceDefaults,
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeReconcileStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, installed });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeReconcileStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, inference, installed });
     if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
         return .{ .state = .busy };
     if (try db.childGenerationSourceDefersOwnerCatalog())
@@ -1965,8 +1978,8 @@ pub fn reconcileStorageKernelOwnerDb(
         backend_runtime,
         antfly_provider,
         null,
-        null,
-        null,
+        inference.api_url,
+        inference.api_key,
         table_name,
         null,
         null,
