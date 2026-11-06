@@ -313,6 +313,9 @@ pub const DenseNativeMigrationPolicySource = @import("runtime_callbacks.zig").De
 
 pub const IndexBackendOptions = struct {
     text_main_backend: persistent_mod.MainBackend = .lsm,
+    /// Required when `text_main_backend == .native_catalog` (Lite only). See
+    /// `storage/native_catalog_backend.zig:Sink`.
+    text_main_native_catalog_sink: ?persistent_mod.NativeCatalogSink = null,
     dense_storage_backend: hbc_mod.StorageBackend = .lsm,
     sparse_backend: sparse_mod.SparseBackend = .lsm,
     graph_reverse_backend: graph_mod.ReverseBackend = .lsm,
@@ -526,6 +529,7 @@ pub fn indexBackendOptionsForPrimary(
     const graph_storage_override = overrides.graph_lsm_storage != null;
     return .{
         .text_main_backend = if (text_storage_override) overrides.text_main_backend else textMainBackendForPrimary(kind),
+        .text_main_native_catalog_sink = overrides.text_main_native_catalog_sink,
         .dense_storage_backend = if (dense_storage_override) overrides.dense_storage_backend else denseStorageBackendForPrimary(kind),
         .sparse_backend = if (sparse_storage_override) overrides.sparse_backend else sparseBackendForPrimary(kind),
         .graph_reverse_backend = if (graph_storage_override) overrides.graph_reverse_backend else graphReverseBackendForPrimary(kind),
@@ -732,6 +736,46 @@ test "index backend resolver honors explicit lsm storage over memory primary" {
     try std.testing.expectEqual(hbc_mod.StorageBackend.lsm, opts.dense_storage_backend);
     try std.testing.expectEqual(sparse_mod.SparseBackend.lsm, opts.sparse_backend);
     try std.testing.expectEqual(graph_mod.ReverseBackend.lsm, opts.graph_reverse_backend);
+}
+
+test "index backend resolver forwards the native catalog sink override" {
+    // Regression: indexBackendOptionsForPrimary's returned IndexBackendOptions
+    // literal must forward every override field, not just the backend kind
+    // enums. text_main_native_catalog_sink previously had no line in that
+    // literal, so Lite's `.native_catalog` override (set by
+    // lite/backend.zig's configureDbOpenOptions before DB.open merges
+    // primary-kind defaults with it) was silently reset to null here,
+    // breaking every real Lite open with error.MissingNativeCatalogSink.
+    const storage: lsm_backend_mod.Storage = undefined;
+    const TestSink = struct {
+        fn submit(_: *anyopaque, _: []const u8, _: []const @import("../native_catalog_backend.zig").Mutation, _: bool) anyerror!void {}
+        fn loadAllAlloc(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]@import("../native_catalog_backend.zig").Entry {
+            return allocator.alloc(@import("../native_catalog_backend.zig").Entry, 0);
+        }
+    };
+    var marker: u8 = 0;
+    const sink = persistent_mod.NativeCatalogSink{
+        .ptr = &marker,
+        .submit = TestSink.submit,
+        .loadAllAlloc = TestSink.loadAllAlloc,
+    };
+    const opts = indexBackendOptionsForPrimary(
+        .mem,
+        null,
+        null,
+        null,
+        0,
+        null,
+        true,
+        .{
+            .text_main_backend = .native_catalog,
+            .text_main_native_catalog_sink = sink,
+            .text_lsm_storage = storage,
+        },
+    );
+    try std.testing.expectEqual(persistent_mod.MainBackend.native_catalog, opts.text_main_backend);
+    try std.testing.expect(opts.text_main_native_catalog_sink != null);
+    try std.testing.expectEqual(@as(*anyopaque, &marker), opts.text_main_native_catalog_sink.?.ptr);
 }
 
 test "index lsm profiles inherit shared cache root generation and overrides" {

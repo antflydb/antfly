@@ -28,6 +28,7 @@ const platform_sync = @import("antfly_platform").sync;
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
+const wal_trace = @import("../write_amplification_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const AtomicWriteSink = storage_io.AtomicWriteSink;
@@ -304,6 +305,8 @@ const CatalogWrite = struct {
 };
 
 fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void {
+    const wal_trace_scope = wal_trace.scope(.vfs_write);
+    defer wal_trace_scope.end();
     var mutation = CatalogWrite{ .kind = .put, .path = path, .value = contents };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
@@ -311,6 +314,8 @@ fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
+    const wal_trace_scope = wal_trace.scope(.vfs_append);
+    defer wal_trace_scope.end();
     var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, sync);
 }
@@ -326,6 +331,8 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, old_path);
     try validateIndexPath(self, new_path);
+    const wal_trace_scope = wal_trace.scope(.vfs_rename);
+    defer wal_trace_scope.end();
     var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
@@ -333,6 +340,8 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
+    const wal_trace_scope = wal_trace.scope(.vfs_delete);
+    defer wal_trace_scope.end();
     var mutation = CatalogWrite{ .kind = .delete, .path = path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
@@ -491,6 +500,8 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
 fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
+    const wal_trace_scope = wal_trace.scope(.vfs_sync);
+    defer wal_trace_scope.end();
     try self.docs.syncIndexContents();
 }
 
@@ -737,6 +748,8 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
         if (self.failure) |err| return err;
+        const wal_trace_scope = wal_trace.scope(.vfs_finish);
+        defer wal_trace_scope.end();
         if (self.file != null) try self.flush();
         try self.storage.docs.submitIndexMutation(self, publish, true);
     }
@@ -745,6 +758,8 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
         if (self.failure) |err| return err;
+        const wal_trace_scope = wal_trace.scope(.vfs_finish);
+        defer wal_trace_scope.end();
         if (self.file != null) try self.flush();
         try self.storage.docs.submitIndexMutation(self, publish, true);
         return self.storage.docs.openArtifactSource(self.path);
@@ -754,6 +769,8 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
         if (self.failure) |err| return err;
+        const wal_trace_scope = wal_trace.scope(.vfs_finish);
+        defer wal_trace_scope.end();
         // Map the builder's existing staging inode, avoiding a second export
         // after native publication. Small buffered artifacts spill once here.
         const file = try self.ensureFile();

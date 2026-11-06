@@ -48,6 +48,7 @@ const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const native_artifact_sink = @import("native_artifact_sink.zig");
 const mem_backend = @import("mem_backend.zig");
+const native_catalog_backend = @import("native_catalog_backend.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const storage_io = lsm_backend.storage_io;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
@@ -128,11 +129,20 @@ pub const PersistentIndexOptions = struct {
     wal_clock: storage_sim.Clock = storage_sim.real_clock,
     wal_commit_scheduler: storage_sim.CompletionScheduler = storage_sim.real_completion_scheduler,
     model_wal_commit_backend_completions: bool = false,
+    /// Required when `main_backend == .native_catalog`. See
+    /// `native_catalog_backend.Sink`.
+    main_native_catalog_sink: ?NativeCatalogSink = null,
 
     pub fn resolvedWalBackend(self: PersistentIndexOptions) wal_mod.StorageBackend {
         return self.wal_backend orelse switch (self.main_backend) {
             .lsm_memory, .mem => .lsm_memory,
             .lsm => .lsm,
+            // A `.native_catalog` publication (segment + metadata) is
+            // already one atomic native transaction (see
+            // `native_catalog_backend.zig`'s commit-through-sink design),
+            // so there is no intermediate state for a separate recovery WAL
+            // to protect. An in-memory WAL costs nothing and is never read.
+            .native_catalog => .lsm_memory,
         };
     }
 };
@@ -210,7 +220,16 @@ pub const MainBackend = enum {
     mem,
     lsm_memory,
     lsm,
+    /// Lite-only: the main backend (segment ranges, active segment set,
+    /// generation metadata) is a view onto native `.aflite` index-catalog
+    /// records (see `native_catalog_backend.zig`), committed as one native
+    /// transaction per `MainTxn.commit()`, instead of an embedded LSM
+    /// instance stored through a virtual filesystem. Requires
+    /// `PersistentIndexOptions.main_native_catalog_sink`.
+    native_catalog,
 };
+
+pub const NativeCatalogSink = native_catalog_backend.Sink;
 
 pub const PersistentIndexStats = struct {
     wal: wal_mod.WalStats,
@@ -969,6 +988,7 @@ fn runtimeNamespace(keyspace: MainKeyspace) backend_types.Namespace {
 const MainStoreOwner = union(enum) {
     mem: *mem_backend.Backend,
     lsm: lsm_backend.BackendHandle,
+    native_catalog: *native_catalog_backend.Backend,
 
     fn close(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
@@ -977,6 +997,10 @@ const MainStoreOwner = union(enum) {
                 alloc.destroy(backend);
             },
             .lsm => |*handle| handle.close(),
+            .native_catalog => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
         }
         self.* = undefined;
     }
@@ -988,83 +1012,91 @@ const MainStoreOwner = union(enum) {
                 alloc.destroy(backend);
             },
             .lsm => |*handle| handle.abandonAfterCrash(),
+            .native_catalog => |backend| {
+                // Every `.native_catalog` commit is already durable before
+                // this backend's in-memory mirror is published (see
+                // `native_catalog_backend.zig`'s `NamespaceTxn.commit`), so
+                // there is nothing to roll back here beyond an ordinary close.
+                backend.close();
+                alloc.destroy(backend);
+            },
         }
         self.* = undefined;
     }
 
     fn sync(self: *MainStoreOwner, force: bool) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native_catalog => {},
             .lsm => |*handle| try handle.backend.sync(force),
         }
     }
 
     fn lsmMaintenanceScore(self: *const MainStoreOwner) u64 {
         return switch (self.*) {
-            .mem => 0,
+            .mem, .native_catalog => 0,
             .lsm => |handle| handle.backend.maintenanceScore(),
         };
     }
 
     fn snapshotLsmMaintenanceStats(self: *const MainStoreOwner) ?lsm_backend.Backend.MaintenanceStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
         };
     }
 
     fn snapshotLsmWriteStats(self: *const MainStoreOwner) ?lsm_backend.Backend.WriteStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.snapshotWriteStats(),
         };
     }
 
     fn snapshotLsmOpenStats(self: *const MainStoreOwner) ?lsm_backend.Backend.OpenStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.snapshotOpenStats(),
         };
     }
 
     fn checkpointLsmWalAfterDurableBoundary(self: *MainStoreOwner) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native_catalog => {},
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
         }
     }
 
     fn pinNativeCheckpoint(self: *MainStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.*) {
-            .mem => error.Unsupported,
+            .mem, .native_catalog => error.Unsupported,
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
         };
     }
 
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
         };
     }
 
     fn runLsmMaintenanceStep(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .mem => false,
+            .mem, .native_catalog => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStep(),
         };
     }
 
     fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .mem => false,
+            .mem, .native_catalog => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
         };
     }
 
     fn commitStatsSnapshot(self: *MainStoreOwner) ?CommitStats {
         return switch (self.*) {
-            .mem, .lsm => null,
+            .mem, .lsm, .native_catalog => null,
         };
     }
 };
@@ -1228,11 +1260,26 @@ pub const PersistentIndex = struct {
 
         pub fn commit(self: *MainTxn) !void {
             if (self.write) |*txn| {
+                const wal_trace_scope = wal_trace.scope(.main_txn_commit);
+                defer wal_trace_scope.end();
                 try txn.commit();
                 self.write = null;
                 return;
             }
             return error.ReadOnly;
+        }
+
+        /// Marks this (still-open) write transaction as a background/
+        /// ride-along publication ahead of `commit()`: safe only for work
+        /// a caller can afford to redo after a crash (segment merge,
+        /// retirement cleanup, async-consumer catch-up), never for a
+        /// publication a caller is waiting on to be durably acknowledged.
+        /// A no-op on backends with no such distinction (`.lsm`/`.mem`
+        /// always commit durably); real on `.native_catalog` (see
+        /// `native_catalog_backend.zig`'s `NamespaceTxn.setDurable`). This
+        /// is the helper WS2's `Store.stageRideAlong` is meant to replace.
+        pub fn setDurable(self: *MainTxn, durable: bool) void {
+            if (self.write) |*txn| txn.setDurableHint(durable);
         }
 
         pub fn get(self: *MainTxn, keyspace: MainKeyspace, key: []const u8) ![]const u8 {
@@ -1437,6 +1484,24 @@ pub const PersistentIndex = struct {
                     .owner = .{ .lsm = handle },
                 };
             },
+            .native_catalog => {
+                const sink = opts.main_native_catalog_sink orelse return error.MissingNativeCatalogSink;
+                const backend = try alloc.create(native_catalog_backend.Backend);
+                errdefer alloc.destroy(backend);
+                backend.* = try native_catalog_backend.Backend.init(alloc, .{
+                    .sink = sink,
+                    .scope = index_path,
+                    .backend = .{ .read_only = opts.read_only },
+                });
+                errdefer backend.close();
+
+                var store = try backend.runtimeNamespaceStore(alloc);
+                errdefer store.deinit();
+                return .{
+                    .store = store,
+                    .owner = .{ .native_catalog = backend },
+                };
+            },
         }
     }
 
@@ -1471,7 +1536,14 @@ pub const PersistentIndex = struct {
         defer alloc.free(wal_path);
 
         var segment_files: ?SegmentFileStore = null;
-        if (builtin.os.tag != .freestanding or opts.main_lsm_storage != null) {
+        // `.native_catalog` publishes small segments inline, as index-catalog
+        // records in the same native transaction as their metadata (see
+        // `indexSegmentOwned`'s `segment_files == null` branch and
+        // `native_catalog_backend.zig`); it never needs a file-backed
+        // SegmentFileStore or the artifact leases that come with one. Large
+        // segments falling back to bounded unlinked staging is follow-up
+        // work (see the design doc's WS4 §3.3 "Artifacts" note).
+        if (opts.main_backend != .native_catalog and (builtin.os.tag != .freestanding or opts.main_lsm_storage != null)) {
             var segments_buf: [512]u8 = undefined;
             const segments_path = std.fmt.bufPrint(&segments_buf, "{s}/segments", .{path_span}) catch return error.PathTooLong;
             segment_files = try SegmentFileStore.open(
@@ -1945,21 +2017,21 @@ pub const PersistentIndex = struct {
 
     pub fn lsmMaintenanceDebtHint(self: *const PersistentIndex) u64 {
         return switch (self.main_store_owner) {
-            .mem => 0,
+            .mem, .native_catalog => 0,
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
         };
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
         return switch (self.main_store_owner) {
-            .mem => null,
+            .mem, .native_catalog => null,
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *PersistentIndex) void {
         switch (self.main_store_owner) {
-            .mem => {},
+            .mem, .native_catalog => {},
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
         }
     }
@@ -3314,6 +3386,11 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Merge/compaction: safe to redo after a crash (the pre-merge
+        // segments stay active until this commits), so this never needs its
+        // own durable sync -- it rides along on the next real durable
+        // boundary. See MainTxn.setDurable.
+        txn.setDurable(false);
 
         if (require_active) {
             const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);

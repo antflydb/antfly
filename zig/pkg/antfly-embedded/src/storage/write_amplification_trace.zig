@@ -48,6 +48,28 @@ pub const Stage = enum(u8) {
     status_snapshot,
     replay_retirement,
     artifact_cleanup,
+    // WS4 attribution: the Lite-only virtual-filesystem-on-native-catalog
+    // call sites in `lite/index_storage.zig` that the LSM text/dense/sparse
+    // backends use to store their logical files. These are the real sites
+    // behind most of the previously-unattributed `other` bucket for an
+    // indexed write; see docs/design/lite-performance/write-amplification-attributed.json.
+    vfs_write,
+    vfs_append,
+    vfs_rename,
+    vfs_delete,
+    vfs_sync,
+    vfs_finish,
+    // The one-time durable lease-pointer commit `artifact_source.Registry.open`
+    // issues on a non-pooled, non-reader-fenced artifact open.
+    artifact_lease,
+    // `PersistentIndex.MainTxn.commit`: the generic main-backend commit that
+    // (today) resolves to an LSM-backend write-transaction commit for every
+    // full-text/dense/sparse/graph index on Lite.
+    main_txn_commit,
+    // The LSM backend's own internal WAL append, inside `lsm_backend.zig`,
+    // distinct from `PersistentIndex`'s own segment-admission WAL (`.lsm_wal`
+    // above).
+    lsm_backend_wal,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;

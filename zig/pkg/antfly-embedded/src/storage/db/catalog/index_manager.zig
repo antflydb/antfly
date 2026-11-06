@@ -1394,6 +1394,7 @@ pub const IndexManager = struct {
     /// vectors fail with `error.ReembedUnavailable`.
     dense_reembedder: ?DenseReembedder = null,
     text_main_backend: persistent_mod.MainBackend,
+    text_main_native_catalog_sink: ?persistent_mod.NativeCatalogSink = null,
     text_lsm_storage: ?lsm_backend_mod.Storage,
     text_main_lsm_options: lsm_backend_mod.Options,
     text_wal_lsm_options: lsm_backend_mod.Options,
@@ -3292,6 +3293,7 @@ pub const IndexManager = struct {
             .relaxed_split_durability = false,
             .leann_replication = opts.leann_replication,
             .text_main_backend = opts.text_main_backend,
+            .text_main_native_catalog_sink = opts.text_main_native_catalog_sink,
             .text_lsm_storage = opts.text_lsm_storage,
             .text_main_lsm_options = text_main_lsm_options,
             .text_wal_lsm_options = text_wal_lsm_options,
@@ -23184,6 +23186,7 @@ pub const IndexManager = struct {
                     .path = zpath,
                     .io = self.io,
                     .main_backend = self.text_main_backend,
+                    .main_native_catalog_sink = self.text_main_native_catalog_sink,
                     .main_lsm_storage = self.effectiveTextMainStorage(),
                     .wal_storage = self.effectiveTextWalStorage(),
                     .main_lsm_options = self.text_main_lsm_options,

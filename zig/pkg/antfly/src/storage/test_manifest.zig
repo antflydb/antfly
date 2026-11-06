@@ -402,6 +402,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_ledger_digest;
     _ = @import("antfly_local_sources").storage_lite_mod;
     _ = @import("antfly_local_sources").storage_lite_native;
+    _ = @import("antfly_local_sources").storage_lite_native_catalog_sink;
     _ = @import("antfly_local_sources").storage_lite_path_lock_wait;
     _ = @import("antfly_local_sources").storage_lite_writer_queue;
     _ = @import("antfly_local_sources").storage_lite_write_amplification_bench_test;
@@ -458,6 +459,7 @@ comptime {
     _ = @import("lsm_vopr.zig");
     _ = @import("antfly_local_sources").storage_maintenance;
     _ = @import("antfly_local_sources").storage_mem_backend;
+    _ = @import("antfly_local_sources").storage_native_catalog_backend;
     _ = @import("antfly_local_sources").storage_mem_ordered;
     _ = @import("antfly_local_sources").storage_object_storage;
     _ = @import("antfly_local_sources").storage_persistent;
