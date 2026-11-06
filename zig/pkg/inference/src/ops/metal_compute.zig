@@ -54904,15 +54904,49 @@ test "Metal prepared dense row projections install pair QKV owners and preserve 
     try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, PreparedDenseRegionFixture.check);
 }
 
-test "Metal prepared projection geometry keeps multirow packed schedules outside synchronous profile" {
+test "Metal prepared projection geometry recognizes multirow heads while row-one profile stays bounded" {
     const a = std.testing.allocator;
     var graph = ml.graph.Graph.init(a);
     defer graph.deinit();
     var builder = ml.graph.Builder.init(&graph);
     const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 64 }));
-    const weight = try builder.parameter("w", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
-    const output = try builder.linearNoBias(x, weight, 2, 64, 64);
-    try std.testing.expect(MetalCompute.DenseProjectionRegion.candidate(&graph, output) == null);
+    for ([_][]const u8{ "q", "k" }) |name| {
+        const weight = try builder.parameter(name, ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+        const output = try builder.linearNoBias(x, weight, 2, 64, 64);
+        try graph.markOutput(output);
+        try std.testing.expect(MetalCompute.DenseProjectionRegion.candidate(&graph, output) != null);
+    }
+    try std.testing.expect(MetalCompute.DenseProjectionRegion.hasProjectionHead(&graph, false));
+    try std.testing.expect(!MetalCompute.DenseProjectionRegion.hasProjectionHead(&graph, true));
+    try std.testing.expect(!MetalCompute.DenseProjectionRegion.hasCandidates(&graph));
+}
+
+test "Metal unclaimed multirow projection geometry cannot acquire a synchronous or Source-owned profile" {
+    const Case = struct {
+        fn run(cb: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+            const a = std.testing.allocator;
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 64 }));
+            for ([_][]const u8{ "q", "k" }) |name| {
+                const weight = try builder.parameter(name, ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+                try graph.markOutput(try builder.linearNoBias(x, weight, 2, 64, 64));
+            }
+            var generic = try @import("../execution/region_execution_profile.zig").acquire(cb, &graph);
+            defer if (generic) |*claim| claim.deinitChecked() catch @panic("raw geometry profile cleanup failed");
+            try std.testing.expect(generic == null);
+            const request = MetalCompute.ProjectionPack.Request{ .count = 2, .slots = .{ 0, 1, 0 }, .generations = .{ 2, 2, 0 }, .declarations = .{ 2, 2, 0 }, .width = 64, .widths = .{ 64, 64, 0 } };
+            var unprepared = try MetalCompute.claimPreparedProjectionProfile(&cb, &graph, request);
+            defer if (unprepared) |*claim| claim.deinitChecked() catch @panic("unprepared Source profile cleanup failed");
+            try std.testing.expect(unprepared == null);
+            const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            try std.testing.expect(compute.packed_projection_profile == null);
+            try std.testing.expect(!metal_runtime_mod.hasActiveFrame(compute.provider_impl.raw_decode_runtime) and !metal_runtime_mod.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
+        }
+    };
+    const helper = @import("media_residency_test.zig");
+    try helper.onMetal(helper.noWeights, Case.run);
 }
 
 const ConcurrentMetalSiblings = struct {

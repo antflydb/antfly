@@ -880,12 +880,34 @@ pub const SharedCache = struct {
             const array = try std.math.mul(usize, self.replacement_required, @sizeOf(AdmissionCredit));
             return std.math.add(usize, @sizeOf(BindingMetadata), try std.math.add(usize, shells, array));
         }
+        fn validateFundingRequest(self: *const @This(), metadata_bytes: usize) !void {
+            const binding = self.parts[0].binding orelse return error.MissingCacheRetirementDomain;
+            var requested = memory.AdmissionAmounts{ .host_weight_bytes = metadata_bytes };
+            for (self.parts) |part| requested = requested.merge(AdmissionBinding.amountsFor(part.tier, part.credit_bytes)) catch return error.MemoryBudgetExceeded;
+            if ((requested.firstLimitExceeded(binding.limits) catch return error.MemoryBudgetExceeded) != null) return error.MemoryBudgetExceeded;
+            const shared = binding.controller.sharedLimitsSnapshot();
+            if ((requested.firstLimitExceeded(.{ .host_limit_bytes = shared.host_limit_bytes, .combined_limit_bytes = shared.unified_limit_bytes }) catch return error.MemoryBudgetExceeded) != null) return error.MemoryBudgetExceeded;
+        }
         pub fn fundOutsideExecution(self: *@This(), pin: *const domain.Pin) !void {
+            self.fundOutsideExecutionImpl(pin) catch |err| {
+                // Shared caps may tighten during the outside acquisitions.
+                // Full failed-candidate cleanup has already run. Revalidate
+                // the WHOLE request so own partial leases never misclassify a
+                // newly intrinsic denial as retryable external contention.
+                if (err == error.ResourceTemporarilyUnavailable) try self.validateFundingRequest(try self.fundingMetadataBytes());
+                return err;
+            };
+        }
+        fn fundOutsideExecutionImpl(self: *@This(), pin: *const domain.Pin) !void {
             if (self.committed) return error.InvalidPreparedCacheGrowth;
             errdefer self.finishOutsideExecution();
             const binding = self.parts[0].binding orelse return error.MissingCacheRetirementDomain;
             if (self.metadata != null or pin.controller() != binding.controller) return error.ForeignAdmissionDomain;
             const metadata_bytes = try self.fundingMetadataBytes();
+            // These leases are ONE cold transaction. Check the entire intrinsic
+            // increment before the first acquisition: its earlier HOST leases
+            // must not masquerade as external contention for a later piece.
+            try self.validateFundingRequest(metadata_bytes);
             if (metadata_bytes != 0) {
                 const node = try self.metadata_allocator.create(BindingMetadata);
                 node.* = .{};
@@ -2075,7 +2097,8 @@ test "two tier physical cache transaction denies either exact cap without publis
     const limits = [_]memory.Limits{
         .{ .host_limit_bytes = metadata + 15, .backend_limit_bytes = 32 },
         .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 31 },
-        .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 32 },
+        .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 32, .combined_limit_bytes = metadata + 47 },
+        .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 32, .combined_limit_bytes = metadata + 48 },
     };
     for (limits, 0..) |limit, index| {
         const owner = try domain.Domain.create();
@@ -2088,7 +2111,7 @@ test "two tier physical cache transaction denies either exact cap without publis
         try cache.installRetirementDomainOutsideExecution(&pin);
         var growth = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
         defer growth.finishOutsideExecution();
-        if (index != 2) {
+        if (index != limits.len - 1) {
             try std.testing.expectError(error.MemoryBudgetExceeded, growth.fundOutsideExecution(&pin));
             try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
             try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
@@ -2120,6 +2143,109 @@ test "two tier physical cache transaction denies either exact cap without publis
         for (backing) |part| part.releaseAfterMetadataDeathOutsideExecution();
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, pin.controller().snapshot());
     }
+}
+
+test "two tier cache intrinsic shared host and unified caps precede every partial lease" {
+    const metadata = @sizeOf(BindingMetadata) + 2 * (try retirement.PreparedCharge.requestedMetadataBytes(0)) + 2 * @sizeOf(AdmissionCredit);
+    const shared_limits = [_]memory.SharedAdmissionLimits{
+        .{ .host_limit_bytes = metadata + 15 },
+        .{ .unified_limit_bytes = metadata + 47 },
+    };
+    for (shared_limits) |shared| {
+        const owner = try domain.Domain.create();
+        defer owner.release();
+        const pin = owner.pin();
+        defer pin.release();
+        pin.controller().configureSharedLimits(shared);
+        var cache = SharedCache.init(.{ .host_limit_bytes = 16, .backend_limit_bytes = 16 });
+        defer cache.deinitAdmission();
+        // Per-backend request limits fit exactly; only the independent shared
+        // physical owner denies the intrinsic full metadata+HOST+BACKEND sum.
+        try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 32, .combined_limit_bytes = metadata + 48 }, .{ .backend_limit_bytes = 64 });
+        try cache.installRetirementDomainOutsideExecution(&pin);
+        const binding = cache.admission.?;
+        const revision = binding.revision;
+        var growth = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
+        defer growth.finishOutsideExecution();
+        try std.testing.expectError(error.MemoryBudgetExceeded, growth.fundOutsideExecution(&pin));
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, pin.controller().snapshot());
+        try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
+        try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+        try std.testing.expectEqual(revision, binding.revision);
+        try std.testing.expectEqual(@as(usize, 0), binding.credits.items.len);
+        try std.testing.expect(growth.metadata == null and growth.replacement.capacity == 0);
+        for (growth.parts) |part| try std.testing.expect(part.lease == null and part.pin == null and part.shell.owner == null);
+    }
+}
+
+test "two tier cache late backend contention unwinds earlier host funding and preserves old cache" {
+    const owner = try domain.Domain.create();
+    defer owner.release();
+    const pin = owner.pin();
+    defer pin.release();
+    const limits = memory.Limits{ .backend_limit_bytes = 40 };
+    var cache = SharedCache.init(.{ .backend_limit_bytes = 64 });
+    defer cache.deinitAdmission();
+    try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, limits, .{ .backend_limit_bytes = 64 });
+    try cache.installRetirementDomainOutsideExecution(&pin);
+    // A genuine existing physical component/credit must survive both the
+    // denied transaction and a subsequent successful commit/rollback.
+    var seed = try cache.snapshotPhysicalGrowthLocked(8, 8, 8);
+    defer seed.finishOutsideExecution();
+    try seed.fundOutsideExecution(&pin);
+    try seed.commit();
+    var seed_backings: ?[2]PhysicalBacking = seed.retainCommittedPhysicalBackings();
+    defer if (seed_backings) |parts| for (parts) |part| part.releaseAfterMetadataDeathOutsideExecution();
+    seed.finishOutsideExecution();
+    const existing = pin.controller().snapshot();
+    const binding = cache.admission.?;
+    const old_revision = binding.revision;
+    const old_credit_count = binding.credits.items.len;
+    const old_credit_pointer = binding.credits.items.ptr;
+    const old_metadata = binding.metadata_host_bytes;
+    var external = try pin.controller().tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 1 }, true);
+    var external_live = true;
+    defer if (external_live) external.release();
+    const occupied = pin.controller().snapshot();
+    var refused = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
+    defer refused.finishOutsideExecution();
+    // The whole request fits alone. Earlier HOST metadata/payload funding
+    // succeeds, then the independently occupied BACKEND denies the last piece.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, refused.fundOutsideExecution(&pin));
+    try std.testing.expectEqualDeep(occupied, pin.controller().snapshot());
+    try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
+    try std.testing.expectEqual(@as(usize, 8), cache.backend_bytes);
+    try std.testing.expectEqual(old_revision, binding.revision);
+    try std.testing.expectEqual(old_credit_count, binding.credits.items.len);
+    try std.testing.expect(old_credit_pointer == binding.credits.items.ptr);
+    try std.testing.expectEqual(old_metadata, binding.metadata_host_bytes);
+    try std.testing.expectEqual(@as(usize, 8), binding.independent_host_bytes);
+    try std.testing.expectEqual(@as(usize, 8), binding.independent_backend_bytes);
+    try std.testing.expect(refused.metadata == null and refused.replacement.capacity == 0);
+    for (refused.parts) |part| {
+        try std.testing.expect(part.lease == null and part.pin == null and part.shell.owner == null);
+    }
+    external.release();
+    external_live = false;
+    try std.testing.expectEqualDeep(existing, pin.controller().snapshot());
+    var retry = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
+    defer retry.finishOutsideExecution();
+    try retry.fundOutsideExecution(&pin);
+    try retry.commit();
+    try std.testing.expectEqual(@as(usize, 24), cache.backend_bytes);
+    try std.testing.expectEqual(@as(usize, 40), pin.controller().snapshot().backend_weight_bytes);
+    try retry.rollbackUnpublishedLocked();
+    retry.finishOutsideExecution();
+    try std.testing.expectEqualDeep(existing, pin.controller().snapshot());
+    try std.testing.expectEqual(@as(usize, 8), cache.backend_bytes);
+    try std.testing.expectEqual(old_credit_count, binding.credits.items.len);
+    try std.testing.expect(old_credit_pointer == binding.credits.items.ptr);
+    try std.testing.expectEqual(old_metadata, binding.metadata_host_bytes);
+    cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, 8);
+    try cache.deinitAdmissionWithCleanup(.{ .outside_execution = true });
+    for (seed_backings.?) |part| part.releaseAfterMetadataDeathOutsideExecution();
+    seed_backings = null;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, pin.controller().snapshot());
 }
 
 fn twoTierCacheAllocationFailureCase(a: std.mem.Allocator) !void {
