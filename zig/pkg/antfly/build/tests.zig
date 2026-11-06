@@ -7432,6 +7432,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.mem_backend.",
             "storage.mem_ordered.",
             "storage.native_catalog_backend.",
+            "storage.commit_participant.",
             "storage.object_storage.",
             "storage.persistent.",
             "storage.persistent_vopr.",
