@@ -18,6 +18,7 @@
 import base64
 import contextlib
 import importlib.util
+import http.client
 import io
 import json
 import tempfile
@@ -144,6 +145,35 @@ class WhisperBaselineTests(unittest.TestCase):
         self.assertEqual(b'{"error":"busy"}', base64.b64decode(row["response_bytes_base64"]))
         self.assertIsNotNone(row["error"])
         self.assertIsNone(row["response"])
+
+    def test_truncated_success_body_retains_known_status_and_actual_partial(self):
+        class Truncated(io.BytesIO):
+            status = 200
+
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"data":', 17)
+
+        with patch.object(benchmark.urllib.request, "urlopen", return_value=Truncated()):
+            row = benchmark.post_record("http://example.test", b"{}", "application/json")
+        self.assertEqual(200, row["http_status"])
+        self.assertEqual(b'{"data":', base64.b64decode(row["response_bytes_base64"]))
+        self.assertEqual("IncompleteRead", row["error"]["type"])
+        self.assertIsNone(row["response"])
+        self.assertGreaterEqual(row["seconds"], 0)
+
+    def test_truncated_http_error_body_retains_known_status_and_actual_partial(self):
+        class Truncated(io.BytesIO):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"error":"bus', 8)
+
+        failure = urllib.error.HTTPError("endpoint", 503, "busy", {}, Truncated())
+        with patch.object(benchmark.urllib.request, "urlopen", side_effect=failure):
+            row = benchmark.post_record("http://example.test", b"{}", "application/json")
+        self.assertEqual(503, row["http_status"])
+        self.assertEqual(b'{"error":"bus', base64.b64decode(row["response_bytes_base64"]))
+        self.assertEqual("IncompleteRead", row["error"]["type"])
+        self.assertIsNone(row["response"])
+        self.assertGreaterEqual(row["seconds"], 0)
 
     def test_cpp_default_report_and_estimator_remain_original(self):
         calls = []

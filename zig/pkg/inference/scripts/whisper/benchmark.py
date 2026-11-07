@@ -24,6 +24,7 @@ servers must run on the same otherwise-idle GPU. Retain server placement logs.
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -148,6 +149,8 @@ def post_record(url, body, content_type):
             raise ValueError("nonfinite JSON constant: " + value)
         result = json.loads(raw, parse_constant=reject_constant)
     except Exception as failure:
+        if isinstance(failure, http.client.IncompleteRead):
+            raw = failure.partial
         error = {"type": type(failure).__name__, "message": str(failure)}
     return {
         "seconds": time.perf_counter() - started,
