@@ -1,7 +1,9 @@
 # Antfly Dictation
 
+<img src="Assets/AppIcon.png" width="128" alt="Antfly Dictation: Antfly outline with a whisper emoji" />
+
 A native macOS push-to-talk app demonstrating Antfly inference and application
-state: hold **Control–Option–Space**, speak, release, and paste into the original
+state: hold **Fn / Globe**, speak, release, and paste into the original
 text field. It includes Apple Speech and Whisper selection, cleanup presets,
 per-app preset selection, a dictionary, incremental Whisper cleanup, JSON import/export,
 Antfly settings snapshots, and optional searchable history.
@@ -86,12 +88,32 @@ bundle IDs, and an optional legacy live-preview choice. The first preset matchin
 otherwise the selected default is used. For example, use `com.apple.mail` for
 Mail. Global dictionary entries are combined with preset entries, up to 256 terms.
 
-The default is hold-to-talk; toggle mode starts/stops on successive key presses.
-The menu bar provides record, finish, cancel, copy, and settings controls. The
-shortcut is configurable using the macOS virtual key code and Carbon modifier
-mask. Space is 49; Command is 256, Shift 512, Option 2048, Control 4096. The default
-Control + Option mask is 6144. Save rejects conflicts without removing the
-previously registered shortcut. Only one app instance should register a shortcut.
+The default shortcut for new settings is **Fn / Globe**, matching
+[Wispr Flow's Mac default](https://docs.wisprflow.ai/articles/3152211871).
+Choose **Control + Option** in the shortcut presets for keyboards without Fn.
+The default behavior is hold-to-talk; toggle mode starts/stops on successive presses.
+The menu bar also provides record, finish, cancel, copy, and settings controls.
+
+Settings provide clickable Fn/Control/Option/Shift/Command buttons, a live shortcut
+label, **Record shortcut**, **Modifiers only**, and **Reset to Fn**. During selection,
+dictation is paused and captured keystrokes are consumed locally. Release your
+keys to accept the selection, or press Escape to cancel. Save settings to apply;
+a registration failure preserves the previous working shortcut. Common editing
+and system commands such as Command-C/Command-V cannot replace dictation shortcuts.
+
+Modifier-only and Fn combinations use a dedicated global keyboard event loop and
+need macOS Accessibility access. Click **Enable keyboard & paste access**, grant
+access in System Settings, then return or save settings again. If macOS also opens
+its emoji picker, set **Press Globe key to → Do Nothing** under Keyboard settings.
+The app never changes system keyboard preferences or grants itself permissions.
+Ordinary Fn navigation/key combinations interrupt a modifier-only dictation and
+pass through instead of inserting accidental speech. Other key chords retain
+Carbon conflict detection. Only one app instance should register the shortcut.
+
+Existing saved shortcuts are preserved, including older numeric Carbon settings;
+click Reset to Fn and Save if you want the new default. Exported settings retain
+compatibility fields while the optional `shortcut` object stores native modifier
+flags and an optional physical key code. No numeric editing is required in the UI.
 
 Recording stops after ten minutes and audio is bounded to 120 MiB. Live preview
 has a separate bounded queue. AVAudioConverter turns microphone audio into 16 kHz mono speech audio; final
@@ -202,6 +224,24 @@ History and audio retention are off by default:
 See the [voice dictation guide](../../docs/guides/voice-dictation.mdx) for the
 complete mode/capability matrix and the stable-session/text-cleanup API contract.
 
+## App icon
+
+The icon preserves the Antfly vector outline with the system's 🤫 whisper/shushing
+emoji in the center. The checked-in `.icns` contains standard and Retina sizes
+from 16 to 1024 pixels. Normal app builds copy it into the bundle. Regenerate it
+on macOS from this example directory:
+
+```bash
+mkdir -p .build/icon-modules .build/clang
+CLANG_MODULE_CACHE_PATH="$PWD/.build/clang" \
+  swift -module-cache-path .build/icon-modules build-icon.swift
+```
+
+The renderer uses `Assets/AntflyOutline.svg` derived from the repository logo and
+Apple Color Emoji. Intermediates stay under `.build/AppIcon.iconset`. Quit/reopen
+the app after rebuilding to load the new bundle/icon. Menu bar symbols still show
+recording/processing state.
+
 ## Validation
 
 ```bash
@@ -235,7 +275,10 @@ installed Whisper model. This opt-in test never downloads assets.
 
 Manual macOS smoke test:
 
-1. Launch the signed app bundle; verify the menu bar item and settings tabs.
+1. Launch the signed app bundle; verify the icon, menu bar item, and settings tabs.
+   Select Fn, grant keyboard Accessibility if needed, and verify it works in another
+   app. Try Fn+arrows, modifier-only Control+Option, a recorded custom chord, Escape
+   during selection, and a conflicting shortcut. Confirm selection never records audio.
 2. Deny microphone access and verify a useful error; grant it in Settings and retry.
 3. In TextEdit, hold/release the shortcut. Verify one result is pasted and the
    prior clipboard is restored. Repeat in toggle mode.

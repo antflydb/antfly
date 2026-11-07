@@ -45,12 +45,14 @@ import Security
 }
 
 @MainActor final class Hotkey {
-  private var reference: EventHotKeyRef?
-  private var handler: EventHandlerRef?
+  private let resources = HotkeyResources()
   var changed: ((Bool) -> Void)?
+  var interrupted: (() -> Void)?
+  private var suspended = false
   private var pressed = false
+  private var bindingVersion = UUID()
   private func receive(_ down: Bool) {
-    guard down != pressed else { return }
+    guard !suspended, down != pressed else { return }
     pressed = down
     changed?(down)
   }
@@ -70,20 +72,59 @@ import Security
           Unmanaged<Hotkey>.fromOpaque(context).takeUnretainedValue().receive(down)
         }
         return noErr
-      }, events.count, &events, Unmanaged.passUnretained(self).toOpaque(), &handler)
+      }, events.count, &events, Unmanaged.passUnretained(self).toOpaque(), &resources.handler)
   }
-  func register(key: UInt32, modifiers: UInt32) throws {
-    // Register replacement first; a conflict must not remove the working key.
-    var next: EventHotKeyRef?
-    let status = RegisterEventHotKey(
-      key, modifiers, EventHotKeyID(signature: 0x414E_5446, id: 1), GetApplicationEventTarget(), 0,
-      &next)
-    guard status == noErr else {
-      throw DictationError.invalid(
-        "Shortcut registration failed (\(status)); choose another key combination.")
+  var isAvailable: Bool {
+    resources.tap?.isAvailable ?? (resources.reference != nil)
+  }
+  func setSuspended(_ value: Bool) {
+    suspended = value
+    resources.tap?.setSuspended(value)
+    if pressed {
+      pressed = false
+      interrupted?()
     }
-    if let reference { UnregisterEventHotKey(reference) }
-    reference = next
+  }
+  func register(_ requested: KeyboardShortcut) throws {
+    let shortcut = try requested.validated()
+    let version = UUID()
+    if shortcut.usesEventTap {
+      let next = try GlobalShortcutTap(shortcut: shortcut) { [weak self] action in
+        DispatchQueue.main.async { [weak self] in
+          guard let self, !self.suspended, self.bindingVersion == version else { return }
+          switch action {
+          case .press: self.receive(true)
+          case .release: self.receive(false)
+          case .interrupt:
+            self.pressed = false
+            self.interrupted?()
+          case .none: break
+          }
+        }
+      }
+      next.setSuspended(suspended)
+      resources.tap?.stop()
+      resources.tap = next
+      if let reference = resources.reference {
+        UnregisterEventHotKey(reference)
+        resources.reference = nil
+      }
+    } else {
+      var next: EventHotKeyRef?
+      let status = RegisterEventHotKey(
+        shortcut.keyCode!, shortcut.carbonModifiers,
+        EventHotKeyID(signature: 0x414E_5446, id: 1), GetApplicationEventTarget(), 0, &next)
+      guard status == noErr else {
+        throw DictationError.invalid(
+          "Shortcut is unavailable (\(status)); the previous shortcut remains registered.")
+      }
+      if let reference = resources.reference { UnregisterEventHotKey(reference) }
+      resources.reference = next
+      resources.tap?.stop()
+      resources.tap = nil
+    }
+    bindingVersion = version
+    pressed = false
   }
 }
 

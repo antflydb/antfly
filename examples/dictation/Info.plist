@@ -6,7 +6,8 @@
 <key>CFBundleIdentifier</key><string>dev.antfly.dictation</string>
 <key>CFBundleExecutable</key><string>AntflyDictation</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleIconFile</key><string>AppIcon.icns</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSMicrophoneUsageDescription</key><string>Record audio while you hold the dictation shortcut and send it to your configured Antfly server.</string>

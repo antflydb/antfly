@@ -65,7 +65,9 @@ struct SettingsView: View {
   var body: some View {
     VStack(alignment: .leading) {
       HStack {
-        Image(systemName: "waveform").font(.largeTitle)
+        Image(nsImage: NSApplication.shared.applicationIconImage).resizable().scaledToFit().frame(
+          width: 48, height: 48
+        ).accessibilityLabel("Antfly Dictation")
         VStack(alignment: .leading) {
           Text("Antfly Dictation").font(.title)
           Text("Push to talk, with your vocabulary.").foregroundStyle(.secondary)
@@ -82,9 +84,10 @@ struct SettingsView: View {
       Text(store.message).font(.callout).textSelection(.enabled).frame(
         maxWidth: .infinity, alignment: .leading)
       HStack {
-        Button("Save settings") { store.save() }.disabled(store.state != .idle || store.working)
+        Button("Save settings") { store.save() }.disabled(
+          store.state != .idle || store.working || store.capturingShortcut)
         Button("Import JSON…") { store.importSettings() }.disabled(
-          store.state != .idle || store.working)
+          store.state != .idle || store.working || store.capturingShortcut)
         Button("Export JSON…") { store.exportSettings() }
         Spacer()
         Button("Cancel recording / request") { store.cancel() }.disabled(store.state == .idle)
@@ -128,17 +131,9 @@ struct SettingsView: View {
           }
           HStack {
             Button("Allow microphone") { store.requestMicrophone() }
-            Button("Enable paste accessibility") { store.requestAccessibility() }
+            Button("Enable keyboard & paste access") { store.requestAccessibility() }
           }
-          TextField(
-            "macOS virtual key code (Space = 49)", value: $store.config.shortcutKey, format: .number
-          )
-          TextField(
-            "Modifier mask (Control + Option = 6144)", value: $store.config.shortcutModifiers,
-            format: .number)
-          Text(
-            "Carbon modifiers: Command 256, Shift 512, Option 2048, Control 4096. Default Control + Option is 6144."
-          ).font(.caption)
+          ShortcutSettings(store: store)
           Toggle("Press to toggle recording instead of hold to talk", isOn: $store.config.toggle)
           Toggle("Paste into the original focused text field", isOn: $store.config.autoPaste)
         }

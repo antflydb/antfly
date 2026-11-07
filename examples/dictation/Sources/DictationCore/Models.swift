@@ -66,6 +66,11 @@ public struct Configuration: Codable, Equatable, Sendable {
   public var server = "http://localhost:8080"
   public var table = "dictation"
   public var profile = "default"
+  public var shortcut: KeyboardShortcut? = .fn
+  public var effectiveShortcut: KeyboardShortcut {
+    get { shortcut ?? KeyboardShortcut(legacyKey: shortcutKey, legacyModifiers: shortcutModifiers) }
+    set { shortcut = newValue }
+  }
   public var shortcutKey: UInt32 = 49  // Space
   public var shortcutModifiers: UInt32 = 6144  // Control + Option (Carbon)
   public var toggle = false
@@ -109,9 +114,10 @@ public struct Configuration: Codable, Equatable, Sendable {
           "Table and profile must use letters, numbers, underscores, or hyphens.")
       }
     }
-    guard shortcutKey < 128, shortcutModifiers & 0x1b00 != 0,
-      shortcutModifiers & ~UInt32(0x1b00) == 0
-    else { throw DictationError.invalid("Shortcut needs a modifier and a valid macOS key code.") }
+    _ = try effectiveShortcut.validated()
+    if shortcut == nil && (shortcutModifiers & ~UInt32(0x1b00) != 0 || shortcutKey >= 128) {
+      throw DictationError.invalid("Invalid legacy shortcut.")
+    }
     for preset in presets {
       if preset.outputMode == .rewrite && preset.processingStrategy == .incremental {
         throw DictationError.invalid("Rewrite requires Automatic or Whole utterance processing.")

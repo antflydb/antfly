@@ -63,5 +63,8 @@
       "mode": "verbatim",
       "processing": "automatic"
     }
-  ]
+  ],
+  "shortcut": {
+    "modifiers": 8388608
+  }
 }

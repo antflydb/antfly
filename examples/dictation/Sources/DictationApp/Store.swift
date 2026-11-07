@@ -18,7 +18,7 @@ import SwiftUI
   @Published var canRecoverRaw = false { didSet { updateOverlay() } }
   @Published var preview = "" { didSet { updateOverlay() } }
   @Published var result = ""
-  @Published var message = "Ready. Control–Option–Space to dictate." { didSet { updateOverlay() } }
+  @Published var message = "Ready. Hold Fn to dictate." { didSet { updateOverlay() } }
   @Published var discovery = ""
   @Published var models: [DiscoveredModel] = []
   @Published var searchText = ""
@@ -44,7 +44,8 @@ import SwiftUI
   private var cadenceTask: Task<Void, Never>?
   private var timeoutTask: Task<Void, Never>?
   private var generation = UUID()
-  private var registered: (UInt32, UInt32)?
+  private var registered: DictationCore.KeyboardShortcut?
+  @Published var capturingShortcut = false
   private var retryAudio: Data?
   private var retryPreset: Preset?
   private let clientFactory: (@Sendable (Configuration) throws -> AntflyClient)?
@@ -74,7 +75,11 @@ import SwiftUI
         historySyncStatus = "Local history could not be loaded: " + error.localizedDescription
       }
     }
-    do { try registerShortcut() } catch { message = error.localizedDescription }
+    do {
+      try registerShortcut()
+      message =
+        "Ready. \(config.toggle ? "Press" : "Hold") \(config.effectiveShortcut.label) to dictate."
+    } catch { message = error.localizedDescription }
     do {
       outbox = try HistoryOutbox(
         directory: self.directory.appendingPathComponent("outbox"), paused: true,
@@ -87,6 +92,7 @@ import SwiftUI
     } catch { historySyncStatus = "History sync unavailable: " + error.localizedDescription }
     token = registerHotkey ? Credentials.read(server: config.server) : ""
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
+    hotkey?.interrupted = { [weak self] in if self?.state != .idle { self?.cancel() } }
     if registerHotkey {
       overlay = RecordingOverlay(
         cancel: { [weak self] in self?.dismissFeedback() },
@@ -106,10 +112,24 @@ import SwiftUI
       server: settings.server, token: Credentials.read(server: settings.server))
   }
   private func registerShortcut() throws {
-    if registered?.0 == config.shortcutKey && registered?.1 == config.shortcutModifiers { return }
-    try hotkey?.register(key: config.shortcutKey, modifiers: config.shortcutModifiers)
-    registered = (config.shortcutKey, config.shortcutModifiers)
+    let shortcut = try config.effectiveShortcut.validated()
+    guard registered != shortcut || hotkey?.isAvailable == false else { return }
+    try hotkey?.register(shortcut)
+    registered = shortcut
   }
+  func refreshShortcutAccess() {
+    guard registered == nil || hotkey?.isAvailable == false, state == .idle, !capturingShortcut
+    else { return }
+    do {
+      try registerShortcut()
+      message = "Shortcut ready: " + config.effectiveShortcut.label
+    } catch { message = error.localizedDescription }
+  }
+  func captureShortcut(_ capturing: Bool) {
+    capturingShortcut = capturing
+    hotkey?.setSuspended(capturing)
+  }
+
   private func write(_ data: Data, to url: URL) throws {
     try data.write(to: url, options: .atomic)
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
@@ -161,7 +181,7 @@ import SwiftUI
     _ = AXIsProcessTrustedWithOptions(options)
   }
   func shortcut(down: Bool) {
-    guard !working else { return }
+    guard !working, !capturingShortcut else { return }
     var next = state
     let toggle = recordingConfig?.toggle ?? config.toggle
     let transition = down ? next.press(toggle: toggle) : next.release(toggle: toggle)
@@ -169,7 +189,7 @@ import SwiftUI
     if next == .recording { start() } else if next == .processing { finish() }
   }
   func start() {
-    guard state == .idle, !working else { return }
+    guard state == .idle, !working, !capturingShortcut else { return }
     do {
       let snapshot = try config.validated()
       guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
