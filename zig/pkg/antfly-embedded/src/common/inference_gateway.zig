@@ -160,7 +160,7 @@ pub const View = struct {
                     .decide => {
                         const cfg = try self.providers.getDeciderConfig(value.name);
                         out.backend_model = cfg.model;
-                        out.executor = @tagName(cfg.provider);
+                        out.executor = if (cfg.decision_method == .cascade) "cascade" else @tagName(cfg.provider);
                         out.model_identity = cfg.model_identity;
                         out.decision_method = @tagName(cfg.decision_method);
                         if (cfg.embedding_options) |options| out.calibration_id = options.calibration_id;
@@ -269,7 +269,8 @@ pub const View = struct {
     pub fn contains(self: View, task: Task, name: []const u8) bool {
         return switch (task) {
             .generate => self.providers.generator_configs.contains(name),
-            .decide => self.providers.decider_configs.contains(name),
+            // Cascade stages execute only through their cascade.
+            .decide => self.providers.decider_configs.contains(name) and !providers.Registry.isCascadeStageName(name),
             .embed => self.providers.embedder_configs.contains(name),
             .rerank => self.providers.reranker_configs.contains(name),
             .chunk => self.providers.chunker_configs.contains(name),
@@ -344,7 +345,10 @@ pub const View = struct {
         var out: std.ArrayList(Target) = .empty;
         errdefer out.deinit(a);
         inline for (.{ .{ Task.generate, "generator_configs" }, .{ Task.decide, "decider_configs" }, .{ Task.embed, "embedder_configs" }, .{ Task.rerank, "reranker_configs" }, .{ Task.chunk, "chunker_configs" }, .{ Task.extract, "extractor_configs" }, .{ Task.rewrite, "rewriter_configs" }, .{ Task.predict, "predictor_configs" } }) |entry| {
-            for (@field(self.providers, entry[1]).keys()) |name| try out.append(a, .{ .configured = .{ .task = entry[0], .name = name } });
+            for (@field(self.providers, entry[1]).keys()) |name| {
+                if (entry[0] == .decide and providers.Registry.isCascadeStageName(name)) continue;
+                try out.append(a, .{ .configured = .{ .task = entry[0], .name = name } });
+            }
         }
         for (self.providers.chains.keys()) |name| try out.append(a, .{ .configured = .{ .task = .generate, .name = name, .chain = true } });
         if (self.readers) |r| for (r.configs.keys()) |name| {
@@ -418,6 +422,26 @@ test "provider registry gateway resolves explicit task identities and preserves 
     const catalog = try view.catalog(a);
     defer a.free(catalog);
     try std.testing.expectEqual(@as(usize, 1), catalog.len);
+}
+
+test "provider registry gateway exposes decider cascades but hides their stages" {
+    const a = std.testing.allocator;
+    var r = try providers.Registry.parseFromSlice(a,
+        \\{"deciders":{"same-entity":{"decision_method":"cascade","cascade":{"stages":[
+        \\  {"name":"fast","decider":{"provider":"antfly","model":"fast"}},
+        \\  {"name":"strong","decider":{"provider":"antfly","model":"strong"},"when":{"probability_between":[0.3,0.9]}}]}}}}
+    );
+    defer r.deinit();
+    const view = View{ .providers = &r };
+    try std.testing.expectEqualStrings("same-entity", (try view.resolve(.decide, "deciders/same-entity", &.{})).configured.name);
+    try std.testing.expectError(error.ModelNotFound, view.resolve(.decide, "deciders/same-entity#strong", &.{}));
+    const catalog = try view.catalog(a);
+    defer a.free(catalog);
+    try std.testing.expectEqual(@as(usize, 1), catalog.len);
+    const descriptor = try view.describe(a, .{ .configured = .{ .task = .decide, .name = "same-entity" } });
+    defer a.free(descriptor.id);
+    try std.testing.expectEqualStrings("cascade", descriptor.executor);
+    try std.testing.expectEqualStrings("cascade", descriptor.decision_method.?);
 }
 
 test "provider registry gateway read resolves ASR and generator bindings without hiding collisions" {

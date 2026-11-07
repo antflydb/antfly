@@ -59,7 +59,7 @@ pub const Lease = struct {
         if (try immutableSnapshot(a, io, model)) return .{};
         var lease = Lease{ .directory = try sharedParent(io, model), .allocator = a };
         errdefer lease.deinit(io);
-        if (std.mem.endsWith(u8, model, ".gguf")) {
+        if (@import("managed_receipt.zig").isDirectModelPath(model)) {
             const root = try @import("managed_receipt.zig").publicationRootAlloc(a, io, model);
             defer a.free(root);
             if (!std.mem.eql(u8, root, model) and !try immutableSnapshot(a, io, root)) {
@@ -269,4 +269,24 @@ test "model selection write lease rejects another installation and released owne
     try std.testing.expectError(error.ModelArtifactsChanging, lease.requireDestination(io, second));
     lease.deinit(io);
     try std.testing.expectError(error.ModelArtifactsChanging, lease.requireDestination(io, first));
+}
+
+test "model selection direct ONNX lease fences the owning installation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "installed/model/onnx");
+    try tmp.dir.writeFile(io, .{ .sub_path = "installed/model/onnx/model.onnx", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "installed/model/.antfly-download-complete.json", .data = "{\"version\":2,\"artifacts\":[{\"path\":\"onnx/model.onnx\",\"size\":7}]}" });
+    const model = try tmp.dir.realPathFileAlloc(io, "installed/model/onnx/model.onnx", a);
+    defer a.free(model);
+    var lease = try Lease.shared(a, io, model);
+    defer lease.deinit(io);
+    const publisher = try tmp.dir.openDir(io, "installed", .{ .iterate = true });
+    defer publisher.close(io);
+    try std.testing.expect(!try Lease.file(publisher).tryLock(io, .exclusive));
+    lease.deinit(io);
+    try std.testing.expect(try Lease.file(publisher).tryLock(io, .exclusive));
+    Lease.file(publisher).unlock(io);
 }

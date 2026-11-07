@@ -77,7 +77,7 @@ fn estimateInputTokens(cfg: decisions.DeciderConfig, input: decisions.Input, pay
     return std.math.add(u64, text_bytes, images) catch error.DecisionLimitExceeded;
 }
 
-const Usage = struct { input_tokens: u64 = 0, output_tokens: u64 = 0 };
+const Usage = struct { input_tokens: u64 = 0, output_tokens: u64 = 0, estimated: bool = false };
 fn reportedUsage(source: decisions.Json) ?Usage {
     if (source != .object) return null;
     const usage = source.object.get("usage") orelse return null;
@@ -103,6 +103,9 @@ pub const Runtime = struct {
     resolution_allocator: std.mem.Allocator = std.heap.smp_allocator,
     resolution_mutex: std.atomic.Mutex = .unlocked,
     resolved_generators: std.ArrayList(*ResolvedGenerator) = .empty,
+    /// Stage limits apply to that stage across every group in the statement.
+    /// Public counters below still account for all model work in the runtime.
+    stage_budgets: std.StringHashMapUnmanaged(StageBudget) = .empty,
 
     limits: *quotas.Registry = &quotas.process_registry,
     http: *httpx.Client,
@@ -123,6 +126,11 @@ pub const Runtime = struct {
     latency_ns: u64 = 0,
     profile_allocator: ?std.mem.Allocator = null,
     provenance: std.ArrayList(struct { decider: []const u8, provider: []const u8, model: []const u8, rows: u64 = 0 }) = .empty,
+    const StageBudget = struct {
+        reserved_rows: u64 = 0,
+        input_tokens: u64 = 0,
+        estimated_input_tokens: u64 = 0,
+    };
     const ResolvedGenerator = struct {
         arena: std.heap.ArenaAllocator,
         cache: remote_capabilities.Cache,
@@ -135,6 +143,10 @@ pub const Runtime = struct {
     /// Model facts live for this runtime's request/statement; routing leases renew.
     /// Profile/provenance storage remains owned by profile_allocator's caller.
     pub fn deinit(self: *Runtime) void {
+        var stage_keys = self.stage_budgets.keyIterator();
+        while (stage_keys.next()) |key| self.resolution_allocator.free(key.*);
+        self.stage_budgets.deinit(self.resolution_allocator);
+        self.stage_budgets = .empty;
         for (self.resolved_generators.items) |entry| {
             entry.cache.deinit();
             entry.arena.deinit();
@@ -195,12 +207,17 @@ pub const Runtime = struct {
         try self.provenance.append(stats_a, .{ .decider = decider, .provider = provider_name, .model = owned_model, .rows = 1 });
     }
     pub fn provider(self: *@This()) decisions.DecisionProvider {
-        return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
+        return .{ .ptr = self, .validate_fn = validatePublic, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
     }
     fn resolvedCapabilities(ptr: *anyopaque, name: []const u8, source_table: []const u8) !decisions.Capabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         var result = try self.registry.getDeciderCapabilities(name);
         const cfg = try self.registry.getDeciderConfig(name);
+        if (cfg.decision_method == .cascade) {
+            // Composite admission uses the registered static contract. Native
+            // model discovery belongs to the stage that actually executes.
+            return result;
+        }
         if (cfg.decision_method == .generated and cfg.generator.?.provider == .antfly and result.images) {
             result.images = (try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table)).capabilities.images;
         }
@@ -210,9 +227,31 @@ pub const Runtime = struct {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (self.context) |ctx| try ctx.check();
     }
+    fn validatePublic(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
+        if (registry_mod.Registry.isCascadeStageName(name)) return error.UnknownDecider;
+        return validate(ptr, name, questions, source_table);
+    }
+
     fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         const cfg = try self.registry.getDeciderConfig(name);
+        if (cfg.decision_method == .cascade) {
+            // Every stage must accept the same questions before any stage runs.
+            const compiled = try self.registry.getCascade(name);
+            try decisions.validateQuestions(questions, compiled.capabilities);
+            var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+            defer arena.deinit();
+            try decisions.cascade_contract.validateBands(&compiled.definition, questions);
+            for (compiled.definition.stages) |stage| {
+                const stage_cfg = try self.registry.getDeciderConfig(try registry_mod.Registry.cascadeStageName(arena.allocator(), name, stage.name));
+                try decisions.validateQuestions(questions, stage_cfg.resolvedCapabilities());
+                if (stage_cfg.generator) |generator| if (generator.provider != .antfly) {
+                    const c = @import("antfly_structured");
+                    try c.validateProviderSchema(generator, try c.hostedCapabilities(generator).select(stage_cfg.output, stage_cfg.probabilities), try generated.questionSchema(arena.allocator(), questions));
+                };
+            }
+            return;
+        }
         try cfg.validate();
         _ = try quotas.Policy.fromConfig(cfg.rate_limit);
         try decisions.validateQuestions(questions, cfg.resolvedCapabilities());
@@ -250,7 +289,7 @@ pub const Runtime = struct {
         if (cfg.decision_method != .generated) return error.InvalidDeciderConfig;
         var lease = admission.tryAcquireLease() orelse return error.DecisionRateLimited;
         defer lease.release();
-        if (self.reserved_rows + requests.len > cfg.max_rows) return error.DecisionLimitExceeded;
+        if (self.reserved_rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
         var estimated = self.estimated_input_tokens;
         for (requests) |request| {
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
@@ -262,15 +301,30 @@ pub const Runtime = struct {
         }
         self.estimated_input_tokens = estimated;
         self.reserved_rows += requests.len;
-        const result = try self.generateBatchPartial(a, cfg, requests);
+        const result = try self.generateBatchPartial(a, cfg, requests, cfg.max_input_tokens - self.input_tokens);
         self.rows += requests.len;
         self.input_tokens +|= result.input_tokens;
         self.output_tokens +|= result.output_tokens;
         self.batches +|= result.calls;
-        if (self.input_tokens > cfg.max_input_tokens) return error.DecisionLimitExceeded;
+        try checkpoint(self);
+        if (self.input_tokens > cfg.max_input_tokens)
+            _ = try failedPartial(.{ .values = result.values, .failures = result.failures }, error.DecisionLimitExceeded, true);
         return result;
     }
-    fn generateBatchPartial(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request) !GeneratedBatch {
+    const GeneratedMeter = struct {
+        items: []Usage,
+        fn record(ptr: *anyopaque, inputs: []const @import("antfly_structured").Item, usage: @import("antfly_structured").Usage) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (inputs, 0..) |input, position| {
+                const item = &self.items[input.id];
+                item.input_tokens +|= usage.input_tokens / inputs.len + @intFromBool(position < usage.input_tokens % inputs.len);
+                item.output_tokens +|= usage.output_tokens / inputs.len + @intFromBool(position < usage.output_tokens % inputs.len);
+                item.estimated = item.estimated or inputs.len > 1;
+            }
+        }
+    };
+
+    fn generateBatchPartial(self: *Runtime, a: std.mem.Allocator, cfg: decisions.DeciderConfig, requests: []const decisions.Request, remaining_input_tokens: u64) !GeneratedBatch {
         const source_table = if (requests[0].source_table.len > 0) requests[0].source_table else self.source_table;
         const resolved = try self.resolveGenerator(requests[0].decider, source_table);
         var engine = self.constrainedRuntime(&resolved.cache);
@@ -297,22 +351,29 @@ pub const Runtime = struct {
         @memset(responses, null);
         var validation = GeneratedValidation{ .cfg = cfg, .requests = requests, .responses = responses };
         engine.semantic_validation = .{ .ptr = &validation, .validate = GeneratedValidation.validate };
+        const item_usage = try a.alloc(Usage, requests.len);
+        @memset(item_usage, .{});
+        var meter = GeneratedMeter{ .items = item_usage };
+        engine.input_token_limit = remaining_input_tokens;
+        engine.invocation_usage = .{ .ptr = &meter, .record = GeneratedMeter.record };
         const result = try engine.executeEvidence(a, generator, mode, try generated.questionSchema(a, requests[0].questions), cfg.instructions, batch, inputs);
         for (responses) |*response| if (response.*) |*value| {
             if (caps.model_revision) |revision| try value.object.put(a, "model_revision", .{ .string = try a.dupe(u8, revision) });
         };
-        // Charge all attempts once, including attempts for invalid items.
-        for (responses) |*response| if (response.*) |*value| {
+        // Attribute each physical call (including repair/failed attempts) to
+        // its actual inputs. Unsubmitted inputs retain zero usage.
+        for (responses, item_usage) |*response, cost| if (response.*) |*value| {
             const usage = value.object.getPtr("usage").?;
-            try usage.object.put(a, "input_tokens", .{ .integer = @intCast(result.input_tokens) });
-            try usage.object.put(a, "output_tokens", .{ .integer = @intCast(result.output_tokens) });
-            break;
+            try usage.object.put(a, "input_tokens", .{ .integer = std.math.cast(i64, cost.input_tokens) orelse return error.InvalidDecisionOutput });
+            try usage.object.put(a, "output_tokens", .{ .integer = std.math.cast(i64, cost.output_tokens) orelse return error.InvalidDecisionOutput });
+            if (cost.estimated) try usage.object.put(a, "estimated", .{ .bool = true });
         };
-        return .{ .values = responses, .failures = result.failures, .input_tokens = result.input_tokens, .output_tokens = result.output_tokens, .calls = result.calls, .execution = result.execution };
+        return .{ .values = responses, .failures = result.failures, .item_usage = item_usage, .input_tokens = result.input_tokens, .output_tokens = result.output_tokens, .calls = result.calls, .execution = result.execution };
     }
     pub const GeneratedBatch = struct {
         values: []?decisions.Json,
         failures: []?anyerror,
+        item_usage: []const Usage,
         input_tokens: u64,
         output_tokens: u64,
         calls: usize,
@@ -356,7 +417,7 @@ pub const Runtime = struct {
             const a = self.arena.allocator();
             const cfg = self.cfg;
             if (cfg.decision_method == .generated) {
-                const result = try self.runtime.generateBatchPartial(a, cfg, &.{self.request});
+                const result = try self.runtime.generateBatchPartial(a, cfg, &.{self.request}, cfg.max_input_tokens -| self.runtime.input_tokens);
                 self.usage = .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens };
                 return result.values[0] orelse return result.failures[0] orelse error.InvalidDecisionOutput;
             }
@@ -468,7 +529,20 @@ pub const Runtime = struct {
     pub const PartialBatch = struct {
         values: []?decisions.Json,
         failures: []?anyerror,
+        /// Measured per-item usage survives transport, normalization and
+        /// post-call budget failures. Unsubmitted items have zero usage.
+        item_usage: ?[]const Usage = null,
     };
+    /// A post-call batch failure invalidates its answers, not its accounting.
+    /// Partial callers (including cascades) receive metered failed outcomes;
+    /// strict callers retain the ordinary error contract.
+    fn failedPartial(result: PartialBatch, err: anyerror, preserve_failures: bool) !PartialBatch {
+        if (!preserve_failures or fatalItemFailure(err)) return err;
+        @memset(result.values, null);
+        @memset(result.failures, err);
+        return result;
+    }
+
     pub fn evaluatePartial(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request) !PartialBatch {
         try self.provider().validateRequests(a, requests);
         return self.evaluateCore(a, requests, true);
@@ -480,7 +554,29 @@ pub const Runtime = struct {
         for (result.values, result.failures, out) |value, failure, *target| target.* = value orelse return failure orelse error.InvalidDecisionOutput;
         return out;
     }
-    fn evaluateCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) !PartialBatch {
+    fn evaluateCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) anyerror!PartialBatch {
+        // Cascades dispatch before admission: their stages re-enter here as
+        // ordinary deciders and take their own leases and quotas.
+        for (requests) |request| {
+            if ((try self.registry.getDeciderConfig(request.decider)).decision_method == .cascade) return self.evaluateWithCascades(a, requests, preserve_failures);
+        }
+        if (requests.len > 0 and registry_mod.Registry.isCascadeStageName(requests[0].decider)) {
+            // Only the cascade runner submits internal stages, one stage at a
+            // time. Keep model caches and aggregate statistics shared while
+            // applying the stage's own cumulative row/token allowance.
+            const name = requests[0].decider;
+            const entry = try self.stage_budgets.getOrPut(self.resolution_allocator, name);
+            if (!entry.found_existing) {
+                errdefer _ = self.stage_budgets.remove(name);
+                entry.key_ptr.* = try self.resolution_allocator.dupe(u8, name);
+                entry.value_ptr.* = .{};
+            }
+            return self.evaluateOrdinaryCore(a, requests, preserve_failures, entry.value_ptr);
+        }
+        return self.evaluateOrdinaryCore(a, requests, preserve_failures, null);
+    }
+
+    fn evaluateOrdinaryCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool, stage_budget: ?*StageBudget) !PartialBatch {
         const ptr: *anyopaque = self;
         const started = std.Io.Clock.awake.now(self.io).nanoseconds;
         defer self.latency_ns +|= @intCast(@max(0, std.Io.Clock.awake.now(self.io).nanoseconds - started));
@@ -490,12 +586,16 @@ pub const Runtime = struct {
         @memset(out, null);
         const failures = try a.alloc(?anyerror, requests.len);
         @memset(failures, null);
+        // Ordinary deciders retain their statement-wide limits. Internal
+        // stages use a persistent ledger without changing public statistics.
+        var statement_budget = StageBudget{ .reserved_rows = self.reserved_rows, .input_tokens = self.input_tokens, .estimated_input_tokens = self.estimated_input_tokens };
+        const budget = stage_budget orelse &statement_budget;
         var batch_size: usize = 32;
-        var estimated = self.estimated_input_tokens;
+        var estimated = budget.estimated_input_tokens;
         for (requests) |request| {
             const cfg = try self.registry.getDeciderConfig(request.decider);
             if (cfg.decision_method == .generated) _ = try self.resolveGenerator(request.decider, if (request.source_table.len > 0) request.source_table else self.source_table);
-            if (self.reserved_rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
+            if (budget.reserved_rows + requests.len > cfg.max_rows or budget.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
             // Reserve text bytes plus the configured visual token bound before
             // any I/O. The shared quota uses this same estimate and actual usage.
@@ -509,7 +609,9 @@ pub const Runtime = struct {
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
             batch_size = @min(batch_size, cfg.batch_size);
         }
-        self.estimated_input_tokens = estimated;
+        self.estimated_input_tokens +|= estimated - budget.estimated_input_tokens;
+        budget.estimated_input_tokens = estimated;
+        budget.reserved_rows += requests.len;
         self.reserved_rows += requests.len;
         if (requests.len > 0) {
             const first = try self.registry.getDeciderConfig(requests[0].decider);
@@ -524,6 +626,7 @@ pub const Runtime = struct {
             if (compatible and first.embedder != null) {
                 const partial = try @import("embedding_decisions.zig").batchPartial(a, self, first, requests);
                 self.input_tokens +|= partial.input_tokens;
+                budget.input_tokens +|= partial.input_tokens;
                 self.batches += 1;
                 for (partial.values, partial.failures, out, failures, requests) |value, failure, *dest, *failed, request| {
                     if (value) |response| {
@@ -539,12 +642,15 @@ pub const Runtime = struct {
                 return .{ .values = out, .failures = failures };
             }
             if (compatible) {
-                const partial = try self.generateBatchPartial(a, first, requests);
+                const partial = try self.generateBatchPartial(a, first, requests, first.max_input_tokens - budget.input_tokens);
                 self.rows += requests.len;
                 self.input_tokens +|= partial.input_tokens;
+                budget.input_tokens +|= partial.input_tokens;
                 self.output_tokens +|= partial.output_tokens;
                 self.batches +|= partial.calls;
-                if (self.input_tokens > first.max_input_tokens) return error.DecisionLimitExceeded;
+                try checkpoint(ptr);
+                if (budget.input_tokens > first.max_input_tokens)
+                    return failedPartial(.{ .values = out, .failures = failures, .item_usage = partial.item_usage }, error.DecisionLimitExceeded, preserve_failures);
                 for (partial.values, partial.failures, out, failures, requests) |value, failure, *response, *failed, request| {
                     if (value) |valid| {
                         response.* = valid;
@@ -555,20 +661,31 @@ pub const Runtime = struct {
                         failed.* = err;
                     }
                 }
-                return .{ .values = out, .failures = failures };
+                return .{ .values = out, .failures = failures, .item_usage = partial.item_usage };
             }
         }
 
+        const item_usage = try a.alloc(Usage, requests.len);
+        @memset(item_usage, .{});
         var begin: usize = 0;
         while (begin < requests.len) {
             try checkpoint(ptr);
             const end = @min(begin + batch_size, requests.len);
+            for (requests[begin..end]) |request| {
+                if (budget.input_tokens >= (try self.registry.getDeciderConfig(request.decider)).max_input_tokens) {
+                    if (!preserve_failures) return error.DecisionLimitExceeded;
+                    @memset(failures[begin..], error.DecisionLimitExceeded);
+                    return .{ .values = out, .failures = failures, .item_usage = item_usage };
+                }
+            }
             const jobs = try a.alloc(Job, end - begin);
             defer a.free(jobs);
             var initialized: usize = 0;
             defer for (jobs[0..initialized]) |*job| job.arena.deinit();
             var group = std.Io.Group.init;
             defer group.cancel(self.io);
+            var dispatch_failure: ?anyerror = null;
+            var submitted: usize = 0;
             for (jobs, requests[begin..end]) |*job, request| {
                 job.* = .{ .runtime = self, .request = request, .cfg = try self.registry.getDeciderConfig(request.decider), .arena = undefined, .budget = .{ .backing = std.heap.smp_allocator, .limit = 8 * 1024 * 1024 } };
                 job.arena = std.heap.ArenaAllocator.init(job.budget.allocator());
@@ -576,16 +693,44 @@ pub const Runtime = struct {
                 // A single decision already runs on its caller's execution
                 // lane. Requiring another worker can reject otherwise valid
                 // concurrent queries on a bounded backend IO runtime.
-                if (jobs.len == 1) job.run() else try group.concurrent(self.io, Job.run, .{job});
+                if (jobs.len == 1) job.run() else group.concurrent(self.io, Job.run, .{job}) catch |err| {
+                    dispatch_failure = err;
+                    break;
+                };
+                submitted += 1;
             }
-            try group.await(self.io);
-            self.batches += 1;
-            try checkpoint(ptr);
-            for (jobs, out[begin..end], failures[begin..end]) |*job, *value, *failure| {
+            // Drain even a partially submitted batch before reading results.
+            // Refusal/cancellation cannot discard usage from completed calls.
+            if (dispatch_failure != null) group.cancel(self.io) else group.await(self.io) catch |err| {
+                dispatch_failure = err;
+            };
+            self.batches += @intFromBool(submitted > 0);
+            var limit_exceeded = false;
+            var fatal_failure: ?anyerror = null;
+            for (jobs[0..initialized], item_usage[begin..][0..initialized]) |*job, *measured| {
                 const usage = if (job.response) |response| reportedUsage(response) orelse job.usage else job.usage;
+                measured.* = usage;
                 self.input_tokens +|= usage.input_tokens;
+                budget.input_tokens +|= usage.input_tokens;
                 self.output_tokens +|= usage.output_tokens;
-                if (self.input_tokens > job.cfg.max_input_tokens) return error.DecisionLimitExceeded;
+                limit_exceeded = limit_exceeded or budget.input_tokens > job.cfg.max_input_tokens;
+                if (job.failure) |err| if (fatalItemFailure(err)) {
+                    // Submission refusal cancels siblings only to drain them;
+                    // the refusal remains the batch cause. Caller cancellation
+                    // is checked independently below and remains fatal.
+                    const cleanup_cancellation = dispatch_failure != null and (err == error.Canceled or err == error.Cancelled);
+                    if (!cleanup_cancellation and fatal_failure == null) fatal_failure = err;
+                };
+            }
+            // Account every completed sibling before any failure or budget
+            // decision. Never submit another window once a limit is exceeded.
+            if (fatal_failure) |err| return err;
+            if (dispatch_failure) |err|
+                return failedPartial(.{ .values = out, .failures = failures, .item_usage = item_usage }, err, preserve_failures);
+            try checkpoint(ptr);
+            if (limit_exceeded)
+                return failedPartial(.{ .values = out, .failures = failures, .item_usage = item_usage }, error.DecisionLimitExceeded, preserve_failures);
+            for (jobs, out[begin..end], failures[begin..end]) |*job, *value, *failure| {
                 if (job.failure) |err| {
                     if (!preserve_failures or fatalItemFailure(err)) return err;
                     failure.* = err;
@@ -602,8 +747,119 @@ pub const Runtime = struct {
             }
             begin = end;
         }
+        return .{ .values = out, .failures = failures, .item_usage = item_usage };
+    }
+    fn evaluateWithCascades(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) !PartialBatch {
+        const out = try a.alloc(?decisions.Json, requests.len);
+        @memset(out, null);
+        const failures = try a.alloc(?anyerror, requests.len);
+        @memset(failures, null);
+        const is_cascade = try a.alloc(bool, requests.len);
+        defer a.free(is_cascade);
+        var plain: std.ArrayList(usize) = .empty;
+        defer plain.deinit(a);
+        for (requests, is_cascade, 0..) |request, *flag, index| {
+            flag.* = (try self.registry.getDeciderConfig(request.decider)).decision_method == .cascade;
+            if (!flag.*) try plain.append(a, index);
+        }
+        if (plain.items.len > 0) {
+            const subset = try a.alloc(decisions.Request, plain.items.len);
+            for (plain.items, subset) |index, *request| request.* = requests[index];
+            const partial = try self.evaluateCore(a, subset, preserve_failures);
+            for (plain.items, partial.values, partial.failures) |index, value, failure| {
+                out[index] = value;
+                failures[index] = failure;
+            }
+        }
+        // Serialize each schema once and hash the routing tuple. All grouping
+        // scratch is released before returning, independently of result storage.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const groups = try cascadeGroups(scratch.allocator(), requests, is_cascade);
+        for (groups) |group| {
+            const outcome = try self.runCascade(a, requests, group.items);
+            for (group.items, outcome.values, outcome.failures) |index, value, failure| {
+                out[index] = value;
+                if (value == null) {
+                    const err = failure orelse error.InvalidDecisionOutput;
+                    if (!preserve_failures or fatalItemFailure(err)) return err;
+                    failures[index] = err;
+                }
+            }
+        }
         return .{ .values = out, .failures = failures };
     }
+
+    fn cascadeGroups(a: std.mem.Allocator, requests: []const decisions.Request, is_cascade: []const bool) ![]std.ArrayList(usize) {
+        var by_key: std.StringHashMapUnmanaged(usize) = .empty;
+        defer by_key.deinit(a);
+        var groups: std.ArrayList(std.ArrayList(usize)) = .empty;
+        for (requests, is_cascade, 0..) |request, cascade, index| {
+            if (!cascade) continue;
+            const key = try std.json.Stringify.valueAlloc(a, .{ request.decider, request.source_table, request.questions }, .{});
+            const entry = try by_key.getOrPut(a, key);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = groups.items.len;
+                try groups.append(a, .empty);
+            } else a.free(key);
+            try groups.items[entry.value_ptr.*].append(a, index);
+        }
+        return groups.toOwnedSlice(a);
+    }
+
+    const CascadeRunner = struct {
+        runtime: *Runtime,
+        cascade: []const u8,
+        requests: []const decisions.Request,
+        group: []const usize,
+
+        fn run(ptr: *anyopaque, a: std.mem.Allocator, _: usize, stage: decisions.cascade_contract.Stage, indices: []const usize) anyerror!decisions.cascade_contract.StageResult {
+            const self: *CascadeRunner = @ptrCast(@alignCast(ptr));
+            const stage_name = try registry_mod.Registry.cascadeStageName(a, self.cascade, stage.name);
+            const first = self.requests[self.group[indices[0]]];
+            // Discovery and dynamic schema checks run under the cascade's
+            // bounded context and its explicit failure policy.
+            try validate(self.runtime, stage_name, first.questions, first.source_table);
+            const stage_requests = try a.alloc(decisions.Request, indices.len);
+            for (indices, stage_requests) |index, *request| {
+                request.* = self.requests[self.group[index]];
+                request.decider = stage_name;
+            }
+            const partial = try self.runtime.evaluateCore(a, stage_requests, true);
+            const usage = if (partial.item_usage) |measured| blk: {
+                const items = try a.alloc(decisions.Json, measured.len);
+                for (measured, items) |cost, *item| {
+                    item.* = decisions.jsonObject();
+                    try decisions.put(a, item, "input_tokens", .{ .integer = std.math.cast(i64, cost.input_tokens) orelse return error.InvalidDecisionOutput });
+                    try decisions.put(a, item, "output_tokens", .{ .integer = std.math.cast(i64, cost.output_tokens) orelse return error.InvalidDecisionOutput });
+                    if (cost.estimated) try decisions.put(a, item, "estimated", .{ .bool = true });
+                }
+                break :blk items;
+            } else null;
+            return .{ .values = partial.values, .failures = partial.failures, .item_usage = usage };
+        }
+        fn checkpoint(ptr: *anyopaque) anyerror!void {
+            const self: *CascadeRunner = @ptrCast(@alignCast(ptr));
+            try Runtime.checkpoint(self.runtime);
+        }
+    };
+
+    fn runCascade(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, group: []const usize) !decisions.cascade_contract.Outcome {
+        const name = requests[group[0]].decider;
+        const definition = &(try self.registry.getCascade(name)).definition;
+        // The cascade deadline narrows, never extends, the caller's deadline.
+        const saved = self.context;
+        defer self.context = saved;
+        if (definition.budget.deadline_ms) |ms| {
+            const deadline = @import("antfly_platform").time.monotonicNs() +| ms * std.time.ns_per_ms;
+            var bounded = saved orelse execution.RequestContext{ .io = self.io, .deadline_ns = null };
+            bounded.deadline_ns = if (bounded.deadline_ns) |existing| @min(existing, deadline) else deadline;
+            self.context = bounded;
+        }
+        var runner = CascadeRunner{ .runtime = self, .cascade = name, .requests = requests, .group = group };
+        return decisions.cascade_contract.execute(a, definition, name, group.len, .{ .ptr = &runner, .run = CascadeRunner.run, .checkpoint = CascadeRunner.checkpoint });
+    }
+
     fn normalizeJob(_: *Runtime, a: std.mem.Allocator, job: *const Job) !decisions.Json {
         if (job.cfg.model_identity) |expected| {
             const root = try decisions.object(job.response.?);
@@ -2405,4 +2661,720 @@ test "decision provider asset transport enforces default request timeout without
     defer group.cancel(io);
     try group.concurrent(io, Fixture.serve, .{&server});
     try std.testing.expectError(error.Timeout, owned.http.get(url, .{}));
+}
+
+test "decision provider cascades escalate only in-band items through registered stages" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    const config = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"decision_method":"cascade","cascade":{"stages":[
+        \\  {"name":"fast","decider":{"provider":"antfly","model":"fast-model"}},
+        \\  {"name":"strong","decider":{"provider":"antfly","model":"strong-model","max_rows":1},
+        \\   "when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}],
+        \\ "budget":{"max_model_calls":2,"deadline_ms":60000}}}
+    , .{});
+    var cfg = try decisions.parseConfig(a, config);
+    defer cfg.deinit(a);
+    try registry.registerDeciderConfig("same-entity", cfg);
+    // Stages are ordinary registry entries, hidden behind their cascade.
+    try std.testing.expectEqualStrings("strong-model", (try registry.getDeciderConfig("same-entity#strong")).model);
+    try std.testing.expectEqualStrings("same-entity", registry.default_decider.?);
+    try std.testing.expectError(error.InvalidDeciderConfig, registry.registerDeciderConfig("bad#name", .{ .model = "m" }));
+
+    const Fake = struct {
+        var fast_calls = std.atomic.Value(usize).init(0);
+        var strong_calls = std.atomic.Value(usize).init(0);
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn extract(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_extracting").Request) !@import("antfly_extracting").Response {
+            return error.TestUnexpectedResult;
+        }
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?managed.RequestContext) ![]u8 {
+            const parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            const model = parsed.value.object.get("model").?.string;
+            const input = parsed.value.object.get("input").?.string;
+            const strong = std.mem.eql(u8, model, "strong-model");
+            _ = if (strong) strong_calls.fetchAdd(1, .monotonic) else fast_calls.fetchAdd(1, .monotonic);
+            // The fast stage is confident on "sure"/"no" and uncertain on "unsure".
+            const p: f64 = if (strong) 0.03 else if (std.mem.eql(u8, input, "sure")) 0.97 else if (std.mem.eql(u8, input, "no")) 0.02 else 0.6;
+            return std.fmt.allocPrint(alloc,
+                \\{{"model":"{s}","answers":[{{"name":"same","type":"choice","decision_method":"typed","choice":"{s}","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}],"usage":{{"input_tokens":5,"output_tokens":0}}}}
+            , .{ model, if (p >= 0.5) "same" else "different", p, 1 - p });
+        }
+    };
+    var token: u8 = 0;
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io, .antfly_provider = .{
+        .ptr = &token,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Fake.dense,
+        .embed_sparse_texts = Fake.sparse,
+        .extract = Fake.extract,
+        .decide_json = Fake.decide,
+    } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
+    , .{});
+    try std.testing.expectError(error.UnknownDecider, runtime.provider().validate("same-entity#fast", questions));
+    const wrong_question = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"typo":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
+    , .{});
+    try std.testing.expectError(error.InvalidDecisionCascade, runtime.provider().validate("same-entity", wrong_question));
+    try std.testing.expectEqual(@as(usize, 0), Fake.fast_calls.load(.monotonic));
+    const requests = [_]decisions.Request{
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "sure" } },
+        .{ .decider = "deciders/same-entity", .questions = questions, .input = .{ .text = "unsure" } },
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "no" } },
+    };
+    // Namespaced and bare names are distinct groups but share one definition.
+    const results = try runtime.provider().evaluateBatch(scratch, &requests);
+    try std.testing.expectEqual(@as(usize, 3), Fake.fast_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), Fake.strong_calls.load(.monotonic));
+    const choice = struct {
+        fn of(value: decisions.Json) []const u8 {
+            return value.object.get("answers").?.array.items[0].object.get("choice").?.string;
+        }
+    }.of;
+    try std.testing.expectEqualStrings("same", choice(results[0]));
+    try std.testing.expectEqualStrings("different", choice(results[1]));
+    try std.testing.expectEqualStrings("different", choice(results[2]));
+    const trace = results[1].object.get("cascade").?.object;
+    try std.testing.expectEqualStrings("strong", trace.get("answered_by").?.string);
+    try std.testing.expectEqual(@as(usize, 2), trace.get("stages").?.array.items.len);
+    try std.testing.expectEqualStrings("strong-model", results[1].object.get("model").?.string);
+    try std.testing.expectEqual(@as(i64, 10), results[1].object.get("usage").?.object.get("input_tokens").?.integer);
+    try std.testing.expectEqualStrings("fast", results[0].object.get("cascade").?.object.get("answered_by").?.string);
+    try std.testing.expectEqual(@as(u64, 20), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 4), runtime.reserved_rows);
+    // The allowance persists across groups and repeated evaluations, while
+    // completed fast-stage siblings remain available in partial batches.
+    const exhausted = try runtime.evaluatePartial(scratch, &.{
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "sure" } },
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "unsure" } },
+    });
+    try std.testing.expect(exhausted.values[0] != null);
+    try std.testing.expect(exhausted.values[1] == null);
+    try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), exhausted.failures[1]);
+    try std.testing.expectEqual(@as(usize, 1), Fake.strong_calls.load(.monotonic));
+
+    // Bands need probabilities: score questions are rejected before any call.
+    const score = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"urgency":{"type":"score","instructions":"How urgent?","criteria":["low","high"]}}
+    , .{});
+    try std.testing.expectError(error.UnsupportedDecisionKind, runtime.provider().evaluateBatch(scratch, &.{.{ .decider = "same-entity", .questions = score, .input = .{ .text = "sure" } }}));
+    try std.testing.expectEqual(@as(usize, 5), Fake.fast_calls.load(.monotonic));
+}
+
+test "decision provider cascade grouping uses bounded linear schema storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 512;
+    const requests = try a.alloc(decisions.Request, count);
+    const flags = try a.alloc(bool, count);
+    @memset(flags, true);
+    for (requests, 0..) |*request, i| {
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, a, try std.fmt.allocPrint(a,
+            \\{{"q":{{"type":"noul","instructions":"Unique predicate {d}"}}}}
+        , .{i}), .{});
+        request.* = .{ .decider = "cascade", .questions = questions, .input = .{ .text = "text" } };
+    }
+    var memory: [512 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    const groups = try Runtime.cascadeGroups(fixed.allocator(), requests, flags);
+    try std.testing.expectEqual(@as(usize, count), groups.len);
+    for (groups, 0..) |group, i| try std.testing.expectEqual(i, group.items[0]);
+}
+
+test "decision provider cascade discovery is lazy bounded and covered by keep_previous" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = try registry_mod.Registry.parseFromSlice(a,
+        \\{"deciders":{"c":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"strong"},"probabilities":"verdict_only"},"on_failure":"keep_previous","when":{"probability_between":[0.3,0.9]}}],"budget":{"deadline_ms":100}}}}}
+    );
+    defer registry.deinit();
+    const Fake = struct {
+        uncertain: bool,
+        delay: bool,
+        discoveries: usize = 0,
+        fn generate(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?execution.RequestContext) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn caps(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_inference_work").Task, ctx: execution.RequestContext) !@import("antfly_inference_work").InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.discoveries += 1;
+            try std.testing.expect(ctx.deadline_ns != null);
+            if (self.delay) {
+                try std.Io.sleep(ctx.io, .fromMilliseconds(120), .awake);
+                try ctx.check();
+            }
+            return error.DecisionUpstreamFailure;
+        }
+        fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return std.fmt.allocPrint(alloc,
+                \\{{"model":"fast","answers":[{{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}],"usage":{{"input_tokens":2,"output_tokens":0}}}}
+            , .{ @as(f64, if (self.uncertain) 0.6 else 0.99), @as(f64, if (self.uncertain) 0.4 else 0.01) });
+        }
+    };
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    for (0..3) |scenario| {
+        var fake = Fake{ .uncertain = scenario > 0, .delay = scenario == 2 };
+        const caller_deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+        var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = std.testing.io, .context = .{ .io = std.testing.io, .deadline_ns = caller_deadline }, .antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate, .decide_json = Fake.decide, .model_capabilities_with_context = Fake.caps } };
+        defer runtime.deinit();
+        const requests = [_]decisions.Request{.{ .decider = "c", .questions = questions, .input = .{ .text = "text" } }};
+        if (scenario == 2) {
+            try std.testing.expectError(error.Timeout, runtime.evaluatePartial(scratch, &requests));
+        } else {
+            const result = try runtime.evaluatePartial(scratch, &requests);
+            const trace = result.values[0].?.object.get("cascade").?.object;
+            try std.testing.expectEqualStrings("fast", trace.get("answered_by").?.string);
+            try std.testing.expectEqual(@as(usize, if (scenario == 0) 1 else 2), trace.get("stages").?.array.items.len);
+        }
+        try std.testing.expectEqual(@as(usize, if (scenario == 0) 0 else 1), fake.discoveries);
+        try std.testing.expectEqual(caller_deadline, runtime.context.?.deadline_ns.?);
+    }
+}
+
+test "decision provider cascade large definitions validate from their registered plan" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    const prompt = try scratch.alloc(u8, 60000);
+    @memset(prompt, 'x');
+    const body = try std.fmt.allocPrint(scratch,
+        \\{{"decision_method":"cascade","cascade":{{"stages":[{{"name":"fast","decider":{{"model":"fast"}}}},{{"name":"strong","decider":{{"decision_method":"generated","instructions":"{s}","generator":{{"provider":"openai","model":"gpt-4.1"}}}},"when":{{"probability_between":[0.3,0.9]}}}}]}}}}
+    , .{prompt});
+    var cfg = try decisions.parseConfig(a, try std.json.parseFromSliceLeaky(decisions.Json, scratch, body, .{}));
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    registry.registerDeciderConfig("c", cfg) catch |err| {
+        cfg.deinit(a);
+        return err;
+    };
+    cfg.deinit(a);
+    const compiled = try registry.getCascade("c");
+    const digest = compiled.definition.sha256;
+    var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = std.testing.io };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const requests = try scratch.alloc(decisions.Request, 512);
+    for (requests) |*request| request.* = .{ .decider = "c", .questions = questions, .input = .{ .text = "text" } };
+    const started = @import("antfly_platform").time.monotonicNs();
+    try runtime.provider().validateRequests(scratch, requests);
+    std.debug.print("CASCADE_VALIDATION prompt_bytes=60000 rows=512 validation_ms={d}\n", .{(@import("antfly_platform").time.monotonicNs() - started) / std.time.ns_per_ms});
+    try std.testing.expectEqual(@as(usize, 0), runtime.resolved_generators.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.compiled_cascades.count());
+    try std.testing.expectEqualStrings(&digest, &(try registry.getCascade("deciders/c")).definition.sha256);
+}
+
+test "decision provider cascade configs reject transport fields and invalid stages" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const invalid = [_][]const u8{
+        // a cascade owns no transport
+        \\{"decision_method":"cascade","model":"m","cascade":{"stages":[{"name":"a","decider":{"model":"x"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+        ,
+        // cascade body without the method
+        \\{"model":"m","cascade":{"stages":[]}}
+        ,
+        // stage configs are validated as complete deciders
+        \\{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"provider":"antfly"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+        ,
+        // no similarity stages
+        \\{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"decision_method":"embedding_similarity","model":"e"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+        ,
+        // missing definition
+        \\{"decision_method":"cascade"}
+        ,
+        // Row/token/batch limits belong to stages and cannot be ignored here.
+        \\{"decision_method":"cascade","max_rows":1,"cascade":{"stages":[{"name":"a","decider":{"model":"x"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+        ,
+    };
+    for (invalid) |bytes| {
+        const value = try std.json.parseFromSliceLeaky(decisions.Json, scratch, bytes, .{});
+        try std.testing.expectError(error.InvalidDeciderConfig, decisions.parseConfig(a, value));
+    }
+    // Owned copies survive the source and free cleanly.
+    const value = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"model":"x"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+    , .{});
+    var cfg = try decisions.parseConfig(a, value);
+    var copy = try cfg.clone(a);
+    cfg.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), copy.cascade.?.object.get("stages").?.array.items.len);
+    try std.testing.expect(!copy.resolvedCapabilities().images);
+    try std.testing.expect(copy.resolvedCapabilities().cascade);
+    copy.deinit(a);
+}
+
+test "decision provider documented Anthropic cascade uses verdict_only probabilities" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const body =
+        \\{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","model":"jev-latest"}},{"name":"strong","decider":{"decision_method":"generated","probabilities":"verdict_only","generator":{"provider":"anthropic","model":"claude-opus-5-5"}},"when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}]}}
+    ;
+    var cfg = try decisions.parseConfig(a, try std.json.parseFromSliceLeaky(decisions.Json, scratch, body, .{}));
+    defer cfg.deinit(a);
+    const invalid = try std.mem.replaceOwned(u8, scratch, body, "\"probabilities\":\"verdict_only\",", "");
+    try std.testing.expectError(error.UnsupportedConstrainedProbabilities, decisions.parseConfig(a, try std.json.parseFromSliceLeaky(decisions.Json, scratch, invalid, .{})));
+}
+
+test "decision provider cascade retains measured failed typed usage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    const config = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"decision_method":"cascade","cascade":{"stages":[
+        \\  {"name":"fast","decider":{"provider":"antfly","model":"fast-model"}},
+        \\  {"name":"strong","decider":{"provider":"antfly","model":"strong-model","max_rows":10},
+        \\   "on_failure":"keep_previous","when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}],
+        \\ "budget":{"max_model_calls":2,"deadline_ms":60000}}}
+    , .{});
+    var cfg = try decisions.parseConfig(a, config);
+    defer cfg.deinit(a);
+    try registry.registerDeciderConfig("same-entity", cfg);
+    // Stages are ordinary registry entries, hidden behind their cascade.
+    try std.testing.expectEqualStrings("strong-model", (try registry.getDeciderConfig("same-entity#strong")).model);
+    try std.testing.expectEqualStrings("same-entity", registry.default_decider.?);
+    try std.testing.expectError(error.InvalidDeciderConfig, registry.registerDeciderConfig("bad#name", .{ .model = "m" }));
+
+    const Fake = struct {
+        var fast_calls = std.atomic.Value(usize).init(0);
+        var strong_calls = std.atomic.Value(usize).init(0);
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn extract(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_extracting").Request) !@import("antfly_extracting").Response {
+            return error.TestUnexpectedResult;
+        }
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?managed.RequestContext) ![]u8 {
+            const parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            const model = parsed.value.object.get("model").?.string;
+            const input = parsed.value.object.get("input").?.string;
+            const strong = std.mem.eql(u8, model, "strong-model");
+            _ = if (strong) strong_calls.fetchAdd(1, .monotonic) else fast_calls.fetchAdd(1, .monotonic);
+            // The fast stage is confident on "sure"/"no" and uncertain on "unsure".
+            const p: f64 = if (strong) 1.5 else if (std.mem.eql(u8, input, "sure")) 0.97 else if (std.mem.eql(u8, input, "no")) 0.02 else 0.6;
+            return std.fmt.allocPrint(alloc,
+                \\{{"model":"{s}","answers":[{{"name":"same","type":"choice","decision_method":"typed","choice":"{s}","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}],"usage":{{"input_tokens":5,"output_tokens":0}}}}
+            , .{ model, if (p >= 0.5) "same" else "different", p, 1 - p });
+        }
+    };
+    var token: u8 = 0;
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io, .antfly_provider = .{
+        .ptr = &token,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Fake.dense,
+        .embed_sparse_texts = Fake.sparse,
+        .extract = Fake.extract,
+        .decide_json = Fake.decide,
+    } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
+    , .{});
+    try std.testing.expectError(error.UnknownDecider, runtime.provider().validate("same-entity#fast", questions));
+    const wrong_question = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"typo":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
+    , .{});
+    try std.testing.expectError(error.InvalidDecisionCascade, runtime.provider().validate("same-entity", wrong_question));
+    try std.testing.expectEqual(@as(usize, 0), Fake.fast_calls.load(.monotonic));
+    const requests = [_]decisions.Request{
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "sure" } },
+        .{ .decider = "deciders/same-entity", .questions = questions, .input = .{ .text = "unsure" } },
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "no" } },
+    };
+    // Namespaced and bare names are distinct groups but share one definition.
+    const results = try runtime.provider().evaluateBatch(scratch, &requests);
+    const retained = results[1];
+    try std.testing.expectEqual(@as(i64, 10), retained.object.get("usage").?.object.get("input_tokens").?.integer);
+    try std.testing.expectEqual(@as(u64, 20), runtime.input_tokens);
+    const stages = retained.object.get("cascade").?.object.get("stages").?.array.items;
+    try std.testing.expectEqualStrings("fast", retained.object.get("cascade").?.object.get("answered_by").?.string);
+    try std.testing.expectEqual(@as(i64, 5), stages[1].object.get("usage").?.object.get("input_tokens").?.integer);
+    try std.testing.expectEqualStrings("InvalidDecisionOutput", stages[1].object.get("error").?.string);
+    try std.testing.expect(!stages[1].object.get("usage").?.object.contains("estimated"));
+    _ = try decisions.cascade_contract.validateTrace(&(try registry.getCascade("same-entity")).definition, retained);
+}
+
+test "decision provider cascade enrichment fences legacy readers including grouped sources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const producer =
+        \\{"type":"decision","config":{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev"}},{"name":"strong","decider":{"provider":"jev"},"when":{"probability_between":[0.3,0.9]}}]}},"questions":[{"name":"same","type":"choice","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]}]}}
+    ;
+    const validation = @import("../storage/db/enrichment/config_validation.zig");
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    var cfg = @import("../storage/db/catalog/enrichment_catalog.zig").EnrichmentConfig{ .name = "cascade", .kind = .asset, .source_field = "text", .producer_json = producer };
+    try std.testing.expectEqual(catalog.decider_cascade_reader_version, try validation.requiredReaderVersion(a, cfg));
+    cfg.group_source_json = "{}";
+    try std.testing.expectEqual(catalog.decider_cascade_reader_version, try validation.requiredReaderVersion(a, cfg));
+    cfg.group_source_json = "";
+    cfg.prior_context_json = "{}";
+    try std.testing.expectEqual(catalog.decider_cascade_reader_version, try validation.requiredReaderVersion(a, cfg));
+}
+
+test "decision provider cascade enrichment publication and reopen preserve reader fence" {
+    const a = std.testing.allocator;
+    const producer =
+        \\{"type":"decision","config":{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev"}},{"name":"strong","decider":{"provider":"jev"},"when":{"probability_between":[0.3,0.9]}}]}},"questions":[{"name":"same","type":"choice","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]}]}}
+    ;
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    const indexes = @import("../storage/db/catalog/index_manager.zig");
+    const docstore = @import("../storage/docstore.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try indexes.IndexManager.init(a, path);
+        defer manager.deinit();
+        try manager.addEnrichment(&store, .{ .name = "cascade", .kind = .asset, .field = "text", .content_type = "application/json", .producer_json = producer });
+        try std.testing.expectEqual(catalog.decider_cascade_reader_version, manager.minimum_reader_version.load(.acquire));
+    }
+    {
+        var store = try docstore.DocStore.open(a, path, .{});
+        defer store.close();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, catalog.decider_cascade_reader_version - 1));
+        try std.testing.expectEqual(catalog.decider_cascade_reader_version, try catalog.readMinimumReaderVersion(&read, catalog.supported_reader_version));
+        var manager = try indexes.IndexManager.init(a, path);
+        defer manager.deinit();
+        try manager.load(&store);
+        try std.testing.expect(manager.getEnrichment(.asset, "cascade") != null);
+        try std.testing.expectEqual(catalog.decider_cascade_reader_version, manager.minimum_reader_version.load(.acquire));
+    }
+}
+
+test "decision provider cascade public image declarations constrain HTTP SQL and expressions" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = try registry_mod.Registry.parseFromSlice(a,
+        \\{"deciders":{"c":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","max_image_input_tokens":100}},{"name":"strong","decider":{"provider":"jev","max_image_input_tokens":100},"when":{"probability_between":[0.3,0.9]}}]}}}}
+    );
+    defer registry.deinit();
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = std.testing.io };
+    defer runtime.deinit();
+    const view = @import("../common/inference_gateway.zig").View{ .providers = &registry };
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const image = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}]
+    , .{}));
+    const text = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":"text"}]
+    , .{}));
+    try std.testing.expect((try registry.getDeciderCapabilities("c")).images);
+    const id = try a.dupe(u8, "deciders/c");
+    try registry.inference_capabilities.put(a, id, .{});
+    const Support = @import("../common/inference_capabilities.zig").Support;
+    for ([_]Support{ .unknown, .unsupported, .supported }) |support| {
+        registry.inference_capabilities.getPtr(id).?.images = support;
+        for ([_][]const u8{ "c", "deciders/c" }) |name| {
+            const caps = try registry.getDeciderCapabilities(name);
+            try std.testing.expectEqual(support == .supported, caps.images);
+            try std.testing.expect(caps.messages);
+            const requests = [_]decisions.Request{.{ .decider = name, .questions = questions, .input = image }};
+            if (support == .supported) {
+                try runtime.provider().validateRequests(scratch, &requests);
+            } else try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().validateRequests(scratch, &requests));
+            try runtime.provider().validateRequests(scratch, &.{.{ .decider = name, .questions = questions, .input = text }});
+        }
+        try std.testing.expectEqual(if (support == .supported) Support.supported else Support.unsupported, view.capabilities(.{ .configured = .{ .task = .decide, .name = "c" } }).images);
+    }
+    // A positive public declaration cannot expand a text-only stage.
+    registry.decider_configs.getPtr("c#fast").?.max_image_input_tokens = null;
+    try std.testing.expect(!(try registry.getDeciderCapabilities("c")).images);
+    try std.testing.expectEqual(@as(u64, 0), runtime.rows);
+}
+
+test "decision provider cascade post-call limits retain every paid cost and stop future windows" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    const Fake = struct {
+        invalid: bool = false,
+        fast_calls: std.atomic.Value(usize) = .init(0),
+        strong_calls: std.atomic.Value(usize) = .init(0),
+        fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            const model = parsed.value.object.get("model").?.string;
+            const strong = std.mem.eql(u8, model, "strong");
+            _ = if (strong) self.strong_calls.fetchAdd(1, .monotonic) else self.fast_calls.fetchAdd(1, .monotonic);
+            const probability: f64 = if (strong) 0.97 else 0.6;
+            return std.fmt.allocPrint(alloc,
+                \\{{"model":"{s}","answers":[{{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}],"usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
+            , .{ model, probability, 1 - probability, @as(u64, if (strong) 1500 else 5), @as(u64, if (strong) 7 else 1) });
+        }
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.strong_calls.fetchAdd(1, .monotonic);
+            const wire = try std.json.parseFromSliceLeaky(decisions.Json, alloc, body, .{});
+            const prompt = try std.json.parseFromSliceLeaky(decisions.Json, alloc, wire.object.get("messages").?.array.items[1].object.get("content").?.string, .{});
+            const inputs = prompt.object.get("items").?.array.items;
+            var rows = decisions.Json{ .array = std.json.Array.init(alloc) };
+            for (inputs) |input| {
+                var value = decisions.jsonObject();
+                try decisions.put(alloc, &value, "same", if (self.invalid) .{ .integer = 1 } else .{ .string = "same" });
+                var row = decisions.jsonObject();
+                try decisions.put(alloc, &row, "item", input.object.get("id").?);
+                try decisions.put(alloc, &row, "value", value);
+                try rows.array.append(row);
+            }
+            var reply = decisions.jsonObject();
+            try decisions.put(alloc, &reply, "items", rows);
+            const content = try std.json.Stringify.valueAlloc(alloc, reply, .{});
+            return std.json.Stringify.valueAlloc(alloc, .{
+                .choices = .{.{ .message = .{ .content = content } }},
+                .usage = .{ .prompt_tokens = if (inputs.len == 3) @as(usize, 4501) else inputs.len * 1500, .completion_tokens = if (inputs.len == 3) @as(usize, 17) else inputs.len * 7 },
+            }, .{});
+        }
+        fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_inference_work").Task) !@import("antfly_inference_work").InferenceCapabilities {
+            return .{ .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true };
+        }
+    };
+    const Case = struct { generated: bool = false, keep_previous: bool = true, batch_size: u16 = 3, budget: u64 = 2000, strict: bool = false, repair: bool = false };
+    for ([_]Case{
+        .{},                                                            .{ .batch_size = 1 },                                    .{ .batch_size = 2 },
+        .{ .keep_previous = false },                                    .{ .keep_previous = false, .strict = true },             .{ .generated = true },
+        .{ .generated = true, .batch_size = 1 },                        .{ .generated = true, .batch_size = 2 },                 .{ .generated = true, .keep_previous = false },
+        .{ .generated = true, .keep_previous = false, .strict = true }, .{ .generated = true, .repair = true },                  .{ .generated = true, .repair = true, .budget = 5000 },
+        .{ .batch_size = 1, .budget = 3000 },                           .{ .generated = true, .batch_size = 1, .budget = 3000 }, .{ .generated = true, .batch_size = 2, .budget = 3000 },
+        .{ .budget = 1 },                                               .{ .generated = true, .budget = 1 },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const strong = if (case.generated) try std.fmt.allocPrint(scratch,
+            \\{{"decision_method":"generated","probabilities":"verdict_only","generator":{{"provider":"antfly","model":"strong"}},"max_input_tokens":{d},"batch_size":{d}}}
+        , .{ case.budget, case.batch_size }) else try std.fmt.allocPrint(scratch,
+            \\{{"model":"strong","max_input_tokens":{d},"batch_size":{d}}}
+        , .{ case.budget, case.batch_size });
+        const config = try std.fmt.allocPrint(scratch,
+            \\{{"deciders":{{"c":{{"decision_method":"cascade","cascade":{{"stages":[{{"name":"fast","decider":{{"model":"fast"}}}},{{"name":"strong","decider":{s},"when":{{"probability_between":[0.3,0.9]}},"on_failure":"{s}"}}]}}}}}}}}
+        , .{ strong, if (case.keep_previous) "keep_previous" else "fail" });
+        var registry = try registry_mod.Registry.parseFromSlice(a, config);
+        defer registry.deinit();
+        var fake = Fake{ .invalid = case.repair };
+        var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = io, .antfly_provider = .{
+            .ptr = &fake,
+            .owns_invocation_admission = true,
+            .embed_dense_texts = undefined,
+            .embed_sparse_texts = undefined,
+            .decide_json = Fake.decide,
+            .generate_json = Fake.generate,
+            .model_capabilities = Fake.capabilities,
+        } };
+        defer runtime.deinit();
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+            \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+        , .{});
+        const requests: [3]decisions.Request = @splat(.{ .decider = "c", .questions = questions, .input = .{ .text = "uncertain" } });
+        const submitted_items: u64 = if (case.budget == 1) 0 else if (case.batch_size == 3) 3 else 2;
+        const shared_three = case.generated and submitted_items == 3;
+        const shared_attempts: u64 = if (case.repair and case.budget >= 4501) 2 else 1;
+        const paid: u64 = if (case.generated) if (case.batch_size == 1) submitted_items else @as(u64, @intFromBool(submitted_items > 0)) * shared_attempts else submitted_items;
+        const strong_input: u64 = if (shared_three) 4501 * shared_attempts else submitted_items * 1500;
+        const strong_output: u64 = if (shared_three) 17 * shared_attempts else submitted_items * 7;
+        if (case.strict) {
+            try std.testing.expectError(error.DecisionLimitExceeded, runtime.provider().evaluateBatch(scratch, &requests));
+        } else {
+            const result = try runtime.evaluatePartial(scratch, &requests);
+            for (result.values, result.failures, 0..) |value, failure, index| {
+                const failed_stage = strong_input > case.budget or index >= submitted_items or case.repair;
+                if (!case.keep_previous and failed_stage) {
+                    try std.testing.expect(value == null);
+                    try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), failure);
+                    continue;
+                }
+                const response = value.?;
+                const cost_in: u64 = if (shared_three) (1500 + @as(u64, @intFromBool(index == 0))) * shared_attempts else if (index < submitted_items) 1500 else 0;
+                const cost_out: u64 = if (shared_three) (5 + @as(u64, @intFromBool(index < 2))) * shared_attempts else if (index < submitted_items) 7 else 0;
+                const usage = response.object.get("usage").?.object;
+                try std.testing.expectEqual(@as(i64, @intCast(5 + cost_in)), usage.get("input_tokens").?.integer);
+                try std.testing.expectEqual(@as(i64, @intCast(1 + cost_out)), usage.get("output_tokens").?.integer);
+                const trace = response.object.get("cascade").?.object;
+                try std.testing.expectEqualStrings(if (failed_stage) "fast" else "strong", trace.get("answered_by").?.string);
+                const stage = trace.get("stages").?.array.items[1].object;
+                if (failed_stage) try std.testing.expectEqualStrings("DecisionLimitExceeded", stage.get("error").?.string) else try std.testing.expect(stage.contains("answers"));
+                if (paid > 0) {
+                    const attempted = stage.get("usage").?.object;
+                    try std.testing.expectEqual(@as(i64, @intCast(cost_in)), attempted.get("input_tokens").?.integer);
+                    try std.testing.expectEqual(@as(i64, @intCast(cost_out)), attempted.get("output_tokens").?.integer);
+                    try std.testing.expectEqual(case.generated and case.batch_size > 1 and index < submitted_items, attempted.contains("estimated"));
+                }
+                _ = try decisions.cascade_contract.validateTrace(&(try registry.getCascade("c")).definition, response);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 3), fake.fast_calls.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, @intCast(paid)), fake.strong_calls.load(.monotonic));
+        try std.testing.expectEqual(15 + strong_input, runtime.input_tokens);
+        try std.testing.expectEqual(3 + strong_output, runtime.output_tokens);
+        const calls_before = fake.fast_calls.load(.monotonic) + fake.strong_calls.load(.monotonic);
+        // Exhausted stage ledgers persist; a retry cannot buy another window.
+        const again = try runtime.evaluatePartial(scratch, &requests);
+        _ = again;
+        try std.testing.expectEqual(calls_before + 3, fake.fast_calls.load(.monotonic) + fake.strong_calls.load(.monotonic));
+        try std.testing.expectEqual(30 + strong_input, runtime.input_tokens);
+        try std.testing.expectEqual(strong_input, runtime.stage_budgets.get("c#strong").?.input_tokens);
+    }
+    // The enrichment entry point returns its physical execution report as
+    // well as metered failures, and cannot rerun an exhausted allowance.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("judge", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "strong", .url = "" }, .probabilities = .verdict_only, .max_input_tokens = 2000, .batch_size = 3 });
+    var fake = Fake{};
+    var runtime = Runtime{ .registry = &registry, .resolution_allocator = a, .http = &client, .io = io, .antfly_provider = .{
+        .ptr = &fake,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = undefined,
+        .embed_sparse_texts = undefined,
+        .generate_json = Fake.generate,
+        .model_capabilities = Fake.capabilities,
+    } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const requests: [3]decisions.Request = @splat(.{ .decider = "judge", .questions = questions, .input = .{ .text = "uncertain" } });
+    const result = try runtime.evaluateGeneratedPartial(scratch, "judge", &requests);
+    for (result.values, result.failures) |value, failure| {
+        try std.testing.expect(value == null);
+        try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), failure);
+    }
+    try std.testing.expectEqual(@as(u64, 4501), result.input_tokens);
+    try std.testing.expectEqual(@as(u64, 17), result.output_tokens);
+    try std.testing.expectEqual(@as(usize, 1), result.calls);
+    try std.testing.expectEqual(@as(u64, 4501), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 17), runtime.output_tokens);
+    try std.testing.expectError(error.DecisionLimitExceeded, runtime.evaluateGeneratedPartial(scratch, "judge", &requests));
+    try std.testing.expectEqual(@as(usize, 1), fake.strong_calls.load(.monotonic));
+}
+
+test "decision functions fatal sibling failure still accounts every completed call" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(a, io_impl.io());
+    defer client.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("plain", .{ .model = "plain" });
+    const Fake = struct {
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const request = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer request.deinit();
+            if (std.mem.eql(u8, request.value.object.get("input").?.string, "timeout")) return error.Timeout;
+            return alloc.dupe(u8,
+                \\{"model":"plain","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.9},{"value":"different","probability":0.1}]}],"usage":{"input_tokens":7,"output_tokens":2}}
+            );
+        }
+    };
+    var token: u8 = 0;
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = io_impl.io(), .antfly_provider = .{ .ptr = &token, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    try std.testing.expectError(error.Timeout, runtime.evaluatePartial(scratch, &.{
+        .{ .decider = "plain", .questions = questions, .input = .{ .text = "timeout" } },
+        .{ .decider = "plain", .questions = questions, .input = .{ .text = "completed" } },
+    }));
+    try std.testing.expectEqual(@as(u64, 7), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), runtime.output_tokens);
+}
+
+test "decision functions generated budget checkpoints preserve fatal execution controls" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var cache = remote_capabilities.Cache.init(a, std.testing.io);
+    defer cache.deinit();
+    const schema = try std.json.parseFromSliceLeaky(decisions.Json, scratch, "{\"type\":\"boolean\"}", .{});
+    for ([_]bool{ false, true }) |with_request| for ([_]bool{ false, true }) |cancel| {
+        var cancelled = std.atomic.Value(bool).init(cancel);
+        const token = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
+        var engine = constrained_runtime.Runtime{ .http = &client, .cache = &cache, .input_token_limit = 0, .options = .{
+            .execution = .{ .cancellation = token, .deadline_ns = if (cancel) null else 0 },
+            .request_context = if (with_request) .{ .io = std.testing.io, .cancellation = token, .deadline_ns = if (cancel) null else 0 } else null,
+        } };
+        const result = engine.executeEvidence(scratch, .{ .provider = .antfly, .model = "never-called", .url = "" }, .grammar, schema, "", .{}, &.{.{ .string = "input" }});
+        if (cancel) {
+            try std.testing.expectError(error.Canceled, result);
+        } else {
+            // The structured layer returns timeouts as per-item failures;
+            // the decision/cascade layer must see Timeout, not a quota error.
+            const stopped = try result;
+            try std.testing.expectEqual(@as(?anyerror, error.Timeout), stopped.failures[0]);
+            try std.testing.expectEqual(@as(usize, 0), stopped.calls);
+        }
+    };
 }
