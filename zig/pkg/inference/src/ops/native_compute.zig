@@ -4477,6 +4477,48 @@ pub const NativeCompute = struct {
         return runAssignedLinearPairImpl(@ptrCast(@alignCast(backend.ptr)), first, second, current, false);
     }
 
+    /// Frame-owned cold call. The Frame owns the selected route, Lease, CT and
+    /// scratch for this whole lifetime. No current inputs, attention or B loans
+    /// survive run(); arbitrary/converted/quantized routes stay generic.
+    pub const PreparedProgramCall = struct {
+        selected: *const @import("../execution/kernel_route.zig").Owned,
+        binding: @import("../execution/assigned_kernel_route.zig").NativeProgramBinding,
+        output: @import("../execution/kernel_route.zig").AssignedOutput,
+        storage: *ops.physical_storage.Lease,
+        output_tensor: CT,
+        workspace: []u8,
+        operator_plan: ?*const ops.OperatorPlan,
+
+        pub fn prepare(backend: *const ops.ComputeBackend, invocation: ops.kernel_descriptor.Invocation, storage: *ops.physical_storage.Lease) !?@This() {
+            if (backend.vtable != &vtable_impl or invocation.descriptor.output_shape.dtype != .f32) return null;
+            const direct = @import("../execution/assigned_kernel_route.zig");
+            const selected = invocation.prepared_route orelse return null;
+            if (!direct.belongsToProgram(selected, backend.*, nativeDirectRouteSupported) and !direct.belongsToProgram(selected, backend.*, nativeResidentDenseLinearRouteSupported)) return null;
+            if (invocation.descriptor.operation == .rope or invocation.workspace != null or invocation.auxiliaries.len != 0 or invocation.prepared_resources != null or selected.vtable.host_input_constraint != null or selected.vtable.prepare_assigned != null) return null;
+            const output = invocation.assigned_output orelse return null;
+            const binding = (try direct.bindNativeProgram(selected, backend.*, invocation.descriptor, output.slot)) orelse return null;
+            if (storage.backend.ptr != backend.ptr or storage.backend.vtable != backend.vtable or !storage.acceptsWritableRegion(output.slot.allocation, output.slot.epoch, output.slot.writable_bytes, output.region)) return error.InvalidAssignedOutputAuthority;
+            return .{ .selected = selected, .binding = binding, .output = output.*, .storage = storage, .output_tensor = invocation.output orelse return null, .workspace = invocation.host_workspace, .operator_plan = invocation.operator_plan };
+        }
+        pub fn run(self: *const @This(), backend: *const ops.ComputeBackend, inputs: []const CT, output: CT, attention: ?*const AttentionContext, generation: u64) !bool {
+            if (backend.vtable != &vtable_impl or backend.ptr != self.selected.implementation.context or @as(*const anyopaque, @ptrCast(backend.vtable)) != self.selected.implementation.table) return error.UnsupportedAuthoredNativeTarget;
+            try self.binding.validateCurrentMetadata(self.output.slot);
+            if (output != self.output_tensor) return error.InvalidTensorShape;
+            const target = toBuf(output);
+            if (nativeTensorReadOnly(target)) return error.ReadOnlyPhysicalStorage;
+            if (target.data.len != self.binding.descriptor().elements()) return error.InvalidTensorShape;
+            if (target.physical_lease != self.storage or !self.storage.acceptsWritableRegion(self.output.slot.allocation, self.output.slot.epoch, self.output.slot.writable_bytes, self.output.region)) return error.InvalidAssignedOutputAuthority;
+            const shape = target.logical_shape orelse return error.InvalidTensorShape;
+            const expected = self.binding.descriptor().output_shape;
+            if (shape.len != expected.rank() or !std.mem.eql(i64, shape, expected.dims[0..expected.rank()])) return error.InvalidTensorShape;
+            const base = toBuf(self.storage.tensor).data;
+            const start = std.math.add(usize, @intFromPtr(base.ptr), self.output.region.byte_offset) catch return error.InvalidAssignedOutputAuthority;
+            if (@intFromPtr(target.data.ptr) != start or target.data.len * @sizeOf(f32) != self.output.slot.writable_bytes or target.source_tensor != null or target.quantized_storage != null or target.owned_quantized_storage != null or target.retained_parent != null or target.view_strides != null or target.view_base_offset != 0 or (target.declared_dtype != null and target.declared_dtype != .f32)) return error.InvalidAssignedOutputAuthority;
+            const invocation = ops.kernel_descriptor.Invocation{ .descriptor = self.binding.descriptor(), .inputs = inputs, .output = output, .attention = attention, .input_generation = generation, .prepared_route = self.selected, .assigned_output = &self.output, .host_workspace = self.workspace, .operator_plan = self.operator_plan };
+            return runAssignedKernelImpl(true, backend.ptr, invocation, &self.binding);
+        }
+    };
+
     pub fn validateAuthoredAttention(backend: *const ops.ComputeBackend, geometry: ops.kernel_descriptor.PagedAttention, attention: *const AttentionContext) !void {
         if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
         _ = try validateAssignedPagedAttention(geometry, attention);
@@ -52961,7 +53003,6 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
 // remains explicitly unknown until all retained planes have one owner report.
 fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../execution/storage_ownership.zig").Visitor) anyerror!@import("../execution/storage_ownership.zig").Coverage {
     const ownership = @import("../execution/storage_ownership.zig");
-    const ml = @import("ml");
     const view = toBuf(tensor);
     if (view.owned and view.retained_parent != null) return .unknown;
     if (view.source_tensor != null and view.physical_lease != null and view.data.len != 0) return .unknown;
@@ -53001,6 +53042,23 @@ fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../executio
         };
         return .complete;
     }
+    return denseStorageOwnership(false, tensor, view, root, lease, visitor);
+}
+const DenseStorageCapture = struct {
+    span: ?@import("../execution/storage_ownership.zig").Span = null,
+    plane: ?@import("../execution/storage_ownership.zig").Plane = null,
+};
+inline fn emitDenseStorage(comptime capture: bool, target: if (capture) *DenseStorageCapture else @import("../execution/storage_ownership.zig").Visitor, report: @import("../execution/storage_ownership.zig").Report) !void {
+    if (comptime capture) {
+        switch (report) {
+            .backing => |span| target.span = span,
+            .plane => |plane| target.plane = plane,
+        }
+    } else try target.emit(report);
+}
+fn denseStorageOwnership(comptime capture: bool, tensor: CT, view: *const Buf, root: *const Buf, lease: ?*ops.physical_storage.Lease, target: if (capture) *DenseStorageCapture else @import("../execution/storage_ownership.zig").Visitor) !@import("../execution/storage_ownership.zig").Coverage {
+    const ownership = @import("../execution/storage_ownership.zig");
+    const ml = @import("ml");
     if (root.source_tensor) |source| {
         if (root.owned or !source.owns_data or source.shape.len > 8 or root.view_strides != null) return .unknown;
         const identity = ownership.Identity{ .kind = .host, .base = @intFromPtr(source.data.ptr) };
@@ -53009,8 +53067,8 @@ fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../executio
         };
         var descriptor = backend_contracts.TensorDesc.init(ml.graph.Shape.init(dtype, source.shape), .host_dense);
         descriptor.current_backend = .native;
-        try visitor.emit(.{ .backing = .{ .identity = identity, .domain = .host, .requested_bytes = source.data.len, .backing_bytes = source.data.len, .access = if (isCachedWeightBuf(root)) .read_only else .writable } });
-        try visitor.emit(.{ .plane = .{ .descriptor = descriptor, .role = .primary, .backing = identity, .byte_offset = 0, .logical_bytes = source.data.len, .readable_bytes = source.data.len } });
+        try emitDenseStorage(capture, target, .{ .backing = .{ .identity = identity, .domain = .host, .requested_bytes = source.data.len, .backing_bytes = source.data.len, .access = if (isCachedWeightBuf(root)) .read_only else .writable } });
+        try emitDenseStorage(capture, target, .{ .plane = .{ .descriptor = descriptor, .role = .primary, .backing = identity, .byte_offset = 0, .logical_bytes = source.data.len, .readable_bytes = source.data.len } });
         return .complete;
     }
     if (root.declared_dtype != null and root.declared_dtype != .f32) return .unknown;
@@ -53029,7 +53087,7 @@ fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../executio
     if (lease) |physical| if (physical.admission) |reserved| {
         span.charged = .{ .identity = reserved.identity, .bytes = physical.admittedBytes() };
     };
-    try visitor.emit(.{ .backing = span });
+    try emitDenseStorage(capture, target, .{ .backing = span });
     var dimensions: [8]i64 = undefined;
     const shape = view.logical_shape orelse flat: {
         dimensions[0] = @intCast(view.data.len);
@@ -53063,7 +53121,7 @@ fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../executio
         readable_bytes = if (elements == 0) 0 else try std.math.mul(usize, try std.math.add(usize, last, 1), @sizeOf(f32));
     }
     if (offset > bytes or readable_bytes > bytes - offset) return .unknown;
-    try visitor.emit(.{ .plane = .{
+    try emitDenseStorage(capture, target, .{ .plane = .{
         .descriptor = descriptor,
         .role = .primary,
         .backing = identity,
@@ -53163,6 +53221,29 @@ fn assignedDenseF32Input(input: CT, expected: @import("ml").graph.Shape) ?[]cons
     return buf.data;
 }
 
+fn currentDenseF32Span(backend: ops.ComputeBackend, input: CT, expected: @import("ml").graph.Shape) ?[]const f32 {
+    const data = assignedDenseF32Input(input, expected) orelse return null;
+    const view = toBuf(input);
+    if (view.owned and view.retained_parent != null) return null;
+    if (view.source_tensor != null and view.physical_lease != null and view.data.len != 0) return null;
+    var root = view;
+    var lease = view.physical_lease;
+    while (root.retained_parent) |parent| {
+        root = toBuf(parent);
+        if (lease == null) lease = root.physical_lease;
+    }
+    if (lease) |physical| root = toBuf(physical.tensor);
+    if (root.quantized_storage != null or root.owned_quantized_storage != null) return null;
+    var report: DenseStorageCapture = .{};
+    const coverage = denseStorageOwnership(true, input, view, root, lease, &report) catch return null;
+    const plane = report.plane orelse return null;
+    if (coverage != .complete or !@import("../execution/assigned_kernel_route.zig").densePlaneMatches(backend, plane, expected)) return null;
+    const backing = plane.backing orelse return null;
+    const start = std.math.add(usize, backing.base, plane.byte_offset) catch return null;
+    if (start != @intFromPtr(data.ptr) or plane.logical_bytes != data.len * @sizeOf(f32)) return null;
+    return data;
+}
+
 const AssignedPagedBinding = struct {
     manager: *runtime.kv.manager.KvManager,
     pool: *runtime.kv.storage.KvStorage,
@@ -53198,17 +53279,21 @@ fn validateAssignedPagedAttention(geometry: ops.kernel_descriptor.PagedAttention
 }
 
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
+    return runAssignedKernelImpl(false, ctx, request, null);
+}
+
+fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.kernel_descriptor.Invocation, program: ?*const @import("../execution/assigned_kernel_route.zig").NativeProgramBinding) anyerror!bool {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const descriptor = request.descriptor;
-    const packed_row_route: ?*const PackedRowRoute = if (request.prepared_route) |selected| (if (selected.vtable == &PackedRowRoute.vtable) @ptrCast(@alignCast(selected.context)) else null) else null;
-    const quantized_route: ?*const QuantizedSingleRoute = if (request.prepared_route) |selected| (if (selected.vtable == &QuantizedSingleRoute.vtable) @ptrCast(@alignCast(selected.context)) else null) else null;
-    const source_route: ?*const NativeSourceRoute = if (request.prepared_route) |selected| prepared: {
+    const packed_row_route: ?*const PackedRowRoute = if (comptime authored) null else if (request.prepared_route) |selected| (if (selected.vtable == &PackedRowRoute.vtable) @ptrCast(@alignCast(selected.context)) else null) else null;
+    const quantized_route: ?*const QuantizedSingleRoute = if (comptime authored) null else if (request.prepared_route) |selected| (if (selected.vtable == &QuantizedSingleRoute.vtable) @ptrCast(@alignCast(selected.context)) else null) else null;
+    const source_route: ?*const NativeSourceRoute = if (comptime authored) null else if (request.prepared_route) |selected| prepared: {
         if (selected.implementation.context != ctx or ((selected.vtable == &QuantizedSingleRoute.vtable or selected.vtable == &PackedRowRoute.vtable) and selected.implementation.table != @as(*const anyopaque, @ptrCast(&vtable_impl)))) return error.InvalidPreparedKernelRoute;
         if (@import("../execution/assigned_kernel_route.zig").isDirect(selected) or selected.vtable == &QuantizedSingleRoute.vtable or selected.vtable == &PackedRowRoute.vtable) break :prepared null;
         if (selected.vtable != &NativeSourceRoute.vtable) return error.InvalidPreparedKernelRoute;
         break :prepared @ptrCast(@alignCast(selected.context));
     } else null;
-    if (!assignedKernelSupportedOp(ctx, descriptor)) return false;
+    if (comptime !authored) if (!assignedKernelSupportedOp(ctx, descriptor)) return false;
     if ((descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix or descriptor.operation == .dense_attention_rows) and request.prepared_route == null) return false;
     const dense_prefix: ?@import("../graph/backend_contracts.zig").DenseAttentionPrefixBinding = if (descriptor.operation == .dense_attention_prefix) (request.attention orelse return false).dense_attention_prefix orelse return false else null;
     if (dense_prefix) |binding| {
@@ -53225,12 +53310,19 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     else
         null;
     if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
-    if (descriptor.output_shape.dtype != .f32) {
+    if (comptime !authored) if (descriptor.output_shape.dtype != .f32) {
         if (source_route != null) return error.InvalidPreparedKernelRoute;
         return runAssignedTypedSlice(request);
-    }
+    };
     var dense_inputs: [3][]const f32 = @splat(&.{});
-    for (request.inputs, 0..) |input, i| {
+    var current_dense = authored and (descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix or descriptor.operation == .dense_attention_rows);
+    if (current_dense) for (request.inputs, 0..) |input, i| {
+        dense_inputs[i] = currentDenseF32Span(.{ .ptr = ctx, .vtable = &vtable_impl }, input, descriptor.input_shapes[i]) orelse {
+            current_dense = false;
+            break;
+        };
+    };
+    if (!current_dense) for (request.inputs, 0..) |input, i| {
         const buf = toBuf(input);
         if (source_route != null and i == 1) continue;
         if (packed_row_route != null and i == 0) continue;
@@ -53260,7 +53352,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         // ordinary Into programs consume only exact nonallocating F32 spans.
         if (descriptor.operation == .linear and buf.source_tensor != null) return false;
         dense_inputs[i] = assignedDenseF32Input(input, descriptor.input_shapes[i]) orelse return false;
-    }
+    };
     if (descriptor.operation == .dot and (toBuf(request.inputs[0]).quantized_storage != null or toBuf(request.inputs[1]).quantized_storage != null)) return false;
     if (descriptor.operation == .rope and (request.auxiliaries.len != 0 or !descriptor.operation.rope.valid(descriptor.output_shape.dims[0..descriptor.output_shape.rank()], descriptor.elements()))) return false;
     if (source_route) |selected| try selected.validateInvocation(request);
@@ -53268,7 +53360,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     if (packed_row_route) |selected| try selected.validateInvocation(request);
     const output_ct = request.output orelse return true;
     const target = toBuf(output_ct);
-    if (nativeTensorReadOnly(target)) return error.ReadOnlyPhysicalStorage;
+    if (comptime !authored) if (nativeTensorReadOnly(target)) return error.ReadOnlyPhysicalStorage;
     const output = target.data;
     // Source-backed read authority cannot become writable through a separately
     // wrapped output. Validate before any numerical writes, for every Into op.
@@ -53276,17 +53368,24 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         const source = dense_inputs[i];
         if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
     };
-    if (target.physical_lease == null or output.len != descriptor.elements()) return error.InvalidTensorShape;
+    if (comptime !authored) if (target.physical_lease == null or output.len != descriptor.elements()) return error.InvalidTensorShape;
     if (descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix or descriptor.operation == .dense_attention_rows) {
         const assigned = request.assigned_output orelse return error.MissingAssignedOutput;
         const selected = request.prepared_route orelse return error.MissingPreparedKernelRoute;
-        if (!target.physical_lease.?.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region) or assigned.slot.writable_bytes != output.len * @sizeOf(f32) or !assigned.slot.logical.eq(descriptor.output_shape)) return error.InvalidAssignedOutputAuthority;
+        if (comptime !authored) if (!target.physical_lease.?.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region) or assigned.slot.writable_bytes != output.len * @sizeOf(f32) or !assigned.slot.logical.eq(descriptor.output_shape)) return error.InvalidAssignedOutputAuthority;
         for (dense_inputs) |input| if (kernel_geometry.byteRangesOverlap(@intFromPtr(input.ptr), input.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
-        var actual_bindings: [3]@import("../execution/kernel_route.zig").Binding = undefined;
-        const implementation = @import("../execution/kernel_route.zig").Implementation{ .context = ctx, .table = &vtable_impl };
-        for (request.inputs, &actual_bindings) |input, *binding| binding.* = .{ .tensor = .{ .value = input, .implementation = implementation } };
-        try @import("../execution/assigned_kernel_route.zig").validateDescriptor(selected, descriptor);
-        try selected.validate(.{ .inputs = &actual_bindings, .output = assigned.slot });
+        if (current_dense) {
+            // The cold call uses this exact private owner's descriptor; the
+            // current complete Native reports above prove every input once.
+            const bound = program.?;
+            if (bound.descriptor() != descriptor) return error.PreparedKernelBindingChanged;
+        } else {
+            var actual_bindings: [3]@import("../execution/kernel_route.zig").Binding = undefined;
+            const implementation = @import("../execution/kernel_route.zig").Implementation{ .context = ctx, .table = &vtable_impl };
+            for (request.inputs, &actual_bindings) |input, *binding| binding.* = .{ .tensor = .{ .value = input, .implementation = implementation } };
+            try @import("../execution/assigned_kernel_route.zig").validateDescriptor(selected, descriptor);
+            try selected.validate(.{ .inputs = &actual_bindings, .output = assigned.slot });
+        }
     }
     if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather) {
         for (request.inputs, 0..) |input, i| {
@@ -60681,6 +60780,7 @@ fn nativeDensePrefixParity(a: std.mem.Allocator) !void {
     const mask = [_]i64{ 1, 0, 1, 1, 1 };
     var context = ops.AttentionContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
     var invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .inputs = &inputs, .output = output, .host_workspace = std.mem.sliceAsBytes(scratch), .prepared_route = &selected, .assigned_output = &assigned, .attention = &context };
+    const program = (try NativeCompute.PreparedProgramCall.prepare(&cb, invocation, lease)) orelse return error.MissingNativeProgramCall;
     for ([_]usize{ 1, 3, 5 }) |live| {
         @memcpy(toBuf(k).data, &keys);
         @memcpy(toBuf(v).data, &values);
@@ -60695,6 +60795,13 @@ fn nativeDensePrefixParity(a: std.mem.Allocator) !void {
         compute.allocator = a;
         try std.testing.expect(try execution);
         try std.testing.expectEqualSlices(f32, getData(reference), toBuf(output).data);
+        const original_output = toBuf(output).data[0..4].*;
+        @memset(toBuf(output).data, 71);
+        compute.allocator = failing.allocator();
+        const prepared_execution = program.run(&cb, &inputs, output, &context, 1);
+        compute.allocator = a;
+        try std.testing.expect(try prepared_execution);
+        try std.testing.expectEqualSlices(f32, &original_output, toBuf(output).data);
         // Independent F64 softmax + weighted values, never the shared helper.
         var expected: [4]f64 = @splat(0);
         for (0..2) |head| {
@@ -60718,6 +60825,26 @@ fn nativeDensePrefixParity(a: std.mem.Allocator) !void {
         for (expected, toBuf(output).data) |gold, actual| try std.testing.expectApproxEqAbs(gold, @as(f64, actual), 0.000002);
     }
     const held = toBuf(output).data[0..4].*;
+    const target = toBuf(output);
+    const original_data = target.data;
+    target.data = (target.data.ptr + 1)[0..target.data.len];
+    const shifted_output = program.run(&cb, &inputs, output, &context, 1);
+    target.data = original_data;
+    try std.testing.expectError(error.InvalidAssignedOutputAuthority, shifted_output);
+    target.logical_shape.?[0] = 2;
+    const wrong_shape = program.run(&cb, &inputs, output, &context, 1);
+    target.logical_shape.?[0] = 1;
+    try std.testing.expectError(error.InvalidTensorShape, wrong_shape);
+    toBuf(k).logical_shape.?[0] = 4;
+    const wrong_input_shape = program.run(&cb, &inputs, output, &context, 1);
+    toBuf(k).logical_shape.?[0] = 5;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, wrong_input_shape);
+    const old_class = lease.accounting_class;
+    lease.accounting_class = .constant;
+    const readonly = program.run(&cb, &inputs, output, &context, 1);
+    lease.accounting_class = old_class;
+    try std.testing.expectError(error.ReadOnlyPhysicalStorage, readonly);
+    try std.testing.expectEqualSlices(f32, &held, target.data);
     context.dense_attention_prefix.?.live_key_rows = 6;
     try std.testing.expectError(error.InvalidAttentionShape, runAssignedKernelOp(&compute, invocation));
     context.dense_attention_prefix = .{ .live_key_rows = 5, .mask = mask[0..4] };
@@ -61118,4 +61245,109 @@ test "Native static causal and multiquery cross attention retain exact routes ma
 }
 test "Native declared multiquery attention cold owner allocation failures release every route and physical root" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeDeclaredAttentionRowsCase, .{});
+}
+
+test "Native compact current spans retain exact complete ownership shape alignment and view checks" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const Shape = @import("ml").graph.Shape;
+    const shape = Shape.init(.f32, &.{4});
+    const owned = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+    defer cb.free(owned);
+    const source = try compute.makeBufWithOwnedSourceTensor(try tensor_mod.Tensor.initFloat32(a, "source", &.{4}, &.{ 1, 2, 3, 4 }));
+    defer cb.free(source);
+    const alias = try cb.primReshape(owned, &.{4});
+    defer cb.free(alias);
+    for ([_]CT{ owned, source, alias }) |value| {
+        const current = currentDenseF32Span(cb, value, shape) orelse return error.MissingCurrentDenseSpan;
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, current);
+        try std.testing.expect(@import("../execution/assigned_kernel_route.zig").bindingDense(cb, .{ .tensor = .{ .value = value, .implementation = .{ .context = cb.ptr, .table = cb.vtable } } }, shape));
+    }
+    var values = [_]f32{ 1, 2, 3, 4 };
+    const borrowed = try cb.fromBorrowedFloat32Shape(&values, &.{4});
+    defer cb.free(borrowed);
+    try std.testing.expect(currentDenseF32Span(cb, borrowed, shape) == null);
+    const buffer = toBuf(owned);
+    buffer.logical_shape.?[0] = 3;
+    try std.testing.expect(assignedDenseF32Input(owned, shape) != null);
+    try std.testing.expect(currentDenseF32Span(cb, owned, shape) == null);
+    buffer.logical_shape.?[0] = 4;
+    const previous = buffer.declared_dtype;
+    buffer.declared_dtype = .i32;
+    try std.testing.expect(currentDenseF32Span(cb, owned, shape) == null);
+    buffer.declared_dtype = previous;
+    try std.testing.expect(currentDenseF32Span(cb, owned, Shape.init(.f32, &.{ 2, 2 })) == null);
+    const original_source_bytes = toBuf(source).source_tensor.?.data;
+    @constCast(toBuf(source).source_tensor.?).data = (original_source_bytes.ptr + 1)[0..original_source_bytes.len];
+    const unaligned_source = currentDenseF32Span(cb, source, shape);
+    @constCast(toBuf(source).source_tensor.?).data = original_source_bytes;
+    try std.testing.expect(unaligned_source == null);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    const final = currentDenseF32Span(cb, owned, shape);
+    compute.allocator = a;
+    try std.testing.expect(final != null);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "Native sealed call retains live resident linear policy and original Into arithmetic" {
+    const a = std.testing.allocator;
+    const Shape = @import("ml").graph.Shape;
+    const route = @import("../execution/kernel_route.zig");
+    const ownership = @import("../execution/storage_ownership.zig");
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 2, 3 }, &.{ 1, 2 });
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer cb.free(weight);
+    const original = try cb.linearNoBias(input, weight, 1, 2, 2);
+    defer cb.free(original);
+    const Capture = struct {
+        plane: ?ownership.Plane = null,
+        fn emit(raw: *anyopaque, report: ownership.Report) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (report) {
+                .plane => |plane| self.plane = plane,
+                .backing => {},
+            }
+        }
+    };
+    var captured: Capture = .{};
+    try std.testing.expectEqual(ownership.Coverage.complete, try storageOwnershipOp(&compute, weight, .{ .context = &captured, .visit = Capture.emit }));
+    const implementation = route.Implementation{ .context = &compute, .table = &vtable_impl };
+    const planes = [_]ownership.Plane{captured.plane.?};
+    const facts = [_]route.Binding{ .{ .tensor = .{ .value = input, .implementation = implementation } }, .{ .resident = .{ .logical = Shape.init(.f32, &.{ 2, 2 }), .planes = &planes, .implementation = implementation } } };
+    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = 1, .in_dim = 2, .out_dim = 2, .bias = false } }, .input_count = 2, .input_shapes = .{ Shape.init(.f32, &.{ 1, 2 }), Shape.init(.f32, &.{ 2, 2 }), .{} }, .output_shape = Shape.init(.f32, &.{ 1, 2 }) };
+    const slot = route.OutputSlot{ .allocation = 0, .node = 3, .epoch = 17, .logical = descriptor.output_shape, .writable_bytes = 8 };
+    var selected = (try prepareKernelRouteOp(&compute, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = &facts, .output = slot })) orelse return error.MissingPreparedKernelRoute;
+    defer selected.deinit();
+    const lease = (try ops.physical_storage.Lease.create(a, cb, 8)).?;
+    defer lease.release();
+    try lease.bindAllocationSlot(0, 17, 8);
+    const output = (try physicalTensorViewOp(&compute, .{ .storage = lease, .shape = &.{ 1, 2 } })).?;
+    defer cb.free(output);
+    const assigned = route.AssignedOutput{ .slot = slot, .region = try lease.writableRegion(0, 17, 8) };
+    const inputs = [_]CT{ input, weight };
+    const program = (try NativeCompute.PreparedProgramCall.prepare(&cb, .{ .descriptor = &descriptor, .inputs = &inputs, .output = output, .prepared_route = &selected, .assigned_output = &assigned }, lease)) orelse return error.MissingNativeProgramCall;
+    @memset(toBuf(output).data, 91);
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const denied = program.run(&cb, &inputs, output, null, 1);
+    compute.cache_embeddinggemma2_bf16_weights = false;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, denied);
+    try std.testing.expectEqualSlices(f32, &.{ 91, 91 }, toBuf(output).data);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    const execution = program.run(&cb, &inputs, output, null, 2);
+    compute.allocator = a;
+    try std.testing.expect(try execution);
+    try std.testing.expectEqualSlices(f32, getData(original), toBuf(output).data);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }

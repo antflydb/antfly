@@ -21,24 +21,41 @@ pub const ImmutableBindings = struct {
     references: std.atomic.Value(usize) = .init(1),
     entries: []route.InputBinding,
     original_tensor_values: []?OriginalTensor,
+    // Entry plane slices borrow this single owner allocation.
+    planes: []@import("storage_ownership.zig").Plane,
     indices: std.AutoHashMapUnmanaged(ml.graph.NodeId, usize) = .empty,
 
     pub fn create(allocator: std.mem.Allocator, inputs: []const route.InputBinding) !*ImmutableBindings {
+        var plane_count: usize = 0;
+        for (inputs) |input| plane_count = try std.math.add(usize, plane_count, switch (input.value) {
+            .planned => |value| value.planes.len,
+            .resident => |value| value.planes.len,
+            else => 0,
+        });
+        const planes = try allocator.alloc(@import("storage_ownership.zig").Plane, plane_count);
+        errdefer allocator.free(planes);
         const entries = try allocator.alloc(route.InputBinding, inputs.len);
         errdefer allocator.free(entries);
         const original_values = try allocator.alloc(?OriginalTensor, inputs.len);
         errdefer allocator.free(original_values);
         @memset(original_values, null);
         var initialized: usize = 0;
-        errdefer for (entries[0..initialized]) |*entry| releaseBinding(allocator, &entry.value);
+        errdefer for (entries[0..initialized]) |*entry| releaseBindingWithCleanup(&entry.value, .{});
         var indices = std.AutoHashMapUnmanaged(ml.graph.NodeId, usize).empty;
         errdefer indices.deinit(allocator);
         try indices.ensureTotalCapacity(allocator, std.math.cast(u32, inputs.len) orelse return error.TooManyKernelInputBindings);
+        var plane_offset: usize = 0;
         for (inputs, entries, 0..) |input, *entry, index| {
             const slot = indices.getOrPutAssumeCapacity(input.node_id);
             if (slot.found_existing) return error.DuplicateKernelInputBinding;
             slot.value_ptr.* = index;
-            entry.* = .{ .node_id = input.node_id, .value = try retainBinding(allocator, input.value) };
+            const count = switch (input.value) {
+                .planned => |value| value.planes.len,
+                .resident => |value| value.planes.len,
+                else => 0,
+            };
+            entry.* = .{ .node_id = input.node_id, .value = try retainBinding(input.value, planes[plane_offset..][0..count]) };
+            plane_offset += count;
             original_values[index] = switch (input.value) {
                 .tensor => |tensor| .{ .value = tensor.value, .implementation = tensor.implementation },
                 else => null,
@@ -46,13 +63,13 @@ pub const ImmutableBindings = struct {
             initialized += 1;
         }
         const self = try allocator.create(ImmutableBindings);
-        self.* = .{ .allocator = allocator, .entries = entries, .original_tensor_values = original_values, .indices = indices };
+        self.* = .{ .allocator = allocator, .entries = entries, .original_tensor_values = original_values, .planes = planes, .indices = indices };
         return self;
     }
     fn backend(implementation: route.Implementation) ops.ComputeBackend {
         return .{ .ptr = implementation.context, .vtable = @ptrCast(@alignCast(implementation.table)) };
     }
-    fn retainBinding(allocator: std.mem.Allocator, value: route.Binding) !route.Binding {
+    fn retainBinding(value: route.Binding, planes: []@import("storage_ownership.zig").Plane) !route.Binding {
         return switch (value) {
             .tensor => |input| blk: {
                 const target = backend(input.implementation);
@@ -62,20 +79,21 @@ pub const ImmutableBindings = struct {
                 const retained = (try retain_tensor(target.ptr, input.value)) orelse break :blk .unknown;
                 break :blk .{ .tensor = .{ .value = retained, .implementation = input.implementation } };
             },
-            .planned => |input| .{ .planned = .{ .logical = input.logical, .planes = try allocator.dupe(@import("storage_ownership.zig").Plane, input.planes) } },
-            .resident => |input| .{ .resident = .{ .logical = input.logical, .planes = try allocator.dupe(@import("storage_ownership.zig").Plane, input.planes), .implementation = input.implementation } },
+            .planned => |input| copied: {
+                @memcpy(planes, input.planes);
+                break :copied .{ .planned = .{ .logical = input.logical, .planes = planes } };
+            },
+            .resident => |input| copied: {
+                @memcpy(planes, input.planes);
+                break :copied .{ .resident = .{ .logical = input.logical, .planes = planes, .implementation = input.implementation } };
+            },
             .imported_host, .unknown => value,
         };
     }
-    fn releaseBinding(allocator: std.mem.Allocator, value: *route.Binding) void {
-        releaseBindingWithCleanup(allocator, value, .{});
-    }
-    fn releaseBindingWithCleanup(allocator: std.mem.Allocator, value: *route.Binding, cleanup: @import("cleanup_context.zig").Context) void {
+    fn releaseBindingWithCleanup(value: *route.Binding, cleanup: @import("cleanup_context.zig").Context) void {
         switch (value.*) {
             .tensor => |input| backend(input.implementation).freeWithCleanup(input.value, cleanup),
-            .planned => |input| allocator.free(input.planes),
-            .resident => |input| allocator.free(input.planes),
-            .imported_host, .unknown => {},
+            .planned, .resident, .imported_host, .unknown => {},
         }
         value.* = .unknown;
     }
@@ -92,7 +110,8 @@ pub const ImmutableBindings = struct {
     }
     pub fn releaseWithCleanup(self: *ImmutableBindings, cleanup: @import("cleanup_context.zig").Context) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
-        for (self.entries) |*entry| releaseBindingWithCleanup(self.allocator, &entry.value, cleanup);
+        for (self.entries) |*entry| releaseBindingWithCleanup(&entry.value, cleanup);
+        self.allocator.free(self.planes);
         self.allocator.free(self.entries);
         self.allocator.free(self.original_tensor_values);
         self.indices.deinit(self.allocator);
@@ -404,4 +423,90 @@ test "prepared region cache keeps compatibility policy separate for identical in
     };
     try Case.run(std.testing.allocator);
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+fn packedInputSnapshotsCase(a: std.mem.Allocator) !void {
+    const ownership = @import("storage_ownership.zig");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const tensor = try cb.fromFloat32Shape(&.{ 1, -2, 3, -4 }, &.{4});
+    var tensor_live = true;
+    defer if (tensor_live) cb.free(tensor);
+    const implementation = route.Implementation{ .context = cb.ptr, .table = cb.vtable };
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    var planes = [_]ownership.Plane{
+        .{ .descriptor = @import("../graph/backend_contracts.zig").TensorDesc.init(shape, .host_f32), .role = .primary, .layout_key = 7, .storage_epoch = 9, .byte_offset = 0, .logical_bytes = 16, .readable_bytes = 16 },
+        .{ .descriptor = @import("../graph/backend_contracts.zig").TensorDesc.init(shape, .host_f32), .role = .host_mirror, .layout_key = 11, .storage_epoch = 13, .byte_offset = 4, .logical_bytes = 16, .readable_bytes = 20 },
+        .{ .descriptor = @import("../graph/backend_contracts.zig").TensorDesc.init(shape, .host_f32), .role = .primary, .layout_key = 17, .storage_epoch = 19, .byte_offset = 8, .logical_bytes = 16, .readable_bytes = 24 },
+    };
+    const original = planes;
+    var inputs = [_]route.InputBinding{
+        .{ .node_id = 0, .value = .{ .resident = .{ .logical = shape, .planes = planes[0..2], .implementation = implementation } } },
+        .{ .node_id = 1, .value = .{ .planned = .{ .logical = shape, .planes = planes[2..] } } },
+        .{ .node_id = 2, .value = .{ .tensor = .{ .value = tensor, .implementation = implementation } } },
+        .{ .node_id = 3, .value = .{ .resident = .{ .logical = shape, .planes = &.{}, .implementation = implementation } } },
+        .{ .node_id = 4, .value = .{ .planned = .{ .logical = shape, .planes = &.{} } } },
+        testFact(4),
+        .{ .node_id = 6, .value = .unknown },
+    };
+    inputs[5].node_id = 5;
+    // A duplicate reached after the real tensor retain must unwind that retain
+    // as well as the flat snapshot, without consuming the original caller CT.
+    if (ImmutableBindings.create(a, &.{ inputs[2], inputs[0], inputs[1], inputs[2] })) |unexpected| {
+        unexpected.release();
+        return error.ExpectedDuplicateBinding;
+    } else |err| switch (err) {
+        error.DuplicateKernelInputBinding => {},
+        else => return err,
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, (try cb.hostFloat32Read(tensor)).?);
+    const first = try ImmutableBindings.create(a, &inputs);
+    var first_live = true;
+    defer if (first_live) first.release();
+    const second = try ImmutableBindings.create(a, &inputs);
+    defer second.release();
+    try std.testing.expect(first.planes.ptr != second.planes.ptr);
+    try std.testing.expectEqual(@as(usize, 3), first.planes.len);
+    try std.testing.expect(first.find(0).?.resident.planes.ptr == first.planes.ptr);
+    try std.testing.expect(first.find(1).?.planned.planes.ptr == first.planes[2..].ptr);
+    try std.testing.expectEqual(@as(usize, 0), first.find(3).?.resident.planes.len);
+    try std.testing.expectEqual(@as(usize, 0), first.find(4).?.planned.planes.len);
+    try std.testing.expect(first.originalTensor(2).?.value == tensor);
+    try std.testing.expect(first.originalTensor(0) == null);
+    // Both real receiving snapshots survive mutation of every source plane
+    // and the source binding list. No request aliases the authoring storage.
+    for (&planes) |*plane| {
+        plane.storage_epoch = 100;
+        plane.logical_bytes = 0;
+        plane.readable_bytes = 0;
+    }
+    for (&inputs) |*input| input.value = .unknown;
+    try std.testing.expectEqualDeep(original[0..2], first.find(0).?.resident.planes);
+    try std.testing.expectEqualDeep(original[2..], first.find(1).?.planned.planes);
+    try std.testing.expectEqualDeep(original[0..2], second.find(0).?.resident.planes);
+    cb.free(tensor);
+    tensor_live = false;
+    const retained_first = first.retain();
+    var retained_first_live = true;
+    defer if (retained_first_live) retained_first.release();
+    first.release();
+    first_live = false;
+    try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, (try cb.hostFloat32Read(retained_first.find(2).?.tensor.value)).?);
+    retained_first.release();
+    retained_first_live = false;
+    // The last reference of the first complete owner is gone; the second
+    // still owns both its copied planes and the actual retained tensor.
+    try std.testing.expectEqualDeep(original[2..], second.find(1).?.planned.planes);
+    try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, (try cb.hostFloat32Read(second.find(2).?.tensor.value)).?);
+}
+
+test "packed immutable input snapshots preserve mutable source copies and retained tensor ownership across last owner death" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try packedInputSnapshotsCase(std.testing.allocator);
+}
+
+test "packed immutable input snapshot construction unwinds every allocation failure including initialized tensor retains" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, packedInputSnapshotsCase, .{});
 }

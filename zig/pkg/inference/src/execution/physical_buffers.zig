@@ -1702,10 +1702,19 @@ pub const Pool = struct {
 };
 
 pub const Frame = struct {
+    const NativeCall = struct {
+        program: @import("../ops/native_compute.zig").NativeCompute.PreparedProgramCall,
+        inputs: [3]NodeId,
+        count: u8,
+        output_allocation: buffers.AllocationId,
+    };
     pool: *Pool,
     /// Private complete Native program metadata, built cold at final address.
     /// These headers never escape; physical allocation roots remain Leases.
     native_program_views: []?CT = &.{},
+    native_program_calls: []NativeCall = &.{},
+    native_program_call_indices: []u32 = &.{},
+    native_program_call_count: usize = 0,
     native_program_view_pins: []usize = &.{},
     native_program_storage_sealed: bool = false,
 
@@ -2754,6 +2763,19 @@ pub const Frame = struct {
             self.native_program_view_pins[slot.allocation] += 1;
             values[index] = view;
         }
+        // One fixed metadata call per eligible canonical Native operation.
+        // No current operand, attention/cleanup borrow or constructor capability
+        // is retained. The same request allocator pays this cold metadata.
+        if (cb.vtable == &@import("../ops/native_compute.zig").vtable_impl) {
+            var capacity: usize = 0;
+            for (self.pool.kernels, 0..) |maybe, index| if (maybe) |kernel| {
+                const selected = self.pool.preparedKernelRoute(@intCast(index)) orelse continue;
+                if (kernel.descriptor.output_shape.dtype == .f32 and kernel.descriptor.operation != .rope and @import("assigned_kernel_route.zig").isDirect(selected)) capacity += 1;
+            };
+            self.native_program_calls = try self.pool.allocator.alloc(NativeCall, capacity);
+            self.native_program_call_indices = try self.pool.allocator.alloc(u32, graph.nodeCount());
+            @memset(self.native_program_call_indices, ml.graph.null_node);
+        }
         // Cold assignment only. Inputs are stable physical headers, not values
         // read by any numerical operation during this preparation.
         for (self.pool.kernels, 0..) |maybe, index| if (maybe) |*kernel| {
@@ -2765,9 +2787,27 @@ pub const Frame = struct {
             var assigned = try self.assignedOutput(@intCast(index), output_storage);
             var invocation = kernels.Invocation{ .descriptor = &kernel.descriptor, .inputs = inputs[0..kernel.descriptor.input_count], .output = self.native_program_views[index], .prepared_route = selected, .assigned_output = &assigned, .host_workspace = self.host_workspace[0..kernel.host_workspace_bytes] };
             self.assigned[index] = try selected.prepareAssigned(.{ .allocator = self.pool.allocator, .invocation = &invocation, .output = assigned.slot });
+            if (self.assigned[index] == null and self.native_program_call_indices.len != 0) {
+                var program_invocation = invocation;
+                const stored_kernel = &self.pool.kernels[index].?;
+                program_invocation.operator_plan = if (stored_kernel.operator_plan) |*plan| plan else null;
+                if (try @import("../ops/native_compute.zig").NativeCompute.PreparedProgramCall.prepare(cb, program_invocation, output_storage)) |program| {
+                    if (self.native_program_call_count == self.native_program_calls.len) return error.InvalidNativeProgramPreparation;
+                    self.native_program_calls[self.native_program_call_count] = .{ .program = program, .inputs = kernel.inputs, .count = kernel.descriptor.input_count, .output_allocation = kernel.output_allocation };
+                    self.native_program_call_indices[index] = std.math.cast(u32, self.native_program_call_count) orelse return error.InvalidNativeProgramPreparation;
+                    self.native_program_call_count += 1;
+                }
+            }
         };
     }
     fn clearNativeProgramViews(self: *Frame, cleanup: @import("cleanup_context.zig").Context) void {
+        // These calls borrow the views/route/Lease below; destroy their pure
+        // metadata first, while the Frame still owns every referenced endpoint.
+        self.pool.allocator.free(self.native_program_calls);
+        self.native_program_calls = &.{};
+        self.pool.allocator.free(self.native_program_call_indices);
+        self.native_program_call_indices = &.{};
+        self.native_program_call_count = 0;
         const views = self.native_program_views;
         self.native_program_views = &.{};
         var remaining = views.len;
@@ -2825,8 +2865,35 @@ pub const Frame = struct {
         return results;
     }
 
+    fn nativeProgramCall(self: *Frame, id: NodeId) ?*NativeCall {
+        if (id >= self.native_program_call_indices.len) return null;
+        const index = self.native_program_call_indices[id];
+        if (index == ml.graph.null_node or index >= self.native_program_call_count) return null;
+        return &self.native_program_calls[index];
+    }
     pub fn executeNativeProgram(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: *const ops.AttentionContext) !CT {
         if (self.native_program_views.len == 0 or cb.kind() != .native) return error.UnpreparedNativeProgramViews;
+        if (self.native_program_storage_sealed) if (self.nativeProgramCall(id)) |call| {
+            // All current values and provider identity are receiving facts.
+            // Private output/descriptor/resources remain owned by this Frame;
+            // no generic SDK/view/scratch discovery is repeated per operation.
+            if (!self.in_use or self.retired or self.scope_backends != 1) return error.InvalidNativeProgramExecution;
+            if (self.pool.plan.slotForNode(id) == null) return error.InactivePhysicalNode;
+            const selected = self.pool.preparedKernelRoute(id) orelse return error.MissingPreparedKernelRoute;
+            if (selected != call.program.selected) return error.PreparedKernelBindingChanged;
+            if (self.pool.plan.allocationById(call.output_allocation) == null or self.storages[call.output_allocation] != call.program.storage) return error.PreparedStorageUnavailable;
+            var inputs: [3]CT = undefined;
+            for (call.inputs[0..call.count], 0..) |node, index| inputs[index] = values[node] orelse return error.MissingValue;
+            const output = self.native_program_views[id] orelse return error.UnpreparedNativeProgramViews;
+            if (!try call.program.run(cb, inputs[0..call.count], output, attention, self.host_input_generation)) return error.PreparedKernelBindingChanged;
+            self.stats.reused_allocations += 1;
+            if (call.program.workspace.len != 0) {
+                if (!self.host_workspace_fresh) self.stats.reused_allocations += 1;
+                self.host_workspace_fresh = false;
+            }
+            self.stats.dispatches += 1;
+            return output;
+        };
         return (try self.executeProgram(cb, values, id, rope_position, attention, true)) orelse error.IncompleteNativeProgram;
     }
     fn executeProgram(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: ?*const ops.AttentionContext, cached: bool) !?CT {
@@ -3716,6 +3783,14 @@ test "cached Native Frame refuses malformed bound input and output before math t
     @memset(values, null);
     for (uploaded) |input| values[input.node_id] = input.value;
     try frame.prepareNativeProgramViews(&backend, &graph, values, .{});
+    try frame.sealNativeProgramStorage();
+    try std.testing.expect(frame.nativeProgramCall(output_node) != null);
+    for (selected.pool.kernels, 0..) |maybe, index| if (maybe != null) {
+        const call = frame.nativeProgramCall(@intCast(index)) orelse continue;
+        const stored_kernel = &selected.pool.kernels[index].?;
+        const actual_plan = if (stored_kernel.operator_plan) |*plan| plan else null;
+        try std.testing.expectEqual(actual_plan, call.program.operator_plan);
+    };
     const output = frame.native_program_views[output_node] orelse return error.MissingValue;
     const slot = selected.pool.plan.slotForNode(output_node) orelse return error.MissingPhysicalSlot;
     const lease = frame.storages[slot.allocation] orelse return error.MissingPhysicalStorage;
@@ -3730,6 +3805,15 @@ test "cached Native Frame refuses malformed bound input and output before math t
     defer backend.free(malformed);
     const attention = ops.AttentionContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
     const allocations = frame.stats.allocations;
+    var copied = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(&copied != backend.vtable);
+    const foreign = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedAuthoredNativeTarget, frame.executeNativeProgram(&foreign, values, output_node, null, &attention));
+    lease.slot_authority.?.epoch += 1;
+    const stale_output = frame.executeNativeProgram(&backend, values, output_node, null, &attention);
+    lease.slot_authority.?.epoch -= 1;
+    try std.testing.expectError(error.InvalidAssignedOutputAuthority, stale_output);
     {
         frame.native_program_views[output_node] = malformed;
         defer frame.native_program_views[output_node] = output;
@@ -4218,6 +4302,7 @@ fn privateNativePreparationCase(a: std.mem.Allocator) !void {
     for (bound) |input| values[input.node_id] = input.value;
     try frame.prepareNativeProgramViews(&backend, &graph, values, .{});
     try frame.sealNativeProgramStorage();
+    try std.testing.expect(frame.nativeProgramCall(output_node) != null);
     try frame.finishNativeProgramPreparation();
     // Re-enter the actual numerical scope and bind its current host value;
     // the cold preparation scope did not run a kernel or lend its input.

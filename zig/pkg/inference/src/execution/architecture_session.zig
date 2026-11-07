@@ -19527,7 +19527,19 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     try std.testing.expect(definition == two.definition and definition.shared != null);
     try std.testing.expect(one.graph.nodes.items.ptr == two.graph.nodes.items.ptr);
     try std.testing.expect(one.descriptors.ptr == two.descriptors.ptr and one.steps.ptr == two.steps.ptr);
-    try std.testing.expect(one.values.ptr != two.values.ptr and one.bindings.ptr != two.bindings.ptr and one.planes.ptr != two.planes.ptr);
+    try std.testing.expect(one.values.ptr != two.values.ptr);
+    const one_inputs = one.selected.pool.selection.?.inputs;
+    const two_inputs = two.selected.pool.selection.?.inputs;
+    try std.testing.expect(one_inputs != two_inputs and one_inputs.entries.ptr != two_inputs.entries.ptr);
+    const one_immutable = one.selected.pool.immutable_bindings.?;
+    const two_immutable = two.selected.pool.immutable_bindings.?;
+    try std.testing.expect(one_immutable != two_immutable and one_immutable.entries.ptr != two_immutable.entries.ptr);
+    for (one_inputs.entries, two_inputs.entries) |left, right| if (left.value == .resident and right.value == .resident) {
+        try std.testing.expect(left.value.resident.planes.ptr != right.value.resident.planes.ptr);
+    };
+    for (one_immutable.entries, two_immutable.entries) |left, right| if (left.value == .resident and right.value == .resident) {
+        try std.testing.expect(left.value.resident.planes.ptr != right.value.resident.planes.ptr);
+    };
     try std.testing.expect(one.selected.pool != two.selected.pool and one.selected != two.selected and one.frame.? != two.frame.?);
     try std.testing.expect(one.backend.ptr != two.backend.ptr);
     try std.testing.expect(first.weights.?.fetcher.handles.items.ptr != second.weights.?.fetcher.handles.items.ptr);

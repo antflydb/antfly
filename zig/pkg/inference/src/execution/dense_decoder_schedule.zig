@@ -15,6 +15,35 @@ const Shape = ml.graph.Shape;
 const route = @import("kernel_route.zig");
 const physical = @import("physical_buffers.zig");
 const Cleanup = @import("cleanup_context.zig").Context;
+const Plane = @import("storage_ownership.zig").Plane;
+
+// Builder storage can move while cold authoring grows. Keep actual planes by
+// index until the constructor stops growing its contiguous plane span.
+const PendingBinding = struct {
+    node_id: Node,
+    source: union(enum) {
+        resident: struct { logical: Shape, plane: usize },
+        host: Shape,
+    },
+};
+const BindingSchema = struct {
+    values: usize,
+    runtime_bindings: usize,
+    immutable_bindings: usize,
+    planes: usize,
+};
+fn materializeBindings(a: std.mem.Allocator, pending: []const PendingBinding, planes: []const Plane, backend: ops.ComputeBackend) ![]route.InputBinding {
+    const result = try a.alloc(route.InputBinding, pending.len);
+    errdefer a.free(result);
+    for (pending, result) |input, *output| output.* = .{ .node_id = input.node_id, .value = switch (input.source) {
+        .resident => |source| resident: {
+            if (source.plane >= planes.len) return error.DenseDefinitionChanged;
+            break :resident .{ .resident = .{ .logical = source.logical, .planes = planes[source.plane..][0..1], .implementation = .{ .context = backend.ptr, .table = backend.vtable } } };
+        },
+        .host => |shape| .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = false } },
+    } };
+    return result;
+}
 
 /// Cold metadata may be physically freed under the actual decoder Model gate.
 /// Accept only reclaiming allocators with no admission/reclamation callbacks;
@@ -59,6 +88,7 @@ pub const Definition = struct {
     steps: []Node,
     analysis: @import("../graph/interpreter.zig").CachedAnalysis,
     layout: @import("../graph/runtime.zig").PhysicalLayout,
+    binding_schema: BindingSchema,
 
     fn keyOf(self: *Definition) [32]u8 {
         return self.key;
@@ -104,7 +134,7 @@ pub const Definition = struct {
         errdefer analysis.deinit(a);
         var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&builder.backend}, .{}, true);
         errdefer layout.deinit();
-        self.* = .{ .allocator = a, .key = if (builder.preparation) |preparation| preparation.key else @splat(0), .shared = if (builder.preparation) |preparation| preparation.shared else null, .graph = graph, .descriptors = descriptors, .steps = steps, .analysis = analysis, .layout = layout };
+        self.* = .{ .allocator = a, .key = if (builder.preparation) |preparation| preparation.key else @splat(0), .shared = if (builder.preparation) |preparation| preparation.shared else null, .graph = graph, .descriptors = descriptors, .steps = steps, .analysis = analysis, .layout = layout, .binding_schema = builder.schema() };
         // No fallible work follows transfer of the finalizer. Publication is
         // sealed separately by the caller after successful private preparation.
         if (self.shared) |owner| {
@@ -133,13 +163,14 @@ pub const Builder = struct {
     allocator: std.mem.Allocator,
     preparation: ?*Preparation = null,
     replay_cursor: usize = 0,
+    cached_capacity_reserved: bool = false,
     graph: ml.graph.Graph,
     descriptors: std.ArrayList(?ops.kernel_descriptor.Descriptor) = .empty,
     values: std.ArrayList(?CT) = .empty,
-    bindings: std.ArrayList(route.InputBinding) = .empty,
-    immutable_resident: std.ArrayList(route.InputBinding) = .empty,
+    bindings: std.ArrayList(PendingBinding) = .empty,
+    immutable_resident: std.ArrayList(PendingBinding) = .empty,
     steps: std.ArrayList(Node) = .empty,
-    planes: std.ArrayList(*@import("storage_ownership.zig").Plane) = .empty,
+    planes: std.ArrayList(Plane) = .empty,
     backend: ops.ComputeBackend,
 
     pub fn init(a: std.mem.Allocator, cb: *const ops.ComputeBackend) Builder {
@@ -152,8 +183,21 @@ pub const Builder = struct {
     fn cached(self: *const Builder) ?*Definition {
         return if (self.preparation) |value| value.cached else null;
     }
+    fn schema(self: *const Builder) BindingSchema {
+        return .{ .values = self.values.items.len, .runtime_bindings = self.bindings.items.len, .immutable_bindings = self.immutable_resident.items.len, .planes = self.planes.items.len };
+    }
+    fn reserveCachedCapacity(self: *Builder, definition: *const Definition) !void {
+        if (self.cached_capacity_reserved) return;
+        const counts = definition.binding_schema;
+        try self.values.ensureTotalCapacityPrecise(self.allocator, counts.values);
+        try self.bindings.ensureTotalCapacityPrecise(self.allocator, counts.runtime_bindings);
+        try self.immutable_resident.ensureTotalCapacityPrecise(self.allocator, counts.immutable_bindings);
+        try self.planes.ensureTotalCapacityPrecise(self.allocator, counts.planes);
+        self.cached_capacity_reserved = true;
+    }
     fn replay(self: *Builder, shape: Shape, inputs: []const Node, descriptor: ?ops.kernel_descriptor.Descriptor) !?Node {
         const definition = self.cached() orelse return null;
+        try self.reserveCachedCapacity(definition);
         if (self.replay_cursor >= definition.graph.nodeCount()) return error.DenseDefinitionChanged;
         const id: Node = @intCast(self.replay_cursor);
         const node = definition.graph.node(id);
@@ -174,14 +218,13 @@ pub const Builder = struct {
         self.bindings.deinit(a);
         self.immutable_resident.deinit(a);
         self.steps.deinit(self.graph.allocator);
-        for (self.planes.items) |plane| a.destroy(plane);
         self.planes.deinit(a);
         if (self.cached() == null) self.graph.deinit();
     }
     pub fn parameter(self: *Builder, shape: Shape, value: CT) !Node {
-        return self.parameterWithPlane(shape, value, try residentPlane(&self.backend, value));
+        return self.parameterWithPlane(shape, value, try residentPlane(&self.backend, value), false);
     }
-    fn parameterWithPlane(self: *Builder, shape: Shape, value: CT, observed: @import("storage_ownership.zig").Plane) !Node {
+    fn parameterWithPlane(self: *Builder, shape: Shape, value: CT, observed: Plane, comptime immutable: bool) !Node {
         const reused = try self.replay(shape, &.{}, null);
         const id = reused orelse fresh: {
             var b = ml.graph.Builder.init(&self.graph);
@@ -190,25 +233,17 @@ pub const Builder = struct {
         };
         if (reused == null) try self.descriptors.append(self.graph.allocator, null);
         try self.values.append(self.allocator, value);
-        const binding: route.Binding = block: {
-            const plane = try self.allocator.create(@import("storage_ownership.zig").Plane);
-            errdefer self.allocator.destroy(plane);
-            plane.* = observed;
-            try self.planes.append(self.allocator, plane);
-            break :block .{ .resident = .{ .logical = shape, .planes = @as([*]const @import("storage_ownership.zig").Plane, @ptrCast(plane))[0..1], .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable } } };
-        };
-        try self.bindings.append(self.allocator, .{ .node_id = id, .value = binding });
+        const index = self.planes.items.len;
+        try self.planes.append(self.allocator, observed);
+        const binding = PendingBinding{ .node_id = id, .source = .{ .resident = .{ .logical = shape, .plane = index } } };
+        if (immutable) try self.immutable_resident.append(self.allocator, binding) else try self.bindings.append(self.allocator, binding);
         return id;
     }
     /// An actual typed held-source proof, not a partial generic storage report.
     /// The architecture retains the immutable witness and Model/store owner;
     /// the existing F32 Direct route receives only this borrowed primary.
     pub fn residentWeight(self: *Builder, value: CT, plane: @import("storage_ownership.zig").Plane) !Node {
-        const node = try self.parameterWithPlane(plane.descriptor.shape, value, plane);
-        const binding = self.bindings.pop().?;
-        std.debug.assert(binding.node_id == node and binding.value == .resident);
-        try self.immutable_resident.append(self.allocator, binding);
-        return node;
+        return self.parameterWithPlane(plane.descriptor.shape, value, plane, true);
     }
     pub fn hostParameter(self: *Builder, shape: Shape) !Node {
         const reused = try self.replay(shape, &.{}, null);
@@ -219,7 +254,7 @@ pub const Builder = struct {
         };
         if (reused == null) try self.descriptors.append(self.graph.allocator, null);
         try self.values.append(self.allocator, null);
-        try self.bindings.append(self.allocator, .{ .node_id = id, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = false } } });
+        try self.bindings.append(self.allocator, .{ .node_id = id, .source = .{ .host = shape } });
         return id;
     }
     pub fn gather(self: *Builder, weight: Node, indices: Node, width: usize) !Node {
@@ -342,8 +377,6 @@ pub const Schedule = struct {
     borrowed: std.AutoHashMapUnmanaged(CT, void) = .empty,
     cursor: usize = 0,
     analysis: @import("../graph/interpreter.zig").CachedAnalysis,
-    bindings: []route.InputBinding,
-    planes: []*@import("storage_ownership.zig").Plane,
 
     /// Creates only metadata. All actual physical banks are funded separately
     /// before enter, without using the architecture's compatibility allowance.
@@ -354,7 +387,7 @@ pub const Schedule = struct {
         self.allocator = a;
         self.backend = builder.backend;
         const definition = if (builder.cached()) |value| block: {
-            if (builder.replay_cursor != value.graph.nodeCount()) return error.DenseDefinitionChanged;
+            if (builder.replay_cursor != value.graph.nodeCount() or !std.meta.eql(builder.schema(), value.binding_schema)) return error.DenseDefinitionChanged;
             break :block value.retain();
         } else try Definition.create(builder);
         errdefer definition.release(.{ .outside_execution = true });
@@ -365,13 +398,12 @@ pub const Schedule = struct {
         self.analysis = definition.analysis;
         self.values = try builder.values.toOwnedSlice(a);
         errdefer a.free(self.values);
-        self.planes = try builder.planes.toOwnedSlice(a);
-        errdefer {
-            for (self.planes) |plane| a.destroy(plane);
-            a.free(self.planes);
-        }
-        self.bindings = try builder.bindings.toOwnedSlice(a);
-        errdefer a.free(self.bindings);
+        // Both receiving owners deep-copy these flat planes. Keep only the
+        // constructor's indexed storage until their snapshots are published.
+        const bindings = try materializeBindings(a, builder.bindings.items, builder.planes.items, self.backend);
+        defer a.free(bindings);
+        const immutable = try materializeBindings(a, builder.immutable_resident.items, builder.planes.items, self.backend);
+        defer a.free(immutable);
         var private_pool: ?*physical.Pool = (definition.layout.createPool(a, &self.graph, &.{&self.backend}, self.descriptors) catch |err| switch (err) {
             error.PhysicalOutputLayoutChanged => fallback: {
                 var fresh = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
@@ -385,7 +417,7 @@ pub const Schedule = struct {
         private_pool.?.coverage_reachable = self.analysis.reachable;
         private_pool.?.coverage_backend = self.backend;
         private_pool.?.native_frame_dispatch = true;
-        self.selected = (try physical.Pool.preparePrivateNativeConsuming(&private_pool, builder.immutable_resident.items, self.bindings)) orelse return error.UnsupportedDenseSchedule;
+        self.selected = (try physical.Pool.preparePrivateNativeConsuming(&private_pool, immutable, bindings)) orelse return error.UnsupportedDenseSchedule;
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.UnsupportedDenseSchedule;
         // A ready authored plan owns its complete cold resource recipe before
@@ -458,12 +490,74 @@ pub const Schedule = struct {
         if (self.numerical_epoch) |*epoch| epoch.release();
         self.numerical_epoch = null;
         self.borrowed.deinit(self.allocator);
-        self.allocator.free(self.bindings);
-        for (self.planes) |plane| self.allocator.destroy(plane);
-        self.allocator.free(self.planes);
         self.allocator.free(self.values);
         const definition = self.definition;
         self.allocator.destroy(self);
         definition.release(current);
     }
 };
+
+fn packedColdBindingCase(a: std.mem.Allocator) !void {
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const first_input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    defer cb.free(first_input);
+    const second_input = try cb.fromFloat32Shape(&.{ -1, -2, -3, -4 }, &.{ 1, 4 });
+    defer cb.free(second_input);
+    const Author = struct {
+        fn create(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, value: CT, preparation: ?*Preparation) !*Schedule {
+            var builder = Builder.initPrepared(allocator, backend, preparation);
+            defer builder.deinit();
+            const shape = Shape.init(.f32, &.{ 1, 4 });
+            var sum = try builder.parameter(shape, value);
+            // Every distinct parameter participates; this crosses cold list
+            // growth boundaries without granting authority to dead metadata.
+            for (0..16) |_| sum = try builder.add(sum, try builder.parameter(shape, value));
+            try builder.output(sum);
+            return Schedule.create(&builder);
+        }
+    };
+    const first = try Author.create(a, &cb, first_input, null);
+    var first_live = true;
+    defer if (first_live) first.deinit(.{ .outside_execution = true });
+    var preparation = Preparation{ .key = @splat(0), .cached = first.definition.retain() };
+    defer preparation.deinit(.{ .outside_execution = true });
+    const second = try Author.create(a, &cb, second_input, &preparation);
+    defer second.deinit(.{ .outside_execution = true });
+    try std.testing.expect(first.definition == second.definition);
+    const first_inputs = first.selected.pool.selection.?.inputs.entries;
+    const second_inputs = second.selected.pool.selection.?.inputs.entries;
+    try std.testing.expect(first_inputs.ptr != second_inputs.ptr);
+    const first_plane = try residentPlane(&cb, first_input);
+    const second_plane = try residentPlane(&cb, second_input);
+    try std.testing.expect(!std.meta.eql(first_plane.backing, second_plane.backing));
+    for (first_inputs, second_inputs) |first_binding, second_binding| {
+        const one = first_binding.value.resident.planes;
+        const two = second_binding.value.resident.planes;
+        try std.testing.expect(one.ptr != two.ptr);
+        try std.testing.expectEqual(@as(usize, 1), one.len);
+        try std.testing.expectEqual(@as(usize, 1), two.len);
+        try std.testing.expectEqual(first_plane.backing, one[0].backing);
+        try std.testing.expectEqual(second_plane.backing, two[0].backing);
+    }
+    first.deinit(.{ .outside_execution = true });
+    first_live = false;
+    // The cached Definition contains counts and semantic metadata only. The
+    // surviving request still validates its independently owned actual planes.
+    try second.selected.validate(second_inputs);
+    for (second_inputs) |binding| try std.testing.expectEqual(second_plane.backing, binding.value.resident.planes[0].backing);
+}
+
+test "dense decoder packed cold bindings keep request planes independent across Definition reuse" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try packedColdBindingCase(std.testing.allocator);
+}
+
+test "dense decoder packed cold binding publication unwinds every allocation failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, packedColdBindingCase, .{});
+}

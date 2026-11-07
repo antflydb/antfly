@@ -244,3 +244,34 @@ pub fn validateDescriptor(selected: *const route.Owned, descriptor: *const ops.k
     const owner: *const Direct = @ptrCast(@alignCast(selected.context));
     if (!std.meta.eql(owner.descriptor, descriptor.*)) return error.PreparedKernelBindingChanged;
 }
+
+/// A cold-bound private Direct descriptor. The selected route/Frame owns this
+/// object; no invocation, operand span or cleanup scope is retained here.
+pub const NativeProgramBinding = struct {
+    owner: *const Direct,
+    pub fn descriptor(self: @This()) *const ops.kernel_descriptor.Descriptor {
+        return &self.owner.descriptor;
+    }
+    pub fn validateCurrentMetadata(self: @This(), slot: route.OutputSlot) !void {
+        const selected = self.owner;
+        if (!selected.support(selected.backend.ptr, &selected.descriptor) or slot.epoch != selected.slot.epoch or slot.node != selected.slot.node or slot.allocation != selected.slot.allocation or !shapeEqual(slot.logical, selected.descriptor.output_shape)) return error.PreparedKernelBindingChanged;
+    }
+};
+
+/// Native calls only after its exact canonical table check. Other providers,
+/// dynamic recipes and foreign/private route owners keep ordinary dispatch.
+pub fn bindNativeProgram(selected: *const route.Owned, backend: ops.ComputeBackend, descriptor: *const ops.kernel_descriptor.Descriptor, slot: route.OutputSlot) !?NativeProgramBinding {
+    if (backend.vtable != &@import("../ops/native_compute.zig").vtable_impl or !belongsTo(selected, backend)) return null;
+    const owner: *const Direct = @ptrCast(@alignCast(selected.context));
+    if (!owner.immutable_resources) return null;
+    try validateDescriptor(selected, descriptor);
+    const bound = NativeProgramBinding{ .owner = owner };
+    try bound.validateCurrentMetadata(slot);
+    return bound;
+}
+
+/// This is the exact predicate used by actualDense after the provider report.
+/// A canonical provider may reuse its current report without another visitor.
+pub fn densePlaneMatches(backend: ops.ComputeBackend, plane: ownership.Plane, expected: ml.graph.Shape) bool {
+    return planeDense(backend, plane, expected);
+}
