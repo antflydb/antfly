@@ -118,6 +118,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         metrics=True,
     )
     failed = True
+    last_call_ms = 0.0
     try:
         archive = server.root / "archive"
         objects = archive / "buckets/antfly/objects"
@@ -143,11 +144,13 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         )
 
         def call(method, path, body=None, allow=()):
+            nonlocal last_call_ms
             # GCS limits repeated updates to the same mutable coordination
             # object. This is a paced correctness fixture, with no retries;
             # keep unpaced throughput qualification separate.
             if provider == "gcs":
                 time.sleep(1.2)
+            request_started = time.monotonic()
             r = requests.request(
                 method,
                 server.api_url + path,
@@ -155,6 +158,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
                 timeout=60,
             )
+            last_call_ms = (time.monotonic() - request_started) * 1000
             assert r.ok or r.status_code in allow, r.text + server.debug_logs()
             value = r.json() if r.content else {}
             return r.status_code, value.get("responses", [value])[0]
@@ -310,9 +314,8 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         # The health endpoint exposes an asynchronous five-second cache.
         time.sleep(6)
         before = metrics()
-        started = time.monotonic()
         _, first = call("POST", "/query", query)
-        record_property("first_page_ms", (time.monotonic() - started) * 1000)
+        record_property("first_page_ms", last_call_ms)
         assert len(first["hits"]["hits"]) == 7
         assert "request-lake:" not in json.dumps(first)
         assert first["next_source_cursor"].startswith("source2:")
