@@ -346,11 +346,14 @@ pub fn normalizeDisabledAgreementJson(a: A, raw: []const u8, decider_path: []con
 
 const NamedAnswer = struct { name: []const u8, value: V };
 fn orderedAnswers(answers: V, storage: *[64]NamedAnswer) ![]NamedAnswer {
+    return orderedEntries(answers, "name", storage);
+}
+fn orderedEntries(answers: V, key: []const u8, storage: *[64]NamedAnswer) ![]NamedAnswer {
     if (answers != .array or answers.array.items.len == 0 or answers.array.items.len > storage.len) return error.InvalidDecisionOutput;
     const entries = storage[0..answers.array.items.len];
     for (answers.array.items, entries) |answer, *entry| {
         if (answer != .object) return error.InvalidDecisionOutput;
-        const name = answer.object.get("name") orelse return error.InvalidDecisionOutput;
+        const name = answer.object.get(key) orelse return error.InvalidDecisionOutput;
         if (name != .string or name.string.len == 0) return error.InvalidDecisionOutput;
         entry.* = .{ .name = name.string, .value = answer };
     }
@@ -481,9 +484,91 @@ pub fn responseAgreement(response: V) !?Agreement {
     if (response != .object) return error.InvalidDecisionOutput;
     const raw = response.object.get("cascade") orelse return null;
     if (raw != .object) return error.InvalidDecisionOutput;
-    const agreement = try readAgreement(raw.object) orelse return null;
+    const agreement = try readAgreement(raw.object);
     try validateReportedIdentity(raw.object);
-    try validateDisagreedQuestions(agreement, response.object.get("answers") orelse return error.InvalidDecisionOutput);
+    if (agreement) |reported| try validateDisagreedQuestions(reported, response.object.get("answers") orelse return error.InvalidDecisionOutput);
+    if (raw.object.get("stages")) |stages| {
+        if (stages != .array or stages.array.items.len == 0 or stages.array.items.len > max_stages) return error.InvalidDecisionOutput;
+        var aggregate: ?Agreement = null;
+        var final: ?std.json.ObjectMap = null;
+        for (stages.array.items, 0..) |entry, index| {
+            const fields = try object(entry);
+            const name = fields.get("name") orelse return error.InvalidDecisionOutput;
+            const method = fields.get("decision_method") orelse return error.InvalidDecisionOutput;
+            const escalated = fields.get("escalated") orelse return error.InvalidDecisionOutput;
+            if (name != .string or name.string.len == 0 or name.string.len > 64 or method != .string or
+                (!std.mem.eql(u8, method.string, "typed") and !std.mem.eql(u8, method.string, "generated")) or
+                escalated != .bool or escalated.bool != (index + 1 < stages.array.items.len)) return error.InvalidDecisionOutput;
+            for (name.string) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return error.InvalidDecisionOutput;
+            for (stages.array.items[0..index]) |previous| if (jsonEqual(previous.object.get("name").?, name)) return error.InvalidDecisionOutput;
+            const local = try readAgreement(fields);
+            if (fields.get("error")) |failure| {
+                if (failure != .string or failure.string.len == 0 or index == 0 or escalated.bool or fields.contains("answers") or fields.contains("upstream_agreement") or fields.contains("upstream_revisions")) return error.InvalidDecisionOutput;
+                if (local) |state| if (state.status != .unverified) return error.InvalidDecisionOutput;
+                aggregate = combineAgreement(aggregate, local);
+            } else {
+                final = fields;
+                const model = fields.get("model") orelse return error.InvalidDecisionOutput;
+                if (model != .string or model.string.len == 0 or !std.unicode.utf8ValidateSlice(model.string)) return error.InvalidDecisionOutput;
+                if (fields.get("model_revision")) |revision| {
+                    if (revision != .string) return error.InvalidDecisionOutput;
+                    try @import("revisions.zig").validateNode(.{ .kind = .cascade, .path = &.{}, .identity = revision.string });
+                }
+                const answers = fields.get("answers") orelse return error.InvalidDecisionOutput;
+                var storage: [64]NamedAnswer = undefined;
+                _ = try orderedAnswers(answers, &storage);
+                try validateReportedIdentity(fields);
+                if (local) |state| try validateDisagreedQuestions(state, answers);
+                const upstream = try readUpstreamAgreement(fields, answers);
+                if (blockedAgreement(upstream)) if (local) |state| if (state.status != .unverified) return error.InvalidDecisionOutput;
+                var dependencies: @import("revisions.zig").Manifest = .{};
+                try dependencies.collect(entry);
+                aggregate = combineAgreement(combineAgreement(aggregate, upstream), local);
+            }
+            if (blockedAgreement(aggregate) and escalated.bool) return error.InvalidDecisionOutput;
+        }
+        try validateAgreement(raw.object, aggregate);
+        const last = final orelse return error.InvalidDecisionOutput;
+        if (!jsonEqual(raw.object.get("answered_by") orelse return error.InvalidDecisionOutput, last.get("name").?) or
+            !jsonEqual(response.object.get("model") orelse return error.InvalidDecisionOutput, last.get("model") orelse return error.InvalidDecisionOutput)) return error.InvalidDecisionOutput;
+        const revision = last.get("model_revision");
+        const public_revision = response.object.get("model_revision");
+        if ((revision == null) != (public_revision == null)) return error.InvalidDecisionOutput;
+        if (revision) |value| if (!jsonEqual(value, public_revision.?)) return error.InvalidDecisionOutput;
+        var root_storage: [64]NamedAnswer = undefined;
+        var stage_storage: [64]NamedAnswer = undefined;
+        const root_answers = try orderedAnswers(response.object.get("answers") orelse return error.InvalidDecisionOutput, &root_storage);
+        const stage_answers = try orderedAnswers(last.get("answers").?, &stage_storage);
+        if (root_answers.len != stage_answers.len) return error.InvalidDecisionOutput;
+        for (root_answers, stage_answers) |root, stage| {
+            if (!std.mem.eql(u8, root.name, stage.name)) return error.InvalidDecisionOutput;
+            // Normalization may enrich confidence or reorder questions. The
+            // selected answer and its probability evidence must remain intact.
+            for ([_][]const u8{ "type", "choice", "probability", "probabilities", "decision_method", "probability_source", "raw_structured_answer" }) |key| {
+                const lhs = root.value.object.get(key);
+                const rhs = stage.value.object.get(key);
+                if ((lhs == null) != (rhs == null)) return error.InvalidDecisionOutput;
+                if (lhs) |value| {
+                    if (std.mem.eql(u8, key, "probabilities")) {
+                        var lstore: [64]NamedAnswer = undefined;
+                        var rstore: [64]NamedAnswer = undefined;
+                        const left = try orderedEntries(value, "value", &lstore);
+                        const right = try orderedEntries(rhs.?, "value", &rstore);
+                        if (left.len != right.len) return error.InvalidDecisionOutput;
+                        for (left, right) |l, r| {
+                            if (!std.mem.eql(u8, l.name, r.name) or
+                                (try number(l.value.object.get("probability") orelse return error.InvalidDecisionOutput)) !=
+                                    (try number(r.value.object.get("probability") orelse return error.InvalidDecisionOutput))) return error.InvalidDecisionOutput;
+                        }
+                    } else {
+                        // Evidence fields are scalar; never recursively traverse
+                        // attacker-controlled objects while checking a receipt.
+                        if (value == .array or value == .object or rhs.? == .array or rhs.? == .object or !jsonEqual(value, rhs.?)) return error.InvalidDecisionOutput;
+                    }
+                }
+            }
+        }
+    }
     return agreement;
 }
 
@@ -1579,4 +1664,36 @@ test "decision cascade malformed unscoped answers return validation errors" {
         const answers = try std.json.parseFromSliceLeaky(V, a, raw, .{});
         try std.testing.expectError(error.InvalidDecisionOutput, inBand(.{ .low = 0.3, .high = 0.9 }, answers));
     }
+}
+
+test "decision cascade reported traces enforce aggregate and final answer coherence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definition = try compileJson(a, example);
+    var fake = Fake{ .fast = &.{0.6}, .strong_same = 0.9 };
+    const result = try execute(a, &definition, "c", 1, .{ .ptr = &fake, .run = Fake.run });
+    const original = try std.json.Stringify.valueAlloc(a, result.values[0].?, .{});
+    var response = try std.json.parseFromSliceLeaky(V, a, original, .{});
+    _ = try responseAgreement(response);
+    // Confidence enrichment is presentation metadata, not a changed answer.
+    try response.object.getPtr("answers").?.array.items[0].object.put(a, "confidence", .{ .float = 0.123 });
+    _ = try responseAgreement(response);
+    const probabilities = response.object.getPtr("answers").?.array.items[0].object.getPtr("probabilities").?.array.items;
+    std.mem.swap(V, &probabilities[0], &probabilities[1]);
+    _ = try responseAgreement(response);
+    try response.object.getPtr("answers").?.array.items[0].object.put(a, "choice", .{ .string = "forged" });
+    try std.testing.expectError(error.InvalidDecisionOutput, responseAgreement(response));
+    response = try std.json.parseFromSliceLeaky(V, a, original, .{});
+    try response.object.getPtr("cascade").?.object.put(a, "answered_by", .{ .string = "fast" });
+    try std.testing.expectError(error.InvalidDecisionOutput, responseAgreement(response));
+    response = try std.json.parseFromSliceLeaky(V, a, original, .{});
+    const stages = response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items;
+    try stages[0].object.put(a, "agreement_status", .{ .string = "unverified" });
+    try std.testing.expectError(error.InvalidDecisionOutput, responseAgreement(response));
+    // Historical metadata-only summaries remain valid.
+    const summary = try std.json.parseFromSliceLeaky(V, a,
+        \\{"answers":[{"name":"same"}],"cascade":{"agreement_status":"unverified"}}
+    , .{});
+    try std.testing.expect(try agreementBlocked(summary));
 }

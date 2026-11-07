@@ -80,7 +80,7 @@ pub fn executeBatch(a: std.mem.Allocator, producer: @import("../storage/db/enric
     var scoped = context;
     const now = @import("antfly_platform").time.monotonicNs();
     for (inputs, requests, 0..) |*input, request, i| {
-        const deadline = now + @as(u64, request.timeout_ms) * std.time.ns_per_ms;
+        const deadline = try request.deadline(now);
         scoped.deadline_ns = if (scoped.deadline_ns) |caller| @min(caller, deadline) else deadline;
         input.* = .{ .producer_type = .decision, .config_json = request.specification_json, .source_text = request.input, .source_fingerprint = request.source_fingerprint, .item_id = try std.fmt.allocPrint(a, "{d}", .{i}) };
     }

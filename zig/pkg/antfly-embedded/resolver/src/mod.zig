@@ -2645,6 +2645,7 @@ pub const ResolutionStage = struct {
         var indices: std.ArrayList(usize) = .empty;
         for (prepared.items, 0..) |item, i| if (item.request) |request| {
             var bounded = request;
+            bounded.budget = budget;
             bounded.timeout_ms = budget.timeout(bounded.timeout_ms) catch {
                 prepared.items[i].evidence.status = .budget_exhausted;
                 continue;
@@ -2676,9 +2677,13 @@ pub const ResolutionStage = struct {
                             continue;
                         },
                     } };
+                    try budget.check();
                 }
                 break :blk values;
             };
+            // A callback may ignore its timeout. Never publish identities from
+            // a batch returned after the source execution deadline.
+            try budget.check();
             if (results.len != indices.items.len) return error.InvalidAdjudicationOutput;
             for (results, indices.items) |result, index| {
                 const evidence = &prepared.items[index].evidence;
@@ -2701,29 +2706,37 @@ pub const ResolutionStage = struct {
                         continue;
                     },
                 };
-                evidence.status = classifier.classify(response) catch |err| {
+                const status = classifier.classify(response) catch |err| {
                     evidence.failure = @errorName(err);
                     continue;
                 };
-                evidence.response = response;
-                if (config.tracksResponseRevisions()) {
-                    var unused: adjudication.Config.RevisionCache = .{};
-                    defer unused.deinit(a);
-                    if (try config.responseRevision(a, response, null, &unused)) |revision| {
-                        evidence.execution_hash = try fingerprintHex(a, .{ execution_hash, revision });
-                        const entry = try revision_specifications.getOrPut(a, revision);
-                        if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(a, .{ semantic_config, revision });
-                        evidence.specification_hash = entry.value_ptr.*;
+                const revision = revision: {
+                    if (config.tracksResponseRevisions()) {
+                        var cache: adjudication.Config.RevisionCache = .{};
+                        defer cache.deinit(a);
+                        break :revision config.responseRevision(a, response, null, &cache) catch |err| switch (err) {
+                            error.OutOfMemory, error.Cancelled, error.Canceled, error.Busy, error.WriterLocked, error.PromotionWriterFenceReleased => return err,
+                            else => {
+                                evidence.failure = @errorName(err);
+                                continue;
+                            },
+                        };
                     }
-                } else if (try adjudication.Config.reportedRevision(response)) |revision| {
-                    // Pin the identity actually used by execution, rather than
-                    // a discovery snapshot that may predate a model reload.
-                    evidence.execution_hash = try fingerprintHex(a, .{ base_execution_hash, revision });
-                    const entry = try revision_specifications.getOrPut(a, revision);
-                    if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(a, .{ semantic_config, revision });
+                    break :revision adjudication.Config.reportedRevision(response) catch |err| {
+                        evidence.failure = @errorName(err);
+                        continue;
+                    };
+                };
+                evidence.status = status;
+                evidence.response = response;
+                if (revision) |recorded_revision| {
+                    evidence.execution_hash = try fingerprintHex(a, .{ if (config.tracksResponseRevisions()) execution_hash else base_execution_hash, recorded_revision });
+                    const entry = try revision_specifications.getOrPut(a, recorded_revision);
+                    if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(a, .{ semantic_config, recorded_revision });
                     evidence.specification_hash = entry.value_ptr.*;
                 }
             }
+            try budget.check();
         }
         for (prepared.items) |item| {
             const entity = &@constCast(resolution.entities)[item.index];
@@ -5519,4 +5532,198 @@ test "REVIEW adjudication deadlines do not round up partial milliseconds" {
     try testing.expectError(error.Timeout, budget.timeout(10));
     Clock.value = 10 * std.time.ns_per_ms;
     try testing.expectError(error.Timeout, budget.check());
+}
+
+const AgreementUpstreamFixture = struct {
+    const cascade = @import("antfly_decisions").cascade;
+    const Fixture = RevisionedAdjudicationFixture;
+    strong: std.json.Value,
+    veto: bool,
+    fn run(ptr: *anyopaque, alloc: std.mem.Allocator, index: usize, _: cascade.Stage, indices: []const usize) !cascade.StageResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var fast = try std.json.parseFromSliceLeaky(std.json.Value, alloc, adjudication_test_response, .{});
+        try fast.object.put(alloc, "model", .{ .string = "fast" });
+        if (self.veto) {
+            const answer = &fast.object.getPtr("answers").?.array.items[0];
+            try answer.object.put(alloc, "choice", .{ .string = "different" });
+            const probabilities = answer.object.getPtr("probabilities").?.array.items;
+            try probabilities[0].object.put(alloc, "probability", .{ .float = 0.4 });
+            try probabilities[1].object.put(alloc, "probability", .{ .float = 0.6 });
+        }
+        const values = try alloc.alloc(?std.json.Value, indices.len);
+        for (values) |*value| value.* = if (index == 0) fast else self.strong;
+        const failures = try alloc.alloc(?anyerror, indices.len);
+        @memset(failures, null);
+        return .{ .values = values, .failures = failures };
+    }
+    fn response(alloc: std.mem.Allocator, cfg: adjudication.Config, revision: [32]u8, veto: bool) !std.json.Value {
+        const definition = try cascade.compile(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+            \\{"stages":[{"name":"fast","decider":{"provider":"jev","model":"fast"}},{"name":"strong","decider":{"decision_method":"generated","generator":{"model":"leaf-a"}},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}
+        , .{}));
+        var self: @This() = .{ .strong = try Fixture.response(alloc, cfg, revision, "leaf-a", false), .veto = veto };
+        const result = try cascade.execute(alloc, &definition, "upstream", 1, .{ .ptr = &self, .run = run });
+        const value = result.values[0].?;
+        _ = try cascade.validateTrace(&definition, value);
+        return value;
+    }
+};
+
+test "REVIEW contradictory upstream aggregate cannot accept" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = RevisionedAdjudicationFixture;
+    const Upstream = AgreementUpstreamFixture;
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    );
+    defer config.deinit();
+
+    var fixture = Fixture{};
+    var response = try Upstream.response(scratch, config.value, fixture.revision, true);
+    try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(scratch, config.value, response));
+    const aggregate = response.object.getPtr("cascade").?;
+    try aggregate.object.put(scratch, "agreement_status", .{ .string = "agreed" });
+    try aggregate.object.put(scratch, "agreed", .{ .bool = true });
+    _ = aggregate.object.swapRemove("disagreed_questions");
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    var parsed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+    defer parsed.deinit();
+    try testing.expectEqual(Decision.review, parsed.entities[0].decision);
+}
+
+test "REVIEW batched inference rejects answers beyond the shared deadline" {
+    const a = testing.allocator;
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        var clock: u64 = 0;
+        fn now() u64 {
+            return clock;
+        }
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            try testing.expect(request.budget != null);
+            clock += 11 * std.time.ns_per_ms;
+            return alloc.dupe(u8, adjudication_test_response);
+        }
+        fn batch(_: *anyopaque, alloc: std.mem.Allocator, requests: []const adjudication.Request) ![]adjudication.Result {
+            const out = try alloc.alloc(adjudication.Result, requests.len);
+            for (requests, out) |request, *result| {
+                try testing.expectEqual(@as(u32, 10), request.timeout_ms);
+                // Simulate a callback ignoring the shared deadline.
+                try testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), request.budget.?.deadline_ns);
+                clock += 9 * std.time.ns_per_ms;
+                result.* = .{ .value = try alloc.dupe(u8, adjudication_test_response) };
+            }
+            return out;
+        }
+    };
+    Fixture.clock = 0;
+    const cfg = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"timeout_ms":10,"budget_ms":10}
+    );
+    defer cfg.deinit();
+    var fixture = Fixture{};
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e1\",\"label\":\"concept\",\"text\":\"Antfly database one\"},{\"id\":\"e2\",\"label\":\"concept\",\"text\":\"Antfly database two\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = .{ .ptr = &fixture, .execute = Fixture.execute, .execute_batch = Fixture.batch }, .now_ns = Fixture.now, .work_retention = .none };
+    try testing.expectError(error.Timeout, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+    try testing.expect(map.map.get("resolution") == null);
+    try testing.expectEqual(@as(u64, 18 * std.time.ns_per_ms), Fixture.clock);
+    // Serial callbacks have the same completion fence, including mint policy.
+    Fixture.clock = 0;
+    stage.adjudicator.?.execute_batch = null;
+    stage.adjudicate.?.on_failure = .mint;
+    const committed = "{\"config_generation\":0,\"entities\":[]}";
+    try map.store().put("resolution", committed);
+    try testing.expectError(error.Timeout, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+    try testing.expectEqualStrings(committed, map.map.get("resolution").?);
+    try testing.expectEqual(@as(u64, 11 * std.time.ns_per_ms), Fixture.clock);
+}
+
+test "REVIEW malformed dependencies are isolated within adjudication batches" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Upstream = AgreementUpstreamFixture;
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    );
+    defer config.deinit();
+
+    const Batch = struct {
+        base: AdjudicationFixture = .{},
+        good: std.json.Value,
+        bad: std.json.Value,
+        calls: usize = 0,
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: adjudication.Request) ![]u8 {
+            return error.UnexpectedSerialInvocation;
+        }
+        fn batch(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const adjudication.Request) ![]adjudication.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += requests.len;
+            const out = try alloc.alloc(adjudication.Result, requests.len);
+            for (out, 0..) |*item, i| item.* = .{ .value = try std.json.Stringify.valueAlloc(alloc, if (i == 0) self.good else self.bad, .{}) };
+            return out;
+        }
+    };
+    const good = try Upstream.response(scratch, config.value, @splat(0xaa), false);
+    var bad = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, good, .{}), .{});
+    // A malformed dependency projection can pass answer classification. Its
+    // recording failure must remain local to this row and leave no response.
+    _ = bad.object.swapRemove("cascade");
+    try bad.object.put(scratch, "upstream_revisions", .{ .bool = false });
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, config.value, bad));
+    var batcher = Batch{ .good = good, .bad = bad };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e1\",\"label\":\"concept\",\"text\":\"Antfly database one\"},{\"id\":\"e2\",\"label\":\"concept\",\"text\":\"Antfly database two\"}]}");
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = .{ .ptr = &batcher, .execute = Batch.execute, .execute_batch = Batch.batch }, .work_retention = .none };
+    _ = stage.run(a, map.store(), batcher.base.provider(), "source", "resolution") catch |err| {
+        return err;
+    };
+    var parsed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+    defer parsed.deinit();
+    try testing.expectEqual(Decision.match, parsed.entities[0].decision);
+    try testing.expectEqual(Decision.review, parsed.entities[1].decision);
+    try testing.expectEqual(adjudication.Status.failed, parsed.entities[1].adjudication.?.status);
+    try testing.expect(parsed.entities[1].adjudication.?.response == null);
+    try testing.expect(parsed.entities[1].adjudication.?.failure != null);
+}
+
+test "REVIEW executor deadlines preserve the shared budget across clock domains" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    const budget = adjudication.ExecutionBudget.init(Clock.now, 10);
+    const request: adjudication.Request = .{ .specification_json = "", .input = "", .source_fingerprint = "", .timeout_ms = 10, .budget = budget };
+    Clock.value = 9 * std.time.ns_per_ms;
+    const host_now = 1000 * std.time.ns_per_ms;
+    try testing.expectEqual(host_now + std.time.ns_per_ms, try request.deadline(host_now));
+    Clock.value = 10 * std.time.ns_per_ms;
+    try testing.expectError(error.Timeout, request.deadline(host_now));
 }

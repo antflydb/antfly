@@ -502,10 +502,24 @@ pub const Evidence = struct {
 };
 
 pub const Request = struct {
+    /// Shared source deadline, including preparation and earlier requests.
+    budget: ?ExecutionBudget = null,
     specification_json: []const u8,
     input: []const u8,
     source_fingerprint: []const u8,
     timeout_ms: u32,
+
+    /// Translate remaining source time into the host's monotonic clock domain.
+    /// Capture host_now before calling this so dispatch never extends the budget.
+    pub fn deadline(self: Request, host_now: u64) !u64 {
+        var end = host_now +| @as(u64, self.timeout_ms) * std.time.ns_per_ms;
+        if (self.budget) |budget| {
+            const current = budget.now();
+            if (current >= budget.deadline_ns) return error.Timeout;
+            end = @min(end, host_now +| (budget.deadline_ns - current));
+        }
+        return end;
+    }
 };
 pub const Result = union(enum) { value: []u8, failure: []const u8 };
 pub const Executor = struct {

@@ -309,7 +309,10 @@ question names, and available cascade identity. They do not recursively embed
 upstream traces or claim to verify the upstream definition. A local required
 comparison is `unverified` when its upstream abstains; the aggregate retains the
 upstream veto. Resolver policies honor this abstention even when they use a
-plain typed proxy and `on_failure: mint`.
+plain typed proxy and `on_failure: mint`. When an upstream response supplies a
+full trace, its bounded stage structure, aggregate status, revision metadata,
+and final answer must be coherent. Metadata-only legacy summaries remain
+supported; upstream policy definitions are not reconstructed locally.
 
 For `provider: antfly`, the default `typed` method selects the Decisions
 transport. A remote named decider may return typed or generated answers,
@@ -370,7 +373,11 @@ mention can also prove invalidation. Ambiguous legacy bindings remain preserved
 until they can be verified or explicitly invalidated by a new configuration.
 Revision discovery and inference share one monotonic deadline, narrowed by any
 cascade deadline. Each lookup receives only the remaining whole milliseconds;
-discovery exhaustion preserves committed evidence. A validated recorded veto
+discovery exhaustion preserves committed evidence. Executor requests also carry
+the shared budget; serial and batch completion checks reject late results with
+`Timeout` before publishing any identity decisions, including under
+`on_failure: mint`. Malformed dependency metadata fails only its own batch row,
+without discarding healthy sibling results. A validated recorded veto
 can still retract an older accepted verdict to REVIEW.
 
 Stage traces include `model_revision` when the provider reports an immutable
