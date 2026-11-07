@@ -70,6 +70,27 @@ pub const Stage = enum(u8) {
     // distinct from `PersistentIndex`'s own segment-admission WAL (`.lsm_wal`
     // above).
     lsm_backend_wal,
+    // graph/graph.zig's GraphIndex.applyMutationPage: the outgoing
+    // (forward-adjacency) store's commit and the reverse (incoming-
+    // adjacency) store's commit. Distinct tags so the two-store commit
+    // shape (one native commit per store today, collapsing toward one
+    // physical sync under `.native_catalog` via ride-along) is visible
+    // separately in the report. Only this function's own commits are
+    // tagged; GraphIndex's other ~140 `beginWriteReverseBatch`/
+    // `beginWriteOutgoingBatch` call sites (maintenance, metric builds,
+    // topology compaction, ownership transfer) are background work and
+    // fall through to whatever generic tag their backend's own leaf I/O
+    // already pushes (`lsm_backend_wal`/`vfs_*`/`other`).
+    graph_forward_commit,
+    graph_reverse_commit,
+    // storage/db/maintenance/graph_metric_runtime.zig's per-tick worker
+    // checkpoint commit.
+    graph_metric_commit,
+    // Graph artifact-sourced edge materialization (asset/chunk-derived
+    // extraction graph ingestion), analogous to `.artifact_stage`/
+    // `.artifact_link` for text segments. Zero for the write-amplification
+    // harness's caller-supplied (no-inference) edge writes.
+    graph_artifact,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;

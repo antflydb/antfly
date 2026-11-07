@@ -147062,6 +147062,272 @@ test "db manual text producers merge capacity without optional workers visibilit
     try std.testing.expectEqual(@as(i64, 1), completed.value.object.get("count").?.integer);
 }
 
+// Bug repro: a `.full_text` write whose visibility wait times out
+// (`error.CommitVisibilityNotSatisfied` -- the primary write is still
+// durable; only the derived/full-text wait missed its deadline) must not
+// leave `close()` hanging forever. Previously, `DB.close()` -> ... ->
+// `maintenance_scheduler.Scheduler.destroy()` parked forever waiting for
+// `tasks.items.len == 0`: some registration made reachable from the
+// visibility-wait path was never `Handle.await()`'d/`cancel()`'d once the
+// wait itself gave up at its deadline. Run `close()` on its own thread with
+// a bounded deadline so a regression here fails the test instead of
+// hanging the whole suite forever.
+test "full_text visibility wait timeout does not hang DB.close" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("bug1-shutdown-hang");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .io_threaded },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    // Deterministically force the visibility wait below to miss its
+    // deadline: pause the full-text derived worker so it can never advance
+    // past this write (mirrors `io_threaded_runtime.zig`'s own "paused"
+    // worker tests), then shrink the wait timeout to effectively zero.
+    try std.testing.expect(try db.executor.pauseWorker("ft_v1"));
+    test_visibility_wait_timeout_ms = 1;
+    defer test_visibility_wait_timeout_ms = null;
+
+    const request: types.BatchRequest = .{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"beta\"}" }},
+        .sync_level = .full_text,
+    };
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batch(request));
+
+    const Closer = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.db.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            // Closing is stuck: detach rather than join (it may never
+            // return) and fail loudly instead of hanging the whole suite.
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    db_open = false;
+}
+
+// Bug repro, variant 2: same shape as "db manual text producers merge
+// capacity without optional workers visibility timeout preserves a
+// committed transform" above, but instead of releasing the held producer
+// permit and draining before `close()`, close immediately while the permit
+// (and whatever admission/registration its holder's visibility wait left
+// behind) is still outstanding -- the state an abrupt shutdown right after
+// a timed-out `.full_text` write would actually observe.
+test "full_text visibility wait timeout via text merge backpressure does not hang DB.close" {
+    const alloc = std.testing.allocator;
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("bug1-shutdown-hang-2");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .manual },
+        .start_optional_runtime_workers = false,
+        .text_merge = .{ .enabled = true, .max_pending_segments = 12, .max_pending_bytes = 0, .backpressure_max_wait_ms = 100 },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"body\":\"counter\",\"count\":0}" }}, .sync_level = .write });
+    // Deliberately never released: this test exercises `close()` while the
+    // permit (and whatever state its holder's timed-out visibility wait
+    // left behind) is still outstanding, matching an abrupt shutdown right
+    // after a timed-out `.full_text` write. Releasing it would require the
+    // runtime `close()` is tearing down, so this is not a leak either way:
+    // `held` is a plain stack value with no allocation of its own.
+    var held = try db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 12, 0);
+    _ = &held;
+    const request: types.BatchRequest = .{
+        .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }},
+        .sync_level = .full_text,
+    };
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batch(request));
+
+    const Closer = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.db.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    db_open = false;
+}
+
+// Bug repro, variant 3: a zero-length deadline with the derived worker
+// healthy and actively racing to catch up (not paused) -- closing right as
+// background `.full_text` work is in flight for the write whose foreground
+// wait just gave up.
+test "full_text visibility wait timeout with an active derived worker does not hang DB.close" {
+    const alloc = std.testing.allocator;
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("bug1-shutdown-hang-3");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .io_threaded },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    test_visibility_wait_timeout_ms = 0;
+    defer test_visibility_wait_timeout_ms = null;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        defer alloc.free(key);
+        const request: types.BatchRequest = .{
+            .writes = &.{.{ .key = key, .value = "{\"body\":\"beta gamma delta\"}" }},
+            .sync_level = .full_text,
+        };
+        db.batch(request) catch |err| switch (err) {
+            error.CommitVisibilityNotSatisfied => {},
+            else => return err,
+        };
+    }
+
+    const Closer = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.db.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    db_open = false;
+}
+
+// Bug repro, variant 4: a *real*, scheduler-registered text-merge worker
+// (optional runtime workers on, matching production defaults) rather than
+// the manual-producer-assistance mode variant 2 above exercises. The
+// producer permit is held externally (as if a `.full_text` write's
+// visibility wait had just timed out while backpressured) and never
+// released before `close()`.
+test "full_text visibility wait timeout with a live text-merge worker does not hang DB.close" {
+    const alloc = std.testing.allocator;
+    var runtime_owner = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime_owner.deinit();
+    var path_tmp = try TestDirectory.init("bug1-shutdown-hang-4");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime_owner.ptr(),
+        .executor = .{ .backend = .io_threaded },
+        .text_merge = .{ .enabled = true, .max_pending_segments = 12, .max_pending_bytes = 0, .backpressure_max_wait_ms = 100 },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"body\":\"counter\",\"count\":0}" }}, .sync_level = .write });
+    try std.testing.expect(db.text_merge_runtime.?.isStarted());
+
+    // Claim the whole segment budget before the live worker has a chance to
+    // reserve any of it itself (unlike variant 2's manual-mode runtime,
+    // which never races this acquire).
+    var held = held_loop: for (0..200) |_| {
+        break :held_loop db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 12, 0) catch |err| switch (err) {
+            error.TextMergeBackpressureTimeout => {
+                std.Thread.yield() catch {};
+                continue;
+            },
+            else => return err,
+        };
+    } else return error.TextMergeBackpressureTimeout;
+    _ = &held;
+    const request: types.BatchRequest = .{
+        .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }},
+        .sync_level = .full_text,
+    };
+    // With a live, scheduler-registered worker (unlike variant 2's manual
+    // mode) the backpressure timeout can surface either wrapped (primary
+    // already committed) or bare (admission blocked before the primary
+    // write landed) depending on exactly when the worker's own activity
+    // interleaves with this call; either way the point of this test is
+    // that `close()` afterward must not hang.
+    db.batch(request) catch |err| switch (err) {
+        error.CommitVisibilityNotSatisfied, error.TextMergeBackpressureTimeout => {},
+        else => return err,
+    };
+
+    const Closer = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.db.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    db_open = false;
+}
+
 test "transient leann re-embedding renders templates through content parts like the producer" {
     const alloc = std.testing.allocator;
     const Probe = struct {

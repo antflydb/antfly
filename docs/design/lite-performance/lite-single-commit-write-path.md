@@ -229,6 +229,13 @@ Dense vectors (HBC), sparse vectors and graph indexes follow the same design as 
 - **Inline publication.** When a write supplies its own vectors or edges and its sync level covers the index, the publication rides in the primary write's transaction through the same contributor list as full-text.
 - **Generated embeddings.** Writes whose vectors must be generated stay asynchronous through enrichment. Inference never runs inside a commit.
 
+### 3.3b Algebraic indexes
+
+Algebraic indexes (`storage/db/algebraic/`) are built differently. They write facts straight into the primary DocStore rather than into a nested LSM, so the fix is the commit pattern, not a backend swap:
+
+- **Synchronous apply.** An algebraic apply for a synchronous write becomes a `commit_participant` contributor. Its facts and progress land in the primary write's own native transaction.
+- **Background work.** HLL maintenance, adaptive backfill and dematerialization, and join-fact upkeep become demand-driven ride-along commits.
+
 ### 3.4 Progress separated from status
 
 **Progress:**
