@@ -495,20 +495,29 @@ function relationalNumberReplacer(_key: string, value: unknown): unknown {
 
 export async function readLimitedResponseBytes(
   response: Response,
-  maxBytes: number
+  maxBytes: number,
+  signal?: AbortSignal
 ): Promise<{ bytes: Uint8Array<ArrayBuffer>; truncated: boolean }> {
   if (!response.body) {
+    signal?.throwIfAborted();
     return { bytes: new Uint8Array(0), truncated: false };
   }
 
   const reader = response.body.getReader();
+  const onAbort = () => {
+    void reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   const chunks: Uint8Array[] = [];
   let total = 0;
   let truncated = false;
 
   try {
     while (true) {
+      signal?.throwIfAborted();
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       const remaining = maxBytes - total;
       if (remaining <= 0) {
@@ -525,6 +534,7 @@ export async function readLimitedResponseBytes(
       total += value.byteLength;
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     if (truncated) {
       try {
         await reader.cancel();
@@ -546,9 +556,10 @@ export async function readLimitedResponseBytes(
 
 export async function readLimitedResponseText(
   response: Response,
-  maxBytes: number
+  maxBytes: number,
+  signal?: AbortSignal
 ): Promise<{ text: string; truncated: boolean }> {
-  const { bytes, truncated } = await readLimitedResponseBytes(response, maxBytes);
+  const { bytes, truncated } = await readLimitedResponseBytes(response, maxBytes, signal);
   return { text: new TextDecoder().decode(bytes), truncated };
 }
 

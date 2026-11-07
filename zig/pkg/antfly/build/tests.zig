@@ -5408,6 +5408,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone tokenizer bridge enforces growth and permits exact teardown",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone resolves the default secret store before full config parsing",
+            "standalone without config supplies default artifact collection policy",
             "standalone runtime secret store follows projected symlink rotation",
             "standalone runtime secret store writes preserve symlinks across target rotation",
             "standalone default secret store follows projected symlink rotation",
@@ -5453,6 +5454,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // Native Linux has its own measured inline-inference owner profile.
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("standalone-runtime-owner-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024),
     });
+    const standalone_config_tests = b.addTest(.{
+        .name = "standalone-config-tests",
+        .root_module = lib_standalone_runtime_test_mod,
+        .filters = &.{"standalone without config supplies default artifact collection policy"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, 8) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-standalone-config-test", "Verify standalone default and explicit artifact collection policy")
+        .dependOn(&addCuratedTestRunArtifact(b, standalone_config_tests, &.{"standalone without config supplies default artifact collection policy"}).step);
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
@@ -7178,6 +7188,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_graph_publication.",
             "storage.db.artifact_inventory.",
             "storage.db.artifact_native_stream.",
+            "storage.db.artifact_producer_context.",
             "storage.db.artifact_producer_dispatch.",
             "storage.db.artifact_producer_input.",
             "storage.db.artifact_producer_obligations.",
@@ -7371,6 +7382,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_index_system_test.",
             "storage.db.relational_constraint_jobs.",
             "storage.db.relational_integrity.",
+            "storage.db.relational_integrity_json.",
             "storage.db.relational_integrity_contract.",
             "storage.db.relational_integrity_topology_contract.",
             "storage.db.relational_transition_contract.",

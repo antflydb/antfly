@@ -17396,7 +17396,7 @@ export interface components {
             content_type_field?: string;
             /** @description Row field holding the source ETag. */
             etag_field?: string;
-            /** @description Row field holding the source checksum. */
+            /** @description Row field holding the source checksum. May name a dotted path (e.g. `metadata.sha256`) to reach a value nested under another row field. */
             checksum_field?: string;
             /** @description Row field holding the source version. */
             version_field?: string;
@@ -17757,6 +17757,11 @@ export interface components {
             etag?: string;
             /** @description Static checksum recorded as source version metadata. */
             checksum?: string;
+            /**
+             * @description Declares that `checksum` (or the row value named by `source.checksum_field`) is a digest of the original bytes, computed with this algorithm. When set and the row carries a well-formed digest, extraction identifies the row by that digest instead of by its location (URL, ETag, version, last-modified), so copying, re-hosting, or renaming a source does not force re-extraction as long as the bytes are unchanged. The downloaded bytes are verified against the declared digest; a mismatch fails extraction instead of keeping stale output alive. A present but malformed digest is also an error, never a silent fall back to location-based identity. Leaving this unset preserves prior behavior byte for byte, including for rows that only set `checksum_field`.
+             * @enum {string}
+             */
+            checksum_algorithm?: "sha256";
             /** @description Static source version. Together with the other metadata it lets extraction skip unchanged sources. */
             version?: string;
             /** @description Static last-modified timestamp recorded as source version metadata. */

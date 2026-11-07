@@ -258,7 +258,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_bge_m3_e2e_bench_tests = checks.bge_benchmark;
     const test_step = ctx.step("test", "Run unit tests");
     const media_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/src/inference.zig" })),
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/inference_test_root.zig" })),
         .target = ctx.target,
         .optimize = ctx.optimize,
     }) });
