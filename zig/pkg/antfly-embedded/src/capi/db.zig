@@ -884,7 +884,7 @@ pub const HandleGuard = struct {
         // reacquire below only needs to take `connection.mutex` back.
         if (self.path_lease) |lease| {
             var owned = lease;
-            if (connection.gate.mutex.retainForWaiter(io, &owned)) {
+            if (connection.gate.mutex.retainForWaiter(io, &owned, connection.storeIdentity())) {
                 // Handing the lease to another same-process caller also
                 // hands it the right to call `refresh`/`pin` -> `attach` on
                 // this shared `Connection`, which asserts nothing is
@@ -1005,7 +1005,7 @@ pub const HandleGuard = struct {
                 var owned = lease;
                 // A thread of this process queued for the gate takes the
                 // lease as is, unless another process is waiting for it.
-                if (!(guard.connection_gate_held and connection.gate.mutex.retainForWaiter(io, &owned))) owned.close();
+                if (!(guard.connection_gate_held and connection.gate.mutex.retainForWaiter(io, &owned, connection.storeIdentity()))) owned.close();
             }
             if (guard.connection_gate_held) connection.gate.mutex.unlock(io);
             if (writer_lane_owes_connection_mutex_release) connection.mutex.unlock(io);

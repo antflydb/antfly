@@ -70,6 +70,17 @@ pub const AllocatorWork = struct {
     reuse_lock_refusals: u64 = 0,
     appended_pages: u64 = 0,
     reuse_blocked_append_pages: u64 = 0,
+    /// Full `reader_epochs` namespace opens (parent/directory/identity
+    /// resolved from scratch): once per `NativeFile`, plus once per rebind
+    /// or externally-moved parent directory. Test-observable proof that the
+    /// namespace cache amortizes this across commits instead of paying it
+    /// on every one.
+    reader_namespace_opens: u64 = 0,
+    /// Full `reader_epochs.scanCached` directory scans (iterate + trylock
+    /// every marker). O(1) per commit regardless of registered-reader count
+    /// as long as the readers directory's membership is unchanged between
+    /// commits; see `NativeFile.scanReaderEpochsCached`.
+    reader_namespace_full_scans: u64 = 0,
 
     pub fn absorb(self: *AllocatorWork, source: *AllocatorWork) void {
         if (self == source) return;
