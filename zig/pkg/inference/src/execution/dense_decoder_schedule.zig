@@ -336,7 +336,6 @@ pub const Schedule = struct {
     descriptors: []?ops.kernel_descriptor.Descriptor,
     values: []?CT,
     steps: []Node,
-    root: *physical.Pool,
     selected: *@import("prepared_routes.zig").PreparedRoutes,
     frame: ?*physical.Frame = null,
     numerical_epoch: ?@import("retirement_sink.zig").Epoch = null,
@@ -373,7 +372,7 @@ pub const Schedule = struct {
         }
         self.bindings = try builder.bindings.toOwnedSlice(a);
         errdefer a.free(self.bindings);
-        self.root = (definition.layout.createPool(a, &self.graph, &.{&self.backend}, self.descriptors) catch |err| switch (err) {
+        var private_pool: ?*physical.Pool = (definition.layout.createPool(a, &self.graph, &.{&self.backend}, self.descriptors) catch |err| switch (err) {
             error.PhysicalOutputLayoutChanged => fallback: {
                 var fresh = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
                 defer fresh.deinit();
@@ -381,13 +380,12 @@ pub const Schedule = struct {
             },
             else => return err,
         }) orelse return error.UnsupportedDenseSchedule;
-        errdefer self.root.deinit();
-        self.root.coverage_graph = &self.graph;
-        self.root.coverage_reachable = self.analysis.reachable;
-        self.root.coverage_backend = self.backend;
-        self.root.native_frame_dispatch = true;
-        try self.root.configureRoutes(builder.immutable_resident.items);
-        self.selected = (try self.root.prepareRoutesWithPolicy(self.bindings, .compatibility_regions)) orelse return error.UnsupportedDenseSchedule;
+        errdefer if (private_pool) |pool| pool.deinit();
+        private_pool.?.coverage_graph = &self.graph;
+        private_pool.?.coverage_reachable = self.analysis.reachable;
+        private_pool.?.coverage_backend = self.backend;
+        private_pool.?.native_frame_dispatch = true;
+        self.selected = (try physical.Pool.preparePrivateNativeConsuming(&private_pool, builder.immutable_resident.items, self.bindings)) orelse return error.UnsupportedDenseSchedule;
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.UnsupportedDenseSchedule;
         // A ready authored plan owns its complete cold resource recipe before
@@ -400,7 +398,6 @@ pub const Schedule = struct {
         return self;
     }
     pub fn setHostWorkspaceAllocator(self: *Schedule, backing: std.mem.Allocator) !void {
-        try self.root.setDeclaredHostWorkspaceAllocator(backing);
         try self.selected.pool.setDeclaredHostWorkspaceAllocator(backing);
     }
     pub fn enter(self: *Schedule, capability: ?@import("storage_admission.zig").Capability, current: Cleanup, host_inputs: []const @import("host_ingress.zig").Input) !void {
@@ -458,7 +455,6 @@ pub const Schedule = struct {
     pub fn deinit(self: *Schedule, current: Cleanup) void {
         if (self.frame) |frame| _ = frame.finishWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.selected.releaseWithCleanup(current);
-        self.root.deinitWithCleanup(current);
         if (self.numerical_epoch) |*epoch| epoch.release();
         self.numerical_epoch = null;
         self.borrowed.deinit(self.allocator);

@@ -19176,7 +19176,7 @@ fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
     const frame = program.schedule.frame.?;
     try std.testing.expect(program.schedule.selected.pool.storage_requirement != null);
     try std.testing.expectEqual(program.schedule.selected.pool.plan.allocations.len, program.schedule.selected.pool.storage_requirement_bounds.len);
-    const immutable = program.schedule.root.immutable_bindings orelse return error.MissingWhisperSourceBindings;
+    const immutable = program.schedule.selected.pool.immutable_bindings orelse return error.MissingWhisperSourceBindings;
     for (immutable.entries) |binding| {
         try std.testing.expect(binding.value == .resident);
         const facts = binding.value.resident;

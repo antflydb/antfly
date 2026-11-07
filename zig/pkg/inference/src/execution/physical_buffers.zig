@@ -733,6 +733,33 @@ pub const Pool = struct {
         self.variant_cache = cache;
     }
 
+    /// Consume only a fresh, exclusively owned canonical Native metadata Pool.
+    /// Unsupported pools are untouched. On error the caller still owns the
+    /// possibly partially prepared Pool and must destroy it, not retry it.
+    /// Only successful PreparedRoutes publication clears the caller's pointer.
+    pub fn preparePrivateNativeConsuming(owner: *?*Pool, immutable_inputs: []const route.InputBinding, inputs: []const route.InputBinding) !?*prepared_routes.PreparedRoutes {
+        const self = owner.* orelse return null;
+        const backend = self.coverage_backend orelse return null;
+        const graph = self.coverage_graph orelse return null;
+        const reachable = self.coverage_reachable orelse return null;
+        const canonical = &@import("../ops/native_compute.zig").vtable_impl;
+        if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or !self.native_frame_dispatch or self.cuda_frame_dispatch or self.metal_frame_dispatch or
+            backend.vtable != canonical or self.backends.len != 1 or self.backends[0].vtable != canonical or self.backends[0].ptr != backend.ptr or
+            reachable.len != graph.nodeCount() or self.kernels.len != graph.nodeCount() or
+            self.frames.items.len != 0 or self.pending_frames != 0 or self.prepared_backings.load(.acquire) or
+            self.immutable_bindings != null or self.variant_cache != null or self.selection != null or self.route_owner != null or self.root_pool != null or
+            self.region_owner != null or self.regions.len != 0 or self.region_by_node.len != 0 or self.region_runtime_last_use.len != 0 or
+            self.region_policy != .select_regions or self.region_execution_profile != .unknown or self.managed_terminal_eligible or
+            self.replay_config != null or self.replay_backend != null or self.replay_inputs.len != 0 or self.replay_outputs.len != 0 or self.replay_input_indices.len != 0 or self.replay_kernel_count != 0 or
+            self.literal_store != null or self.host_input_plans.len != 0 or self.storage_requirement != null or self.storage_requirement_bounds.len != 0 or self.host_workspace_allocator != null) return null;
+        for (self.transfers) |transfer| if (transfer != null) return null;
+        for (self.plan.allocations) |allocation| if (allocation.backend != .native) return null;
+        self.immutable_bindings = try prepared_routes.ImmutableBindings.create(self.allocator, immutable_inputs);
+        const selected = (try finishPreparedVariant(self, inputs, .compatibility_regions, .unknown, null)) orelse return null;
+        owner.* = null;
+        return selected;
+    }
+
     pub fn prepareRoutes(self: *Pool, inputs: []const route.InputBinding) !?*prepared_routes.PreparedRoutes {
         return self.prepareRoutesWithPolicy(inputs, .select_regions);
     }
@@ -1015,11 +1042,17 @@ pub const Pool = struct {
         // This later defer runs before child errdefer; callbacks never execute
         // under the snapshot gate, including candidate-allocation failures.
         defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        return finishPreparedVariant(child, inputs, policy, profile, metadata.token());
+    }
+
+    // One finalizer owns selection, resource recipes, ingress and coverage for
+    // both cached variants and exclusively owned private Native schedules.
+    fn finishPreparedVariant(child: *Pool, inputs: []const route.InputBinding, policy: @import("region_route.zig").SelectionPolicy, profile: @import("region_route.zig").ExecutionProfile, authority: ?@import("backend_operation.zig").Borrowed) !?*prepared_routes.PreparedRoutes {
         child.region_policy = policy;
         child.region_execution_profile = profile;
         try @import("reachable_projection.zig").deactivate(child);
-        child.selection = try RouteSelection.createWithAuthority(child, inputs, metadata.token());
-        if (policy == .select_regions) try child.prepareRegionsWithAuthority(metadata.token());
+        child.selection = try RouteSelection.createWithAuthority(child, inputs, authority);
+        if (policy == .select_regions) try child.prepareRegionsWithAuthority(authority);
         const capture_supported = try child.applyRouteRequirements();
         try child.recomputeHostWorkspace();
         try child.prepareHostIngress();
@@ -1039,13 +1072,13 @@ pub const Pool = struct {
         };
         try @import("reachable_projection.zig").refine(child);
         child.payload_coverage = if (child.cuda_frame_dispatch or child.metal_frame_dispatch)
-            @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, metadata.token())
+            @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, authority)
         else
             @import("owned_coverage.zig").assess(child);
         const immutable = child.immutable_bindings orelse return error.MissingImmutableKernelBindings;
         // Epoch is identity, not a hash of equivalent metadata. Every cache hit
         // still calls full backend matches and validates its concrete policy.
-        return try prepared_routes.PreparedRoutes.create(root.allocator, child, immutable, child.selection.?.epoch);
+        return try prepared_routes.PreparedRoutes.create(child.allocator, child, immutable, child.selection.?.epoch);
     }
 
     fn currentRegionPolicy(self: *const Pool, backend_index: usize) !u64 {
@@ -4067,4 +4100,143 @@ test "pending exact managed operation blocks warm credit and sole-bank reuse unt
     if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
     try TerminalReuseFixture.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, TerminalReuseFixture.run, .{});
+}
+
+fn privateNativePreparationCase(a: std.mem.Allocator) !void {
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const input_node = try builder.parameter("x", shape);
+    const output_node = try builder.neg(input_node);
+    try graph.markOutput(output_node);
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&backend}, .{}, false);
+    defer layout.deinit();
+    var owned: ?*Pool = (try layout.createPool(a, &graph, &.{&backend}, null)) orelse return error.MissingPhysicalPool;
+    defer if (owned) |pool| pool.deinit();
+    const original = owned.?;
+    original.coverage_graph = &graph;
+    original.coverage_reachable = analysis.reachable;
+    original.coverage_backend = backend;
+    original.native_frame_dispatch = true;
+    const facts = [_]route.InputBinding{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = true } } }};
+    // Every pre-entry refusal retains the exact fresh caller-owned pool and
+    // creates neither binding owners nor a variant cache. No opaque provider
+    // access is needed to reject a copied implementation table.
+    inline for (.{ "copied", "parent", "cache", "frame", "backed", "borrowed", "async", "replay", "region" }) |guard| {
+        var copied = backend.vtable.*;
+        std.mem.doNotOptimizeAway(&copied);
+        if (comptime std.mem.eql(u8, guard, "copied")) {
+            try std.testing.expect(&copied != backend.vtable);
+            original.backends[0].vtable = &copied;
+        }
+        if (comptime std.mem.eql(u8, guard, "parent")) original.root_pool = original;
+        if (comptime std.mem.eql(u8, guard, "cache")) original.variant_cache = @ptrFromInt(16);
+        if (comptime std.mem.eql(u8, guard, "frame")) original.pending_frames = 1;
+        if (comptime std.mem.eql(u8, guard, "backed")) original.prepared_backings.store(true, .release);
+        if (comptime std.mem.eql(u8, guard, "borrowed")) original.owns_plan = false;
+        if (comptime std.mem.eql(u8, guard, "async")) original.cuda_frame_dispatch = true;
+        if (comptime std.mem.eql(u8, guard, "replay")) original.replay_backend = 0;
+        if (comptime std.mem.eql(u8, guard, "region")) original.region_policy = .compatibility_regions;
+        const declined = try Pool.preparePrivateNativeConsuming(&owned, &.{}, &facts);
+        try std.testing.expect(declined == null);
+        try std.testing.expect(owned.? == original);
+        try std.testing.expect(original.immutable_bindings == null);
+        original.backends[0].vtable = backend.vtable;
+        original.root_pool = null;
+        original.variant_cache = null;
+        original.pending_frames = 0;
+        original.prepared_backings.store(false, .release);
+        original.owns_plan = true;
+        original.cuda_frame_dispatch = false;
+        original.replay_backend = null;
+        original.region_policy = .select_regions;
+    }
+    const plan_slots = original.plan.slots.ptr;
+    const kernel_metadata = original.kernels.ptr;
+    const ledger = original.accounting;
+    const selected = Pool.preparePrivateNativeConsuming(&owned, &.{}, &facts) catch |err| {
+        // Allocation failures may leave partial selection/ingress metadata,
+        // but never transfer or destroy the caller's Pool. Its defer owns all
+        // successfully installed pieces, including ImmutableBindings.
+        try std.testing.expect(owned.? == original);
+        try std.testing.expect(original.route_owner == null);
+        try std.testing.expect(original.variant_cache == null);
+        return err;
+    };
+    const private = selected orelse return error.MissingPreparedRoutes;
+    defer private.release();
+    try std.testing.expect(owned == null);
+    try std.testing.expect(private.pool == original);
+    try std.testing.expect(private.pool.plan.slots.ptr == plan_slots);
+    // Resource finalization may resize allocation recipes, but it never
+    // clones the slots, kernels, ledger or parent Pool.
+    try std.testing.expect(private.pool.kernels.ptr == kernel_metadata);
+    try std.testing.expect(private.pool.accounting == ledger);
+    try std.testing.expect(private.pool.root_pool == null and private.pool.variant_cache == null);
+    try std.testing.expect(private.pool.route_owner == private);
+    try std.testing.expect(private.pool.completeOwnedPayload() != null);
+    const immutable = private.pool.immutable_bindings orelse return error.MissingImmutableKernelBindings;
+    try std.testing.expect(immutable == private.immutable);
+    try std.testing.expectEqual(@as(usize, 2), immutable.references.load(.acquire));
+
+    // The unchanged generic cached path has the same complete route and exact
+    // storage recipe. It still owns a child of its independently owned root.
+    const root = (try layout.createPool(a, &graph, &.{&backend}, null)) orelse return error.MissingPhysicalPool;
+    defer root.deinit();
+    root.coverage_graph = &graph;
+    root.coverage_reachable = analysis.reachable;
+    root.coverage_backend = backend;
+    root.native_frame_dispatch = true;
+    try root.configureRoutes(&.{});
+    const cached = (try root.prepareRoutesWithPolicy(&facts, .compatibility_regions)) orelse return error.MissingPreparedRoutes;
+    defer cached.release();
+    try std.testing.expect(cached.pool != root and cached.pool.root_pool == root);
+    try std.testing.expect(root.variant_cache != null);
+    try std.testing.expectEqualDeep(try cached.storageRequirement(), try private.storageRequirement());
+    try std.testing.expectEqual(cached.pool.plan.allocations.len, private.pool.plan.allocations.len);
+    try std.testing.expectEqual(cached.pool.selection.?.routes.len, private.pool.selection.?.routes.len);
+    try private.validate(&facts);
+    const frame = (try private.pool.acquire()) orelse return error.MissingPhysicalFrame;
+    try frame.begin();
+    var active = true;
+    defer if (active) {
+        _ = frame.finish() catch unreachable;
+    };
+    var data = [_]f32{ 1, -2, 3, -4 };
+    const tensor = @import("../backends/tensor.zig").Tensor{ .data = std.mem.sliceAsBytes(&data), .shape = &.{4}, .dtype = .f32, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+    const inputs = [_]host_ingress.Input{.{ .node_id = input_node, .value = &tensor }};
+    const bound = try frame.bindHostInputs(&inputs);
+    const values = try a.alloc(?CT, graph.nodeCount());
+    defer a.free(values);
+    @memset(values, null);
+    for (bound) |input| values[input.node_id] = input.value;
+    try frame.prepareNativeProgramViews(&backend, &graph, values, .{});
+    try frame.sealNativeProgramStorage();
+    try frame.finishNativeProgramPreparation();
+    // Re-enter the actual numerical scope and bind its current host value;
+    // the cold preparation scope did not run a kernel or lend its input.
+    try frame.begin();
+    const rebound = try frame.bindHostInputs(&inputs);
+    for (rebound) |input| values[input.node_id] = input.value;
+    const output = try frame.executeNativeProgram(&backend, values, output_node, null, &.{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 });
+    try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, (try backend.hostFloat32Read(output)).?);
+    _ = try frame.finish();
+    active = false;
+    try std.testing.expect(private.pool.frames.items.len == 1);
+}
+
+test "private Native preparation consumes one Pool only after publication and matches cached execution" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try privateNativePreparationCase(std.testing.allocator);
+}
+
+test "private Native preparation preserves caller cleanup through every allocation failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, privateNativePreparationCase, .{});
 }
