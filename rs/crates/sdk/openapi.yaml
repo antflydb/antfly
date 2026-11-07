@@ -69366,6 +69366,10 @@ components:
             - generated
         model:
           type: string
+        model_revision:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Immutable model revision reported by this stage, when available.
         answers:
           type: array
           description: This stage's answers. Absent when the stage failed.

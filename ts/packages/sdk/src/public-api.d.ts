@@ -30804,6 +30804,8 @@ export interface components {
             /** @enum {string} */
             decision_method: "typed" | "generated";
             model?: string;
+            /** @description Immutable model revision reported by this stage, when available. */
+            model_revision?: string;
             /** @description This stage's answers. Absent when the stage failed. */
             answers?: components["schemas"]["InferenceDecideAnswer"][];
             usage?: components["schemas"]["DecisionUsage"];

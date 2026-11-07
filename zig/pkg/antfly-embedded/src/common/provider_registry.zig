@@ -277,6 +277,16 @@ pub const Registry = struct {
     pub fn registerDeciderConfig(self: *Registry, name: []const u8, cfg: decisions.DeciderConfig) !void {
         try cfg.validate();
         if (name.len == 0 or std.mem.indexOfScalar(u8, name, decisions.cascade_stage_separator) != null) return error.InvalidDeciderConfig;
+        if (self.decider_configs.contains(name)) return error.DuplicateDeciderName;
+        const before = self.decider_configs.count();
+        errdefer while (self.decider_configs.count() > before) {
+            const last = self.decider_configs.count() - 1;
+            const key = self.decider_configs.keys()[last];
+            var value = self.decider_configs.values()[last];
+            self.decider_configs.orderedRemoveAt(last);
+            value.deinit(self.allocator);
+            self.allocator.free(key);
+        };
         if (cfg.decision_method == .cascade) {
             // Stages are ordinary deciders under derived names, so quotas,
             // generator resolution and normalization stay shared. They are
@@ -573,6 +583,32 @@ fn cloneChainLinks(alloc: Allocator, links: []const ChainLinkConfig) ![]ChainLin
         cloned_len = i + 1;
     }
     return owned;
+}
+
+test "decision provider cascade registration rolls back every allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const value = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+                \\{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"model":"fast"}},{"name":"b","decider":{"model":"strong"},"when":{"probability_between":[0.3,0.9]}}]}}
+            , .{});
+            var cfg = try decisions.parseConfig(scratch, value);
+            defer cfg.deinit(scratch);
+            var registry = Registry.init(a);
+            defer registry.deinit();
+            registry.registerDeciderConfig("c", cfg) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), registry.decider_configs.count());
+                try std.testing.expect(registry.default_decider == null);
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, 3), registry.decider_configs.count());
+            try std.testing.expectError(error.DuplicateDeciderName, registry.registerDeciderConfig("c", cfg));
+            try std.testing.expectEqual(@as(usize, 3), registry.decider_configs.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "provider registry parses named generators rerankers and chains" {

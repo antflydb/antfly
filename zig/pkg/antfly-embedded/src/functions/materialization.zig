@@ -43,6 +43,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specifica
         // Hosted generated stages must accept the frozen questions too.
         const arena = parsed.arena.allocator();
         const definition = try d.cascade_contract.compile(arena, parsed.value.decider.cascade.?);
+        try d.cascade_contract.validateBands(&definition, parsed.value.questions);
         for (definition.stages) |stage| {
             const stage_config = try d.DeciderConfig.parseStage(arena, stage.decider);
             const generator = stage_config.generator orelse continue;

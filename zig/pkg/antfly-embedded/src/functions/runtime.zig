@@ -103,6 +103,9 @@ pub const Runtime = struct {
     resolution_allocator: std.mem.Allocator = std.heap.smp_allocator,
     resolution_mutex: std.atomic.Mutex = .unlocked,
     resolved_generators: std.ArrayList(*ResolvedGenerator) = .empty,
+    /// Stage limits apply to that stage across every group in the statement.
+    /// Public counters below still account for all model work in the runtime.
+    stage_budgets: std.StringHashMapUnmanaged(StageBudget) = .empty,
 
     limits: *quotas.Registry = &quotas.process_registry,
     http: *httpx.Client,
@@ -123,6 +126,11 @@ pub const Runtime = struct {
     latency_ns: u64 = 0,
     profile_allocator: ?std.mem.Allocator = null,
     provenance: std.ArrayList(struct { decider: []const u8, provider: []const u8, model: []const u8, rows: u64 = 0 }) = .empty,
+    const StageBudget = struct {
+        reserved_rows: u64 = 0,
+        input_tokens: u64 = 0,
+        estimated_input_tokens: u64 = 0,
+    };
     const ResolvedGenerator = struct {
         arena: std.heap.ArenaAllocator,
         cache: remote_capabilities.Cache,
@@ -135,6 +143,10 @@ pub const Runtime = struct {
     /// Model facts live for this runtime's request/statement; routing leases renew.
     /// Profile/provenance storage remains owned by profile_allocator's caller.
     pub fn deinit(self: *Runtime) void {
+        var stage_keys = self.stage_budgets.keyIterator();
+        while (stage_keys.next()) |key| self.resolution_allocator.free(key.*);
+        self.stage_budgets.deinit(self.resolution_allocator);
+        self.stage_budgets = .empty;
         for (self.resolved_generators.items) |entry| {
             entry.cache.deinit();
             entry.arena.deinit();
@@ -195,7 +207,7 @@ pub const Runtime = struct {
         try self.provenance.append(stats_a, .{ .decider = decider, .provider = provider_name, .model = owned_model, .rows = 1 });
     }
     pub fn provider(self: *@This()) decisions.DecisionProvider {
-        return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
+        return .{ .ptr = self, .validate_fn = validatePublic, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
     }
     fn resolvedCapabilities(ptr: *anyopaque, name: []const u8, source_table: []const u8) !decisions.Capabilities {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
@@ -222,6 +234,11 @@ pub const Runtime = struct {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (self.context) |ctx| try ctx.check();
     }
+    fn validatePublic(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
+        if (registry_mod.Registry.isCascadeStageName(name)) return error.UnknownDecider;
+        return validate(ptr, name, questions, source_table);
+    }
+
     fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json, source_table: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         const cfg = try self.registry.getDeciderConfig(name);
@@ -232,6 +249,7 @@ pub const Runtime = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
             defer arena.deinit();
             const definition = try decisions.cascade_contract.compile(arena.allocator(), cfg.cascade.?);
+            try decisions.cascade_contract.validateBands(&definition, questions);
             for (definition.stages) |stage| try validate(ptr, try registry_mod.Registry.cascadeStageName(arena.allocator(), name, stage.name), questions, source_table);
             return;
         }
@@ -501,12 +519,29 @@ pub const Runtime = struct {
         for (result.values, result.failures, out) |value, failure, *target| target.* = value orelse return failure orelse error.InvalidDecisionOutput;
         return out;
     }
-    fn evaluateCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) !PartialBatch {
+    fn evaluateCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) anyerror!PartialBatch {
         // Cascades dispatch before admission: their stages re-enter here as
         // ordinary deciders and take their own leases and quotas.
         for (requests) |request| {
             if ((try self.registry.getDeciderConfig(request.decider)).decision_method == .cascade) return self.evaluateWithCascades(a, requests, preserve_failures);
         }
+        if (requests.len > 0 and registry_mod.Registry.isCascadeStageName(requests[0].decider)) {
+            // Only the cascade runner submits internal stages, one stage at a
+            // time. Keep model caches and aggregate statistics shared while
+            // applying the stage's own cumulative row/token allowance.
+            const name = requests[0].decider;
+            const entry = try self.stage_budgets.getOrPut(self.resolution_allocator, name);
+            if (!entry.found_existing) {
+                errdefer _ = self.stage_budgets.remove(name);
+                entry.key_ptr.* = try self.resolution_allocator.dupe(u8, name);
+                entry.value_ptr.* = .{};
+            }
+            return self.evaluateOrdinaryCore(a, requests, preserve_failures, entry.value_ptr);
+        }
+        return self.evaluateOrdinaryCore(a, requests, preserve_failures, null);
+    }
+
+    fn evaluateOrdinaryCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool, stage_budget: ?*StageBudget) !PartialBatch {
         const ptr: *anyopaque = self;
         const started = std.Io.Clock.awake.now(self.io).nanoseconds;
         defer self.latency_ns +|= @intCast(@max(0, std.Io.Clock.awake.now(self.io).nanoseconds - started));
@@ -516,12 +551,16 @@ pub const Runtime = struct {
         @memset(out, null);
         const failures = try a.alloc(?anyerror, requests.len);
         @memset(failures, null);
+        // Ordinary deciders retain their statement-wide limits. Internal
+        // stages use a persistent ledger without changing public statistics.
+        var statement_budget = StageBudget{ .reserved_rows = self.reserved_rows, .input_tokens = self.input_tokens, .estimated_input_tokens = self.estimated_input_tokens };
+        const budget = stage_budget orelse &statement_budget;
         var batch_size: usize = 32;
-        var estimated = self.estimated_input_tokens;
+        var estimated = budget.estimated_input_tokens;
         for (requests) |request| {
             const cfg = try self.registry.getDeciderConfig(request.decider);
             if (cfg.decision_method == .generated) _ = try self.resolveGenerator(request.decider, if (request.source_table.len > 0) request.source_table else self.source_table);
-            if (self.reserved_rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
+            if (budget.reserved_rows + requests.len > cfg.max_rows or budget.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
             try request.input.checkLimit(a, cfg.resolvedCapabilities().max_input_bytes);
             // Reserve text bytes plus the configured visual token bound before
             // any I/O. The shared quota uses this same estimate and actual usage.
@@ -535,7 +574,9 @@ pub const Runtime = struct {
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
             batch_size = @min(batch_size, cfg.batch_size);
         }
-        self.estimated_input_tokens = estimated;
+        self.estimated_input_tokens +|= estimated - budget.estimated_input_tokens;
+        budget.estimated_input_tokens = estimated;
+        budget.reserved_rows += requests.len;
         self.reserved_rows += requests.len;
         if (requests.len > 0) {
             const first = try self.registry.getDeciderConfig(requests[0].decider);
@@ -550,6 +591,7 @@ pub const Runtime = struct {
             if (compatible and first.embedder != null) {
                 const partial = try @import("embedding_decisions.zig").batchPartial(a, self, first, requests);
                 self.input_tokens +|= partial.input_tokens;
+                budget.input_tokens +|= partial.input_tokens;
                 self.batches += 1;
                 for (partial.values, partial.failures, out, failures, requests) |value, failure, *dest, *failed, request| {
                     if (value) |response| {
@@ -568,9 +610,10 @@ pub const Runtime = struct {
                 const partial = try self.generateBatchPartial(a, first, requests);
                 self.rows += requests.len;
                 self.input_tokens +|= partial.input_tokens;
+                budget.input_tokens +|= partial.input_tokens;
                 self.output_tokens +|= partial.output_tokens;
                 self.batches +|= partial.calls;
-                if (self.input_tokens > first.max_input_tokens) return error.DecisionLimitExceeded;
+                if (budget.input_tokens > first.max_input_tokens) return error.DecisionLimitExceeded;
                 for (partial.values, partial.failures, out, failures, requests) |value, failure, *response, *failed, request| {
                     if (value) |valid| {
                         response.* = valid;
@@ -610,8 +653,9 @@ pub const Runtime = struct {
             for (jobs, out[begin..end], failures[begin..end]) |*job, *value, *failure| {
                 const usage = if (job.response) |response| reportedUsage(response) orelse job.usage else job.usage;
                 self.input_tokens +|= usage.input_tokens;
+                budget.input_tokens +|= usage.input_tokens;
                 self.output_tokens +|= usage.output_tokens;
-                if (self.input_tokens > job.cfg.max_input_tokens) return error.DecisionLimitExceeded;
+                if (budget.input_tokens > job.cfg.max_input_tokens) return error.DecisionLimitExceeded;
                 if (job.failure) |err| {
                     if (!preserve_failures or fatalItemFailure(err)) return err;
                     failure.* = err;
@@ -652,23 +696,12 @@ pub const Runtime = struct {
                 failures[index] = failure;
             }
         }
-        // Items sharing a cascade, routing scope and questions escalate together.
-        const handled = try a.alloc(bool, requests.len);
-        defer a.free(handled);
-        @memset(handled, false);
-        for (requests, 0..) |first, start| {
-            if (!is_cascade[start] or handled[start]) continue;
-            const question_bytes = try std.json.Stringify.valueAlloc(a, first.questions, .{});
-            var group: std.ArrayList(usize) = .empty;
-            defer group.deinit(a);
-            for (requests[start..], start..) |request, index| {
-                if (!is_cascade[index] or handled[index]) continue;
-                if (!std.mem.eql(u8, request.decider, first.decider) or !std.mem.eql(u8, request.source_table, first.source_table)) continue;
-                const bytes = try std.json.Stringify.valueAlloc(a, request.questions, .{});
-                if (!std.mem.eql(u8, bytes, question_bytes)) continue;
-                handled[index] = true;
-                try group.append(a, index);
-            }
+        // Serialize each schema once and hash the routing tuple. All grouping
+        // scratch is released before returning, independently of result storage.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const groups = try cascadeGroups(scratch.allocator(), requests, is_cascade);
+        for (groups) |group| {
             const outcome = try self.runCascade(a, requests, group.items);
             for (group.items, outcome.values, outcome.failures) |index, value, failure| {
                 out[index] = value;
@@ -680,6 +713,23 @@ pub const Runtime = struct {
             }
         }
         return .{ .values = out, .failures = failures };
+    }
+
+    fn cascadeGroups(a: std.mem.Allocator, requests: []const decisions.Request, is_cascade: []const bool) ![]std.ArrayList(usize) {
+        var by_key: std.StringHashMapUnmanaged(usize) = .empty;
+        defer by_key.deinit(a);
+        var groups: std.ArrayList(std.ArrayList(usize)) = .empty;
+        for (requests, is_cascade, 0..) |request, cascade, index| {
+            if (!cascade) continue;
+            const key = try std.json.Stringify.valueAlloc(a, .{ request.decider, request.source_table, request.questions }, .{});
+            const entry = try by_key.getOrPut(a, key);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = groups.items.len;
+                try groups.append(a, .empty);
+            } else a.free(key);
+            try groups.items[entry.value_ptr.*].append(a, index);
+        }
+        return groups.toOwnedSlice(a);
     }
 
     const CascadeRunner = struct {
@@ -2541,7 +2591,7 @@ test "decision provider cascades escalate only in-band items through registered 
     const config = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
         \\{"decision_method":"cascade","cascade":{"stages":[
         \\  {"name":"fast","decider":{"provider":"antfly","model":"fast-model"}},
-        \\  {"name":"strong","decider":{"provider":"antfly","model":"strong-model"},
+        \\  {"name":"strong","decider":{"provider":"antfly","model":"strong-model","max_rows":1},
         \\   "when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}],
         \\ "budget":{"max_model_calls":2,"deadline_ms":60000}}}
     , .{});
@@ -2592,6 +2642,12 @@ test "decision provider cascades escalate only in-band items through registered 
     const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
         \\{"same":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
     , .{});
+    try std.testing.expectError(error.UnknownDecider, runtime.provider().validate("same-entity#fast", questions));
+    const wrong_question = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"typo":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
+    , .{});
+    try std.testing.expectError(error.InvalidDecisionCascade, runtime.provider().validate("same-entity", wrong_question));
+    try std.testing.expectEqual(@as(usize, 0), Fake.fast_calls.load(.monotonic));
     const requests = [_]decisions.Request{
         .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "sure" } },
         .{ .decider = "deciders/same-entity", .questions = questions, .input = .{ .text = "unsure" } },
@@ -2615,13 +2671,46 @@ test "decision provider cascades escalate only in-band items through registered 
     try std.testing.expectEqualStrings("strong-model", results[1].object.get("model").?.string);
     try std.testing.expectEqual(@as(i64, 10), results[1].object.get("usage").?.object.get("input_tokens").?.integer);
     try std.testing.expectEqualStrings("fast", results[0].object.get("cascade").?.object.get("answered_by").?.string);
+    try std.testing.expectEqual(@as(u64, 20), runtime.input_tokens);
+    try std.testing.expectEqual(@as(u64, 4), runtime.reserved_rows);
+    // The allowance persists across groups and repeated evaluations, while
+    // completed fast-stage siblings remain available in partial batches.
+    const exhausted = try runtime.evaluatePartial(scratch, &.{
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "sure" } },
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "unsure" } },
+    });
+    try std.testing.expect(exhausted.values[0] != null);
+    try std.testing.expect(exhausted.values[1] == null);
+    try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), exhausted.failures[1]);
+    try std.testing.expectEqual(@as(usize, 1), Fake.strong_calls.load(.monotonic));
 
     // Bands need probabilities: score questions are rejected before any call.
     const score = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
         \\{"urgency":{"type":"score","instructions":"How urgent?","criteria":["low","high"]}}
     , .{});
     try std.testing.expectError(error.UnsupportedDecisionKind, runtime.provider().evaluateBatch(scratch, &.{.{ .decider = "same-entity", .questions = score, .input = .{ .text = "sure" } }}));
-    try std.testing.expectEqual(@as(usize, 3), Fake.fast_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 5), Fake.fast_calls.load(.monotonic));
+}
+
+test "decision provider cascade grouping uses bounded linear schema storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 512;
+    const requests = try a.alloc(decisions.Request, count);
+    const flags = try a.alloc(bool, count);
+    @memset(flags, true);
+    for (requests, 0..) |*request, i| {
+        const questions = try std.json.parseFromSliceLeaky(decisions.Json, a, try std.fmt.allocPrint(a,
+            \\{{"q":{{"type":"noul","instructions":"Unique predicate {d}"}}}}
+        , .{i}), .{});
+        request.* = .{ .decider = "cascade", .questions = questions, .input = .{ .text = "text" } };
+    }
+    var memory: [512 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    const groups = try Runtime.cascadeGroups(fixed.allocator(), requests, flags);
+    try std.testing.expectEqual(@as(usize, count), groups.len);
+    for (groups, 0..) |group, i| try std.testing.expectEqual(i, group.items[0]);
 }
 
 test "decision provider cascade configs reject transport fields and invalid stages" {
@@ -2644,6 +2733,9 @@ test "decision provider cascade configs reject transport fields and invalid stag
         ,
         // missing definition
         \\{"decision_method":"cascade"}
+        ,
+        // Row/token/batch limits belong to stages and cannot be ignored here.
+        \\{"decision_method":"cascade","max_rows":1,"cascade":{"stages":[{"name":"a","decider":{"model":"x"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
         ,
     };
     for (invalid) |bytes| {

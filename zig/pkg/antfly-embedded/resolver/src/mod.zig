@@ -4154,6 +4154,16 @@ const adjudication_cascade_response =
     \\   {"name":"strong","decision_method":"generated","model":"strong","answers":[],"usage":{"input_tokens":10,"output_tokens":1},"escalated":false}]}}
 ;
 
+fn adjudicationCascadeResponse(a: std.mem.Allocator, config: adjudication.Config) ![]u8 {
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, adjudication_cascade_response, .{});
+    const lowered = try std.json.parseFromSliceLeaky(std.json.Value, a, try config.producerSpecification(a), .{});
+    const definition = try @import("antfly_decisions").cascade.compile(a, lowered.object.get("decider").?.object.get("cascade").?);
+    const trace = value.object.getPtr("cascade").?;
+    try trace.object.put(a, "definition_sha256", .{ .string = try a.dupe(u8, &definition.sha256) });
+    try trace.object.getPtr("stages").?.array.items[1].object.put(a, "answers", value.object.get("answers").?);
+    return std.json.Stringify.valueAlloc(a, value, .{});
+}
+
 test "REVIEW adjudication cascade receipts verify the answering stage and its trace" {
     const a = testing.allocator;
     const config = try adjudication.Config.parse(a, adjudication_cascade_config);
@@ -4161,20 +4171,30 @@ test "REVIEW adjudication cascade receipts verify the answering stage and its tr
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
+    const response = try adjudicationCascadeResponse(scratch, config.value);
     const parse = struct {
         fn f(alloc: std.mem.Allocator, bytes: []const u8) !std.json.Value {
             return std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{});
         }
     }.f;
-    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, config.value, try parse(scratch, adjudication_cascade_response)));
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, config.value, try parse(scratch, response)));
     // Answers must match the answering stage's decision method.
-    const wrong_method = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_response, "\"answered_by\":\"strong\"", "\"answered_by\":\"fast\"");
+    const wrong_method = try std.mem.replaceOwned(u8, scratch, response, "\"answered_by\":\"strong\"", "\"answered_by\":\"fast\"");
     try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, try parse(scratch, wrong_method)));
     // A cascade answer without its trace is not authoritative.
     try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, try parse(scratch, adjudication_test_response)));
     // Stages cannot be invented or reordered.
-    const invented = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_response, "{\"name\":\"fast\"", "{\"name\":\"other\"");
+    const invented = try std.mem.replaceOwned(u8, scratch, response, "{\"name\":\"fast\"", "{\"name\":\"other\"");
     try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, try parse(scratch, invented)));
+    // A valid final distribution cannot disagree with the recorded stage.
+    const inconsistent = try parse(scratch, response);
+    const probabilities = inconsistent.object.get("answers").?.array.items[0].object.get("probabilities").?.array.items;
+    try probabilities[0].object.put(scratch, "probability", .{ .float = 0.8 });
+    try probabilities[1].object.put(scratch, "probability", .{ .float = 0.2 });
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, inconsistent));
+    const stale = try parse(scratch, response);
+    try stale.object.getPtr("cascade").?.object.put(scratch, "definition_sha256", .{ .string = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, stale));
     // The policy hash covers the cascade definition and ignores credentials.
     const rotated = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"api_key\":\"secret\"", "\"api_key\":\"rotated\"");
     const rotated_config = try adjudication.Config.parse(a, rotated);
@@ -4201,7 +4221,9 @@ test "REVIEW adjudication cascade persists the stage trace in the receipt" {
     defer resolver.deinit();
     const config = try adjudication.Config.parse(a, adjudication_cascade_config);
     defer config.deinit();
-    var fixture: AdjudicationFixture = .{ .response = adjudication_cascade_response };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fixture: AdjudicationFixture = .{ .response = try adjudicationCascadeResponse(arena.allocator(), config.value) };
     var map: MapStore = .{ .alloc = a };
     defer map.deinit();
     try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");

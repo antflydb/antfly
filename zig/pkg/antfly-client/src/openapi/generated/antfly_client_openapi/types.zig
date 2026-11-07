@@ -10649,6 +10649,8 @@ pub const DecisionCascadeStageTrace = struct {
     name: []const u8,
     decision_method: []const u8,
     model: ?[]const u8 = null,
+    /// Immutable model revision reported by this stage, when available.
+    model_revision: ?[]const u8 = null,
     /// This stage's answers. Absent when the stage failed.
     answers: ?[]const InferenceDecideAnswer = null,
     usage: ?DecisionUsage = null,
@@ -10664,6 +10666,7 @@ pub const DecisionCascadeStageTrace = struct {
         .{ "name", "name", false },
         .{ "decision_method", "decision_method", false },
         .{ "model", "model", true },
+        .{ "model_revision", "model_revision", true },
         .{ "answers", "answers", true },
         .{ "usage", "usage", true },
         .{ "provenance", "provenance", true },
@@ -10687,6 +10690,10 @@ pub const DecisionCascadeStageTrace = struct {
         try jw.write(self.decision_method);
         if (self.model) |value| {
             try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
             try jw.write(value);
         }
         if (self.answers) |value| {

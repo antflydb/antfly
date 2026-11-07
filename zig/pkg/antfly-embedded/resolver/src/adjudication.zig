@@ -258,33 +258,32 @@ pub const Executor = struct {
 /// Plain deciders answer for themselves. A cascade response must carry its
 /// stage trace, and the answering stage must be one the policy configured,
 /// with the trace ending on that stage's answer.
-fn answeringDecider(config: Config, response: std.json.Value) !std.json.Value {
+fn answeringDecider(a: std.mem.Allocator, config: Config, response: std.json.Value) anyerror!std.json.Value {
     const stages = config.cascadeStages();
     if (stages.len == 0) return config.decider;
-    const trace = response.object.get("cascade") orelse return error.InvalidAdjudicationOutput;
-    if (trace != .object) return error.InvalidAdjudicationOutput;
-    const digest = trace.object.get("definition_sha256") orelse return error.InvalidAdjudicationOutput;
-    if (digest != .string or digest.string.len != 64) return error.InvalidAdjudicationOutput;
-    const answered_by = trace.object.get("answered_by") orelse return error.InvalidAdjudicationOutput;
-    const executed = trace.object.get("stages") orelse return error.InvalidAdjudicationOutput;
-    if (answered_by != .string or executed != .array or executed.array.items.len == 0 or executed.array.items.len > stages.len) return error.InvalidAdjudicationOutput;
-    var last_answer: ?[]const u8 = null;
-    for (executed.array.items, 0..) |entry, i| {
-        if (entry != .object) return error.InvalidAdjudicationOutput;
-        const name = entry.object.get("name") orelse return error.InvalidAdjudicationOutput;
-        const configured = stages[i].object.get("name") orelse return error.InvalidAdjudicationOutput;
-        // Stages run in configured order; none can be skipped or invented.
-        if (name != .string or configured != .string or !std.mem.eql(u8, name.string, configured.string)) return error.InvalidAdjudicationOutput;
-        if (entry.object.contains("answers")) last_answer = name.string;
+    // Resolver-specific batch bounds are part of the executed definition.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const lowered = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try config.producerSpecification(scratch), .{});
+    const cascade = @import("antfly_decisions").cascade;
+    const definition = cascade.compile(scratch, lowered.object.get("decider").?.object.get("cascade").?) catch |err|
+        return if (err == error.OutOfMemory) err else error.InvalidAdjudicationOutput;
+    const index = cascade.validateTrace(&definition, response) catch return error.InvalidAdjudicationOutput;
+    // Independently validate every successful stage's distribution. A trace
+    // cannot smuggle an invalid intermediate answer into durable evidence.
+    const executed = response.object.get("cascade").?.object.get("stages").?.array.items;
+    for (executed, stages[0..executed.len]) |entry, stage| {
+        if (!entry.object.contains("answers")) continue;
+        var stage_config = config;
+        stage_config.decider = stage.object.get("decider").?;
+        _ = try classify(scratch, stage_config, entry);
     }
-    if (last_answer == null or !std.mem.eql(u8, last_answer.?, answered_by.string)) return error.InvalidAdjudicationOutput;
-    for (stages) |stage| if (std.mem.eql(u8, stage.object.get("name").?.string, answered_by.string)) return stage.object.get("decider").?;
-    return error.InvalidAdjudicationOutput;
+    return stages[index].object.get("decider").?;
 }
 
 /// Only a well-formed, typed, normalized choice distribution can change identity.
 pub fn classify(a: std.mem.Allocator, config: Config, response: std.json.Value) !Status {
-    _ = a;
     if (response != .object) return error.InvalidAdjudicationOutput;
     const model = response.object.get("model") orelse return error.InvalidAdjudicationOutput;
     if (model != .string or model.string.len == 0) return error.InvalidAdjudicationOutput;
@@ -297,7 +296,7 @@ pub fn classify(a: std.mem.Allocator, config: Config, response: std.json.Value) 
     const method = answer.object.get("decision_method") orelse return error.InvalidAdjudicationOutput;
     if (name != .string or !std.mem.eql(u8, name.string, config.question.name) or kind != .string or !std.mem.eql(u8, kind.string, "choice") or method != .string or (!std.mem.eql(u8, method.string, "typed") and !std.mem.eql(u8, method.string, "generated"))) return error.InvalidAdjudicationOutput;
     // A cascade answer is checked against the stage that produced it.
-    const answering = try answeringDecider(config, response);
+    const answering = try answeringDecider(a, config, response);
     const expected_method = answering.object.get("decision_method") orelse std.json.Value{ .string = "typed" };
     if (expected_method != .string or !std.mem.eql(u8, method.string, expected_method.string)) return error.InvalidAdjudicationOutput;
     var verdict_only = false;

@@ -955,6 +955,28 @@ pub const Runtime = struct {
                     const inputs = try a.alloc(@import("functions/decisions.zig").Request, requests.len);
                     for (requests, inputs) |request, *input| input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } };
                     caller_workspace_bytes = try @import("functions/embedding_decisions.zig").workingBytes(a, cfg, embedder, inputs);
+                } else if (cfg.decision_method == .cascade) {
+                    var arena = std.heap.ArenaAllocator.init(alloc);
+                    defer arena.deinit();
+                    const scratch = arena.allocator();
+                    const d = @import("functions/decisions.zig");
+                    const definition = try d.cascade_contract.compile(scratch, cfg.cascade.?);
+                    remote = false;
+                    for (definition.stages) |stage| {
+                        var stage_cfg = try d.DeciderConfig.parseStage(scratch, stage.decider);
+                        var stage_remote = true;
+                        if (stage_cfg.decision_method == .generated) {
+                            try self.routeGeneratorConfig(scratch, &stage_cfg.generator.?);
+                            var engine = self.constrainedRuntime();
+                            const caps = try engine.capabilities(scratch, &stage_cfg.generator.?);
+                            _ = try caps.select(stage_cfg.output, stage_cfg.probabilities);
+                            stage_remote = stage_cfg.generator.?.provider != .antfly or stage_cfg.generator.?.url.len > 0;
+                        } else if (stage_cfg.provider == .antfly and stage_cfg.url.len == 0 and self.antfly_provider != null) {
+                            stage_remote = self.antfly_provider.?.decide_json == null;
+                        }
+                        if (!stage_remote) allocator_owner = try localInvocationAllocatorOwner(self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable);
+                        remote = remote or stage_remote;
+                    }
                 } else if (cfg.decision_method == .generated) {
                     try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
                     var engine = self.constrainedRuntime();
@@ -1502,6 +1524,10 @@ pub const Runtime = struct {
                     var spec = try @import("functions/materialization.zig").parse(alloc, first.config_json);
                     defer spec.deinit();
                     if (spec.value.decider.embedder != null) break :blk .native;
+                    // A cascade can batch generated stages even when its typed
+                    // stages use serial provider calls. It has no single model
+                    // capability record, so advertise the composite explicitly.
+                    if (spec.value.decider.decision_method == .cascade) break :blk .serial_compatibility;
                 }
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
                 break :blk capabilities.batch.mode;
@@ -8858,6 +8884,74 @@ test "decision functions materialized enrichment records version model and sourc
     try std.testing.expectEqualStrings("resolved-model", provenance.get("model").?.string);
     try std.testing.expectEqualStrings("revision-2", provenance.get("source_fingerprint").?.string);
     try std.testing.expect(provenance.get("specification_hash").?.string.len > 0);
+}
+
+test "decision functions cascade enrichments advertise batching and share generated escalation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fake = struct {
+        fast_calls: std.atomic.Value(usize) = .init(0),
+        strong_calls: usize = 0,
+        fn decide(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: ?RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.fast_calls.fetchAdd(1, .monotonic);
+            return alloc.dupe(u8,
+                \\{"model":"fast","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.6},{"value":"different","probability":0.4}]}],"usage":{"input_tokens":2,"output_tokens":0}}
+            );
+        }
+        fn generate(ptr: *anyopaque, alloc: Allocator, bytes: []const u8, _: ?RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.strong_calls += 1;
+            const body = try std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{});
+            const messages = body.object.get("messages").?.array.items;
+            const prompt = try std.json.parseFromSliceLeaky(std.json.Value, alloc, messages[1].object.get("content").?.string, .{});
+            try std.testing.expectEqual(@as(usize, 2), prompt.object.get("items").?.array.items.len);
+            return alloc.dupe(u8,
+                \\{"choices":[{"message":{"content":"{\"items\":[{\"item\":0,\"value\":{\"same\":\"same\"}},{\"item\":1,\"value\":{\"same\":\"different\"}}]}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            );
+        }
+        fn capabilities(_: *anyopaque, _: Allocator, _: []const u8, _: inference_work.Task) !inference_work.InferenceCapabilities {
+            return .{ .model_revision = @splat(1), .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true };
+        }
+    };
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(a, io_impl.io());
+    defer client.deinit();
+    var fake = Fake{};
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide, .generate_json = Fake.generate, .model_capabilities = Fake.capabilities } });
+    defer runtime.deinit();
+    const specification =
+        \\{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[
+        \\ {"name":"fast","decider":{"model":"fast"}},
+        \\ {"name":"strong","decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"strong"},"probabilities":"verdict_only"},"when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}]}},
+        \\ "questions":[{"name":"same","type":"choice","instructions":"Same entity?","choices":[{"value":"same"},{"value":"different"}]}]}
+    ;
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .decision, .config_json = specification, .source_text = "A B", .item_id = "a" },
+        .{ .producer_type = .decision, .config_json = specification, .source_text = "C D", .item_id = "b" },
+    };
+    const producer = runtime.producer();
+    try std.testing.expectEqual(inference_work.BatchMode.serial_compatibility, try producer.batchMode(a, &requests));
+    var result = try producer.produceBatchReported(a, &requests);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), fake.fast_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), fake.strong_calls);
+    for (result.items) |item| {
+        const response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, item.result.value, .{});
+        const trace = response.object.get("cascade").?.object;
+        try std.testing.expectEqualStrings("strong", trace.get("answered_by").?.string);
+        try std.testing.expectEqual(@as(usize, 2), trace.get("stages").?.array.items.len);
+        try std.testing.expect(trace.get("stages").?.array.items[1].object.contains("model_revision"));
+    }
+    // An available local callback must not change the ownership of hosted stages.
+    const hosted =
+        \\{"version":"v1","decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"provider":"jev"}},{"name":"b","decider":{"provider":"jev"},"when":{"probability_between":[0.3,0.9]}}]}},"questions":[{"name":"same","type":"predicate","instructions":"Same?"}]}
+    ;
+    const memory = try producer.invocationMemoryForRequests(a, &.{.{ .producer_type = .decision, .config_json = hosted, .source_text = "text" }});
+    try std.testing.expectEqual(inference_work.InvocationAllocatorOwner.caller, memory.allocator_owner);
 }
 
 test "decision functions Cloudflare extraction resolves secret references before transport" {

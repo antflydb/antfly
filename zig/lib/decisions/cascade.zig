@@ -327,6 +327,96 @@ pub fn inBand(band: Band, answers: V) !bool {
     return false;
 }
 
+/// Bind selectors to the validated internal question schema before any model
+/// runs. Every answer inspected by an unqualified band must be measurable;
+/// otherwise validity would depend on the order and values of model answers.
+pub fn validateBands(definition: *const Definition, questions: V) !void {
+    if (questions != .object) return error.InvalidDecisionCascade;
+    for (definition.stages[1..]) |stage| {
+        const band = stage.when.?;
+        if (band.question) |name| {
+            try validateBandQuestion(band, questions.object.get(name) orelse return error.InvalidDecisionCascade);
+        } else for (questions.object.values()) |question| try validateBandQuestion(band, question);
+    }
+}
+
+fn validateBandQuestion(band: Band, question: V) !void {
+    if (question != .object) return error.InvalidDecisionCascade;
+    const kind = question.object.get("type") orelse return error.InvalidDecisionCascade;
+    if (kind != .string) return error.InvalidDecisionCascade;
+    if (std.mem.eql(u8, kind.string, "noul") or std.mem.eql(u8, kind.string, "predicate")) return;
+    if (!std.mem.eql(u8, kind.string, "choice")) return error.InvalidDecisionCascade;
+    if (band.choice) |choice| {
+        const criteria = question.object.get("criteria") orelse return error.InvalidDecisionCascade;
+        if (criteria != .object or !criteria.object.contains(choice)) return error.InvalidDecisionCascade;
+    }
+}
+
+/// Validate a successful composite receipt against the definition that was
+/// actually executed, including escalation and explicit keep_previous stops.
+/// Returns the index of the stage responsible for the public answer.
+pub fn validateTrace(definition: *const Definition, response: V) !usize {
+    if (response != .object) return error.InvalidDecisionOutput;
+    const cascade = try object(response.object.get("cascade") orelse return error.InvalidDecisionOutput);
+    const digest = cascade.get("definition_sha256") orelse return error.InvalidDecisionOutput;
+    if (digest != .string or !std.mem.eql(u8, digest.string, &definition.sha256)) return error.InvalidDecisionOutput;
+    const executed = cascade.get("stages") orelse return error.InvalidDecisionOutput;
+    const answered = cascade.get("answered_by") orelse return error.InvalidDecisionOutput;
+    if (executed != .array or executed.array.items.len == 0 or executed.array.items.len > definition.stages.len or answered != .string) return error.InvalidDecisionOutput;
+    var last: ?usize = null;
+    for (executed.array.items, 0..) |entry, index| {
+        const fields = try object(entry);
+        const stage = definition.stages[index];
+        const name = fields.get("name") orelse return error.InvalidDecisionOutput;
+        const method = fields.get("decision_method") orelse return error.InvalidDecisionOutput;
+        const escalated = fields.get("escalated") orelse return error.InvalidDecisionOutput;
+        if (name != .string or !std.mem.eql(u8, name.string, stage.name) or method != .string or !std.mem.eql(u8, method.string, @tagName(stage.method)) or escalated != .bool) return error.InvalidDecisionOutput;
+        const has_next = index + 1 < executed.array.items.len;
+        if (fields.get("error")) |err| {
+            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous) return error.InvalidDecisionOutput;
+            continue;
+        }
+        const answers = fields.get("answers") orelse return error.InvalidDecisionOutput;
+        if (answers != .array or answers.array.items.len == 0) return error.InvalidDecisionOutput;
+        const should_escalate = if (index + 1 < definition.stages.len) try inBand(definition.stages[index + 1].when.?, answers) else false;
+        if (escalated.bool != should_escalate or has_next != should_escalate) return error.InvalidDecisionOutput;
+        last = index;
+    }
+    const index = last orelse return error.InvalidDecisionOutput;
+    const final = executed.array.items[index].object;
+    if (!std.mem.eql(u8, answered.string, definition.stages[index].name) or
+        !jsonEqual(final.get("answers").?, response.object.get("answers") orelse return error.InvalidDecisionOutput) or
+        !jsonEqual(final.get("model") orelse return error.InvalidDecisionOutput, response.object.get("model") orelse return error.InvalidDecisionOutput)) return error.InvalidDecisionOutput;
+    const revision = final.get("model_revision");
+    const public_revision = response.object.get("model_revision");
+    if ((revision == null) != (public_revision == null)) return error.InvalidDecisionOutput;
+    if (revision) |v| if (!jsonEqual(v, public_revision.?)) return error.InvalidDecisionOutput;
+    return index;
+}
+
+fn jsonEqual(lhs: V, rhs: V) bool {
+    if ((lhs == .integer or lhs == .float) and (rhs == .integer or rhs == .float)) return (number(lhs) catch return false) == (number(rhs) catch return false);
+    if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+    return switch (lhs) {
+        .null => true,
+        .bool => lhs.bool == rhs.bool,
+        .string => std.mem.eql(u8, lhs.string, rhs.string),
+        .number_string => std.mem.eql(u8, lhs.number_string, rhs.number_string),
+        .integer => lhs.integer == rhs.integer,
+        .float => lhs.float == rhs.float,
+        .array => blk: {
+            if (lhs.array.items.len != rhs.array.items.len) break :blk false;
+            for (lhs.array.items, rhs.array.items) |l, r| if (!jsonEqual(l, r)) break :blk false;
+            break :blk true;
+        },
+        .object => blk: {
+            if (lhs.object.count() != rhs.object.count()) break :blk false;
+            for (lhs.object.keys(), lhs.object.values()) |key, l| if (!jsonEqual(l, rhs.object.get(key) orelse break :blk false)) break :blk false;
+            break :blk true;
+        },
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -412,8 +502,15 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
         if (runner.checkpoint) |check| try check(runner.ptr);
         calls += 1;
         const result = runner.run(runner.ptr, a, stage_index, stage, active.items) catch |err| {
-            if (isFatal(err) or stage_index == 0 or stage.on_failure == .fail) return err;
-            for (active.items) |index| try rows[index].stages.append(try trace(a, stage, null, null, err));
+            if (isFatal(err)) return err;
+            for (active.items) |index| {
+                const row = &rows[index];
+                try row.stages.append(try trace(a, stage, null, null, err));
+                if (stage_index == 0 or stage.on_failure == .fail) {
+                    row.response = null;
+                    row.failure = err;
+                }
+            }
             break;
         };
         if (result.values.len != active.items.len or result.failures.len != active.items.len) return error.InvalidDecisionOutput;
@@ -463,6 +560,7 @@ fn trace(a: A, stage: Stage, response: ?V, usage: ?V, err: ?anyerror) !V {
     try put(a, &entry, "decision_method", .{ .string = @tagName(stage.method) });
     if (response) |value| {
         if (value.object.get("model")) |model| try put(a, &entry, "model", model);
+        if (value.object.get("model_revision")) |revision| try put(a, &entry, "model_revision", revision);
         try put(a, &entry, "answers", value.object.get("answers").?);
         var u = std.json.ObjectMap{};
         try put(a, &u, "input_tokens", .{ .integer = @intCast(usageField(usage, "input_tokens")) });
@@ -683,7 +781,9 @@ test "decision cascade stage failure fails unless keep_previous is configured" {
     const a = arena.allocator();
     var fake = Fake{ .fast = &.{0.5}, .strong_fails = true };
     const strict = try compileJson(a, example);
-    try std.testing.expectError(error.DecisionUpstreamFailure, execute(a, &strict, "c", 1, .{ .ptr = &fake, .run = Fake.run }));
+    const failed = try execute(a, &strict, "c", 1, .{ .ptr = &fake, .run = Fake.run });
+    try std.testing.expect(failed.values[0] == null);
+    try std.testing.expectEqual(@as(?anyerror, error.DecisionUpstreamFailure), failed.failures[0]);
 
     const lenient = try compileJson(a,
         \\{"stages":[{"name":"fast","decider":{"model":"x"}},
@@ -697,6 +797,7 @@ test "decision cascade stage failure fails unless keep_previous is configured" {
     try std.testing.expectEqual(@as(usize, 2), stages.len);
     try std.testing.expectEqualStrings("DecisionUpstreamFailure", stages[1].object.get("error").?.string);
     try std.testing.expectEqualStrings("fast", kept.get("cascade").?.object.get("answered_by").?.string);
+    try std.testing.expectEqual(@as(usize, 0), try validateTrace(&lenient, .{ .object = kept }));
 }
 
 test "decision cascade per-item failures stay isolated" {
@@ -710,6 +811,75 @@ test "decision cascade per-item failures stay isolated" {
     try std.testing.expectEqual(@as(?anyerror, error.InvalidDecisionOutput), out.failures[0]);
     try std.testing.expect(out.values[1] != null);
     try std.testing.expect(out.values[2] != null);
+}
+
+test "decision cascade stage-wide failures preserve completed siblings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definition = try compileJson(a, example);
+    var fake = Fake{ .fast = &.{ 0.99, 0.6, 0.02 }, .strong_fails = true };
+    const result = try execute(a, &definition, "c", 3, .{ .ptr = &fake, .run = Fake.run });
+    try std.testing.expect(result.values[0] != null);
+    try std.testing.expect(result.values[1] == null);
+    try std.testing.expectEqual(@as(?anyerror, error.DecisionUpstreamFailure), result.failures[1]);
+    try std.testing.expect(result.values[2] != null);
+    _ = try validateTrace(&definition, result.values[0].?);
+    _ = try validateTrace(&definition, result.values[2].?);
+}
+
+test "decision cascade binds question and choice selectors before inference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definition = try compileJson(a, example);
+    const valid = try std.json.parseFromSliceLeaky(V, a,
+        \\{"same":{"type":"choice","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    try validateBands(&definition, valid);
+    const invalid = [_][]const u8{
+        \\{"typo":{"type":"choice","criteria":{"same":"Same","different":"Different"}}}
+        ,
+        \\{"same":{"type":"choice","criteria":{"yes":"Yes","no":"No"}}}
+        ,
+    };
+    for (invalid) |bytes| try std.testing.expectError(error.InvalidDecisionCascade, validateBands(&definition, try std.json.parseFromSliceLeaky(V, a, bytes, .{})));
+    const predicate = try std.json.parseFromSliceLeaky(V, a,
+        \\{"same":{"type":"noul"}}
+    , .{});
+    try validateBands(&definition, predicate);
+}
+
+test "decision cascade receipts retain every revision and reject contradictory traces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definition = try compileJson(a, example);
+    const RunnerWithRevisions = struct {
+        fn run(ptr: *anyopaque, alloc: A, stage_index: usize, stage: Stage, indices: []const usize) !StageResult {
+            const result = try Fake.run(ptr, alloc, stage_index, stage, indices);
+            const values = try alloc.dupe(?V, result.values);
+            for (values) |*value| if (value.*) |*response| {
+                try response.object.put(alloc, "model_revision", .{ .string = if (stage_index == 0) "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" else "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+            };
+            return .{ .values = values, .failures = result.failures };
+        }
+    };
+    var fake = Fake{ .fast = &.{0.6} };
+    const result = try execute(a, &definition, "c", 1, .{ .ptr = &fake, .run = RunnerWithRevisions.run });
+    var response = result.values[0].?;
+    try std.testing.expectEqual(@as(usize, 1), try validateTrace(&definition, response));
+    const stages = response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items;
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", stages[0].object.get("model_revision").?.string);
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", stages[1].object.get("model_revision").?.string);
+    try stages[0].object.put(a, "escalated", .{ .bool = false });
+    try std.testing.expectError(error.InvalidDecisionOutput, validateTrace(&definition, response));
+    try stages[0].object.put(a, "escalated", .{ .bool = true });
+    try response.object.put(a, "model", .{ .string = "invented" });
+    try std.testing.expectError(error.InvalidDecisionOutput, validateTrace(&definition, response));
+    try response.object.put(a, "model", stages[1].object.get("model").?);
+    try response.object.getPtr("cascade").?.object.put(a, "definition_sha256", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+    try std.testing.expectError(error.InvalidDecisionOutput, validateTrace(&definition, response));
 }
 
 test "decision cascade rejects similarity-only answers as band input" {

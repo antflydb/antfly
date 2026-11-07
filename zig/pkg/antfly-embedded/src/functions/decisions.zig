@@ -156,7 +156,7 @@ pub const DeciderConfig = struct {
             self.probabilities != defaults.probabilities or self.instructions.len != 0 or !std.meta.eql(self.batch, defaults.batch) or
             self.model.len != 0 or self.model_identity != null or self.embedding_options != null or self.url.len != 0 or self.api_key != null or
             self.account_id != null or self.gateway_id != null or self.max_image_input_tokens != null or self.rate_limit != null or
-            self.max_rows == 0 or self.max_input_tokens == 0 or self.batch_size == 0 or self.batch_size > 256) return error.InvalidDeciderConfig;
+            self.max_rows != defaults.max_rows or self.max_input_tokens != defaults.max_input_tokens or self.batch_size != defaults.batch_size) return error.InvalidDeciderConfig;
         var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer arena.deinit();
         const a = arena.allocator();

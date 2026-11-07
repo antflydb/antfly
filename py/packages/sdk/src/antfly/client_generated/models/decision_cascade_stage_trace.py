@@ -33,6 +33,7 @@ class DecisionCascadeStageTrace:
         decision_method (DecisionCascadeStageTraceDecisionMethod):
         escalated (bool): Whether this answer fell inside the next stage's band, sending the input on.
         model (str | Unset):
+        model_revision (str | Unset): Immutable model revision reported by this stage, when available.
         answers (list[EmbeddingChoiceAnswer | EmbeddingMultiChoiceAnswer | GeneratedChoiceAnswer |
             GeneratedMultiChoiceAnswer | GeneratedPredicateAnswer | GeneratedScoreAnswer | TrainedChoiceAnswer |
             TrainedPredicateAnswer | TrainedScoreAnswer] | Unset): This stage's answers. Absent when the stage failed.
@@ -47,6 +48,7 @@ class DecisionCascadeStageTrace:
     decision_method: DecisionCascadeStageTraceDecisionMethod
     escalated: bool
     model: str | Unset = UNSET
+    model_revision: str | Unset = UNSET
     answers: (
         list[
             EmbeddingChoiceAnswer
@@ -82,6 +84,8 @@ class DecisionCascadeStageTrace:
         escalated = self.escalated
 
         model = self.model
+
+        model_revision = self.model_revision
 
         answers: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.answers, Unset):
@@ -130,6 +134,8 @@ class DecisionCascadeStageTrace:
         )
         if model is not UNSET:
             field_dict["model"] = model
+        if model_revision is not UNSET:
+            field_dict["model_revision"] = model_revision
         if answers is not UNSET:
             field_dict["answers"] = answers
         if usage is not UNSET:
@@ -163,6 +169,8 @@ class DecisionCascadeStageTrace:
         escalated = d.pop("escalated")
 
         model = d.pop("model", UNSET)
+
+        model_revision = d.pop("model_revision", UNSET)
 
         _answers = d.pop("answers", UNSET)
         answers: (
@@ -291,6 +299,7 @@ class DecisionCascadeStageTrace:
             decision_method=decision_method,
             escalated=escalated,
             model=model,
+            model_revision=model_revision,
             answers=answers,
             usage=usage,
             provenance=provenance,

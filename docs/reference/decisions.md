@@ -242,12 +242,15 @@ resolver `adjudicate` policy or decision enrichment.
   stages, and a band cannot follow a `verdict_only` generated stage.
 - Escalation applies to successful answers. It is not failover: a stage error
   ends the input unless that stage sets `on_failure: keep_previous`, which keeps
-  the previous answer and records the error.
+  the previous answer and records the error. A later stage's operational failure
+  does not discard confident siblings that already completed an earlier stage.
 - `budget.max_model_calls` (at most 8, at least the stage count) bounds stage
   invocations; `budget.deadline_ms` narrows the caller's deadline.
 - Each stage keeps its own rate limits, row and token budgets, and media
-  limits. The cascade admits images and message evidence only when every stage
-  does.
+  limits across batches in the same statement. Set row, token and batch limits
+  on the stage deciders. The cascade admits images and message evidence only
+  when every stage does. Question and choice selectors are validated against
+  the request before any stage runs.
 
 Responses carry a `cascade` trace per input (top-level for single input, on each
 batch row otherwise):
@@ -260,6 +263,9 @@ batch row otherwise):
 ```
 
 `definition_sha256` identifies the cascade definition without credentials.
+Stage traces include `model_revision` when the provider reports an immutable
+revision. Resolver adjudication verifies the definition, escalation decisions,
+stage order, and agreement between the trace and the final answer.
 Probabilities from different models are not calibrated against each other, so
 set each band on labelled examples for the models involved and measure how
 often inputs escalate. The trace has what an evaluation needs: the answering
