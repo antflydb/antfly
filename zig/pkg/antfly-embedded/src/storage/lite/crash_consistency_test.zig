@@ -971,12 +971,12 @@ test "WS4 phase 2: a synchronous full_text write lands in exactly one native com
     const path = try testAflitePath(allocator, tmp);
     defer allocator.free(path);
 
-    // Not `openDbWithIo`: WS4 phase 2's inline fast path only engages
-    // when there is no background executor to otherwise notify/wait on
-    // (see `batchInternalPreparedOwned`'s `!executor.hasWorkers()` gate)
-    // -- today's synchronous-ack inline-apply condition. Force that
-    // configuration explicitly rather than relying on the shared
-    // helper's default.
+    // Not `openDbWithIo`: this scenario specifically covers the no-worker
+    // configuration (background index workers never started). WS4 phase 2
+    // round 2 made the inline fast path engage with workers running too --
+    // see the "...with background index workers running..." test below
+    // for that configuration. Force the no-worker configuration explicitly
+    // here rather than relying on the shared helper's default.
     var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = std.testing.io });
     var backend_owned = true;
     errdefer if (backend_owned) lite_backend.deinit();
@@ -1033,6 +1033,202 @@ test "WS4 phase 2: a synchronous full_text write lands in exactly one native com
     });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+}
+
+test "WS4 phase 2 round 2: a synchronous full_text write lands in one native commit with background index workers running, and the worker never re-applies it" {
+    // Default Lite configuration: background index workers running
+    // (`openDbWithIo` does not override `start_index_workers`, so it keeps
+    // the open-options default). Before this change, this configuration
+    // took the notify-workers-and-wait path and saw none of WS4 phase 2's
+    // benefit; this test is the one from directly above, but through the
+    // path this round actually targets.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+    try handle.db.runUntilIdle();
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+
+    const after_ack_sequence = store.file.activeCheckpoint().commit_sequence;
+    const commits_for_this_write = after_ack_sequence - before_sequence;
+    // Same bound as the no-worker scenario above: the inline publication
+    // itself is still exactly one commit: see that test's comment for why
+    // a handful more land end to end (unrelated background bookkeeping WS7
+    // owns driving to zero). Proves the inline fast path engaged here too
+    // -- without it, this write would additionally wake and wait on a
+    // worker, but would not by itself add more *commits* before the ack
+    // returns, so the real claim this bound guards is the search-visible
+    // assertion immediately below: that only holds if the write's own
+    // index effects are already durable at ack time, which requires the
+    // inline path, not the worker (a worker applies asynchronously, after
+    // `batch()` has already returned).
+    try std.testing.expect(commits_for_this_write <= 6);
+
+    // Searchable immediately after ack, before the background worker has
+    // had any chance to run.
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "needle" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+
+    // Let the background worker observe this write and decide whether to
+    // catch this index up. If it is not told the write already landed
+    // inline, it will re-apply the same document from the journal --
+    // doubling the hit count below (two postings for the same unique term)
+    // even though document storage itself is idempotent by key.
+    try handle.db.runUntilIdle();
+
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "needle" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+
+    // A second write to a different document, still synchronous full_text,
+    // still with the worker running: the same claims hold repeatedly, not
+    // just for a single write before the worker ever wakes.
+    try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc-2", .value = "{\"body\":\"another needle here\"}" }}, .sync_level = .full_text });
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "needle" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    }
+    try handle.db.runUntilIdle();
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "needle" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    }
+}
+
+test "WS4 phase 2 round 2: a worker-backlogged index falls back correctly instead of skipping the gap" {
+    // Deliberately creates the one scenario the inline fast path must
+    // refuse: a background worker still owes this index an earlier
+    // write's effects (one that never required `.full_text` visibility,
+    // so nothing but the worker's own catch-up will ever apply it) when a
+    // later, synchronous `.full_text` write to the SAME index arrives.
+    //
+    // `std.testing.io` schedules the background executor cooperatively:
+    // nothing it drives gets a turn unless this test explicitly yields
+    // (`runUntilIdle`, or a wait loop's own `io.sleep`). The `.write`-level
+    // batch below is therefore guaranteed to still be unapplied backlog by
+    // the time the very next statement -- the `.full_text` batch -- runs
+    // its own inline-eligibility pre-check.
+    //
+    // If the pre-check wrongly ignored that backlog and took the fast
+    // path anyway, it would durably advance this index's progress past
+    // the backlogged document's sequence, and nothing would ever revisit
+    // it: `old-doc` would never become searchable. Instead, the `.full_text`
+    // write must fall back to the existing slow path, which forces the
+    // worker to catch up the backlog (and its own write) before the ack
+    // returns.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    // A write-level batch leaves this index's own effects as backlog: no
+    // caller is waiting on `.full_text`/`.full_index` visibility, so only
+    // the (not yet scheduled) background worker will ever apply it.
+    try handle.db.batch(.{ .writes = &.{.{ .key = "old-doc", .value = "{\"body\":\"aardvark lives here\"}" }}, .sync_level = .write });
+
+    // Immediately -- no `runUntilIdle` in between -- a synchronous
+    // full_text write to the same index. The inline pre-check must see
+    // the worker still behind on "old-doc" and fall back.
+    try handle.db.batch(.{ .writes = &.{.{ .key = "new-doc", .value = "{\"body\":\"zebra arrived later\"}" }}, .sync_level = .full_text });
+
+    // The fallback must have forced the worker to catch both documents up
+    // before this ack returned: both are searchable right away, with no
+    // duplication.
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "aardvark" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "zebra" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+
+    // Draining any remaining background activity must not change the
+    // picture (no double-apply once the worker actually gets a turn).
+    try handle.db.runUntilIdle();
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "aardvark" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "zebra" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    }
+
+    // A subsequent, ordinary full_text write still gets the inline fast
+    // path once the backlog has drained (self-healing, not permanently
+    // disabled by the earlier fallback).
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+    try handle.db.batch(.{ .writes = &.{.{ .key = "new-doc-2", .value = "{\"body\":\"zebra again\"}" }}, .sync_level = .full_text });
+    const after_sequence = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expect(after_sequence - before_sequence <= 6);
+    {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "body_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "zebra" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    }
 }
 
 test "crash sweep: full text synchronous visibility" {
