@@ -142,6 +142,13 @@ const Plan = struct {
     }
 };
 
+/// Vendor-default SDPA does not expose instruction quantum, online traversal
+/// or row-reduction order. Fixed schedules require a separately proven backend.
+pub const NumericalContract = enum { vendor_selected, flash_bf16, efficient_bf16 };
+pub fn supportsNumericalContract(contract: NumericalContract) bool {
+    return contract == .vendor_selected;
+}
+
 pub const Key = struct {
     batch: usize = 0,
     q_heads: usize = 0,
@@ -155,9 +162,10 @@ pub const Key = struct {
     florence_vision: bool = false,
     dense_seq2seq: bool = false,
     dtype: enum { bf16, f16 } = .bf16,
+    numerical_contract: NumericalContract = .vendor_selected,
 
     fn eql(a: Key, b: Key) bool {
-        return a.batch == b.batch and a.q_heads == b.q_heads and a.kv_heads == b.kv_heads and
+        return a.numerical_contract == b.numerical_contract and a.batch == b.batch and a.q_heads == b.q_heads and a.kv_heads == b.kv_heads and
             a.sequence == b.sequence and a.dim == b.dim and a.florence_vision == b.florence_vision and a.dense_seq2seq == b.dense_seq2seq and a.dtype == b.dtype and a.ocr_vision == b.ocr_vision and a.local_window_radius == b.local_window_radius and a.padding_mask == b.padding_mask and
             @as(u32, @bitCast(a.scale)) == @as(u32, @bitCast(b.scale));
     }
@@ -165,7 +173,7 @@ pub const Key = struct {
 
 fn keyFingerprint(key: Key) usize {
     var value: usize = key.batch;
-    inline for (.{ key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.florence_vision)), @as(usize, @intFromBool(key.dense_seq2seq)), @as(usize, @backingInt(key.dtype)), @as(usize, @intFromBool(key.ocr_vision)), @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
+    inline for (.{ @as(usize, @backingInt(key.numerical_contract)), key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.florence_vision)), @as(usize, @intFromBool(key.dense_seq2seq)), @as(usize, @backingInt(key.dtype)), @as(usize, @intFromBool(key.ocr_vision)), @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
         value = (value ^ part) *% 0x9e3779b1;
     return value;
 }
@@ -299,6 +307,10 @@ pub const Module = struct {
     }
 
     fn getPlan(self: *Module, key: Key) !?*Plan {
+        if (!supportsNumericalContract(key.numerical_contract)) {
+            self.stats_.plan_declines += 1;
+            return null;
+        }
         if (!eligible(key, self.version)) return null;
         for (self.plans[0..self.plan_count]) |*p| if (p.key.eql(key)) {
             self.stats_.plan_hits += 1;
@@ -951,4 +963,20 @@ test "cuDNN legacy candidate retry remains unchanged while explicit dense SDK er
         }
         try std.testing.expectEqual(@as(usize, 0), Fault.live());
     }
+}
+
+test "cuDNN SDPA fixed numerical contracts decline before cache or SDK access" {
+    try std.testing.expect(supportsNumericalContract(.vendor_selected));
+    var module: Module = undefined;
+    module.stats_ = .{};
+    for ([_]NumericalContract{ .flash_bf16, .efficient_bf16 }) |contract| {
+        const key = Key{ .batch = 1, .q_heads = 4, .kv_heads = 2, .sequence = 15, .dim = 256, .numerical_contract = contract };
+        try std.testing.expect(!supportsNumericalContract(contract));
+        try std.testing.expect((try module.workspaceBytesFor(key)) == null);
+        var vendor = key;
+        vendor.numerical_contract = .vendor_selected;
+        try std.testing.expect(!key.eql(vendor));
+        try std.testing.expect(keyFingerprint(key) != keyFingerprint(vendor));
+    }
+    try std.testing.expectEqual(@as(u64, 2), module.stats_.plan_declines);
 }

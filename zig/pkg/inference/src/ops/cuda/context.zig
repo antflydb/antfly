@@ -44,6 +44,7 @@ pub const DeviceInfo = struct {
     name_len: usize = 0,
     compute_major: i32 = 0,
     compute_minor: i32 = 0,
+    multiprocessor_count: i32 = 0,
 
     pub fn nameSlice(self: *const DeviceInfo) []const u8 {
         return self.name[0..self.name_len];
@@ -164,6 +165,7 @@ pub const CudaContext = struct {
         info.name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;
 
         checkStep(&driver, "cuDeviceComputeCapability", driver.fns.cuDeviceComputeCapability(&info.compute_major, &info.compute_minor, device)) catch |err| return err;
+        info.multiprocessor_count = try queryMultiprocessorCount(&driver, device);
 
         // Reject incompatible images before retaining a context or allocating
         // device storage. Do not confuse toolkit installation with driver API
@@ -547,6 +549,16 @@ pub const CudaContext = struct {
     }
 };
 
+// Query the actual cold property before retaining a primary context. A default
+// or fabricated DeviceInfo never supplies device capacity authority.
+fn queryMultiprocessorCount(driver: *const CudaDriver, device: CUdevice) driver_mod.Error!i32 {
+    const attribute = driver.fns.cuDeviceGetAttribute orelse return error.CudaSymbolMissing;
+    var count: c_int = 0;
+    try checkStep(driver, "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)", attribute(&count, 16, device));
+    if (count <= 0) return error.InvalidCudaState;
+    return count;
+}
+
 fn checkStep(driver: *const CudaDriver, step: []const u8, result: driver_mod.CUresult) driver_mod.Error!void {
     if (result != driver_mod.CUDA_SUCCESS) {
         std.log.err("CUDA context init failed at {s}: {s} ({s})", .{ step, driver.errorName(result), driver.errorString(result) });
@@ -665,4 +677,33 @@ test "CUDA observation cold installation publishes one complete state and retire
     context.observation.store(null, .release);
     installed.deinit();
     try std.testing.expectEqual(@as(usize, 2), allocator.frees.load(.monotonic));
+}
+
+test "CUDA cold multiprocessor query rejects missing and malformed properties before context ownership" {
+    const Fake = struct {
+        threadlocal var count: c_int = 0;
+        threadlocal var calls: usize = 0;
+        fn attribute(value: *c_int, kind: c_int, device: CUdevice) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(kind == 16 and device == 7);
+            calls += 1;
+            value.* = count;
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    // Only the queried field is initialized: no context, allocation, or opaque
+    // driver operation may be touched by these cold property controls.
+    var driver: CudaDriver = undefined;
+    driver.fns.cuDeviceGetAttribute = null;
+    Fake.calls = 0;
+    try std.testing.expectError(error.CudaSymbolMissing, queryMultiprocessorCount(&driver, 7));
+    try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+    driver.fns.cuDeviceGetAttribute = Fake.attribute;
+    for ([_]c_int{ 0, -1 }) |invalid| {
+        Fake.count = invalid;
+        try std.testing.expectError(error.InvalidCudaState, queryMultiprocessorCount(&driver, 7));
+    }
+    Fake.count = 17; // Explicit simulated property, never an actual GPU witness.
+    try std.testing.expectEqual(@as(i32, 17), try queryMultiprocessorCount(&driver, 7));
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+    try std.testing.expectEqual(@as(i32, 0), (DeviceInfo{}).multiprocessor_count);
 }

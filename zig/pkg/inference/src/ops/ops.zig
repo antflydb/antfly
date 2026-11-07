@@ -4492,12 +4492,40 @@ pub const ComputeBackend = struct {
     /// Publish F32 rows independently of mutable decoder/arena storage. This
     /// copies on the selected backend; it never stages activations through host.
     pub fn snapshotRows2D(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, start_row: usize, rows: usize, cols: usize) !CT {
+        return self.snapshotRows2DPolicy(allocator, input, start_row, rows, cols, null, .{});
+    }
+
+    /// Same backend copy with independently prepared quota. Only preallocated
+    /// backing ownership moves under the current caller's numerical boundary;
+    /// no supplier, partition or quota growth occurs at this receiving entry.
+    pub fn snapshotRows2DWithAdmission(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, start_row: usize, rows: usize, cols: usize, capability: @import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context) !CT {
+        if (capability.services.takeBacking == null) return error.PreparedPhysicalAdmissionRequired;
+        const functions = self.vtable.kernels orelse return error.UnsupportedPhysicalStoragePolicy;
+        if (!functions.accepts(self.vtable) or functions.physical_storage_policy == null) return error.UnsupportedPhysicalStoragePolicy;
+        if (functions.physicalTensorView == null) return error.UnsupportedBackendOp;
+        const actual = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        const expected = capability.constructionEpoch() orelse return error.MissingCurrentCleanupEpoch;
+        if (actual.record != expected.record or actual.nonce != expected.nonce) return error.BackendOperationCleanupChanged;
+        if (try actual.isSealed()) return error.RetirementEpochSealed;
+        return self.snapshotRows2DPolicy(allocator, input, start_row, rows, cols, capability, current);
+    }
+
+    fn snapshotRows2DPolicy(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, start_row: usize, rows: usize, cols: usize, capability: ?@import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context) !CT {
         if (rows == 0 or cols == 0 or rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return error.InvalidShape;
         if (try self.tensorDType(input) != .f32) return error.UnsupportedTensorType;
         const count = try std.math.mul(usize, rows, cols);
         if (count > std.math.maxInt(i32)) return error.InvalidShape;
         const shape = [_]i32{ @intCast(rows), @intCast(cols) };
         const output = stable_storage: {
+            if (capability) |prepared| {
+                const functions = self.vtable.kernels orelse return error.UnsupportedPhysicalStoragePolicy;
+                if (!functions.accepts(self.vtable) or functions.physical_storage_policy == null) return error.UnsupportedPhysicalStoragePolicy;
+                const view = functions.physicalTensorView orelse return error.UnsupportedBackendOp;
+                const bytes = try std.math.mul(usize, count, @sizeOf(f32));
+                const storage = (try physical_storage.Lease.createAdmitted(allocator, self.*, bytes, null, .activation, prepared)) orelse return error.UnsupportedBackendOp;
+                defer storage.releaseWithCleanup(current);
+                break :stable_storage (try view(self.ptr, .{ .storage = storage, .shape = &shape })) orelse return error.UnsupportedBackendOp;
+            }
             // Stable target storage bypasses temporary arena slots. The owned
             // reshape retains the flat allocation through the published value.
             if (self.vtable.kernels) |functions| if (functions.physical_storage_policy) |policy| {
@@ -4509,7 +4537,7 @@ pub const ComputeBackend = struct {
             };
             break :stable_storage (try self.allocUninitF32Shape(&shape)) orelse return error.UnsupportedBackendOp;
         };
-        errdefer self.free(output);
+        errdefer if (capability != null) self.freeWithCleanup(output, current) else self.free(output);
         if (!try self.copyRows2D(allocator, output, 0, input, start_row, rows, cols)) return error.UnsupportedBackendOp;
         return output;
     }
@@ -7766,4 +7794,67 @@ test "modelConstant unadvertised raw callback retains original no preparation co
     try std.testing.expect((try cb.modelConstant("audio_tower.prepared.scope163", null)) == null);
     try std.testing.expectEqualSlices(u8, &.{2}, probe.events[0..probe.count]);
     try std.testing.expect(!probe.active);
+}
+
+fn admittedRowsSnapshotPreflightCase(a: std.mem.Allocator) !void {
+    const Native = @import("native_compute.zig");
+    const Sink = @import("../execution/retirement_sink.zig");
+    const Storage = @import("../execution/storage_admission.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    var store = Native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = Native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &Native.vtable_impl };
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer cb.free(input);
+    const domain = try Domain.create();
+    defer domain.release();
+    var first = try Sink.Ref.create();
+    defer first.release();
+    var guard = try first.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var second = try Sink.Ref.create();
+    defer second.release();
+    var other_guard = try second.enter();
+    defer other_guard.finish();
+    var other = try other_guard.retainEpoch();
+    defer other.release();
+    const Probe = struct {
+        expected: *const Sink.Epoch,
+        fn construction(raw: *anyopaque) ?*const Sink.Epoch {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            return probe.expected;
+        }
+        fn reserve(_: *anyopaque, _: std.mem.Allocator, _: BackendKind, _: @import("../execution/storage_accounting.zig").Class, _: usize) !Storage.Reservation {
+            return error.UnexpectedReservationCallback;
+        }
+        fn backing(_: *anyopaque, _: std.mem.Allocator, _: BackendKind, _: @import("../execution/storage_accounting.zig").Class, _: usize) !Storage.BackingReservation {
+            return error.UnexpectedBackingCallback;
+        }
+    };
+    var probe = Probe{ .expected = &epoch };
+    const capability = Storage.Capability{ .identity = .{ .controller = &domain.controller, .backend_class = .cpu }, .context = &probe, .services = &.{ .reserve = Probe.reserve, .takeBacking = Probe.backing, .constructionEpoch = Probe.construction } };
+    var copied_table = cb.vtable.*;
+    std.mem.doNotOptimizeAway(&copied_table);
+    try std.testing.expect(&copied_table != cb.vtable);
+    const copied = ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied_table };
+    try std.testing.expectError(error.UnsupportedPhysicalStoragePolicy, copied.snapshotRows2DWithAdmission(a, input, 0, 2, 2, capability, .{ .boundary = &epoch }));
+    copied_table.kernels = null;
+    try std.testing.expectError(error.UnsupportedPhysicalStoragePolicy, copied.snapshotRows2DWithAdmission(a, input, 0, 2, 2, capability, .{ .boundary = &epoch }));
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, cb.snapshotRows2DWithAdmission(a, input, 0, 2, 2, capability, .{}));
+    try std.testing.expectError(error.BackendOperationCleanupChanged, cb.snapshotRows2DWithAdmission(a, input, 0, 2, 2, capability, .{ .boundary = &other }));
+    guard.finish();
+    try std.testing.expectError(error.RetirementEpochSealed, cb.snapshotRows2DWithAdmission(a, input, 0, 2, 2, capability, .{ .boundary = &epoch }));
+    const actual = try cb.toFloat32(input, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, actual);
+    try std.testing.expectEqualDeep(@import("../runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "admitted row snapshot refuses missing foreign and sealed boundaries before backing or source mutation" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try admittedRowsSnapshotPreflightCase(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, admittedRowsSnapshotPreflightCase, .{});
 }

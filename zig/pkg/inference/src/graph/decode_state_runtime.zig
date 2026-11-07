@@ -75,6 +75,8 @@ const SelectionQueryEntry = struct {
 };
 
 pub const NativeDecodeState = struct {
+    /// Synchronous borrow; the actual request/PAGE retires banks after state.
+    dense_ffn_program: ?*@import("../ops/cuda/cuda_compute.zig").CudaCompute.DenseFfnProgram = null,
     /// Borrowed through claimed-step drain and publication.
     execution_backend: ?@import("../ops/ops.zig").ComputeBackend = null,
     execution_control: ?InferenceExecutionControl = null,
@@ -757,6 +759,7 @@ pub const NativeDecodeState = struct {
         self.kv_view = null;
         self.kv_compacted = false;
         self.qwen35_linear_cache = null;
+        self.dense_ffn_program = null;
         self.deepseek_v4_compressed_cache = null;
         self.kv_storage = null;
         self.kv_manager = null;
@@ -787,6 +790,7 @@ pub const NativeDecodeState = struct {
         self.kv_view = null;
         self.kv_compacted = false;
         self.qwen35_linear_cache = null;
+        self.dense_ffn_program = null;
         self.deepseek_v4_compressed_cache = null;
     }
 
@@ -1222,6 +1226,7 @@ pub const NativeDecodeState = struct {
                 .kv_sequence_len = seq_len,
                 .kv_position_offset = 0,
                 .moe_runtime = &self.moe_runtime,
+                .dense_ffn_program = self.dense_ffn_program,
                 .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
                 .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
                 .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
@@ -1241,6 +1246,7 @@ pub const NativeDecodeState = struct {
             .kv_manager = self.kv_manager,
             .kv_storage = self.kv_storage,
             .moe_runtime = &self.moe_runtime,
+            .dense_ffn_program = self.dense_ffn_program,
             .qwen35_linear_cache = if (self.qwen35_linear_cache) |*cache| cache else null,
             .gemma4_layer_spec_cache = &self.gemma4_layer_spec_cache,
             .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,

@@ -843,11 +843,24 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
     }
 
+    const VisionPublication = if (build_options.enable_cuda) @import("execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else struct {};
+    var vision_publication: ?VisionPublication = null;
+    defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
+    if (comptime build_options.enable_cuda) if (generation_resources.resources) |*primary| {
+        const publication_bytes = if (backend_kind == .cuda and draft_model == null and config.qwen3vl_parity_json_path == null) generation.nativeCudaVisionPublicationBytes(allocator, opts.model_dir, gpt_config, &messages, @intCast(@max(config.max_tokens, 1)), 1) catch 0 else 0;
+        vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, .{});
+    };
+    var publication_cleanup: ?@import("execution/cleanup_owner.zig").Owner = if (vision_publication != null) try @import("execution/cleanup_owner.zig").Owner.beginAdmitted(model.session) else null;
+    defer if (publication_cleanup) |*owner| owner.finishAfterUnlock();
+
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
     defer kv_manager.deinit();
 
     debugGenerateSetup("compute backend begin", .{});
-    var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
+    var cb = (if (publication_cleanup) |*owner|
+        @import("execution/architecture_session.zig").getComputeBackendWithBudgetAndCleanup(model.session, allocator, &run_budget, .{ .boundary = owner.epoch() })
+    else
+        session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget)) catch |err| {
         debugGenerateSetup("compute backend failed err={s}", .{@errorName(err)});
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
@@ -856,7 +869,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     debugGenerateSetup("compute backend done", .{});
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
-    defer cb.deinit();
+    defer if (publication_cleanup) |*owner| cb.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = cb.operationToken() }) else cb.deinit();
     if (opts.debug_gemma4_target) {
         try printGemma4TargetDebug(&cb, tokenizer, model.manifest, gpt_config, prompt_encoded.ids[0..prompt_tokens]);
     }
@@ -933,7 +946,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (compiled_attachment_target != .whole_model or draft_model != null or opts.video_path != null or opts.image_count != 0 or opts.audio_count != 0) return error.UnsupportedPjrtFeature;
     }
 
+    defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.finish(.{ .boundary = if (publication_cleanup) |*owner| owner.epoch() else null, .operation = cb.operationToken() });
     var pipeline = generation.NativeGenerationPipeline{
+        .vision_publication = if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication else null else null,
+        .execution_cleanup_owner = if (publication_cleanup) |*owner| owner else null,
         .allocator = allocator,
         .io = io,
         .cb = cb,

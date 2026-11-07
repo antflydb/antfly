@@ -210,6 +210,39 @@ pub fn nativeCudaPinnedPatchUploadBytesAtMost(allocator: std.mem.Allocator, mode
     return qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(config, images, limits, maximum_upload_bytes);
 }
 
+/// Same prompt-limited singleton geometry as the ordinary numerical path.
+/// Outside callers use the returned value only to request fresh optional quota.
+pub fn nativeCudaVisionPublicationBytes(allocator: std.mem.Allocator, model_dir: []const u8, config: gpt_mod.Config, messages: []const Message, requested_output_tokens: usize, maximum_batch_items: usize) !usize {
+    if (!config.hasQwen35VisionArchitectureContract() or !messagesHaveImages(messages)) return 0;
+    const images = try collectImagesInPromptOrder(allocator, messages);
+    defer allocator.free(images);
+    if (images.len != 1) return 0;
+    const expanded_limit = try nativeGenerationPromptTokenLimit(config, null, requested_output_tokens, 0, 0);
+    var limits = try qwenVisionLimits(allocator, model_dir, config);
+    if (expanded_limit < limits.min_merged_tokens) return error.InputTokenLimitExceeded;
+    limits.max_merged_tokens = @min(limits.max_merged_tokens, expanded_limit);
+    if (maximum_batch_items > 1) {
+        const batch: ?qwen3vl_projector.ResidentBatchGeometry = qwen3vl_projector.residentBatchGeometry(.cuda, config, images[0], limits) catch |err| switch (err) {
+            error.UnsupportedBatchedVision => null,
+            else => return err,
+        };
+        if (batch) |shape| if (@min(maximum_batch_items, shape.max_items) > 1) return 0;
+    }
+    return qwen3vl_projector.planResidentFeaturePublicationBytes(config, images, limits);
+}
+
+pub fn prepareNativeVisionPublication(session: @import("../backends/session.zig").Session, primary: *runtime.tier.memory.AdmissionLease, bytes: usize, copies: usize, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !(if (build_options.enable_cuda) ?@import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else ?void) {
+    if (comptime !build_options.enable_cuda) return null;
+    if (comptime build_options.enable_cuda) {
+        if (bytes == 0 or copies == 0 or copies > 2) return null;
+        var requirements: [2]@import("../execution/prepared_storage_admission.zig").Requirement = undefined;
+        for (requirements[0..copies]) |*entry| entry.* = .{ .backend = .cuda, .class = .activation, .bytes = bytes };
+        const metadata = try std.math.mul(usize, copies, @sizeOf(ops.physical_storage.Lease) + 2 * @sizeOf(@import("../ops/cuda/cuda_compute.zig").CudaTensor) + 3 * @sizeOf(i64));
+        const Supplement = @import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage;
+        return Supplement.prepare(Supplement.requestSession(session, limits), primary, requirements[0..copies], .{ .consumer_metadata_bytes = metadata }, control);
+    }
+}
+
 pub fn nativeGenerationMediaAdmission(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -2533,6 +2566,7 @@ pub const NativeGenerationPipeline = struct {
     execution_gate: ?*execution_control_mod.ExecutionLane = null,
     execution_pause: ?*const execution_control_mod.ExecutionPause = null,
     execution_cleanup_owner: ?*const @import("../execution/cleanup_owner.zig").Owner = null,
+    vision_publication: if (build_options.enable_cuda) ?*@import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else ?*void = null,
     /// Invocation-local receiver, never retained by a cached runtime or graph.
     request_finish: ?*graph_mod.model_runtime.RequestFinish = null,
     draft_execution_cleanup_owner: ?*const @import("../execution/cleanup_owner.zig").Owner = null,
@@ -3279,14 +3313,8 @@ pub const NativeGenerationPipeline = struct {
                             vision_limits,
                         )
                     else
-                        try qwen3vl_projector.encodeProjectedImagesResident(
-                            &self.cb,
-                            allocator,
-                            self.gpt_config,
-                            images,
-                            vision_limits,
-                        );
-                    defer projected.deinit();
+                        try self.encodeResidentProjected(allocator, images, vision_limits);
+                    defer projected.deinitWithCleanup(.{ .boundary = if (self.execution_cleanup_owner) |owner| owner.epoch() else null, .operation = self.cb.operationToken() });
                     var qwen_encoded = try encodeQwenPromptWithImagePlaceholders(
                         self.tokenizer,
                         allocator,
@@ -7672,11 +7700,21 @@ pub const NativeGenerationPipeline = struct {
 
     const MtpMaterializedDeviceActivation = decoder_forward.Runtime.MtpMaterializedDeviceActivation;
 
+    fn encodeResidentProjected(self: *NativeGenerationPipeline, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+        if (comptime build_options.enable_cuda) if (self.vision_publication) |publication| {
+            const owner = self.execution_cleanup_owner orelse return error.MissingCurrentCleanupEpoch;
+            const current = @import("../execution/cleanup_context.zig").Context{ .boundary = owner.epoch(), .operation = self.cb.operationToken() };
+            const admission = qwen3vl_projector.FeaturePublicationAdmission{ .capability = try publication.bind(&self.cb, current), .expected_target = publication.target.target.cuda, .cleanup = current };
+            return qwen3vl_projector.encodeProjectedImagesResidentWithPublication(&self.cb, allocator, self.gpt_config, images, limits, admission);
+        };
+        return qwen3vl_projector.encodeProjectedImagesResident(&self.cb, allocator, self.gpt_config, images, limits);
+    }
+
     fn retireBatchedProjectedImages(self: *NativeGenerationPipeline, projected: *qwen3vl_projector.ProjectedImages) void {
         const device = projected.device_embeddings != null;
         var execution_scope: ?ExecutionScope = if (device) (if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null) else null;
         defer if (execution_scope) |*scope| scope.deinit();
-        projected.deinit();
+        projected.deinitWithCleanup(.{ .boundary = if (self.execution_cleanup_owner) |owner| owner.epoch() else null, .operation = self.cb.operationToken() });
     }
 
     fn finishModelRuntimeRequest(self: *NativeGenerationPipeline) !void {

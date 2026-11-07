@@ -655,6 +655,7 @@ pub const DecodeContext = struct {
 
     /// Set only by a reader whose admission includes retained decode plans.
     prepared_lighton_decode: bool = false,
+    dense_ffn_program: ?*@import("../ops/cuda/cuda_compute.zig").CudaCompute.DenseFfnProgram = null,
     attention_mode: AttentionMode = .full_recompute,
     total_sequence_len: usize,
     query_sequence_len: usize,
@@ -6487,7 +6488,7 @@ fn decoderBlockImpl(
 
         compute_region_scope.deinit();
         compute_region_scope = try cb.decoderRuntimePushComputeRegion(.ffn_norm);
-        if (try tryLightOnFusedFfnBlock(cb, config, attn_res, total, layer, &name_buf)) |result| {
+        if (try tryDenseSiluFfnBlock(cb, config, attn_res, total, layer, &name_buf, decode_context, raw_overrides.cleanup)) |result| {
             freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
             return result;
         }
@@ -7400,7 +7401,7 @@ fn decoderBlockImpl(
     };
 
     if (trace_sink == null) {
-        if (try tryLightOnFusedFfnBlock(cb, config, attn_res, total, layer, &name_buf)) |result| {
+        if (try tryDenseSiluFfnBlock(cb, config, attn_res, total, layer, &name_buf, decode_context, raw_overrides.cleanup)) |result| {
             freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
             return result;
         }
@@ -12125,7 +12126,7 @@ fn applyAttnNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config
     return applyNormAt(cb, allocator, config, hidden, layer, "attn", buf);
 }
 
-fn tryLightOnFusedFfnBlock(cb: *const ComputeBackend, config: Config, input: CT, rows: usize, layer: usize, name_buf: *[256]u8) !?CT {
+fn tryDenseSiluFfnBlock(cb: *const ComputeBackend, config: Config, input: CT, rows: usize, layer: usize, name_buf: *[256]u8, decode_context: ?*const DecodeContext, cleanup: ?*const @import("../execution/cleanup_context.zig").Context) !?CT {
     if (comptime !build_options.enable_cuda) return null;
     const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
     if (!config.hasQwen35VisionArchitectureContract() or config.activation != .silu or config.usesMoe() or !CudaCompute.lightOnFfnBlockEnabled(cb)) return null;
@@ -12138,7 +12139,7 @@ fn tryLightOnFusedFfnBlock(cb: *const ComputeBackend, config: Config, input: CT,
     defer cb.free(up);
     const down = try getFFNWeight(cb, config, layer, "down", name_buf);
     defer cb.free(down);
-    return CudaCompute.lightOnFfnBlock(cb, .{ .input = input, .norm = norm, .weights = .{ gate, up, down }, .rows = rows, .hidden = config.hidden_size, .intermediate = config.intermediateSize(layer), .eps = config.norm_eps, .weight_offset = config.norm_weight_offset });
+    return CudaCompute.denseSiluFfnBlock(cb, .{ .input = input, .norm = norm, .weights = .{ gate, up, down }, .rows = rows, .hidden = config.hidden_size, .intermediate = config.intermediateSize(layer), .eps = config.norm_eps, .weight_offset = config.norm_weight_offset, .program = if (decode_context) |context| context.dense_ffn_program else null, .cleanup = if (cleanup) |value| value.* else .{} });
 }
 
 fn applyFFNNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT, layer: usize, buf: *[256]u8) !CT {

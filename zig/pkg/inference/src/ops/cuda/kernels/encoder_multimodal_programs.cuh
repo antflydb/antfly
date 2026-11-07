@@ -442,188 +442,412 @@ extern "C" __global__ void termite_embedding_gemma2_attention_bf16(
 
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-// Keep two 512-thread blocks resident on devices with a 64K register file.
-// A small register-count increase must not halve attention occupancy.
-extern "C" __global__ __launch_bounds__(512, 2) void termite_embedding_gemma2_attention_local_flash_bf16(
+// Each deployment entry below selects its own register/occupancy policy.
+// Generic BF16 online attention schedules. The policy is an explicit numerical
+// descriptor: both use full-K Tensor Core accumulation with their source
+// key-block sizes, traversal, row-reduction and normalization ownership.
+template<AntflyAttentionSchedule Schedule, unsigned Dim, bool Split = false>
+__device__ __forceinline__ void antfly_attention_block_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* q, const __nv_bfloat16* k,
     const __nv_bfloat16* v, const long long* mask, unsigned batch,
-    unsigned seq, unsigned q_heads, unsigned kv_heads, unsigned dim,
-    unsigned local_radius) {
+    unsigned seq, unsigned source_seq, unsigned q_heads, unsigned kv_heads,
+    unsigned local_radius, float* partial_output, float* partial_lse, unsigned split_count) {
     using namespace nvcuda;
-    constexpr unsigned QT = 64, KT = 16, MMA = 16, THREADS = 512, WARPS = 16, QK_WARPS = 4;
+    constexpr unsigned QT = 16, KT = Schedule == AntflyAttentionSchedule::FlashBF16 ? 64 : 128, MMA = 16, THREADS = 128, WARPS = 4;
+    constexpr unsigned dim = Dim;
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const unsigned qh = blockIdx.x;
-    const unsigned qt = blockIdx.y * QT;
-    const unsigned b = blockIdx.z;
-    if (blockDim.x != THREADS || b >= batch || qh >= q_heads || qt >= seq ||
+    const unsigned qh = blockIdx.x, qt = blockIdx.y * QT;
+    const unsigned b = Split ? blockIdx.z % batch : blockIdx.z;
+    const unsigned split = Split ? blockIdx.z / batch : 0;
+    if (blockDim.x != THREADS || b >= batch || qh >= q_heads || qt >= seq || source_seq == 0 || source_seq > seq ||
         (dim != 256 && dim != 512) || (kv_heads != 1 && kv_heads != 2)) return;
-    const unsigned valid_rows = min(QT, seq - qt);
-    const unsigned kvh = qh * kv_heads / q_heads;
-
+    const unsigned valid_rows = min(QT, seq - qt), kvh = qh * kv_heads / q_heads;
     extern __shared__ unsigned char storage[];
-    __nv_bfloat16* kvs = reinterpret_cast<__nv_bfloat16*>(storage);
-    // Four dimension partials for every query share storage with the sixteen
-    // warp-private PV merge tiles; both require 4096 FP32 values.
-    float* warp_scratch = reinterpret_cast<float*>(kvs + KT * dim);
-    __nv_bfloat16* probs = reinterpret_cast<__nv_bfloat16*>(warp_scratch + QK_WARPS * QT * KT);
+    __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(storage);
+    __nv_bfloat16* kvs = qs + QT * dim;
+    // Efficient QK/PV read K/V directly. After probability conversion, QS
+    // plus dead score bytes hold the exact previous F32 output; reserve only
+    // the padding needed to keep that output disjoint from live probabilities.
+    constexpr unsigned KV_BYTES = Schedule == AntflyAttentionSchedule::FlashBF16
+        ? MMA * dim * 2
+        : (QT * dim * 4 > QT * dim * 2 + QT * KT * 4
+            ? QT * dim * 4 - QT * dim * 2 - QT * KT * 4 : 0);
+    float* scores = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(kvs) + KV_BYTES);
+    __nv_bfloat16* probs = reinterpret_cast<__nv_bfloat16*>(scores + QT * KT);
     float* running_max = reinterpret_cast<float*>(probs + QT * KT);
-    float* running_sum = running_max + QT;
-    float* alpha = running_sum + QT;
-
-    if (tid < QT) {
-        running_max[tid] = -INFINITY;
-        running_sum[tid] = 0.0f;
+    float* running_sum = running_max + QT; // Four Flash partials, one efficient sum.
+    float* alpha = running_sum + QT * 4;
+    for (unsigned i = tid; i < QT * dim; i += THREADS) {
+        const unsigned row = i / dim, d = i % dim;
+        const bool live = row < valid_rows && qt + row < source_seq && (!mask || mask[(size_t)b * seq + qt + row]);
+        qs[i] = live ? q[(((size_t)b * seq + qt + row) * q_heads + qh) * dim + d]
+                     : __float2bfloat16_rn(0.0f);
     }
+    if (tid < QT) running_max[tid] = -INFINITY;
+    if (tid < QT * 4) running_sum[tid] = 0.0f;
     __syncthreads();
-
-    // Four query subtiles; HD256 uses one output fragment per warp and HD512
-    // uses two.
-    // Use the PTX m16n8k16 ABI rather than indexing opaque WMMA fragments.
-    // Each lane owns adjacent columns in rows lane/4 and lane/4+8. Two
-    // m16n8 tiles form one m16n16 tile, keeping online rescaling in registers.
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float
-    float out_frag[4][2][2][4] = {};
-    const unsigned fragments = (dim / 16) / WARPS;
-
-    unsigned first = 0, last = seq;
+    float out_frag[8][2][4] = {};
+    const unsigned fragments = dim / (MMA * WARPS);
+    unsigned first = 0, last = source_seq;
     if (local_radius) {
         first = qt > local_radius ? qt - local_radius : 0;
-        last = min(seq, qt + valid_rows + local_radius);
+        last = min(source_seq, qt + valid_rows + local_radius);
     }
     first = (first / KT) * KT;
-    last = ((last + KT - 1) / KT) * KT;
-    for (unsigned kt = first; kt < last; kt += KT) {
-        for (unsigned i = tid; i < KT * dim; i += THREADS) {
-            const unsigned row = i / dim, d = i - row * dim, key = kt + row;
-            const bool valid = key < seq && (!mask || mask[(size_t)b * seq + key]);
-            kvs[i] = valid ? k[(((size_t)b * seq + key) * kv_heads + kvh) * dim + d]
-                           : __float2bfloat16_rn(0.0f);
-        }
-        __syncthreads();
-
-        const unsigned qsub = (warp / QK_WARPS) * MMA;
-        const unsigned partial = warp % QK_WARPS;
-        const unsigned slice = dim / QK_WARPS;
-        const unsigned begin_d = partial * slice;
-        {
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> sf;
-            wmma::fill_fragment(sf, 0.0f);
-            for (unsigned d = begin_d; d < begin_d + slice; d += MMA) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16,
-                    __nv_bfloat16, wmma::row_major> af;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16,
-                    __nv_bfloat16, wmma::col_major> bf;
-                const __nv_bfloat16* q_tile = q +
-                    (((size_t)b * seq + qt + qsub) * q_heads + qh) * dim;
-                wmma::load_matrix_sync(af, q_tile + d, q_heads * dim);
-                wmma::load_matrix_sync(bf, kvs + d, dim);
-                wmma::mma_sync(sf, af, bf, sf);
+    if (Split) {
+        const unsigned blocks = (source_seq + KT - 1) / KT;
+        const unsigned per_split = (blocks + split_count - 1) / split_count;
+        first = max(first, split * per_split * KT);
+        last = min(last, min(blocks, (split + 1) * per_split) * KT);
+    }
+    first = min(first, ((last + KT - 1) / KT) * KT);
+    const unsigned tiles = (last + KT - 1) / KT - first / KT;
+    for (unsigned tile = 0; tile < tiles; ++tile) {
+        const unsigned kt = first + (Schedule == AntflyAttentionSchedule::FlashBF16 ? tiles - 1 - tile : tile) * KT;
+        // QS/KVS hold exact previous F32 output during efficient PV. Reload
+        // this tile's queries only after every warp finished its prior merge.
+        if (Schedule == AntflyAttentionSchedule::EfficientBF16) {
+            for (unsigned i = tid; i < QT * dim; i += THREADS) {
+                const unsigned row = i / dim, d = i % dim;
+                const bool live = row < valid_rows && qt + row < source_seq && (!mask || mask[(size_t)b * seq + qt + row]);
+                qs[i] = live ? q[(((size_t)b * seq + qt + row) * q_heads + qh) * dim + d]
+                             : __float2bfloat16_rn(0.0f);
             }
-            wmma::store_matrix_sync(
-                warp_scratch + partial * QT * KT + qsub * KT, sf, KT,
-                wmma::mem_row_major);
+            __syncthreads();
         }
-        __syncthreads();
-
-        for (unsigned score_base = 0; score_base < QT * KT; score_base += THREADS) {
-            const unsigned score_index = score_base + tid;
-            const unsigned row = score_index / KT, col = score_index - row * KT;
-            const unsigned query = qt + row, key = kt + col;
-            float score = 0.0f;
-            #pragma unroll
-            for (unsigned w = 0; w < QK_WARPS; ++w)
-                score += warp_scratch[(w * QT + row) * KT + col];
-            const bool visible = row < valid_rows && query < seq && key < seq &&
-                (!mask || (mask[(size_t)b * seq + query] && mask[(size_t)b * seq + key])) &&
-                (!local_radius || (key <= query + local_radius && query <= key + local_radius));
-            score = visible ? score : -INFINITY;
-            float tile_max = score;
-            #pragma unroll
-            for (unsigned offset = KT / 2; offset != 0; offset >>= 1)
-                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, offset, KT));
-            const float old_max = running_max[row];
-            const float next_max = fmaxf(old_max, tile_max);
-            const float a = isfinite(old_max) ? expf(old_max - next_max) : 0.0f;
-            const float p = isfinite(score) ? expf(score - next_max) : 0.0f;
-            probs[row * KT + col] = antfly_attention_probability_bf16(p);
-            float tile_sum = p;
-            #pragma unroll
-            for (unsigned offset = KT / 2; offset != 0; offset >>= 1)
-                tile_sum += __shfl_xor_sync(0xffffffffu, tile_sum, offset, KT);
-            if (col == 0) {
-                alpha[row] = a;
-                running_sum[row] = running_sum[row] * a + tile_sum;
-                running_max[row] = next_max;
-            }
-        }
-        __syncthreads();
-        // QK partials are dead; reuse their shared allocation for V.
-        for (unsigned i = tid; i < KT * dim; i += THREADS) {
-            const unsigned row = i / dim, d = i - row * dim, key = kt + row;
-            const bool valid = key < seq && (!mask || mask[(size_t)b * seq + key]);
-            kvs[i] = valid ? v[(((size_t)b * seq + key) * kv_heads + kvh) * dim + d]
-                           : __float2bfloat16_rn(0.0f);
-        }
-        __syncthreads();
-        for (unsigned qsub = 0; qsub < 4; ++qsub) {
-            unsigned pf[4];
-            const unsigned pp = __cvta_generic_to_shared(
-                probs + qsub * MMA * KT + (lane % 16) * KT + (lane / 16) * 8);
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                : "=r"(pf[0]), "=r"(pf[1]), "=r"(pf[2]), "=r"(pf[3]) : "r"(pp));
-            for (unsigned f = 0; f < fragments; ++f) {
-                const unsigned ot = warp + f * WARPS;
-                unsigned vf[4];
-                const unsigned vp = __cvta_generic_to_shared(
-                    kvs + (lane % 16) * dim + ot * MMA + (lane / 16) * 8);
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(vf[0]), "=r"(vf[1]), "=r"(vf[2]), "=r"(vf[3]) : "r"(vp));
+        // Each warp owns independent 16-key score columns. Every score keeps
+        // its original full ordered K8/K16 accumulator; no split-K summation.
+        if (Schedule == AntflyAttentionSchedule::EfficientBF16) {
+            for (unsigned sub = warp * MMA; sub < KT; sub += WARPS * MMA) {
+                float sf[2][4] = {};
+                #pragma unroll
+                for (unsigned d = 0; d < dim; d += 8) {
+                    const unsigned row = lane / 4, column = (lane % 4) * 2;
+                    const unsigned a0 = *reinterpret_cast<const unsigned*>(qs + row * dim + d + column);
+                    const unsigned a1 = *reinterpret_cast<const unsigned*>(qs + (row + 8) * dim + d + column);
+                    #pragma unroll
+                    for (unsigned half = 0; half < 2; ++half) {
+                        const unsigned key = kt + sub + half * 8 + row;
+                        const bool live = key < source_seq && (!mask || mask[(size_t)b * seq + key]);
+                        const unsigned b0 = live
+                            ? *reinterpret_cast<const unsigned*>(k + (((size_t)b * seq + key) * kv_heads + kvh) * dim + d + column)
+                            : 0u;
+                        antfly_attention_mma_bf16_k8(sf[half], a0, a1, b0);
+                    }
+                }
                 #pragma unroll
                 for (unsigned half = 0; half < 2; ++half) {
-                    float tf[4] = {};
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                        : "+f"(tf[0]), "+f"(tf[1]), "+f"(tf[2]), "+f"(tf[3])
-                        : "r"(pf[0]), "r"(pf[1]), "r"(pf[2]), "r"(pf[3]),
-                          "r"(vf[half * 2]), "r"(vf[half * 2 + 1]));
                     #pragma unroll
                     for (unsigned i = 0; i < 4; ++i) {
-                        const unsigned row = qsub * MMA + (lane >> 2) + (i >= 2 ? 8 : 0);
-                        // Preserve the previous multiply-then-add boundary.
-                        out_frag[qsub][f][half][i] *= alpha[row];
-                        out_frag[qsub][f][half][i] += tf[i];
+                        const unsigned row = lane / 4 + (i >= 2 ? 8 : 0);
+                        const unsigned col = half * 8 + (lane % 4) * 2 + (i & 1);
+                        scores[row * KT + sub + col] = sf[half][i];
+                    }
+                }
+            }
+            __syncthreads();
+        } else {
+            for (unsigned sub = 0; sub < KT; sub += MMA) {
+                for (unsigned i = tid; i < MMA * dim; i += THREADS) {
+                    const unsigned key = kt + sub + i / dim, d = i % dim;
+                    const bool live = key < source_seq && (!mask || mask[(size_t)b * seq + key]);
+                    kvs[i] = live ? k[(((size_t)b * seq + key) * kv_heads + kvh) * dim + d]
+                                  : __float2bfloat16_rn(0.0f);
+                }
+                __syncthreads();
+                if (warp == 0) {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> sf;
+                wmma::fill_fragment(sf, 0.0f);
+                #pragma unroll
+                for (unsigned d = 0; d < dim; d += MMA) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
+                    wmma::load_matrix_sync(af, qs + d, dim);
+                    wmma::load_matrix_sync(bf, kvs + d, dim);
+                    wmma::mma_sync(sf, af, bf, sf);
+                }
+                wmma::store_matrix_sync(scores + sub, sf, KT, wmma::mem_row_major);
+                }
+                __syncthreads();
+            }
+        }
+        // Tensor Core accumulator columns belong to four adjacent lanes:
+        // lane c visits 2*c,2*c+1,2*c+8,2*c+9,... in that exact order.
+        if (tid < QT * 4) {
+            const unsigned row = tid / 4, c = tid % 4, query = qt + row;
+            float maximum = -INFINITY;
+            for (unsigned n = 0; n < KT / 8; ++n) {
+                for (unsigned half = 0; half < 2; ++half) {
+                    const unsigned col = n * 8 + c * 2 + half, key = kt + col;
+                    const bool live = row < valid_rows && query < source_seq && key < source_seq &&
+                        (!mask || (mask[(size_t)b * seq + query] && mask[(size_t)b * seq + key])) &&
+                        (!local_radius || (key <= query + local_radius && query <= key + local_radius));
+                    float score = live ? scores[row * KT + col] : -INFINITY;
+                    if (Schedule == AntflyAttentionSchedule::EfficientBF16) score = antfly_attention_log2_score(score);
+                    scores[row * KT + col] = score;
+                    maximum = fmaxf(maximum, score);
+                }
+            }
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, 2));
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, 1));
+            const float previous = running_max[row], next = fmaxf(previous, maximum);
+            const float scale = isfinite(previous) ? antfly_attention_rescale_bf16<Schedule>(previous, next) : 0.0f;
+            const float previous_sum = Schedule == AntflyAttentionSchedule::FlashBF16 ? running_sum[tid] : 0.0f;
+            float sum = 0.0f;
+            float efficient_sums[4] = {};
+            for (unsigned n = 0; n < KT / 8; ++n) {
+                for (unsigned half = 0; half < 2; ++half) {
+                    const unsigned col = n * 8 + c * 2 + half;
+                    const float score = scores[row * KT + col];
+                    const float p = isfinite(score) ? antfly_attention_exponent_bf16<Schedule>(score, next) : 0.0f;
+                    probs[row * KT + col] = antfly_attention_probability_bf16(p);
+                    if (Schedule == AntflyAttentionSchedule::FlashBF16) {
+                        // The original nonfirst-tile row reduction contracts
+                        // rescale-old + first-probability as one F32 FMA.
+                        // Later probabilities keep their sequential additions.
+                        if (n == 0 && half == 0) sum = tile == 0 ? p : __fmaf_rn(previous_sum, scale, p);
+                        else sum += p;
+                    } else efficient_sums[col / 32] += p;
+                }
+            }
+            if (Schedule == AntflyAttentionSchedule::FlashBF16) running_sum[tid] = sum;
+            else {
+                float total = __fmul_rn(running_sum[row * 4], scale);
+                #pragma unroll
+                for (unsigned n = 0; n < KT / 32; ++n) {
+                    float part = efficient_sums[n];
+                    part += __shfl_xor_sync(0xffffffffu, part, 1);
+                    part += __shfl_xor_sync(0xffffffffu, part, 2);
+                    total += part;
+                }
+                if (c == 0) running_sum[row * 4] = total;
+            }
+            if (c == 0) { running_max[row] = next; alpha[row] = scale; }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned f = 0; f < fragments; ++f) {
+            for (unsigned half = 0; half < 2; ++half) {
+                for (unsigned i = 0; i < 4; ++i) {
+                    const unsigned row = (lane >> 2) + (i >= 2 ? 8 : 0);
+                    if (Schedule == AntflyAttentionSchedule::FlashBF16) out_frag[f][half][i] *= alpha[row];
+                    else {
+                        const unsigned col = (warp + f * WARPS) * MMA + half * 8 + (lane % 4) * 2 + (i & 1);
+                        reinterpret_cast<float*>(qs)[row * dim + col] = out_frag[f][half][i];
+                        out_frag[f][half][i] = 0.0f;
                     }
                 }
             }
         }
-        __syncthreads();
-    }
-
-    for (unsigned qsub = 0; qsub < 4; ++qsub) {
-        for (unsigned f = 0; f < fragments; ++f) {
-            const unsigned ot = warp + f * WARPS;
-            #pragma unroll
-            for (unsigned half = 0; half < 2; ++half) {
+        if (Schedule == AntflyAttentionSchedule::EfficientBF16) __syncthreads();
+        // Efficient PV reads the same ordered K8 operands directly. QS/KVS
+        // are no longer needed for QK and hold the previous F32 output exactly;
+        // this avoids both per-subtile staging barriers and a duplicate
+        // register accumulator without allocating another shared bank.
+        if (Schedule == AntflyAttentionSchedule::EfficientBF16) {
+            const auto* values = reinterpret_cast<const unsigned short*>(v);
+            for (unsigned k8 = 0; k8 < KT; k8 += 8) {
+                const unsigned row = lane / 4, column = (lane % 4) * 2;
+                const unsigned a0 = *reinterpret_cast<const unsigned*>(probs + row * KT + k8 + column);
+                const unsigned a1 = *reinterpret_cast<const unsigned*>(probs + (row + 8) * KT + k8 + column);
+                const unsigned key0 = kt + k8 + column, key1 = key0 + 1;
+                const bool live0 = key0 < source_seq && (!mask || mask[(size_t)b * seq + key0]);
+                const bool live1 = key1 < source_seq && (!mask || mask[(size_t)b * seq + key1]);
                 #pragma unroll
-                for (unsigned i = 0; i < 4; ++i) {
-                    const unsigned row = qsub * MMA + (lane >> 2) + (i >= 2 ? 8 : 0);
-                    const unsigned col = half * 8 + (lane % 4) * 2 + (i & 1);
-                    if (row < valid_rows && ot * MMA + col < dim) {
-                        const float denom = running_sum[row];
-                        out[(((size_t)b * seq + qt + row) * q_heads + qh) * dim + ot * MMA + col] =
-                            __float2bfloat16_rn(denom > 0.0f ? out_frag[qsub][f][half][i] / denom : 0.0f);
+                for (unsigned f = 0; f < fragments; ++f) {
+                    const unsigned ot = warp + f * WARPS;
+                    #pragma unroll
+                    for (unsigned half = 0; half < 2; ++half) {
+                        const unsigned col = ot * MMA + half * 8 + row;
+                        const unsigned lo = live0 ? values[(((size_t)b * seq + key0) * kv_heads + kvh) * dim + col] : 0u;
+                        const unsigned hi = live1 ? values[(((size_t)b * seq + key1) * kv_heads + kvh) * dim + col] : 0u;
+                        antfly_attention_mma_bf16_k8(out_frag[f][half], a0, a1, lo | (hi << 16));
                     }
+                }
+            }
+        } else {
+            for (unsigned sub = 0; sub < KT; sub += MMA) {
+                for (unsigned i = tid; i < MMA * dim; i += THREADS) {
+                    const unsigned key = kt + sub + i / dim, d = i % dim;
+                    const bool live = key < source_seq && (!mask || mask[(size_t)b * seq + key]);
+                    kvs[i] = live ? v[(((size_t)b * seq + key) * kv_heads + kvh) * dim + d]
+                                  : __float2bfloat16_rn(0.0f);
+                }
+                __syncthreads();
+            unsigned pf[4];
+            const unsigned pp = __cvta_generic_to_shared(probs + (lane % 16) * KT + sub + (lane / 16) * 8);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(pf[0]), "=r"(pf[1]), "=r"(pf[2]), "=r"(pf[3]) : "r"(pp));
+            #pragma unroll
+            for (unsigned f = 0; f < fragments; ++f) {
+                const unsigned ot = warp + f * WARPS;
+                unsigned vf[4];
+                const unsigned vp = __cvta_generic_to_shared(kvs + (lane % 16) * dim + ot * MMA + (lane / 16) * 8);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(vf[0]), "=r"(vf[1]), "=r"(vf[2]), "=r"(vf[3]) : "r"(vp));
+                for (unsigned half = 0; half < 2; ++half) {
+                    auto& tf = out_frag[f][half];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(tf[0]), "+f"(tf[1]), "+f"(tf[2]), "+f"(tf[3])
+                        : "r"(pf[0]), "r"(pf[1]), "r"(pf[2]), "r"(pf[3]), "r"(vf[half*2]), "r"(vf[half*2+1]));
+                }
+            }
+                __syncthreads();
+            }
+        }
+        // Efficient attention keeps each key block's PV accumulator separate.
+        // Its epilogue merges the previous F32 output, and applies final
+        // normalization to both terms before the last BF16 output store.
+        if (Schedule == AntflyAttentionSchedule::EfficientBF16) {
+            #pragma unroll
+            for (unsigned f = 0; f < fragments; ++f) {
+                for (unsigned half = 0; half < 2; ++half) {
+                    for (unsigned i = 0; i < 4; ++i) {
+                        const unsigned row = (lane >> 2) + (i >= 2 ? 8 : 0);
+                        const float denom = running_sum[row * 4];
+                        const float scale = kt + KT >= source_seq && denom > 0.0f ? 1.0f / denom : 1.0f;
+                        const float beta = scale * alpha[row];
+                        const unsigned col = (warp + f * WARPS) * MMA + half * 8 + (lane % 4) * 2 + (i & 1);
+                        const float old_output = reinterpret_cast<const float*>(qs)[row * dim + col];
+                        // CUTLASS specializes nonfinal epilogues with alpha=1:
+                        // rescale-old + new-PV contracts as that exact FMA.
+                        // Final normalization instead rounds beta*old before
+                        // the alpha*new-PV FMA. Cancellation makes the two
+                        // contraction orders observably different in BF16.
+                        out_frag[f][half][i] = tile == 0 ? scale * out_frag[f][half][i]
+                            : kt + KT >= source_seq
+                                ? __fmaf_rn(scale, out_frag[f][half][i], beta * old_output)
+                                : __fmaf_rn(alpha[row], old_output, out_frag[f][half][i]);
+                    }
+                }
+            }
+        }
+        // QS will become queries again on the next tile. Every prior-output
+        // read must finish before any warp starts that role transition.
+        if (Schedule == AntflyAttentionSchedule::EfficientBF16) __syncthreads();
+    }
+    // Efficient epilogues still consume the shared per-block rescale after
+    // the last PV barrier. Finish every warp's merge before reusing alpha as
+    // the final normalization plane; otherwise this is a real read/write race.
+    if (Schedule == AntflyAttentionSchedule::EfficientBF16) __syncthreads();
+    if (tid < QT * 4) {
+        const unsigned row = tid / 4;
+        float sum = running_sum[tid];
+        if (Schedule == AntflyAttentionSchedule::FlashBF16) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+        } else sum = running_sum[row * 4];
+        if (tid % 4 == 0) {
+            // An explicit local bias still normalizes at the full sequence's
+            // final key block in CUTLASS. If we skipped its zero-P tail, retain
+            // that separate normalization after the last nonempty PV merge.
+            const bool normalized_in_loop = tiles && ((last + KT - 1) / KT) * KT >= source_seq;
+            alpha[row] = Schedule == AntflyAttentionSchedule::EfficientBF16
+                ? (normalized_in_loop || sum <= 0.0f ? 1.0f : 1.0f / sum)
+                : (sum > 0.0f ? 1.0f / sum : 0.0f);
+            if (Split && row < valid_rows)
+                partial_lse[(((size_t)split * batch + b) * q_heads + qh) * seq + qt + row] = sum > 0.0f ? __fadd_rn(running_max[row], __logf(sum)) : -INFINITY;
+        }
+    }
+    __syncthreads();
+    #pragma unroll
+    for (unsigned f = 0; f < fragments; ++f) {
+        const unsigned ot = warp + f * WARPS;
+        for (unsigned half = 0; half < 2; ++half) {
+            for (unsigned i = 0; i < 4; ++i) {
+                const unsigned row = (lane >> 2) + (i >= 2 ? 8 : 0), col = half * 8 + (lane % 4) * 2 + (i & 1);
+                if (row < valid_rows && ot * MMA + col < dim) {
+                    const float result = out_frag[f][half][i] * alpha[row];
+                    if (Split)
+                        partial_output[((((size_t)split * batch + b) * q_heads + qh) * seq + qt + row) * dim + ot * MMA + col] = result;
+                    else out[(((size_t)b * seq + qt + row) * q_heads + qh) * dim + ot * MMA + col] = __float2bfloat16_rn(result);
                 }
             }
         }
     }
 }
+
+extern "C" __global__ __launch_bounds__(128, 2) void termite_embedding_gemma2_attention_local_flash_bf16(
+    __nv_bfloat16* out, const __nv_bfloat16* q, const __nv_bfloat16* k,
+    const __nv_bfloat16* v, const long long* mask, unsigned batch,
+    unsigned seq, unsigned source_seq, unsigned q_heads, unsigned kv_heads, unsigned dim,
+    unsigned local_radius, unsigned schedule, float* partial_output,
+    float* partial_lse, unsigned split_count, const unsigned* logical_metadata) {
+    if (logical_metadata) {
+        source_seq = logical_metadata[0];
+        const unsigned original_mask_kind = logical_metadata[1];
+        if (original_mask_kind > 2 || (original_mask_kind != 0 && schedule == (unsigned)AntflyAttentionSchedule::FlashBF16)) return;
+    }
+    if (schedule == (unsigned)AntflyAttentionSchedule::FlashBF16 && dim == 256) {
+        if (split_count > 1)
+            antfly_attention_block_bf16<AntflyAttentionSchedule::FlashBF16, 256, true>(out,q,k,v,mask,batch,seq,source_seq,q_heads,kv_heads,local_radius,partial_output,partial_lse,split_count);
+        else antfly_attention_block_bf16<AntflyAttentionSchedule::FlashBF16, 256>(out,q,k,v,mask,batch,seq,source_seq,q_heads,kv_heads,local_radius,nullptr,nullptr,1);
+    } else if (schedule == (unsigned)AntflyAttentionSchedule::EfficientBF16 && dim == 256)
+        antfly_attention_block_bf16<AntflyAttentionSchedule::EfficientBF16, 256>(out,q,k,v,mask,batch,seq,source_seq,q_heads,kv_heads,local_radius,nullptr,nullptr,1);
+    else if (schedule == (unsigned)AntflyAttentionSchedule::EfficientBF16 && dim == 512)
+        antfly_attention_block_bf16<AntflyAttentionSchedule::EfficientBF16, 512>(out,q,k,v,mask,batch,seq,source_seq,q_heads,kv_heads,local_radius,nullptr,nullptr,1);
+}
+
+// The efficient HD256 layout admits four resident blocks without imposing
+// HD512 or Flash register requirements on this entry. Arithmetic stays shared.
+extern "C" __global__ __launch_bounds__(128, 4) void antfly_attention_efficient_bf16_hd256(
+    __nv_bfloat16* out, const __nv_bfloat16* q, const __nv_bfloat16* k,
+    const __nv_bfloat16* v, const long long* mask, unsigned batch,
+    unsigned seq, unsigned source_seq, unsigned q_heads, unsigned kv_heads, unsigned dim,
+    unsigned local_radius, unsigned schedule, float* partial_output,
+    float* partial_lse, unsigned split_count, const unsigned* logical_metadata) {
+    if (logical_metadata) {
+        source_seq = logical_metadata[0];
+        const unsigned original_mask_kind = logical_metadata[1];
+        if (original_mask_kind > 2 || (original_mask_kind != 0 && schedule == (unsigned)AntflyAttentionSchedule::FlashBF16)) return;
+    }
+    if (schedule == (unsigned)AntflyAttentionSchedule::EfficientBF16 && dim == 256)
+        antfly_attention_block_bf16<AntflyAttentionSchedule::EfficientBF16, 256>(out,q,k,v,mask,batch,seq,source_seq,q_heads,kv_heads,local_radius,nullptr,nullptr,1);
+}
+
 #else
 extern "C" __global__ void termite_embedding_gemma2_attention_local_flash_bf16(
     __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    const long long*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned) {}
+    const long long*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, float*, float*, unsigned, const unsigned*) {}
+extern "C" __global__ void antfly_attention_efficient_bf16_hd256(
+    __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const long long*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, float*, float*, unsigned, const unsigned*) {}
 #endif
+
+
+extern "C" __global__ void antfly_attention_split_merge_bf16(
+    __nv_bfloat16* out, const float* partial_output, const float* partial_lse,
+    unsigned batch, unsigned seq, unsigned heads, unsigned dim, unsigned splits) {
+    const unsigned lane = threadIdx.x & 31, row = blockIdx.x;
+    if (blockDim.x != 32 || row >= batch * heads * seq || splits < 2 || splits > 128) return;
+    unsigned maximum_splits = 1;
+    while (maximum_splits < splits) maximum_splits *= 2;
+    const unsigned group = min(maximum_splits, 32u), local = lane % group;
+    const unsigned pieces = maximum_splits / group;
+    float lse[4];
+    float maximum = -INFINITY;
+    for (unsigned i = 0; i < pieces; ++i) {
+        const unsigned split = local + i * group;
+        lse[i] = split < splits ? partial_lse[(size_t)split * batch * heads * seq + row] : -INFINITY;
+        maximum = fmaxf(maximum, lse[i]);
+    }
+    for (unsigned offset = group / 2; offset; offset /= 2) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+    if (maximum == -INFINITY) maximum = 0.0f;
+    float sum = expf(lse[0] - maximum);
+    for (unsigned i = 1; i < pieces; ++i) sum += expf(lse[i] - maximum);
+    for (unsigned offset = group / 2; offset; offset /= 2) sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+    const float normalization = sum == 0.0f || isnan(sum) ? INFINITY : logf(sum) + maximum;
+    const unsigned query = row % seq, head = (row / seq) % heads, b = row / (seq * heads);
+    for (unsigned d = lane; d < dim; d += 32) {
+        float value = 0.0f;
+        for (unsigned split = 0; split < splits; ++split) {
+            const float weight = expf(partial_lse[(size_t)split * batch * heads * seq + row] - normalization);
+            value = __fmaf_rn(weight, partial_output[((size_t)split * batch * heads * seq + row) * dim + d], value);
+        }
+        out[(((size_t)b * seq + query) * heads + head) * dim + d] = __float2bfloat16_rn(value);
+    }
+}
 
 
 extern "C" __global__ void termite_embedding_gemma2_attention_softmax_bf16(

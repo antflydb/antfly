@@ -1,8 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
-// Exact, opt-in GB10 L2-prefetch variants; arithmetic and reduction order
-// retain the qualified row projection arithmetic and reduction order unchanged.
-
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 __device__ __forceinline__ void antfly_quant_rows_prefetch_l2(const void* address) {
     asm volatile("prefetch.global.L2 [%0];" :: "l"(address));

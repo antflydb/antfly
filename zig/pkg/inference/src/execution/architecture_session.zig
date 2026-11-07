@@ -14712,6 +14712,74 @@ test "actual Native source geometry preserves declared packed rows and refuses u
 /// Caller owns actual run/page admission before prepare, actual execution lanes
 /// before bind, and ends those lanes before finishAfterUnlock.
 pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
+    /// Private optional publication beside the actual original run/PAGE.
+    /// Its cold model pin ends only after unlock; moved banks own pure Domain.
+    pub const SupplementalStorage = struct {
+        target: @import("../backends/cold_compute_target.zig").Retained,
+        banks: ?*@import("prepared_storage_admission.zig").Prepared,
+        /// A lexical policy copy only: actual caller limits may narrow, never
+        /// replace or enlarge the loaded Model's admission contract.
+        pub fn requestSession(session: Session, limits: runtime.tier.memory.Limits) Session {
+            var selected = session;
+            if (selected.run_admission) |*policy| policy.limits = runtime.tier.memory.intersectAdmissionLimits(policy.limits, limits);
+            return selected;
+        }
+        pub fn prepare(session: Session, primary: *runtime.tier.memory.AdmissionLease, requirements: []const @import("prepared_storage_admission.zig").Requirement, options: @import("prepared_storage_admission.zig").Prepared.AdditionalOptions, control: InferenceExecutionControl) !?@This() {
+            if (requirements.len == 0 or session.backend() != .cuda) return null;
+            var target = (@import("../backends/cold_compute_target.zig").Retained.acquire(session, control) catch |err| switch (err) {
+                error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => return null,
+                else => return err,
+            }) orelse return null;
+            var transferred = false;
+            defer if (!transferred) target.deinit();
+            _ = (try Cuda.temporaryRecurrentTarget(target.target)) orelse return null;
+            const banks = @import("prepared_storage_admission.zig").Prepared.prepareAdditionalOutside(session, primary, requirements, options) catch |err| switch (err) {
+                error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => return null,
+                else => return err,
+            };
+            if (banks == null) return null;
+            transferred = true;
+            return .{ .target = target, .banks = banks };
+        }
+        pub fn bind(self: *@This(), cb: *const ops.ComputeBackend, current: @import("cleanup_context.zig").Context) !@import("storage_admission.zig").Capability {
+            const banks = self.banks orelse return error.PreparedStorageAdmissionConsumed;
+            const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+            const selected = switch (self.target.target) {
+                .cuda => |value| value,
+                else => return error.ForeignComputeBackend,
+            };
+            if (cb.ptr != selected.implementation_context) return error.ForeignComputeBackend;
+            const expected = (try Cuda.temporaryRecurrentTarget(self.target.target)) orelse return error.ForeignComputeBackend;
+            var actual = selected;
+            actual.implementation_context = cb.ptr;
+            actual.implementation_table = @ptrCast(cb.vtable);
+            const received = (try Cuda.temporaryRecurrentTarget(.{ .cuda = actual })) orelse return error.ForeignComputeBackend;
+            if (expected != received) return error.ForeignComputeBackend;
+            if (banks.construction_epoch) |held| {
+                if (held.record != epoch.record or held.nonce != epoch.nonce) return error.BackendOperationCleanupChanged;
+                if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            } else try banks.bindConstructionEpoch(epoch);
+            return @import("prepared_storage_admission.zig").Prepared.forDispatch(banks, banks.identity);
+        }
+        pub fn finish(self: *@This(), current: @import("cleanup_context.zig").Context) void {
+            const banks = self.banks orelse return;
+            const epoch = current.boundary orelse platform.inference_process_supervisor.restartWorker();
+            // Even an unused optional plan must defer refunds under actual B;
+            // abortBeforeExecution is reserved for the post-unlock deinit path.
+            if (banks.construction_epoch == null) banks.bindConstructionEpoch(epoch) catch platform.inference_process_supervisor.restartWorker();
+            self.banks = null;
+            banks.finishInvocationWithBoundary(epoch);
+        }
+        /// Actual caller releases lanes first. Unentered sets own no SDK state.
+        pub fn deinit(self: *@This()) void {
+            if (self.banks) |banks| {
+                self.banks = null;
+                banks.abortBeforeExecution() catch platform.inference_process_supervisor.restartWorker();
+            }
+            self.target.deinit();
+        }
+    };
+
     pub const pinned_upload_capacity = @import("../ops/cuda/pinned_input_arena.zig").capacity;
     const Cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
     const Cache = @import("../ops/cuda/prepared_cache.zig");
@@ -14869,6 +14937,15 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
         if (!scheduler.ownsAcquired(waiter, gate)) return error.ExecutionCohortNotOwned;
         try self.validateBeforePublication();
     }
+    /// Only the live retained Reader PAGE calls this under its actual step.
+    /// Revalidate its Model/cohort and the original bound funding before the
+    /// private-provider snapshot; a cold target alone grants no stream access.
+    pub fn readerProfileSnapshot(self: *@This(), session: Session, waiter: *const @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter, cb: *const ops.ComputeBackend, roots: *const Cuda.CapturedCacheRoots, epoch: *const @import("retirement_sink.zig").Epoch) !@import("../ops/cuda/cuda_compute.zig").RuntimeStats {
+        if (!self.bound) return error.MissingPreparedNormRequestEntry;
+        try self.validateForCohort(session, waiter);
+        return Cuda.drainOwnedReaderProfileSnapshot(cb, self.compute, self.funding(), roots, epoch);
+    }
+
     pub fn finishFundingOutsideExecution(self: *@This()) void {
         std.debug.assert(!self.bound);
         if (self.cold) |cold| cold.finishOutsideExecution();
@@ -14942,6 +15019,63 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
         a.free(self.requests);
         a.destroy(self);
     }
+    /// Fresh invocation storage, never a Model cache. The full original run
+    /// remains admitted; refusal of this independent supplement keeps that path.
+    pub const DenseFfnPreparation = struct {
+        const Program = Cuda.DenseFfnProgram;
+        supplemental: PreparedComputeAdmission.SupplementalStorage,
+        layout: Program.Layout,
+        output_retirements: Program.OutputRetirements,
+        program: ?*Program = null,
+
+        pub fn prepare(session: Session, primary: *runtime.tier.memory.AdmissionLease, compute: *Cuda, control: InferenceExecutionControl) !?@This() {
+            const config = getGptConfig(session) orelse return null;
+            if (!config.hasQwen35VisionArchitectureContract() or config.activation != .silu or config.usesMoe() or config.num_hidden_layers == 0) return null;
+            const intermediate = config.intermediateSize(0);
+            for (0..config.num_hidden_layers) |layer| if (config.intermediateSize(layer) != intermediate) return null;
+            const header = compute.computeBackend();
+            const layout = (try Program.layoutFor(&header, 1, config.hidden_size, intermediate)) orelse return null;
+            var requirements: @import("prepared_storage_admission.zig").Builder = .{ .allocator = std.heap.smp_allocator };
+            defer requirements.deinit();
+            try layout.requirements(&requirements);
+            var supplemental = (try PreparedComputeAdmission.SupplementalStorage.prepare(session, primary, requirements.items(), .{ .consumer_metadata_bytes = Program.metadataBytes(layout) }, control)) orelse return null;
+            errdefer supplemental.deinit();
+            // The actual retained receiver is certified before any SDK/library
+            // endpoint opens. No numerical lane has been acquired yet.
+            const expected = (try Cuda.temporaryRecurrentTarget(supplemental.target.target)) orelse return error.ForeignComputeBackend;
+            if (expected != @intFromPtr(compute)) return error.ForeignComputeBackend;
+            try control.check();
+            const retirements = try Program.OutputRetirements.prepare(std.heap.smp_allocator, &header);
+            return .{ .supplemental = supplemental, .layout = layout, .output_retirements = retirements };
+        }
+        pub fn bind(self: *@This(), session: Session, waiter: *const @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter, cb: *const ops.ComputeBackend, current: @import("cleanup_context.zig").Context) !void {
+            if (self.program != null or self.supplemental.banks == null) return error.PreparedStorageAdmissionConsumed;
+            const capability = try self.supplemental.bind(cb, current);
+            defer self.supplemental.finish(current);
+            const program = Program.prepare(std.heap.smp_allocator, cb, session, waiter, self.layout, capability, &self.output_retirements, current) catch |err| {
+                self.output_retirements.deinit();
+                switch (err) {
+                    // Optional storage declines happen before the first FFN math.
+                    // SDK/shape/source/authority failures remain terminal.
+                    error.OutOfMemory, error.CudaMemoryLimitExceeded, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.UnsupportedDenseFfnProgram => return,
+                    else => return err,
+                }
+            };
+            self.program = program;
+        }
+        pub fn retire(self: *@This(), current: @import("cleanup_context.zig").Context) !void {
+            if (self.program) |program| {
+                try program.destroyWithCleanup(current);
+                self.program = null;
+            }
+        }
+        /// Caller has retired its program and released every actual lane.
+        pub fn deinitAfterUnlock(self: *@This()) void {
+            std.debug.assert(self.program == null);
+            self.output_retirements.deinit();
+            self.supplemental.deinit();
+        }
+    };
     /// Synchronous request entry for the existing native generation mutex.
     /// Cold funding precedes BOTH this mutex and the Session model cohort.
     /// The caller keeps its primary lease alive until deinit returns.
@@ -14953,6 +15087,7 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
         execution_lane: ?*@import("../execution_control.zig").ExecutionLane,
         lane_lease: ?@import("../execution_control.zig").ExecutionLane.Lease = null,
         cleanup: @import("cleanup_owner.zig").Owner,
+        dense_ffn: ?DenseFfnPreparation = null,
         waiter: @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter = .{},
         native_owned: bool = false,
         cohort_owned: bool = false,
@@ -14962,6 +15097,12 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
             return acquireAfterAdmissionWithUploadBytes(session, primary, 0, native_mutex, execution_lane, control);
         }
         pub fn acquireAfterAdmissionWithUploadBytes(session: Session, primary: *const runtime.tier.memory.AdmissionLease, max_upload_bytes: usize, native_mutex: ?*std.atomic.Mutex, execution_lane: ?*@import("../execution_control.zig").ExecutionLane, control: InferenceExecutionControl) !?*@This() {
+            return acquireOutside(session, primary, max_upload_bytes, null, native_mutex, execution_lane, control);
+        }
+        pub fn acquireAfterAdmissionWithLimits(session: Session, primary: *runtime.tier.memory.AdmissionLease, max_upload_bytes: usize, actual_limits: runtime.tier.memory.Limits, native_mutex: ?*std.atomic.Mutex, execution_lane: ?*@import("../execution_control.zig").ExecutionLane, control: InferenceExecutionControl) !?*@This() {
+            return acquireOutside(session, primary, max_upload_bytes, .{ .primary = primary, .limits = actual_limits }, native_mutex, execution_lane, control);
+        }
+        fn acquireOutside(session: Session, primary: *const runtime.tier.memory.AdmissionLease, max_upload_bytes: usize, additional: ?struct { primary: *runtime.tier.memory.AdmissionLease, limits: runtime.tier.memory.Limits }, native_mutex: ?*std.atomic.Mutex, execution_lane: ?*@import("../execution_control.zig").ExecutionLane, control: InferenceExecutionControl) !?*@This() {
             const preparation = (try PreparedComputeAdmission.prepareAfterAdmissionWithUploadBytes(session, primary, max_upload_bytes, control)) orelse return null;
             var preparation_owned = true;
             defer if (preparation_owned) preparation.finishAfterUnlock(null);
@@ -14969,6 +15110,12 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
             errdefer std.heap.smp_allocator.destroy(self);
             self.* = .{ .session = session, .preparation = preparation, .native_mutex = native_mutex, .execution_lane = execution_lane, .cleanup = try @import("cleanup_owner.zig").Owner.beginAdmitted(session) };
             errdefer self.cleanup.finishAfterUnlock();
+            // Additional resource callbacks run before native/lane/cohort entry.
+            if (additional) |request| {
+                if (request.primary != primary) return error.ForeignAdmissionDomain;
+                self.dense_ffn = try DenseFfnPreparation.prepare(PreparedComputeAdmission.SupplementalStorage.requestSession(session, request.limits), request.primary, preparation.compute, control);
+            }
+            errdefer if (self.dense_ffn) |*owned| owned.deinitAfterUnlock();
             const epoch = self.cleanup.epoch() orelse return error.MissingCurrentCleanupEpoch;
             if (session.execution_gate == null or session.cohort_scheduler == null) return error.MissingExecutionCohortScheduler;
             if (native_mutex != null and native_mutex == session.execution_gate) return error.ExecutionCohortGateChanged;
@@ -15028,6 +15175,7 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
             const cb = try getComputeBackendWithBudgetAndCleanup(self.session, allocator, budget, .{ .boundary = self.cleanup.epoch() });
             errdefer cb.deinitWithCleanup(.{ .boundary = self.cleanup.epoch() });
             try self.preparation.bind(&cb, self.cleanup.epoch().?);
+            if (self.dense_ffn) |*owned| try owned.bind(self.session, &self.waiter, &cb, .{ .boundary = self.cleanup.epoch(), .operation = cb.operationToken() });
             self.backend_live = true;
             return cb;
         }
@@ -15039,6 +15187,10 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
             self.backend_live = true;
             return managed;
         }
+        pub fn denseFfnProgram(self: *const @This()) ?*Cuda.DenseFfnProgram {
+            if (!self.backend_live or !self.cohort_owned) return null;
+            return if (self.dense_ffn) |owned| owned.program else null;
+        }
         pub fn closeManaged(self: *@This(), managed: *@import("../backends/compute_provider.zig").ManagedComputeBackend) void {
             std.debug.assert(self.backend_live and self.cohort_owned);
             self.backend_live = false;
@@ -15048,6 +15200,7 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
         pub fn closeBackend(self: *@This(), cb: *const ops.ComputeBackend) void {
             std.debug.assert(self.backend_live and self.cohort_owned);
             self.backend_live = false;
+            if (self.dense_ffn) |*owned| owned.retire(.{ .boundary = self.cleanup.epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
             self.preparation.unbind(cb);
             cb.deinitWithCleanup(.{ .boundary = self.cleanup.epoch() });
         }
@@ -15055,6 +15208,7 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
             std.debug.assert(!self.backend_live);
             self.preparation.unbindExpected();
             self.leaveLanes();
+            if (self.dense_ffn) |*owned| owned.deinitAfterUnlock();
             self.preparation.finishAfterUnlock(self.cleanup.epoch());
             self.cleanup.finishAfterUnlock();
             std.heap.smp_allocator.destroy(self);
@@ -20583,4 +20737,40 @@ test "CUDA operation profile formatting retains all role counters without trunca
     try std.testing.expect(std.mem.indexOf(u8, prefill, "ffn_block=") != null);
     try std.testing.expect(std.mem.indexOf(u8, prefill, "recurrent_core=") != null);
     try std.testing.expect(std.mem.indexOf(u8, prefill, "collection_failures=") != null);
+}
+
+test "supplemental request policy preserves actual Model primary and zero-unset narrower denial" {
+    if (comptime !build_options.enable_cuda or !build_options.enable_native) return error.SkipZigTest;
+    const Prepared = @import("prepared_storage_admission.zig").Prepared;
+    const Supplement = PreparedComputeAdmission.SupplementalStorage;
+    const a = std.testing.allocator;
+    var session = try ownedTextOutputFixtureSession(a);
+    defer session.close();
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 4 * 1024 * 1024, .backend_limit_bytes = 8 * 1024 * 1024, .combined_limit_bytes = 12 * 1024 * 1024, .kv_limit_bytes = 4096, .scratch_limit_bytes = 4 * 1024 * 1024 }, .static_workspace_bytes = 23, .opaque_workspace_bytes = 29, .check_live_memory = false };
+    const original = session;
+    const amounts = runtime.tier.memory.AdmissionAmounts{ .host_weight_bytes = 3, .backend_weight_bytes = 5, .host_kv_bytes = 7, .backend_kv_bytes = 11, .host_scratch_bytes = 13, .backend_scratch_bytes = 17 };
+    var primary = try domain.controller.tryAcquire(.cpu, session.run_admission.?.limits, amounts, false);
+    defer primary.release();
+    const original_primary = primary;
+    const metadata = try Prepared.additionalMetadataBytes(1, .{});
+    const narrow = Supplement.requestSession(session, .{ .host_limit_bytes = amounts.hostTotalBytes() + metadata + 127 });
+    try std.testing.expectEqual(session.ptr, narrow.ptr);
+    try std.testing.expectEqual(session.vtable, narrow.vtable);
+    try std.testing.expectEqual(session.model_lifetime, narrow.model_lifetime);
+    var compared_policy = narrow.run_admission.?;
+    compared_policy.limits = original.run_admission.?.limits;
+    try std.testing.expect(std.meta.eql(original.run_admission.?, compared_policy));
+    try std.testing.expectEqual(original.run_admission.?.limits.backend_limit_bytes, narrow.run_admission.?.limits.backend_limit_bytes);
+    try std.testing.expect(std.meta.eql(session.run_admission, Supplement.requestSession(session, .{}).run_admission));
+    try std.testing.expectError(error.ResourceLimitExceeded, Prepared.prepareAdditionalOutside(narrow, &primary, &.{.{ .backend = .native, .class = .host_workspace, .bytes = 128 }}, .{}));
+    try std.testing.expect(std.meta.eql(original_primary, primary));
+    try std.testing.expectEqualDeep(amounts, domain.controller.snapshot());
+    try std.testing.expect(std.meta.eql(original, session));
+    var unset = session;
+    unset.run_admission.?.limits.host_limit_bytes = 0;
+    try std.testing.expectEqual(@as(usize, 64), Supplement.requestSession(unset, .{ .host_limit_bytes = 64 }).run_admission.?.limits.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), unset.run_admission.?.limits.host_limit_bytes);
 }

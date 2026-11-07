@@ -143,3 +143,34 @@ __device__ __forceinline__ void antfly_row_layer_norm(
 __device__ __forceinline__ __nv_bfloat16 antfly_attention_probability_bf16(float probability) {
     return __float2bfloat16_rn(probability);
 }
+
+// Numerical schedules selected by the typed attention descriptor, independent
+// of model names. F32 row policies above retain their original arithmetic.
+enum class AntflyAttentionSchedule : unsigned { FlashBF16 = 0, EfficientBF16 = 1 };
+__device__ __forceinline__ float antfly_attention_log2_score(float x) {
+    return __fmul_rn(x, 1.4426950408889634074f);
+}
+__device__ __forceinline__ float antfly_attention_exp2_bf16(float x) {
+    // Match the declared CUDA exp2f node; do not substitute the approximate
+    // FTZ instruction or change compiler flags for unrelated F32 programs.
+    return exp2f(x);
+}
+template<AntflyAttentionSchedule Schedule>
+__device__ __forceinline__ float antfly_attention_exponent_bf16(float score, float maximum) {
+    if (Schedule == AntflyAttentionSchedule::FlashBF16)
+        return antfly_attention_exp2_bf16(__fsub_rn(antfly_attention_log2_score(score), antfly_attention_log2_score(maximum)));
+    return antfly_attention_exp2_bf16(__fsub_rn(score, maximum));
+}
+template<AntflyAttentionSchedule Schedule>
+__device__ __forceinline__ float antfly_attention_rescale_bf16(float previous, float maximum) {
+    const float delta = __fsub_rn(previous, maximum);
+    return antfly_attention_exp2_bf16(Schedule == AntflyAttentionSchedule::FlashBF16 ? antfly_attention_log2_score(delta) : delta);
+}
+
+// CUTLASS-compatible BF16 K8 accumulator quantum. This is deliberately not a
+// K16 MMA followed by an independent partial-sum merge.
+__device__ __forceinline__ void antfly_attention_mma_bf16_k8(float (&c)[4], unsigned a0, unsigned a1, unsigned b0) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+}

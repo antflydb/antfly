@@ -1826,7 +1826,7 @@ fn intersectAdmissionLimit(a: usize, b: usize) usize {
     return @min(a, b);
 }
 
-fn intersectAdmissionLimits(a: Limits, b: Limits) Limits {
+pub fn intersectAdmissionLimits(a: Limits, b: Limits) Limits {
     return .{
         .host_limit_bytes = intersectAdmissionLimit(a.host_limit_bytes, b.host_limit_bytes),
         .backend_limit_bytes = intersectAdmissionLimit(a.backend_limit_bytes, b.backend_limit_bytes),

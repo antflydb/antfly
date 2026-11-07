@@ -1688,9 +1688,6 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *LoadedModel) void {
-        // Provider/worker teardown precedes release of an unadopted source
-        // fence; a failed final publication cannot strand either owner.
-        defer self.discardPrimaryConstruction();
         std.debug.assert(self.native_reader_stream.context == null and self.native_reader_stream.users == 0);
         if (self.embedding_prototype_cache) |cache| self.allocator.destroy(cache);
         if (self.embedding_prototype_cache_lease) |*lease| lease.release();
@@ -1757,6 +1754,9 @@ pub const Runtime = struct {
             self.allocator.destroy(ct_mut);
         }
         if (self.resource_lease) |*lease| lease.release();
+        // An unadopted source fence outlives provider/worker teardown, while
+        // its root still borrows this runtime's own live pathname.
+        self.discardPrimaryConstruction();
         self.manifest.deinit();
         self.allocator.free(self.model_dir);
     }
@@ -2172,6 +2172,9 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
     tokenizer_resource_lease = null;
     qualified_profile_bundle = null;
     const model = try Runtime.fromOwnedAssets(allocator, assets, control);
+    // The pending proof may outlive this caller's path buffer. All other
+    // artifact paths already own their storage; rebind its one root borrow.
+    tokenizer_artifacts.root = model.model_dir;
     model.pending_primary = .{ .io = io, .publication = publication_lease, .artifacts = tokenizer_artifacts };
     publication_owned = false;
     artifacts_owned = false;
@@ -2238,6 +2241,34 @@ test "primary model preparation loads without a serving registry and preserves i
     try retained_session.acquireSelectedCohort(.{}, &waiter);
     try std.testing.expect(scheduler.ownsAcquired(&waiter, gate));
     retained_session.releaseSelectedCohortGate(&waiter);
+}
+
+test "pending primary proof owns its root through adoption and unadopted rollback" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try writeRuntimeConstructionFixture(temp.dir);
+    const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..] });
+    defer a.free(directory);
+    var sessions = backends.SessionManager.initWithIo(a, std.testing.io);
+    sessions.preferred_backends = &.{.native};
+    sessions.native_call_policy = .in_process;
+    for ([_]bool{ false, true }) |adopt| {
+        const model = prepared: {
+            const caller_path = try a.dupe(u8, directory);
+            defer a.free(caller_path);
+            break :prepared try preparePrimary(a, caller_path, &sessions, .{ .host = Host.unmanaged(), .component_sessions = &sessions, .executor_io = std.testing.io }, null);
+        };
+        defer a.destroy(model);
+        defer model.deinit();
+        try std.testing.expect(model.pending_primary != null);
+        try std.testing.expectEqual(model.model_dir.ptr, model.pending_primary.?.artifacts.root.ptr);
+        if (adopt) {
+            try model.finishPrimaryConstruction();
+            try std.testing.expect(model.pending_primary == null);
+        }
+    }
 }
 
 pub const ChunkPlanningAssets = struct {

@@ -26,6 +26,37 @@ const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 pub const packed_limit = 512 * 1024 * 1024;
 pub const arena_limit = 128 * 1024 * 1024;
 pub const graph_rows_limit = 4096;
+const EncoderConfig = @import("../../models/embedding_gemma2.zig").Config;
+const EncoderAttention = @import("embedding_gemma2.zig");
+const EncoderPolicy = @import("embedding_gemma2_policy.zig").Policy;
+pub const EncoderRouteState = struct {
+    cudnn_enabled: bool = false,
+    cudnn_unavailable: bool = false,
+    cudnn_initialized: bool = false,
+    scratch_bytes: usize = 0,
+    scratch_limit: usize = 0,
+};
+pub const LogicalUpload = struct {
+    values: [2]u32 = .{ 0, 0 },
+    captured_config: ?EncoderConfig = null,
+    captured_policy: EncoderPolicy = .{},
+    captured_route: EncoderRouteState = .{},
+};
+pub fn logicalUploadHostBytes(kind: @FieldType(prepared.Arena, "kind")) usize {
+    return if (kind == .encoder) @sizeOf(LogicalUpload) else 0;
+}
+pub fn encoderMaskBytes(rows: usize) !usize {
+    return std.math.add(usize, try std.math.mul(usize, rows, 8), 8);
+}
+pub const AttentionSource = struct {
+    sequence: usize,
+    all_valid: bool,
+    mask_kind: u8 = 0,
+    pub fn eql(self: AttentionSource, other: AttentionSource) bool {
+        return self.sequence == other.sequence and self.all_valid == other.all_valid and self.mask_kind == other.mask_kind;
+    }
+};
+
 pub const Arena = struct {
     kind: enum { encoder, vision, audio } = .encoder,
     grid_x: usize = 0,
@@ -35,6 +66,9 @@ pub const Arena = struct {
     batch: usize = 0,
     mask_kind: u8 = 0,
     attention_workspace: usize = 0,
+    /// Captured scalar arguments, separate from the reusable physical banks.
+    attention_source: ?AttentionSource = null,
+    logical_upload: ?*LogicalUpload = null,
     weight_generation: usize = 0,
     buffers: [11]Buffer = @splat(.{}),
     quota: CacheQuota = .none,
@@ -53,12 +87,80 @@ pub const Arena = struct {
     completion: driver.CUevent = null,
     pending: bool = false,
     fence_valid: bool = false,
+    pub fn invalidateGraph(self: *Arena, ctx: *Context) !void {
+        // Bank allocation and quota stay untouched. Publish no replacement
+        // captured-argument stamp until the actual eager/capture path succeeds.
+        try ctx.destroyGraphExecChecked(&self.graph);
+        self.warm = false;
+        self.attention_source = null;
+        self.resetTiming();
+    }
+    pub fn attentionSourceMatches(self: *const Arena, source: AttentionSource) bool {
+        return if (self.attention_source) |captured| captured.eql(source) else false;
+    }
+    fn encoderGeometry(self: *const Arena) !struct { batch: u32, sequence: u32 } {
+        if (self.kind != .encoder or self.batch == 0 or self.batch > 4 or self.sequence == 0 or self.sequence > 8192 or self.batch > graph_rows_limit / self.sequence) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        return .{ .batch = std.math.cast(u32, self.batch) orelse return error.InvalidEmbeddingGemma2AttentionSchedule, .sequence = std.math.cast(u32, self.sequence) orelse return error.InvalidEmbeddingGemma2AttentionSchedule };
+    }
+    /// Full value comparison, not a digest: all captured nonattention scalar
+    /// configuration and policy must stay equal. Each attention retains its
+    /// exact algorithm/splits/merge/workspace; only logical key/query bounds move.
+    pub fn prepareAttentionSource(self: *Arena, ctx: *Context, source: AttentionSource, config: EncoderConfig, policy: EncoderPolicy, route: EncoderRouteState) !void {
+        const geometry = try self.encoderGeometry();
+        if (config.num_hidden_layers == 0 or config.num_hidden_layers > config.layer_types.len or config.num_hidden_layers > config.per_layer_head_dim.len or config.num_hidden_layers > config.per_layer_num_key_value_heads.len or config.layer_types_len != config.num_hidden_layers) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        if (source.sequence == 0 or source.sequence > self.sequence or source.mask_kind > 2 or source.all_valid != (source.mask_kind == 0)) return error.InvalidEmbeddingGemma2AttentionSchedule;
+        const source_sequence = std.math.cast(u32, source.sequence) orelse return error.InvalidEmbeddingGemma2AttentionSchedule;
+        var compatible = false;
+        if (self.attention_source) |old| if (self.logical_upload) |upload| if (upload.captured_config) |captured| {
+            compatible = std.meta.eql(captured, config) and std.meta.eql(upload.captured_policy, policy) and std.meta.eql(upload.captured_route, route) and old.all_valid == source.all_valid and old.mask_kind == source.mask_kind;
+            if (compatible) for (0..config.num_hidden_layers) |index| {
+                const lc = try config.layer(index);
+                const shape = EncoderAttention.Attention{ .batch = geometry.batch, .seq = geometry.sequence, .q_heads = lc.num_attention_heads, .kv_heads = lc.num_key_value_heads, .head_dim = lc.head_dim, .local_radius = if (lc.kind == .sliding_attention) config.sliding_window else 0 };
+                var previous = try EncoderAttention.AttentionProgram.forResolvedMask(shape, std.math.cast(u32, old.sequence) orelse return error.InvalidEmbeddingGemma2AttentionSchedule, old.all_valid, ctx.info.multiprocessor_count);
+                const current = try EncoderAttention.AttentionProgram.forResolvedMask(shape, source_sequence, source.all_valid, ctx.info.multiprocessor_count);
+                previous.source_sequence = current.source_sequence;
+                if (!std.meta.eql(previous, current)) {
+                    compatible = false;
+                    break;
+                }
+            };
+        };
+        if (!compatible) try self.invalidateGraph(ctx) else if (!self.attentionSourceMatches(source)) self.resetTiming();
+    }
+    pub fn noteAttentionSource(self: *Arena, source: AttentionSource, config: EncoderConfig, policy: EncoderPolicy, route: EncoderRouteState) void {
+        self.attention_source = source;
+        if (self.logical_upload) |upload| {
+            upload.captured_config = config;
+            upload.captured_policy = policy;
+            upload.captured_route = route;
+        }
+    }
+    /// The host cell survives cache moves and every asynchronous upload. Drain
+    /// the actual previous use BEFORE rewriting it; no ring/stack address is saved.
+    pub fn uploadLogical(self: *Arena, ctx: *Context, device: Buffer, source: AttentionSource) !void {
+        _ = try self.encoderGeometry();
+        const source_sequence = std.math.cast(u32, source.sequence) orelse return error.InvalidEmbeddingGemma2AttentionSchedule;
+        const upload = self.logical_upload orelse return error.InvalidCudaState;
+        if (device.ptr == 0 or device.len != 8 or device.ptr % 4 != 0 or source.sequence == 0 or source.sequence > self.sequence or source.mask_kind > 2 or source.all_valid != (source.mask_kind == 0)) return error.InvalidCudaState;
+        if (try ctx.streamCaptureActive()) return error.CudaGraphCaptureUnsafeHostCopy;
+        try self.drain(ctx);
+        upload.values = .{ source_sequence, source.mask_kind };
+        // Even an upload error may have queued work: retirement falls back to
+        // the actual stream barrier until noteUse publishes its event.
+        self.pending = true;
+        self.fence_valid = false;
+        device.copyFromHost(ctx, std.mem.asBytes(&upload.values)) catch |err| {
+            self.attention_source = null;
+            self.warm = false;
+            return err;
+        };
+    }
     fn sizesMatch(self: *const Arena, sizes: [11]usize) bool {
         for (self.buffers, sizes) |buffer, size| if (buffer.len != size) return false;
         return true;
     }
     pub fn hasBacking(self: *const Arena) bool {
-        return self.bytes() != 0 or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease();
+        return self.bytes() != 0 or self.logical_upload != null or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease();
     }
     pub fn noteUse(self: *Arena, ctx: *Context) void {
         self.pending = true;
@@ -79,6 +181,11 @@ pub const Arena = struct {
         var total: usize = 0;
         for (self.buffers) |b| total += b.len;
         return total;
+    }
+    pub const GraphAction = enum { eager, capture, replay };
+    pub fn graphAction(self: *const Arena) GraphAction {
+        if (self.graph != null) return if (self.preferReplay()) .replay else .eager;
+        return if (self.warm and !self.disabled) .capture else .eager;
     }
     pub fn preferReplay(self: *const Arena) bool {
         if (self.replay_samples < 2) return true;
@@ -119,6 +226,7 @@ pub const Arena = struct {
         ctx.destroyEventChecked(&self.completion) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         ctx.destroyGraphExecChecked(&self.graph) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         for (&self.buffers) |*buffer| _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (self.logical_upload) |upload| std.heap.smp_allocator.destroy(upload);
         self.quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.* = .{};
     }
@@ -183,7 +291,7 @@ pub const ArenaPreview = struct {
             for (&self.arenas, 0..) |*entry, index| if (choice.victims & (@as(u8, 1) << @intCast(index)) != 0) {
                 entry.* = .{};
             };
-            self.arenas[choice.index] = .{ .kind = @fromBackingInt(@intCast(@backingInt(request.kind))), .grid_x = request.grid_x, .grid_y = request.grid_y, .sequence = request.sequence, .batch = request.batch, .mask_kind = request.mask_kind, .sizes = request.sizes, .has_backing = choice.bytes != 0 };
+            self.arenas[choice.index] = .{ .kind = @fromBackingInt(@intCast(@backingInt(request.kind))), .grid_x = request.grid_x, .grid_y = request.grid_y, .sequence = request.sequence, .batch = request.batch, .mask_kind = request.mask_kind, .sizes = request.sizes, .has_backing = choice.bytes != 0 or logicalUploadHostBytes(request.kind) != 0 };
             self.projected |= @as(u8, 1) << @intCast(choice.index);
         }
         const entry = &self.arenas[choice.index];
@@ -282,6 +390,10 @@ pub const Cache = struct {
             try ctx.destroyEventChecked(&entry.completion);
             try ctx.destroyGraphExecChecked(&entry.graph);
             for (&entry.buffers) |*buffer| _ = try buffer.freeChecked(ctx);
+            if (entry.logical_upload) |upload| {
+                std.heap.smp_allocator.destroy(upload);
+                entry.logical_upload = null;
+            }
             try entry.quota.releaseAfterSdkDeath(current);
             entry.* = .{};
         }
@@ -302,7 +414,10 @@ pub const Cache = struct {
     /// destruction owns all device cleanup, release host keys and admission
     /// without making further calls through the lost driver context.
     pub fn releaseAfterContextDestroyed(self: *Cache, allocator: std.mem.Allocator) void {
-        for (&self.arenas) |*entry| entry.quota.releaseOutsideExecution();
+        for (&self.arenas) |*entry| {
+            if (entry.logical_upload) |upload| std.heap.smp_allocator.destroy(upload);
+            entry.quota.releaseOutsideExecution();
+        }
         var iterator = self.weights.iterator();
         while (iterator.next()) |entry| {
             entry.value_ptr.quota.releaseOutsideExecution();
@@ -397,7 +512,7 @@ pub const Cache = struct {
             try value.drain(ctx);
             value.deinit(ctx); // Explicit raw path only; bound path proved empty.
         };
-        var lease = prepared.acquire(ctx, .{ .arena = request }, .{ .backend_scratch_bytes = selected.bytes }) catch return null;
+        var lease = prepared.acquire(ctx, .{ .arena = request }, .{ .backend_scratch_bytes = selected.bytes, .host_scratch_bytes = logicalUploadHostBytes(request.kind) }) catch return null;
         errdefer lease.releaseAfterSdkDeath();
         var candidate = Arena{ .kind = kind, .grid_x = grid_x, .grid_y = grid_y, .sequence = sequence, .batch = batch, .mask_kind = mask_kind };
         errdefer for (&candidate.buffers) |*buffer| {
@@ -415,6 +530,18 @@ pub const Cache = struct {
                 lease.releaseAfterSdkDeath();
                 return null;
             };
+        }
+        if (kind == .encoder) {
+            candidate.logical_upload = std.heap.smp_allocator.create(LogicalUpload) catch {
+                for (&candidate.buffers) |*allocated| {
+                    if (lease.funded()) {
+                        _ = allocated.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                    } else allocated.free(ctx);
+                }
+                lease.releaseAfterSdkDeath();
+                return null;
+            };
+            candidate.logical_upload.?.* = .{};
         }
         candidate.last_used = self.clock;
         candidate.uses = 1;
@@ -485,6 +612,7 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     try std.testing.expectEqual(pointer, first.buffers[0].ptr);
     _ = (try cache.allocatePacked(std.testing.allocator, &ctx, "qkv", 512)).?;
     try std.testing.expectEqual(@as(usize, 864), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(2 * @sizeOf(LogicalUpload), controller.snapshot().host_scratch_bytes);
     // The second owner has physical room but must respect shared pressure.
     var other = Cache{};
     defer other.clear(std.testing.allocator, &ctx) catch unreachable;
@@ -494,6 +622,16 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     try std.testing.expectEqual(@as(usize, 1), Mock.graphs);
     try std.testing.expectEqual(@as(usize, 23), Mock.frees);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    // Actual shared host admission refuses the new retained metadata BEFORE
+    // a device bank is acquired, while the original complete quota stays exact.
+    const before_denial = controller.snapshot();
+    const allocations_before_denial = ctx.device_allocations.snapshot();
+    ctx.video_cache_budget.admission.?.limits.host_limit_bytes = @sizeOf(LogicalUpload) - 1;
+    try std.testing.expect((try cache.arena(&ctx, 1, 64, 1, @splat(16))) == null);
+    try std.testing.expectEqualDeep(before_denial, controller.snapshot());
+    try std.testing.expectEqualDeep(allocations_before_denial, ctx.device_allocations.snapshot());
+    ctx.video_cache_budget.admission.?.limits.host_limit_bytes = 0;
     try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
     _ = (try other.allocatePacked(std.testing.allocator, &ctx, "gate", 256)).?;
     try other.discardPacked(std.testing.allocator, &ctx, "gate");
@@ -786,4 +924,267 @@ test "CUDA retained cache purposes reach uniform report across checked free fail
     try std.testing.expectEqualDeep(summary, retained);
     try std.testing.expectEqual(.exact_authored_owning_lifetimes_with_explicit_unclassified_remainder, retained.reports[0].semantic_lifetime_classes);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "encoder logical attention signatures do not alter physical bank selection" {
+    // Actual selector metadata only; no fake device allocation or graph handle.
+    var cache: Cache = .{};
+    var request: prepared.Arena = .{ .kind = .encoder, .batch = 1, .sequence = 192, .mask_kind = 1, .sizes = @splat(0) };
+    request.sizes[0] = 192 * 8;
+    cache.arenas[0].sequence = request.sequence;
+    cache.arenas[0].batch = request.batch;
+    cache.arenas[0].mask_kind = request.mask_kind;
+    cache.arenas[0].buffers[0].len = request.sizes[0];
+    const first = AttentionSource{ .sequence = 177, .all_valid = true };
+    const next = AttentionSource{ .sequence = 178, .all_valid = true };
+    try std.testing.expect(!cache.arenas[0].attentionSourceMatches(first));
+    cache.arenas[0].attention_source = first;
+    try std.testing.expect(cache.arenas[0].attentionSourceMatches(first));
+    try std.testing.expect(!cache.arenas[0].attentionSourceMatches(next));
+    const before = (try cache.selectArena(request)).?;
+    cache.arenas[0].attention_source = next;
+    const after = (try cache.selectArena(request)).?;
+    try std.testing.expect(before.hit and after.hit and before.index == after.index);
+    try std.testing.expectEqualDeep(before, after);
+    try std.testing.expect(cache.arenas[0].attentionSourceMatches(next));
+    try std.testing.expect(!cache.arenas[0].attentionSourceMatches(.{ .sequence = next.sequence, .all_valid = false }));
+    const preview = ArenaPreview.fromCache(&cache);
+    try std.testing.expectEqualDeep(after, (try preview.select(request)).?);
+}
+
+test "CUDA encoder graph refresh preserves physical banks across logical source transitions" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    if (!@import("artifact.zig").hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor)) return error.SkipZigTest;
+    const Attention = @import("embedding_gemma2.zig");
+    var module = try Attention.Module.init(&ctx);
+    defer module.deinit(&ctx);
+    var cache: Cache = .{};
+    defer cache.clear(std.testing.allocator, &ctx) catch @panic("CUDA arena cleanup failed");
+    const shape = Attention.Attention{ .batch = 1, .seq = 192, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 512 };
+    const first = try Attention.AttentionProgram.forResolvedMask(shape, 177, true, ctx.info.multiprocessor_count);
+    const next = try Attention.AttentionProgram.forResolvedMask(shape, 178, true, ctx.info.multiprocessor_count);
+    try std.testing.expectEqual(first.split_count, next.split_count);
+    const scratch_bytes = (try first.workspace()).total_bytes;
+    try std.testing.expectEqual(scratch_bytes, (try next.workspace()).total_bytes);
+    const q_elements = 192 * 4 * 256;
+    const kv_elements = 192 * 2 * 256;
+    var sizes: [11]usize = @splat(0);
+    sizes[0] = q_elements * 2;
+    sizes[1] = kv_elements * 2;
+    sizes[2] = kv_elements * 2;
+    sizes[3] = q_elements * 2;
+    sizes[4] = try encoderMaskBytes(192);
+    sizes[5] = scratch_bytes;
+    const entry = (try cache.arena(&ctx, 1, 192, 1, sizes)) orelse return error.TestUnexpectedResult;
+    const a = std.testing.allocator;
+    const zeros = try a.alloc(u16, q_elements);
+    defer a.free(zeros);
+    @memset(zeros, 0);
+    const values = try a.alloc(u16, kv_elements);
+    defer a.free(values);
+    @memset(values, 0);
+    // The new logical tail has the only nonzero V row. Replaying a stale177
+    // graph with the178 mask therefore produces0 instead of BF16(32/178).
+    @memset(values[177 * 2 * 256 ..][0 .. 2 * 256], 0x4200);
+    const output = try a.alloc(u16, q_elements);
+    defer a.free(output);
+    // Keep host upload/readback arrays alive even on a later driver failure.
+    defer ctx.synchronize() catch @panic("CUDA test upload retirement failed");
+    try entry.buffers[0].copyFromHost(&ctx, std.mem.sliceAsBytes(zeros));
+    try entry.buffers[1].copyFromHost(&ctx, std.mem.sliceAsBytes(zeros[0..kv_elements]));
+    try entry.buffers[2].copyFromHost(&ctx, std.mem.sliceAsBytes(values));
+    var mask: [192]i64 = @splat(0);
+    @memset(mask[0..177], 1);
+    try entry.buffers[4].copyFromHost(&ctx, std.mem.sliceAsBytes(&mask));
+    const Fixture = struct {
+        fn capture(context: *Context, m: *Attention.Module, arena: *Arena, program: Attention.AttentionProgram) !void {
+            var recording = false;
+            defer if (recording) {
+                if (context.endStreamCapture()) |graph| context.destroyGraph(graph) else |_| {}
+            };
+            try context.beginStreamCapture(driver.CU_STREAM_CAPTURE_MODE_RELAXED);
+            recording = true;
+            try m.launchLocalFlashAttention(context, arena.buffers[3], arena.buffers[0], arena.buffers[1], arena.buffers[2], arena.buffers[4], program, arena.buffers[5]);
+            const graph = try context.endStreamCapture();
+            recording = false;
+            defer context.destroyGraph(graph);
+            arena.graph = try context.instantiateGraph(graph);
+            arena.attention_source = .{ .sequence = program.source_sequence, .all_valid = true };
+            arena.warm = true;
+        }
+        fn alternate(context: *Context, m: *Attention.Module, arena: *Arena, program: Attention.AttentionProgram, config: EncoderConfig) !Arena.GraphAction {
+            const source: AttentionSource = .{ .sequence = program.source_sequence, .all_valid = true };
+            try arena.prepareAttentionSource(context, source, config, .{}, .{});
+            try arena.uploadLogical(context, program.logical_metadata, source);
+            const action = arena.graphAction();
+            switch (action) {
+                .eager => {
+                    try m.launchLocalFlashAttention(context, arena.buffers[3], arena.buffers[0], arena.buffers[1], arena.buffers[2], arena.buffers[4], program, arena.buffers[5]);
+                    arena.warm = true;
+                },
+                .capture => {
+                    try @This().capture(context, m, arena, program);
+                    try context.launchGraph(arena.graph);
+                },
+                .replay => try context.launchGraph(arena.graph),
+            }
+            arena.noteAttentionSource(source, config, .{}, .{});
+            arena.noteUse(context);
+            return action;
+        }
+        fn check(context: *Context, arena: *Arena, host: []u16, sequence: usize, expected: u16) !void {
+            try arena.buffers[3].copyToHost(context, std.mem.sliceAsBytes(host));
+            try context.synchronize();
+            for (host, 0..) |value, i| try std.testing.expectEqual(if (i / (4 * 256) < sequence) expected else @as(u16, 0), value);
+        }
+    };
+    try Fixture.capture(&ctx, &module, entry, first);
+    try ctx.launchGraph(entry.graph);
+    try Fixture.check(&ctx, entry, output, 177, 0);
+    const before = ctx.device_allocations.snapshot();
+    var pointers: [11]driver.CUdeviceptr = undefined;
+    for (entry.buffers, &pointers) |bank, *pointer| pointer.* = bank.ptr;
+    mask[177] = 1;
+    try entry.buffers[4].copyFromHost(&ctx, std.mem.sliceAsBytes(&mask));
+    // Actual old captured scalar arguments remain177 despite the new mask.
+    try ctx.launchGraph(entry.graph);
+    try Fixture.check(&ctx, entry, output, 178, 0);
+    const same = (try cache.arena(&ctx, 1, 192, 1, sizes)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(same == entry);
+    try std.testing.expect(!entry.attentionSourceMatches(.{ .sequence = 178, .all_valid = true }));
+    try entry.invalidateGraph(&ctx); // SAME receiver used by production.
+    try std.testing.expect(entry.graph == null and !entry.warm and entry.attention_source == null);
+    try std.testing.expectEqual(before.allocations, ctx.device_allocations.snapshot().allocations);
+    try std.testing.expectEqual(before.frees, ctx.device_allocations.snapshot().frees);
+    try std.testing.expectEqual(before.live, ctx.device_allocations.snapshot().live);
+    for (entry.buffers, pointers) |bank, pointer| try std.testing.expectEqual(pointer, bank.ptr);
+    try Fixture.capture(&ctx, &module, entry, next);
+    try ctx.launchGraph(entry.graph);
+    try Fixture.check(&ctx, entry, output, 178, 0x3e38); // independently BF16(32/178)
+    try std.testing.expect(entry.attentionSourceMatches(.{ .sequence = 178, .all_valid = true }));
+    try std.testing.expectEqual(before.allocations, ctx.device_allocations.snapshot().allocations);
+    for (entry.buffers, pointers) |bank, pointer| try std.testing.expectEqual(pointer, bank.ptr);
+    // SAME production topology/graph-action receiver: logical177 warms,
+    // logical178 captures, then alternating177/178 replays the SAME graph.
+    // This is availability through real Cache state, not manual recapture.
+    var config = std.mem.zeroes(EncoderConfig);
+    config.num_hidden_layers = 1;
+    config.layer_types_len = 1;
+    config.layer_types[0] = .sliding_attention;
+    config.num_attention_heads = 4;
+    config.num_key_value_heads = 2;
+    config.head_dim = 256;
+    config.sliding_window = 512;
+    try entry.invalidateGraph(&ctx);
+    const graph_submissions_before = ctx.stats.graph_submissions;
+    var dynamic_first = first;
+    var dynamic_next = next;
+    const metadata = Buffer{ .ptr = entry.buffers[4].ptr + 192 * 8, .len = 8 };
+    dynamic_first.logical_metadata = metadata;
+    dynamic_next.logical_metadata = metadata;
+    mask[177] = 0;
+    try entry.buffers[4].copyFromHost(&ctx, std.mem.sliceAsBytes(&mask));
+    try std.testing.expectEqual(Arena.GraphAction.eager, try Fixture.alternate(&ctx, &module, entry, dynamic_first, config));
+    try Fixture.check(&ctx, entry, output, 177, 0);
+    mask[177] = 1;
+    try entry.buffers[4].copyFromHost(&ctx, std.mem.sliceAsBytes(&mask));
+    try std.testing.expectEqual(Arena.GraphAction.capture, try Fixture.alternate(&ctx, &module, entry, dynamic_next, config));
+    try Fixture.check(&ctx, entry, output, 178, 0x3e38);
+    const captured = entry.graph;
+    try std.testing.expect(captured != null);
+    for ([_]usize{ 177, 178, 177, 178 }) |logical| {
+        mask[177] = if (logical == 178) 1 else 0;
+        try entry.buffers[4].copyFromHost(&ctx, std.mem.sliceAsBytes(&mask));
+        const program = if (logical == 178) dynamic_next else dynamic_first;
+        try std.testing.expectEqual(Arena.GraphAction.replay, try Fixture.alternate(&ctx, &module, entry, program, config));
+        try Fixture.check(&ctx, entry, output, logical, if (logical == 178) 0x3e38 else 0);
+        try std.testing.expectEqual(captured, entry.graph);
+    }
+    try std.testing.expectEqual(before.allocations, ctx.device_allocations.snapshot().allocations);
+    try std.testing.expectEqual(before.frees, ctx.device_allocations.snapshot().frees);
+    for (entry.buffers, pointers) |bank, pointer| try std.testing.expectEqual(pointer, bank.ptr);
+    try std.testing.expectEqual(graph_submissions_before + 5, ctx.stats.graph_submissions);
+    // Actual original mask policy changes invalidate topology before dispatch.
+    try entry.prepareAttentionSource(&ctx, .{ .sequence = 178, .all_valid = false, .mask_kind = 1 }, config, .{}, .{});
+    try std.testing.expect(entry.graph == null and !entry.warm);
+}
+
+test "encoder retained logical metadata rejects topology changes without borrowing configuration" {
+    // Only the null-graph pure metadata receiver runs here; no CUDA calls.
+    var ctx: Context = undefined;
+    ctx.info.multiprocessor_count = 17;
+    var config = std.mem.zeroes(EncoderConfig);
+    config.num_hidden_layers = 1;
+    config.layer_types_len = 1;
+    config.layer_types[0] = .sliding_attention;
+    config.num_attention_heads = 4;
+    config.num_key_value_heads = 2;
+    config.head_dim = 256;
+    config.sliding_window = 512;
+    var upload: LogicalUpload = .{};
+    var entry: Arena = .{ .sequence = 192, .batch = 1, .logical_upload = &upload, .warm = true };
+    const first: AttentionSource = .{ .sequence = 177, .all_valid = true };
+    const next: AttentionSource = .{ .sequence = 178, .all_valid = true };
+    entry.noteAttentionSource(first, config, .{ .graph_replay = true }, .{});
+    entry.eager_samples = 1;
+    try entry.prepareAttentionSource(&ctx, next, config, .{ .graph_replay = true }, .{});
+    try std.testing.expect(entry.warm); // next logical request can capture
+    try std.testing.expectEqual(Arena.GraphAction.capture, entry.graphAction());
+    try std.testing.expectEqual(@as(u8, 0), entry.eager_samples);
+    try std.testing.expectEqual(@as(usize, 177), entry.attention_source.?.sequence); // not published before execution
+    var changed = config;
+    changed.rms_norm_eps = 0.01;
+    try entry.prepareAttentionSource(&ctx, next, changed, .{ .graph_replay = true }, .{});
+    try std.testing.expect(!entry.warm and entry.attention_source == null);
+    entry.noteAttentionSource(first, config, .{ .graph_replay = true }, .{});
+    entry.warm = true;
+    try entry.prepareAttentionSource(&ctx, next, config, .{}, .{});
+    try std.testing.expect(!entry.warm);
+    entry.noteAttentionSource(first, config, .{ .graph_replay = true }, .{});
+    entry.warm = true;
+    try entry.prepareAttentionSource(&ctx, next, config, .{ .graph_replay = true }, .{ .cudnn_enabled = true });
+    try std.testing.expect(!entry.warm);
+    try std.testing.expectEqual(@as(usize, 192 * 8 + 8), try encoderMaskBytes(192));
+    try std.testing.expectEqual(@sizeOf(LogicalUpload), logicalUploadHostBytes(.encoder));
+    try std.testing.expectEqual(@as(usize, 0), logicalUploadHostBytes(.audio));
+    try std.testing.expectError(error.Overflow, encoderMaskBytes(std.math.maxInt(usize)));
+}
+
+test "encoder logical metadata public receivers reject malformed geometry before SDK or mutation" {
+    var ctx: Context = undefined; // no field may be read on these rejection paths
+    const config = std.mem.zeroes(EncoderConfig);
+    const source: AttentionSource = .{ .sequence = 177, .all_valid = true };
+    var upload: LogicalUpload = .{ .values = .{ 71, 2 } };
+    const cases = [_]Arena{
+        .{ .sequence = 192, .batch = 0 },
+        .{ .sequence = 192, .batch = std.math.maxInt(usize) },
+        .{ .sequence = 0, .batch = 1 },
+        .{ .sequence = std.math.maxInt(usize), .batch = 1 },
+        .{ .sequence = 8192, .batch = 4 },
+        .{ .kind = .vision, .sequence = 192, .batch = 1 },
+    };
+    for (cases) |value| {
+        var entry = value;
+        entry.logical_upload = &upload;
+        entry.attention_source = source;
+        entry.warm = true;
+        try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, entry.prepareAttentionSource(&ctx, source, config, .{}, .{}));
+        try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, entry.uploadLogical(&ctx, .{ .ptr = 16, .len = 8 }, source));
+        try std.testing.expect(entry.warm and entry.attention_source.?.eql(source));
+        try std.testing.expectEqualSlices(u32, &.{ 71, 2 }, &upload.values);
+    }
+    var valid: Arena = .{ .sequence = 192, .batch = 1, .logical_upload = &upload, .attention_source = source, .warm = true };
+    var excessive = config;
+    excessive.num_hidden_layers = @intCast(excessive.layer_types.len + 1);
+    excessive.layer_types_len = @intCast(excessive.layer_types.len + 1);
+    try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, valid.prepareAttentionSource(&ctx, source, excessive, .{}, .{}));
+    excessive.num_hidden_layers = 1;
+    try std.testing.expectError(error.InvalidEmbeddingGemma2AttentionSchedule, valid.prepareAttentionSource(&ctx, source, excessive, .{}, .{}));
+    try std.testing.expect(valid.warm and valid.attention_source.?.eql(source));
+    try std.testing.expectEqualSlices(u32, &.{ 71, 2 }, &upload.values);
 }

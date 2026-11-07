@@ -6492,15 +6492,22 @@ pub const Node = struct {
             });
         };
         const PreparedOcrRequest = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.LockedRequest else struct {};
+        const VisionPublication = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else struct {};
+        var vision_publication: ?VisionPublication = null;
+        defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
         var prepared_ocr: ?*PreparedOcrRequest = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
+            const publication_bytes = if (model.session.backend() == .cuda) generation.nativeCudaVisionPublicationBytes(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), 1) catch 0 else 0;
+            vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), PreparedOcrRequest.pinned_input_upload_capacity) catch 0
             else
                 0; // optional metadata-only decline; original validation remains in the pipeline
-            prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(model.session, primary, upload_bytes, model.nativeGenerationMutex(), null, execution_control);
+            prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithLimits(model.session, primary, upload_bytes, budget_limits, model.nativeGenerationMutex(), null, execution_control);
         };
         defer if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.deinit();
+        var publication_cleanup: ?@import("../execution/cleanup_owner.zig").Owner = if (prepared_ocr == null and vision_publication != null) try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(model.session) else null;
+        defer if (publication_cleanup) |*owner| owner.finishAfterUnlock();
         var model_lock: ?BatchModelLock = null;
         if (prepared_ocr == null) model_lock = try BatchModelLock.initWithControl(execution_mode, model.nativeGenerationMutex(), io, execution_control);
         defer if (model_lock) |*lock| lock.deinit();
@@ -6509,6 +6516,7 @@ pub const Node = struct {
         defer kv_manager.deinit();
         var cb = (if (comptime build_options.enable_cuda) blk: {
             if (prepared_ocr) |prepared| break :blk prepared.acquireBackend(allocator, &run_budget);
+            if (publication_cleanup) |*owner| break :blk @import("../execution/architecture_session.zig").getComputeBackendWithBudgetAndCleanup(model.session, allocator, &run_budget, .{ .boundary = owner.epoch() });
             break :blk session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget);
         } else session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget)) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
@@ -6524,7 +6532,7 @@ pub const Node = struct {
             if (native_host_state) |owned| {
                 cb.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() });
             } else if (comptime build_options.enable_cuda) {
-                if (prepared_ocr) |prepared| prepared.closeBackend(&cb) else cb.deinit();
+                if (prepared_ocr) |prepared| prepared.closeBackend(&cb) else if (publication_cleanup) |*owner| cb.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = cb.operationToken() }) else cb.deinit();
             } else cb.deinit();
         }
 
@@ -6587,6 +6595,9 @@ pub const Node = struct {
         };
         if (kv_storage) |*storage| try cb.provisionKvDeviceWriteHook(storage);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        if (comptime build_options.enable_cuda) {
+            if (prepared_ocr) |prepared| decode_state.dense_ffn_program = prepared.denseFfnProgram();
+        }
         if (active_kv_storage) |storage| {
             decode_state.kv_storage = storage;
         } else if (kv_storage) |*storage| {
@@ -6605,8 +6616,12 @@ pub const Node = struct {
             projector_store_error = err;
             break :blk null;
         };
+        defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| {
+            publication.finish(.{ .boundary = if (prepared_ocr) |prepared| prepared.cleanupOwner().epoch() else if (publication_cleanup) |*owner| owner.epoch() else null, .operation = cb.operationToken() });
+        };
         var pipeline = generation.NativeGenerationPipeline{
-            .execution_cleanup_owner = if (native_host_state) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.cleanupOwner() else null else null,
+            .vision_publication = if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication else null else null,
+            .execution_cleanup_owner = if (native_host_state) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.cleanupOwner() else if (publication_cleanup) |*owner| owner else null else null,
             .allocator = allocator,
             .io = io,
             .cb = cb,
@@ -9078,9 +9093,34 @@ pub const Node = struct {
         for (0..width) |_| amounts = try amounts.merge(one);
         var admission = try self.model_manager.acquireGenerationResources(&.{.{ .session = model.session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = amounts } }});
         defer admission.release();
+        var foreign_sink = try @import("../execution/retirement_sink.zig").Ref.create();
+        defer foreign_sink.release();
+        var foreign_guard = try foreign_sink.enter();
+        defer foreign_guard.finish();
+        var foreign_epoch = try foreign_guard.retainEpoch();
+        defer foreign_epoch.release();
         const PreparedOcrRequest = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.LockedRequest else struct {};
+        const VisionPublication = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else struct {};
+        var vision_publication: ?VisionPublication = null;
+        defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
         var prepared_ocr: ?*PreparedOcrRequest = null;
         if (comptime build_options.enable_cuda) if (admission.resources) |*primary| {
+            const publication_bytes = if (model.session.backend() == .cuda) try qwen3vl_projector.planResidentFeaturePublicationBytes(cfg, &.{fixture}, .{}) else 0;
+            if (model.session.backend() == .cuda) {
+                const original_primary = primary.*; // nonowning comparison facts only
+                const controller = primary.controller orelse return error.MissingRunAdmission;
+                const before_optional = controller.snapshot();
+                var tight = limits;
+                tight.backend_limit_bytes = primary.amounts.backendTotalBytes();
+                try std.testing.expect(tight.backend_limit_bytes != 0);
+                var denied = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 2, tight, control);
+                defer if (denied) |*unexpected| unexpected.deinit();
+                try std.testing.expect(denied == null);
+                try std.testing.expect(std.meta.eql(original_primary, primary.*));
+                try std.testing.expectEqualDeep(before_optional, controller.snapshot());
+            }
+            vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 2, limits, control);
+            if (model.session.backend() == .cuda and vision_publication == null) return error.MissingQualifiedPublicationFunding;
             const upload_bytes = if (model.session.backend() == .cuda) try qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(cfg, &.{fixture}, .{}, PreparedOcrRequest.pinned_input_upload_capacity) else 0;
             prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(model.session, primary, upload_bytes, model.nativeGenerationMutex(), &model.native_reader_execution_lane, control);
         };
@@ -9100,6 +9140,21 @@ pub const Node = struct {
                 if (prepared_ocr) |prepared| prepared.closeBackend(&cb) else cb.deinit();
             } else cb.deinit();
         }
+        const publication_current = @import("../execution/cleanup_context.zig").Context{ .boundary = if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.cleanupOwner().epoch() else null else null, .operation = cb.operationToken() };
+        defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.finish(publication_current);
+        if (comptime build_options.enable_cuda) if (vision_publication) |*publication| {
+            _ = try publication.bind(&cb, publication_current);
+            var wrong_receiver = cb;
+            wrong_receiver.ptr = @ptrFromInt(1);
+            try std.testing.expectError(error.ForeignComputeBackend, publication.bind(&wrong_receiver, publication_current));
+            var copied_table = cb.vtable.*;
+            std.mem.doNotOptimizeAway(&copied_table);
+            try std.testing.expect(&copied_table != cb.vtable);
+            wrong_receiver = cb;
+            wrong_receiver.vtable = &copied_table;
+            try std.testing.expectError(error.ForeignComputeBackend, publication.bind(&wrong_receiver, publication_current));
+            try std.testing.expectError(error.BackendOperationCleanupChanged, publication.bind(&cb, .{ .boundary = &foreign_epoch, .operation = cb.operationToken() }));
+        };
         const decoded = try image_pipeline.decode(a, fixture);
         defer decoded.deinit(a);
         const rgba = try a.alloc(u8, @as(usize, decoded.width) * decoded.height * 4);
@@ -9111,12 +9166,46 @@ pub const Node = struct {
         const altered = try antfly_image.png.encodeRgba(a, decoded.width, decoded.height, rgba);
         defer a.free(altered);
         const images = [_][]const u8{ fixture, altered };
+        if (comptime build_options.enable_cuda) if (vision_publication != null) try std.testing.expectEqual(try qwen3vl_projector.planResidentFeaturePublicationBytes(cfg, &.{fixture}, .{}), try qwen3vl_projector.planResidentFeaturePublicationBytes(cfg, &.{altered}, .{}));
         var serial: [2]qwen3vl_projector.ProjectedImages = undefined;
         var initialized: usize = 0;
-        defer for (serial[0..initialized]) |*value| value.deinit();
+        defer for (serial[0..initialized]) |*value| value.deinitWithCleanup(publication_current);
         for (images, 0..) |bytes, index| {
-            serial[index] = try qwen3vl_projector.encodeProjectedImagesResident(&cb, a, cfg, &.{bytes}, .{});
+            const download_before = if (comptime build_options.enable_cuda)
+                (if (cb.kind() == .cuda) @as(*@import("../ops/cuda/cuda_compute.zig").CudaCompute, @ptrCast(@alignCast(cb.ptr))).stats.d2h_bytes else 0)
+            else
+                0;
+            serial[index] = if (comptime build_options.enable_cuda) explicit: {
+                if (vision_publication) |*publication| {
+                    const feature_admission = qwen3vl_projector.FeaturePublicationAdmission{ .capability = try publication.bind(&cb, publication_current), .expected_target = publication.target.target.cuda, .cleanup = publication_current };
+                    break :explicit try qwen3vl_projector.encodeProjectedImagesResidentWithPublication(&cb, a, cfg, &.{bytes}, .{}, feature_admission);
+                }
+                break :explicit try qwen3vl_projector.encodeProjectedImagesResident(&cb, a, cfg, &.{bytes}, .{});
+            } else try qwen3vl_projector.encodeProjectedImagesResident(&cb, a, cfg, &.{bytes}, .{});
             initialized += 1;
+            if (comptime build_options.enable_cuda) if (cb.kind() == .cuda) {
+                const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+                try std.testing.expectEqual(download_before, compute.stats.d2h_bytes);
+                const tensor = serial[index].device_embeddings orelse return error.ExpectedResidentVisionFeatures;
+                const actual: *const @import("../ops/cuda/cuda_compute.zig").CudaTensor = @ptrCast(@alignCast(tensor));
+                const lease = actual.physical_lease orelse return error.ExpectedIndependentFeatureStorage;
+                const backing: *const @import("../ops/cuda/cuda_compute.zig").CudaTensor = @ptrCast(@alignCast(lease.tensor));
+                try std.testing.expect(lease.retirement_owner != null and lease.admittedBytes() >= actual.buffer.len);
+                try std.testing.expect(backing.owns_buffer and !backing.buffer.borrowed and !actual.buffer.borrowed);
+                try std.testing.expectEqual(backing.buffer.ptr, actual.buffer.ptr);
+                try std.testing.expectEqual(cb.ptr, serial[index].device_backend.?.ptr);
+                try std.testing.expectEqual(@as(usize, 0), serial[index].embeddings.len);
+                // Materialize only in qualification, after proving ordinary
+                // publication stayed resident. The prepared host producer
+                // below remains the independent original serial oracle.
+                const capability = try vision_publication.?.bind(&cb, publication_current);
+                try std.testing.expectError(error.BackendOperationCleanupChanged, cb.snapshotRows2DWithAdmission(a, tensor, 0, serial[index].tokens_per_image[0], serial[index].hidden_size, capability, .{ .boundary = &foreign_epoch, .operation = cb.operationToken() }));
+                const features = try cb.toFloat32(tensor, a);
+                cb.freeWithCleanup(tensor, publication_current);
+                serial[index].device_embeddings = null;
+                serial[index].device_backend = null;
+                serial[index].embeddings = features;
+            };
             var prepared = try qwen3vl_projector.prepareProjectedImageResident(a, cfg, bytes, .{}, control.imageWorkControl());
             defer prepared.deinit();
             var split = try qwen3vl_projector.encodePreparedProjectedImageResident(&cb, a, cfg, &prepared, .{});
@@ -9185,6 +9274,17 @@ pub const Node = struct {
         io: std.Io,
         control: InferenceExecutionControl,
 
+        publication: if (build_options.enable_cuda) ?*@import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else ?*void = null,
+
+        /// Borrow the Set only while this exact PAGE step/B is actually owned.
+        /// Broker payloads below never carry this pointer or a boundary.
+        fn encodeResident(request: *@This(), cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+            if (comptime build_options.enable_cuda) if (request.publication) |publication| {
+                const current = @import("../execution/cleanup_context.zig").Context{ .boundary = request.ctx.cleanup_owner.epoch(), .operation = cb.operationToken() };
+                return qwen3vl_projector.encodeProjectedImagesResidentWithPublication(cb, allocator, request.ctx.cfg, images, limits, .{ .capability = try publication.bind(cb, current), .expected_target = publication.target.target.cuda, .cleanup = current });
+            };
+            return qwen3vl_projector.encodeProjectedImagesResident(cb, allocator, request.ctx.cfg, images, limits);
+        }
         /// The epoch backend carries no request control, so its per-layer
         /// vision checks never fire. A page encoding alone checks its own
         /// deadline at each command-buffer boundary and then frees the gate.
@@ -9204,7 +9304,7 @@ pub const Node = struct {
             try request.ctx.lockStep(request.control);
             defer request.ctx.unlockStep();
             var cb = request.pageBackend();
-            return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, request.ctx.cfg, images, limits);
+            return request.encodeResident(&cb, allocator, images, limits);
         }
 
         fn encodeCpuPrepared(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, original_limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
@@ -9264,6 +9364,10 @@ pub const Node = struct {
                 defer allocator.free(result);
                 return result[0];
             }
+            if (comptime build_options.enable_cuda) if (request.publication) |publication| {
+                const current = @import("../execution/cleanup_context.zig").Context{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() };
+                return qwen3vl_projector.encodePreparedProjectedImageResidentWithPublication(&cb, allocator, ctx.cfg, &prepared, limits, .{ .capability = try publication.bind(&cb, current), .expected_target = publication.target.target.cuda, .cleanup = current });
+            };
             return qwen3vl_projector.encodePreparedProjectedImageResident(&cb, allocator, ctx.cfg, &prepared, limits);
         }
 
@@ -9285,7 +9389,7 @@ pub const Node = struct {
                 try ctx.lockStep(request.control);
                 defer ctx.unlockStep();
                 var cb = request.pageBackend();
-                return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
+                return request.encodeResident(&cb, allocator, images, limits);
             }
             const Cancel = struct {
                 fn check(ptr: *const anyopaque) bool {
@@ -9637,9 +9741,45 @@ pub const Node = struct {
             admission.release(&pool_lease);
             pool_owned = false;
         }
+        const VisionPublication = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else struct {};
+        var vision_publication: ?VisionPublication = null;
+        defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| {
+            const Close = struct {
+                fn run(owned: *VisionPublication, _: @import("../backends/session.zig").Session, _: *runtime.tier.memory.AdmissionLease, _: InferenceExecutionControl) anyerror!void {
+                    owned.deinit();
+                }
+            };
+            // State and coordinator owners have already retired. The same
+            // mandatory PAGE cleanup policy waits for its actual outside turn.
+            while (true) {
+                admission.withSupplementalOutside(limits, .{}, publication, Close.run) catch |err| {
+                    if (err == error.ResourceTemporarilyUnavailable) {
+                        platform.time.yieldBriefly();
+                        continue;
+                    }
+                    platform.inference_process_supervisor.restartWorker();
+                };
+                break;
+            }
+        };
+        if (comptime build_options.enable_cuda) {
+            const publication_bytes = if (backend == .cuda and !ctx.features.device_vision_features) generation.nativeCudaVisionPublicationBytes(a, model_path, cfg, &messages, @intCast(@max(max_tokens, 1)), ctx.features.vision_batch_items) catch 0 else 0;
+            if (publication_bytes != 0) {
+                const Prepare = struct {
+                    fn run(bytes: usize, selected: @import("../backends/session.zig").Session, primary: *runtime.tier.memory.AdmissionLease, active: InferenceExecutionControl) !?VisionPublication {
+                        return generation.prepareNativeVisionPublication(selected, primary, bytes, 1, selected.run_admission.?.limits, active);
+                    }
+                };
+                vision_publication = admission.withSupplementalOutside(limits, control, publication_bytes, Prepare.run) catch |err| switch (err) {
+                    error.ResourceTemporarilyUnavailable => null,
+                    else => return err,
+                };
+            }
+        }
         // The creator's existing lease has moved before cancellation, so every
         // unwind follows the same page/pool lifetime and never reserves twice.
         try control.check();
+        try admission.prepareDenseFfn(factory.limits, control);
         try ctx.lockStep(control);
         const before = ctx.budget;
         const chunk = runtime.tier.memory.reserveGptGenerationAtLargestChunk(&ctx.budget, &components, estimate.token_count, @intCast(max_tokens), ceiling) catch |err| {
@@ -9668,23 +9808,28 @@ pub const Node = struct {
             ctx.unlockStep();
             return err;
         };
+        admission.bindDenseFfn() catch |err| {
+            ctx.unlockStep();
+            return err;
+        };
         ctx.startExecutor(self, kv_dtype) catch |err| {
             ctx.unlockStep();
             return err;
         };
-        var cuda_profile = ctx.beginCudaRequestProfile() catch |err| unavailable: {
+        var cuda_profile = ctx.beginCudaRequestProfile(&admission) catch |err| unavailable: {
             std.log.warn("cuda_read_profile: status=unavailable reason={s}", .{@errorName(err)});
             break :unavailable LightOnStreamContext.CudaRequestProfile{};
         };
         var cuda_profile_complete = false;
         // Later request/result/state/lease defers finish first; the real PAGE,
         // resident CB and current B remain alive until AFTER this observer.
-        defer cuda_profile.finish(ctx, cuda_profile_complete);
+        defer cuda_profile.finish(ctx, &admission, cuda_profile_complete);
         ctx.unlockStep();
         var lease = try ctx.coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = prompt.len, .prompt_tokens = estimate.token_count, .prefill_chunk_limit = chunk, .max_tokens = max_tokens });
         defer ctx.coordinator.release(lease);
         admission.beginState();
         var state = generation.NativeDecodeState.initPaged(a, &ctx.manager, ctx.pool, model.shared_moe_cache);
+        if (comptime build_options.enable_cuda) state.dense_ffn_program = admission.denseFfnProgram();
         state.kv_storage = &ctx.storage;
         state.kv_lock = &ctx.kv_mutex;
         defer {
@@ -9709,7 +9854,12 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const page_io = self.inferenceIo(a, control.io, &owned_io);
-        var vision_request = LightOnVisionRequest{ .ctx = ctx, .io = page_io, .control = control };
+        defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| {
+            ctx.lockStepForCleanup();
+            defer ctx.unlockStep();
+            publication.finish(.{ .boundary = ctx.cleanup_owner.epoch(), .operation = if (ctx.cb) |*backend_cb| backend_cb.operationToken() else null });
+        };
+        var vision_request = LightOnVisionRequest{ .ctx = ctx, .io = page_io, .control = control, .publication = if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication else null else null };
         var pipeline = generation.NativeGenerationPipeline{
             .qwen_prefill_batch = if (ctx.features.prefill_batch or ctx.features.packed_mixed) .{ .ptr = &vision_request, .run_fn = batchLightOnPreparedPrefill } else null,
             .qwen_vision_batch = if (ctx.features.cpu_preprocess) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeCpuPrepared } else if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeSerial },
@@ -10057,7 +10207,7 @@ pub const Node = struct {
                 const page_messages = [_]generation.Message{.{ .role = "user", .content = payload.prompt, .image_bytes = &.{payload.image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = payload.prompt } } }};
                 upload_bytes = @max(upload_bytes, generation.nativeCudaPinnedPatchUploadBytesAtMost(allocator, payload.model_path, cfg, &page_messages, @intCast(@max(payload.max_tokens, 1)), PreparedOcrRequest.pinned_input_upload_capacity) catch 0);
             };
-            prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(model.session, primary, upload_bytes, model.nativeGenerationMutex(), null, control);
+            prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithLimits(model.session, primary, upload_bytes, limits, model.nativeGenerationMutex(), null, control);
         };
         defer if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.deinit();
         if (prepared_ocr == null) try control.lock(model.nativeGenerationMutex());
@@ -10085,6 +10235,11 @@ pub const Node = struct {
         const states = try allocator.alloc(generation.NativeDecodeState, items.len);
         defer allocator.free(states);
         for (states) |*state| state.* = generation.NativeDecodeState.initPaged(allocator, &manager, pool, model.shared_moe_cache);
+        if (comptime build_options.enable_cuda) {
+            if (states.len == 1) if (prepared_ocr) |prepared| {
+                states[0].dense_ffn_program = prepared.denseFfnProgram();
+            };
+        }
         // CUDA selected cohorts already use device-only recurrent State.
         // Retire their original admitted SDK owners under the actual B.
         defer for (states) |*state| {
@@ -17373,8 +17528,13 @@ pub const Node = struct {
         else
             null;
         const PreparedGeneration = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.GenerationPair else struct {};
+        const VisionPublication = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.SupplementalStorage else struct {};
+        var vision_publication: ?VisionPublication = null;
+        defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
         var prepared_generation: ?*PreparedGeneration = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
+            const publication_bytes = if (backend_kind == .cuda and !cooperative_cuda and draft_model_for_generation == null) generation.nativeCudaVisionPublicationBytes(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), 1) catch 0 else 0;
+            vision_publication = generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control) catch |err| return inferenceFailureResponse(ctx, err);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), PreparedGeneration.pinned_input_upload_capacity) catch 0
             else
@@ -17382,6 +17542,8 @@ pub const Node = struct {
             prepared_generation = PreparedGeneration.acquireAfterAdmissionWithUploadBytes(model.session, if (draft_model_for_generation) |draft| draft.session else null, primary, upload_bytes, first_locked_model.nativeGenerationMutex(), if (second_locked_model) |second| second.nativeGenerationMutex() else null, execution_control) catch |err| return inferenceFailureResponse(ctx, err);
         };
         defer if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| prepared.deinit();
+        var publication_cleanup: ?@import("../execution/cleanup_owner.zig").Owner = if (prepared_generation == null and vision_publication != null) try @import("../execution/cleanup_owner.zig").Owner.beginAdmitted(model.session) else null;
+        defer if (publication_cleanup) |*owner| owner.finishAfterUnlock();
         // Existing raw draft cleanup is declared earlier. An adopted pair
         // closes its wrapper under CURRENT B before dropping either lane.
         defer if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| {
@@ -17437,6 +17599,7 @@ pub const Node = struct {
         var cb = (if (comptime build_options.enable_cuda) blk: {
             if (cooperative_cuda) break :blk session_factory.getCoordinatedCudaComputeBackend(model.session, &run_budget, generation_slot.owner_id);
             if (prepared_generation) |prepared| break :blk prepared.acquireBackend(0, execution_allocator, &run_budget);
+            if (publication_cleanup) |*owner| break :blk @import("../execution/architecture_session.zig").getComputeBackendWithBudgetAndCleanup(model.session, execution_allocator, &run_budget, .{ .boundary = owner.epoch() });
             break :blk session_factory.getComputeBackendWithBudget(model.session, execution_allocator, &run_budget);
         } else session_factory.getComputeBackendWithBudget(model.session, execution_allocator, &run_budget)) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
@@ -17455,7 +17618,7 @@ pub const Node = struct {
             if (native_host_state) |owned| {
                 cb.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() });
             } else if (comptime build_options.enable_cuda) {
-                if (prepared_generation) |prepared| prepared.closeBackend(0, &cb) else cb.deinit();
+                if (prepared_generation) |prepared| prepared.closeBackend(0, &cb) else if (publication_cleanup) |*owner| cb.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = cb.operationToken() }) else cb.deinit();
             } else cb.deinit();
         };
         if (setup_scope) |*scope| scope.bind(cb) catch |err| return inferenceFailureResponse(ctx, err);
@@ -17650,8 +17813,12 @@ pub const Node = struct {
             projector_store_error = err;
             break :blk null;
         };
+        defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| {
+            publication.finish(.{ .boundary = if (prepared_generation) |prepared| if (prepared.cleanupOwner(0)) |owner| owner.epoch() else null else if (publication_cleanup) |*owner| owner.epoch() else null, .operation = cb.operationToken() });
+        };
         var pipeline = generation.NativeGenerationPipeline{
-            .execution_cleanup_owner = if (native_host_state) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| prepared.cleanupOwner(0) else null else null,
+            .vision_publication = if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication else null else null,
+            .execution_cleanup_owner = if (native_host_state) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| prepared.cleanupOwner(0) else if (publication_cleanup) |*owner| owner else null else null,
             .draft_execution_cleanup_owner = if (draft_host_state) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| prepared.cleanupOwner(1) else null else null,
             .allocator = execution_allocator,
             .io = ctx.io,
@@ -52347,6 +52514,8 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
             {
                 try actual.lockStep(factory.control);
                 defer actual.unlockStep();
+                const profile = try page[0].cudaProfileSnapshot(actual);
+                try std.testing.expectEqual(compute.stats.profile_collection_failures, profile.profile_collection_failures);
                 const Gpt = @import("../architectures/gpt.zig");
                 const current = @import("../execution/cleanup_context.zig").Context{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() };
                 const embedding = try Gpt.getEmbeddingWeight(cb, cfg);
@@ -52588,6 +52757,10 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 page[row].noteStateRetired(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
             }
             state_count = 0;
+            // Real completed states/PAGEs still retain the original provider,
+            // funding, Model cohort and B during this terminal observation.
+            const terminal_profile = try page[0].cudaProfileSnapshot(actual);
+            try std.testing.expectEqual(compute.stats.profile_collection_failures, terminal_profile.profile_collection_failures);
             actual.unlockStep();
             for (&state) |*value| try std.testing.expect(value.sequence_id == null and value.qwen35_linear_cache == null);
             executor.endEpoch();

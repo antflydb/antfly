@@ -248,6 +248,8 @@ required_symbols=(
   termite_embedding_gemma2_training_rope_vjp_f32
   termite_embedding_gemma2_attention_bf16
   termite_embedding_gemma2_attention_local_flash_bf16
+  antfly_attention_split_merge_bf16
+  antfly_attention_efficient_bf16_hd256
   termite_embedding_gemma2_attention_softmax_bf16
   termite_embedding_gemma2_matmul_bf16
   termite_embedding_gemma2_gelu_mul_bf16

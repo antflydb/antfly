@@ -669,7 +669,12 @@ pub const RunAdmission = struct {
             // vision-attention arena and F32 bridge tensors. Reserve their
             // measured peak plus headroom independently of the Lt workspace.
             const fixed = 80 * 1024 * 1024 + (if (request.preprocessing_complete) @as(usize, 0) else 384 * 1024 * 1024);
-            return try addBytes(try addBytes(try addBytes(arena, states), staging), try addBytes(attention, fixed));
+            // The CUDA producer accepts only the official text topology before
+            // encoder allocation. Its Flash layers are HD256/local512; global
+            // HD512 and masked layers use the zero-workspace efficient route.
+            const split_workspace = try embeddingGemma2SplitWorkspaceBytes(request.batch, request.sequence);
+            const logical_metadata = 2 * @sizeOf(u32); // exact mask-bank device tail
+            return try addBytes(try addBytes(try addBytes(try addBytes(arena, states), staging), try addBytes(attention, fixed)), try addBytes(split_workspace, logical_metadata));
         }
         // Attention and FFN phases are sequential, so reserve the larger peak
         // rather than summing mutually exclusive intermediates.
@@ -739,6 +744,23 @@ pub const RunAdmission = struct {
 fn embeddingGemma2AdmissionSequence(sequence: usize) usize {
     if (sequence < 128 or sequence % 64 == 0 or sequence >= 8192) return sequence;
     return ((sequence + 63) / 64) * 64;
+}
+
+/// Bound every shorter logical source allowed by the request envelope, not
+/// just the envelope's own schedule. This is the official EG2 CUDA producer
+/// contract (isOfficialTextTopology), NOT a general AttentionProgram bound:
+/// public HD256/global descriptors may use Flash beyond511 and are unrelated.
+fn embeddingGemma2SplitWorkspaceBytes(batch: usize, sequence_bound: usize) !usize {
+    if (batch == 0 or sequence_bound == 0) return 0;
+    const flash_keys = @min(sequence_bound, @as(usize, 511));
+    const splits = (flash_keys + 63) / 64; // <=8, without guessing a GPU SM count
+    if (splits <= 1) return 0;
+    const physical = embeddingGemma2AdmissionSequence(flash_keys);
+    const rows = try mulBytes(batch, physical);
+    const partial_rows = try mulBytes(try mulBytes(rows, 4), splits);
+    // Exact AttentionProgram.workspace layout: FP32 partial output followed
+    // by one FP32 LSE per query/head/split; the output already aligns to256.
+    return mulBytes(partial_rows, 256 * @sizeOf(f32) + @sizeOf(f32));
 }
 
 pub const RunRequest = struct {
@@ -10179,4 +10201,37 @@ test "owned execution gate publishes the retained Model FIFO before Runtime and 
 
 test "owned execution cohort construction unwinds every allocation failure without publishing a partial pair" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ownedExecutionCohortCase, .{});
+}
+
+test "official CUDA encoder admission bounds actual split programs for every declared source class" {
+    // Pure typed schedule/layout calls only. No Context/driver/module/model is
+    // initialized, and no GPU or allocation timing is part of this contract.
+    const Attention = @import("../ops/cuda/embedding_gemma2.zig");
+    const envelopes = [_]usize{ 1, 64, 65, 127, 128, 177, 178, 256, 270, 320, 511, 512, 513, 577, 8192 };
+    const logical_lengths = [_]usize{ 1, 16, 63, 64, 65, 127, 128, 129, 177, 178, 255, 256, 257, 270, 319, 320, 383, 384, 385, 447, 448, 449, 510, 511, 512, 513, 577, 1024, 4096, 8192 };
+    for ([_]usize{ 1, 4, 8 }) |batch| for (envelopes) |envelope| {
+        const bound = try embeddingGemma2SplitWorkspaceBytes(batch, envelope);
+        for (logical_lengths) |logical| {
+            if (logical > envelope) continue;
+            for ([_]usize{ logical, embeddingGemma2AdmissionSequence(logical) }) |physical| {
+                for ([_]i32{ 1, 17, 48, 132 }) |multiprocessors| for ([_]bool{ false, true }) |all_valid| {
+                    const local = Attention.Attention{ .batch = @intCast(batch), .seq = @intCast(physical), .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 512 };
+                    const program = try Attention.AttentionProgram.forResolvedMask(local, @intCast(logical), all_valid, multiprocessors);
+                    try std.testing.expect((try program.workspace()).total_bytes <= bound);
+                    if (logical >= 512 or !all_valid) try std.testing.expectEqual(@as(usize, 0), (try program.workspace()).total_bytes);
+                    var global = local;
+                    global.kv_heads = 1;
+                    global.head_dim = 512;
+                    global.local_radius = 0;
+                    const global_program = try Attention.AttentionProgram.forResolvedMask(global, @intCast(logical), all_valid, multiprocessors);
+                    try std.testing.expectEqual(@as(usize, 0), (try global_program.workspace()).total_bytes);
+                };
+            }
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 0), try embeddingGemma2SplitWorkspaceBytes(0, 177));
+    try std.testing.expectEqual(@as(usize, 0), try embeddingGemma2SplitWorkspaceBytes(1, 0));
+    try std.testing.expectEqual(@as(usize, 0), try embeddingGemma2SplitWorkspaceBytes(1, 64));
+    try std.testing.expectEqual(try embeddingGemma2SplitWorkspaceBytes(1, 511), try embeddingGemma2SplitWorkspaceBytes(1, std.math.maxInt(usize)));
+    try std.testing.expectError(error.ResourceLimitExceeded, embeddingGemma2SplitWorkspaceBytes(std.math.maxInt(usize), 65));
 }

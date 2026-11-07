@@ -659,7 +659,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (projected.device_embeddings != null) {
                 ctx.lockStepForCleanup();
                 defer ctx.unlockStep();
-                projected.deinit();
+                projected.deinitWithCleanup(.{ .boundary = ctx.cleanup_owner.epoch(), .operation = if (ctx.cb) |*backend| backend.operationToken() else null });
             } else projected.deinit();
         }
 
@@ -682,17 +682,13 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         pub const CudaRequestProfile = struct {
             before: ?session_factory.CudaRuntimeStats = null,
 
-            pub fn finish(self: *CudaRequestProfile, ctx: *LightOnStreamContext, complete: bool) void {
+            pub fn finish(self: *CudaRequestProfile, ctx: *LightOnStreamContext, page: *const PageLease, complete: bool) void {
                 if (comptime build_options.enable_cuda) {
                     const before = self.before orelse return;
                     self.before = null;
                     ctx.lockStepForCleanup();
                     defer ctx.unlockStep();
-                    const cb = if (ctx.cb) |*value| value else {
-                        std.log.warn("cuda_read_profile: status=unavailable reason=MissingReaderBackend", .{});
-                        return;
-                    };
-                    const after = @import("../ops/cuda/cuda_compute.zig").CudaCompute.drainProfileSnapshot(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch |err| {
+                    const after = page.cudaProfileSnapshot(ctx) catch |err| {
                         std.log.warn("cuda_read_profile: status=unavailable reason={s} request_outcome={s}", .{ @errorName(err), if (complete) "complete" else "partial" });
                         return;
                     };
@@ -720,12 +716,12 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
 
         /// Called only with the initialized resident backend and step already
         /// owned. Draining first excludes cold preparation and older references.
-        pub fn beginCudaRequestProfile(ctx: *LightOnStreamContext) !CudaRequestProfile {
+        pub fn beginCudaRequestProfile(ctx: *LightOnStreamContext, page: *const PageLease) !CudaRequestProfile {
             if (comptime build_options.enable_cuda) {
                 if (!session_factory.cudaOpProfileLoggingEnabled()) return .{};
                 const cb = if (ctx.cb) |*value| value else return error.MissingReaderBackend;
                 if (cb.kind() != .cuda) return .{};
-                return .{ .before = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.drainProfileSnapshot(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }) };
+                return .{ .before = try page.cudaProfileSnapshot(ctx) };
             }
             return .{};
         }
@@ -948,6 +944,80 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             quota: model_manager_mod.GenerationAdmissionLease,
             state: State = .empty,
             origin: ?@import("../execution/retirement_sink.zig").SealWitness = null,
+            dense_ffn: if (build_options.enable_cuda) ?@import("../execution/architecture_session.zig").PreparedComputeAdmission.DenseFfnPreparation else ?void = null,
+
+            /// The callback performs only cold construction. Its typed owner
+            /// may escape; the actual outside window, primary borrow, narrowed
+            /// Session and synchronous control do not. Both vision publication
+            /// and private FFN setup use this same genuine PAGE transition.
+            pub fn withSupplementalOutside(self: *PageLease, actual_limits: runtime.tier.memory.Limits, control: InferenceExecutionControl, context: anytype, comptime cold_prepare: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(cold_prepare)).@"fn".return_type.?).error_union.payload {
+                const ctx = self.ctx orelse return error.PageLeaseConsumed;
+                if (self.state == .active) return error.InvalidPreparedComputePhase;
+                const primary = if (self.quota.resources) |*value| value else return error.MissingPrimaryAdmission;
+                var outside = try ctx.parkForAdmission(control);
+                defer outside.restore() catch platform.inference_process_supervisor.restartWorker();
+                const Prepared = @import("../execution/architecture_session.zig").PreparedComputeAdmission;
+                return cold_prepare(context, Prepared.SupplementalStorage.requestSession(ctx.model.session, actual_limits), primary, control);
+            }
+            pub fn prepareDenseFfn(self: *PageLease, actual_limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !void {
+                if (comptime !build_options.enable_cuda) return;
+                const ctx = self.ctx orelse return error.PageLeaseConsumed;
+                if (self.dense_ffn != null) return error.InvalidPreparedComputePhase;
+                if (self.quota.resources == null) return;
+                const norms = ctx.norm_preparation orelse return;
+                const Prepare = struct {
+                    fn run(compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute, session: @import("../backends/session.zig").Session, primary: *runtime.tier.memory.AdmissionLease, current_control: InferenceExecutionControl) !?@import("../execution/architecture_session.zig").PreparedComputeAdmission.DenseFfnPreparation {
+                        return @import("../execution/architecture_session.zig").PreparedComputeAdmission.DenseFfnPreparation.prepare(session, primary, compute, current_control);
+                    }
+                };
+                self.dense_ffn = self.withSupplementalOutside(actual_limits, control, norms.expectedCudaCompute(), Prepare.run) catch |err| switch (err) {
+                    error.ResourceTemporarilyUnavailable => null,
+                    else => return err,
+                };
+            }
+            pub fn bindDenseFfn(self: *PageLease) !void {
+                if (comptime !build_options.enable_cuda) return;
+                const ctx = self.ctx orelse return error.PageLeaseConsumed;
+                const backend = if (ctx.cb) |*value| value else return error.MissingComputeBackend;
+                if (self.dense_ffn) |*owned| try owned.bind(ctx.model.session, &ctx.cohort_waiter, backend, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = backend.operationToken() });
+            }
+            pub fn denseFfnProgram(self: *const PageLease) ?*@import("../ops/cuda/cuda_compute.zig").CudaCompute.DenseFfnProgram {
+                if (comptime !build_options.enable_cuda) return null;
+                return if (self.dense_ffn) |owned| owned.program else null;
+            }
+            fn finishDenseFfnOutside(self: *PageLease) void {
+                if (comptime build_options.enable_cuda) if (self.dense_ffn) |*owned| {
+                    owned.deinitAfterUnlock();
+                    self.dense_ffn = null;
+                };
+            }
+
+            /// Lexical diagnostic access uses the SAME live PAGE that owns
+            /// this request's quota and retained epoch. It does not retain a
+            /// token, backend header or permission across a step unlock.
+            pub fn cudaProfileSnapshot(self: *const PageLease, ctx: *LightOnStreamContext) !session_factory.CudaRuntimeStats {
+                if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+                if (self.ctx != ctx or self.owner_id != @intFromPtr(ctx) or self.execution_id != ctx.execution_id) return error.ForeignReaderProfileOwner;
+                const actual = ctx.cleanup_owner.epoch() orelse return error.MissingCurrentCleanupEpoch;
+                const scheduler = ctx.model.session.cohort_scheduler orelse return error.MissingExecutionCohortScheduler;
+                const gate = ctx.model.session.execution_gate orelse return error.MissingExecutionCohortGate;
+                if (!ctx.cohort_owned or !scheduler.ownsAcquired(&ctx.cohort_waiter, gate)) return error.ExecutionCohortNotOwned;
+                if (try actual.isSealed()) return error.RetirementEpochSealed;
+                const cb = if (ctx.cb) |*value| value else return error.MissingReaderBackend;
+                const operation = @import("../execution/backend_operation.zig");
+                var scope: operation.Scope = undefined;
+                try operation.enterInto(cb, null, cb.operationToken(), .legacy_unknown_frame, &scope);
+                defer scope.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+                if (scope.token()) |token| {
+                    if (!try ctx.cleanup_owner.bindScope(&scope)) return error.BackendOperationCleanupUnavailable;
+                    const result = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.drainProfileSnapshot(cb, .{ .boundary = actual, .operation = token });
+                    try scope.finish();
+                    return result;
+                }
+                const preparation = ctx.norm_preparation orelse return error.UnsupportedReaderEpochBackend;
+                const roots = if (ctx.captured_roots) |*value| value else return error.ForeignReaderProfileOwner;
+                return preparation.readerProfileSnapshot(ctx.model.session, &ctx.cohort_waiter, cb, roots, actual);
+            }
 
             pub fn beginState(self: *PageLease) void {
                 std.debug.assert(self.ctx != null and self.state == .empty);
@@ -968,6 +1038,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 if (ctx.cb) |*cb| {
                     if (cb.operationToken() != null) _ = try current.operationFor(cb);
                 }
+                if (comptime build_options.enable_cuda) if (self.dense_ffn) |*owned| try owned.retire(current);
                 self.origin = try actual.sealWitness();
                 self.state = .retired;
             }
@@ -1001,6 +1072,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                         // a join; another thread's outside flag is insufficient.
                         if (self.originSealed(ctx) catch platform.inference_process_supervisor.restartWorker()) {
                             if (ctx.admission_window.borrowOutside() catch platform.inference_process_supervisor.restartWorker()) |borrow| {
+                                self.finishDenseFfnOutside();
                                 self.quota.release();
                                 self.quota = .{};
                                 self.finishOrigin();
@@ -1015,6 +1087,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                             continue;
                         };
                         if (!(self.originSealed(ctx) catch platform.inference_process_supervisor.restartWorker())) platform.inference_process_supervisor.restartWorker();
+                        self.finishDenseFfnOutside();
                         self.quota.release();
                         self.quota = .{};
                         self.finishOrigin();
@@ -1025,6 +1098,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 } else {
                     // Context already died, or owns the moved final quota.
                     // Only pure origin metadata may outlive that destruction.
+                    self.finishDenseFfnOutside();
                     self.quota.release();
                     self.quota = .{};
                     self.finishOrigin();
@@ -1742,7 +1816,23 @@ test "reader CUDA request profile disabled finish never touches retired epoch me
     const Context = Epoch(struct {}, struct {});
     var profile = Context.CudaRequestProfile{};
     const unavailable: *Context = @ptrFromInt(16);
-    profile.finish(unavailable, true);
-    profile.finish(unavailable, false);
+    profile.finish(unavailable, @ptrFromInt(16), true);
+    profile.finish(unavailable, @ptrFromInt(16), false);
     try std.testing.expect(profile.before == null);
+}
+
+test "reader profile requires the same live PAGE before backend or operation access" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const Context = Epoch(struct {}, model_manager_mod.LoadedModel);
+    var page = Context.PageLease{ .ctx = null, .owner_id = 0, .execution_id = 0, .quota = .{} };
+    try std.testing.expectError(error.ForeignReaderProfileOwner, page.cudaProfileSnapshot(@ptrFromInt(16)));
+    var ctx: Context = undefined;
+    ctx.execution_id = 7;
+    ctx.cleanup_owner = .{};
+    page.ctx = &ctx;
+    page.owner_id = @intFromPtr(&ctx);
+    page.execution_id = 8;
+    try std.testing.expectError(error.ForeignReaderProfileOwner, page.cudaProfileSnapshot(&ctx));
+    page.execution_id = 7;
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, page.cudaProfileSnapshot(&ctx));
 }
