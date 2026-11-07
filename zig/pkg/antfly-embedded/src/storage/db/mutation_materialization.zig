@@ -6609,6 +6609,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (extraction_budgeted) |*budgeted| budgeted.deinit();
             const extraction_alloc = if (extraction_budgeted) |*budgeted| budgeted.allocator() else alloc;
 
+            // See the matching log in enrichment_runtime.zig's
+            // processDocumentExtractionAsset: past this point the declared
+            // digest, if any, did not already prove this extraction
+            // unnecessary.
+            std.log.info("document extraction fetching source: doc_key={s} artifact={s} url={s}", .{ request.doc_key, artifact_name, source_url });
             const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
                 extraction_alloc,
                 remoteRenderConfig(db, null),
