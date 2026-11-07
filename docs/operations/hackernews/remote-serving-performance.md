@@ -687,3 +687,52 @@ Consumer size limits and cancellation still apply on hits, and cache admission
 failure falls back to the existing read path. Mutable sources continue remote
 revalidation. This caches immutable evidence after authority selection; it does
 not substitute a cached catalog pointer for current authority.
+
+To reproduce the local matched-binding matrix from a worktree with a freshly
+built server:
+
+```sh
+ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
+ANTFLY_E2E_COMPOSED_PROFILE_ROUNDS=5 \
+uv run --project zig/e2e/antfly pytest -q \
+  zig/e2e/antfly/test_composed_lake_readers.py -k local \
+  --junitxml=qualification-assets/owned-local.xml
+```
+
+Both modes register the same sealed archive shape. Only native mode enables
+serving-cut ownership. The fixture checks malformed-manifest rejection, two
+preparations over multiple leaves, full result sets, later mutations, pending
+replacements across restart, cursor tampering, cancellation recovery and a
+retention increase while warehouse writes remain disabled. Owned mode also
+checks zero query-time cursor-publication calls and a burst of 12 searches at
+concurrency four.
+
+GCS runs require `ANTFLY_E2E_GCS_BUCKET`, a fresh
+`ANTFLY_E2E_GCS_PREFIX=qualification/...`, and an OAuth token in a private file
+specified by `ANTFLY_E2E_GCS_TOKEN_FILE`; select `-k 'not local'`. Each case adds a
+UUID and records its exact `artifact_prefix` for scoped cleanup. `gcs` keeps raw
+source files local; `gcs_remote` puts source Parquet and the managed Iceberg
+warehouse in GCS too. Mutation calls and strict-control reads are paced to avoid
+coordination-object write-rate interference; native-owned composed reads and
+concurrent searches are unpaced. Reported latency excludes that pacing.
+
+For real comment bodies, set `ANTFLY_E2E_COMPOSED_CORPUS_DIR` to a directory of
+Parquet files containing `body`, set `ANTFLY_E2E_COMPOSED_ARCHIVE_ROWS` to their
+combined row count, and choose `ANTFLY_E2E_COMPOSED_PROFILE_TERM=database` and
+`ANTFLY_E2E_COMPOSED_HIGHLIGHTS=1`. The fixture assigns deterministic IDs and adds
+a correctness marker to the first 100 bodies; performance queries search the
+independent profile term over the whole corpus. Set
+`ANTFLY_E2E_COMPOSED_STORE_SOURCE=1` or `0` to compare stored-source and Parquet
+hydration. JUnit properties retain corpus hashes, binary hash, host load,
+concurrent compiler count, samples, CPU, sampled peak RSS/footprint, response
+bytes, continuation size and cache-cleared startup/query time. UTF-8 highlight
+spans are checked against returned fragment bytes.
+
+Native-admitted cuts also expose their retained generation lease through the
+lake reader's snapshot-protection port. That pin owns a separate checked reader
+handle and preserves cancellation, deadlines and expiry. An authenticated
+publication's exact-version delete proof can then be reused under native
+retention, without a fresh delete-object HEAD on every search. The adapter is
+installed only after admission of the native cut; strict external reads retain
+their catalog pin and qualification rules. Missing or unsupported version proofs
+continue to use the existing validation path.

@@ -195,6 +195,19 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             # Keep deterministic correctness assertions on the first 100 rows;
             # profiling can search an independent term in the real comments.
             bodies[:100] = ["quasar " + body for body in bodies[:100]]
+            sizes = [len(body.encode("utf-8")) for body in bodies]
+            record_property(
+                "corpus_body_bytes",
+                json.dumps(
+                    {
+                        "min": min(sizes),
+                        "mean": sum(sizes) / len(sizes),
+                        "max": max(sizes),
+                        "total": sum(sizes),
+                        "marker_rows": 100,
+                    }
+                ),
+            )
             record_property(
                 "corpus_files_sha256",
                 json.dumps(
@@ -256,58 +269,57 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             current_uri = f"gs://{gcs_bucket}/{gcs_prefix}/source/current"
             warehouse_connection = "warehouse-gcs"
 
-        if owned:
+        # Match archive bindings across the strict/native ablation; sealing
+        # membership is independent of opting into native serving authority.
 
-            def write_object(name, body):
-                (objects / name).write_bytes(
-                    b"AFOBJ001"
-                    + struct.pack("<QI", len(body), 0)
-                    + hashlib.sha256(body).hexdigest().encode()
-                    + body
-                )
-
-            if remote_source:
-                write_object = put_remote
-            chunk = json.dumps(
-                [
-                    {
-                        "file_id": "sample.parquet",
-                        "object_uri": f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/sample.parquet"
-                        if remote_source
-                        else "object://antfly/sample.parquet",
-                        "version_id": str(version) if remote_source else "",
-                        "etag": ""
-                        if remote_source
-                        else hashlib.sha256(data).hexdigest(),
-                        "byte_len": len(data),
-                        "row_count": archive_rows,
-                    }
-                ]
-            ).encode()
-            write_object("files.json", chunk)
-            head = json.dumps(
-                {
-                    "version": 1,
-                    "source_id": "history",
-                    "chunks": [
-                        {
-                            "uri": f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/files.json"
-                            if remote_source
-                            else "object://antfly/files.json",
-                            "sha256": hashlib.sha256(chunk).hexdigest(),
-                            "byte_len": len(chunk),
-                            "file_count": 1,
-                        }
-                    ],
-                    "file_count": 1,
-                }
-            ).encode()
-            write_object("sealed.parquet-manifest.json", head)
-            archive_uri = (
-                f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/sealed.parquet-manifest.json"
-                if remote_source
-                else (archive / "sealed.parquet-manifest.json").as_uri()
+        def write_object(name, body):
+            (objects / name).write_bytes(
+                b"AFOBJ001"
+                + struct.pack("<QI", len(body), 0)
+                + hashlib.sha256(body).hexdigest().encode()
+                + body
             )
+
+        if remote_source:
+            write_object = put_remote
+        chunk = json.dumps(
+            [
+                {
+                    "file_id": "sample.parquet",
+                    "object_uri": f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/sample.parquet"
+                    if remote_source
+                    else "object://antfly/sample.parquet",
+                    "version_id": str(version) if remote_source else "",
+                    "etag": "" if remote_source else hashlib.sha256(data).hexdigest(),
+                    "byte_len": len(data),
+                    "row_count": archive_rows,
+                }
+            ]
+        ).encode()
+        write_object("files.json", chunk)
+        head = json.dumps(
+            {
+                "version": 1,
+                "source_id": "history",
+                "chunks": [
+                    {
+                        "uri": f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/files.json"
+                        if remote_source
+                        else "object://antfly/files.json",
+                        "sha256": hashlib.sha256(chunk).hexdigest(),
+                        "byte_len": len(chunk),
+                        "file_count": 1,
+                    }
+                ],
+                "file_count": 1,
+            }
+        ).encode()
+        write_object("sealed.parquet-manifest.json", head)
+        archive_uri = (
+            f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/sealed.parquet-manifest.json"
+            if remote_source
+            else (archive / "sealed.parquet-manifest.json").as_uri()
+        )
 
         def assert_highlights(value, term="quasar"):
             if not highlights:

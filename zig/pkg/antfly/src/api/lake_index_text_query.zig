@@ -433,6 +433,12 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
         break :blk try @import("lake_published_navigation.zig").open(a, server, table.table_id, table.lake_index_catalog_json, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, request, lease);
     };
     defer if (!transferred) source.deinit();
+    // A native-admitted cut already protects the exact published source and
+    // immutable delete versions. Expose that retention through the existing
+    // snapshot port so qualified delete proofs need no provider HEAD. Strict
+    // external sources keep their catalog pins and fresh qualification rules.
+    if (prepared.native_cut != null and source.snapshot_pin == null)
+        source.snapshot_pin = try lease.snapshotPin();
     try source.attachCache(&server.lake_read_cache, schema.binding, context);
     context = source.protectContext(context);
     const ca = a;
