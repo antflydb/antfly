@@ -32,7 +32,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const typed_dv = @import("../section/typed_doc_values.zig");
 const geo = @import("geo.zig");
-const epoch = std.time.epoch;
 
 /// Native timestamp buckets preserve the signed, nanosecond storage domain.
 /// The unsigned collector below remains available to legacy aggregation ports.
@@ -50,7 +49,7 @@ fn DateHistogram(comptime Timestamp: type) type {
             self.buckets.deinit(self.alloc);
         }
         pub fn collect(self: *@This(), timestamp: Timestamp) !void {
-            const entry = try self.buckets.getOrPut(self.alloc, if (Timestamp == i128) try truncateSignedToInterval(timestamp, self.interval) else truncateToInterval(timestamp, self.interval));
+            const entry = try self.buckets.getOrPut(self.alloc, if (Timestamp == i128) try truncateSignedToInterval(timestamp, self.interval) else std.math.cast(u64, try truncateSignedToInterval(timestamp, self.interval)) orelse return error.InvalidAggregation);
             if (!entry.found_existing) entry.value_ptr.* = 0;
             entry.value_ptr.* += 1;
         }
@@ -68,13 +67,17 @@ fn DateHistogram(comptime Timestamp: type) type {
 }
 
 pub fn truncateSignedToInterval(ns: i128, interval: DateInterval) !i128 {
-    return @import("../datetime.zig").truncateSigned(ns, switch (interval) {
+    const datetime = @import("../datetime.zig");
+    if (interval == .fixed) return datetime.binSigned(ns, interval.fixed.every_ns, interval.fixed.origin_ns) orelse error.InvalidDateTime;
+    return datetime.truncateSigned(ns, switch (interval) {
         .minute => .minute,
         .hour => .hour,
         .day => .day,
         .week => .week,
         .month => .month,
+        .quarter => .quarter,
         .year => .year,
+        .fixed => unreachable,
     }) orelse error.InvalidDateTime;
 }
 
@@ -278,13 +281,15 @@ pub const TermsFacet = struct {
 // Date histogram aggregation
 // ============================================================================
 
-pub const DateInterval = enum {
+pub const DateInterval = union(enum) {
     minute,
     hour,
     day,
     week,
     month,
     year,
+    quarter,
+    fixed: struct { every_ns: u64, origin_ns: i128 = 0 },
 };
 
 /// Calendar-aligned histogram over u64 nanosecond timestamps.
@@ -294,35 +299,9 @@ const ns_per_sec: u64 = 1_000_000_000;
 
 /// Truncate a nanosecond timestamp to the start of the given calendar interval.
 pub fn truncateToInterval(ns: u64, interval: DateInterval) u64 {
-    const secs = ns / ns_per_sec;
-    switch (interval) {
-        .minute => return (secs / 60) * 60 * ns_per_sec,
-        .hour => return (secs / 3600) * 3600 * ns_per_sec,
-        .day => return (secs / 86400) * 86400 * ns_per_sec,
-        .week => {
-            // Epoch (Jan 1 1970) was a Thursday. Align to Monday.
-            // (days + 3) % 7 gives Monday=0.
-            const days = secs / 86400;
-            const dow = (days + 3) % 7;
-            const monday = days - dow;
-            return monday * 86400 * ns_per_sec;
-        },
-        .month => {
-            const epoch_secs = epoch.EpochSeconds{ .secs = secs };
-            const epoch_day = epoch_secs.getEpochDay();
-            const year_day = epoch_day.calculateYearDay();
-            const month_day = year_day.calculateMonthDay();
-            const start_day = epoch_day.day - month_day.day_index;
-            return @as(u64, start_day) * 86400 * ns_per_sec;
-        },
-        .year => {
-            const epoch_secs = epoch.EpochSeconds{ .secs = secs };
-            const epoch_day = epoch_secs.getEpochDay();
-            const year_day = epoch_day.calculateYearDay();
-            const start_day = epoch_day.day - year_day.day;
-            return @as(u64, start_day) * 86400 * ns_per_sec;
-        },
-    }
+    // Legacy unsigned callers cannot represent a bucket before the epoch.
+    // Native signed collectors retain that boundary exactly.
+    return std.math.cast(u64, truncateSignedToInterval(ns, interval) catch return 0) orelse 0;
 }
 
 // ============================================================================
@@ -754,4 +733,20 @@ test "signed date histograms align negative weeks leap months and wide years" {
         try std.testing.expectEqual(datetime.parseRfc3339ToSignedNs(&month).?, try truncateSignedToInterval(ns, .month));
         try std.testing.expectEqual(datetime.parseRfc3339ToSignedNs(&year).?, try truncateSignedToInterval(ns, .year));
     }
+}
+
+pub fn parseDateInterval(calendar: []const u8, fixed: []const u8, origin: []const u8) !DateInterval {
+    const dt = @import("../datetime.zig");
+    if (calendar.len > 0 and fixed.len > 0) return error.InvalidAggregation;
+    if (fixed.len > 0) return .{ .fixed = .{
+        .every_ns = dt.durationNs(fixed) orelse return error.InvalidAggregation,
+        .origin_ns = if (origin.len == 0) 0 else dt.parseRfc3339ToSignedNs(origin) orelse return error.InvalidAggregation,
+    } };
+    if (origin.len > 0) return error.InvalidAggregation;
+    const names = .{ "minute", "hour", "day", "week", "month", "quarter", "year" };
+    const aliases = .{ "1m", "1h", "1d", "1w", "1M", "1q", "1y" };
+    inline for (names, aliases) |name, alias| if (std.mem.eql(u8, calendar, name) or std.mem.eql(u8, calendar, alias)) return @unionInit(DateInterval, name, {});
+    if (std.mem.eql(u8, calendar, "60m")) return .hour;
+    if (std.mem.eql(u8, calendar, "24h")) return .day;
+    return error.InvalidAggregation;
 }

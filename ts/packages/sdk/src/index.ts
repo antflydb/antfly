@@ -567,3 +567,22 @@ export type {
   PrivacyFindingsPage,
 } from "./types.js";
 export type { AudioReadOptions, AudioReadMetadata, AudioReadSegment } from "./inference-types.js";
+
+export type {
+  SeriesBucket,
+  SeriesPoint,
+  SeriesQueryOptions,
+  SeriesRange,
+  TimeSeries,
+} from "./time-series.js";
+export {
+  fixedDurationNanoseconds,
+  seriesTimestampNanoseconds,
+  SeriesImportError,
+  seriesBatch,
+  seriesQuery,
+  seriesRead,
+  seriesResults,
+  seriesSQL,
+  timeSeriesTable,
+} from "./time-series.js";

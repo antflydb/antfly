@@ -1,0 +1,293 @@
+---
+title: Time series
+description: Ingest timestamped readings, query exact ranges, and chart bucketed measurements using ordinary Antfly tables and algebraic indexes.
+---
+
+Time series use ordinary Antfly tables. Declare a timestamp, keyword dimensions
+such as `device_id`, and numeric measurements. Use the normal batch and query
+APIs; the planner decides whether an eligible aggregation can use an algebraic
+materialization.
+
+## Create a table
+
+```typescript
+import { AntflyClient, timeSeriesTable } from "@antfly/sdk";
+
+const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+const config = timeSeriesTable({
+  timestamp: "observed_at",
+  dimensions: ["device_id"],
+  measurements: ["temperature"],
+  retention: "7d",
+  bucket: "5m",
+});
+console.log(config); // Ordinary, inspectable schema and index configuration.
+await client.tables.create("readings", config);
+```
+
+The preset declares sortable fields, a descending timestamp physical index
+order, optional table TTL, and exact temporal algebraic recipes. It creates no
+embeddings. The physical order accelerates compatible chronological reads;
+selective filters may instead use exact candidate collection. Inspect the query
+profile rather than assuming every query uses the same access path.
+
+A series identity is a grouping convention, not an event identity. Multiple
+valid readings may share the same timestamp and device. Use a producer event ID,
+or a stable combination of device, timestamp, and sequence, for each observation.
+
+## Ingest and correct readings
+
+```typescript
+import { seriesBatch } from "@antfly/sdk";
+
+await client.tables.batch("readings", {
+  ...seriesBatch([
+    { id: "sensor-1:sequence-42", document: {
+      device_id: "sensor-1",
+      observed_at: "2026-11-06T12:01:00.000000001Z",
+      temperature: 23.4,
+    } },
+  ], "observed_at"),
+  sync_level: "full_index",
+});
+```
+
+Readings can arrive out of order. RFC3339 timezone offsets normalize to the same
+instant, and nanosecond strings retain their precision. Fixed durations accept
+positive integer components in `ns`, `us`, `ms`, `s`, `m`, `h`, `d`, and `w`.
+Examples include `30s`, `5m`, and `1h30m`. Months and years are calendar units,
+not fixed durations.
+
+Batch writes are ordinary upserts with the API's existing transaction guarantees.
+Replaying the same ID and payload avoids an extra observation, but an old retry
+can overwrite a newer correction. Use version-conditional writes where that must
+be prevented. Helpers do not automatically replay ambiguous writes. Split large
+imports into bounded batches and preserve the IDs and exact payload for retries.
+`client.writeSeries(table, timestamp, readings, { batchSize: 500 })` consumes an
+iterable or async iterable in sequential bounded batches. It stops on error;
+earlier batches remain committed. The result reports pending and repair-required
+batch counts, and an optional `onBatch` callback receives each full commit outcome.
+A `SeriesImportError` exposes acknowledged progress and pending IDs; reconcile
+that batch before retrying it.
+
+## Query bucketed measurements
+
+```typescript
+const options = {
+  table: "readings", timestamp: "observed_at",
+  start: "2026-11-06T12:00:00Z", end: "2026-11-06T13:00:00Z",
+  dimensions: { device_id: "sensor-1" },
+  groupBy: ["device_id"], bucket: { every: "5m" },
+  measures: {
+    average: { op: "avg" as const, field: "temperature" },
+    minimum: { op: "min" as const, field: "temperature" },
+    maximum: { op: "max" as const, field: "temperature" },
+  },
+};
+const { series, result } = await client.series(options);
+```
+
+The SDK constructs a normal query. The equivalent aggregation request is:
+
+```json
+{
+  "limit": 0,
+  "filter_query": {
+    "field": "observed_at",
+    "start": "2026-11-06T12:00:00Z",
+    "end": "2026-11-06T13:00:00Z",
+    "inclusive_start": true,
+    "inclusive_end": false
+  },
+  "aggregations": {
+    "points": {
+      "type": "date_histogram",
+      "field": "observed_at",
+      "fixed_interval": "5m",
+      "date_bounds": {
+        "start": "2026-11-06T12:00:00Z",
+        "end": "2026-11-06T13:00:00Z"
+      },
+      "min_doc_count": 0,
+      "sub_aggregations": {
+        "average": { "type": "avg", "field": "temperature" }
+      }
+    }
+  }
+}
+```
+
+Ranges are half open: the start is included and the end is excluded. A fixed
+interval aligns to the UTC epoch unless `bucket_origin` supplies an RFC3339
+origin. Calendar intervals use `calendar_interval` instead and reject a fixed
+origin. Calendar buckets currently use UTC boundaries; IANA timezone/DST bucket
+rules are not implemented by this API. Explicitly normalize any application
+business-time policy before relying on calendar buckets.
+
+`date_bounds` supplies the empty-bucket extent, not a document filter. Supply a
+matching range filter to restrict measurements. Empty generation is limited to
+10,000 buckets. Bounded filling currently accepts primary metrics, not pipeline
+aggregations. Grouped requests use a terms limit; increase it deliberately or
+select explicit series rather than assuming all high-cardinality series fit.
+
+The series helpers preserve missing measurements as null. A count of zero is different from a temperature
+of zero. If a visualization requires zero filling, perform it explicitly for that
+measurement. Do not interpolate values implicitly.
+
+## SQL
+
+```sql
+SELECT device_id,
+       date_bin('5m', observed_at, '1970-01-01T00:00:00Z'::datetime) AS bucket,
+       AVG(temperature) AS average
+FROM readings
+WHERE observed_at >= '2026-11-06T12:00:00Z'::datetime
+  AND observed_at < '2026-11-06T13:00:00Z'::datetime
+GROUP BY device_id, bucket
+ORDER BY device_id, bucket;
+```
+
+`date_bin` shares exact fixed-duration arithmetic with JSON histograms, including
+origins and offset normalization. The SQL helper casts both source timestamps and
+range parameters to datetime, including the preset's JSON string columns. For grouped
+queries using the preset's scalar keyword dimension model, it selects the same top `maxSeries` by observation count and key before
+bucketing, including canonical JSON tuple tie-breaking for composite keyword groups.
+Series helpers set `exclude_null: true` on terms grouping: both paths exclude null
+and missing grouping keys before series ranking. Ordinary terms queries retain
+their existing null policy unless this option is enabled.
+Its selection CTE retains only the bounded series list; it does not materialize the
+entire filtered source. SQL COUNT results follow the SQL API's lossless bigint wire
+representation and can be decimal strings. JSON metric responses retain 64-bit floating-point
+precision, matching SQL floating measurements. Exact decimal SQL values retain
+their separate numeric type semantics. Use `date_trunc('day', observed_at)` for UTC
+calendar grouping. SQL emits populated groups; bounded empty generation is a JSON
+presentation option. `seriesSQL(options)` produces parameterized SQL with quoted
+identifiers. SQL expressions outside the materialization planner's proven shapes
+retain normal scan execution.
+
+### PostgreSQL and TimescaleDB conventions
+
+The fixed-duration SQL primitive follows PostgreSQL's
+[`date_bin`](https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-BIN)
+shape: width, timestamp, and explicit origin. Antfly currently accepts its compact
+duration strings, such as `'5m'`, rather than PostgreSQL `INTERVAL` values.
+
+TimescaleDB's [`time_bucket_gapfill`](https://docs.tigerdata.com/api/latest/hyperfunctions/gapfilling/time_bucket_gapfill/)
+is a useful model for the separate gap-generation stage: missing buckets do not
+imply measured zeroes. Antfly's bounded JSON histograms generate missing buckets,
+while SQL currently emits populated groups. With `fill: 0`, generated SQL applies
+`COALESCE` after measurement aggregation, preserving document counts. Antfly does not currently expose SQL
+`time_bucket_gapfill`, last-observation-carried-forward, or interpolation functions.
+These policies belong after aggregation, so inferred values never become facts
+in an algebraic index. TimescaleDB timezone, calendar, and default-alignment
+behavior should not be assumed for Antfly queries.
+
+## Latest readings and pagination
+
+```typescript
+import { seriesRead } from "@antfly/sdk";
+
+const page = await client.query(seriesRead({
+  table: "readings", timestamp: "observed_at",
+  start: "2026-11-06T00:00:00Z", end: "2026-11-07T00:00:00Z",
+  dimensions: { device_id: "sensor-1" }, limit: 100,
+}));
+```
+
+Reads default to descending time. The server appends `_id` as a deterministic
+tie-breaker. Continue with the complete last `_sort` tuple and the retained
+`remote_snapshot` from the response. Keep the bounds, filter, and order unchanged.
+If the snapshot expires, restart the read rather than mixing snapshots. For latest
+N per device, issue bounded per-device requests; a broad SQL window expression
+can be correct without having a bounded per-device access cost. The TypeScript
+`latestSeries` helper accepts an explicit selection of at most 100 series and
+limits concurrency to four requests, retaining each result’s snapshot. On failure
+it stops admitting queued requests, cancels outstanding calls, and waits for them
+to finish before rejecting.
+
+## Other SDKs
+
+Python exposes `series_query` and `fixed_duration_nanoseconds`:
+
+```python
+from antfly import series_query
+result = client.query("readings", query=series_query(
+    timestamp="observed_at", start="2026-11-06T12:00:00Z",
+    end="2026-11-06T13:00:00Z", measurement="temperature",
+    every="5m", group_by=["device_id"],
+))
+```
+
+Go exposes `NewSeriesQuery(SeriesQueryOptions{...})`, using `time.Time` bounds and
+`time.Duration` intervals. Rust exposes `time_series::series_query`, returning a
+`GlobalStatefulQueryRequest` accepted directly by `client.global_query(&request)`. All SDKs expose the generated temporal aggregation
+and recipe fields directly.
+
+## Algebraic maintenance and retention
+
+Public aggregate recipes can declare `time` and `bucket` along with dimensions,
+operation, and measurement. Fixed buckets align to the epoch. The engine owns
+physical state and only reuses compatible, complete materializations. Grouped
+`terms → date_histogram → metrics` queries reuse the preset when their half-open
+source range aligns to the maintained bucket boundaries. The range proof comes
+from the source predicate, independently of `date_bounds` or empty-bucket presentation;
+`emptyBuckets: false` retains the same indexed access opportunity. Equivalent fixed widths
+such as `5m` and `300s` match. Extra maintained dimensions constrained by exact keyword filters are reduced,
+and those filters are applied, and complete shard states merge before global series
+ranking. A custom origin, unaligned boundary, unsupported predicate, stale index,
+or incompatible layout uses the exact scan path. Unconstrained extra dimensions also
+fall back because documents missing those fields may be absent from the materialization. Profiled responses report
+`aggregation_execution: "materialized_temporal"` when this path succeeds, or a
+`scan_...` reason when a temporal plan declines.
+
+Execution is bounded to one million maintained cells and 64 MiB of retained distributed
+partial data. Owners apply proven time and dimension predicates before exporting
+states; unrelated history still counts against the maintained-scan work budget,
+but does not consume transfer or coordinator retention budgets. Owner exports
+use bounded parallel fanout, with at most four transport
+buffers alive in a window. Budget exhaustion declines the acceleration attempt
+rather than failing an otherwise valid exact scan. The scan fallback retains its normal source-row limit. Choose
+bounded time ranges and dimensions; the accelerator scans maintained state rather
+than guaranteeing a constant-cost range lookup. TTL reuse additionally requires
+proof that every matching observation remains visible through the query deadline;
+otherwise the exact visibility-filtered scan runs.
+
+AVG merges sum and non-null count state, never averages of averages. Late inserts,
+overwrite corrections, and deletes follow the ordinary algebraic maintenance
+path. Authorization and snapshot coverage still gate reuse.
+
+Table TTL expires raw observations and removes their contributions from exact
+aggregate indexes. These indexes are rebuildable accelerators over retained raw
+data. They do **not** preserve historical summaries after source expiration.
+Independently retained summaries, summary-aware TTL, and live subscriptions are
+tracked separately in [the time-series feature request](https://github.com/antflydb/antfly/issues/1540).
+
+## Explore in Antfarm
+
+Open a table's **Time series** section. Choose the timestamp, measurement, grouping
+fields, range, and interval; inspect charts or bucket data and copy SQL/JSON.
+Refresh polling is opt-in, cancels obsolete requests, and uses a fixed selected
+range. It is not a live subscription or an automatically advancing window.
+
+
+Bounded empty histograms accept metric children only and share a request-wide
+budget of 100,000 generated cells (bucket plus metrics), in addition to the 10,000
+bucket limit per histogram. The complete extent is reserved before constructing
+metric results, including on populated scans. Histograms without explicit bounds
+still fill interior gaps when `min_doc_count` is zero. Nested bounded bucket generation
+is rejected before execution. Cancellation and deadlines are checked while folding
+and filling; partially constructed histograms are safely released on failure.
+
+The TypeScript series helpers use the maintained AVG non-null count as an
+internal measurement-presence companion for SUM. The `count` operation counts
+observations (SQL `COUNT(*)`), consistent with JSON document-count semantics.
+An absent measurement is returned as the selected fill value, while a measured
+zero stays zero; raw JSON SUM keeps its normal empty-sum identity. Internal
+`__antfly_series_` metric names are reserved. `writeSeries` failures preserve
+acknowledged progress and report the failure phase, buffered IDs, ambiguous
+submitted IDs, and pending or repair-required batch counts. A callback failure
+occurs after acknowledgement and does not make that batch ambiguous.
+
+Charts retain extrema within a bounded pixel budget, show isolated observations
+as dots, and never bridge missing intervals. The bucket table mounts on expansion
+and displays 100 rows per page.

@@ -1,4 +1,13 @@
 import { AntflyHTTPError, AntflyResponseError } from "./errors.js";
+import {
+  SeriesImportError,
+  type SeriesQueryOptions,
+  type SeriesRange,
+  seriesBatch,
+  seriesQuery,
+  seriesRead,
+  seriesResults,
+} from "./time-series.js";
 /**
  * Antfly SDK Client
  * Provides a high-level interface for interacting with the Antfly API
@@ -1382,6 +1391,144 @@ export class AntflyClient {
     const data = await this.performQuery("/db/v1/query", request, undefined, options);
     // The global query returns QueryResponses, extract the first result
     return data?.responses?.[0];
+  }
+
+  /** Import bounded sequential batches. An error stops the import; committed
+   * earlier batches remain committed. No automatic ambiguous-write retry occurs.
+   */
+  async writeSeries(
+    table: string,
+    timestamp: string,
+    readings:
+      | AsyncIterable<{ id: string; document: Record<string, unknown> }>
+      | Iterable<{ id: string; document: Record<string, unknown> }>,
+    options?: WriteOptions & {
+      batchSize?: number;
+      syncLevel?: BatchRequest["sync_level"];
+      onBatch?: (outcome: BatchResult, submitted: number) => void | Promise<void>;
+    }
+  ) {
+    const batchSize = options?.batchSize ?? 500;
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1000)
+      throw new RangeError("batchSize must be 1–1000");
+    let batch: { id: string; document: Record<string, unknown> }[] = [];
+    let submitted = 0;
+    let committedPendingBatches = 0;
+    let repairRequiredBatches = 0;
+    let lastOutcome: BatchResult | undefined;
+    const state: { phase: "source" | "validation" | "submission" | "callback" | "aborted" } = {
+      phase: "source",
+    };
+    let pendingIds: string[] = [];
+    const checkAbort = () => {
+      if (options?.signal?.aborted) {
+        state.phase = "aborted";
+        options.signal.throwIfAborted();
+      }
+    };
+    const flush = async () => {
+      if (!batch.length) return;
+      checkAbort();
+      state.phase = "validation";
+      const request = { ...seriesBatch(batch, timestamp), sync_level: options?.syncLevel };
+      state.phase = "submission";
+      pendingIds = Object.keys(request.inserts ?? {});
+      const outcome = await this.tables.batchWithOptions(table, request, options);
+      submitted += batch.length;
+      lastOutcome = outcome;
+      if (outcome.status === "committed_pending") committedPendingBatches++;
+      if (outcome.status === "committed_repair_required") repairRequiredBatches++;
+      batch = [];
+      pendingIds = [];
+      state.phase = "callback";
+      await options?.onBatch?.(outcome, submitted);
+      state.phase = "source";
+    };
+    try {
+      checkAbort();
+      for await (const reading of readings) {
+        batch.push(reading);
+        checkAbort();
+        if (batch.length === batchSize) await flush();
+      }
+      await flush();
+    } catch (cause) {
+      throw new SeriesImportError(submitted, pendingIds, cause, {
+        phase: state.phase,
+        bufferedIds:
+          state.phase === "submission"
+            ? []
+            : batch.flatMap((reading) => {
+                try {
+                  const id = reading?.id;
+                  return typeof id === "string" ? [id] : [];
+                } catch {
+                  return [];
+                }
+              }),
+        mayHaveCommitted: state.phase === "submission",
+        committedPendingBatches,
+        repairRequiredBatches,
+        lastOutcome,
+      });
+    }
+    return { submitted, committedPendingBatches, repairRequiredBatches, lastOutcome };
+  }
+
+  /** Latest N for an explicit bounded selection of series, with four requests
+   * in flight at most. Each result retains its independent snapshot cursor.
+   */
+  async latestSeries(
+    request: Omit<SeriesRange, "dimensions"> & {
+      table: string;
+      series: Record<string, string>[];
+      limit?: number;
+    },
+    options?: QueryExecutionOptions
+  ) {
+    if (request.series.length > 100) throw new RangeError("Select at most 100 series");
+    // Validate the complete selection before starting any network work.
+    const requests = request.series.map((dimensions) => seriesRead({ ...request, dimensions }));
+    const results: (QueryResult | undefined)[] = new Array(requests.length);
+    const stop = new AbortController();
+    const signal = options?.signal ? AbortSignal.any([options.signal, stop.signal]) : stop.signal;
+    signal.throwIfAborted();
+    let next = 0;
+    let failed = false;
+    let failure: unknown;
+    // Each worker absorbs its error so Promise.all joins every in-flight call.
+    // The first failure closes admission and cancels siblings, preserving its cause.
+    await Promise.all(
+      Array.from({ length: Math.min(4, requests.length) }, async () => {
+        while (!failed && next < requests.length) {
+          try {
+            signal.throwIfAborted();
+            const index = next++;
+            results[index] = await this.query(requests[index]!, { ...options, signal });
+          } catch (cause) {
+            if (!failed) {
+              failed = true;
+              failure = cause;
+              stop.abort(cause);
+            }
+          }
+        }
+      })
+    );
+    if (failed) throw failure;
+    signal.throwIfAborted();
+    return results;
+  }
+
+  /** Query bucketed series using the ordinary JSON query and aggregation API. */
+  async series(request: SeriesQueryOptions, options?: QueryExecutionOptions) {
+    const result = await this.query(seriesQuery(request), options);
+    if (!result) throw new Error("Time-series query returned no result");
+    if (result.error || (result.status !== undefined && result.status >= 400))
+      throw new AntflyResponseError(
+        `Time-series query failed (${result.status ?? "unknown"}): ${result.error ?? "unsuccessful query result"}`
+      );
+    return { series: seriesResults(result, request.fill), result };
   }
 
   /**

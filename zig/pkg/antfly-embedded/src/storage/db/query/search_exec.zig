@@ -9819,7 +9819,7 @@ fn searchQueryCanUseSnapshot(
         .multi_phrase => |item| try snapshot.hasInvertedField(item.field),
         .term => |item| (allow_analyzed_terms or
             try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
-            try snapshot.hasInvertedField(item.field),
+            (snapshot.liveDocCount() == 0 or try snapshot.hasInvertedField(item.field)),
         .fuzzy => |item| try snapshot.hasInvertedField(item.field),
         .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric),
         .date_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .datetime),
@@ -9827,9 +9827,9 @@ fn searchQueryCanUseSnapshot(
         .geo_distance => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .geo_bbox => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .term_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
-            try snapshot.hasInvertedField(item.field),
+            (snapshot.liveDocCount() == 0 or try snapshot.hasInvertedField(item.field)),
         .ip_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
-            try snapshot.hasInvertedField(item.field),
+            (snapshot.liveDocCount() == 0 or try snapshot.hasInvertedField(item.field)),
         .geo_shape => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .prefix => |item| try snapshot.hasInvertedField(item.field),
         .wildcard => |item| try snapshot.hasInvertedField(item.field),
@@ -38300,4 +38300,30 @@ test "native member verification preserves candidate provenance after native fil
     try std.testing.expect(!residual.value_search_execution.allow_scan);
     const unbounded = requestAfterNativeFilters(.{}, false, false);
     try std.testing.expectEqual(@as(usize, 0), unbounded.value_search_candidate_keys.len);
+}
+
+test "time series exact keyword filters admit empty shards without accepting missing live coverage" {
+    const a = std.testing.allocator;
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{
+        .name = "reading",
+        .fields = &.{.{ .path = "device_id", .emitted_name = "device_id", .analyzer = "keyword" }},
+    }} };
+    const query: search_mod.SearchQuery = .{ .term = .{ .field = "device_id", .term = "sensor" } };
+    try std.testing.expect(try searchQueryCanUseSnapshot(writer.snapshot(), query, .{}, schema, false));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const filter = try search_mod.searchQueryToFilterArena(arena.allocator(), query);
+    const matches = try writer.snapshot().executeFilter(a, filter);
+    defer a.free(matches);
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
+
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    try segment.addStoredDoc("doc:a", "{}");
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    try std.testing.expect(!try searchQueryCanUseSnapshot(writer.snapshot(), query, .{}, schema, false));
 }

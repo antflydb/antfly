@@ -1224,3 +1224,5 @@ mod tests {
 /// Optional client for the separately deployed source management service.
 #[cfg(feature = "sources")]
 pub mod sources;
+
+pub mod time_series;

@@ -2987,6 +2987,15 @@ const JoinScanBounds = struct {
     }
 };
 
+/// Request-owned budget shared by temporal scans across all aggregation roots.
+pub const TemporalScanBudget = struct {
+    remaining_cells: usize = 1_000_000,
+    /// Logical metric columns also count aliases of one physical state.
+    remaining_fold_cells: usize = 4_000_000,
+    remaining_bytes: usize = 64 * 1024 * 1024,
+    control: @import("../../../search/execution_control.zig").ExecutionControl = .{},
+};
+
 pub const Index = struct {
     alloc: Allocator,
     /// Public catalog identity used by planners and request access paths.
@@ -12581,7 +12590,18 @@ pub const Index = struct {
         return if (row.slots[0].value) |value| try self.alloc.dupe(u8, value) else null;
     }
 
+    pub fn scanMaterializedExpressionRowsBounded(self: *Index, store: *docstore_mod.DocStore, materializations: []const []const u8, budget: *TemporalScanBudget) !?[]MaterializedExpressionRowEntry {
+        if (materializations.len == 0) return null;
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        return self.scanMaterializedExpressionRowsBudgetedTxn(&txn, materializations, budget);
+    }
+
     fn scanMaterializedExpressionRowsTxn(self: *Index, txn: anytype, materializations: []const []const u8) !?[]MaterializedExpressionRowEntry {
+        return self.scanMaterializedExpressionRowsBudgetedTxn(txn, materializations, null);
+    }
+
+    fn scanMaterializedExpressionRowsBudgetedTxn(self: *Index, txn: anytype, materializations: []const []const u8, budget: ?*TemporalScanBudget) !?[]MaterializedExpressionRowEntry {
         const first_mat_idx = self.materializationIndex(materializations[0]) orelse return null;
         const first_mat = self.config().materializations[first_mat_idx];
         const first_op = algebra.Op.parse(first_mat.op) orelse return null;
@@ -12608,6 +12628,10 @@ pub const Index = struct {
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (budget) |limit| {
+                try limit.control.check();
+                if (materializations.len > limit.remaining_cells) return error.QueryCandidateBudgetExceeded;
+            }
             const values = try self.alloc.alloc(?[]u8, materializations.len);
             errdefer {
                 for (values) |value| if (value) |bytes| self.alloc.free(bytes);
@@ -12674,6 +12698,18 @@ pub const Index = struct {
                 self.alloc.free(group_key);
                 if (values.len > 0) self.alloc.free(values);
                 continue;
+            }
+            if (budget) |limit| {
+                // Export repeats each axis per metric; account for that shape
+                // before retaining rows, plus state and descriptor overhead.
+                var bytes = std.math.mul(usize, group_key.len + 64, materializations.len) catch return error.QueryCandidateBudgetExceeded;
+                for (values, materializations) |value, name| {
+                    bytes = std.math.add(usize, bytes, name.len) catch return error.QueryCandidateBudgetExceeded;
+                    if (value) |raw| bytes = std.math.add(usize, bytes, raw.len) catch return error.QueryCandidateBudgetExceeded;
+                }
+                if (bytes > limit.remaining_bytes) return error.QueryCandidateBudgetExceeded;
+                limit.remaining_cells -= materializations.len;
+                limit.remaining_bytes -= bytes;
             }
             try out.append(self.alloc, .{
                 .group_key = group_key,

@@ -1991,6 +1991,7 @@ pub const HttpHandler = struct {
             source_hits,
         );
         defer ctx_owned.deinit(self.alloc);
+        ctx_owned.ctx.control.cancellation = execution.session.?.readCancellation();
 
         const db_hits = try allocDbAggregationHitsAlloc(self.alloc, &execution.session.?, source_hits);
         defer freeDbSearchHits(self.alloc, db_hits);
@@ -2047,6 +2048,15 @@ pub const HttpHandler = struct {
             .context_json = .fromSlice(context_json),
             .hits = if (hits.len == 0) null else hits.ptr,
             .hit_count = @intCast(hits.len),
+            .execution_deadline_ns = ctx.control.deadline_ns orelse 0,
+            .has_execution_deadline = @intFromBool(ctx.control.deadline_ns != null),
+            .cancellation_ctx = if (ctx.control.cancellation != null) @ptrCast(@constCast(&ctx.control.cancellation.?)) else null,
+            .cancellation_fn = if (ctx.control.cancellation != null) struct {
+                fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                    const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                    return @intFromBool(token.isCancelled());
+                }
+            }.cancelled else null,
         });
         defer response.deinit();
         const results = std.json.parseFromSliceLeaky(
