@@ -1576,6 +1576,47 @@ test "lite coordinator publication cancellation never performs fallible notifica
     try std.testing.expect((try file.check()).valid);
 }
 
+// `checkpoint_publication_uncertain` means "a publication failed in a way
+// that may have left disk ahead of header", never merely "a publication is
+// in flight" -- see that field's doc comment. `publication_in_flight` is
+// the separate signal for the latter: true for the whole span of one
+// `publishCheckpoint` call past its point of no return, regardless of
+// outcome, so a concurrent reader that only needs "wait for this to
+// finish" never mistakes an ordinary in-flight commit for one needing
+// reconciliation. This checks the field's lifecycle around both outcomes
+// from the same thread (never stuck `true` after a call returns, either
+// way); a cross-thread check that a concurrent reader observes it mid-sync
+// without tripping reconciliation needs the as-yet-unmerged lock-release
+// path (`sync_lock_hooks`) this fix prepares for to actually let anything
+// run concurrently with the sync in the first place.
+test "lite publication_in_flight never outlives a publishCheckpoint call, on either outcome" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "publication-in-flight.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    try std.testing.expect(!file.publication_in_flight);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+
+    try file.putDocument("doc", "durable");
+    try std.testing.expect(!file.publication_in_flight);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+
+    // An injected failure during that same window still latches
+    // `checkpoint_publication_uncertain` and still reconciles, exactly as
+    // before this change -- only the proactive, before-the-fact set is
+    // gone. `publication_in_flight` clears regardless of outcome.
+    file.test_fail_checkpoint_publication = error.InputOutput;
+    try std.testing.expectError(error.OutcomeUnknown, file.putDocument("doc", "durable again"));
+    try std.testing.expect(!file.publication_in_flight);
+    try std.testing.expect(file.checkpoint_publication_uncertain);
+    try file.reconcilePublicationUncertainty();
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+}
+
 test "lite allocator v4 long keys shared values incremental deletion and vacuum" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5069,16 +5110,35 @@ pub const NativeFile = struct {
     /// backend embedded Lite normally opens with), since this bypasses the
     /// vtable (and its cancellation support) entirely.
     durability_policy: ?antfly_platform.filesystem.DurabilityPolicy = null,
-    // An error after slot publication may leave disk ahead of header. Do not
-    // elide a subsequent write based on the old in-memory checkpoint then.
+    // A publication that fails after it may have started writing the slot
+    // may leave disk ahead of header -- this means exactly that: a
+    // publication *failed* in a way that leaves the relationship between
+    // disk and this in-memory header unknown. It is set only in
+    // `publishCheckpoint`'s own failure path (and by an injected test
+    // fault), never proactively before an attempt: an ordinary, still
+    // in-flight publish that hasn't failed is not "uncertain", and must
+    // not be treated as needing reconciliation by a concurrent observer of
+    // this same NativeFile (see `publication_in_flight` for that case).
+    // Do not elide a subsequent write based on the old in-memory checkpoint
+    // while this is set.
     checkpoint_publication_uncertain: bool = false,
+    /// True for the entire span of one `publishCheckpoint` call past its
+    /// point of no return (the slot write/sync attempt), regardless of how
+    /// it ends -- success, a reconciled failure, or a latched one. Concurrent
+    /// code (e.g. a maintenance pass, an owner refresh) that only needs to
+    /// know "a publish is in progress, wait for it" belongs on this flag,
+    /// never on `checkpoint_publication_uncertain`: that one means failure,
+    /// this one means "in flight", and conflating them is exactly what let
+    /// a benign in-flight commit be mistaken for one needing reconciliation.
+    publication_in_flight: bool = false,
     /// The checkpoint `publishCheckpoint` was writing into `uncertain_slot`
     /// when the I/O that set `checkpoint_publication_uncertain` failed.
     /// `reconcilePublicationUncertainty` compares this against what is
     /// actually on disk to resolve the latch in-process, without a
-    /// close+reopen. Both are set together, immediately before the risky
-    /// write, and cleared together whenever the latch clears (on success in
-    /// `publishCheckpoint`, or by reconciliation).
+    /// close+reopen. Captured before the risky write (unconditionally, same
+    /// as `publication_in_flight`) so it is available the moment a failure
+    /// does set the latch, and cleared together with it whenever the latch
+    /// clears (on success in `publishCheckpoint`, or by reconciliation).
     uncertain_checkpoint: ?CheckpointSlot = null,
     uncertain_slot: ?u8 = null,
     /// Owner admission budget. Reuse remains permitted at the file-size cap.
@@ -10671,6 +10731,11 @@ pub const NativeFile = struct {
             }
             var destination = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(dest_path), .file = out_file, .header = self.header, .no_sync = false, .page_cache_enabled = .init(false) };
             defer destination.page_cache.deinit(self.allocator);
+            // See `copyExternalValue`'s matching comment: `destination` never
+            // closes, so its manifest tracking state (populated by the
+            // `writePage`/`writeSlotPage` calls below) must be freed
+            // explicitly.
+            defer destination.manifest_builder.deinit(self.allocator);
             try destination.bindPrivateEpochNamespace(dest_path);
             // The raw copy above just took whatever bytes were physically at
             // both slot pages at copy time, which (this handle's own
@@ -12152,6 +12217,17 @@ pub const NativeFile = struct {
                 self.allocator.free(old.value);
             }
         } else {
+            // `getOrPut` already wrote `owned.key` into `slot.key_ptr` for a
+            // new entry (its own contract: "if (!found_existing) gop.key_ptr.*
+            // = key"), but `slot.value_ptr` is still whatever garbage backed
+            // that slot -- this function doesn't fill it in until the very
+            // end. If the undo-log append below fails, unwind through the
+            // two `errdefer`s above frees `owned.key`/`owned.value`, which
+            // would otherwise leave this half-initialized slot in the map
+            // with a dangling key and an uninitialized value. Remove it
+            // before that happens; `owned.key` is still valid here since
+            // `errdefer`s run in reverse registration order.
+            errdefer _ = map.remove(owned.key);
             writes.count += 1;
             if (recording) {
                 const undo_key = try self.allocator.dupe(u8, owned.key);
@@ -12796,15 +12872,23 @@ pub const NativeFile = struct {
         encodeCheckpointSlotPage(slot_page, checkpoint);
 
         const io = self.runtimeIo();
-        self.checkpoint_publication_uncertain = true;
-        // Ground truth for `reconcilePublicationUncertainty`: which slot and
-        // which proposed checkpoint were in flight when the latch set. Both
-        // clear together with the latch, below and in that method.
+        // Ground truth for `reconcilePublicationUncertainty` if the write
+        // below fails: which slot and which proposed checkpoint were in
+        // flight. Captured before the write unconditionally, but capturing
+        // it is not itself "uncertain" -- see `checkpoint_publication_uncertain`'s
+        // doc comment for why that flag is set only in the failure path
+        // below, never proactively here.
         self.uncertain_checkpoint = checkpoint;
         self.uncertain_slot = next_slot;
-        // From here until the flag clears, a failure leaves the commit's
-        // durability unknown: report exactly that, not a raw I/O error a
-        // caller might retry as if nothing had been written.
+        // A publish is "in flight" for this entire window regardless of how
+        // it ends; concurrent code that only needs "wait for this to
+        // finish" (never "reconcile") belongs on this flag, not on
+        // `checkpoint_publication_uncertain`. See that field's doc comment.
+        self.publication_in_flight = true;
+        defer self.publication_in_flight = false;
+        // From here until a failure sets the latch below, a failure leaves
+        // the commit's durability unknown: report exactly that, not a raw
+        // I/O error a caller might retry as if nothing had been written.
         (blk: {
             if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
                 self.test_fail_checkpoint_publication = null;
@@ -12816,7 +12900,10 @@ pub const NativeFile = struct {
         }) catch {
             // Cancellation included: once slot I/O may have started, the
             // commit can already be durable, so "cancelled" would wrongly
-            // read as "not applied".
+            // read as "not applied". Only now -- a publication that
+            // actually failed, possibly leaving disk ahead of header --
+            // does `checkpoint_publication_uncertain` become true.
+            self.checkpoint_publication_uncertain = true;
             return error.OutcomeUnknown;
         };
 
