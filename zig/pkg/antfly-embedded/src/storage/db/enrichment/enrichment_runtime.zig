@@ -17482,6 +17482,18 @@ fn processDocumentExtractionAsset(
 
     const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(runtime.alloc, source_url, config_json, config);
     defer if (metadata_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
+    // A stored pre-upgrade (location-based) fingerprint is also an acceptable
+    // match: recomputing it from the row's current fields and finding it
+    // still matches what was stored proves location and metadata have not
+    // changed, exactly as strictly as it always proved that. Without this,
+    // declaring checksum_algorithm would force a one-time re-extraction of
+    // every already-extracted row purely from the fingerprint format
+    // changing, not from anything about the row actually changing.
+    const legacy_fingerprint = if (metadata_fingerprint != null)
+        try document_extraction_mod.metadataFingerprintLegacyAlloc(runtime.alloc, source_url, config_json, config)
+    else
+        null;
+    defer if (legacy_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
     if (metadata_fingerprint) |fingerprint| {
         if (try skipRuntimeDocumentExtractionByFingerprint(
             runtime,
@@ -17493,6 +17505,18 @@ fn processDocumentExtractionAsset(
             from_generation,
             request.producer_json,
         )) return;
+        if (legacy_fingerprint) |legacy| {
+            if (!std.mem.eql(u8, legacy, fingerprint) and try skipRuntimeDocumentExtractionByFingerprint(
+                runtime,
+                request.doc_key,
+                artifact_name,
+                legacy,
+                existing_state,
+                existing_manifest,
+                from_generation,
+                request.producer_json,
+            )) return;
+        }
     }
 
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
@@ -17567,6 +17591,35 @@ fn processDocumentExtractionAsset(
     const prepared_source = prepared_source_lease.entry();
     const downloaded = &prepared_source.content;
     resource_tracker.setExternallyAccountedDownloadedBytes(downloaded.data.len);
+    // Verify the declared digest against the bytes actually fetched --
+    // prepared_source.content_sha256 is already computed once for every
+    // caller, so this never hashes a second time or buffers beyond what the
+    // caller already held -- before any of those bytes can be extracted,
+    // embedded, or otherwise referenced. A wrong digest must fail loudly
+    // here, not keep stale output alive under a digest that no longer
+    // matches what is actually at the source.
+    var content_digest_hex: [64]u8 = undefined;
+    document_extraction_mod.hexBytesBuf(&prepared_source.content_sha256, &content_digest_hex);
+    document_extraction_mod.verifyChecksumDigestHex(config, &content_digest_hex) catch |raw_err| {
+        try writeDocumentExtractionFailureManifest(
+            runtime,
+            request.doc_key,
+            artifact_name,
+            source_url,
+            metadata_fingerprint orelse "",
+            config.content_type,
+            @errorName(raw_err),
+            "declared checksum does not match the downloaded bytes",
+            "document_checksum_verification",
+            manifest_key,
+            previous_child_ranges,
+            existing_state,
+            from_generation,
+            window,
+        );
+        try recordIsolatedRequestError(runtime, window, request, raw_err);
+        return;
+    };
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintFromDigestAlloc(runtime.alloc, &prepared_source.source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &prepared_source.content_sha256)
     else
