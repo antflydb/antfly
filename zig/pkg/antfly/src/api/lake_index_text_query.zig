@@ -171,6 +171,15 @@ const Prepared = struct {
     deferred_cursor: bool = false,
     local_id: usize = 0,
     durable_token: ?[]const u8 = null,
+    fn localToken(self: *Prepared, io: std.Io) ![]const u8 {
+        // Internal leaves still traverse the public snapshot parser, whose
+        // generic digest contract is exactly 64 bytes. A fresh nonce prevents
+        // a caller from predicting another request's local reference. Only
+        // Scope.find can resolve it, and publication rewrites it before return.
+        var nonce: [16]u8 = undefined;
+        try io.randomSecure(&nonce);
+        return std.fmt.allocPrint(self.arena.allocator(), "request-lake:{s}:{d:0>18}", .{ std.fmt.bytesToHex(nonce, .lower), self.local_id });
+    }
     fn publish(self: *Prepared, server: *server_api.ApiHttpServer) ![]const u8 {
         try self.context.ensureActive();
         const retained_api = @import("lake_retained_cut.zig");
@@ -539,7 +548,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const serving_token: []const u8 = cursor: {
         const cursor_started = @import("antfly_platform").time.monotonicNs();
         defer request_profile.record(&server.lake_query_metrics, .cursor_retention, cursor_started);
-        break :cursor if (prepared.serving_token) |token| token else if (prepared.deferred_cursor) try std.fmt.allocPrint(ra, "request-lake:{d}", .{prepared.local_id}) else if (prepared.retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
+        break :cursor if (prepared.serving_token) |token| token else if (prepared.deferred_cursor) try prepared.localToken(server.embedding_provider_runtime.io) else if (prepared.retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
             var artifacts = store.artifactStore();
             if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
             break :cut try retained_api.saveCached(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = prepared.pending, .catalog_metadata = prepared.metadata, .published_only = prepared.published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud, .recent_runs = owner.recent_runs }, retained_cancellation, &server.lake_retained_payloads);
@@ -6308,4 +6317,23 @@ test "external lake composed prepared budget exhaustion fails without retaining 
     try std.testing.expect(scope.budget.exhausted);
     try std.testing.expectEqual(@as(usize, 0), scope.len);
     try std.testing.expectEqual(@as(usize, 0), scope.budget.live);
+}
+
+test "external lake composed local cuts pass explicit text index leaf parsing" {
+    const a = std.testing.allocator;
+    var prepared: Prepared = .{ .backing = a, .arena = .init(a), .local_id = 15 };
+    defer prepared.arena.deinit();
+    const token = try prepared.localToken(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 64), token.len);
+    try std.testing.expect(std.mem.startsWith(u8, token, "request-lake:"));
+    try std.testing.expect(!std.mem.eql(u8, token, try prepared.localToken(std.testing.io)));
+    const body = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = token, .full_text_search = .{ .match_all = .{} }, .full_text_index = "body_text" }, .{});
+    defer a.free(body);
+    var parsed = try local.api_query.parsePublicQueryRequest(a, null, "events", body);
+    defer parsed.deinit(a);
+    try std.testing.expectEqualStrings(token, parsed.req.remote_snapshot.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text_queries.len);
+    var scope = Scope.init(a);
+    defer scope.deinit();
+    try std.testing.expect((try scope.find(.{ .table_id = 7, .name = "events" }, parsed.req)) == null);
 }

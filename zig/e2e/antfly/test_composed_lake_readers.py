@@ -50,8 +50,9 @@ pytestmark = [
     "provider",
     ["local", pytest.param("gcs", marks=pytest.mark.objectstore_integration)],
 )
+@pytest.mark.parametrize("index_selector", ["explicit", "inferred"])
 def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
-    monkeypatch, record_property, provider
+    monkeypatch, record_property, provider, index_selector
 ):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -271,10 +272,9 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 "changes": [{"op": "upsert", "row": row} for row in rows],
             },
         )
-        text = {
-            "full_text_search": {"match": "quasar", "field": "body"},
-            "full_text_index": "body_text",
-        }
+        text = {"full_text_search": {"match": "quasar", "field": "body"}}
+        if index_selector == "explicit":
+            text["full_text_index"] = "body_text"
         wait_query("history", {**text, "limit": 1})
         wait_query(
             "current",

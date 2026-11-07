@@ -474,7 +474,9 @@ the exact source cut first returned by that leaf. Each leaf still resolves and
 authorizes its table; reuse fences incarnation, object generation, index recipe,
 visibility, receipt watermark, expiry, cancellation and the reader/snapshot lease.
 Readers are request-local, never shared across principals or unrelated requests.
-Vector and named-component execution keep their existing preparation path.
+An explicit `full_text_index` selector uses the same shared text reader even
+though the parser represents it as one named component. Vector and
+multi-component execution keep their existing preparation path.
 
 The prepared store must be constructed at its final address before publication
 selection: cloud-generation bindings retain a pointer to its inline object-store
@@ -544,6 +546,14 @@ exact distinct IDs, and checks reuse across several resumed leaf calls. Its GCS
 variant requires explicit qualification bucket/prefix/token-file settings and
 verifies that both retained publications contain cloud-generation maps. The
 credential is resolved through a secret reference; it is absent from the config.
+
+The GCS correctness fixture spaces API requests by 1.2 seconds without retrying
+failed queries. Cloud Storage documents a [one-write-per-second limit for the
+same object name](https://docs.cloud.google.com/storage/quotas#objects). An
+unpaced rc.10 baseline failed during resumed pagination with `RateLimited` and
+HTTP 500; the paced baseline passed. The log does not identify the throttled
+object or prove which quota caused it. Preserve that failed run and qualify
+unpaced throughput separately. Request latency excludes the pacing delay.
 
 Set `ANTFLY_E2E_COMPOSED_PROFILE_ROUNDS=5` for opt-in measurements of the first
 query after restart and five warm queries, including sampled server RSS and CPU.
