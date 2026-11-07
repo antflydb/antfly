@@ -2115,6 +2115,7 @@ pub const DocStore = struct {
             .columnar_owner = self,
             .runtime = try self.runtime_store.beginBatchWithOptions(options),
             .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
+            .document_revisions = .{ .prepared_values = options.prepared_document_values },
         };
     }
 

@@ -1257,18 +1257,23 @@ pub const PreparedTextMapperPublication = struct {
     }
 
     pub fn stage(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
-        return self.stageWithIdentities(stager, false, false);
+        return self.stageWithIdentities(stager, false, null);
     }
 
     pub fn stageNative(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
-        return self.stageWithIdentities(stager, true, false);
+        return self.stageWithIdentities(stager, true, null);
     }
 
     pub fn stageDetachedNative(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
-        return self.stageWithIdentities(stager, true, true);
+        var budget: @import("../../immutable_artifact.zig").AdmissionBudget = .{ .remaining_ns = 5 * std.time.ns_per_s };
+        return self.stageDetachedNativeWithBudget(stager, &budget);
     }
 
-    fn stageWithIdentities(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager, native_identities: bool, detached: bool) !void {
+    pub fn stageDetachedNativeWithBudget(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager, budget: *@import("../../immutable_artifact.zig").AdmissionBudget) !void {
+        return self.stageWithIdentities(stager, true, budget);
+    }
+
+    fn stageWithIdentities(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager, native_identities: bool, detached: ?*@import("../../immutable_artifact.zig").AdmissionBudget) !void {
         if (self.staged.len != 0 or self.segments.len == 0) return;
         const staged = try self.alloc.alloc(persistent_mod.PreparedReplaySegment, self.segments.len);
         var initialized: usize = 0;
@@ -1277,7 +1282,7 @@ pub const PreparedTextMapperPublication = struct {
             self.alloc.free(staged);
         }
         for (self.segments, 0..) |*bytes, i| {
-            staged[i] = if (detached) try persistent_mod.prepareDetachedNativeTextSegment(self.alloc, stager, bytes.*) else if (native_identities) try persistent_mod.prepareNativeTextSegment(self.alloc, stager, bytes.*) else try persistent_mod.prepareReplaySegment(self.alloc, stager, bytes.*);
+            staged[i] = if (detached) |budget| try persistent_mod.prepareDetachedNativeTextSegmentWithBudget(self.alloc, stager, bytes.*, budget) else if (native_identities) try persistent_mod.prepareNativeTextSegment(self.alloc, stager, bytes.*) else try persistent_mod.prepareReplaySegment(self.alloc, stager, bytes.*);
             initialized += 1;
         }
         // Staging succeeds as a unit. On refusal, the caller still owns all
@@ -6520,6 +6525,7 @@ pub const IndexManager = struct {
         text_requires_root: bool = true,
         text_fields: [][]u8 = &.{},
         foreground_text: []ForegroundTextProjection = &.{},
+        vector_store_fields: [][]u8 = &.{},
         dense_fields: []DenseFieldWritePlan,
         sparse_fields: []SparseFieldWritePlan,
         graph_fields: []GraphFieldWritePlan,
@@ -6549,6 +6555,8 @@ pub const IndexManager = struct {
                 self.alloc.free(field.field_name);
             }
             self.alloc.free(self.dense_fields);
+            for (self.vector_store_fields) |field| self.alloc.free(field);
+            self.alloc.free(self.vector_store_fields);
             for (self.sparse_fields) |field| {
                 self.alloc.free(field.index_name);
                 self.alloc.free(field.field_name);
@@ -7099,6 +7107,11 @@ pub const IndexManager = struct {
             for (foreground_text) |*projection| projection.deinit();
             alloc.free(foreground_text);
         }
+        const vector_store_fields = try self.vectorStoreFieldNamesAlloc(alloc);
+        errdefer {
+            for (vector_store_fields) |field| alloc.free(field);
+            alloc.free(vector_store_fields);
+        }
         return .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
@@ -7110,6 +7123,7 @@ pub const IndexManager = struct {
                 }
                 break :blk false;
             },
+            .vector_store_fields = vector_store_fields,
             .dense_fields = dense_fields,
             .sparse_fields = sparse_fields,
             .graph_fields = graph_fields,

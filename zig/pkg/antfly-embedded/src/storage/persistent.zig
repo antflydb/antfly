@@ -1038,18 +1038,23 @@ pub const NativeOrdinalPreparation = struct {
 };
 
 pub fn prepareNativeTextSegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
-    return prepareNativeTextSegmentWithStaging(alloc, stager, bytes, false);
+    return prepareNativeTextSegmentWithStaging(alloc, stager, bytes, null);
 }
 
 pub fn prepareDetachedNativeTextSegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
-    return prepareNativeTextSegmentWithStaging(alloc, stager, bytes, true);
+    var budget: immutable_artifact.AdmissionBudget = .{ .remaining_ns = 5 * std.time.ns_per_s };
+    return prepareDetachedNativeTextSegmentWithBudget(alloc, stager, bytes, &budget);
 }
 
-fn prepareNativeTextSegmentWithStaging(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8, detached: bool) !PreparedReplaySegment {
-    var result = if (detached) blk: {
+pub fn prepareDetachedNativeTextSegmentWithBudget(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8, budget: *immutable_artifact.AdmissionBudget) !PreparedReplaySegment {
+    return prepareNativeTextSegmentWithStaging(alloc, stager, bytes, budget);
+}
+
+fn prepareNativeTextSegmentWithStaging(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8, detached: ?*immutable_artifact.AdmissionBudget) !PreparedReplaySegment {
+    var result = if (detached) |budget| blk: {
         var range = try extractSegmentKeyRange(alloc, bytes);
         errdefer range.deinit(alloc);
-        break :blk PreparedReplaySegment{ .artifact = try stager.stageDetached(bytes), .key_range = range, .alloc = alloc };
+        break :blk PreparedReplaySegment{ .artifact = try stager.stageDetachedWithBudget(bytes, budget), .key_range = range, .alloc = alloc };
     } else try prepareReplaySegment(alloc, stager, bytes);
     errdefer result.deinit();
     var resources = (try stager.acquireBuildResources()) orelse return error.Unsupported;

@@ -450,7 +450,7 @@ const NativeArtifactStager = struct {
     resources: ?immutable_artifact.BuildResources,
     no_sync: bool,
     max_file_bytes: ?u64,
-    const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .stage_detached = stageDetached, .acquire_build_resources = acquireBuildResources, .deinit = deinit };
+    const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .stage_detached = stageDetached, .stage_detached_with_budget = stageDetachedWithBudget, .acquire_build_resources = acquireBuildResources, .deinit = deinit };
 
     fn retainBuildResources(raw: *anyopaque) void {
         const registry: *artifacts.Registry = @ptrCast(@alignCast(raw));
@@ -476,6 +476,11 @@ const NativeArtifactStager = struct {
     }
 
     fn stageDetached(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
+        var budget: immutable_artifact.AdmissionBudget = .{ .remaining_ns = 5 * std.time.ns_per_s };
+        return stageDetachedWithBudget(raw, bytes, &budget);
+    }
+
+    fn stageDetachedWithBudget(raw: *anyopaque, bytes: []const u8, budget: *immutable_artifact.AdmissionBudget) !immutable_artifact.Prepared {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (bytes.len == 0) return error.InvalidArtifactConstructionState;
         const resources = self.resources orelse return error.Unsupported;
@@ -485,17 +490,17 @@ const NativeArtifactStager = struct {
                 else => return err,
             }
         }
-        return self.stageOwnedConstruction(bytes, resources);
+        return self.stageOwnedConstruction(bytes, resources, budget);
     }
 
-    fn stageOwnedConstruction(self: *@This(), bytes: []const u8, resources: immutable_artifact.BuildResources) !immutable_artifact.Prepared {
+    fn stageOwnedConstruction(self: *@This(), bytes: []const u8, resources: immutable_artifact.BuildResources, budget: *immutable_artifact.AdmissionBudget) !immutable_artifact.Prepared {
         var gate = self.registry.capturePublicationGate() orelse return error.Unsupported;
         defer gate.deinit();
         const pending = try self.alloc.create(NativePreparedArtifact);
         errdefer self.alloc.destroy(pending);
         const prefix = try self.alloc.dupe(u8, self.prefix);
         errdefer self.alloc.free(prefix);
-        var construction = try self.registry.beginOwnedConstruction(self.inode);
+        var construction = try self.registry.beginOwnedConstructionWithBudget(self.inode, budget);
         errdefer construction.deinit();
         pending.* = .{ .alloc = self.alloc, .prefix = prefix, .construction = construction };
         // Ownership moves to pending only after every fallible operation.
@@ -504,7 +509,11 @@ const NativeArtifactStager = struct {
         var offset: usize = 0;
         const io = self.registry.io();
         while (offset < bytes.len) {
-            var lease = try gate.acquire(io, std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s);
+            var lease = blk: {
+                const started = std.Io.Clock.awake.now(io).nanoseconds;
+                defer budget.chargeElapsed(io, started);
+                break :blk try gate.acquire(io, budget.deadline(io));
+            };
             defer lease.deinit();
             var file = try native.NativeFile.openWithIo(lease.allocator, lease.io, self.registry.path, .{ .externally_locked = true, .no_sync = self.no_sync, .reader_coordinator = self.registry.coordinator, .resource_manager = resources.resource_manager });
             defer file.close();

@@ -1237,6 +1237,14 @@ pub fn testPathReplacementAdmission() !void {
 }
 
 test "capi owned native artifact service queues without a Store and survives last connection close" {
+    try testOwnedArtifactService(false);
+}
+
+test "capi owned native artifact service exhausts one wait budget without stranding the queue" {
+    try testOwnedArtifactService(true);
+}
+
+fn testOwnedArtifactService(timeout: bool) !void {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = try api.TestDirectory.init("owned-artifact-service");
@@ -1274,16 +1282,17 @@ test "capi owned native artifact service queues without a Store and survives las
     const Work = struct {
         result: ?@import("../storage/immutable_artifact.zig").Prepared = null,
         failure: ?anyerror = null,
+        budget: @import("../storage/immutable_artifact.zig").AdmissionBudget,
         finished: std.Io.Event = .unset,
         fn run(self: *@This(), capability: @import("../storage/immutable_artifact.zig").Stager, input: []const u8) void {
             defer self.finished.set(h.handleLockIo());
-            self.result = capability.stageDetached(input) catch |err| {
+            self.result = capability.stageDetachedWithBudget(input, &self.budget) catch |err| {
                 self.failure = err;
                 return;
             };
         }
     };
-    var work: Work = .{};
+    var work: Work = .{ .budget = .{ .remaining_ns = if (timeout) 100 * std.time.ns_per_ms else 5 * std.time.ns_per_s } };
     const thread = try std.Thread.spawn(.{}, Work.run, .{ &work, stager, bytes });
     defer {
         if (held) |guard| guard.release();
@@ -1300,6 +1309,28 @@ test "capi owned native artifact service queues without a Store and survives las
         try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectEqual(@as(usize, 0), registry.callbacks);
+    if (timeout) {
+        // Keep the gate held until the queued request reports refusal. This
+        // cannot pass by merely running after the contending owner releases it.
+        const watchdog = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + 5 * std.time.ns_per_s;
+        while (!work.finished.isSet()) {
+            if (std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds >= watchdog) return error.TestWatchdog;
+            try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(error.FileBusy, work.failure.?);
+        try std.testing.expect(work.result == null);
+        try std.testing.expectEqual(@as(u64, 0), work.budget.remaining_ns);
+        try std.testing.expect(work.budget.waited_ns >= 100 * std.time.ns_per_ms);
+        try std.testing.expectEqual(@as(usize, 0), registry.callbacks);
+        held.?.release();
+        held = null;
+        const next = try acquirePathReplacement(path);
+        next.release();
+        var file = try native.NativeFile.openWithIo(a, h.handleLockIo(), path, .{ .no_sync = true });
+        defer file.close();
+        try std.testing.expect((try file.check()).valid);
+        return;
+    }
     held.?.release();
     held = null;
     work.finished.waitUncancelable(h.handleLockIo());

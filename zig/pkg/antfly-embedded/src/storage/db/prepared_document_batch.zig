@@ -38,6 +38,7 @@ pub const Plan = struct {
     incarnation: u128,
     schema: ?@import("schema_registry.zig").SchemaView = null,
     rows: std.StringHashMapUnmanaged(Entry) = .empty,
+    value_authorities: @import("../document_mutation_revision.zig").PreparedValues = .{},
     text: std.ArrayListUnmanaged(Text) = .empty,
     text_delete_keys: []const []const u8 = &.{},
     text_guards: []manager_mod.OwnedForegroundTextPublication.Guard = &.{},
@@ -53,7 +54,7 @@ pub const Plan = struct {
     transform_capture_declined: bool = false,
     needs_reprepare: bool = false,
     const Text = struct { config: manager_mod.ForegroundTextProjection, built: manager_mod.PreparedTextMapperPublication, publication: ?*manager_mod.OwnedForegroundTextPublication = null };
-    const Entry = struct { value: []const u8, ordinal_key: []const u8 = &.{}, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
+    const Entry = struct { value: []const u8, stored_value: ?[]u8 = null, ordinal_key: []const u8 = &.{}, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
 
     /// Called under the short catalog lifetime fence. No borrowed DB pointer
     /// or primary snapshot survives this capture.
@@ -77,6 +78,7 @@ pub const Plan = struct {
         while (entries.next()) |entry| {
             if (entry.extracted) |*row| row.deinit(self.alloc);
             entry.template.deinit(self.alloc);
+            if (entry.stored_value) |body| self.alloc.free(body);
         }
         for (self.text.items) |*item| {
             if (item.publication) |publication| publication.deinit();
@@ -91,6 +93,7 @@ pub const Plan = struct {
         self.effects_seen.deinit(self.alloc);
         self.ordinal_postimages.deinit(self.alloc);
         self.rows.deinit(self.alloc);
+        self.value_authorities.deinit(self.alloc);
         if (self.resolved_effects) |*effects| effects.deinit(self.alloc);
         if (self.transform_inputs) |*inputs| inputs.deinit();
         self.alloc.free(self.transform_base_keys);
@@ -169,9 +172,19 @@ pub const Plan = struct {
                 try graph_fields.fromSnapshot(plan.graph_fields, a, key, parsed.value, &row);
                 try plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(a, key, parsed.value, &row);
             }
+            const stored_value: ?[]u8 = if (row.cleaned_value != null and plan.vector_store_fields.len != 0)
+                (try mapper.stripTopLevelFieldsAlloc(a, row.cleaned_value.?, plan.vector_store_fields)) orelse try a.dupe(u8, "{}")
+            else
+                null;
+            errdefer if (stored_value) |body| a.free(body);
+            if (row.cleaned_value) |body| {
+                const physical = try @import("../internal_keys.zig").documentKeyAlloc(a, key);
+                defer a.free(physical);
+                try self.value_authorities.add(a, physical, stored_value orelse body);
+            }
             const entry = try self.rows.getOrPut(a, key);
             std.debug.assert(!entry.found_existing);
-            entry.value_ptr.* = .{ .value = value, .template = row };
+            entry.value_ptr.* = .{ .value = value, .stored_value = stored_value, .template = row };
         }
         try self.prepareForegroundText(request);
         try self.prepareAttempt();
@@ -280,7 +293,12 @@ pub const Plan = struct {
     /// using captured resource/file identities. No live DB or Registry
     /// callback is needed. Large artifacts use independent bounded commands.
     pub fn stageIndependentForegroundText(self: *Plan) !void {
-        for (self.text.items) |*item| item.built.stageDetachedNative(item.config.stager) catch |err| switch (err) {
+        var budget: @import("../immutable_artifact.zig").AdmissionBudget = .{ .remaining_ns = 5 * std.time.ns_per_s };
+        return self.stageIndependentForegroundTextWithBudget(&budget);
+    }
+
+    pub fn stageIndependentForegroundTextWithBudget(self: *Plan, budget: *@import("../immutable_artifact.zig").AdmissionBudget) !void {
+        for (self.text.items) |*item| item.built.stageDetachedNativeWithBudget(item.config.stager, budget) catch |err| switch (err) {
             error.Unsupported, error.ResourceBudgetExceeded, error.OutOfMemory => {},
             else => return err,
         };
@@ -438,6 +456,14 @@ pub const Plan = struct {
         defer current.release();
         const expected = self.catalog.plan().artifact_catalogs orelse return false;
         return current.plan().matchesArtifactInventory(expected);
+    }
+
+    /// Exact stored postimage, including catalog-selected vector stripping.
+    /// Borrowed only through the synchronous authoritative commit.
+    pub fn storedValueFor(self: *const Plan, key: []const u8, value: []const u8) ?[]const u8 {
+        const entry = self.rows.get(key) orelse return null;
+        if (!std.mem.eql(u8, entry.value, value)) return null;
+        return entry.stored_value orelse entry.template.cleaned_value;
     }
 
     /// Transfer allocations into the ordinary commit cleanup domain. Plans

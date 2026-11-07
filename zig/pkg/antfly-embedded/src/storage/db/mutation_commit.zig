@@ -1741,12 +1741,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try write_buffers.owned_store_values.append(S.ownerField(self, "alloc").*, packed_row);
                         }
                         break :blk packed_row;
-                    } else try strippedStoredDocumentValueAlloc(
-                        S.ownerField(self, "alloc").*,
-                        cleaned,
-                        write_buffers.vector_store_field_names,
-                        &write_buffers.owned_store_values,
-                    );
+                    } else if (prepared_document != null)
+                        opts.prepared_documents.?.storedValueFor(write.key, write.value) orelse return error.InvalidDerivedApplyState
+                    else
+                        try strippedStoredDocumentValueAlloc(
+                            S.ownerField(self, "alloc").*,
+                            cleaned,
+                            write_buffers.vector_store_field_names,
+                            &write_buffers.owned_store_values,
+                        );
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                     const store_key = if (use_preprepared_rows) preparation.effects.?[i].store_key.? else try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
                     if (!use_preprepared_rows) try write_buffers.owned_store_keys.append(S.ownerField(self, "alloc").*, store_key);
@@ -3124,13 +3127,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         try primary.store.putBatchWithPublications(primary.io, primary.writes, primary.deletes, primary.replay, primary.options, primary.authored, participant);
                     }
                 };
+                var primary_options = store_batch_options;
+                if (prepared_documents_current) primary_options.prepared_document_values = &opts.prepared_documents.?.value_authorities;
                 var foreground_primary: ForegroundPrimary = .{
                     .store = S.ownerField(self, "core").*.store,
                     .io = S.ownerField(self, "backend_runtime").*.io(),
                     .writes = write_buffers.store_writes.items,
                     .deletes = write_buffers.delete_keys.items,
                     .replay = replay_append,
-                    .options = store_batch_options,
+                    .options = primary_options,
                     .authored = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
                 };
                 const foreground_committed = if (prepared_documents_current and append_derived_replay)

@@ -99,6 +99,23 @@ pub const BuildResources = struct {
     }
 };
 
+/// One request's remaining contention budget. Active preparation/IO does not
+/// consume it; every nested admission debits the same independently owned sink.
+pub const AdmissionBudget = struct {
+    remaining_ns: u64,
+    waited_ns: u64 = 0,
+    pub fn deadline(self: *const AdmissionBudget, io: std.Io) i96 {
+        return std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.remaining_ns);
+    }
+    pub fn charge(self: *AdmissionBudget, elapsed_ns: u64) void {
+        self.waited_ns +|= elapsed_ns;
+        self.remaining_ns -|= elapsed_ns;
+    }
+    pub fn chargeElapsed(self: *AdmissionBudget, io: std.Io, started_ns: i96) void {
+        self.charge(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started_ns)));
+    }
+};
+
 /// Captured under catalog admission, used after releasing that admission.
 /// Owns no mutable index, primary snapshot or borrowed DB/runtime pointer.
 pub const Stager = struct {
@@ -111,6 +128,7 @@ pub const Stager = struct {
         /// primary snapshot. Large artifacts may use bounded unpublished
         /// native commands through an independently retained publication gate.
         stage_detached: ?*const fn (*anyopaque, []const u8) anyerror!Prepared = null,
+        stage_detached_with_budget: ?*const fn (*anyopaque, []const u8, *AdmissionBudget) anyerror!Prepared = null,
         acquire_build_resources: ?*const fn (*anyopaque) anyerror!?BuildResources = null,
         deinit: *const fn (*anyopaque) void,
     };
@@ -125,6 +143,10 @@ pub const Stager = struct {
     pub fn stageDetached(self: Stager, bytes: []const u8) !Prepared {
         const operation = self.vtable.stage_detached orelse return error.Unsupported;
         return Boundary.call("stage_detached", self.dispatch, operation, .{ self.ptr, bytes });
+    }
+    pub fn stageDetachedWithBudget(self: Stager, bytes: []const u8, budget: *AdmissionBudget) !Prepared {
+        const operation = self.vtable.stage_detached_with_budget orelse return error.Unsupported;
+        return Boundary.call("stage_detached_with_budget", self.dispatch, operation, .{ self.ptr, bytes, budget });
     }
     pub fn deinit(self: *Stager) void {
         self.vtable.deinit(self.ptr);

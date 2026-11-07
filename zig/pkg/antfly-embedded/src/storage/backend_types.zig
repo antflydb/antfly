@@ -158,6 +158,9 @@ pub const CommitProgress = struct {
 pub threadlocal var commit_progress: ?*CommitProgress = null;
 
 pub const BatchOptions = struct {
+    /// Borrowed immutable postimage proofs. DocStore consumes these only during
+    /// this synchronous call; storage backends must not retain the pointer.
+    prepared_document_values: ?*const @import("document_mutation_revision.zig").PreparedValues = null,
     mode: BatchMode = .default,
     defer_commit_flush: bool = false,
     // Read-throughs performed by a write batch (for example, loading exact

@@ -453,3 +453,25 @@ The component evidence and remaining qualification are in
 These contracts do not establish end-to-end performance. Primary-effect readsets,
 same-index commit cohorts and durable posting-delta buffering remain separate
 integration work.
+
+
+### Owned primary postimages and shared wait budgets
+
+Document-mode plans now own their exact stored postimages, including stripping
+catalog-selected direct vector fields. Preparation computes SHA256 content proofs
+and projection/source-value certificates before writer admission. A synchronous
+DocStore batch borrows those proofs only when document identity, row kind and
+actual bytes match; other writes retain authoritative proof computation. Actual
+mutation revisions are still assigned in the transaction. Request-owned proof
+storage survives through commit or abort and is never retained by the engine.
+
+Catalog captures and every bounded detached artifact turn now debit one request's
+remaining contention budget. Active mapping, hashing, allocator proof work and IO
+do not consume that waiting budget. Failed preparation releases registry pins.
+The timeout regression keeps the gate held until refusal, then checks that a later
+request can acquire it. Component evidence is recorded in
+[owned-primary-content-debug.json](owned-primary-content-debug.json).
+
+This does not finish same-index publication cohorts, SQL preparation integration,
+or durable normalized posting-delta windows. No end-to-end throughput claim is
+made from these component tests.

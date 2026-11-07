@@ -78114,6 +78114,48 @@ test "db owned document preparation transfers effects and rejects changed identi
     try std.testing.expectError(error.TableNotFound, prepared.matches(&database));
 }
 
+test "db owned document preparation strips catalog vector fields before admission" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-vector-postimage");
+    defer directory.cleanup();
+    var database = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false });
+    defer database.close();
+    try database.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3}" });
+    try database.addIndex(.{ .name = "sparse", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" });
+    const request: types.BatchRequest = .{ .writes = &.{
+        .{ .key = "a", .value = "{\"title\":\"résumé 日本語\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1]}}" },
+        .{ .key = "b", .value = "{\"embedding\":[0,1,0]}" },
+    }, .sync_level = .write };
+    var plan = (try @import("prepared_document_batch.zig").Plan.capture(a, &database)).?;
+    defer plan.deinit();
+    try plan.prepare(request);
+    const expected = plan.storedValueFor("a", request.writes[0].value).?;
+    try std.testing.expectEqualStrings("{\"title\":\"résumé 日本語\"}", expected);
+    try std.testing.expectEqualStrings("{}", plan.storedValueFor("b", request.writes[1].value).?);
+    var committed = false;
+    try database.batchTrackedWithPreparedDocuments(request, &committed, null, &plan);
+    try std.testing.expect(committed);
+    const stored = (try database.get(a, "a")).?;
+    defer a.free(stored);
+    try std.testing.expectEqualSlices(u8, expected, stored);
+    const physical = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(physical);
+    var read = try database.core.store.beginReadTxn();
+    defer read.abort();
+    const proof = (try @import("../document_mutation_revision.zig").loadContent(&read, physical)).?;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(stored, &digest, .{});
+    try std.testing.expectEqualSlices(u8, &digest, &proof.digest);
+    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(a, "a", "dense");
+    defer a.free(dense_key);
+    const dense = try database.core.store.get(a, dense_key);
+    defer a.free(dense);
+    const sparse_key = try expectedDocumentEmbeddingArtifactKeyAlloc(a, "a", "sparse");
+    defer a.free(sparse_key);
+    const sparse = try database.core.store.get(a, sparse_key);
+    defer a.free(sparse);
+}
+
 test "db native foreground text shares the primary commit and binds authoritative document identities" {
     try testNativeForegroundTextPrimary(false, false, false);
 }

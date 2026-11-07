@@ -5044,31 +5044,47 @@ pub fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaqu
     return executeBatchWithReplayPreparation(ptr, request, null, apply);
 }
 
-fn prepareOwnedBatchAttempt(handle_ptr: ?*anyopaque, prepared: *?@import("../storage/db/prepared_document_batch.zig").Plan, request: db_mod.types.BatchRequest) !void {
+const PreparationBudget = @import("../storage/immutable_artifact.zig").AdmissionBudget;
+
+fn enterOwnedPreparation(ptr: ?*anyopaque, budget: *PreparationBudget) ?HandleGuard {
+    const entry = HandleEntry.capture(ptr) orelse return null;
+    const before = budget.remaining_ns;
+    const guard = enterWithAdmissionBudget(entry, ptr, .read, .read_only, false, @as(i96, before)) orelse return null;
+    if (guard.admission_budget_ns) |remaining| {
+        // Admission already excludes this call's own detached proof work.
+        // Debiting its remainder preserves that exclusion across preparation.
+        const left: u64 = @intCast(@min(@as(i96, before), @max(0, remaining)));
+        budget.charge(before - left);
+    }
+    return guard;
+}
+
+fn prepareOwnedBatchAttempt(handle_ptr: ?*anyopaque, prepared: *?@import("../storage/db/prepared_document_batch.zig").Plan, request: db_mod.types.BatchRequest, budget: *PreparationBudget) !void {
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    if (request.writes.len == 0 and request.deletes.len == 0 and request.transforms.len == 0) return;
     var refreshed = false;
-    if (prepared.*) |*plan| if (plan.needs_reprepare) {
-        const guard = enterHandle(handle_ptr, .read) orelse return error.InvalidArgument;
+    if (prepared.* == null or prepared.*.?.needs_reprepare) {
+        const guard = enterOwnedPreparation(handle_ptr, budget) orelse return error.InvalidArgument;
         defer guard.leave();
         if (guard.entry_error != null) return;
         const replacement = try Prepared.capture(guard.handle.database().alloc, guard.handle.database());
-        plan.deinit();
+        if (prepared.*) |*plan| plan.deinit();
         prepared.* = replacement;
         refreshed = true;
-    };
+    }
     const plan = if (prepared.*) |*value| value else return;
     if (refreshed) try plan.prepare(request);
     try plan.prepareAttempt();
     if (plan.needsTransformCapture()) {
-        const guard = enterHandle(handle_ptr, .read) orelse return error.InvalidArgument;
+        const guard = enterOwnedPreparation(handle_ptr, budget) orelse return error.InvalidArgument;
         defer guard.leave();
         if (guard.entry_error != null) return;
         try plan.captureTransformInputs(guard.handle.database());
     }
     try plan.finishOwnedTransforms(request);
-    try plan.stageIndependentForegroundText();
+    try plan.stageIndependentForegroundTextWithBudget(budget);
     {
-        const guard = enterHandle(handle_ptr, .read) orelse return error.InvalidArgument;
+        const guard = enterOwnedPreparation(handle_ptr, budget) orelse return error.InvalidArgument;
         defer guard.leave();
         if (guard.entry_error != null) return;
         try plan.captureForegroundText(guard.handle.database());
@@ -5076,7 +5092,7 @@ fn prepareOwnedBatchAttempt(handle_ptr: ?*anyopaque, prepared: *?@import("../sto
     try plan.finishForegroundText();
 }
 
-fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prepare_attempt: ?*const fn (*anyopaque) anyerror!void, apply: *const fn (*anyopaque, *Handle, *bool) anyerror!void) capi.ErrorCode {
+fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prepare_attempt: ?*const fn (*anyopaque, *PreparationBudget) anyerror!void, apply: *const fn (*anyopaque, *Handle, *bool) anyerror!void) capi.ErrorCode {
     const alloc = std.heap.c_allocator;
     var entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
     var entry_owned = true;
@@ -5090,10 +5106,12 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
     while (true) {
         if (prepare_attempt) |prepare| {
             const started = std.Io.Clock.awake.now(io).nanoseconds;
-            prepare(request) catch |err| return capi.mapError(err);
-            // The admission budget excludes active owned preparation, just
-            // as it excludes the body after a pre-commit capacity refusal.
-            deadline += @max(0, std.Io.Clock.awake.now(io).nanoseconds - started);
+            var budget: PreparationBudget = .{ .remaining_ns = std.math.cast(u64, @max(0, deadline - started)) orelse std.math.maxInt(u64) };
+            prepare(request, &budget) catch |err| return capi.mapError(err);
+            // Parsing, proof, mapping and IO are active request work. Actual
+            // nested gate/lease waits consume this same overall call budget.
+            const elapsed = @max(0, std.Io.Clock.awake.now(io).nanoseconds - started);
+            deadline += @max(0, elapsed - @as(i96, budget.waited_ns));
         }
 
         // Admission consumes the entry on every outcome. Before that handoff,
@@ -5171,23 +5189,13 @@ pub fn antfly_db_batch(
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
     var prepared: ?Prepared = null;
     defer if (prepared) |*plan| plan.deinit();
-    if (owned.req.writes.len != 0 or owned.req.deletes.len != 0 or owned.req.transforms.len != 0) {
-        const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
-        defer guard.leave();
-        if (guard.entry_error) |code| {
-            // Optional preparation must not turn ordinary mutation admission
-            // retry into a one-shot read refusal. The mutation path rechecks it.
-            if (code != .busy) return capi.ensureError(code, @src().fn_name);
-        } else prepared = Prepared.capture(guard.handle.database().alloc, guard.handle.database()) catch |err| return capi.mapError(err);
-    }
-    if (prepared) |*plan| plan.prepare(owned.req) catch |err| return capi.mapError(err);
     const Request = struct {
         owned: *StructBatchRequest,
         prepared: *?Prepared,
         handle_ptr: ?*anyopaque,
-        fn prepare(raw: *anyopaque) !void {
+        fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
-            try prepareOwnedBatchAttempt(request.handle_ptr, request.prepared, request.owned.req);
+            try prepareOwnedBatchAttempt(request.handle_ptr, request.prepared, request.owned.req, budget);
         }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
@@ -5242,24 +5250,13 @@ pub fn antfly_db_batch_json(
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
     var prepared: ?Prepared = null;
     defer if (prepared) |*plan| plan.deinit();
-    if (owned.req.writes.len != 0 or owned.req.deletes.len != 0 or owned.req.transforms.len != 0) {
-        // Capture only immutable catalog inputs under ordinary handle lifetime
-        // admission. Parsing/mapping and graph-field extraction then proceed
-        // without either process gate or native writer lease.
-        const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
-        defer guard.leave();
-        if (guard.entry_error) |code| {
-            if (code != .busy) return capi.ensureError(code, @src().fn_name);
-        } else prepared = Prepared.capture(guard.handle.database().alloc, guard.handle.database()) catch |err| return capi.mapError(err);
-    }
-    if (prepared) |*plan| plan.prepare(owned.req) catch |err| return capi.mapError(err);
     const Request = struct {
         owned: *@TypeOf(owned),
         prepared: *?Prepared,
         handle_ptr: ?*anyopaque,
-        fn prepare(raw: *anyopaque) !void {
+        fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
-            try prepareOwnedBatchAttempt(request.handle_ptr, request.prepared, request.owned.req);
+            try prepareOwnedBatchAttempt(request.handle_ptr, request.prepared, request.owned.req, budget);
         }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
@@ -12125,9 +12122,9 @@ test "capi owned transforms reprepare changed bases without applying an incremen
         request: db_mod.types.BatchRequest,
         injected: bool = false,
         refusals: usize = 0,
-        fn prepare(raw: *anyopaque) !void {
+        fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try prepareOwnedBatchAttempt(self.id, self.plan, self.request);
+            try prepareOwnedBatchAttempt(self.id, self.plan, self.request, budget);
             if (!self.injected) {
                 self.injected = true;
                 var out: capi.Buffer = .{};
@@ -12155,6 +12152,44 @@ test "capi owned transforms reprepare changed bases without applying an incremen
     try std.testing.expectEqual(@as(i64, 11), row.value.object.get("n").?.integer);
 }
 
+test "capi owned preparation debits gate waits from the batch admission budget" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-preparation-budget");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    const wrapper = try @import("lite_connection.zig").open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 100 }, true);
+    const id = try publishHandle(wrapper);
+    defer antfly_db_close(id);
+    const held = try @import("lite_connection.zig").acquirePathReplacement(path);
+    defer held.release();
+    const Probe = struct {
+        id: ?*anyopaque,
+        applied: bool = false,
+        waited: u64 = 0,
+        remaining: u64 = std.math.maxInt(u64),
+        fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const guard = enterOwnedPreparation(self.id, budget) orelse return error.InvalidArgument;
+            defer guard.leave();
+            try std.testing.expectEqual(capi.ErrorCode.busy, guard.entry_error.?);
+            self.waited = budget.waited_ns;
+            self.remaining = budget.remaining_ns;
+        }
+        fn apply(raw: *anyopaque, _: *Handle, _: *bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.applied = true;
+        }
+    };
+    var probe: Probe = .{ .id = id };
+    try std.testing.expectEqual(capi.ErrorCode.busy, executeBatchWithReplayPreparation(id, &probe, Probe.prepare, Probe.apply));
+    try std.testing.expect(!probe.applied);
+    try std.testing.expectEqual(@as(u64, 0), probe.remaining);
+    try std.testing.expect(probe.waited > 0);
+}
+
 test "capi native batch preparation failure releases table and parent pins" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("batch-preparation-pins");
@@ -12173,7 +12208,7 @@ test "capi native batch preparation failure releases table and parent pins" {
     defer antfly_db_close(table);
     const Probe = struct {
         applied: bool = false,
-        fn prepare(_: *anyopaque) !void {
+        fn prepare(_: *anyopaque, _: *PreparationBudget) !void {
             return error.OutOfMemory;
         }
         fn apply(raw: *anyopaque, _: *Handle, _: *bool) !void {

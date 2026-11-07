@@ -651,6 +651,36 @@ pub const Registry = struct {
         return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
     }
 
+    fn createMarkerWithBudget(self: *Registry, path: []const u8, budget: *@import("../immutable_artifact.zig").AdmissionBudget) !std.Io.File {
+        const runtime = self.io();
+        const guard = blk: {
+            const started = std.Io.Clock.awake.now(runtime).nanoseconds;
+            defer budget.chargeElapsed(runtime, started);
+            const deadline = budget.deadline(runtime);
+            while (true) {
+                try runtime.checkCancel();
+                if (self.mutex.tryLock()) {
+                    const guard = self.publication_guard orelse {
+                        self.mutex.unlock(runtime);
+                        return error.ReadOnly;
+                    };
+                    const locked = guard.tryLock(runtime, .exclusive) catch |err| {
+                        self.mutex.unlock(runtime);
+                        return err;
+                    };
+                    if (locked) break :blk guard;
+                    self.mutex.unlock(runtime);
+                }
+                const remaining = deadline - std.Io.Clock.awake.now(runtime).nanoseconds;
+                if (remaining <= 0) return error.FileBusy;
+                try runtime.sleep(.fromNanoseconds(@min(remaining, std.time.ns_per_ms)), .awake);
+            }
+        };
+        defer self.mutex.unlock(runtime);
+        defer guard.unlock(runtime);
+        return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
+    }
+
     pub fn beginConstruction(self: *Registry) !Construction {
         const owner = self.beginCallback() orelse return error.ReadOnly;
         defer self.endCallback();
@@ -666,6 +696,14 @@ pub const Registry = struct {
     /// independently admitted native writer checks inode and namespace before
     /// publishing any construction bytes.
     pub fn beginOwnedConstruction(self: *Registry, inode: u64) !Construction {
+        return self.beginOwnedConstructionImpl(inode, null);
+    }
+
+    pub fn beginOwnedConstructionWithBudget(self: *Registry, inode: u64, budget: *@import("../immutable_artifact.zig").AdmissionBudget) !Construction {
+        return self.beginOwnedConstructionImpl(inode, budget);
+    }
+
+    fn beginOwnedConstructionImpl(self: *Registry, inode: u64, budget: ?*@import("../immutable_artifact.zig").AdmissionBudget) !Construction {
         if (!self.marker_namespace_safe or inode != self.inode) return error.StaleArtifactConstruction;
         const runtime = self.io();
         const a = self.allocator;
@@ -678,7 +716,7 @@ pub const Registry = struct {
         defer a.free(marker_name);
         const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
         errdefer a.free(path);
-        const marker = try self.createMarker(path);
+        const marker = if (budget) |admission| try self.createMarkerWithBudget(path, admission) else try self.createMarker(path);
         errdefer {
             marker.close(runtime);
             std.Io.Dir.cwd().deleteFile(runtime, path) catch {};
