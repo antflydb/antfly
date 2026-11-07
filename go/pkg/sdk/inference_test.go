@@ -1580,3 +1580,17 @@ func TestAudioReadMetadataPresenceRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestCascadeAgreementTraceRoundTripPreservesFalseAndAbsence(t *testing.T) {
+	for _, wire := range []string{
+		`{"decider":"c","definition_sha256":"abc","answered_by":"strong","stages":[],"agreement_status":"agreed","agreed":true}`,
+		`{"decider":"c","definition_sha256":"abc","answered_by":"strong","stages":[],"agreement_status":"disagreed","agreed":false,"disagreed_questions":["same"]}`,
+		`{"decider":"c","definition_sha256":"abc","answered_by":"fast","stages":[],"agreement_status":"unverified"}`,
+	} {
+		var trace oapi.DecisionCascadeTrace
+		require.NoError(t, json.Unmarshal([]byte(wire), &trace))
+		encoded, err := json.Marshal(trace)
+		require.NoError(t, err)
+		assert.JSONEq(t, wire, string(encoded))
+	}
+}

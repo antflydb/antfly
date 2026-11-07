@@ -167,6 +167,9 @@ pub const Resolution = struct {
     arena: std.heap.ArenaAllocator,
     config_generation: u64,
     namespace_curation_generation: u64 = 0,
+    /// Base policy/source binding shared by every adjudication receipt. Kept
+    /// outside Evidence so legacy strict evidence parsers remain compatible.
+    adjudication_execution_hash: ?[]const u8 = null,
     entities: []const ResolvedEntity,
     skipped_mentions: usize = 0,
     work: ?WorkCache = null,
@@ -188,6 +191,10 @@ pub const Resolution = struct {
         if (self.namespace_curation_generation != 0) {
             try out.appendSlice(allocator, ",\"namespace_curation_generation\":");
             try appendInt(allocator, &out, self.namespace_curation_generation);
+        }
+        if (self.adjudication_execution_hash) |hash| {
+            try out.appendSlice(allocator, ",\"adjudication_execution_hash\":");
+            try writeJsonString(allocator, &out, hash);
         }
         try out.appendSlice(allocator, ",\"skipped_mentions\":");
         try appendInt(allocator, &out, self.skipped_mentions);
@@ -1077,6 +1084,12 @@ pub const ParsedResolution = struct {
     arena: std.heap.ArenaAllocator,
     config_generation: u64,
     namespace_curation_generation: u64 = 0,
+    /// Base policy/source binding shared by every adjudication receipt. Kept
+    /// outside Evidence so legacy strict evidence parsers remain compatible.
+    adjudication_execution_hash: ?[]const u8 = null,
+    /// Legacy fallback may prove a mention changed only when its surface form
+    /// was explicitly recorded, rather than synthesized from a candidate name.
+    has_surface_forms: bool = true,
     entities: []const ResolvedEntity,
 
     pub fn deinit(self: *ParsedResolution) void {
@@ -1116,12 +1129,14 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
     if (entities_v != .array) return error.InvalidResolution;
 
     const out = try a.alloc(ResolvedEntity, entities_v.array.items.len);
+    var has_surface_forms = true;
     for (entities_v.array.items, 0..) |ev, i| {
         if (ev != .object) return error.InvalidResolution;
         const o = ev.object;
         const ref = o.get("doc_ref") orelse return error.InvalidResolution;
         if (ref != .object) return error.InvalidResolution;
         const decision_tag = jsonString(o.get("decision") orelse return error.InvalidResolution) orelse return error.InvalidResolution;
+        has_surface_forms = has_surface_forms and if (o.get("surface_form")) |value| value == .string else false;
         const canonical_name = if (o.get("canonical_name")) |v| try a.dupe(u8, jsonString(v) orelse "") else "";
         const surface_form = if (o.get("surface_form")) |v|
             try a.dupe(u8, jsonString(v) orelse "")
@@ -1153,7 +1168,12 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
         };
     }
     const namespace_generation = obj.get("namespace_curation_generation");
-    return .{ .arena = arena, .config_generation = config_generation, .namespace_curation_generation = if (namespace_generation) |value| if (value == .integer and value.integer >= 0) @intCast(value.integer) else return error.InvalidResolution else 0, .entities = out };
+    const binding: ?[]const u8 = if (obj.get("adjudication_execution_hash")) |value| blk: {
+        if (value != .string or value.string.len != 64) return error.InvalidResolution;
+        for (value.string) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidResolution;
+        break :blk try a.dupe(u8, value.string);
+    } else null;
+    return .{ .arena = arena, .has_surface_forms = has_surface_forms, .adjudication_execution_hash = binding, .config_generation = config_generation, .namespace_curation_generation = if (namespace_generation) |value| if (value == .integer and value.integer >= 0) @intCast(value.integer) else return error.InvalidResolution else 0, .entities = out };
 }
 
 /// Parse the `entities` array of an extraction artifact (the shape produced by
@@ -1897,7 +1917,7 @@ test "REVIEW adjudication abstains rejects bounds work and propagates cancellati
     const config = try adjudication.Config.parse(a, adjudication_test_config);
     defer config.deinit();
     var fixture: AdjudicationFixture = .{ .response =
-        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","probabilities":[{"value":"same","probability":0.4},{"value":"different","probability":0.6}]}]}
+        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"different","probabilities":[{"value":"same","probability":0.4},{"value":"different","probability":0.6}]}]}
     };
     var map: MapStore = .{ .alloc = a };
     defer map.deinit();
@@ -1912,7 +1932,7 @@ test "REVIEW adjudication abstains rejects bounds work and propagates cancellati
     try testing.expectEqual(adjudication.Status.abstained, result.entities[0].adjudication.?.status);
     try testing.expectEqual(adjudication.Status.budget_exhausted, result.entities[1].adjudication.?.status);
     fixture.response =
-        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","probabilities":[{"value":"same","probability":0.02},{"value":"different","probability":0.98}]}]}
+        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"different","probabilities":[{"value":"same","probability":0.02},{"value":"different","probability":0.98}]}]}
     ;
     const rejected = (try stage.computeAlloc(a, map.store(), fixture.provider(), "source")).?;
     defer a.free(rejected);
@@ -2164,6 +2184,7 @@ pub const ResolutionStage = struct {
         parsed.entities = parsed.entities[0..kept];
 
         const arena = parsed.arena.allocator();
+        const budget = if (self.adjudicate) |config| adjudication.ExecutionBudget.init(self.now_ns, config.budgetLimitMs()) else null;
         const model_revision: ?[32]u8 = if (self.adjudicate) |config| blk: {
             const stages = config.cascadeStages();
             if (stages.len > 0) {
@@ -2175,27 +2196,54 @@ pub const ResolutionStage = struct {
             if (method != .string or !std.mem.eql(u8, method.string, "generated")) break :blk null;
             const executor = self.adjudicator orelse break :blk null;
             const resolve = executor.model_revision orelse break :blk null;
-            break :blk try resolve(executor.ptr, arena, try config.producerSpecification(arena), @min(config.timeout_ms, config.budget_ms));
+            const revision = try resolve(executor.ptr, arena, try config.producerSpecification(arena), try budget.?.timeout(config.timeout_ms));
+            try budget.?.check();
+            break :blk revision;
         } else null;
-        const base_receipt_hash = if (self.adjudicate) |config| try fingerprintHex(arena, .{ self.config_generation, self.execution_dependency, try config.semantic(arena), extraction.?, self.mention_descriptions_json, self.sibling_resolutions_json }) else "";
+        const semantic_policy = if (self.adjudicate) |config| try config.semantic(arena) else null;
+        const base_receipt_hash = if (semantic_policy) |config| try fingerprintHex(arena, .{ self.config_generation, self.execution_dependency, config, extraction.?, self.mention_descriptions_json, self.sibling_resolutions_json }) else "";
         const receipt_hash = if (model_revision) |revision| try fingerprintHex(arena, .{ base_receipt_hash, revision }) else base_receipt_hash;
         const receipts = if (self.adjudicate != null and existing != null) try parseResolution(gpa, existing.?) else null;
         defer if (receipts) |value| {
             var owner = value;
             owner.deinit();
         };
+        var classifier = if (self.adjudicate) |config| try adjudication.Classifier.init(arena, config) else null;
+        defer if (classifier) |*prepared| prepared.deinit();
         const reused = try arena.alloc(?ResolvedEntity, parsed.entities.len);
-        var cascade_revisions: adjudication.Config.RevisionCache = @splat(.{});
+        const replay_statuses = try arena.alloc(?adjudication.Status, parsed.entities.len);
+        @memset(replay_statuses, null);
+        const base_matches = if (receipts) |prior| if (prior.adjudication_execution_hash) |hash| std.mem.eql(u8, hash, base_receipt_hash) else true else false;
+        var cascade_revisions: adjudication.Config.RevisionCache = .{ .budget = budget };
+        defer cascade_revisions.deinit(arena);
+        var migrated_specifications: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
+        defer migrated_specifications.deinit(arena);
         for (parsed.entities, 0..) |entity, i| {
             reused[i] = null;
+            if (!base_matches) continue;
             if (alias_mask[i] or (if (self.overrides) |overrides| overrides.overrideFor(entity.local_id) != null else false)) continue;
             if (receipts) |prior_resolution| {
                 if (prior_resolution.config_generation != self.config_generation or prior_resolution.namespace_curation_generation != self.namespace_curation_generation) continue;
                 for (prior_resolution.entities) |prior_entity| {
                     if (!std.mem.eql(u8, prior_entity.local_id, entity.local_id)) continue;
+                    // Legacy artifacts have no shared base binding. A changed
+                    // mention is still positive proof that its receipt is stale.
+                    if (prior_resolution.adjudication_execution_hash == null and prior_resolution.has_surface_forms and
+                        (!std.mem.eql(u8, prior_entity.surface_form, entity.text) or !std.mem.eql(u8, prior_entity.label, entity.label))) continue;
                     if (prior_entity.adjudication) |evidence| {
+                        if (evidence.version != 1) continue;
+                        const successful = evidence.status == .accepted or evidence.status == .rejected or evidence.status == .abstained;
+                        if (successful != (evidence.response != null)) return error.InvalidAdjudicationOutput;
+                        if (!successful and model_revision == null and !self.adjudicate.?.tracksResponseRevisions() and
+                            !std.mem.eql(u8, evidence.execution_hash, base_receipt_hash))
+                        {
+                            const method = self.adjudicate.?.decider.object.get("decision_method");
+                            if (method != null and method.? == .string and std.mem.eql(u8, method.?.string, "generated"))
+                                return error.CapabilityDiscoveryUnavailable;
+                        }
                         var expected = receipt_hash;
-                        if (self.adjudicate.?.cascadeStages().len > 0) {
+                        var migrate_revision: ?[32]u8 = null;
+                        if (self.adjudicate.?.tracksResponseRevisions()) {
                             const response = evidence.response orelse {
                                 // Failure and exhausted-budget receipts are
                                 // authoritative too. They have no successful
@@ -2205,15 +2253,39 @@ pub const ResolutionStage = struct {
                                     reused[i] = prior_entity;
                                 continue;
                             };
-                            const recorded = self.adjudicate.?.cascadeRevision(arena, response, null, &cascade_revisions) catch continue;
+                            const recorded = try self.adjudicate.?.responseRevision(arena, response, null, &cascade_revisions);
                             const recorded_hash = if (recorded) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
                             // Changed inputs/policy do not need to discover an
                             // obsolete receipt's model dependencies.
-                            if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash)) continue;
+                            const old_revision = try self.adjudicate.?.legacyResponseRevision(response);
+                            const old_hash = if (old_revision) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
+                            var legacy = recorded != null and (std.mem.eql(u8, evidence.execution_hash, old_hash) or std.mem.eql(u8, evidence.execution_hash, base_receipt_hash));
+                            if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash) and !legacy) {
+                                const historical = try self.adjudicate.?.historicalResponseRevision(arena, response);
+                                const historical_hash = if (historical) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
+                                legacy = std.mem.eql(u8, evidence.execution_hash, historical_hash);
+                                if (!legacy) {
+                                    // A preceding writer hashed injected markers.
+                                    // Its capacity overflow cannot invalidate a
+                                    // valid older binding recognized above.
+                                    const previous = self.adjudicate.?.previousResponseRevision(arena, response) catch |err| switch (err) {
+                                        error.OutOfMemory => return err,
+                                        else => null,
+                                    };
+                                    if (previous) |digest| legacy = std.mem.eql(u8, evidence.execution_hash, try fingerprintHex(arena, .{ base_receipt_hash, digest }));
+                                }
+                            }
+                            if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash) and !legacy) continue;
+                            replay_statuses[i] = try classifier.?.classify(response);
+                            const veto = try @import("antfly_decisions").cascade.agreementBlocked(response);
                             // Receipts with no model revision dependency can
                             // still replay offline, like ordinary typed ones.
                             if (self.adjudicator == null) {
-                                if (recorded != null) continue;
+                                if (recorded != null and !veto) return error.CapabilityDiscoveryUnavailable;
+                                if (veto) {
+                                    reused[i] = prior_entity;
+                                    continue;
+                                }
                                 if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, base_receipt_hash)) reused[i] = prior_entity;
                                 continue;
                             }
@@ -2221,10 +2293,52 @@ pub const ResolutionStage = struct {
                             // If an executed dependency cannot be verified,
                             // leave the committed verdict intact. A transient
                             // metadata outage must not silently replace it.
-                            const revision = try self.adjudicate.?.cascadeRevision(arena, response, executor, &cascade_revisions);
+                            const revision = self.adjudicate.?.responseRevision(arena, response, executor, &cascade_revisions) catch |err| {
+                                // A validated recorded veto may retract an old
+                                // verdict offline. It does not suppress model
+                                // invalidation when verification succeeds.
+                                switch (err) {
+                                    error.OutOfMemory, error.Cancelled, error.Canceled, error.Busy, error.WriterLocked, error.PromotionWriterFenceReleased => return err,
+                                    else => {},
+                                }
+                                if (!veto) return err;
+                                reused[i] = prior_entity;
+                                continue;
+                            };
                             expected = if (revision) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
+                            if (legacy and std.mem.eql(u8, expected, recorded_hash)) migrate_revision = recorded;
+                        } else if (evidence.response) |response| {
+                            if (try adjudication.Config.reportedRevision(response)) |recorded| {
+                                const recorded_hash = try fingerprintHex(arena, .{ base_receipt_hash, recorded });
+                                // Older native discovery hashed the hexadecimal
+                                // representation. Recognize that historical binding
+                                // only for this unchanged execution identity.
+                                var legacy_revision: [32]u8 = undefined;
+                                std.crypto.hash.sha2.Sha256.hash(&std.fmt.bytesToHex(recorded, .lower), &legacy_revision, .{});
+                                const legacy_hash = try fingerprintHex(arena, .{ base_receipt_hash, legacy_revision });
+                                const legacy = std.mem.eql(u8, evidence.execution_hash, legacy_hash);
+                                if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash) and !legacy) continue;
+                                if (model_revision == null) return error.CapabilityDiscoveryUnavailable;
+                                if (legacy and std.mem.eql(u8, expected, recorded_hash)) migrate_revision = recorded;
+                            }
                         }
-                        if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, expected)) reused[i] = prior_entity;
+                        if (evidence.response == null and (evidence.status == .failed or evidence.status == .budget_exhausted)) {
+                            if (model_revision) |revision| {
+                                var legacy_revision: [32]u8 = undefined;
+                                std.crypto.hash.sha2.Sha256.hash(&std.fmt.bytesToHex(revision, .lower), &legacy_revision, .{});
+                                const legacy_hash = try fingerprintHex(arena, .{ base_receipt_hash, legacy_revision });
+                                if (std.mem.eql(u8, evidence.execution_hash, legacy_hash)) migrate_revision = revision;
+                            }
+                        }
+                        if (migrate_revision) |revision| {
+                            if (evidence.version != 1) continue;
+                            var upgraded = prior_entity;
+                            upgraded.adjudication.?.execution_hash = expected;
+                            const entry = try migrated_specifications.getOrPut(arena, revision);
+                            if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(arena, .{ semantic_policy.?, revision });
+                            upgraded.adjudication.?.specification_hash = entry.value_ptr.*;
+                            reused[i] = upgraded;
+                        } else if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, expected)) reused[i] = prior_entity;
                     }
                 }
             }
@@ -2381,12 +2495,31 @@ pub const ResolutionStage = struct {
         // Committed model verdicts survive optional-cache eviction and destination
         // changes. Only a new execution/source identity explicitly re-resolves them.
         const result_arena = resolution.arena.allocator();
+        if (self.adjudicate != null) resolution.adjudication_execution_hash = try result_arena.dupe(u8, base_receipt_hash);
         for (@constCast(resolution.entities), 0..) |*entity, i| {
             if (reused[i]) |receipt| {
                 entity.* = try cloneResolvedEntity(result_arena, receipt);
+                const evidence = &entity.adjudication.?;
+                switch (evidence.status) {
+                    .accepted, .rejected, .abstained => {
+                        const response = evidence.response orelse return error.InvalidAdjudicationOutput;
+                        const status = replay_statuses[i] orelse try classifier.?.classify(response);
+                        if (status != evidence.status) {
+                            // Reinterpret old receipts under the current validation
+                            // rules without spending inference or promoting a verdict.
+                            if (status != .abstained) return error.InvalidAdjudicationOutput;
+                            evidence.status = .abstained;
+                            entity.decision = .review;
+                            entity.doc_ref = .{ .table = try result_arena.dupe(u8, self.resolver.table), .key = try self.resolver.renderKeyAlloc(result_arena, parsed.entities[i]) };
+                            entity.canonical_name = try result_arena.dupe(u8, parsed.entities[i].text);
+                            entity.redirected_from = null;
+                        }
+                    },
+                    .failed, .budget_exhausted => if (evidence.response != null) return error.InvalidAdjudicationOutput,
+                }
             }
         }
-        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &resolution, parsed.entities, lists, reused, receipt_hash, model_revision);
+        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &classifier.?, budget.?, &resolution, parsed.entities, lists, reused, base_receipt_hash, model_revision);
 
         // Apply human-curation overrides: a reviewed mention takes the curator's
         // decision and endpoint (strings copied into the resolution arena so they
@@ -2438,10 +2571,9 @@ pub const ResolutionStage = struct {
         return try resolution.toJson(gpa);
     }
 
-    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, execution_hash: []const u8, model_revision: ?[32]u8) !void {
-        var classifier = try adjudication.Classifier.init(a, config);
-        defer classifier.deinit();
+    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, classifier: *const adjudication.Classifier, budget: adjudication.ExecutionBudget, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, base_execution_hash: []const u8, model_revision: ?[32]u8) !void {
         const specification = classifier.specification_json;
+        const execution_hash = if (model_revision) |revision| try fingerprintHex(a, .{ base_execution_hash, revision }) else base_execution_hash;
         const semantic_config = try config.semantic(a);
         const specification_hash = if (model_revision) |revision| try fingerprintHex(a, .{ semantic_config, revision }) else try fingerprintHex(a, semantic_config);
         // All items share a frozen policy. Hash its large instructions only
@@ -2459,7 +2591,6 @@ pub const ResolutionStage = struct {
         };
         var prepared: std.ArrayList(Prepared) = .empty;
         var calls: u32 = 0;
-        const deadline = if (self.now_ns) |now| now() + @as(u64, config.budget_ms) * std.time.ns_per_ms else null;
         for (@constCast(resolution.entities), 0..) |*entity, i| {
             if (entity.decision != .review or reused[i] != null) continue;
             if (self.overrides) |overrides| if (overrides.overrideFor(entity.local_id) != null) continue;
@@ -2475,7 +2606,7 @@ pub const ResolutionStage = struct {
             const target = candidate.resolved_doc_ref orelse candidate.doc_ref;
             var candidate_description = recordTextField(canonical_record, "description");
             var description_observed = false;
-            const within_budget = calls < config.max_pairs and (if (deadline) |end| self.now_ns.?() < end else true);
+            const within_budget = calls < config.max_pairs and budget.now() < budget.deadline_ns;
             if (within_budget) if (config.description_inputs.candidate_artifact) |artifact| {
                 if (self.adjudicator) |executor| if (executor.get_description) |get| {
                     description_observed = true;
@@ -2499,15 +2630,10 @@ pub const ResolutionStage = struct {
             };
             var pending_request: ?adjudication.Request = null;
             execute: {
-                var timeout_ms = config.timeout_ms;
-                if (deadline) |end| {
-                    const now = self.now_ns.?();
-                    if (now >= end) {
-                        evidence.status = .budget_exhausted;
-                        break :execute;
-                    }
-                    timeout_ms = @intCast(@min(timeout_ms, @max(1, (end - now) / std.time.ns_per_ms)));
-                }
+                const timeout_ms = budget.timeout(config.timeout_ms) catch {
+                    evidence.status = .budget_exhausted;
+                    break :execute;
+                };
                 if (calls >= config.max_pairs) {
                     evidence.status = .budget_exhausted;
                     break :execute;
@@ -2534,14 +2660,11 @@ pub const ResolutionStage = struct {
         var indices: std.ArrayList(usize) = .empty;
         for (prepared.items, 0..) |item, i| if (item.request) |request| {
             var bounded = request;
-            if (deadline) |end_ns| {
-                const now = self.now_ns.?();
-                if (now >= end_ns) {
-                    prepared.items[i].evidence.status = .budget_exhausted;
-                    continue;
-                }
-                bounded.timeout_ms = @intCast(@min(bounded.timeout_ms, @max(1, (end_ns - now) / std.time.ns_per_ms)));
-            }
+            bounded.budget = budget;
+            bounded.timeout_ms = budget.timeout(bounded.timeout_ms) catch {
+                prepared.items[i].evidence.status = .budget_exhausted;
+                continue;
+            };
             try requests.append(a, bounded);
             try indices.append(a, i);
         };
@@ -2558,14 +2681,10 @@ pub const ResolutionStage = struct {
                 const values = try a.alloc(adjudication.Result, requests.items.len);
                 for (requests.items, values) |request, *value| {
                     var bounded = request;
-                    if (deadline) |end_ns| {
-                        const now = self.now_ns.?();
-                        if (now >= end_ns) {
-                            value.* = .{ .failure = "Timeout" };
-                            continue;
-                        }
-                        bounded.timeout_ms = @intCast(@min(bounded.timeout_ms, @max(1, (end_ns - now) / std.time.ns_per_ms)));
-                    }
+                    bounded.timeout_ms = budget.timeout(bounded.timeout_ms) catch {
+                        value.* = .{ .failure = "Timeout" };
+                        continue;
+                    };
                     value.* = .{ .value = executor.execute(executor.ptr, a, bounded) catch |err| switch (err) {
                         error.OutOfMemory, error.Cancelled, error.Canceled, error.Busy, error.WriterLocked, error.PromotionWriterFenceReleased => return err,
                         else => {
@@ -2573,9 +2692,13 @@ pub const ResolutionStage = struct {
                             continue;
                         },
                     } };
+                    try budget.check();
                 }
                 break :blk values;
             };
+            // A callback may ignore its timeout. Never publish identities from
+            // a batch returned after the source execution deadline.
+            try budget.check();
             if (results.len != indices.items.len) return error.InvalidAdjudicationOutput;
             for (results, indices.items) |result, index| {
                 const evidence = &prepared.items[index].evidence;
@@ -2598,21 +2721,37 @@ pub const ResolutionStage = struct {
                         continue;
                     },
                 };
-                evidence.status = classifier.classify(response) catch |err| {
+                const status = classifier.classify(response) catch |err| {
                     evidence.failure = @errorName(err);
                     continue;
                 };
-                evidence.response = response;
-                if (config.cascadeStages().len > 0) {
-                    var unused: adjudication.Config.RevisionCache = @splat(.{});
-                    if (try config.cascadeRevision(a, response, null, &unused)) |revision| {
-                        evidence.execution_hash = try fingerprintHex(a, .{ execution_hash, revision });
-                        const entry = try revision_specifications.getOrPut(a, revision);
-                        if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(a, .{ semantic_config, revision });
-                        evidence.specification_hash = entry.value_ptr.*;
+                const revision = revision: {
+                    if (config.tracksResponseRevisions()) {
+                        var cache: adjudication.Config.RevisionCache = .{};
+                        defer cache.deinit(a);
+                        break :revision config.responseRevision(a, response, null, &cache) catch |err| switch (err) {
+                            error.OutOfMemory, error.Cancelled, error.Canceled, error.Busy, error.WriterLocked, error.PromotionWriterFenceReleased => return err,
+                            else => {
+                                evidence.failure = @errorName(err);
+                                continue;
+                            },
+                        };
                     }
+                    break :revision adjudication.Config.reportedRevision(response) catch |err| {
+                        evidence.failure = @errorName(err);
+                        continue;
+                    };
+                };
+                evidence.status = status;
+                evidence.response = response;
+                if (revision) |recorded_revision| {
+                    evidence.execution_hash = try fingerprintHex(a, .{ if (config.tracksResponseRevisions()) execution_hash else base_execution_hash, recorded_revision });
+                    const entry = try revision_specifications.getOrPut(a, recorded_revision);
+                    if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(a, .{ semantic_config, recorded_revision });
+                    evidence.specification_hash = entry.value_ptr.*;
                 }
             }
+            try budget.check();
         }
         for (prepared.items) |item| {
             const entity = &@constCast(resolution.entities)[item.index];
@@ -4204,6 +4343,13 @@ test "REVIEW adjudication cascade receipts verify the answering stage and its tr
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
+    const disabled_raw = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"when\":", "\"require_agreement\":false,\"when\":");
+    const disabled_config = try adjudication.Config.parse(a, disabled_raw);
+    defer disabled_config.deinit();
+    // Direct embedded callers can construct or mutate Config values too.
+    try disabled_config.value.decider.object.get("cascade").?.object.get("stages").?.array.items[1].object.put(scratch, "require_agreement", .{ .bool = false });
+    try testing.expectEqualStrings(try config.value.producerSpecification(scratch), try disabled_config.value.producerSpecification(scratch));
+    try testing.expectEqualStrings(try fingerprintHex(scratch, try config.value.semantic(scratch)), try fingerprintHex(scratch, try disabled_config.value.semantic(scratch)));
     const response = try adjudicationCascadeResponse(scratch, config.value);
     const parse = struct {
         fn f(alloc: std.mem.Allocator, bytes: []const u8) !std.json.Value {
@@ -4399,7 +4545,13 @@ test "REVIEW adjudication prepared cascade classification allocates no per-resul
     const prompt = try a.alloc(u8, 60000);
     @memset(prompt, 'x');
     try config.decider.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[1].object.getPtr("decider").?.object.put(a, "instructions", .{ .string = prompt });
+    try config.decider.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[1].object.put(a, "require_agreement", .{ .bool = true });
     const response = try std.json.parseFromSliceLeaky(std.json.Value, a, try adjudicationCascadeResponse(a, config), .{});
+    const cascade_trace = response.object.getPtr("cascade").?;
+    for ([_]*std.json.ObjectMap{ &cascade_trace.object, &cascade_trace.object.getPtr("stages").?.array.items[1].object }) |fields| {
+        try fields.put(a, "agreement_status", .{ .string = "agreed" });
+        try fields.put(a, "agreed", .{ .bool = true });
+    }
     const AllocationFailure = struct {
         fn run(alloc: std.mem.Allocator, policy: adjudication.Config, value: std.json.Value) !void {
             var prepared = try adjudication.Classifier.init(alloc, policy);
@@ -4465,4 +4617,1494 @@ test "REVIEW adjudication failed cascade receipts survive recovery until explici
         defer refreshed.deinit();
         try testing.expectEqual(Decision.match, refreshed.entities[0].decision);
     };
+}
+
+test "REVIEW guarded adjudication abstains durably even when operational failure permits mint" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    for ([_]enum { disagreed, unverified, sampled, sampled_agreed }{ .disagreed, .unverified, .sampled, .sampled_agreed }) |mode| {
+        const failed = mode == .unverified;
+        const raw = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"when\":", "\"require_agreement\":true,\"on_failure\":\"keep_previous\",\"when\":");
+        var cfg_value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{});
+        try cfg_value.object.put(scratch, "on_failure", .{ .string = "mint" });
+        const config = try adjudication.Config.parse(a, try std.json.Stringify.valueAlloc(scratch, cfg_value, .{}));
+        defer config.deinit();
+        var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try adjudicationCascadeResponse(scratch, config.value), .{});
+        const trace = response.object.getPtr("cascade").?;
+        const entries = trace.object.getPtr("stages").?.array.items;
+        const first = entries[0].object.get("answers").?.array.items[0];
+        if (failed) {
+            // A fallback that otherwise meets the acceptance threshold must
+            // still abstain when its required confirmation was unavailable.
+            const distribution = first.object.get("probabilities").?.array.items;
+            try distribution[0].object.put(scratch, "probability", .{ .float = 0.9 });
+            try distribution[1].object.put(scratch, "probability", .{ .float = 0.1 });
+            _ = entries[1].object.swapRemove("answers");
+            try entries[1].object.put(scratch, "error", .{ .string = "ProviderUnavailable" });
+            try response.object.put(scratch, "answers", entries[0].object.get("answers").?);
+            try response.object.put(scratch, "model", entries[0].object.get("model").?);
+            try trace.object.put(scratch, "answered_by", .{ .string = "fast" });
+        } else if (mode == .sampled or mode == .sampled_agreed) {
+            // A legitimate sampled generated vote can differ from its argmax.
+            const answers = response.object.getPtr("answers").?.array.items;
+            try answers[0].object.put(scratch, "choice", .{ .string = "different" });
+            try answers[0].object.put(scratch, "raw_structured_answer", .{ .string = "different" });
+            try entries[1].object.put(scratch, "answers", response.object.get("answers").?);
+            if (mode == .sampled_agreed) {
+                var prior = first;
+                try prior.object.put(scratch, "choice", .{ .string = "different" });
+                entries[0].object.getPtr("answers").?.array.items[0] = prior;
+                const distribution = prior.object.get("probabilities").?.array.items;
+                try distribution[0].object.put(scratch, "probability", .{ .float = 0.4 });
+                try distribution[1].object.put(scratch, "probability", .{ .float = 0.6 });
+            }
+        } else {
+            // Prior stage votes different; final strong answer is confidently same.
+            var changed = first;
+            try changed.object.put(scratch, "choice", .{ .string = "different" });
+            entries[0].object.getPtr("answers").?.array.items[0] = changed;
+            const distribution = changed.object.get("probabilities").?.array.items;
+            try distribution[0].object.put(scratch, "probability", .{ .float = 0.4 });
+            try distribution[1].object.put(scratch, "probability", .{ .float = 0.6 });
+        }
+        for ([_]*std.json.ObjectMap{ &trace.object, &entries[1].object }) |fields| {
+            try fields.put(scratch, "agreement_status", .{ .string = if (failed) "unverified" else if (mode == .sampled_agreed) "agreed" else "disagreed" });
+            if (!failed) {
+                try fields.put(scratch, "agreed", .{ .bool = mode == .sampled_agreed });
+                if (mode != .sampled_agreed) try fields.put(scratch, "disagreed_questions", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "[\"same\"]", .{}));
+            }
+        }
+        try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(scratch, config.value, response));
+        var resolver = try Resolver.parse(a,
+            \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+        );
+        defer resolver.deinit();
+        var fixture: AdjudicationFixture = .{ .response = try std.json.Stringify.valueAlloc(scratch, response, .{}) };
+        var map: MapStore = .{ .alloc = a };
+        defer map.deinit();
+        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+        var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+        try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+        const bytes = (try map.store().get(a, "resolution")).?;
+        defer a.free(bytes);
+        var parsed = try parseResolution(a, bytes);
+        defer parsed.deinit();
+        try testing.expectEqual(Decision.review, parsed.entities[0].decision);
+        try testing.expectEqual(adjudication.Status.abstained, parsed.entities[0].adjudication.?.status);
+        stage.adjudicator = null;
+        _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 1), fixture.calls);
+        // Abstention does not make contradictory votes or malformed distributions valid.
+        var altered = entries[0].object.get("answers").?.array.items[0];
+        const original_choice = altered.object.get("choice").?;
+        try altered.object.put(scratch, "choice", .{ .string = if (std.mem.eql(u8, original_choice.string, "same")) "different" else "same" });
+        entries[0].object.getPtr("answers").?.array.items[0] = altered;
+        if (failed) response.object.getPtr("answers").?.array.items[0] = altered;
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+        try altered.object.put(scratch, "choice", original_choice);
+        // Neither a missing aggregate gate nor a contradictory flag is authoritative.
+        _ = trace.object.swapRemove("agreement_status");
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+    }
+}
+
+test "REVIEW generated adjudication thresholds follow sampled votes and validate raw evidence" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"strong"}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"reject":{"choice":"different","min_probability":0.9}}
+    );
+    defer config.deinit();
+    for ([_]struct { selected: []const u8, same: f64, expected: adjudication.Status }{
+        .{ .selected = "same", .same = 0.96, .expected = .accepted },
+        .{ .selected = "different", .same = 0.04, .expected = .rejected },
+        .{ .selected = "different", .same = 0.96, .expected = .abstained },
+        .{ .selected = "same", .same = 0.04, .expected = .abstained },
+        .{ .selected = "same", .same = 0.6, .expected = .abstained },
+    }) |case| {
+        const body = try std.fmt.allocPrint(a,
+            \\{{"model":"strong","answers":[{{"name":"same","type":"choice","decision_method":"generated","probability_source":"token_logprobs","raw_structured_answer":"{s}","choice":"{s}","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}]}}
+        , .{ case.selected, case.selected, case.same, 1 - case.same });
+        var response = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+        try testing.expectEqual(case.expected, try adjudication.classify(a, config.value, response));
+        const answer = &response.object.getPtr("answers").?.array.items[0];
+        try answer.object.put(a, "raw_structured_answer", .{ .string = "not-the-vote" });
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(a, config.value, response));
+        try answer.object.put(a, "raw_structured_answer", .{ .string = case.selected });
+        try answer.object.put(a, "choice", .{ .string = "unknown" });
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(a, config.value, response));
+    }
+    const verdict_config = try adjudication.Config.parse(a,
+        \\{"decider":{"decision_method":"generated","probabilities":"verdict_only","generator":{"provider":"antfly","model":"strong"}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":1}}
+    );
+    defer verdict_config.deinit();
+    const wrong_verdict = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"model":"strong","answers":[{"name":"same","type":"choice","decision_method":"generated","probability_source":"verdict","raw_structured_answer":"different","choice":"different","probabilities":[{"value":"same","probability":1},{"value":"different","probability":0}]}]}
+    , .{});
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(a, verdict_config.value, wrong_verdict));
+}
+
+test "REVIEW upstream Decisions methods preserve abstention through mint and offline replay" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"provider":"antfly","model":"deciders/upstream","url":"http://upstream.example/ai/v1"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"on_failure":"mint"}
+    );
+    defer config.deinit();
+    for ([_]enum { typed, generated, verdict, sampled }{ .typed, .generated, .verdict, .sampled }) |mode| {
+        for ([_][]const u8{ "disagreed", "unverified", "agreed", "absent" }) |status| {
+            var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+            const answer = &response.object.getPtr("answers").?.array.items[0];
+            if (mode != .typed) {
+                try answer.object.put(scratch, "decision_method", .{ .string = "generated" });
+                try answer.object.put(scratch, "probability_source", .{ .string = if (mode == .verdict) "verdict" else "token_logprobs" });
+                try answer.object.put(scratch, "raw_structured_answer", .{ .string = if (mode == .sampled) "different" else "same" });
+                if (mode == .sampled) try answer.object.put(scratch, "choice", .{ .string = "different" });
+                if (mode == .verdict) {
+                    const probabilities = answer.object.getPtr("probabilities").?.array.items;
+                    try probabilities[0].object.put(scratch, "probability", .{ .integer = 1 });
+                    try probabilities[1].object.put(scratch, "probability", .{ .integer = 0 });
+                }
+            }
+            const trace = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.fmt.allocPrint(scratch,
+                \\{{"agreement_status":"{s}"{s}}}
+            , .{ status, if (std.mem.eql(u8, status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"same\"]" else if (std.mem.eql(u8, status, "agreed")) ",\"agreed\":true" else "" }), .{});
+            const absent = std.mem.eql(u8, status, "absent");
+            if (!absent) try response.object.put(scratch, "cascade", trace);
+            const blocked = (!absent and !std.mem.eql(u8, status, "agreed")) or mode == .sampled;
+            try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, try adjudication.classify(scratch, config.value, response));
+            var resolver = try Resolver.parse(a,
+                \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+            );
+            defer resolver.deinit();
+            var fixture: AdjudicationFixture = .{ .response = try std.json.Stringify.valueAlloc(scratch, response, .{}) };
+            var map: MapStore = .{ .alloc = a };
+            defer map.deinit();
+            try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+            var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+            _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+            const bytes = (try map.store().get(a, "resolution")).?;
+            defer a.free(bytes);
+            var parsed = try parseResolution(a, bytes);
+            defer parsed.deinit();
+            try testing.expectEqual(if (blocked) Decision.review else Decision.match, parsed.entities[0].decision);
+            try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, parsed.entities[0].adjudication.?.status);
+            stage.adjudicator = null;
+            if (!absent and std.mem.eql(u8, status, "agreed")) {
+                // Metadata-only historical summaries cannot establish an
+                // empty dependency set. Vetoes may still replay safely.
+                try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+                try testing.expectEqualStrings(bytes, (try map.store().get(scratch, "resolution")).?);
+            } else _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+            try testing.expectEqual(@as(usize, 1), fixture.calls);
+            if (!absent) {
+                try response.object.getPtr("cascade").?.object.put(scratch, "agreed", .{ .bool = !std.mem.eql(u8, status, "agreed") });
+                try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+                _ = response.object.swapRemove("cascade");
+            }
+            if (mode != .typed) {
+                // A valid veto cannot excuse invalid raw evidence or broaden other
+                // providers' trained-only result contract.
+                try answer.object.put(scratch, "raw_structured_answer", .{ .string = "not-the-vote" });
+                try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+                try answer.object.put(scratch, "raw_structured_answer", answer.object.get("choice").?);
+                if (mode != .verdict) {
+                    try answer.object.put(scratch, "probability_source", .{ .string = "verdict" });
+                    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+                }
+                var trained = config.value;
+                trained.decider = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"provider\":\"jev\",\"model\":\"trained\"}", .{});
+                try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, trained, response));
+            }
+        }
+    }
+}
+
+test "REVIEW frozen cascades validate proxied generated stages without per-result plans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw =
+        \\{"decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","model":"fast"}},{"name":"strong","decider":{"provider":"antfly","model":"remote"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"on_failure":"mint"}
+    ;
+    const config = try adjudication.Config.parse(a, raw);
+    defer config.deinit();
+    var fixed = std.heap.FixedBufferAllocator.init(try a.alloc(u8, 2 * 1024 * 1024));
+    var classifier = try adjudication.Classifier.init(fixed.allocator(), config.value);
+    defer classifier.deinit();
+    for ([_][]const u8{ "agreed", "disagreed", "unverified", "absent" }) |upstream_status| {
+        const response = try std.json.parseFromSliceLeaky(std.json.Value, a, try adjudicationCascadeResponse(a, config.value), .{});
+        const cascade = response.object.getPtr("cascade").?;
+        const stage = &cascade.object.getPtr("stages").?.array.items[1];
+        try stage.object.put(a, "decision_method", .{ .string = "typed" });
+        const blocked = std.mem.eql(u8, upstream_status, "disagreed") or std.mem.eql(u8, upstream_status, "unverified");
+        const summary = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.fmt.allocPrint(a,
+            \\{{"agreement_status":"{s}"{s}}}
+        , .{ upstream_status, if (std.mem.eql(u8, upstream_status, "disagreed")) ",\"agreed\":false,\"disagreed_questions\":[\"same\"]" else if (std.mem.eql(u8, upstream_status, "agreed")) ",\"agreed\":true" else "" }), .{});
+        if (!std.mem.eql(u8, upstream_status, "absent")) try stage.object.put(a, "upstream_agreement", summary);
+        try stage.object.put(a, "agreement_status", .{ .string = if (blocked) "unverified" else "agreed" });
+        if (!blocked) try stage.object.put(a, "agreed", .{ .bool = true });
+        for (summary.object.keys(), summary.object.values()) |key, value| if (blocked) try cascade.object.put(a, key, value);
+        if (!blocked) {
+            try cascade.object.put(a, "agreement_status", .{ .string = "agreed" });
+            try cascade.object.put(a, "agreed", .{ .bool = true });
+        }
+        const used = fixed.end_index;
+        for (0..256) |_| try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, try classifier.classify(response));
+        try testing.expectEqual(used, fixed.end_index);
+        // Local trace assertions and raw generated evidence remain mandatory.
+        const answer = &response.object.getPtr("answers").?.array.items[0];
+        try answer.object.put(a, "raw_structured_answer", .{ .string = "different" });
+        try testing.expectError(error.InvalidAdjudicationOutput, classifier.classify(response));
+    }
+}
+
+const RevisionedAdjudicationFixture = struct {
+    base: AdjudicationFixture = .{},
+    revision: [32]u8 = @splat(0xaa),
+    probes: usize = 0,
+    fail: bool = false,
+    missing: bool = false,
+    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return AdjudicationFixture.execute(&self.base, alloc, request);
+    }
+    fn revisionFor(ptr: *anyopaque, alloc: std.mem.Allocator, specification: []const u8, _: u32) !?[32]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.probes += 1;
+        const request = try std.json.parseFromSliceLeaky(std.json.Value, alloc, specification, .{});
+        const model = if (request.object.get("decision_revision_probe")) |value| blk: {
+            const probe = value.object;
+            const original = try std.json.parseFromSliceLeaky(std.json.Value, alloc, probe.get("specification").?.string, .{});
+            try testing.expectEqualStrings("remote", original.object.get("decider").?.object.get("model").?.string);
+            break :blk probe.get("model").?.string;
+        } else request.object.get("decider").?.object.get("generator").?.object.get("model").?.string;
+        if (self.fail) return error.CapabilityDiscoveryUnavailable;
+        if (self.missing) return null;
+        if (request.object.get("decision_revision_probe")) |probe| if (probe.object.get("dependencies")) |nodes| {
+            if (nodes == .array) {
+                for (nodes.array.items) |*node| if (std.mem.eql(u8, node.object.get("kind").?.string, "model")) {
+                    const revision: [32]u8 = if (std.mem.eql(u8, node.object.get("model").?.string, "leaf-b")) @splat(0xcc) else self.revision;
+                    try node.object.put(alloc, "identity", .{ .string = try alloc.dupe(u8, &std.fmt.bytesToHex(revision, .lower)) });
+                };
+                var manifest: @import("antfly_decisions").revisions.Manifest = .{};
+                var projection = std.json.Value{ .object = .empty };
+                try projection.object.put(alloc, "upstream_revisions", nodes);
+                try projection.object.put(alloc, "upstream_revisions_version", .{ .integer = 1 });
+                try manifest.collect(projection);
+                return manifest.digest(false);
+            }
+        };
+        return if (std.mem.eql(u8, model, "leaf-b")) @splat(0xcc) else self.revision;
+    }
+    fn executor(self: *@This()) adjudication.Executor {
+        return .{ .ptr = self, .execute = execute, .model_revision = revisionFor };
+    }
+    fn response(alloc: std.mem.Allocator, cfg: adjudication.Config, revision: [32]u8, model: []const u8, veto: bool) !std.json.Value {
+        var source = try std.json.parseFromSliceLeaky(std.json.Value, alloc, adjudication_test_response, .{});
+        try source.object.put(alloc, "model", .{ .string = model });
+        try source.object.put(alloc, "model_revision", .{ .string = try alloc.dupe(u8, &std.fmt.bytesToHex(revision, .lower)) });
+        const answer = &source.object.getPtr("answers").?.array.items[0];
+        try answer.object.put(alloc, "decision_method", .{ .string = "generated" });
+        try answer.object.put(alloc, "raw_structured_answer", .{ .string = "same" });
+        try answer.object.put(alloc, "probability_source", .{ .string = "token_logprobs" });
+        const summary = try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+            \\{"agreement_status":"disagreed","agreed":false,"disagreed_questions":["same"]}
+        , .{});
+        if (cfg.cascadeStages().len == 0) {
+            if (veto) try source.object.put(alloc, "cascade", summary);
+            return source;
+        }
+        var result = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try adjudicationCascadeResponse(alloc, cfg), .{});
+        const cascade = result.object.getPtr("cascade").?;
+        const stage = &cascade.object.getPtr("stages").?.array.items[1];
+        try stage.object.put(alloc, "decision_method", .{ .string = "typed" });
+        for ([_][]const u8{ "answers", "model", "model_revision" }) |key| {
+            try result.object.put(alloc, key, source.object.get(key).?);
+            try stage.object.put(alloc, key, source.object.get(key).?);
+        }
+        if (veto) try source.object.put(alloc, "cascade", summary);
+        var manifest: @import("antfly_decisions").revisions.Manifest = .{};
+        try manifest.collect(source);
+        try stage.object.put(alloc, "upstream_revisions", try manifest.value(alloc));
+        try stage.object.put(alloc, "upstream_revisions_version", .{ .integer = 2 });
+        try stage.object.put(alloc, "upstream_revisions_complete", .{ .bool = !manifest.incomplete });
+        try stage.object.put(alloc, "agreement_status", .{ .string = if (veto) "unverified" else "agreed" });
+        if (veto) {
+            try stage.object.put(alloc, "upstream_agreement", summary);
+            for (summary.object.keys(), summary.object.values()) |key, value| try cascade.object.put(alloc, key, value);
+        } else {
+            try stage.object.put(alloc, "agreed", .{ .bool = true });
+            try cascade.object.put(alloc, "agreement_status", .{ .string = "agreed" });
+            try cascade.object.put(alloc, "agreed", .{ .bool = true });
+        }
+        return result;
+    }
+};
+
+test "REVIEW generated revisions pin direct proxy cascade and explicit receipts and preserve failures" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = RevisionedAdjudicationFixture;
+    for ([_]enum { proxy, cascade, generated }{ .proxy, .cascade, .generated }) |mode| {
+        const cascade = mode == .cascade;
+        const explicit = mode == .generated;
+        const raw = try std.fmt.allocPrint(scratch,
+            \\{{"decider":{s},"template":"{{{{m.text}}}} / {{{{c.canonical_name}}}}","question":{{"type":"choice","name":"same","instructions":"Same?","choices":[{{"value":"same"}},{{"value":"different"}}]}},"accept":{{"choice":"same","min_probability":0.9}},"on_failure":"mint"}}
+        , .{if (cascade)
+            \\{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","model":"fast"}},{"name":"strong","decider":{"model":"remote"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}}
+        else if (explicit)
+            \\{"decision_method":"generated","generator":{"provider":"antfly","model":"leaf-a"}}
+        else
+            \\{"provider":"antfly","model":"remote"}
+        });
+        const config = try adjudication.Config.parse(a, raw);
+        defer config.deinit();
+        var fixture = Fixture{};
+        const initial = try Fixture.response(scratch, config.value, fixture.revision, "leaf-a", false);
+        try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, config.value, initial));
+        if (!explicit) {
+            var cache: adjudication.Config.RevisionCache = .{};
+            defer cache.deinit(scratch);
+            try testing.expect((try config.value.responseRevision(scratch, initial, null, &cache)) != null);
+            for (0..32) |_| _ = try config.value.responseRevision(scratch, initial, fixture.executor(), &cache);
+            try testing.expectEqual(@as(usize, 1), fixture.probes);
+            const other = try Fixture.response(scratch, config.value, @splat(0xcc), "leaf-b", false);
+            _ = try config.value.responseRevision(scratch, other, fixture.executor(), &cache);
+            try testing.expectEqual(@as(usize, 2), fixture.probes);
+        }
+        fixture.probes = 0;
+        fixture.base.response = try std.json.Stringify.valueAlloc(scratch, initial, .{});
+        var resolver = try Resolver.parse(a,
+            \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+        );
+        defer resolver.deinit();
+        var map: MapStore = .{ .alloc = a };
+        defer map.deinit();
+        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+        var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, if (explicit) 1 else 0), fixture.probes);
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+        try testing.expectEqual(@as(usize, if (explicit) 2 else 1), fixture.probes);
+        // Migrate earlier dependency-free proxy bindings and the old native
+        // hex-hash binding only after verifying the same recorded revision.
+        const current_bytes = (try map.store().get(a, "resolution")).?;
+        defer a.free(current_bytes);
+        const legacy = try std.json.parseFromSliceLeaky(std.json.Value, scratch, current_bytes, .{});
+        const legacy_evidence = &legacy.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?.*;
+        const source_bytes = (try map.store().get(scratch, "source")).?;
+        const base_hash = try fingerprintHex(scratch, .{ stage.config_generation, stage.execution_dependency, try config.value.semantic(scratch), source_bytes, stage.mention_descriptions_json, stage.sibling_resolutions_json });
+        var old_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&std.fmt.bytesToHex(fixture.revision, .lower), &old_digest, .{});
+        try legacy_evidence.object.put(scratch, "execution_hash", .{ .string = if (explicit) try fingerprintHex(scratch, .{ base_hash, old_digest }) else base_hash });
+        const legacy_bytes = try std.json.Stringify.valueAlloc(scratch, legacy, .{});
+        try map.store().put("resolution", legacy_bytes);
+        fixture.fail = true;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        const unchanged_legacy = (try map.store().get(a, "resolution")).?;
+        defer a.free(unchanged_legacy);
+        try testing.expectEqualStrings(legacy_bytes, unchanged_legacy);
+        fixture.fail = false;
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+        const before = (try map.store().get(a, "resolution")).?;
+        defer a.free(before);
+        fixture.fail = true;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        fixture.fail = false;
+        fixture.missing = true;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        fixture.missing = false;
+        stage.adjudicator = null;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        const retained = (try map.store().get(a, "resolution")).?;
+        defer a.free(retained);
+        try testing.expectEqualStrings(before, retained);
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+        stage.adjudicator = fixture.executor();
+        fixture.revision = @splat(0xbb);
+        fixture.base.response = try std.json.Stringify.valueAlloc(scratch, try Fixture.response(scratch, config.value, fixture.revision, "leaf-a", true), .{});
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+        const updated = (try map.store().get(a, "resolution")).?;
+        defer a.free(updated);
+        var parsed = try parseResolution(a, updated);
+        defer parsed.deinit();
+        try testing.expectEqual(Decision.review, parsed.entities[0].decision);
+        try testing.expectEqual(adjudication.Status.abstained, parsed.entities[0].adjudication.?.status);
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+    }
+}
+
+test "REVIEW receipt replay retracts historical veto verdicts migrates native failures and rejects malformed responses" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        legacy: bool = false,
+        missing: bool = false,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return AdjudicationFixture.execute(&self.base, alloc, request);
+        }
+        fn revision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.missing) return null;
+            const raw: [32]u8 = @splat(0xaa);
+            if (!self.legacy) return raw;
+            var old: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&std.fmt.bytesToHex(raw, .lower), &old, .{});
+            return old;
+        }
+        fn executor(self: *@This()) adjudication.Executor {
+            return .{ .ptr = self, .execute = execute, .model_revision = revision };
+        }
+    };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    for ([_]enum { veto, failure, budget, malformed }{ .veto, .failure, .budget, .malformed }) |mode| {
+        const generated = mode != .veto;
+        const cfg = try adjudication.Config.parse(a, if (generated)
+            \\{"decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"leaf"}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"on_failure":"mint"}
+        else
+            adjudication_test_config);
+        defer cfg.deinit();
+        var fixture = Fixture{};
+        var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+        if (generated) {
+            const answer = &response.object.getPtr("answers").?.array.items[0];
+            try answer.object.put(scratch, "decision_method", .{ .string = "generated" });
+            try answer.object.put(scratch, "raw_structured_answer", .{ .string = "same" });
+            try answer.object.put(scratch, "probability_source", .{ .string = "token_logprobs" });
+            try response.object.put(scratch, "model_revision", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+        }
+        fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+        fixture.legacy = mode == .failure or mode == .budget;
+        if (mode == .failure) fixture.base.fail = error.CapabilityDiscoveryUnavailable;
+        if (mode == .budget) fixture.base.fail = error.Timeout;
+        var map = MapStore{ .alloc = a };
+        defer map.deinit();
+        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+        var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = fixture.executor(), .work_retention = .none };
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        const saved = (try map.store().get(scratch, "resolution")).?;
+        var stored = try std.json.parseFromSliceLeaky(std.json.Value, scratch, saved, .{});
+        const evidence = stored.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
+        switch (mode) {
+            .veto => {
+                // This was a valid accepted receipt before upstream veto
+                // interpretation was introduced. Keep its old binding/status.
+                try response.object.put(scratch, "cascade", try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+                    \\{"agreement_status":"disagreed","agreed":false,"disagreed_questions":["same"]}
+                , .{}));
+                try evidence.object.put(scratch, "response", response);
+                stage.adjudicator = null;
+            },
+            .failure, .budget => {
+                fixture.missing = true;
+                try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+                try testing.expectEqualStrings(saved, (try map.store().get(scratch, "resolution")).?);
+                fixture.missing = false;
+                fixture.legacy = false;
+                fixture.base.fail = null;
+            },
+            .malformed => try evidence.object.put(scratch, "response", .{ .array = std.array_list.Managed(std.json.Value).init(scratch) }),
+        }
+        const edited = try std.json.Stringify.valueAlloc(scratch, stored, .{});
+        try map.store().put("resolution", edited);
+        if (mode == .malformed) {
+            try testing.expectError(error.InvalidAdjudicationOutput, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+            try testing.expectEqualStrings(edited, (try map.store().get(scratch, "resolution")).?);
+        } else {
+            _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+            var parsed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+            defer parsed.deinit();
+            try testing.expectEqual(if (mode == .veto) Decision.review else Decision.new, parsed.entities[0].decision);
+            try testing.expectEqual(if (mode == .veto) adjudication.Status.abstained else if (mode == .budget) adjudication.Status.budget_exhausted else adjudication.Status.failed, parsed.entities[0].adjudication.?.status);
+            try testing.expectEqualStrings("Antfly database", parsed.entities[0].canonical_name);
+            try testing.expectEqualStrings("concept/antfly_database", parsed.entities[0].doc_ref.key);
+        }
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+    }
+}
+
+test "REVIEW composite proxy dependencies verify earlier generated leaves with a typed final" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const config = try adjudication.Config.parse(a, adjudication_test_config);
+    defer config.deinit();
+    const Fixture = struct {
+        calls: usize = 0,
+        changed: bool = false,
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: adjudication.Request) ![]u8 {
+            return error.UnexpectedInferenceDuringDiscovery;
+        }
+        fn revision(ptr: *anyopaque, alloc: std.mem.Allocator, raw: []const u8, _: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const envelope = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+            const request = try adjudication.Config.parseRevisionRequest(alloc, envelope.object.get("decision_revision_probe").?);
+            try testing.expectEqual(@as(u32, 2), request.version);
+            var manifest: @import("antfly_decisions").revisions.Manifest = .{};
+            var flat = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, request.dependencies.?, .{ .emit_null_optional_fields = false }), .{});
+            if (self.changed) try flat.array.items[0].object.put(alloc, "identity", .{ .string = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" });
+            var projection = std.json.Value{ .object = .empty };
+            try projection.object.put(alloc, "upstream_revisions", flat);
+            try projection.object.put(alloc, "upstream_revisions_version", .{ .integer = 1 });
+            try manifest.collect(projection);
+            return manifest.digest(false);
+        }
+    };
+    const response = try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+        \\{"model":"typed-final","answers":[{"decision_method":"typed"}],"cascade":{"definition_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stages":[{"name":"fast","decision_method":"generated","model":"gen","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answers":[{"decision_method":"generated"}]},{"name":"strong","decision_method":"typed","upstream_revisions_version":1,"upstream_revisions":[],"model":"typed-final","answers":[{"decision_method":"typed"}]}]}}
+    , .{});
+    var fixture = Fixture{};
+    const executor: adjudication.Executor = .{ .ptr = &fixture, .execute = Fixture.execute, .model_revision = Fixture.revision };
+    var cache: adjudication.Config.RevisionCache = .{};
+    defer cache.deinit(scratch);
+    const recorded = (try config.value.responseRevision(scratch, response, null, &cache)).?;
+    for (0..32) |_| try testing.expectEqualSlices(u8, &recorded, &(try config.value.responseRevision(scratch, response, executor, &cache)).?);
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+    fixture.changed = true;
+    var next_batch: adjudication.Config.RevisionCache = .{};
+    defer next_batch.deinit(scratch);
+    const refreshed = (try config.value.responseRevision(scratch, response, executor, &next_batch)).?;
+    try testing.expect(!std.mem.eql(u8, &recorded, &refreshed));
+    try testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "REVIEW ordinary abstentions refresh on changed generated revisions" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = RevisionedAdjudicationFixture;
+    const cascade = @import("antfly_decisions").cascade;
+    const Upstream = struct {
+        strong: std.json.Value,
+        veto: bool,
+        fn run(ptr: *anyopaque, alloc: std.mem.Allocator, index: usize, _: cascade.Stage, indices: []const usize) !cascade.StageResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var fast = try std.json.parseFromSliceLeaky(std.json.Value, alloc, adjudication_test_response, .{});
+            try fast.object.put(alloc, "model", .{ .string = "fast" });
+            if (self.veto) {
+                const answer = &fast.object.getPtr("answers").?.array.items[0];
+                try answer.object.put(alloc, "choice", .{ .string = "different" });
+                const probabilities = answer.object.getPtr("probabilities").?.array.items;
+                try probabilities[0].object.put(alloc, "probability", .{ .float = 0.4 });
+                try probabilities[1].object.put(alloc, "probability", .{ .float = 0.6 });
+            }
+            const values = try alloc.alloc(?std.json.Value, indices.len);
+            for (values) |*value| value.* = if (index == 0) fast else self.strong;
+            const failures = try alloc.alloc(?anyerror, indices.len);
+            @memset(failures, null);
+            return .{ .values = values, .failures = failures };
+        }
+        fn response(alloc: std.mem.Allocator, cfg: adjudication.Config, revision: [32]u8, veto: bool) !std.json.Value {
+            const definition = try cascade.compile(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+                \\{"stages":[{"name":"fast","decider":{"provider":"jev","model":"fast"}},{"name":"strong","decider":{"decision_method":"generated","generator":{"model":"leaf-a"}},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}
+            , .{}));
+            var self: @This() = .{ .strong = try Fixture.response(alloc, cfg, revision, "leaf-a", false), .veto = veto };
+            const result = try cascade.execute(alloc, &definition, "upstream", 1, .{ .ptr = &self, .run = run });
+            const value = result.values[0].?;
+            _ = try cascade.validateTrace(&definition, value);
+            return value;
+        }
+    };
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    );
+    defer config.deinit();
+    var fixture = Fixture{};
+    var response = try Fixture.response(scratch, config.value, fixture.revision, "leaf-a", false);
+    const probabilities = response.object.getPtr("answers").?.array.items[0].object.getPtr("probabilities").?.array.items;
+    try probabilities[0].object.put(scratch, "probability", .{ .float = 0.6 });
+    try probabilities[1].object.put(scratch, "probability", .{ .float = 0.4 });
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    stage.adjudicator = null;
+    const before = (try map.store().get(scratch, "resolution")).?;
+    try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+    try testing.expectEqualStrings(before, (try map.store().get(scratch, "resolution")).?);
+    stage.adjudicator = fixture.executor();
+    fixture.revision = @splat(0xbb);
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, try Fixture.response(scratch, config.value, fixture.revision, "leaf-a", false), .{});
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    var parsed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+    try testing.expectEqual(Decision.match, parsed.entities[0].decision);
+    fixture.revision = @splat(0xcc);
+    const veto = try Upstream.response(scratch, config.value, fixture.revision, true);
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, veto, .{});
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    stage.adjudicator = null;
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(@as(usize, 3), fixture.base.calls);
+    stage.adjudicator = fixture.executor();
+    fixture.fail = true;
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(@as(usize, 3), fixture.base.calls);
+    fixture.fail = false;
+    fixture.revision = @splat(0xdd);
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, try Upstream.response(scratch, config.value, fixture.revision, false), .{});
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(@as(usize, 4), fixture.base.calls);
+    var refreshed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+    defer refreshed.deinit();
+    try testing.expectEqual(Decision.match, refreshed.entities[0].decision);
+}
+
+test "REVIEW malformed cached trace answers return controlled errors" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const raw = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"question\":\"same\",\"choice\":\"same\",", "");
+    const cfg = try adjudication.Config.parse(a, raw);
+    defer cfg.deinit();
+    var fixture = AdjudicationFixture{ .response = try adjudicationCascadeResponse(scratch, cfg.value) };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+    const stored = try std.json.parseFromSliceLeaky(std.json.Value, scratch, (try map.store().get(scratch, "resolution")).?, .{});
+    const response = stored.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?.object.getPtr("response").?;
+    for ([_]std.json.Value{ .null, .{ .bool = true }, .{ .integer = 1 }, .{ .array = std.json.Array.init(scratch) } }) |bad| {
+        response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[0].object.getPtr("answers").?.array.items[0] = bad;
+        const bytes = try std.json.Stringify.valueAlloc(scratch, stored, .{});
+        try map.store().put("resolution", bytes);
+        try testing.expectError(error.InvalidAdjudicationOutput, stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+        try testing.expectEqualStrings(bytes, (try map.store().get(scratch, "resolution")).?);
+    }
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "REVIEW changed source invalidates obsolete failures before revision verification" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        missing: bool = false,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return AdjudicationFixture.execute(&self.base, alloc, request);
+        }
+        fn revision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.missing) null else @splat(0xaa);
+        }
+    };
+    const cfg = try adjudication.Config.parse(a,
+        \\{"decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"leaf"}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"on_failure":"mint"}
+    );
+    defer cfg.deinit();
+    for ([_]bool{ false, true }) |legacy| {
+        for ([_]enum { mention, description, binding }{ .mention, .description, .binding }) |change| {
+            if (legacy and change != .mention) continue; // Other legacy changes cannot be proven without their old revision.
+            var fixture = Fixture{ .base = .{ .fail = error.Timeout } };
+            var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+            const answer = &response.object.getPtr("answers").?.array.items[0];
+            try answer.object.put(scratch, "decision_method", .{ .string = "generated" });
+            try answer.object.put(scratch, "raw_structured_answer", .{ .string = "same" });
+            try answer.object.put(scratch, "probability_source", .{ .string = "token_logprobs" });
+            fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+            var resolver = try Resolver.parse(a,
+                \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+            );
+            defer resolver.deinit();
+            var map = MapStore{ .alloc = a };
+            defer map.deinit();
+            try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+            var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = .{ .ptr = &fixture, .execute = Fixture.execute, .model_revision = Fixture.revision }, .work_retention = .none };
+            _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+            if (legacy) {
+                var stored = try std.json.parseFromSliceLeaky(std.json.Value, scratch, (try map.store().get(scratch, "resolution")).?, .{});
+                try testing.expect(stored.object.swapRemove("adjudication_execution_hash"));
+                try map.store().put("resolution", try std.json.Stringify.valueAlloc(scratch, stored, .{}));
+            }
+            fixture.missing = true;
+            fixture.base.fail = null;
+            const prior = (try map.store().get(scratch, "resolution")).?;
+            try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+            try testing.expectEqualStrings(prior, (try map.store().get(scratch, "resolution")).?);
+            switch (change) {
+                .mention => try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly changed mention\"}]}"),
+                .description => try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\",\"description\":\"new description\"}]}"),
+                .binding => stage.execution_dependency = "changed-source-binding",
+            }
+            _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+            var parsed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+            defer parsed.deinit();
+            try testing.expect(parsed.adjudication_execution_hash != null);
+            try testing.expectEqual(Decision.match, parsed.entities[0].decision);
+            try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+        }
+    }
+}
+
+test "REVIEW proxy revision discovery and inference share a cumulative deadline" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        probes: usize = 0,
+        overrun: bool = false,
+        changed: bool = false,
+        timeouts: [4]u32 = @splat(0),
+        execution_timeout: u32 = 0,
+        var clock: u64 = 0;
+        fn now() u64 {
+            return clock;
+        }
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.execution_timeout = request.timeout_ms;
+            const raw = try AdjudicationFixture.execute(&self.base, alloc, request);
+            var response = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+            try response.object.put(alloc, "model", .{ .string = try std.fmt.allocPrint(alloc, "leaf-{d}", .{self.base.calls}) });
+            if (self.changed) try response.object.put(alloc, "model_revision", .{ .string = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+            return std.json.Stringify.valueAlloc(alloc, response, .{});
+        }
+        fn revision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, timeout_ms: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.timeouts[self.probes] = timeout_ms;
+            self.probes += 1;
+            clock += @as(u64, if (self.overrun) timeout_ms else timeout_ms - 1) * std.time.ns_per_ms;
+            return if (self.changed) @splat(0xbb) else @splat(0xaa);
+        }
+    };
+    Fixture.clock = 0;
+    const cfg = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"budget_ms":10,"timeout_ms":10}
+    );
+    defer cfg.deinit();
+    var fixture = Fixture{};
+    var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+    const answer = &response.object.getPtr("answers").?.array.items[0];
+    try answer.object.put(scratch, "decision_method", .{ .string = "generated" });
+    try answer.object.put(scratch, "raw_structured_answer", .{ .string = "same" });
+    try answer.object.put(scratch, "probability_source", .{ .string = "token_logprobs" });
+    try response.object.put(scratch, "model_revision", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e1\",\"label\":\"concept\",\"text\":\"Antfly database one\"},{\"id\":\"e2\",\"label\":\"concept\",\"text\":\"Antfly database two\"}]}");
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = .{ .ptr = &fixture, .execute = Fixture.execute, .model_revision = Fixture.revision }, .work_retention = .none, .now_ns = Fixture.now };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expect(Fixture.clock <= @as(u64, cfg.value.budget_ms) * std.time.ns_per_ms);
+    try testing.expectEqualSlices(u32, &.{ 10, 1 }, fixture.timeouts[0..fixture.probes]);
+    const before = (try map.store().get(scratch, "resolution")).?;
+    fixture.probes = 0;
+    fixture.overrun = true;
+    Fixture.clock = 0;
+    try testing.expectError(error.Timeout, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 1), fixture.probes);
+    try testing.expectEqualStrings(before, (try map.store().get(scratch, "resolution")).?);
+    try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+    fixture.probes = 0;
+    fixture.overrun = false;
+    fixture.changed = true;
+    Fixture.clock = 0;
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(@as(usize, 4), fixture.base.calls);
+    try testing.expectEqual(@as(u32, 1), fixture.execution_timeout);
+}
+
+test "REVIEW frozen generated cascade verification shares its deadline across stages" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        probes: usize = 0,
+        timeouts: [4]u32 = @splat(0),
+        var clock: u64 = 0;
+        fn now() u64 {
+            return clock;
+        }
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return AdjudicationFixture.execute(&self.base, alloc, request);
+        }
+        fn revision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, timeout_ms: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.timeouts[self.probes] = timeout_ms;
+            self.probes += 1;
+            clock += @as(u64, timeout_ms - 1) * std.time.ns_per_ms;
+            return @splat(0xaa);
+        }
+    };
+    Fixture.clock = 0;
+    const cfg = try adjudication.Config.parse(a,
+        \\{"decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"decision_method":"generated","generator":{"model":"fast"}}},{"name":"strong","decider":{"decision_method":"generated","generator":{"model":"strong"}},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"budget_ms":10,"timeout_ms":10}
+    );
+    defer cfg.deinit();
+    try cfg.value.decider.object.getPtr("cascade").?.object.put(scratch, "budget", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"deadline_ms\":6}", .{}));
+    var fixture = Fixture{};
+    var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try adjudicationCascadeResponse(scratch, cfg.value), .{});
+    const stages = response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items;
+    for (stages) |*stage| {
+        try stage.object.put(scratch, "model_revision", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+        try stage.object.put(scratch, "decision_method", .{ .string = "generated" });
+        const answer = &stage.object.getPtr("answers").?.array.items[0];
+        try answer.object.put(scratch, "decision_method", .{ .string = "generated" });
+        try answer.object.put(scratch, "raw_structured_answer", .{ .string = "same" });
+        try answer.object.put(scratch, "probability_source", .{ .string = "token_logprobs" });
+    }
+    try response.object.put(scratch, "model_revision", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+    try response.object.put(scratch, "answers", stages[1].object.get("answers").?);
+    try stages[1].object.put(scratch, "agreement_status", .{ .string = "agreed" });
+    try stages[1].object.put(scratch, "agreed", .{ .bool = true });
+    try response.object.getPtr("cascade").?.object.put(scratch, "agreement_status", .{ .string = "agreed" });
+    try response.object.getPtr("cascade").?.object.put(scratch, "agreed", .{ .bool = true });
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, cfg.value, response));
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = .{ .ptr = &fixture, .execute = Fixture.execute, .model_revision = Fixture.revision }, .work_retention = .none, .now_ns = Fixture.now };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqualSlices(u32, &.{ 6, 1 }, fixture.timeouts[0..fixture.probes]);
+    try testing.expect(Fixture.clock <= @as(u64, cfg.value.budgetLimitMs()) * std.time.ns_per_ms);
+}
+
+test "REVIEW adjudication base binding round trips independently of strict evidence parsing" {
+    const a = testing.allocator;
+    const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const raw = "{\"config_generation\":1,\"entities\":[],\"adjudication_execution_hash\":\"" ++ hash ++ "\"}";
+    var parsed = try parseResolution(a, raw);
+    defer parsed.deinit();
+    const value: Resolution = .{ .arena = undefined, .config_generation = parsed.config_generation, .entities = parsed.entities, .adjudication_execution_hash = parsed.adjudication_execution_hash };
+    const encoded = try value.toJson(a);
+    defer a.free(encoded);
+    var replay = try parseResolution(a, encoded);
+    defer replay.deinit();
+    try testing.expectEqualStrings(hash, replay.adjudication_execution_hash.?);
+    var legacy = try parseResolution(a, "{\"config_generation\":1,\"entities\":[]}");
+    defer legacy.deinit();
+    try testing.expect(legacy.adjudication_execution_hash == null);
+    for ([_][]const u8{ "[]", "null", "\"short\"", "1" }) |bad| {
+        const malformed = try std.fmt.allocPrint(a, "{{\"config_generation\":1,\"entities\":[],\"adjudication_execution_hash\":{s}}}", .{bad});
+        defer a.free(malformed);
+        try testing.expectError(error.InvalidResolution, parseResolution(a, malformed));
+    }
+}
+
+test "REVIEW adjudication deadlines do not round up partial milliseconds" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    const budget = adjudication.ExecutionBudget.init(Clock.now, 10);
+    try testing.expectEqual(@as(u32, 3), try budget.timeout(3));
+    Clock.value = 9 * std.time.ns_per_ms;
+    try testing.expectEqual(@as(u32, 1), try budget.timeout(10));
+    Clock.value += 1;
+    try testing.expectError(error.Timeout, budget.timeout(10));
+    Clock.value = 10 * std.time.ns_per_ms;
+    try testing.expectError(error.Timeout, budget.check());
+}
+
+const AgreementUpstreamFixture = struct {
+    const cascade = @import("antfly_decisions").cascade;
+    const Fixture = RevisionedAdjudicationFixture;
+    strong: std.json.Value,
+    veto: bool,
+    fn run(ptr: *anyopaque, alloc: std.mem.Allocator, index: usize, _: cascade.Stage, indices: []const usize) !cascade.StageResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var fast = try std.json.parseFromSliceLeaky(std.json.Value, alloc, adjudication_test_response, .{});
+        try fast.object.put(alloc, "model", .{ .string = "fast" });
+        if (self.veto) {
+            const answer = &fast.object.getPtr("answers").?.array.items[0];
+            try answer.object.put(alloc, "choice", .{ .string = "different" });
+            const probabilities = answer.object.getPtr("probabilities").?.array.items;
+            try probabilities[0].object.put(alloc, "probability", .{ .float = 0.4 });
+            try probabilities[1].object.put(alloc, "probability", .{ .float = 0.6 });
+        }
+        const values = try alloc.alloc(?std.json.Value, indices.len);
+        for (values) |*value| value.* = if (index == 0) fast else self.strong;
+        const failures = try alloc.alloc(?anyerror, indices.len);
+        @memset(failures, null);
+        return .{ .values = values, .failures = failures };
+    }
+    fn response(alloc: std.mem.Allocator, cfg: adjudication.Config, revision: [32]u8, veto: bool) !std.json.Value {
+        const definition = try cascade.compile(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+            \\{"stages":[{"name":"fast","decider":{"provider":"jev","model":"fast"}},{"name":"strong","decider":{"decision_method":"generated","generator":{"model":"leaf-a"}},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}
+        , .{}));
+        var self: @This() = .{ .strong = try Fixture.response(alloc, cfg, revision, "leaf-a", false), .veto = veto };
+        const result = try cascade.execute(alloc, &definition, "upstream", 1, .{ .ptr = &self, .run = run });
+        const value = result.values[0].?;
+        _ = try cascade.validateTrace(&definition, value);
+        return value;
+    }
+};
+
+test "REVIEW contradictory upstream aggregate cannot accept" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = RevisionedAdjudicationFixture;
+    const Upstream = AgreementUpstreamFixture;
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    );
+    defer config.deinit();
+
+    var fixture = Fixture{};
+    var response = try Upstream.response(scratch, config.value, fixture.revision, true);
+    try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(scratch, config.value, response));
+    const aggregate = response.object.getPtr("cascade").?;
+    try aggregate.object.put(scratch, "agreement_status", .{ .string = "agreed" });
+    try aggregate.object.put(scratch, "agreed", .{ .bool = true });
+    _ = aggregate.object.swapRemove("disagreed_questions");
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    var parsed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+    defer parsed.deinit();
+    try testing.expectEqual(Decision.review, parsed.entities[0].decision);
+}
+
+test "REVIEW batched inference rejects answers beyond the shared deadline" {
+    const a = testing.allocator;
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        var clock: u64 = 0;
+        fn now() u64 {
+            return clock;
+        }
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            try testing.expect(request.budget != null);
+            clock += 11 * std.time.ns_per_ms;
+            return alloc.dupe(u8, adjudication_test_response);
+        }
+        fn batch(_: *anyopaque, alloc: std.mem.Allocator, requests: []const adjudication.Request) ![]adjudication.Result {
+            const out = try alloc.alloc(adjudication.Result, requests.len);
+            for (requests, out) |request, *result| {
+                try testing.expectEqual(@as(u32, 10), request.timeout_ms);
+                // Simulate a callback ignoring the shared deadline.
+                try testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), request.budget.?.deadline_ns);
+                clock += 9 * std.time.ns_per_ms;
+                result.* = .{ .value = try alloc.dupe(u8, adjudication_test_response) };
+            }
+            return out;
+        }
+    };
+    Fixture.clock = 0;
+    const cfg = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"timeout_ms":10,"budget_ms":10}
+    );
+    defer cfg.deinit();
+    var fixture = Fixture{};
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e1\",\"label\":\"concept\",\"text\":\"Antfly database one\"},{\"id\":\"e2\",\"label\":\"concept\",\"text\":\"Antfly database two\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = .{ .ptr = &fixture, .execute = Fixture.execute, .execute_batch = Fixture.batch }, .now_ns = Fixture.now, .work_retention = .none };
+    try testing.expectError(error.Timeout, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+    try testing.expect(map.map.get("resolution") == null);
+    try testing.expectEqual(@as(u64, 18 * std.time.ns_per_ms), Fixture.clock);
+    // Serial callbacks have the same completion fence, including mint policy.
+    Fixture.clock = 0;
+    stage.adjudicator.?.execute_batch = null;
+    stage.adjudicate.?.on_failure = .mint;
+    const committed = "{\"config_generation\":0,\"entities\":[]}";
+    try map.store().put("resolution", committed);
+    try testing.expectError(error.Timeout, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+    try testing.expectEqualStrings(committed, map.map.get("resolution").?);
+    try testing.expectEqual(@as(u64, 11 * std.time.ns_per_ms), Fixture.clock);
+}
+
+test "REVIEW malformed dependencies are isolated within adjudication batches" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Upstream = AgreementUpstreamFixture;
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    );
+    defer config.deinit();
+
+    const Batch = struct {
+        base: AdjudicationFixture = .{},
+        good: std.json.Value,
+        bad: std.json.Value,
+        calls: usize = 0,
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: adjudication.Request) ![]u8 {
+            return error.UnexpectedSerialInvocation;
+        }
+        fn batch(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const adjudication.Request) ![]adjudication.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += requests.len;
+            const out = try alloc.alloc(adjudication.Result, requests.len);
+            for (out, 0..) |*item, i| item.* = .{ .value = try std.json.Stringify.valueAlloc(alloc, if (i == 0) self.good else self.bad, .{}) };
+            return out;
+        }
+    };
+    const good = try Upstream.response(scratch, config.value, @splat(0xaa), false);
+    var bad = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, good, .{}), .{});
+    // A malformed dependency projection can pass answer classification. Its
+    // recording failure must remain local to this row and leave no response.
+    _ = bad.object.swapRemove("cascade");
+    try bad.object.put(scratch, "upstream_revisions", .{ .bool = false });
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, config.value, bad));
+    var batcher = Batch{ .good = good, .bad = bad };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e1\",\"label\":\"concept\",\"text\":\"Antfly database one\"},{\"id\":\"e2\",\"label\":\"concept\",\"text\":\"Antfly database two\"}]}");
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = .{ .ptr = &batcher, .execute = Batch.execute, .execute_batch = Batch.batch }, .work_retention = .none };
+    _ = stage.run(a, map.store(), batcher.base.provider(), "source", "resolution") catch |err| {
+        return err;
+    };
+    var parsed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+    defer parsed.deinit();
+    try testing.expectEqual(Decision.match, parsed.entities[0].decision);
+    try testing.expectEqual(Decision.review, parsed.entities[1].decision);
+    try testing.expectEqual(adjudication.Status.failed, parsed.entities[1].adjudication.?.status);
+    try testing.expect(parsed.entities[1].adjudication.?.response == null);
+    try testing.expect(parsed.entities[1].adjudication.?.failure != null);
+}
+
+test "REVIEW executor deadlines preserve the shared budget across clock domains" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    const budget = adjudication.ExecutionBudget.init(Clock.now, 10);
+    const request: adjudication.Request = .{ .specification_json = "", .input = "", .source_fingerprint = "", .timeout_ms = 10, .budget = budget };
+    Clock.value = 9 * std.time.ns_per_ms;
+    const host_now = 1000 * std.time.ns_per_ms;
+    try testing.expectEqual(host_now + std.time.ns_per_ms, try request.deadline(host_now));
+    Clock.value = 10 * std.time.ns_per_ms;
+    try testing.expectError(error.Timeout, request.deadline(host_now));
+}
+
+test "REVIEW reported agreement must match a single question vote" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cfg = try adjudication.Config.parse(a, adjudication_test_config);
+    defer cfg.deinit();
+    var response = try AgreementUpstreamFixture.response(alloc, cfg.value, @splat(0xaa), true);
+    try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(alloc, cfg.value, response));
+    const trace = response.object.getPtr("cascade").?;
+    const final = &trace.object.getPtr("stages").?.array.items[1];
+    for ([_]*std.json.Value{ trace, final }) |value| {
+        try value.object.put(alloc, "agreement_status", .{ .string = "agreed" });
+        try value.object.put(alloc, "agreed", .{ .bool = true });
+        _ = value.object.swapRemove("disagreed_questions");
+    }
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(alloc, cfg.value, response));
+    // Historical one-question traces are equally unambiguous without scope.
+    _ = final.object.swapRemove("agreement_questions");
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(alloc, cfg.value, response));
+}
+
+test "REVIEW root dependency projection cannot erase a cascade" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const c = @import("antfly_decisions").cascade;
+    const cfg = try adjudication.Config.parse(a, adjudication_test_config);
+    defer cfg.deinit();
+    const Runner = struct {
+        strong: std.json.Value,
+        fn run(ptr: *anyopaque, scratch: std.mem.Allocator, index: usize, _: c.Stage, ids: []const usize) !c.StageResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const typed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+            const values = try scratch.alloc(?std.json.Value, ids.len);
+            @memset(values, if (index == 0) self.strong else typed);
+            const failures = try scratch.alloc(?anyerror, ids.len);
+            @memset(failures, null);
+            return .{ .values = values, .failures = failures };
+        }
+    };
+    const definition = try c.compile(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+        \\{"stages":[{"name":"gen","decider":{"decision_method":"generated","generator":{"model":"leaf-a"}}},{"name":"typed","decider":{"model":"typed"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0,1]}}]}
+    , .{}));
+    var runner = Runner{ .strong = try RevisionedAdjudicationFixture.response(alloc, cfg.value, @splat(0xaa), "leaf-a", false) };
+    const outcome = try c.execute(alloc, &definition, "upstream", 1, .{ .ptr = &runner, .run = Runner.run });
+    var response = outcome.values[0].?;
+    _ = try c.validateTrace(&definition, response);
+    var cache: adjudication.Config.RevisionCache = .{};
+    defer cache.deinit(alloc);
+    try testing.expect((try cfg.value.responseRevision(alloc, response, null, &cache)) != null);
+    const clean_response = try std.json.Stringify.valueAlloc(alloc, response, .{});
+    try response.object.put(alloc, "upstream_revisions", .{ .array = .init(alloc) });
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(alloc, cfg.value, response));
+    try testing.expectError(error.InvalidAdjudicationOutput, cfg.value.responseRevision(alloc, response, null, &cache));
+    var fixture = AdjudicationFixture{ .response = try std.json.Stringify.valueAlloc(alloc, response, .{}) };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+    stage.adjudicator = null;
+    _ = try stage.run(a, map.store(), null, "source", "resolution");
+    var receipt = try parseResolution(a, map.map.get("resolution").?);
+    defer receipt.deinit();
+    try testing.expectEqual(Decision.review, receipt.entities[0].decision);
+    try testing.expectEqual(adjudication.Status.failed, receipt.entities[0].adjudication.?.status);
+    try testing.expect(receipt.entities[0].adjudication.?.response == null);
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+
+    // A historical writer could have persisted this successful response with
+    // an unversioned binding. An upgraded reader must not reuse it offline.
+    var legacy_map = MapStore{ .alloc = a };
+    defer legacy_map.deinit();
+    try legacy_map.store().put("source", map.map.get("source").?);
+    fixture.response = clean_response;
+    stage.adjudicator = fixture.executor();
+    _ = try stage.run(a, legacy_map.store(), fixture.provider(), "source", "resolution");
+    var legacy = try std.json.parseFromSliceLeaky(std.json.Value, alloc, legacy_map.map.get("resolution").?, .{});
+    const evidence = legacy.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
+    try evidence.object.put(alloc, "response", response);
+    try evidence.object.put(alloc, "execution_hash", legacy.object.get("adjudication_execution_hash").?);
+    const corrupt_receipt = try std.json.Stringify.valueAlloc(alloc, legacy, .{});
+    try legacy_map.store().put("resolution", corrupt_receipt);
+    stage.adjudicator = null;
+    try testing.expectError(error.InvalidAdjudicationOutput, stage.run(a, legacy_map.store(), null, "source", "resolution"));
+    try testing.expectEqualStrings(corrupt_receipt, legacy_map.map.get("resolution").?);
+    try testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "REVIEW upstream typed votes must match their distributions" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cfg = try adjudication.Config.parse(a, adjudication_test_config);
+    defer cfg.deinit();
+    var response = try AgreementUpstreamFixture.response(alloc, cfg.value, @splat(0xaa), true);
+    try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(alloc, cfg.value, response));
+    const metadata = response.object.getPtr("cascade").?;
+    const stages = metadata.object.getPtr("stages").?.array.items;
+    const fast = &stages[0].object.getPtr("answers").?.array.items[0];
+    // The typed stage still says P(same)=0.4, P(different)=0.6.
+    try fast.object.put(alloc, "choice", .{ .string = "same" });
+    for ([_]*std.json.Value{ metadata, &stages[1] }) |value| {
+        try value.object.put(alloc, "agreement_status", .{ .string = "agreed" });
+        try value.object.put(alloc, "agreed", .{ .bool = true });
+        _ = value.object.swapRemove("disagreed_questions");
+    }
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(alloc, cfg.value, response));
+}
+
+test "REVIEW typed upstream cascade retains its definition dependency" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const c = @import("antfly_decisions").cascade;
+    const cfg = try adjudication.Config.parse(a, adjudication_test_config);
+    defer cfg.deinit();
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        probes: usize = 0,
+        definition_identity: []const u8 = "",
+        changed: bool = false,
+        fn run(ptr: *anyopaque, scratch: std.mem.Allocator, index: usize, _: c.Stage, ids: []const usize) !c.StageResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const values = try scratch.alloc(?std.json.Value, ids.len);
+            const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+            if (self.changed and index == 1) {
+                const answer = &value.object.getPtr("answers").?.array.items[0];
+                try answer.object.put(scratch, "choice", .{ .string = "different" });
+                const probabilities = answer.object.getPtr("probabilities").?.array.items;
+                try probabilities[0].object.put(scratch, "probability", .{ .float = 0.03 });
+                try probabilities[1].object.put(scratch, "probability", .{ .float = 0.97 });
+            }
+            @memset(values, value);
+            const failures = try scratch.alloc(?anyerror, ids.len);
+            @memset(failures, null);
+            return .{ .values = values, .failures = failures };
+        }
+        fn execute(ptr: *anyopaque, scratch: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return AdjudicationFixture.execute(&self.base, scratch, request);
+        }
+        fn revision(ptr: *anyopaque, scratch: std.mem.Allocator, raw: []const u8, _: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.probes += 1;
+            const envelope = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{});
+            const probe = try adjudication.Config.parseRevisionRequest(scratch, envelope.object.get("decision_revision_probe").?);
+            try testing.expectEqual(@as(u32, 2), probe.version);
+            const nodes = envelope.object.get("decision_revision_probe").?.object.get("dependencies").?;
+            try testing.expectEqual(@as(usize, 1), nodes.array.items.len);
+            try testing.expectEqualStrings("cascade", nodes.array.items[0].object.get("kind").?.string);
+            try nodes.array.items[0].object.put(scratch, "identity", .{ .string = self.definition_identity });
+            var projection = std.json.Value{ .object = .empty };
+            try projection.object.put(scratch, "upstream_revisions", nodes);
+            try projection.object.put(scratch, "upstream_revisions_version", .{ .integer = 1 });
+            var manifest: @import("antfly_decisions").revisions.Manifest = .{};
+            try manifest.collect(projection);
+            return manifest.digest(false);
+        }
+    };
+    const definition = try c.compile(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+        \\{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"model":"strong"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0,1]}}]}
+    , .{}));
+    var fixture = Fixture{ .definition_identity = &definition.sha256 };
+    const outcome = try c.execute(alloc, &definition, "upstream", 1, .{ .ptr = &fixture, .run = Fixture.run });
+    const response = outcome.values[0].?;
+    _ = try c.validateTrace(&definition, response);
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(alloc, cfg.value, response));
+    var cache: adjudication.Config.RevisionCache = .{};
+    defer cache.deinit(alloc);
+    const executor: adjudication.Executor = .{ .ptr = &fixture, .execute = Fixture.execute, .model_revision = Fixture.revision };
+    const recorded = try cfg.value.responseRevision(alloc, response, null, &cache);
+    const current = try cfg.value.responseRevision(alloc, response, executor, &cache);
+    try testing.expect(recorded != null and current != null);
+    try testing.expectEqualSlices(u8, &recorded.?, &current.?);
+    try testing.expectEqual(@as(usize, 1), fixture.probes);
+    fixture.probes = 0;
+    fixture.base.response = try std.json.Stringify.valueAlloc(alloc, response, .{});
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = executor, .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    const accepted_artifact = try alloc.dupe(u8, map.map.get("resolution").?);
+    const next_config = try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+        \\{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"model":"strong-v2"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0,1]}}]}
+    , .{});
+    const next_definition = try c.compile(alloc, next_config);
+    fixture.changed = true;
+    fixture.definition_identity = &next_definition.sha256;
+    const next = try c.execute(alloc, &next_definition, "upstream", 1, .{ .ptr = &fixture, .run = Fixture.run });
+    _ = try c.validateTrace(&next_definition, next.values[0].?);
+    try testing.expect(try c.agreementBlocked(next.values[0].?));
+    fixture.base.response = try std.json.Stringify.valueAlloc(alloc, next.values[0].?, .{});
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    var replay = try parseResolution(a, map.map.get("resolution").?);
+    defer replay.deinit();
+    try testing.expectEqual(Decision.review, replay.entities[0].decision);
+    try testing.expectEqual(adjudication.Status.abstained, replay.entities[0].adjudication.?.status);
+    try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+    try testing.expectEqual(@as(usize, 1), fixture.probes);
+    // Historical empty projections cannot prove that hidden definitions were
+    // absent. Keep the artifact intact and require explicit invalidation.
+    const legacy = try std.json.parseFromSliceLeaky(std.json.Value, alloc, accepted_artifact, .{});
+    const evidence = legacy.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
+    for (evidence.object.getPtr("response").?.object.getPtr("cascade").?.object.getPtr("stages").?.array.items) |*entry| {
+        _ = entry.object.swapRemove("upstream_revisions_version");
+        _ = entry.object.swapRemove("upstream_revisions_complete");
+    }
+    try evidence.object.put(alloc, "execution_hash", legacy.object.get("adjudication_execution_hash").?);
+    const historical_bytes = try std.json.Stringify.valueAlloc(alloc, legacy, .{});
+    try map.store().put("resolution", historical_bytes);
+    try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+    stage.adjudicator = null;
+    try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), null, "source", "resolution"));
+    try testing.expectEqualStrings(historical_bytes, map.map.get("resolution").?);
+    try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+    try testing.expectEqual(@as(usize, 1), fixture.probes);
+    stage.config_generation += 1;
+    stage.adjudicator = executor;
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    try testing.expectEqual(@as(usize, 3), fixture.base.calls);
+}
+
+test "REVIEW historical composite bindings preserve evidence without authorizing incomplete replay" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const config = try adjudication.Config.parse(a,
+        \\{"decider":{"model":"remote"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    );
+    defer config.deinit();
+    var fixture = RevisionedAdjudicationFixture{};
+    const upstream = try AgreementUpstreamFixture.response(scratch, config.value, fixture.revision, false);
+    fixture.base.response = try std.json.Stringify.valueAlloc(scratch, upstream, .{});
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+    const old = try std.json.parseFromSliceLeaky(std.json.Value, scratch, map.map.get("resolution").?, .{});
+    const evidence = old.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
+    const response = evidence.object.getPtr("response").?;
+    for (response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items) |*entry| {
+        _ = entry.object.swapRemove("upstream_revisions_version");
+        _ = entry.object.swapRemove("upstream_revisions_complete");
+    }
+    const historical = (try config.value.historicalResponseRevision(scratch, response.*)).?;
+    var cache: adjudication.Config.RevisionCache = .{};
+    defer cache.deinit(scratch);
+    const current = (try config.value.responseRevision(scratch, response.*, null, &cache)).?;
+    try testing.expect(!std.mem.eql(u8, &historical, &current));
+    const previous = (try config.value.previousResponseRevision(scratch, response.*)).?;
+    try testing.expect(!std.mem.eql(u8, &historical, &previous));
+    for ([_][32]u8{ historical, previous }) |binding| {
+        try evidence.object.put(scratch, "execution_hash", .{ .string = try fingerprintHex(scratch, .{ old.object.get("adjudication_execution_hash").?.string, binding }) });
+        const bytes = try std.json.Stringify.valueAlloc(scratch, old, .{});
+        try map.store().put("resolution", bytes);
+        stage.adjudicator = null;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), null, "source", "resolution"));
+        stage.adjudicator = fixture.executor();
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        try testing.expectEqualStrings(bytes, map.map.get("resolution").?);
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+        try testing.expectEqual(@as(usize, 0), fixture.probes);
+    }
+}
+
+test "REVIEW maximum historical dependency receipts can still retract a veto" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const cfg = try adjudication.Config.parse(a, adjudication_test_config);
+    defer cfg.deinit();
+    const response = try AgreementUpstreamFixture.response(scratch, cfg.value, @splat(0xaa), true);
+    const entries = response.object.get("cascade").?.object.get("stages").?.array.items;
+    for (entries) |*entry| {
+        _ = entry.object.swapRemove("upstream_revisions_version");
+        _ = entry.object.swapRemove("upstream_revisions_complete");
+    }
+    const nodes = entries[1].object.getPtr("upstream_revisions").?;
+    for (0..30) |index| {
+        var node = std.json.Value{ .object = .empty };
+        try node.object.put(scratch, "kind", .{ .string = "model" });
+        try node.object.put(scratch, "identity", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+        try node.object.put(scratch, "model", .{ .string = "leaf-a" });
+        var path = std.json.Array.init(scratch);
+        try path.append(.{ .string = try std.fmt.allocPrint(scratch, "branch{d}", .{index}) });
+        try node.object.put(scratch, "path", .{ .array = path });
+        try nodes.array.append(node);
+    }
+    try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(scratch, cfg.value, response));
+    var historical: @import("antfly_decisions").revisions.Manifest = .{};
+    try historical.collectHistorical(response);
+    try testing.expectEqual(@as(usize, 32), historical.len);
+    var cache: adjudication.Config.RevisionCache = .{};
+    defer cache.deinit(scratch);
+    try testing.expect((try cfg.value.responseRevision(scratch, response, null, &cache)) != null);
+    var fixture = AdjudicationFixture{ .response = try std.json.Stringify.valueAlloc(scratch, try AgreementUpstreamFixture.response(scratch, cfg.value, @splat(0xaa), false), .{}) };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+    const old = try std.json.parseFromSliceLeaky(std.json.Value, scratch, map.map.get("resolution").?, .{});
+    const evidence = old.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
+    try evidence.object.put(scratch, "response", response);
+    try evidence.object.put(scratch, "specification_hash", .{ .string = try fingerprintHex(scratch, .{ try cfg.value.semantic(scratch), historical.digest(false) }) });
+    try evidence.object.put(scratch, "execution_hash", .{ .string = try fingerprintHex(scratch, .{ old.object.get("adjudication_execution_hash").?.string, historical.digest(false) }) });
+    try map.store().put("resolution", try std.json.Stringify.valueAlloc(scratch, old, .{}));
+    stage.adjudicator = null;
+    _ = try stage.run(a, map.store(), null, "source", "resolution");
+    var replay = try parseResolution(a, map.map.get("resolution").?);
+    defer replay.deinit();
+    try testing.expectEqual(Decision.review, replay.entities[0].decision);
+    try testing.expectEqual(adjudication.Status.abstained, replay.entities[0].adjudication.?.status);
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+    // The same capacity fix cannot authorize an incomplete positive verdict.
+    const metadata = response.object.getPtr("cascade").?;
+    const strong = &metadata.object.getPtr("stages").?.array.items[1];
+    const fast = &metadata.object.getPtr("stages").?.array.items[0].object.getPtr("answers").?.array.items[0];
+    try fast.object.put(scratch, "choice", .{ .string = "same" });
+    try fast.object.getPtr("probabilities").?.array.items[0].object.put(scratch, "probability", .{ .float = 0.97 });
+    try fast.object.getPtr("probabilities").?.array.items[1].object.put(scratch, "probability", .{ .float = 0.03 });
+    for ([_]*std.json.Value{ metadata, strong }) |fields| {
+        try fields.object.put(scratch, "agreement_status", .{ .string = "agreed" });
+        try fields.object.put(scratch, "agreed", .{ .bool = true });
+        _ = fields.object.swapRemove("disagreed_questions");
+    }
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, cfg.value, response));
+    const positive = try std.json.Stringify.valueAlloc(scratch, old, .{});
+    try map.store().put("resolution", positive);
+    try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), null, "source", "resolution"));
+    stage.adjudicator = fixture.executor();
+    try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqualStrings(positive, map.map.get("resolution").?);
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
 }
