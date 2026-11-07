@@ -925,6 +925,73 @@ test "lite write amplification report" {
     std.debug.print("lite_write_amplification_json_begin\n{s}\nlite_write_amplification_json_end\n", .{json_text});
 }
 
+// Diagnostic-only (not part of the regular report/ceilings tests): isolates
+// dense's own write path from every other mode in "lite write amplification
+// report", to narrow down a suspected `error.UnexpectedNativePageKind`
+// surfaced on an unrelated index when dense_storage_backend is flipped to
+// `.native_catalog` in lite/backend.zig's configureDbOpenOptions. See the
+// handback's dense/open-risk section. Requires dense_storage_backend to
+// actually be `.native_catalog` to reproduce anything -- with it left at
+// the shipped default (`.lsm`) this test is expected to pass cleanly, same
+// as the "indexed" and "dense-vector-visible" modes in the main report.
+test "lite write amplification diagnostic: dense vector mode alone" {
+    const alloc = std.testing.allocator;
+    const dense = try measureSingleWriterVector(alloc, "lite-write-amp-diag-dense-alone", false, default_updates);
+    printStageTable("diagnostic: dense-vector-visible alone", dense);
+}
+
+// Same diagnostic, but with a full_text ("indexed") mode run in the SAME
+// process immediately beforehand, matching the main report's mode order
+// (indexed runs second, well before any dense mode) -- isolates whether
+// the corruption needs a prior, unrelated full_text-indexed Fixture to
+// have run in-process first, or reproduces with dense alone (the test
+// above) just as readily.
+test "lite write amplification diagnostic: full text then dense vector mode" {
+    const alloc = std.testing.allocator;
+    const indexed = try measureSingleWriter(alloc, "lite-write-amp-diag-indexed-first", true, default_updates);
+    printStageTable("diagnostic: full-text-visible (indexed)", indexed);
+    const dense = try measureSingleWriterVector(alloc, "lite-write-amp-diag-dense-after-indexed", false, default_updates);
+    printStageTable("diagnostic: dense-vector-visible after indexed", dense);
+}
+
+// Same diagnostic family, extended to the full single-process mode lineup
+// the main report test runs (minus its own 8-writer variants other than
+// dense's): primary, indexed, graph, dense, sparse in sequence, then
+// dense's own 8-writer concurrent mode last. Narrows whether a suspected
+// corruption needs the full report's exact mode sequence/concurrency to
+// reproduce, or reproduces already in the two simpler diagnostics above.
+test "lite write amplification diagnostic: full mode lineup plus dense concurrent" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+    const primary = try measureSingleWriter(alloc, "lite-write-amp-diag2-primary", false, updates);
+    printStageTable("diagnostic2: primary-only", primary);
+    const indexed = try measureSingleWriter(alloc, "lite-write-amp-diag2-indexed", true, updates);
+    printStageTable("diagnostic2: indexed", indexed);
+    const graph = try measureSingleWriterGraph(alloc, "lite-write-amp-diag2-graph", updates);
+    printStageTable("diagnostic2: graph", graph);
+    const dense = try measureSingleWriterVector(alloc, "lite-write-amp-diag2-dense", false, updates);
+    printStageTable("diagnostic2: dense", dense);
+    const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-diag2-sparse", true, updates);
+    printStageTable("diagnostic2: sparse", sparse);
+    const dense_concurrent = try measureConcurrentVector(alloc, "lite-write-amp-diag2-dense-concurrent", false, default_writers, updates / default_writers);
+    printStageTable("diagnostic2: dense 8 writers", dense_concurrent);
+}
+
+// Narrows the diagnostic2 failure (UnexpectedNativePageKind surfaced while
+// closing the "indexed" Fixture, immediately before the "graph" Fixture's
+// first edge write fails) to whether dense's activation is even involved:
+// this test never touches a dense (or sparse) index at all.
+test "lite write amplification diagnostic: primary then indexed then graph only" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+    const primary = try measureSingleWriter(alloc, "lite-write-amp-diag3-primary", false, updates);
+    printStageTable("diagnostic3: primary-only", primary);
+    const indexed = try measureSingleWriter(alloc, "lite-write-amp-diag3-indexed", true, updates);
+    printStageTable("diagnostic3: indexed", indexed);
+    const graph = try measureSingleWriterGraph(alloc, "lite-write-amp-diag3-graph", updates);
+    printStageTable("diagnostic3: graph", graph);
+}
+
 // Regression gate: ceilings start at the measured baseline plus a small
 // slack factor. TODO(write-amplification): tighten these once the
 // publication-shape work in docs/design/lite-performance/README.md lands;

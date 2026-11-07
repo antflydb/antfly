@@ -1399,6 +1399,7 @@ pub const IndexManager = struct {
     text_main_lsm_options: lsm_backend_mod.Options,
     text_wal_lsm_options: lsm_backend_mod.Options,
     dense_storage_backend: hbc_mod.StorageBackend,
+    dense_main_native_catalog_sink: ?hbc_mod.NativeCatalogSink = null,
     dense_lsm_storage: ?lsm_backend_mod.Storage,
     vector_block_storage: ?lsm_backend_mod.Storage,
     generation_storage: ?lsm_backend_mod.Storage,
@@ -3316,6 +3317,7 @@ pub const IndexManager = struct {
             .text_main_lsm_options = text_main_lsm_options,
             .text_wal_lsm_options = text_wal_lsm_options,
             .dense_storage_backend = opts.dense_storage_backend,
+            .dense_main_native_catalog_sink = opts.dense_main_native_catalog_sink,
             .dense_lsm_storage = opts.dense_lsm_storage,
             .vector_block_storage = vector_block_storage,
             .generation_storage = opts.generation_storage,
@@ -6859,6 +6861,7 @@ pub const IndexManager = struct {
             .storage = self.effectiveDenseStorage(),
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
+            .native_catalog_sink = self.dense_main_native_catalog_sink,
         });
         errdefer entry.index.close();
 
@@ -18559,6 +18562,17 @@ pub const IndexManager = struct {
                 applied_sequence,
                 @errorName(err),
             });
+            // Bug-3/open-risk diagnostic: the generic error name alone does
+            // not say which of persistExperimentalPostingSidecarAtApplied
+            // SequenceWithLease's internal calls (openExperimentalPostingStore,
+            // finishExperimentalPostingMutationCapture, publishExperimental
+            // PostingCheckpoint, posting_store.commitPrepared, ...) actually
+            // failed. Dump the Debug-build error-return trace captured at the
+            // point of failure so a real repro's log pinpoints the call site.
+            if (@errorReturnTrace()) |trace| {
+                std.debug.print("dense posting sidecar failure trace index={s} sequence={} err={s}:\n", .{ name, applied_sequence, @errorName(err) });
+                std.debug.dumpErrorReturnTrace(trace);
+            }
             entry.index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                 std.log.warn("dense posting sidecar invalidation failed index={s} err={s}", .{ name, @errorName(invalidate_err) });
             };
@@ -23472,6 +23486,7 @@ pub const IndexManager = struct {
                     .storage = self.effectiveDenseStorage(),
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
+                    .native_catalog_sink = self.dense_main_native_catalog_sink,
                 });
                 index_open = true;
                 index.setIo(self.io);
@@ -33106,45 +33121,42 @@ pub const IndexManager = struct {
             if (profile_enabled) profile.artifact_decode_ns = platform_time.monotonicNs() - decode_start_ns;
             if (unreadable_artifact_keys.items.len > 0) return error.ArtifactRepairRequired;
 
-            if (delete_keys.items.len > 0) {
-                const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-                try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
-                    .defer_term_range_updates = true,
-                    .backend_batch_options = batch_options,
-                });
-                if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
-            }
-            if (sparse_writes.items.len > 0) {
+            // Delete-before-insert for the same logical write (every entry
+            // appended to sparse_writes above also appended its own key to
+            // delete_keys) used to cost two separate native commits here --
+            // SparseIndex.batchWithOptions already accepts deletes and
+            // writes together in one transaction, so there is nothing
+            // sequencing-sensitive about combining them: both arms still
+            // process deletes before inserts internally.
+            if (delete_keys.items.len > 0 or sparse_writes.items.len > 0) {
                 const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-                try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
-                try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
+                if (sparse_writes.items.len > 0) try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
+                try entry.index.batchWithOptions(sparse_writes.items, delete_keys.items, .{
                     .defer_term_range_updates = true,
                     .backend_batch_options = batch_options,
                     .prefer_bulk_build = batch_options.mode == .bulk_ingest,
                     .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
                 });
-                if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                if (profile_enabled) {
+                    profile.delete_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                    profile.sparse_batch_ns = profile.delete_batch_ns;
+                }
             }
         }
 
-        if (pending_artifact_loads.items.len == 0 and delete_keys.items.len > 0) {
-            const delete_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-            try entry.index.batchWithOptions(&.{}, delete_keys.items, .{
-                .defer_term_range_updates = true,
-                .backend_batch_options = batch_options,
-            });
-            if (profile_enabled) profile.delete_batch_ns = platform_time.monotonicNs() - delete_start_ns;
-        }
-        if (pending_artifact_loads.items.len == 0 and sparse_writes.items.len > 0) {
+        if (pending_artifact_loads.items.len == 0 and (delete_keys.items.len > 0 or sparse_writes.items.len > 0)) {
             const sparse_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-            try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
-            try entry.index.batchWithOptions(sparse_writes.items, &.{}, .{
+            if (sparse_writes.items.len > 0) try self.assignSparseWriteDocNumsFromIdentity(store, entry, sparse_writes.items);
+            try entry.index.batchWithOptions(sparse_writes.items, delete_keys.items, .{
                 .defer_term_range_updates = true,
                 .backend_batch_options = batch_options,
                 .prefer_bulk_build = batch_options.mode == .bulk_ingest,
                 .assume_new_doc_ids = batch_options.mode == .bulk_ingest,
             });
-            if (profile_enabled) profile.sparse_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+            if (profile_enabled) {
+                profile.delete_batch_ns = platform_time.monotonicNs() - sparse_start_ns;
+                profile.sparse_batch_ns = profile.delete_batch_ns;
+            }
         }
         if (profile_enabled and (pending_artifact_loads.items.len > 0 or sparse_writes.items.len > 0 or delete_keys.items.len > 0)) {
             std.log.info(

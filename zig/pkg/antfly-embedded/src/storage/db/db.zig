@@ -29165,6 +29165,18 @@ pub const DB = struct {
     }
 
     fn recoverCommittedIndexAdmission(self: *DB, cfg: types.IndexConfig, activation_err: anyerror) !?u128 {
+        // An outcome-unknown error means the native commit protocol itself
+        // could not confirm whether this index's post-commit bookkeeping (or
+        // even its own catalog admission) actually landed durably -- this is
+        // not an ordinary recoverable activation failure, it is exactly the
+        // class of error `batchTrackedWithMarkerAndWriterLaneHook` already
+        // refuses to swallow for primary writes (see `isOutcomeUnknownError`
+        // above). Treating it as "committed, repair pending" here would let
+        // `addIndex()` report success (null or a repair id) over state this
+        // process does not actually know is correct: a crash or injected
+        // fault during admission activation must surface as an error to the
+        // caller, not get silently absorbed into the repair path.
+        if (isOutcomeUnknownError(activation_err)) return activation_err;
         // Admission remains fail-closed until the durable repair marker is
         // materialized, so this is degraded-but-recoverable state.
         std.log.warn("index catalog admission committed with pending activation index={s} err={s}", .{ cfg.name, @errorName(activation_err) });

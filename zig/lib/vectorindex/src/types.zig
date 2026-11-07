@@ -147,6 +147,15 @@ pub const QuantizationRefine = enum {
 
 pub const StorageBackend = enum {
     lsm,
+    /// WS4-for-vectors: one native commit per HBC publication, via
+    /// `storage/native_catalog_backend.zig`, instead of an LSM instance (its
+    /// own WAL) on Lite's virtual filesystem. See
+    /// `docs/design/lite-performance/lite-single-commit-write-path.md`.
+    /// Lite-only: the hosted server never selects this. Orthogonal to the
+    /// experimental native posting-WAL raw-storage AUTHORITY mode
+    /// (`hbc_backend.OpenedBackend.native`): a `.native_catalog`-backed
+    /// index is never promoted to that mode.
+    native_catalog,
 };
 
 pub const BulkBuildAlgo = enum {

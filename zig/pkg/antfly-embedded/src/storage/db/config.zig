@@ -317,6 +317,9 @@ pub const IndexBackendOptions = struct {
     /// `storage/native_catalog_backend.zig:Sink`.
     text_main_native_catalog_sink: ?persistent_mod.NativeCatalogSink = null,
     dense_storage_backend: hbc_mod.StorageBackend = .lsm,
+    /// Required when `dense_storage_backend == .native_catalog` (Lite
+    /// only). See `storage/native_catalog_backend.zig:Sink`.
+    dense_main_native_catalog_sink: ?hbc_mod.NativeCatalogSink = null,
     sparse_backend: sparse_mod.SparseBackend = .lsm,
     /// Required when `sparse_backend == .native_catalog` (Lite only). See
     /// `storage/native_catalog_backend.zig:Sink`.
@@ -538,6 +541,7 @@ pub fn indexBackendOptionsForPrimary(
         .text_main_backend = if (text_storage_override) overrides.text_main_backend else textMainBackendForPrimary(kind),
         .text_main_native_catalog_sink = overrides.text_main_native_catalog_sink,
         .dense_storage_backend = if (dense_storage_override) overrides.dense_storage_backend else denseStorageBackendForPrimary(kind),
+        .dense_main_native_catalog_sink = overrides.dense_main_native_catalog_sink,
         .sparse_backend = if (sparse_storage_override) overrides.sparse_backend else sparseBackendForPrimary(kind),
         .sparse_main_native_catalog_sink = overrides.sparse_main_native_catalog_sink,
         .graph_reverse_backend = if (graph_storage_override) overrides.graph_reverse_backend else graphReverseBackendForPrimary(kind),

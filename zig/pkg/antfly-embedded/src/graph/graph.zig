@@ -39,6 +39,7 @@ const typed_edges = @import("typed_edges.zig");
 const maintenance = @import("maintenance.zig");
 const cancellation_mod = @import("antfly_cancellation");
 const backend_erased = @import("../storage/backend_erased.zig");
+const backend_types = @import("../storage/backend_types.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
@@ -1341,6 +1342,18 @@ pub const GraphIndex = struct {
         return try self.outgoing_store.beginBatch();
     }
 
+    /// WS4-for-vectors/§3.2a: lets a background-only caller (metric builds,
+    /// topology compaction, ownership transfer) mark its commit
+    /// `.durability = .ride_along` on a `.native_catalog`-backed graph
+    /// index, same as sparse's own beginBatchTxn/beginBatchWithOptions
+    /// sites. Not yet wired into any call site in this file -- see the
+    /// handback's graph-leftovers note on why that per-site audit (dozens
+    /// of production call sites across the metric-build pipeline) is left
+    /// for a follow-up with a working build to verify against.
+    fn beginWriteOutgoingBatchWithOptions(self: *GraphIndex, options: backend_types.BatchOptions) !backend_erased.Batch {
+        return try self.outgoing_store.beginBatchWithOptions(options);
+    }
+
     fn beginReadOutgoingTxn(self: *GraphIndex) !backend_erased.ReadTxn {
         if (self.borrowed_owner) |owner| return owner.beginReadOutgoingTxn();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
@@ -1631,6 +1644,11 @@ pub const GraphIndex = struct {
 
     fn beginWriteReverseBatch(self: *GraphIndex) !backend_erased.Batch {
         return try self.reverse_store.beginBatch();
+    }
+
+    /// See beginWriteOutgoingBatchWithOptions's identical note.
+    fn beginWriteReverseBatchWithOptions(self: *GraphIndex, options: backend_types.BatchOptions) !backend_erased.Batch {
+        return try self.reverse_store.beginBatchWithOptions(options);
     }
 
     fn loadGraphCounters(store: *backend_erased.Store) !Stats {
