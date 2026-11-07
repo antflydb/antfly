@@ -48,21 +48,37 @@ pytestmark = [
 
 @pytest.mark.parametrize(
     "provider",
-    ["local", pytest.param("gcs", marks=pytest.mark.objectstore_integration)],
+    [
+        "local",
+        pytest.param("gcs", marks=pytest.mark.objectstore_integration),
+        pytest.param("gcs_remote", marks=pytest.mark.objectstore_integration),
+    ],
 )
 @pytest.mark.parametrize("index_selector", ["explicit", "inferred"])
+@pytest.mark.parametrize("owned", [False, True])
 def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
-    monkeypatch, record_property, provider, index_selector
+    monkeypatch, record_property, provider, index_selector, owned
 ):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     import conftest
 
+    archive_rows = int(os.environ.get("ANTFLY_E2E_COMPOSED_ARCHIVE_ROWS", "100"))
+    assert 100 <= archive_rows <= 1_000_000
+    extra_id = archive_rows + 100
+    later_id = archive_rows + 101
+    body_bytes = int(os.environ.get("ANTFLY_E2E_COMPOSED_BODY_BYTES", "6"))
+    assert 6 <= body_bytes <= 4096
+    record_property("archive_rows", archive_rows)
+    record_property("body_bytes", body_bytes)
+
     gcs_bucket = os.environ.get("ANTFLY_E2E_GCS_BUCKET")
     gcs_prefix = os.environ.get("ANTFLY_E2E_GCS_PREFIX")
     token_file = os.environ.get("ANTFLY_E2E_GCS_TOKEN_FILE")
     token = None
-    if provider == "gcs":
+    is_gcs = provider.startswith("gcs")
+    remote_source = provider == "gcs_remote"
+    if is_gcs:
         if not all((gcs_bucket, gcs_prefix, token_file)):
             pytest.skip(
                 "GCS qualification requires an explicit bucket, qualification prefix and token file"
@@ -81,6 +97,13 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         path = original(root, **kwargs)
         config = json.loads(path.read_text())
         config["deployment_mode"] = "standalone"
+        if owned:
+            config.setdefault("lake_indexes", {})["serving_cuts"] = {"enabled": True}
+        config["lake_cache"] = {
+            "root": str(root / "serving-cache"),
+            "max_memory_bytes": 64 * 1024**2,
+            "max_disk_bytes": 1024**3,
+        }
         config["storage"] = {"engine": "local", "local": {"base_dir": str(root)}}
         config["connections"]["warehouse-fs"] = {
             "kind": "external_io",
@@ -88,7 +111,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             + ([] if publication_blocked else ["lake.write"]),
             "external_io": {"protocol": "filesystem", "root": str(root)},
         }
-        if provider == "gcs":
+        if is_gcs:
             config["connections"]["prepared-gcs"] = {
                 "kind": "external_io",
                 "capabilities": ["storage.primary"],
@@ -106,6 +129,21 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 "connection": "prepared-gcs",
                 "bucket": gcs_bucket,
                 "prefix": gcs_prefix,
+            }
+        if remote_source:
+            config["connections"]["warehouse-gcs"] = {
+                "kind": "external_io",
+                "capabilities": ["lake.read"]
+                + ([] if publication_blocked else ["lake.write"]),
+                "external_io": {
+                    "protocol": "gcs",
+                    "buckets": [gcs_bucket],
+                    "prefix": gcs_prefix,
+                    "credentials": {
+                        "source": "bearer_token",
+                        "bearer_token": "${secret:composed.gcs.token}",
+                    },
+                },
             }
         path.write_text(json.dumps(config))
         path.chmod(0o600)
@@ -128,13 +166,15 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         pq.write_table(
             pa.table(
                 {
-                    "id": list(range(100)),
-                    "body": ["quasar"] * 100,
-                    "deleted": [False] * 100,
+                    "id": list(range(archive_rows)),
+                    "body": [("quasar " + "archive " * ((body_bytes - 6) // 8)).strip()]
+                    * archive_rows,
+                    "deleted": [False] * archive_rows,
                 }
             ),
             payload,
             compression="NONE",
+            row_group_size=1000,
         )
         data = payload.getvalue()
         (objects / "sample.parquet").write_bytes(
@@ -144,12 +184,90 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             + data
         )
 
+        archive_uri = archive.as_uri()
+        current_uri = (server.root / "current").as_uri()
+        warehouse_connection = "warehouse-fs"
+        if remote_source:
+
+            def put_remote(name, body):
+                r = requests.post(
+                    f"https://storage.googleapis.com/upload/storage/v1/b/{gcs_bucket}/o",
+                    params={
+                        "uploadType": "media",
+                        "name": f"{gcs_prefix}/source/archive/{name}",
+                        "ifGenerationMatch": "0",
+                    },
+                    data=body,
+                    headers={
+                        "Authorization": "Bearer " + token,
+                        "Content-Type": "application/octet-stream",
+                    },
+                    timeout=60,
+                )
+                assert r.ok, f"GCS fixture upload failed: {r.status_code}"
+                return r.json()
+
+            version = put_remote("sample.parquet", data)["generation"]
+            archive_uri = f"gs://{gcs_bucket}/{gcs_prefix}/source/archive"
+            current_uri = f"gs://{gcs_bucket}/{gcs_prefix}/source/current"
+            warehouse_connection = "warehouse-gcs"
+
+        if owned:
+
+            def write_object(name, body):
+                (objects / name).write_bytes(
+                    b"AFOBJ001"
+                    + struct.pack("<QI", len(body), 0)
+                    + hashlib.sha256(body).hexdigest().encode()
+                    + body
+                )
+
+            if remote_source:
+                write_object = put_remote
+            chunk = json.dumps(
+                [
+                    {
+                        "file_id": "sample.parquet",
+                        "object_uri": f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/sample.parquet"
+                        if remote_source
+                        else "object://antfly/sample.parquet",
+                        "version_id": str(version) if remote_source else "",
+                        "byte_len": len(data),
+                        "row_count": archive_rows,
+                    }
+                ]
+            ).encode()
+            write_object("files.json", chunk)
+            head = json.dumps(
+                {
+                    "version": 1,
+                    "source_id": "history",
+                    "chunks": [
+                        {
+                            "uri": f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/files.json"
+                            if remote_source
+                            else "object://antfly/files.json",
+                            "sha256": hashlib.sha256(chunk).hexdigest(),
+                            "byte_len": len(chunk),
+                            "file_count": 1,
+                        }
+                    ],
+                    "file_count": 1,
+                }
+            ).encode()
+            write_object("sealed.parquet-manifest.json", head)
+            archive_uri = (
+                f"gs://{gcs_bucket}/{gcs_prefix}/source/archive/sealed.parquet-manifest.json"
+                if remote_source
+                else (archive / "sealed.parquet-manifest.json").as_uri()
+            )
+
         def call(method, path, body=None, allow=()):
             nonlocal last_call_ms
             # GCS limits repeated updates to the same mutable coordination
             # object. This is a paced correctness fixture, with no retries;
             # keep unpaced throughput qualification separate.
-            if provider == "gcs":
+            if is_gcs and not (owned and method == "POST" and path == "/query"):
                 time.sleep(1.2)
             request_started = time.monotonic()
             r = requests.request(
@@ -176,14 +294,25 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 time.sleep(0.1)
 
         for name, source in (
-            ("history", {"format": "parquet", "uri": archive.as_uri()}),
+            (
+                "history",
+                {
+                    "format": "parquet",
+                    "uri": archive_uri,
+                    **(
+                        {"credentials": {"ref": warehouse_connection}}
+                        if remote_source
+                        else {}
+                    ),
+                },
+            ),
             (
                 "current",
                 {
                     "format": "iceberg",
-                    "uri": (server.root / "current").as_uri(),
+                    "uri": current_uri,
                     "write_policy": "iceberg_writer",
-                    "credentials": {"ref": "warehouse-fs"},
+                    "credentials": {"ref": warehouse_connection},
                     "catalog": {"type": "managed"},
                 },
             ),
@@ -259,7 +388,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         rows = [
             {"id": i, "body": "different" if i == 1 else "quasar", "deleted": i == 2}
             for i in range(30)
-        ] + [{"id": 200, "body": "quasar", "deleted": False}]
+        ] + [{"id": extra_id, "body": "quasar", "deleted": False}]
         _, receipt = call(
             "POST",
             "/tables/current/lake/changes",
@@ -301,6 +430,15 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             "limit": 7,
         }
 
+        if archive_rows > 100:
+            query["filter_query"] = {
+                "disjuncts": [
+                    {"numeric_range": {"field": "id", "min": 0, "max": 99}},
+                    {"term": {"path": "/id", "value": extra_id}},
+                    {"term": {"path": "/id", "value": later_id}},
+                ]
+            }
+
         def metrics():
             r = requests.get(server.health_url + "/metrics", timeout=10)
             assert r.ok
@@ -318,8 +456,10 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         record_property("first_page_ms", last_call_ms)
         assert len(first["hits"]["hits"]) == 7
         assert "request-lake:" not in json.dumps(first)
-        assert first["next_source_cursor"].startswith("source2:")
-        if provider == "gcs":
+        assert first["next_source_cursor"].startswith(
+            "source3:" if owned else "source2:"
+        )
+        if is_gcs and not owned:
 
             def artifact(reference, generation=None):
                 assert re.fullmatch(
@@ -379,6 +519,26 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             - before["antfly_lake_query_composed_leaf_calls_total"]
             > 2
         )
+        cursor_publications = (
+            after["antfly_lake_query_cursor_publications_total"]
+            - before["antfly_lake_query_cursor_publications_total"]
+        )
+        assert cursor_publications == (0 if owned else 3)
+        record_property("query_cursor_publications", cursor_publications)
+        if owned:
+            # The state is already durable: a forged inline continuation must
+            # fail authentication before any retained source can be selected.
+            original_cursor = first["next_source_cursor"]
+            forged = original_cursor[:-1] + ("0" if original_cursor[-1] != "0" else "1")
+            status, _ = call(
+                "POST", "/query", {**query, "source_cursor": forged}, allow=(400, 409)
+            )
+            assert status in (400, 409)
+            # Cancellation after admission must release the whole request scope;
+            # the next ordinary request still resolves the same live owner cut.
+            call("POST", "/query", {**query, "timeout_ms": 1}, allow=(408, 504))
+            _, healthy = call("POST", "/query", query)
+            assert len(healthy["hits"]["hits"]) == 7
         record_property(
             "preparation_calls",
             after["antfly_lake_query_source_calls_total"]
@@ -411,7 +571,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                     for row in (
                         {"id": 3, "body": "quasar", "deleted": True},
                         {"id": 50, "body": "different", "deleted": False},
-                        {"id": 201, "body": "quasar", "deleted": False},
+                        {"id": later_id, "body": "quasar", "deleted": False},
                     )
                 ],
             },
@@ -419,8 +579,10 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         _, committed = call("GET", "/tables/current/lake/catalog")
         assert committed["metadata"]["properties"]["antfly.wal.coverage"] == "1"
         _, accepted_first = call("POST", "/query", query)
-        assert accepted_first["next_source_cursor"].startswith("source2:")
-        if provider == "gcs":
+        assert accepted_first["next_source_cursor"].startswith(
+            "source3:" if owned else "source2:"
+        )
+        if is_gcs and not owned:
             cursor = retained(accepted_first["next_source_cursor"], "source2:")
             positions = json.loads(cursor["payload"])["sources"]
             current = next(p for p in positions if p["table"] == "current")
@@ -433,14 +595,14 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
         _, complete = call("POST", "/query", {**query, "limit": 128})
         assert len(complete["hits"]["hits"]) == 98
         assert {h["_source"]["id"] for h in complete["hits"]["hits"]} == (
-            set(range(100)) | {200, 201}
+            set(range(100)) | {extra_id, later_id}
         ) - {1, 2, 3, 50}
         assert not complete.get("next_source_cursor")
         assert "request-lake:" not in json.dumps(complete)
         server.restart()
         for page_one, expected in (
-            (first, (set(range(100)) | {200}) - {1, 2}),
-            (accepted_first, (set(range(100)) | {200, 201}) - {1, 2, 3, 50}),
+            (first, (set(range(100)) | {extra_id}) - {1, 2}),
+            (accepted_first, (set(range(100)) | {extra_id, later_id}) - {1, 2, 3, 50}),
         ):
             seen = {h["_source"]["id"] for h in page_one["hits"]["hits"]}
             cursor = page_one["next_source_cursor"]
@@ -486,16 +648,17 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             )
             record_property("host", platform.platform())
             samples = []
+            profile_query = {k: v for k, v in query.items() if k != "filter_query"}
             server.restart()
             read = logical_process_reader(server.proc.pid)
             for index in range(rounds + 1):
-                if provider == "gcs":
+                if is_gcs and not owned:
                     time.sleep(1.2)
                 response, usage = measure(
                     read,
                     lambda: requests.post(
                         server.api_url + "/query",
-                        json=query,
+                        json=profile_query,
                         auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
                         timeout=60,
                     ),
@@ -505,6 +668,58 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 assert len(value["hits"]["hits"]) == 7
                 samples.append({"mode": "restart" if index == 0 else "warm", **usage})
             record_property("query_samples", json.dumps(samples))
+            if owned:
+                from concurrent.futures import ThreadPoolExecutor
+
+                def simultaneous(_):
+                    started = time.monotonic()
+                    response = requests.post(
+                        server.api_url + "/query",
+                        json=profile_query,
+                        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                        timeout=60,
+                    )
+                    assert response.ok, (
+                        f"Concurrent query failed: {response.status_code}"
+                    )
+                    result = response.json()["responses"][0]
+                    assert len(result["hits"]["hits"]) == 7
+                    assert result["next_source_cursor"].startswith("source3:")
+                    return (time.monotonic() - started) * 1000
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    record_property(
+                        "concurrent_query_ms",
+                        json.dumps(list(pool.map(simultaneous, range(12)))),
+                    )
+            # Reset only this fixture's verified serving cache, with the
+            # process stopped. Preserve native metadata/WAL and source objects.
+            import shutil
+
+            server.pause()
+            cache_root = (server.root / "serving-cache").resolve()
+            assert cache_root.parent == server.root.resolve()
+            shutil.rmtree(cache_root, ignore_errors=True)
+            cold_started = time.monotonic()
+            server.resume()
+            response, usage = measure(
+                logical_process_reader(server.proc.pid),
+                lambda: requests.post(
+                    server.api_url + "/query",
+                    json=profile_query,
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=60,
+                ),
+            )
+            assert (
+                response.ok
+                and len(response.json()["responses"][0]["hits"]["hits"]) == 7
+            )
+            record_property("cold_cache_query", json.dumps(usage))
+            record_property(
+                "cold_cache_startup_and_query_ms",
+                (time.monotonic() - cold_started) * 1000,
+            )
         failed = False
     finally:
         server.stop(test_failed=failed)

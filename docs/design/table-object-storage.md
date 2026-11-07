@@ -72,22 +72,38 @@ The native catalog owns existence, logical naming, schema, indexes, and table
 incarnation. In distributed mode it retains metadata consensus. Removing data
 Raft does not remove metadata authority or coordinated publication.
 
-### Planned authoritative serving cuts
+### Native owner serving cuts
 
-Request-local preparation reuse retains the current remote authority checks.
-The next serving design moves those checks to the authoritative native owner
-for sources whose complete write path Antfly controls. This is planned work,
-not a property of the reader-sharing implementation.
+The candidate adds opt-in native owner admission for sources whose complete
+write path Antfly controls. `lake_indexes.serving_cuts.enabled` starts durable
+activation after all writers are upgraded. Reader sharing alone retains strict
+remote checks; an activated owned source instead serves its native admitted
+publication/WAL record. This candidate still requires end-to-end qualification
+before release or deployment.
 
 Eligible sources are managed Iceberg behind an enforced writer gateway and
 sealed immutable Parquet manifests. An immutable-file prefix is insufficient:
 its membership can still change. Shared external catalogs retain fresh catalog
 coordination or an explicit bounded-staleness contract.
 
+Activation conditionally claims the managed catalog and WAL heads with the
+same durable owner nonce. Unhooked writers fail, including older binaries whose
+strict parsers reject the ownership field. A partially completed claim remains
+unavailable until reconciliation finishes; turning the configuration off does
+not remove an established fence. Sealed manifests have immutable membership.
+
 The native owner persists source identity, incarnation, ownership epoch,
 acknowledged WAL watermark and the current reusable serving-cut reference.
-Every accepted write advances or invalidates that record before acknowledgment.
-Catalog changes invalidate it before returning success. Admission of a rebuilt
+A compact projection is written in the same native transaction as lifecycle
+state, so fresh queries do not transfer retained publication history. Native
+snapshots include both projections; older checkpoints reconstruct the compact
+view on the metadata owner. Every accepted write advances or invalidates that
+record before acknowledgment.
+Catalog changes invalidate it before returning success. If remote commitment
+succeeds but native acknowledgment fails, the API reports `state: unknown`
+without a read receipt. Exact retries repeat native acknowledgment without
+appending the WAL again; resolving a committed catalog request also repairs
+native invalidation before reporting success. Admission of a rebuilt
 cut compares the epoch captured before observing catalog/WAL state, and cannot
 regress the acknowledged watermark. An unavailable replacement cut returns a
 retryable rebuilding response rather than serving an older acknowledged state.
@@ -105,10 +121,15 @@ enable this mode.
 Publication and write acceptance construct reusable immutable state references
 containing the published generation and bounded pending row images. Queries
 issue authenticated cursor references to that state and a WAL position, without
-uploading another retained image or cursor envelope. Cursor validation still
+uploading another retained image or cursor envelope. The implementation uses
+HMAC-authenticated `lake3:` and `source3:` capabilities, while retaining legacy
+`lake2:`/`source2:` reads. Signing keys stay in private native metadata. Cursor validation still
 checks current permissions, incarnation, recipe, ownership and expiry. Reader
 leases protect published generations through every issued cursor's expiry;
-state images and their row groups must live at least as long. Refresh happens
+state images and their row groups must live at least as long. Admission extends
+the publication reader through twice the cursor TTL plus a refresh margin,
+atomically with accepting the image reference. Existing generation and metadata
+bounds can impose explicit backpressure at high publication rates. Refresh happens
 before the remaining retention horizon becomes too short for a new cursor.
 Raw captured WAL heads cannot substitute for retained row images when their
 underlying roots can be collected independently.

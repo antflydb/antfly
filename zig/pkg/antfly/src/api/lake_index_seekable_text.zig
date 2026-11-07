@@ -97,6 +97,33 @@ pub const Read = struct {
         try self.cancellation.check();
     }
 };
+/// Seed a bounded working set through the exact same verified caches used by
+/// demand reads. The rest of the index remains remote and fills on misses.
+pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    if (ref.byte_len > maximum_bytes or ref.byte_len > 512 * 1024) return 0;
+    try read.check();
+    const directory = try loadDirectory(a, read, ref);
+    var spent: usize = @intCast(ref.byte_len);
+    if (directory.metadata_bundle) |bundle| if (bundle.byte_len <= maximum_bytes -| spent) {
+        const bytes = try artifacts.readArtifact(a, read.store, bundle, read.cancellation, read.cache);
+        defer a.free(bytes);
+        spent += bytes.len;
+    };
+    for ([_][]const Piece{ directory.metadata, directory.blocks }) |pieces| {
+        // Cover dictionary/locator opening pages and a bounded sample of
+        // posting/source blocks; actual query blocks remain in the shared
+        // memory/disk cache after their first authenticated demand read.
+        for (pieces, 0..) |piece, index| {
+            if (index == 4) break;
+            if (piece.ref.byte_len > maximum_bytes -| spent) break;
+            try read.check();
+            var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
+            spent += @intCast(piece.ref.byte_len);
+            held.deinit();
+        }
+    }
+    return spent;
+}
 fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !Ref {
     var writer = store.*;
     writer.allocator = a;
