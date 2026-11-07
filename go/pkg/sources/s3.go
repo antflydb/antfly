@@ -108,8 +108,11 @@ func (c *S3Connector) Enumerate(ctx context.Context, r Request) (Inventory, erro
 		// is scoped to one. The relative key is this source's own root-relative
 		// name, so a source that only ever sees keys under its configured prefix
 		// keeps the same relative key if the prefix (or bucket) later changes.
-		relativeKey := strings.TrimPrefix(strings.TrimPrefix(info.Key, cfg.Prefix), "/")
-		out.Objects = append(out.Objects, Item{ID: "s3://" + strings.Trim(r.SourceNamespace, "/") + "/" + cfg.Bucket + "/" + info.Key, Path: info.Key, RelativeKey: relativeKey, Filename: filepath.Base(info.Key), Revision: rev, URL: uri, Size: info.Size, SourceKind: ProviderS3, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "bucket": cfg.Bucket, "key": info.Key, "etag": rev, "size": info.Size, "version_id": info.VersionID, "mime_type": info.ContentType}})
+		// Prefixes are literal; do not trim slashes from the suffix, since
+		// "a" and "/a" are distinct object names. Use a trailing slash on
+		// a directory prefix when directory-relative identities are desired.
+		relativeKey := strings.TrimPrefix(info.Key, cfg.Prefix)
+		out.Objects = append(out.Objects, Item{ID: "s3://" + strings.Trim(r.SourceNamespace, "/") + "/" + cfg.Bucket + "/" + info.Key, Path: info.Key, RelativeKey: relativeKey, RelativeKeySet: true, Filename: filepath.Base(info.Key), Revision: rev, URL: uri, Size: info.Size, SourceKind: ProviderS3, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "bucket": cfg.Bucket, "key": info.Key, "etag": rev, "size": info.Size, "version_id": info.VersionID, "mime_type": info.ContentType}})
 		return nil
 	}
 	if cfg.Key != "" {

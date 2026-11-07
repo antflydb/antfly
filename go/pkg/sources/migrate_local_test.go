@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -739,7 +740,7 @@ func TestMigrateLocalSecondRunIsNoOp(t *testing.T) {
 	require.Equal(t, 0, second.Copied)
 	require.Equal(t, 1, second.Skipped)
 	require.True(t, second.CatalogRepointed)
-	require.Empty(t, second.RunID, "an already-repointed source must not trigger another sync")
+	require.NotEmpty(t, second.RunID, "a rerun must confirm publication even after PUT already committed")
 
 	bucket.mu.Lock()
 	require.Equal(t, putsAfterFirst, bucket.puts)
@@ -1085,4 +1086,90 @@ func TestMigrateLocalRepointsCatalogForGCSAndSyncsAfterward(t *testing.T) {
 	// works against the fake, not just the one-off migration read).
 	job := startServiceJob(t, service)
 	require.Equal(t, "completed", job.State, "the migrated GCS source must sync normally afterward")
+}
+
+// PUT is durable before sync; neither a failed admission nor a failed job
+// establishes publication. A retry must confirm the destination rows.
+func TestMigrateLocalRetryConfirmsPublicationAfterCommittedPUT(t *testing.T) {
+	for _, failure := range []string{"before-sync", "failed-job"} {
+		t.Run(failure, func(t *testing.T) {
+			opts, service, _, _, backend := migrateLiveFixture(t)
+			var fail atomic.Bool
+			fail.Store(true)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if fail.Load() && r.Method == http.MethodPost && r.URL.Path == "/v1/sync" {
+					if failure == "before-sync" {
+						w.WriteHeader(500)
+					} else {
+						w.WriteHeader(http.StatusAccepted)
+						fmt.Fprint(w, `{"version":1,"id":"failed-job","state":"failed","code":"injected"}`)
+					}
+					return
+				}
+				service.ServeHTTP(w, r)
+			}))
+			defer server.Close()
+			opts.Server = server.URL
+			_, err := MigrateLocal(t.Context(), opts)
+			require.Error(t, err)
+			service.mu.Lock()
+			connection := service.profile.Sources[0].Connection
+			service.mu.Unlock()
+			require.Equal(t, "bucket", connection)
+			backend.mu.Lock()
+			published := len(backend.records)
+			backend.mu.Unlock()
+			require.Zero(t, published)
+			fail.Store(false)
+			result, err := MigrateLocal(t.Context(), opts)
+			require.NoError(t, err)
+			require.True(t, result.CatalogRepointed)
+			require.Zero(t, result.Copied)
+			require.Equal(t, 1, result.Skipped)
+			require.NotEmpty(t, result.RunID)
+			backend.mu.Lock()
+			published = len(backend.records)
+			backend.mu.Unlock()
+			require.Equal(t, 1, published)
+		})
+	}
+}
+
+func TestBucketRelativeKeysPreserveExactPrefixSuffix(t *testing.T) {
+	for _, kind := range migrateTestDestinationKinds {
+		for _, prefix := range []string{"", "team/", "team"} {
+			t.Run(kind+"/"+prefix, func(t *testing.T) {
+				td := newMigrateTestDestination(t, kind)
+				suffixes := []string{"a", "/a", "//a"}
+				if prefix != "" {
+					suffixes = append(suffixes, "")
+				}
+				for _, suffix := range suffixes {
+					td.seed(prefix+suffix, []byte("x"))
+				}
+				var connector Connector
+				if kind == "s3" {
+					dest := td.dest.(*s3Destination)
+					connector = &S3Connector{Client: dest.client}
+				} else {
+					dest := td.dest.(*gcsDestination)
+					connector = &GoogleConnector{ProviderName: ProviderGCS, APIBase: dest.apiBase, HTTPClient: dest.client}
+				}
+				raw, err := json.Marshal(map[string]any{"bucket": "testbucket", "prefix": prefix})
+				require.NoError(t, err)
+				inventory, err := connector.Enumerate(t.Context(), Request{Mode: ImportModeSource, SourceNamespace: "job/" + testSourceID, Config: raw})
+				require.NoError(t, err)
+				require.Len(t, inventory.Objects, len(suffixes))
+				keys := map[string]bool{}
+				for _, item := range inventory.Objects {
+					require.Equal(t, strings.TrimPrefix(item.Path, prefix), item.RelativeKey)
+					require.Equal(t, item.RelativeKey, relativeKeyFor(testSourceID, item))
+					key, err := IdentityKey(testSourceID, "stable", relativeKeyFor(testSourceID, item), item.ID)
+					require.NoError(t, err)
+					require.False(t, keys[key], "distinct object names must never share an identity")
+					keys[key] = true
+				}
+			})
+		}
+	}
 }

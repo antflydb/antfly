@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import type { AntflyClient } from "@antfly/sdk";
 import type { SourceSyncJob, StandaloneSourcesClient } from "@antfly/sdk/sources";
 import { type AntflyAssetReference, encodeAssetReference } from "./reference.js";
@@ -112,21 +112,55 @@ export class AssetUploadTimeoutError extends Error {
  * for a newly-uploaded object.
  */
 export async function uploadFile(options: UploadFileOptions): Promise<UploadFileResult> {
+  const deadline = Date.now() + (options.timeoutMs ?? 120_000);
+  const profile = await options.sources.profile(options.signal);
+  const source = profile.sources.find((source) => source.id === options.sourceId);
+  if (
+    !source ||
+    source.table !== options.table ||
+    source.publication !== "media" ||
+    profile.connections[source.connection]?.provider !== "local"
+  ) {
+    throw new Error("Upload requires a registered local media source in the specified table");
+  }
+  const prefix = source.config.prefix ?? "";
+  if (
+    typeof prefix !== "string" ||
+    prefix !== (options.prefix ?? "") ||
+    (prefix !== "" &&
+      (prefix.startsWith("/") ||
+        prefix.includes("\\") ||
+        prefix.includes("\0") ||
+        posix.normalize(prefix) !== prefix ||
+        prefix === ".." ||
+        prefix.startsWith("../")))
+  ) {
+    throw new Error("Upload prefix must match the source's local prefix");
+  }
   const digest = createHash("sha256").update(options.data).digest("hex");
   const ext = MIME_EXTENSIONS[options.mimeType];
   const objectsDir = join(options.localRoot, options.prefix ?? "", "objects", "sha256");
-  const finalPath = join(objectsDir, ext ? `${digest}.${ext}` : digest);
+  const filename = ext ? `${digest}.${ext}` : digest;
+  const relativeKey = `objects/sha256/${filename}`;
+  const identity = source.identity?.namespace
+    ? `${source.identity.namespace}/${relativeKey}`
+    : `local://job/${options.sourceId}/${posix.join(prefix, relativeKey)}`;
+  const keyDigest = createHash("sha256").update(identity).digest("hex");
+  const reference = {
+    table: options.table,
+    key: `source://job/${options.sourceId}/records/${keyDigest}`,
+  };
+  const finalPath = join(objectsDir, filename);
   await mkdir(objectsDir, { recursive: true });
   const tempPath = join(objectsDir, `.upload-${randomUUID()}`);
   await writeFile(tempPath, options.data);
   await rename(tempPath, finalPath);
 
-  const job = await runSourceSync(options);
+  const job = await runSourceSync(options, deadline);
   if (job.state !== "completed") throw new SourceSyncFailedError(job);
 
-  const deadline = Date.now() + (options.timeoutMs ?? 120_000);
   const pollIntervalMs = options.pollIntervalMs ?? 500;
-  const reference = await pollForCatalogRow(options, digest, deadline, pollIntervalMs);
+  await pollForCatalogRow(options, reference, relativeKey, digest, deadline, pollIntervalMs);
   if ((options.waitFor ?? "published") === "published") {
     return {
       reference,
@@ -135,7 +169,7 @@ export async function uploadFile(options: UploadFileOptions): Promise<UploadFile
       state: "published",
     };
   }
-  await pollForSearchable(options, digest, deadline, pollIntervalMs);
+  await pollForSearchable(options, reference, digest, deadline, pollIntervalMs);
   return {
     reference,
     providerReferenceId: encodeAssetReference(reference),
@@ -144,7 +178,7 @@ export async function uploadFile(options: UploadFileOptions): Promise<UploadFile
   };
 }
 
-async function runSourceSync(options: UploadFileOptions): Promise<SourceSyncJob> {
+async function runSourceSync(options: UploadFileOptions, deadline: number): Promise<SourceSyncJob> {
   const maxRetries = options.maxSyncConflictRetries ?? 5;
   const retryDelayMs = options.syncConflictRetryDelayMs ?? 2000;
   let job: SourceSyncJob | undefined;
@@ -162,7 +196,6 @@ async function runSourceSync(options: UploadFileOptions): Promise<SourceSyncJob>
     }
   }
   if (!job) throw new SourceSyncConflictError(options.sourceId);
-  const deadline = Date.now() + (options.timeoutMs ?? 120_000);
   while (job.state === "running") {
     if (Date.now() > deadline) throw new AssetUploadTimeoutError("published");
     await delay(options.pollIntervalMs ?? 500, options.signal);
@@ -171,32 +204,42 @@ async function runSourceSync(options: UploadFileOptions): Promise<SourceSyncJob>
   return job;
 }
 
-/** Scans recent rows for the one whose `content.resource` names this digest, matching the server's own verification convention. */
-async function findCatalogRowByDigest(
-  client: AntflyClient,
-  table: string,
-  digest: string
-): Promise<AntflyAssetReference | undefined> {
-  const response = await client.tables.query(table, { limit: 256 });
-  const envelope = response as {
-    responses?: { hits?: { hits?: { _id: string; _source: unknown }[] } }[];
-  };
-  const hits = envelope.responses?.[0]?.hits?.hits ?? [];
-  for (const hit of hits) {
-    if (JSON.stringify(hit._source).includes(digest)) return { table, key: hit._id };
-  }
-  return undefined;
-}
-
+/** Direct identity lookup is independent of table size and search indexing. */
 async function pollForCatalogRow(
   options: UploadFileOptions,
+  reference: AntflyAssetReference,
+  relativeKey: string,
   digest: string,
   deadline: number,
   pollIntervalMs: number
-): Promise<AntflyAssetReference> {
+): Promise<void> {
   while (true) {
-    const found = await findCatalogRowByDigest(options.client, options.table, digest);
-    if (found) return found;
+    const { data, response } = await options.client
+      .getRawClient()
+      .GET("/db/v1/tables/{tableName}/documents/{key}", {
+        params: {
+          path: { tableName: reference.table, key: reference.key },
+          query: { consistency: "read_index" },
+        },
+        signal: options.signal,
+      });
+    if (response.ok) {
+      const row = data as {
+        source?: { id?: string; relative_key?: string };
+        metadata?: { sha256?: string };
+        content?: { resource?: { type?: string; version?: string } };
+      };
+      if (
+        row?.source?.id === options.sourceId &&
+        row.source.relative_key === relativeKey &&
+        row.metadata?.sha256 === digest &&
+        row.content?.resource?.type === "source" &&
+        row.content.resource.version === `"${digest}"`
+      )
+        return;
+    } else if (response.status !== 404) {
+      throw new Error(`Upload catalog lookup failed: HTTP ${response.status}`);
+    }
     if (Date.now() > deadline) throw new AssetUploadTimeoutError("published");
     await delay(pollIntervalMs, options.signal);
   }
@@ -204,6 +247,7 @@ async function pollForCatalogRow(
 
 async function pollForSearchable(
   options: UploadFileOptions,
+  reference: AntflyAssetReference,
   digest: string,
   deadline: number,
   pollIntervalMs: number
@@ -211,6 +255,7 @@ async function pollForSearchable(
   while (true) {
     const response = await options.client.tables.query(options.table, {
       full_text_search: { query: digest },
+      filter_query: { ids: [reference.key] },
       limit: 1,
     });
     const envelope = response as { responses?: { hits?: { hits?: unknown[] } }[] };
@@ -223,10 +268,14 @@ async function pollForSearchable(
 function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason);
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    const onAbort = () => {
       clearTimeout(timer);
-      reject(signal.reason);
-    });
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }

@@ -80,6 +80,7 @@ describe("createAssetDisplayHandler", () => {
     });
     const response = await handler(request);
     expect(response.status).toBe(206);
+    expect(response.headers.get("content-disposition")).toBe("inline");
     expect(response.headers.get("content-range")).toBe("bytes 0-3/4");
     response.headers.forEach((value) => {
       expect(value).not.toContain("CAPABILITY-SECRET");
@@ -102,4 +103,24 @@ describe("createAssetDisplayHandler", () => {
     const response = await handler(new Request("https://app.example/assets/x"));
     expect(response.status).toBe(404);
   });
+});
+
+it.each([
+  "text/html",
+  "image/svg+xml",
+  "application/xhtml+xml",
+  "application/octet-stream",
+])("downloads active or unknown content: %s", async (contentType) => {
+  stubCatalogAndMedia(
+    () => new Response("<script>alert(1)</script>", { headers: { "content-type": contentType } })
+  );
+  const handler = createAssetDisplayHandler({
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    authorize: () => true,
+    referenceId: () => encodeAssetReference(reference),
+  });
+  const response = await handler(new Request("https://app.example/assets/x"));
+  expect(response.headers.get("content-disposition")).toBe("attachment");
+  expect(response.headers.get("content-security-policy")).toContain("sandbox");
+  expect(response.headers.get("cache-control")).toBe("private, no-store");
 });

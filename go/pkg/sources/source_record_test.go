@@ -91,10 +91,11 @@ func TestIdentityKeyNamespaceFollowsContentNotLocation(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, fromS3, differentRelativeKey)
 
-	// A namespace is set but no relative key is available: an error, not a
-	// silent fall back to a degenerate or location-based key.
-	_, err = IdentityKey(testSourceID, "ns", "", "s3://job/"+testSourceID+"/bucket/docs/file.txt")
-	require.Error(t, err)
+	// The object whose name equals a literal bucket prefix has an explicit
+	// empty suffix. It is a distinct identity, not a missing/native-ID key.
+	rootKey, err := IdentityKey(testSourceID, "ns", "", "s3://job/"+testSourceID+"/bucket/docs/file.txt")
+	require.NoError(t, err)
+	require.NotEqual(t, fromS3, rootKey)
 }
 
 // TestIdentityKeyCurrentPrefixInvariant pins the construction this task's
@@ -209,4 +210,24 @@ func TestStreamChangesDoNotReacquireSources(t *testing.T) {
 	require.NoError(t, ValidateTextStreams(source.Streams))
 	source.Streams[0].Index = ""
 	require.Error(t, ValidateTextStreams(source.Streams))
+}
+
+func TestExplicitEmptyBucketRelativeKeySurvivesPublication(t *testing.T) {
+	item := Item{ID: "s3://job/" + testSourceID + "/bucket/prefix", Path: "prefix", URL: "s3://bucket/prefix", Revision: "v1", SourceKind: ProviderS3, RelativeKeySet: true}
+	doc, err := Normalize(testSourceID, item, []byte("content"), Permissions{Public: true}, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, "", doc.Metadata["relative_key"])
+	key, err := IdentityKey(testSourceID, "ns", "", item.ID)
+	require.NoError(t, err)
+	_, err = SourceRow(key, testSourceID, "ns", doc)
+	require.NoError(t, err)
+	raw, err := json.Marshal(doc)
+	require.NoError(t, err)
+	var decoded Document
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	_, err = SourceRow(key, testSourceID, "ns", decoded)
+	require.NoError(t, err)
+	delete(doc.Metadata, "relative_key")
+	_, err = SourceRow(key, testSourceID, "ns", doc)
+	require.Error(t, err, "missing metadata must not impersonate an explicit empty key")
 }

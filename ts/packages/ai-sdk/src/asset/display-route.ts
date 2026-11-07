@@ -34,6 +34,26 @@ export interface AssetDisplayRouteOptions {
   fetch?: typeof fetch;
 }
 
+// Only passive formats may render on the application's authenticated origin.
+const INLINE_MEDIA_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/ogg",
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/wav",
+  "audio/ogg",
+  "audio/webm",
+  "audio/flac",
+]);
+
 const FORWARDED_REQUEST_HEADERS = ["range", "if-match", "if-none-match", "if-range"];
 const FORWARDED_RESPONSE_HEADERS = [
   "content-type",
@@ -80,7 +100,10 @@ export function createAssetDisplayHandler(
     }
     // `resource.uri` is the capability URL; it is read here, server-side,
     // and in no other field of this response.
-    const upstream = await fetchFn(resource.uri, { headers: upstreamHeaders });
+    const upstream = await fetchFn(resource.uri, {
+      headers: upstreamHeaders,
+      signal: request.signal,
+    });
 
     const headers = new Headers();
     for (const name of FORWARDED_RESPONSE_HEADERS) {
@@ -88,7 +111,11 @@ export function createAssetDisplayHandler(
       if (value !== null) headers.set(name, value);
     }
     if (!headers.has("content-type")) headers.set("content-type", resource.mime_type);
-    headers.set("content-disposition", "inline");
+    const mediaType = headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() ?? "";
+    const inline = INLINE_MEDIA_TYPES.has(mediaType);
+    headers.set("content-disposition", inline ? "inline" : "attachment");
+    if (!inline) headers.set("content-security-policy", "sandbox; default-src 'none'");
+    headers.set("cache-control", "private, no-store");
     headers.set("x-content-type-options", "nosniff");
 
     return new Response(upstream.body, { status: upstream.status, headers });

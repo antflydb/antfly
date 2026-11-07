@@ -123,8 +123,8 @@ type MigrateLocalOptions struct {
 
 	// SourceID names a configured source. Its connection must currently be
 	// either FromConnection (not yet migrated) or ToConnection (a previous
-	// run already repointed it; rerunning finds nothing new to copy and
-	// skips the repoint).
+	// run already repointed it; rerunning reuses verified copies and
+	// confirms publication again).
 	SourceID string
 	// FromConnection names a configured connection with provider "local"
 	// that objects are read from. This is independent of the source's own
@@ -249,14 +249,9 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 	if err != nil {
 		return result, err
 	}
-	alreadyPointed := source.Connection == opts.ToConnection && string(bytes.TrimSpace(source.Config)) == string(bytes.TrimSpace(destConfig))
-	if alreadyPointed && result.Copied == 0 {
-		// Already pointed at this exact destination, and this run copied no
-		// new object (a clean rerun): nothing changed, so there is nothing
-		// to republish.
-		result.CatalogRepointed = true
-		return result, nil
-	}
+	// Configuration alone is not a publication checkpoint: a previous run may
+	// have committed PUT and then failed (or crashed) before completing sync.
+	// Reconfirm publication on every invocation; verified copies are still reused.
 	updated := source
 	updated.Connection, updated.Config = opts.ToConnection, destConfig
 	if updated.Identity.Namespace == "" {
@@ -345,6 +340,12 @@ func resolveMigrationSource(profile Profile, opts MigrateLocalOptions) (Source, 
 // migrateDestinationConfig builds the source Config a repoint publishes,
 // matching whichever connector will enumerate it afterward.
 func migrateDestinationConfig(provider, bucket, prefix string) (json.RawMessage, error) {
+	// Bucket prefixes are literal byte prefixes. A directory boundary keeps the
+	// exact suffix identical to LocalConnector's relative key, including any
+	// meaningful leading slash in a bucket object name.
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
 	switch provider {
 	case ProviderS3:
 		return json.Marshal(S3Config{Bucket: bucket, Prefix: prefix})

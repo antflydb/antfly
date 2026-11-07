@@ -126,6 +126,9 @@ func SourceRow(id, sourceID, namespace string, document Document) (map[string]an
 	if document.Version != SourceRecordVersion {
 		return nil, fmt.Errorf("source publication requires neutral record v%d", SourceRecordVersion)
 	}
+	if _, present := document.Metadata["relative_key"].(string); namespace != "" && !present {
+		return nil, fmt.Errorf("record is missing its relative key")
+	}
 	key, err := IdentityKey(sourceID, namespace, configString(document.Metadata, "relative_key"), configString(document.Metadata, "identity"))
 	if err != nil || key != id {
 		return nil, fmt.Errorf("record identity differs from source ownership")

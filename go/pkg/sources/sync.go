@@ -69,11 +69,13 @@ func RecordKey(sourceID, providerID string) (string, error) {
 // A namespace adopted as anything else re-keys every row exactly once;
 // only a brand new source (given an opaque namespace at creation before
 // any row exists) never has rows to re-key in the first place.
+// An empty relative key is valid for a bucket object whose name exactly equals
+// its prefix. Publication requires explicit relative_key metadata for that case.
 func IdentityKey(sourceID, namespace, relativeKey, providerID string) (string, error) {
 	if namespace == "" {
 		return RecordKey(sourceID, providerID)
 	}
-	if !canonicalID(sourceID) || relativeKey == "" || !utf8.ValidString(relativeKey) || strings.ContainsRune(relativeKey, 0) || !utf8.ValidString(namespace) || strings.ContainsRune(namespace, 0) {
+	if !canonicalID(sourceID) || !utf8.ValidString(relativeKey) || strings.ContainsRune(relativeKey, 0) || !utf8.ValidString(namespace) || strings.ContainsRune(namespace, 0) {
 		return "", fmt.Errorf("invalid source record identity")
 	}
 	digest := sha256.Sum256([]byte(namespace + "/" + relativeKey))
@@ -108,7 +110,7 @@ func LegacyNamespace(sourceID string, items []Item) (string, error) {
 	for i, item := range items {
 		relativeKey := relativeKeyFor(sourceID, item)
 		suffix := "/" + relativeKey
-		if relativeKey == "" || !strings.HasSuffix(item.ID, suffix) {
+		if !strings.HasSuffix(item.ID, suffix) {
 			return "", fmt.Errorf("item %q does not end with its relative key %q; cannot derive a legacy namespace", item.ID, relativeKey)
 		}
 		candidate := strings.TrimSuffix(item.ID, suffix)
@@ -224,6 +226,10 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 	}
 	ids := make([]string, 0, len(documents))
 	for id, doc := range documents {
+		if _, present := doc.Metadata["relative_key"].(string); w.namespace != "" && !present {
+			w.failed = true
+			return MergeResult{}, fmt.Errorf("record is missing its relative key")
+		}
 		key, err := IdentityKey(w.sourceID, w.namespace, configString(doc.Metadata, "relative_key"), configString(doc.Metadata, "identity"))
 		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID {
 			w.failed = true

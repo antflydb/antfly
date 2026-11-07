@@ -445,8 +445,10 @@ antfly-source migrate-local --config sources.json --state-dir /var/lib/antfly-so
 
 This copies one source's objects to an S3-compatible or GCS connection,
 keeping the `objects/sha256/<digest>[.ext]` layout so the digest stays the
-key. Every copy is verified by an independent read-back and hash of the
-destination object, whether just uploaded or already there from an earlier
+key. Bucket prefixes are literal prefixes: leading slashes in their suffixes
+are significant. The migration configures a trailing-slash destination prefix
+so those suffixes match the local store's relative keys exactly. Every copy
+is verified by an independent read-back and hash of the destination object, whether just uploaded or already there from an earlier
 run, before anything can reference it; a mismatch fails that object and the
 run (GCS gives back CRC32C and MD5, not SHA-256, so this reads the object
 back and hashes it the same way S3 does, rather than trusting either). GCS
@@ -454,8 +456,11 @@ uploads pass `ifGenerationMatch=0`, so two runs (or a run colliding with
 anything else) can never overwrite each other's object at the same
 content-addressed key; S3 has no equivalent atomic precondition, so it relies
 on the existence check before uploading instead. Rerunning only uploads
-what's still missing, and a clean rerun uploads nothing. It never deletes or
-edits the local store; once satisfied, remove
+what's still missing, and a clean rerun uploads nothing. Every rerun still
+completes a source sync: a committed configuration PUT alone cannot prove
+that a previous run published the new references. A retry after a failed
+sync or an interrupted cutover therefore repairs publication automatically.
+It never deletes or edits the local store; once satisfied, remove
 `<local_root>/<prefix>/objects/sha256` yourself.
 
 Copying and verifying never take any service lock; they only read the local

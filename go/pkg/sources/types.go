@@ -67,10 +67,15 @@ type Item struct {
 	// with a source's identity.namespace, to key a row by content location
 	// instead of by acquisition revision metadata (ID/Revision), so a
 	// namespace-scoped source's rows survive a connection or provider change.
+	// Bucket prefixes are literal: suffixes retain every slash. Use a trailing
+	// slash in a directory prefix to produce directory-relative keys.
 	RelativeKey string
-	Size        int64
-	Metadata    map[string]any
-	ObjectIndex int
+	// RelativeKeySet distinguishes an explicit empty bucket-prefix suffix from
+	// an older checkpoint or a connector that uses its native ID as the key.
+	RelativeKeySet bool `json:",omitempty"`
+	Size           int64
+	Metadata       map[string]any
+	ObjectIndex    int
 }
 type DiagnosticSource struct{ Key, SourceKind, Revision string }
 type Diagnostic struct {

@@ -17525,7 +17525,7 @@ fn processDocumentExtractionAsset(
     // change triggered zero of these, the same way skip_by_hash_count
     // confirms the skip path did fire, without adding a new stats field to
     // the table status aggregation pipeline for a one-off verification.
-    std.log.info("document extraction fetching source: doc_key={s} artifact={s} url={s}", .{ request.doc_key, artifact_name, source_url });
+    std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
     const fetched = prepared_sources.fetch(

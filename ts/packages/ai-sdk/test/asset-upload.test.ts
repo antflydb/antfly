@@ -17,6 +17,7 @@ afterEach(async () => {
   await rm(localRoot, { recursive: true, force: true });
 });
 
+const sourceId = "11111111-1111-1111-1111-111111111111";
 const data = new TextEncoder().encode("fake mp4 bytes");
 const digest = createHash("sha256").update(data).digest("hex");
 
@@ -24,12 +25,33 @@ function stubFetch(handlers: {
   sync?: () => Response;
   job?: () => Response;
   query?: () => Response;
+  lookup?: () => Response;
+  namespace?: string;
+  prefix?: string;
 }) {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/v1/profile"))
+        return new Response(
+          JSON.stringify({
+            version: 1,
+            connections: { local: { provider: "local" } },
+            sources: [
+              {
+                id: sourceId,
+                connection: "local",
+                table: "files",
+                publication: "media",
+                config: { prefix: handlers.prefix ?? "" },
+                identity: handlers.namespace ? { namespace: handlers.namespace } : undefined,
+              },
+            ],
+          })
+        );
+      if (url.includes("/documents/")) return (handlers.lookup ?? defaultLookup)();
       if (url.endsWith("/v1/sync")) return (handlers.sync ?? defaultSync)();
       if (url.includes("/v1/jobs/")) return (handlers.job ?? defaultJob)();
       if (url.includes("/db/v1/tables/") && url.includes("/query"))
@@ -44,18 +66,22 @@ const defaultSync = () =>
   });
 const defaultJob = () =>
   new Response(JSON.stringify({ version: 1, id: "job-1", state: "completed", started_at: 1 }));
-const defaultQuery = () =>
+const defaultLookup = () =>
   new Response(
     JSON.stringify({
-      responses: [
-        {
-          hits: {
-            hits: [{ _id: "row-1", _source: { content: { resource: { version: digest } } } }],
-          },
-        },
-      ],
+      source: { id: sourceId, relative_key: `objects/sha256/${digest}.mp4` },
+      metadata: { sha256: digest },
+      content: { resource: { type: "source", version: `"${digest}"` } },
     })
   );
+const defaultQuery = () => new Response(JSON.stringify({ responses: [{ hits: { hits: [] } }] }));
+function expectedKey(namespace?: string, prefix = "") {
+  const relative = `objects/sha256/${digest}.mp4`;
+  const identity = namespace
+    ? `${namespace}/${relative}`
+    : `local://job/${sourceId}/${prefix ? `${prefix}/` : ""}${relative}`;
+  return `source://job/${sourceId}/records/${createHash("sha256").update(identity).digest("hex")}`;
+}
 
 function newClients() {
   const client = new AntflyClient({ baseUrl: "http://db.test" });
@@ -68,7 +94,7 @@ function newClients() {
 
 describe("uploadFile", () => {
   it("writes the content-addressed object and waits for the catalog row (published)", async () => {
-    stubFetch({});
+    stubFetch({ prefix: "uploads" });
     const { client, sources } = newClients();
     const result = await uploadFile({
       client,
@@ -82,7 +108,7 @@ describe("uploadFile", () => {
     });
     expect(result.digest).toBe(digest);
     expect(result.state).toBe("published");
-    expect(result.reference).toEqual({ table: "files", key: "row-1" });
+    expect(result.reference).toEqual({ table: "files", key: expectedKey(undefined, "uploads") });
     const written = await readFile(
       join(localRoot, "uploads", "objects", "sha256", `${digest}.mp4`)
     );
@@ -136,4 +162,82 @@ describe("uploadFile", () => {
       })
     ).rejects.toBeInstanceOf(SourceSyncFailedError);
   });
+});
+
+// No unfiltered table query is permitted: identity lookup scales independently
+// of table cardinality and cannot match another source's digest-bearing text.
+it.each([
+  undefined,
+  "stable-namespace",
+])("looks up the exact upload identity (%s)", async (namespace) => {
+  stubFetch({
+    namespace,
+    query: () => {
+      throw new Error("unexpected table scan");
+    },
+  });
+  const { client, sources } = newClients();
+  const result = await uploadFile({
+    client,
+    sources,
+    sourceId,
+    localRoot,
+    table: "files",
+    data,
+    mimeType: "video/mp4",
+  });
+  expect(result.reference.key).toBe(expectedKey(namespace));
+  const calls = vi.mocked(fetch).mock.calls;
+  const lookup = calls.find(([input]) =>
+    (input instanceof Request ? input.url : String(input)).includes("/documents/")
+  );
+  const url = new URL(lookup?.[0] instanceof Request ? lookup[0].url : String(lookup?.[0]));
+  expect(decodeURIComponent(url.pathname)).toContain(expectedKey(namespace));
+  expect(url.searchParams.get("consistency")).toBe("read_index");
+});
+
+it("does not accept a digest on another source's row", async () => {
+  stubFetch({
+    lookup: () =>
+      new Response(JSON.stringify({ source: { id: "other" }, metadata: { sha256: digest } })),
+  });
+  const { client, sources } = newClients();
+  await expect(
+    uploadFile({
+      client,
+      sources,
+      sourceId,
+      localRoot,
+      table: "files",
+      data,
+      mimeType: "video/mp4",
+      timeoutMs: 10,
+      pollIntervalMs: 1,
+    })
+  ).rejects.toThrow("Timed out");
+});
+
+it("restricts searchable polling to the uploaded record", async () => {
+  stubFetch({
+    query: () =>
+      new Response(JSON.stringify({ responses: [{ hits: { hits: [{ _id: expectedKey() }] } }] })),
+  });
+  const { client, sources } = newClients();
+  await uploadFile({
+    client,
+    sources,
+    sourceId,
+    localRoot,
+    table: "files",
+    data,
+    mimeType: "video/mp4",
+    waitFor: "searchable",
+  });
+  const call = vi
+    .mocked(fetch)
+    .mock.calls.find(([input]) =>
+      (input instanceof Request ? input.url : String(input)).includes("/query")
+    );
+  const request = call?.[0] as Request;
+  expect((await request.clone().json()).filter_query).toEqual({ ids: [expectedKey()] });
 });

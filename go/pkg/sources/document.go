@@ -56,7 +56,7 @@ func (e *NormalizationError) Error() string { return e.Detail }
 // identity already is their native ID, and moving such an item across
 // providers is never a meaningful operation to begin with.
 func relativeKeyFor(sourceID string, item Item) string {
-	if item.RelativeKey != "" {
+	if item.RelativeKeySet || item.RelativeKey != "" {
 		return item.RelativeKey
 	}
 	if _, rest, ok := strings.Cut(item.ID, "://job/"+sourceID+"/"); ok {

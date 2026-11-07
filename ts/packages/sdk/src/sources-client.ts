@@ -27,6 +27,7 @@ export interface SourceDefinition {
   permissions: { public: boolean; readers: string[] };
   permission_ttl_seconds?: number;
   publication?: "text" | "media";
+  identity?: { namespace?: string };
 }
 
 export interface SourceProfile {
@@ -144,7 +145,7 @@ export class StandaloneSourcesClient extends SourceTransport {
   putSource(
     source: SourceDefinition,
     signal?: AbortSignal
-  ): Promise<{ version: 1; state: string }> {
+  ): Promise<{ version: 1; state: string; rekeys: boolean }> {
     return this.request("PUT", `/v1/sources/${encodeURIComponent(source.id)}`, source, signal);
   }
   removeSource(id: string, signal?: AbortSignal): Promise<{ version: 1; state: string }> {

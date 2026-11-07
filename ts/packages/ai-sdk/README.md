@@ -88,6 +88,11 @@ const result = await generateText({
   waiting for `waitFor: "published"` (default) or `"searchable"` (a
   best-effort poll -- publishing the catalog row is not the same as being
   enrichment-indexed, and the server has no durable signal for the latter).
+  The helper checks the configured source and looks up its exact record key
+  with `read_index`, verifying ownership and the pinned content digest. Table
+  size and other sources with identical bytes do not affect confirmation.
+  Pass `prefix` when the source has a configured prefix. Searchable polling
+  is restricted to this same record.
   Only the `local` antfly-sources provider is implemented; a bucket-backed
   connection needs the equivalent provider-specific PUT. `FilesV4` is not
   implemented for Antfly: an existing object can't be re-registered through
@@ -96,7 +101,10 @@ const result = await generateText({
   authorize, referenceId })` builds a plain `Request -> Response` handler
   for a route in your own app (the pattern settled on antfly#1491).
   `FileUIPart.url` points at that route; the capability URL never reaches
-  the browser, and Antfly never fetches through it.
+  the browser, and Antfly never fetches through it. Passive image, audio, and
+  video formats use an explicit inline allowlist; HTML, SVG, and other formats
+  download as attachments with a sandbox policy. Responses are private and
+  uncached so each request checks authorization.
 - **Known codes**: `src/asset/errors.ts` exports guards
   (`isVideoCodecUnavailable`, `isOneVideoPerRequest`,
   `isContextManagementWithMedia`, `isRetryableCapacityError`, ...) over the

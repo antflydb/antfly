@@ -6613,7 +6613,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // processDocumentExtractionAsset: past this point the declared
             // digest, if any, did not already prove this extraction
             // unnecessary.
-            std.log.info("document extraction fetching source: doc_key={s} artifact={s} url={s}", .{ request.doc_key, artifact_name, source_url });
+            std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
             const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
                 extraction_alloc,
                 remoteRenderConfig(db, null),
@@ -6647,7 +6647,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // referenced. downloaded_mut.data is already fully buffered by
             // this path, so hashing it here adds no additional buffering,
             // only an extra pass over memory already resident.
-            {
+            if (config.checksum_algorithm != null and config.checksum.len > 0) {
                 var content_digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
                 var content_digest_hex: [64]u8 = undefined;

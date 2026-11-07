@@ -227,8 +227,9 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 			// item.Name is the full bucket object name, including config.Prefix
 			// when the source is scoped to one; strip it so the relative key
 			// survives a later prefix or bucket change, same as S3.
-			relativeKey := strings.TrimPrefix(strings.TrimPrefix(item.Name, config.Prefix), "/")
-			o := Item{ID: "gcs://" + r.SourceNamespace + "/" + config.Bucket + "/" + item.Name, Path: item.Name, RelativeKey: relativeKey, Filename: filepath.Base(item.Name), URL: canonical, Revision: item.Generation, Size: size, ReadMode: sourceReadBytes, SourceKind: c.ProviderName, Metadata: map[string]any{"bucket": config.Bucket, "key": item.Name, "generation": item.Generation, "mime_type": item.ContentType, "canonical_url": canonical}}
+			// Preserve the exact suffix: a leading slash is part of the key.
+			relativeKey := strings.TrimPrefix(item.Name, config.Prefix)
+			o := Item{ID: "gcs://" + r.SourceNamespace + "/" + config.Bucket + "/" + item.Name, Path: item.Name, RelativeKey: relativeKey, RelativeKeySet: true, Filename: filepath.Base(item.Name), URL: canonical, Revision: item.Generation, Size: size, ReadMode: sourceReadBytes, SourceKind: c.ProviderName, Metadata: map[string]any{"bucket": config.Bucket, "key": item.Name, "generation": item.Generation, "mime_type": item.ContentType, "canonical_url": canonical}}
 			stop, err := add(o)
 			if err != nil || stop {
 				return err

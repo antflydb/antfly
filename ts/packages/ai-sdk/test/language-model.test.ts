@@ -380,3 +380,42 @@ describe("providerReference.antfly file parts", () => {
     await expect(throwing.doGenerate(options as never)).rejects.toThrow("denied");
   });
 });
+
+it("replays parallel tool results as ordered individual wire messages", async () => {
+  const { toInferenceMessages } = await import("../src/prompt.js");
+  const messages = await toInferenceMessages(
+    [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", toolCallId: "a", toolName: "search", input: { q: "a" } },
+          { type: "tool-call", toolCallId: "b", toolName: "search", input: { q: "b" } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "a",
+            toolName: "search",
+            output: { type: "text", value: "first" },
+          },
+          {
+            type: "tool-result",
+            toolCallId: "b",
+            toolName: "search",
+            output: { type: "json", value: { result: "second" } },
+          },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "continue" }] },
+    ],
+    []
+  );
+  expect(messages.slice(1)).toEqual([
+    { role: "tool", tool_call_id: "a", content: "first" },
+    { role: "tool", tool_call_id: "b", content: '{"result":"second"}' },
+    { role: "user", content: [{ type: "text", text: "continue" }] },
+  ]);
+});

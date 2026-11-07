@@ -36,7 +36,21 @@ export async function toInferenceMessages(
   warnings: SharedV4Warning[],
   resolveSource?: ResolveAssetReference
 ): Promise<InferenceChatMessage[]> {
-  return Promise.all(prompt.map((message) => toInferenceMessage(message, warnings, resolveSource)));
+  const messages = await Promise.all(
+    prompt.map(async (message) => {
+      // AI SDK groups parallel results; Antfly's wire format needs one message per call.
+      if (message.role === "tool") {
+        return message.content.flatMap((part): InferenceChatMessage[] => {
+          if (part.type !== "tool-result") return [];
+          return [
+            { role: "tool", tool_call_id: part.toolCallId, content: toolOutputToText(part.output) },
+          ];
+        });
+      }
+      return [await toInferenceMessage(message, warnings, resolveSource)];
+    })
+  );
+  return messages.flat();
 }
 
 async function toInferenceMessage(
@@ -106,23 +120,6 @@ async function toInferenceMessage(
         role: "assistant",
         ...(text.length ? { content: text.join("") } : {}),
         ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-      };
-    }
-    case "tool": {
-      const results = message.content.filter((part) => part.type === "tool-result");
-      if (results.length !== 1) {
-        throw new UnsupportedFunctionalityError({
-          functionality: "multiple tool results in one tool message",
-          message:
-            "Antfly's chat completions route expects exactly one tool result per role:tool message.",
-        });
-      }
-      const result = results[0];
-      if (result.type !== "tool-result") throw new Error("unreachable");
-      return {
-        role: "tool",
-        tool_call_id: result.toolCallId,
-        content: toolOutputToText(result.output),
       };
     }
     default:
