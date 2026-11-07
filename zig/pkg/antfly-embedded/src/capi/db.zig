@@ -12215,6 +12215,87 @@ test "capi owned transforms reprepare changed bases without applying an incremen
     try std.testing.expectEqual(@as(i64, 11), row.value.object.get("n").?.integer);
 }
 
+test "capi owned artifact collision retries before an increment and preserves the occupied alias" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-artifact-collision");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    const wrapper = try @import("lite_connection.zig").open(path, .{ .no_sync = true, .profile = .native, .busy_timeout_ms = 5000 }, true);
+    const id = try publishHandle(wrapper);
+    defer antfly_db_close(id);
+    var output: capi.Buffer = .{};
+    defer antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"counter\":{\"n\":0}},\"sync_level\":\"full_text\"}"), &output));
+    antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+    const owner = wrapper.lite_connection.?.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(handleLockIo());
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    var prepared: ?Prepared = null;
+    defer if (prepared) |*plan| plan.deinit();
+    const Request = struct {
+        id: *anyopaque,
+        plan: *?Prepared,
+        request: db_mod.types.BatchRequest,
+        occupied_path: ?[]u8 = null,
+        occupied_id: u64 = 0,
+        refusals: usize = 0,
+        fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try prepareOwnedBatchAttempt(self.id, self.plan, self.request, budget);
+            const plan = if (self.plan.*) |*value| value else return error.TestExpectedOwnedPlan;
+            try std.testing.expect(plan.text.items.len != 0);
+            const item = &plan.text.items[0];
+            const publication = item.publication orelse return error.TestExpectedPublication;
+            const candidate = publication.native.?;
+            const chosen = candidate.replacements[candidate.replacements.len - 1].id;
+            if (self.occupied_path != null) {
+                try std.testing.expect(chosen != self.occupied_id);
+                return;
+            }
+            const guard = enterHandle(self.id, .write).?;
+            defer guard.leave();
+            try std.testing.expect(guard.entry_error == null);
+            const index = guard.handle.database().core.index_manager.textIndex(item.config.name).?;
+            self.occupied_id = chosen;
+            self.occupied_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{d}.seg", .{ index.segment_files.?.root_dir, chosen });
+            // A legacy/interrupted publisher can leave an alias without changing
+            // this index's semantic generation. Introduce it after preparation.
+            try guard.handle.owned_lite_backend.?.native_docstore.?.file.putIndexCatalogRecord(self.occupied_path.?, "occupied alias must remain unchanged");
+        }
+        fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            trackedBatchWithPreparedDocuments(handle.database(), self.request, primary_committed, handle.selected_table_name, if (self.plan.*) |*plan| plan else null) catch |err| {
+                if (err == error.OwnedPreparationStale) {
+                    try std.testing.expect(!primary_committed.*);
+                    self.refusals += 1;
+                }
+                return err;
+            };
+        }
+    };
+    var request: Request = .{ .id = id, .plan = &prepared, .request = .{ .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "n", .value_json = "1" }} }}, .sync_level = .write } };
+    defer if (request.occupied_path) |value| a.free(value);
+    try std.testing.expectEqual(capi.ErrorCode.ok, executeBatchWithReplayPreparation(id, &request, Request.prepare, Request.apply));
+    try std.testing.expectEqual(@as(usize, 1), request.refusals);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(id, .fromSlice("counter"), &output));
+    var row = try std.json.parseFromSlice(std.json.Value, a, output.ptr.?[0..output.len], .{});
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), row.value.object.get("n").?.integer);
+    const guard = enterHandle(id, .read).?;
+    defer guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    const retained = (try guard.handle.owned_lite_backend.?.native_docstore.?.file.getIndexCatalogRecordAlloc(a, request.occupied_path.?)).?;
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("occupied alias must remain unchanged", retained);
+}
+
 test "capi owned preparation debits gate waits from the batch admission budget" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;

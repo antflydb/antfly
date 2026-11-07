@@ -25,7 +25,7 @@ pub const Host = struct {
     index_prefix: []const u8,
 
     pub fn view(self: *Host) publication.View {
-        return .{ .ptr = self, .link_fn = link, .put_fn = put, .get_metadata_fn = getMetadata, .put_metadata_fn = putMetadata, .namespace_fn = publishNamespace };
+        return .{ .ptr = self, .link_fn = link, .put_fn = put, .get_metadata_fn = getMetadata, .put_metadata_fn = putMetadata, .namespace_fn = publishNamespace, .require_absent_fn = requireAbsent };
     }
 
     fn checkedFile(self: *Host, inode: u64) !*native.NativeFile {
@@ -58,6 +58,13 @@ pub const Host = struct {
             if (plan.expected_generation == null or !std.mem.eql(u8, value[5..], &plan.expected_generation.?)) return error.FileBusy;
         } else if (plan.expected_generation != null) return error.FileBusy;
         try file.putIndexCatalogBatch(plan.mutations);
+    }
+
+    fn requireAbsent(raw: *anyopaque, inode: u64, destination: []const u8) !void {
+        const self: *Host = @ptrCast(@alignCast(raw));
+        try self.validateDestination(destination);
+        const file = try self.checkedFile(inode);
+        if (try file.getIndexCatalogRecordSize(destination) != null) return error.NativeArtifactDestinationOccupied;
     }
 
     fn link(raw: *anyopaque, inode: u64, construction: []const u8, destination: []const u8, length: usize) !void {

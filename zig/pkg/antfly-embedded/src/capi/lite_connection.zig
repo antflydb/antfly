@@ -7722,6 +7722,12 @@ test "capi native allocator proof issue1431 committed transform visibility timeo
     var held = try runtime.acquireProducerPermit("ft_v1", runtime.config.max_pending_segments - active, 0);
     defer held.release();
     const increment = "{\"transforms\":[{\"key\":\"counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"full_text\"}";
+    // Foreground publication may now satisfy visibility despite the producer
+    // permit. Inject the same error at the explicit durable boundary so this
+    // contract always tests committed classification, not scheduler timing.
+    const mutation_commit = @import("../storage/db/mutation_commit.zig");
+    mutation_commit.test_fail_after_primary_commit = error.TextMergeBackpressureTimeout;
+    defer mutation_commit.test_fail_after_primary_commit = null;
     try std.testing.expectEqual(h.capi.ErrorCode.stalled, api.antfly_db_batch_json(fixture.id, .fromSlice(increment), &output));
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(h.capi.lastErrorDetail()), "primary write committed") != null);
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(h.capi.lastErrorDetail()), "do not retry") != null);

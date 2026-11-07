@@ -429,7 +429,13 @@ pub const Plan = struct {
                 try ordinals.bind(ordinals.assigned);
             }
         }
-        try persistent.PersistentIndex.commitNativePublications(self.text_candidates[0..selected], primary);
+        persistent.PersistentIndex.commitNativePublications(self.text_candidates[0..selected], primary) catch |err| {
+            if (err == error.NativeArtifactDestinationOccupied) {
+                self.needs_reprepare = true;
+                return error.OwnedPreparationStale;
+            }
+            return err;
+        };
         for (self.text_selected[0..selected], self.text_guards[0..selected]) |index, *guard| {
             const publication = self.text.items[index].publication.?;
             publication.activate(guard);

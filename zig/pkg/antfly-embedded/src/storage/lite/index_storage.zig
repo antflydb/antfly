@@ -592,7 +592,7 @@ const InlinePreparedArtifact = struct {
     file_namespace: [32]u8,
     bytes: *Bytes,
     path: ?[]u8 = null,
-    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .prepare_link_at = prepareLinkAt, .stage_link = stageLink, .deinit = deinit };
+    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .prepare_link_at = prepareLinkAt, .stage_link = stageLink, .validate_link = validateLink, .deinit = deinit };
 
     const Bytes = artifacts.OwnedBytes;
 
@@ -643,6 +643,11 @@ const InlinePreparedArtifact = struct {
         return source;
     }
 
+    fn validateLink(raw: *anyopaque, view: native_publication.View) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try view.requireAbsent(self.inode, self.path orelse return error.InvalidArtifactConstructionState);
+    }
+
     fn stageLink(raw: *anyopaque, view: native_publication.View) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         try view.put(self.inode, self.path orelse return error.InvalidArtifactConstructionState, self.bytes.data);
@@ -687,7 +692,7 @@ const NativePreparedArtifact = struct {
     construction: artifacts.Construction,
     file_namespace: [32]u8 = @splat(0),
     pending_link: ?struct { key: []u8, path: []u8, inode: u64, length: usize, source: SegmentSource, registry: *artifacts.Registry } = null,
-    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .prepare_link_at = prepareLinkAt, .stage_link = stageLink, .deinit = deinit };
+    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .prepare_link_at = prepareLinkAt, .stage_link = stageLink, .validate_link = validateLink, .deinit = deinit };
 
     fn freezeSource(self: *@This()) !void {
         if (self.pending_link != null) return;
@@ -742,6 +747,13 @@ const NativePreparedArtifact = struct {
         defer pending.registry.endCallback();
         if (try owner.file.getIndexCatalogRecordSize(path) != null) return error.PathAlreadyExists;
         return prepareLinkAt(raw, .{ .inode = (try owner.file.file.stat(owner.file.runtime())).inode, .file_namespace = owner.file.header.reader_epoch_namespace, .prefix = self.prefix }, path);
+    }
+
+    fn validateLink(raw: *anyopaque, view: native_publication.View) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pending = self.pending_link orelse return error.InvalidArtifactConstructionState;
+        if (pending.path.len == 0) return error.InvalidArtifactConstructionState;
+        try view.requireAbsent(pending.inode, pending.path);
     }
 
     fn stageLink(raw: *anyopaque, view: native_publication.View) !void {

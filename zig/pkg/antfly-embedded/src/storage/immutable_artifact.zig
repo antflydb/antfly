@@ -40,6 +40,7 @@ pub const Prepared = struct {
         prepare_link: ?*const fn (*anyopaque, []const u8) anyerror!Source = null,
         prepare_link_at: ?*const fn (*anyopaque, AliasTarget, []const u8) anyerror!Source = null,
         stage_link: ?*const fn (*anyopaque, @import("native_publication.zig").View) anyerror!void = null,
+        validate_link: ?*const fn (*anyopaque, @import("native_publication.zig").View) anyerror!void = null,
         deinit: *const fn (*anyopaque) void,
     };
     const Boundary = abi.Boundary(VTable);
@@ -53,6 +54,12 @@ pub const Prepared = struct {
     pub fn prepareLinkAt(self: Prepared, target: AliasTarget, path: []const u8) !Source {
         const operation = self.vtable.prepare_link_at orelse return error.Unsupported;
         return Boundary.call("prepare_link_at", self.dispatch, operation, .{ self.ptr, target, path });
+    }
+    /// Recheck a selected destination before any primary mutations are staged.
+    /// Native implementations use metadata-only absence checks under the lease.
+    pub fn validateLink(self: Prepared, view: @import("native_publication.zig").View) !void {
+        const operation = self.vtable.validate_link orelse return;
+        return Boundary.call("validate_link", self.dispatch, operation, .{ self.ptr, view });
     }
     pub fn stageLink(self: Prepared, view: @import("native_publication.zig").View) !void {
         const operation = self.vtable.stage_link orelse return error.Unsupported;

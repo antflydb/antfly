@@ -1528,6 +1528,7 @@ pub const PersistentIndex = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.namespace.participant.validate(view);
             if (self.metadata) |joined| try joined.participant.validate(view);
+            for (self.segments) |segment| try segment.artifact.validateLink(view);
         }
 
         fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
@@ -1761,8 +1762,26 @@ pub const PersistentIndex = struct {
             if (bytes.len != 8) return error.InvalidDerivedApplyState;
             if (self.writer.next_segment_id < std.mem.readInt(u64, bytes[0..8], .little)) return error.EnrichmentWaitCanceled;
         }
-        const ids = try self.reserveSegmentIds(self.alloc, segment_count);
+        // Unreferenced aliases from an interrupted older publisher can outlive
+        // its volatile ID frontier without changing the semantic namespace.
+        // Select free IDs under this short capture; publish their frontier in
+        // the same transaction as activation. No artifact bodies are loaded.
+        const ids = try self.alloc.alloc(u64, segment_count);
         errdefer self.alloc.free(ids);
+        var selected: usize = 0;
+        var collisions: usize = 0;
+        while (selected < ids.len) {
+            const id = self.reserveSegmentId();
+            const path = try files.pathAlloc(id);
+            defer self.alloc.free(path);
+            if (files.storage.fileSize(path)) |_| {
+                collisions += 1;
+                if (collisions == 64) return error.EnrichmentWaitCanceled;
+                continue;
+            } else |err| if (err != error.FileNotFound) return err;
+            ids[selected] = id;
+            selected += 1;
+        }
         var inputs = try self.writer.capturePreparation();
         errdefer inputs.deinit();
         const root = try self.alloc.dupe(u8, files.root_dir);

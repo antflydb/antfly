@@ -103,14 +103,21 @@ pub const View = struct {
     get_metadata_fn: *const fn (*anyopaque, std.mem.Allocator, Scope, []const u8) anyerror![]u8,
     put_metadata_fn: *const fn (*anyopaque, Scope, []const u8, []const u8) anyerror!void,
     namespace_fn: ?*const fn (*anyopaque, NamespacePlan) anyerror!void = null,
+    require_absent_fn: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     const Boundary = abi.Boundary(struct {
         namespace: *const fn (*anyopaque, NamespacePlan) anyerror!void,
+        require_absent: *const fn (*anyopaque, u64, []const u8) anyerror!void,
         link: *const fn (*anyopaque, u64, []const u8, []const u8, usize) anyerror!void,
         put: *const fn (*anyopaque, u64, []const u8, []const u8) anyerror!void,
         get_metadata: *const fn (*anyopaque, std.mem.Allocator, Scope, []const u8) anyerror![]u8,
         put_metadata: *const fn (*anyopaque, Scope, []const u8, []const u8) anyerror!void,
     });
+
+    pub fn requireAbsent(self: View, inode: u64, path: []const u8) !void {
+        const operation = self.require_absent_fn orelse return error.Unsupported;
+        return Boundary.call("require_absent", self.dispatch, operation, .{ self.ptr, inode, path });
+    }
 
     pub fn publishNamespace(self: View, plan: NamespacePlan) !void {
         const operation = self.namespace_fn orelse return error.Unsupported;
