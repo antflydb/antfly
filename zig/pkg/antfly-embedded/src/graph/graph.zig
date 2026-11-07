@@ -8217,6 +8217,30 @@ pub const GraphIndex = struct {
         publication.* = undefined;
     }
 
+    /// The forward (outgoing-adjacency) store's `.native_catalog` scope --
+    /// the same string an inline caller must pass as `scope` to
+    /// `commit_participant.View.putIndexCatalog` when folding
+    /// `InlineEdgePublication.forwardMutations()` into an externally-owned
+    /// native transaction. `null` when this store is not `.native_catalog`
+    /// (in which case `prepareInlineEdgePublication` itself already fails
+    /// with `error.InlineEdgePublicationUnsupported`, so a caller that
+    /// checks this first never needs to attempt `prepare` at all).
+    pub fn forwardCatalogScope(self: *const GraphIndex) ?[]const u8 {
+        return switch (self.outgoing_owner) {
+            .native_catalog => |backend| backend.scope,
+            else => null,
+        };
+    }
+
+    /// The reverse (incoming-adjacency) store's `.native_catalog` scope;
+    /// see `forwardCatalogScope`.
+    pub fn reverseCatalogScope(self: *const GraphIndex) ?[]const u8 {
+        return switch (self.reverse_owner) {
+            .native_catalog => |backend| backend.scope,
+            else => null,
+        };
+    }
+
     const TopologyMutation = struct { before: bool, after: bool, kind: []const u8, source: []const u8, target: []const u8 };
 
     /// Count original-to-final connectivity once, independent of duplicate

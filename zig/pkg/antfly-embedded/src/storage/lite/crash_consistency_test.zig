@@ -1446,6 +1446,84 @@ test "WS4 phase 2 round 2: a synchronous full_text write lands in one native com
     }
 }
 
+test "WS4-for-graph: a synchronous graph edge write lands in one native commit and is queryable immediately" {
+    // Graph analog of the full_text round 2 test above (lite-single-
+    // commit-write-path.md §3.3a's graph extension): default Lite
+    // configuration (background index workers running), one edge write
+    // expressed through a document's `_edges` field, `sync_level =
+    // .full_index` (graph has no narrower sync level of its own -- see
+    // `types.SyncLevel`'s enum order). Proves `InlineGraphPublication`
+    // engages for the simple single-edge case: the edge is queryable
+    // immediately after ack, and the background worker's later catch-up
+    // does not re-apply it (no duplicate edge).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+    defer handle.close();
+
+    try handle.db.addIndex(.{ .name = "gr_idx", .kind = .graph, .config_json = "{}" });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"marker\":\"seed\"}" }}, .sync_level = .write });
+    try handle.db.runUntilIdle();
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "edge-source", .value = "{\"marker\":\"edge-source-marker\",\"_edges\":{\"gr_idx\":{\"links\":[{\"target\":\"edge-target\",\"weight\":1.0}]}}}" },
+        .{ .key = "edge-target", .value = "{\"marker\":\"edge-target-marker\"}" },
+    }, .sync_level = .full_index });
+
+    const after_ack_sequence = store.file.activeCheckpoint().commit_sequence;
+    const commits_for_this_write = after_ack_sequence - before_sequence;
+    // Same bound as the full_text tests above: the inline publication
+    // itself contributes no extra commit beyond the primary write's own
+    // (its forward/reverse mutations and progress ride inside the SAME
+    // native transaction via `commit_participant.View.putIndexCatalog`);
+    // a handful more land end to end from unrelated background
+    // bookkeeping (replication outbox staging, opportunistic maintenance
+    // ticks) WS7 owns driving to zero.
+    try std.testing.expect(commits_for_this_write <= 6);
+
+    {
+        const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-source", "links", .out);
+        defer graph_mod.GraphIndex.freeEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("edge-target", edges[0].target);
+    }
+
+    // Let the background worker observe this write. If it were not told
+    // the edge already landed inline (`Executor.
+    // advanceAppliedSequenceIfContiguous`), it would re-apply the same
+    // edge from the journal, doubling the forward adjacency list.
+    try handle.db.runUntilIdle();
+    {
+        const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-source", "links", .out);
+        defer graph_mod.GraphIndex.freeEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+
+    // A second edge write, still synchronous, still with the worker
+    // running: the same claims hold repeatedly.
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "edge-source-2", .value = "{\"marker\":\"edge-source-2-marker\",\"_edges\":{\"gr_idx\":{\"links\":[{\"target\":\"edge-target\",\"weight\":2.0}]}}}" },
+    }, .sync_level = .full_index });
+    {
+        const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-target", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+    }
+    try handle.db.runUntilIdle();
+    {
+        const edges = try handle.db.getEdges(allocator, "gr_idx", "edge-target", "links", .in);
+        defer graph_mod.GraphIndex.freeEdges(allocator, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+    }
+}
+
 test "WS4 phase 2 round 2: a worker-backlogged index falls back correctly instead of skipping the gap" {
     // Deliberately creates the one scenario the inline fast path must
     // refuse: a background worker still owes this index an earlier

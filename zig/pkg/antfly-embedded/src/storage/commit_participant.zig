@@ -123,7 +123,22 @@ pub const Participant = struct {
 /// attachment order; a failure from any member aborts the whole host
 /// transaction, same as a single `Participant` failing today.
 pub const List = struct {
-    pub const max_participants = 4;
+    /// WS4 phase 2 (text) started this at 4, sized for exactly one kind of
+    /// contributor (authored_acceptance XOR one text publication) at a
+    /// time. Dense, sparse and graph inline publications (lite-single-
+    /// commit-write-path.md §3.3a) are each their OWN contributor appended
+    /// alongside text's, so one write can now carry: authored_acceptance
+    /// (1) + up to `mutation_commit.zig`'s own inline-text-publication cap
+    /// (today 4, sized independently of this constant -- see that file's
+    /// own array) + dense (1) + sparse (1) + graph (1) + headroom for
+    /// algebraic indexes (§3.3b, not yet wired). Raised to 16 so that sum
+    /// never silently saturates this fixed array; `append` still returns
+    /// `error.TooManyCommitParticipants` (never a silent drop) if a future
+    /// caller ever does exceed it, and every inline-publication call site
+    /// that appends here must treat that error as "fall back to this
+    /// contributor's own slow path", exactly like a `prepareInline*`
+    /// failure, never as a reason to fail the whole write.
+    pub const max_participants = 16;
 
     items: [max_participants]Participant = undefined,
     len: usize = 0,
