@@ -2165,6 +2165,26 @@ pub const ResolutionStage = struct {
 
         const arena = parsed.arena.allocator();
         const model_revision: ?[32]u8 = if (self.adjudicate) |config| blk: {
+            const stages = config.cascadeStages();
+            if (stages.len > 0) {
+                // A cascade's receipt depends on every generated stage's revision.
+                const executor = self.adjudicator orelse break :blk null;
+                const resolve = executor.model_revision orelse break :blk null;
+                var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                var pinned = false;
+                for (stages) |stage| {
+                    const method = stage.object.get("decider").?.object.get("decision_method") orelse continue;
+                    if (method != .string or !std.mem.eql(u8, method.string, "generated")) continue;
+                    const revision = try resolve(executor.ptr, arena, try config.stageProducerSpecification(arena, stage), @min(config.timeout_ms, config.budget_ms)) orelse continue;
+                    hasher.update(stage.object.get("name").?.string);
+                    hasher.update(&revision);
+                    pinned = true;
+                }
+                if (!pinned) break :blk null;
+                var combined: [32]u8 = undefined;
+                hasher.final(&combined);
+                break :blk combined;
+            }
             const method = config.decider.object.get("decision_method") orelse break :blk null;
             if (method != .string or !std.mem.eql(u8, method.string, "generated")) break :blk null;
             const executor = self.adjudicator orelse break :blk null;
@@ -4118,4 +4138,84 @@ test "native execution projections retain only negatives across large profile id
         try std.testing.expect(scratch.queryCapacity() < 16 * 1024);
     }
     std.debug.print("NATIVE PROJECTION phases=10 retained_configured_aliases=0 arena_bytes_per_phase<16384\n", .{});
+}
+
+const adjudication_cascade_config =
+    \\{"decider":{"decision_method":"cascade","cascade":{"stages":[
+    \\  {"name":"fast","decider":{"provider":"jev","model":"jev-latest","api_key":"secret"}},
+    \\  {"name":"strong","decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"strong"}},"when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}]}},
+    \\ "template":"A: {{ m.text }} B: {{ c.canonical_name }}","question":{"type":"choice","name":"same","instructions":"Same entity?","choices":[{"value":"same"},{"value":"different"}]},
+    \\ "accept":{"choice":"same","min_probability":0.9},"reject":{"choice":"different","min_probability":0.9}}
+;
+const adjudication_cascade_response =
+    \\{"model":"strong","answers":[{"name":"same","type":"choice","decision_method":"generated","probability_source":"token_logprobs","raw_structured_answer":"same","choice":"same","probabilities":[{"value":"same","probability":0.96},{"value":"different","probability":0.04}]}],"usage":{"input_tokens":20,"output_tokens":1},
+    \\ "cascade":{"decider":"materialized","definition_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answered_by":"strong","stages":[
+    \\   {"name":"fast","decision_method":"typed","model":"jev-latest","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"same","probabilities":[{"value":"same","probability":0.6},{"value":"different","probability":0.4}]}],"usage":{"input_tokens":10,"output_tokens":0},"escalated":true},
+    \\   {"name":"strong","decision_method":"generated","model":"strong","answers":[],"usage":{"input_tokens":10,"output_tokens":1},"escalated":false}]}}
+;
+
+test "REVIEW adjudication cascade receipts verify the answering stage and its trace" {
+    const a = testing.allocator;
+    const config = try adjudication.Config.parse(a, adjudication_cascade_config);
+    defer config.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const parse = struct {
+        fn f(alloc: std.mem.Allocator, bytes: []const u8) !std.json.Value {
+            return std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{});
+        }
+    }.f;
+    try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, config.value, try parse(scratch, adjudication_cascade_response)));
+    // Answers must match the answering stage's decision method.
+    const wrong_method = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_response, "\"answered_by\":\"strong\"", "\"answered_by\":\"fast\"");
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, try parse(scratch, wrong_method)));
+    // A cascade answer without its trace is not authoritative.
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, try parse(scratch, adjudication_test_response)));
+    // Stages cannot be invented or reordered.
+    const invented = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_response, "{\"name\":\"fast\"", "{\"name\":\"other\"");
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, try parse(scratch, invented)));
+    // The policy hash covers the cascade definition and ignores credentials.
+    const rotated = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"api_key\":\"secret\"", "\"api_key\":\"rotated\"");
+    const rotated_config = try adjudication.Config.parse(a, rotated);
+    defer rotated_config.deinit();
+    try testing.expectEqualStrings(try fingerprintHex(scratch, try config.value.semantic(scratch)), try fingerprintHex(scratch, try rotated_config.value.semantic(scratch)));
+    const rebanded = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "[0.3,0.9]", "[0.2,0.9]");
+    const rebanded_config = try adjudication.Config.parse(a, rebanded);
+    defer rebanded_config.deinit();
+    try testing.expect(!std.mem.eql(u8, try fingerprintHex(scratch, try config.value.semantic(scratch)), try fingerprintHex(scratch, try rebanded_config.value.semantic(scratch))));
+    // Generated stages receive the resolver's per-call bounds.
+    const specification = try parse(scratch, try config.value.producerSpecification(scratch));
+    const strong = specification.object.get("decider").?.object.get("cascade").?.object.get("stages").?.array.items[1].object.get("decider").?;
+    try testing.expectEqual(@as(i64, 8), strong.object.get("batch").?.object.get("max_items_per_call").?.integer);
+    // Verdict-only stages admit only 0/1 thresholds.
+    const verdict = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"generator\":{\"provider\":\"antfly\",\"model\":\"strong\"}", "\"generator\":{\"provider\":\"antfly\",\"model\":\"strong\"},\"probabilities\":\"verdict_only\"");
+    try testing.expectError(error.InvalidAdjudicationConfig, adjudication.Config.parse(a, verdict));
+}
+
+test "REVIEW adjudication cascade persists the stage trace in the receipt" {
+    const a = testing.allocator;
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    const config = try adjudication.Config.parse(a, adjudication_cascade_config);
+    defer config.deinit();
+    var fixture: AdjudicationFixture = .{ .response = adjudication_cascade_response };
+    var map: MapStore = .{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+    const bytes = (try map.store().get(a, "resolution")).?;
+    defer a.free(bytes);
+    var parsed = try parseResolution(a, bytes);
+    defer parsed.deinit();
+    const evidence = parsed.entities[0].adjudication.?;
+    try testing.expectEqual(adjudication.Status.accepted, evidence.status);
+    try testing.expectEqual(Decision.match, parsed.entities[0].decision);
+    const trace = evidence.response.?.object.get("cascade").?.object;
+    try testing.expectEqualStrings("strong", trace.get("answered_by").?.string);
+    try testing.expectEqual(@as(usize, 2), trace.get("stages").?.array.items.len);
 }

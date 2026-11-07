@@ -201,6 +201,18 @@ pub const Runtime = struct {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         var result = try self.registry.getDeciderCapabilities(name);
         const cfg = try self.registry.getDeciderConfig(name);
+        if (cfg.decision_method == .cascade) {
+            var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+            defer arena.deinit();
+            const definition = try decisions.cascade_contract.compile(arena.allocator(), cfg.cascade.?);
+            for (definition.stages) |stage| {
+                const stage_caps = try resolvedCapabilities(ptr, try registry_mod.Registry.cascadeStageName(arena.allocator(), name, stage.name), source_table);
+                result.images = result.images and stage_caps.images;
+                result.messages = result.messages and stage_caps.messages;
+                result.max_input_bytes = @min(result.max_input_bytes, stage_caps.max_input_bytes);
+            }
+            return result;
+        }
         if (cfg.decision_method == .generated and cfg.generator.?.provider == .antfly and result.images) {
             result.images = (try self.resolveGenerator(name, if (source_table.len > 0) source_table else self.source_table)).capabilities.images;
         }
@@ -214,6 +226,15 @@ pub const Runtime = struct {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         const cfg = try self.registry.getDeciderConfig(name);
         try cfg.validate();
+        if (cfg.decision_method == .cascade) {
+            // Every stage must accept the same questions before any stage runs.
+            try decisions.validateQuestions(questions, cfg.resolvedCapabilities());
+            var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+            defer arena.deinit();
+            const definition = try decisions.cascade_contract.compile(arena.allocator(), cfg.cascade.?);
+            for (definition.stages) |stage| try validate(ptr, try registry_mod.Registry.cascadeStageName(arena.allocator(), name, stage.name), questions, source_table);
+            return;
+        }
         _ = try quotas.Policy.fromConfig(cfg.rate_limit);
         try decisions.validateQuestions(questions, cfg.resolvedCapabilities());
         if (cfg.decision_method == .generated) {
@@ -481,6 +502,11 @@ pub const Runtime = struct {
         return out;
     }
     fn evaluateCore(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) !PartialBatch {
+        // Cascades dispatch before admission: their stages re-enter here as
+        // ordinary deciders and take their own leases and quotas.
+        for (requests) |request| {
+            if ((try self.registry.getDeciderConfig(request.decider)).decision_method == .cascade) return self.evaluateWithCascades(a, requests, preserve_failures);
+        }
         const ptr: *anyopaque = self;
         const started = std.Io.Clock.awake.now(self.io).nanoseconds;
         defer self.latency_ns +|= @intCast(@max(0, std.Io.Clock.awake.now(self.io).nanoseconds - started));
@@ -604,6 +630,98 @@ pub const Runtime = struct {
         }
         return .{ .values = out, .failures = failures };
     }
+    fn evaluateWithCascades(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, preserve_failures: bool) !PartialBatch {
+        const out = try a.alloc(?decisions.Json, requests.len);
+        @memset(out, null);
+        const failures = try a.alloc(?anyerror, requests.len);
+        @memset(failures, null);
+        const is_cascade = try a.alloc(bool, requests.len);
+        defer a.free(is_cascade);
+        var plain: std.ArrayList(usize) = .empty;
+        defer plain.deinit(a);
+        for (requests, is_cascade, 0..) |request, *flag, index| {
+            flag.* = (try self.registry.getDeciderConfig(request.decider)).decision_method == .cascade;
+            if (!flag.*) try plain.append(a, index);
+        }
+        if (plain.items.len > 0) {
+            const subset = try a.alloc(decisions.Request, plain.items.len);
+            for (plain.items, subset) |index, *request| request.* = requests[index];
+            const partial = try self.evaluateCore(a, subset, preserve_failures);
+            for (plain.items, partial.values, partial.failures) |index, value, failure| {
+                out[index] = value;
+                failures[index] = failure;
+            }
+        }
+        // Items sharing a cascade, routing scope and questions escalate together.
+        const handled = try a.alloc(bool, requests.len);
+        defer a.free(handled);
+        @memset(handled, false);
+        for (requests, 0..) |first, start| {
+            if (!is_cascade[start] or handled[start]) continue;
+            const question_bytes = try std.json.Stringify.valueAlloc(a, first.questions, .{});
+            var group: std.ArrayList(usize) = .empty;
+            defer group.deinit(a);
+            for (requests[start..], start..) |request, index| {
+                if (!is_cascade[index] or handled[index]) continue;
+                if (!std.mem.eql(u8, request.decider, first.decider) or !std.mem.eql(u8, request.source_table, first.source_table)) continue;
+                const bytes = try std.json.Stringify.valueAlloc(a, request.questions, .{});
+                if (!std.mem.eql(u8, bytes, question_bytes)) continue;
+                handled[index] = true;
+                try group.append(a, index);
+            }
+            const outcome = try self.runCascade(a, requests, group.items);
+            for (group.items, outcome.values, outcome.failures) |index, value, failure| {
+                out[index] = value;
+                if (value == null) {
+                    const err = failure orelse error.InvalidDecisionOutput;
+                    if (!preserve_failures or fatalItemFailure(err)) return err;
+                    failures[index] = err;
+                }
+            }
+        }
+        return .{ .values = out, .failures = failures };
+    }
+
+    const CascadeRunner = struct {
+        runtime: *Runtime,
+        cascade: []const u8,
+        requests: []const decisions.Request,
+        group: []const usize,
+
+        fn run(ptr: *anyopaque, a: std.mem.Allocator, _: usize, stage: decisions.cascade_contract.Stage, indices: []const usize) anyerror!decisions.cascade_contract.StageResult {
+            const self: *CascadeRunner = @ptrCast(@alignCast(ptr));
+            const stage_name = try registry_mod.Registry.cascadeStageName(a, self.cascade, stage.name);
+            const stage_requests = try a.alloc(decisions.Request, indices.len);
+            for (indices, stage_requests) |index, *request| {
+                request.* = self.requests[self.group[index]];
+                request.decider = stage_name;
+            }
+            const partial = try self.runtime.evaluateCore(a, stage_requests, true);
+            return .{ .values = partial.values, .failures = partial.failures };
+        }
+        fn checkpoint(ptr: *anyopaque) anyerror!void {
+            const self: *CascadeRunner = @ptrCast(@alignCast(ptr));
+            try Runtime.checkpoint(self.runtime);
+        }
+    };
+
+    fn runCascade(self: *Runtime, a: std.mem.Allocator, requests: []const decisions.Request, group: []const usize) !decisions.cascade_contract.Outcome {
+        const name = requests[group[0]].decider;
+        const cfg = try self.registry.getDeciderConfig(name);
+        const definition = try decisions.cascade_contract.compile(a, cfg.cascade orelse return error.InvalidDeciderConfig);
+        // The cascade deadline narrows, never extends, the caller's deadline.
+        const saved = self.context;
+        defer self.context = saved;
+        if (definition.budget.deadline_ms) |ms| {
+            const deadline = @import("antfly_platform").time.monotonicNs() +| ms * std.time.ns_per_ms;
+            var bounded = saved orelse execution.RequestContext{ .io = self.io, .deadline_ns = null };
+            bounded.deadline_ns = if (bounded.deadline_ns) |existing| @min(existing, deadline) else deadline;
+            self.context = bounded;
+        }
+        var runner = CascadeRunner{ .runtime = self, .cascade = name, .requests = requests, .group = group };
+        return decisions.cascade_contract.execute(a, &definition, name, group.len, .{ .ptr = &runner, .run = CascadeRunner.run, .checkpoint = CascadeRunner.checkpoint });
+    }
+
     fn normalizeJob(_: *Runtime, a: std.mem.Allocator, job: *const Job) !decisions.Json {
         if (job.cfg.model_identity) |expected| {
             const root = try decisions.object(job.response.?);
@@ -2405,4 +2523,142 @@ test "decision provider asset transport enforces default request timeout without
     defer group.cancel(io);
     try group.concurrent(io, Fixture.serve, .{&server});
     try std.testing.expectError(error.Timeout, owned.http.get(url, .{}));
+}
+
+test "decision provider cascades escalate only in-band items through registered stages" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    const config = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"decision_method":"cascade","cascade":{"stages":[
+        \\  {"name":"fast","decider":{"provider":"antfly","model":"fast-model"}},
+        \\  {"name":"strong","decider":{"provider":"antfly","model":"strong-model"},
+        \\   "when":{"question":"same","choice":"same","probability_between":[0.3,0.9]}}],
+        \\ "budget":{"max_model_calls":2,"deadline_ms":60000}}}
+    , .{});
+    var cfg = try decisions.parseConfig(a, config);
+    defer cfg.deinit(a);
+    try registry.registerDeciderConfig("same-entity", cfg);
+    // Stages are ordinary registry entries, hidden behind their cascade.
+    try std.testing.expectEqualStrings("strong-model", (try registry.getDeciderConfig("same-entity#strong")).model);
+    try std.testing.expectEqualStrings("same-entity", registry.default_decider.?);
+    try std.testing.expectError(error.InvalidDeciderConfig, registry.registerDeciderConfig("bad#name", .{ .model = "m" }));
+
+    const Fake = struct {
+        var fast_calls = std.atomic.Value(usize).init(0);
+        var strong_calls = std.atomic.Value(usize).init(0);
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn extract(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @import("antfly_extracting").Request) !@import("antfly_extracting").Response {
+            return error.TestUnexpectedResult;
+        }
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?managed.RequestContext) ![]u8 {
+            const parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            const model = parsed.value.object.get("model").?.string;
+            const input = parsed.value.object.get("input").?.string;
+            const strong = std.mem.eql(u8, model, "strong-model");
+            _ = if (strong) strong_calls.fetchAdd(1, .monotonic) else fast_calls.fetchAdd(1, .monotonic);
+            // The fast stage is confident on "sure"/"no" and uncertain on "unsure".
+            const p: f64 = if (strong) 0.03 else if (std.mem.eql(u8, input, "sure")) 0.97 else if (std.mem.eql(u8, input, "no")) 0.02 else 0.6;
+            return std.fmt.allocPrint(alloc,
+                \\{{"model":"{s}","answers":[{{"name":"same","type":"choice","decision_method":"typed","choice":"{s}","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}],"usage":{{"input_tokens":5,"output_tokens":0}}}}
+            , .{ model, if (p >= 0.5) "same" else "different", p, 1 - p });
+        }
+    };
+    var token: u8 = 0;
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io, .antfly_provider = .{
+        .ptr = &token,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Fake.dense,
+        .embed_sparse_texts = Fake.sparse,
+        .extract = Fake.extract,
+        .decide_json = Fake.decide,
+    } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same entity?","criteria":{"same":"Same entity","different":"Different entities"}}}
+    , .{});
+    const requests = [_]decisions.Request{
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "sure" } },
+        .{ .decider = "deciders/same-entity", .questions = questions, .input = .{ .text = "unsure" } },
+        .{ .decider = "same-entity", .questions = questions, .input = .{ .text = "no" } },
+    };
+    // Namespaced and bare names are distinct groups but share one definition.
+    const results = try runtime.provider().evaluateBatch(scratch, &requests);
+    try std.testing.expectEqual(@as(usize, 3), Fake.fast_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), Fake.strong_calls.load(.monotonic));
+    const choice = struct {
+        fn of(value: decisions.Json) []const u8 {
+            return value.object.get("answers").?.array.items[0].object.get("choice").?.string;
+        }
+    }.of;
+    try std.testing.expectEqualStrings("same", choice(results[0]));
+    try std.testing.expectEqualStrings("different", choice(results[1]));
+    try std.testing.expectEqualStrings("different", choice(results[2]));
+    const trace = results[1].object.get("cascade").?.object;
+    try std.testing.expectEqualStrings("strong", trace.get("answered_by").?.string);
+    try std.testing.expectEqual(@as(usize, 2), trace.get("stages").?.array.items.len);
+    try std.testing.expectEqualStrings("strong-model", results[1].object.get("model").?.string);
+    try std.testing.expectEqual(@as(i64, 10), results[1].object.get("usage").?.object.get("input_tokens").?.integer);
+    try std.testing.expectEqualStrings("fast", results[0].object.get("cascade").?.object.get("answered_by").?.string);
+
+    // Bands need probabilities: score questions are rejected before any call.
+    const score = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"urgency":{"type":"score","instructions":"How urgent?","criteria":["low","high"]}}
+    , .{});
+    try std.testing.expectError(error.UnsupportedDecisionKind, runtime.provider().evaluateBatch(scratch, &.{.{ .decider = "same-entity", .questions = score, .input = .{ .text = "sure" } }}));
+    try std.testing.expectEqual(@as(usize, 3), Fake.fast_calls.load(.monotonic));
+}
+
+test "decision provider cascade configs reject transport fields and invalid stages" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const invalid = [_][]const u8{
+        // a cascade owns no transport
+        \\{"decision_method":"cascade","model":"m","cascade":{"stages":[{"name":"a","decider":{"model":"x"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+        ,
+        // cascade body without the method
+        \\{"model":"m","cascade":{"stages":[]}}
+        ,
+        // stage configs are validated as complete deciders
+        \\{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"provider":"antfly"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+        ,
+        // no similarity stages
+        \\{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"decision_method":"embedding_similarity","model":"e"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+        ,
+        // missing definition
+        \\{"decision_method":"cascade"}
+        ,
+    };
+    for (invalid) |bytes| {
+        const value = try std.json.parseFromSliceLeaky(decisions.Json, scratch, bytes, .{});
+        try std.testing.expectError(error.InvalidDeciderConfig, decisions.parseConfig(a, value));
+    }
+    // Owned copies survive the source and free cleanly.
+    const value = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"decision_method":"cascade","cascade":{"stages":[{"name":"a","decider":{"model":"x"}},{"name":"b","decider":{"model":"y"},"when":{"probability_between":[0.1,0.9]}}]}}
+    , .{});
+    var cfg = try decisions.parseConfig(a, value);
+    var copy = try cfg.clone(a);
+    cfg.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), copy.cascade.?.object.get("stages").?.array.items.len);
+    try std.testing.expect(!copy.resolvedCapabilities().images);
+    try std.testing.expect(copy.resolvedCapabilities().cascade);
+    copy.deinit(a);
 }

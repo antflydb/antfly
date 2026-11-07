@@ -16,6 +16,13 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Decider cascades** — a named decider can run a cheap stage on every input
+  and escalate only inputs whose answer probability falls inside a configured
+  band to a stronger stage (`decision_method: cascade`). Cascades work in
+  `/ai/v1/decisions`, SQL decision functions, decision enrichments and resolver
+  REVIEW adjudication. Responses and adjudication receipts carry a per-stage
+  trace. Resolver catalogs that use a cascade require reader epoch 30.
+
 - **`@antfly/design-system` license** — first-party code in the package is now
   Apache-2.0, matching the rest of the repository. shadcn/ui-derived code keeps
   its MIT notice, and the Aeonik font files are excluded from the package license.

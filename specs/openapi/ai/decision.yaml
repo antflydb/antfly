@@ -841,6 +841,59 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DecideAnswer'
+        cascade:
+          $ref: '#/components/schemas/DecisionCascadeTrace'
+    DecisionCascadeTrace:
+      type: object
+      additionalProperties: false
+      required: [decider, definition_sha256, answered_by, stages]
+      description: Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages.
+      properties:
+        decider:
+          type: string
+          description: The configured cascade name.
+        definition_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Identity of the cascade definition, excluding credentials. Any change to stages, bands, failure policy or budget changes it.
+        answered_by:
+          type: string
+          description: Name of the stage whose answer is final.
+        stages:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/DecisionCascadeStageTrace'
+    DecisionCascadeStageTrace:
+      type: object
+      additionalProperties: false
+      required: [name, decision_method, escalated]
+      properties:
+        name:
+          type: string
+        decision_method:
+          type: string
+          enum: [typed, generated]
+        model:
+          type: string
+        answers:
+          type: array
+          description: This stage's answers. Absent when the stage failed.
+          items:
+            $ref: '#/components/schemas/DecideAnswer'
+        usage:
+          $ref: '#/components/schemas/DecisionUsage'
+        provenance:
+          type: object
+          additionalProperties: true
+          description: Producer provenance reported for this stage, when present.
+        escalated:
+          type: boolean
+          description: Whether this answer fell inside the next stage's band, sending the input on.
+        error:
+          type: string
+          description: Error code when this stage failed for the input. With on_failure keep_previous, the previous stage's answer stands.
     DecideResponse:
       type: object
       additionalProperties: false
@@ -864,5 +917,7 @@ components:
             $ref: '#/components/schemas/DecisionBatchItem'
         usage:
           $ref: '#/components/schemas/DecisionUsage'
+        cascade:
+          $ref: '#/components/schemas/DecisionCascadeTrace'
       description: Single-input responses have answers. Batch responses have data in input order, with
         one named answer array per input and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model at the top level and resolved models per successful item.

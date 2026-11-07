@@ -81,7 +81,9 @@ pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
 pub const resolver_static_profiles_reader_version: u32 = 19;
 pub const resolver_pin_index_reader_version: u32 = 29;
-pub const supported_reader_version: u32 = resolver_pin_index_reader_version;
+/// Adjudication policies whose decider is a cascade of typed/generated stages.
+pub const adjudication_cascade_reader_version: u32 = 30;
+pub const supported_reader_version: u32 = adjudication_cascade_reader_version;
 
 const reader_version_encodings = blk: {
     @setEvalBranchQuota(10000);
@@ -129,6 +131,7 @@ pub fn catalogEncoding(a: Allocator, data: []const u8) !CatalogEncoding {
                 defer config.deinit();
                 if (config.value == .object) if (config.value.object.get("decider")) |decider| if (decider == .object) if (decider.object.get("decision_method")) |method| {
                     if (method == .string and std.mem.eql(u8, method.string, "generated")) required = @max(required, generated_producers_reader_version);
+                    if (method == .string and std.mem.eql(u8, method.string, "cascade")) required = @max(required, adjudication_cascade_reader_version);
                 };
             }
         }
@@ -1372,6 +1375,26 @@ test "resolver adjudication catalogs fence old readers and redact public credent
     defer a.free(public_json);
     try std.testing.expect(std.mem.indexOf(u8, public_json, "private-key") == null);
     try std.testing.expect(public.object.contains("adjudicate"));
+}
+
+test "resolver adjudication catalogs fence old readers from cascade deciders and redact stage credentials" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"{{_entity.text}}","scorer":{"comparisons":[]},"adjudicate":{"decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","api_key":"private-stage-key"}},{"name":"strong","decider":{"provider":"antfly","model":"fixture"},"when":{"probability_between":[0.3,0.9]}}]}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{});
+    const parsed = try ResolverConfig.parseValue(a, value);
+    defer parsed.deinit();
+    try parsed.value.validate();
+    const catalog = try serializeCatalog(a, &.{parsed.value});
+    defer a.free(catalog);
+    try std.testing.expectEqual(adjudication_cascade_reader_version, try catalogReaderVersion(a, catalog));
+    const public = try parsed.value.publicValue(arena.allocator());
+    const public_json = try std.json.Stringify.valueAlloc(a, public, .{});
+    defer a.free(public_json);
+    try std.testing.expect(std.mem.indexOf(u8, public_json, "private-stage-key") == null);
 }
 
 test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {

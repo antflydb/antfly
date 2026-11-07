@@ -248,6 +248,21 @@ pub const Registry = struct {
     pub fn getDeciderCapabilities(self: *const Registry, name: []const u8) !decisions.Capabilities {
         const cfg = try self.getDeciderConfig(name);
         var caps = cfg.resolvedCapabilities();
+        if (cfg.decision_method == .cascade) {
+            // Media must be admitted by every stage, each under its own bounds.
+            var buffer: [512]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const definition = try decisions.cascade_contract.compile(arena.allocator(), cfg.cascade.?);
+            for (definition.stages) |stage| {
+                fixed.reset();
+                const stage_caps = try self.getDeciderCapabilities(try cascadeStageName(fixed.allocator(), name, stage.name));
+                caps.images = caps.images and stage_caps.images;
+                caps.messages = caps.messages and stage_caps.messages;
+            }
+            return caps;
+        }
         caps.images = caps.images and cfg.max_image_input_tokens != null;
         if (!caps.images or self.inference_capabilities.count() == 0) return caps;
         var buffer: [1024]u8 = undefined;
@@ -261,7 +276,33 @@ pub const Registry = struct {
 
     pub fn registerDeciderConfig(self: *Registry, name: []const u8, cfg: decisions.DeciderConfig) !void {
         try cfg.validate();
-        if (name.len == 0) return error.InvalidDeciderConfig;
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, decisions.cascade_stage_separator) != null) return error.InvalidDeciderConfig;
+        if (cfg.decision_method == .cascade) {
+            // Stages are ordinary deciders under derived names, so quotas,
+            // generator resolution and normalization stay shared. They are
+            // hidden from public resolution and never become the default.
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const definition = try decisions.cascade_contract.compile(a, cfg.cascade.?);
+            for (definition.stages) |stage| {
+                const stage_name = try cascadeStageName(a, name, stage.name);
+                try self.putDeciderConfig(stage_name, try decisions.DeciderConfig.parseStage(a, stage.decider), false);
+            }
+        }
+        try self.putDeciderConfig(name, cfg, true);
+    }
+
+    /// Registry key for one cascade stage. Owned by `a`.
+    pub fn cascadeStageName(a: Allocator, cascade: []const u8, stage: []const u8) ![]u8 {
+        return std.fmt.allocPrint(a, "{s}{c}{s}", .{ stripNamespace(cascade, "deciders/"), decisions.cascade_stage_separator, stage });
+    }
+
+    pub fn isCascadeStageName(name: []const u8) bool {
+        return std.mem.indexOfScalar(u8, name, decisions.cascade_stage_separator) != null;
+    }
+
+    fn putDeciderConfig(self: *Registry, name: []const u8, cfg: decisions.DeciderConfig, may_default: bool) !void {
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);
         var owned = try cfg.clone(self.allocator);
@@ -270,7 +311,7 @@ pub const Registry = struct {
         if (entry.found_existing) return error.DuplicateDeciderName;
         entry.key_ptr.* = key;
         entry.value_ptr.* = owned;
-        if (self.default_decider == null) self.default_decider = key;
+        if (may_default and self.default_decider == null) self.default_decider = key;
     }
 
     pub fn defaultGeneratorName(self: *const Registry) ?[]const u8 {

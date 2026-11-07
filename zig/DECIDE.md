@@ -54,6 +54,28 @@ admission remain shared with managed inference. Calibration binds the model,
 geometry, renderer, question prototypes and selection mode. Threshold quality
 still needs application-specific held-out evaluation.
 
+## Cascades
+
+`lib/decisions/cascade.zig` owns the cascade contract: compilation, canonical
+identity (`definition_sha256`, credentials excluded), band evaluation over
+public answers and per-input trace assembly. Stage execution is injected.
+
+The shared decision runtime (`pkg/antfly-embedded/src/functions/runtime.zig`)
+is the only executor, so the gateway's `deciders/<name>`, SQL `ai_*`
+functions, decision enrichments and resolver adjudication share it. The
+registry stores each stage as an ordinary decider under `<cascade>#<stage>`, so
+quotas, generator resolution and normalization are unchanged. Stage entries
+are hidden from gateway resolution and the catalog, and configured names
+cannot contain `#`. `evaluateCore` dispatches cascades before admission;
+inputs sharing a cascade, routing scope and questions escalate together, and
+each stage re-enters `evaluateCore` as an ordinary batch.
+
+Cascade capabilities are the intersection of the stages'. Questions are
+limited to choice and predicate. Normalization validates each answer by its
+own decision method, because typed and generated stages can answer in one
+batch. Escalation reads successful answers only; whole-stage and per-input
+failures follow `on_failure` and never fall through to another stage.
+
 ## Batches and limits
 
 A single request uses `input` and returns `answers`. A batch uses

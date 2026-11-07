@@ -34,7 +34,24 @@ pub const WirePayload = struct {
 pub const Provider = enum { antfly, jev, openai, cloudflare };
 pub const Kind = enum { choice, multi_choice, score, noul };
 pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability };
-pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, images: bool = false, messages: bool = false, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
+pub const Capabilities = struct {
+    max_questions: usize = 64,
+    max_choices: usize = 64,
+    max_levels: usize,
+    max_input_bytes: usize = 1024 * 1024,
+    images: bool = false,
+    messages: bool = false,
+    full_distribution: bool = true,
+    embedding_similarity: bool = false,
+    generated: bool = false,
+    /// Answers come from whichever cascade stage answered last, so each answer
+    /// is validated by its own decision method. Only probability kinds apply.
+    cascade: bool = false,
+};
+pub const cascade_contract = contract.cascade;
+/// Separates a cascade's name from its stage name in derived registry keys.
+/// Configured decider names cannot contain it.
+pub const cascade_stage_separator = '#';
 pub fn capabilities(provider: Provider) Capabilities {
     return .{ .max_levels = if (provider == .antfly) 64 else 10, .images = provider != .antfly, .messages = provider != .antfly };
 }
@@ -63,7 +80,10 @@ pub const EmbeddingOptions = struct {
 };
 pub const DeciderConfig = struct {
     provider: Provider = .antfly,
-    decision_method: enum { typed, embedding_similarity, generated } = .typed,
+    decision_method: enum { typed, embedding_similarity, generated, cascade } = .typed,
+    /// `decision_method: cascade` only: `{"stages":[...],"budget":{...}}`. Each
+    /// stage carries an inline typed or generated decider configuration.
+    cascade: ?Json = null,
     generator: ?generating.GeneratorConfig = null,
     embedder: ?[]const u8 = null,
     output: constrained.Output = .auto,
@@ -85,6 +105,8 @@ pub const DeciderConfig = struct {
     batch_size: u16 = 32,
     rate_limit: ?RateLimit = null,
     pub fn validate(self: @This()) !void {
+        if (self.decision_method == .cascade) return self.validateCascade();
+        if (self.cascade != null) return error.InvalidDeciderConfig;
         if (self.embedder == null) if (self.embedding_options) |options| switch (options.dimensions) {
             128, 256, 512, 768 => {},
             else => return error.InvalidDeciderConfig,
@@ -126,7 +148,55 @@ pub const DeciderConfig = struct {
             if (policy.pacing == .completion and (policy.requests_per_minute == null or (policy.burst orelse 1) != 1)) return error.InvalidDeciderConfig;
         }
     }
+    /// A cascade owns no transport. Its stages are complete deciders and are
+    /// validated as such; budgets and rate limits belong to each stage.
+    fn validateCascade(self: @This()) !void {
+        const defaults = DeciderConfig{ .decision_method = .cascade, .cascade = self.cascade };
+        if (self.provider != defaults.provider or self.generator != null or self.embedder != null or self.output != defaults.output or
+            self.probabilities != defaults.probabilities or self.instructions.len != 0 or !std.meta.eql(self.batch, defaults.batch) or
+            self.model.len != 0 or self.model_identity != null or self.embedding_options != null or self.url.len != 0 or self.api_key != null or
+            self.account_id != null or self.gateway_id != null or self.max_image_input_tokens != null or self.rate_limit != null or
+            self.max_rows == 0 or self.max_input_tokens == 0 or self.batch_size == 0 or self.batch_size > 256) return error.InvalidDeciderConfig;
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const definition = cascade_contract.compile(a, self.cascade orelse return error.InvalidDeciderConfig) catch |err|
+            return if (err == error.OutOfMemory) err else error.InvalidDeciderConfig;
+        for (definition.stages) |stage| {
+            const stage_config = try parseStage(a, stage.decider);
+            if (stage_config.decision_method != .typed and stage_config.decision_method != .generated) return error.InvalidDeciderConfig;
+        }
+    }
+    /// Parse and validate one inline stage. Results borrow `a`.
+    pub fn parseStage(a: std.mem.Allocator, decider: Json) anyerror!DeciderConfig {
+        const bytes = try std.json.Stringify.valueAlloc(a, decider, .{});
+        const parsed = std.json.parseFromSliceLeaky(DeciderConfig, a, bytes, .{ .allocate = .alloc_always }) catch |err|
+            return if (err == error.OutOfMemory) err else error.InvalidDeciderConfig;
+        if (parsed.decision_method == .cascade) return error.InvalidDeciderConfig;
+        try parsed.validate();
+        return parsed;
+    }
+    /// Stages execute independently, so the cascade admits only what every
+    /// stage admits.
+    fn cascadeCapabilities(self: @This()) Capabilities {
+        var caps = Capabilities{ .max_levels = 0, .cascade = true, .images = true, .messages = true };
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const value = self.cascade orelse return .{ .max_levels = 0, .cascade = true };
+        const definition = cascade_contract.compile(a, value) catch return .{ .max_levels = 0, .cascade = true };
+        for (definition.stages) |stage| {
+            const stage_caps = (parseStage(a, stage.decider) catch return .{ .max_levels = 0, .cascade = true }).resolvedCapabilities();
+            caps.max_questions = @min(caps.max_questions, stage_caps.max_questions);
+            caps.max_choices = @min(caps.max_choices, stage_caps.max_choices);
+            caps.max_input_bytes = @min(caps.max_input_bytes, stage_caps.max_input_bytes);
+            caps.images = caps.images and stage_caps.images;
+            caps.messages = caps.messages and stage_caps.messages;
+        }
+        return caps;
+    }
     pub fn resolvedCapabilities(self: @This()) Capabilities {
+        if (self.decision_method == .cascade) return self.cascadeCapabilities();
         var caps = capabilities(self.provider);
         caps.generated = self.decision_method == .generated;
         if (caps.generated) {
@@ -143,6 +213,7 @@ pub const DeciderConfig = struct {
         return caps;
     }
     pub fn modelName(self: @This()) []const u8 {
+        if (self.decision_method == .cascade) return "cascade";
         return if (self.embedder) |name| name else if (self.generator) |generator| generator.model else if (self.model.len != 0) self.model else "jev-latest";
     }
     pub fn baseUrl(self: @This()) []const u8 {
@@ -176,6 +247,8 @@ pub const DeciderConfig = struct {
         result.generator = if (self.generator) |generator| try generator.clone(a) else null;
         errdefer if (result.generator) |*generator| generator.deinit(a);
         result.instructions = try a.dupe(u8, self.instructions);
+        errdefer a.free(result.instructions);
+        result.cascade = if (self.cascade) |value| try cloneJson(a, value) else null;
         return result;
     }
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
@@ -189,9 +262,61 @@ pub const DeciderConfig = struct {
         if (self.api_key) |key| a.free(key);
         if (self.model_identity) |identity| a.free(identity);
         if (self.embedding_options) |options| if (options.calibration_id) |id| a.free(id);
+        if (self.cascade) |value| freeJson(a, value);
         self.* = undefined;
     }
 };
+
+/// Deep copy owned by `a`; release with `freeJson`.
+pub fn cloneJson(a: std.mem.Allocator, value: Json) std.mem.Allocator.Error!Json {
+    return switch (value) {
+        .null, .bool, .integer, .float => value,
+        .number_string => |s| .{ .number_string = try a.dupe(u8, s) },
+        .string => |s| .{ .string = try a.dupe(u8, s) },
+        .array => |items| blk: {
+            var out = std.json.Array.init(a);
+            errdefer freeJson(a, .{ .array = out });
+            try out.ensureTotalCapacity(items.items.len);
+            for (items.items) |item| out.appendAssumeCapacity(try cloneJson(a, item));
+            break :blk .{ .array = out };
+        },
+        .object => |o| blk: {
+            var out: std.json.ObjectMap = .empty;
+            errdefer freeJson(a, .{ .object = out });
+            try out.ensureTotalCapacity(a, o.count());
+            for (o.keys(), o.values()) |key, item| {
+                const owned_key = try a.dupe(u8, key);
+                const owned_value = cloneJson(a, item) catch |err| {
+                    a.free(owned_key);
+                    return err;
+                };
+                out.putAssumeCapacity(owned_key, owned_value);
+            }
+            break :blk .{ .object = out };
+        },
+    };
+}
+
+pub fn freeJson(a: std.mem.Allocator, value: Json) void {
+    switch (value) {
+        .null, .bool, .integer, .float => {},
+        .number_string => |s| a.free(s),
+        .string => |s| a.free(s),
+        .array => |items| {
+            for (items.items) |item| freeJson(a, item);
+            var owned = items;
+            owned.deinit();
+        },
+        .object => |o| {
+            for (o.keys(), o.values()) |key, item| {
+                a.free(key);
+                freeJson(a, item);
+            }
+            var owned = o;
+            owned.deinit(a);
+        },
+    }
+}
 pub fn wireRequest(a: std.mem.Allocator, cfg: DeciderConfig, input: []const u8, questions: Json) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -264,6 +389,9 @@ pub fn validateQuestions(questions: Json, caps: Capabilities) !void {
         while (keys.next()) |key| if (!std.mem.eql(u8, key.key_ptr.*, "type") and !std.mem.eql(u8, key.key_ptr.*, "instructions") and !std.mem.eql(u8, key.key_ptr.*, "criteria") and !std.mem.eql(u8, key.key_ptr.*, "level_labels") and !(caps.embedding_similarity and (std.mem.eql(u8, key.key_ptr.*, "embedding_options") or std.mem.eql(u8, key.key_ptr.*, "similarity_thresholds")))) return error.InvalidDecisionSpecification;
         const kind = std.meta.stringToEnum(Kind, try text(q.get("type") orelse return error.InvalidDecisionSpecification)) orelse return error.InvalidDecisionSpecification;
         if ((caps.embedding_similarity and kind != .choice and kind != .multi_choice) or (!caps.embedding_similarity and !caps.generated and kind == .multi_choice)) return error.UnsupportedDecisionKind;
+        // Escalation bands read probabilities, which only choice and predicate
+        // answers carry across both typed and generated stages.
+        if (caps.cascade and kind != .choice and kind != .noul) return error.UnsupportedDecisionKind;
         schema_bytes +|= (try text(q.get("instructions") orelse return error.InvalidDecisionSpecification)).len;
         const criteria = q.get("criteria");
         switch (kind) {
@@ -425,7 +553,7 @@ fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Ca
         if (answer != .object) return error.InvalidDecisionOutput;
         const actual_kind = answer.object.get("type") orelse return error.InvalidDecisionOutput;
         if (actual_kind != .string or !std.mem.eql(u8, actual_kind.string, @tagName(kind))) return error.InvalidDecisionOutput;
-        if (caps.generated) {
+        if (caps.generated or (caps.cascade and generatedAnswer(answer))) {
             try validateGeneratedAnswer(a, spec, kind, answer);
             try put(a, &normalized, q.key_ptr.*, answer);
             continue;
@@ -571,6 +699,11 @@ fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Ca
     var result = response;
     result.object.getPtr("answers").?.* = normalized;
     return result;
+}
+
+fn generatedAnswer(answer: Json) bool {
+    const method = answer.object.get("decision_method") orelse return false;
+    return method == .string and std.mem.eql(u8, method.string, "generated");
 }
 
 fn validateGeneratedAnswer(a: std.mem.Allocator, spec: std.json.ObjectMap, kind: Kind, answer: Json) !void {

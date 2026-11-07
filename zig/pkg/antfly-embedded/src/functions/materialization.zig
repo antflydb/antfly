@@ -39,6 +39,18 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specifica
         const c = @import("antfly_structured");
         try c.validateProviderSchema(generator, try c.hostedCapabilities(generator).select(parsed.value.decider.output, parsed.value.decider.probabilities), try @import("generated.zig").questionSchema(parsed.arena.allocator(), parsed.value.questions));
     };
+    if (parsed.value.decider.decision_method == .cascade) {
+        // Hosted generated stages must accept the frozen questions too.
+        const arena = parsed.arena.allocator();
+        const definition = try d.cascade_contract.compile(arena, parsed.value.decider.cascade.?);
+        for (definition.stages) |stage| {
+            const stage_config = try d.DeciderConfig.parseStage(arena, stage.decider);
+            const generator = stage_config.generator orelse continue;
+            if (generator.provider == .antfly) continue;
+            const c = @import("antfly_structured");
+            try c.validateProviderSchema(generator, try c.hostedCapabilities(generator).select(stage_config.output, stage_config.probabilities), try @import("generated.zig").questionSchema(arena, parsed.value.questions));
+        }
+    }
     return parsed;
 }
 pub fn registry(a: std.mem.Allocator, spec: Specification) !providers.Registry {
@@ -82,11 +94,19 @@ pub fn provenanceWithRevision(a: std.mem.Allocator, spec: Specification, source_
         digest.update("antfly-frozen-embedder-v1");
         digest.update(dependency);
         digest.final(&hash);
+    } else if (spec.decider.decision_method == .cascade) {
+        // Stages, bands and budgets are behavior; credentials are not.
+        const definition = try d.cascade_contract.compile(a, spec.decider.cascade orelse return error.InvalidDeciderConfig);
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update(bytes);
+        digest.update("antfly-decider-cascade-v1");
+        digest.update(&definition.sha256);
+        digest.final(&hash);
     } else std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     var value = d.jsonObject();
     if (revision) |actual| try d.put(a, &value, "model_revision", actual);
     try d.put(a, &value, "version", .{ .string = spec.version });
-    try d.put(a, &value, "provider", .{ .string = if (spec.decider.generator) |cfg| @tagName(cfg.provider) else @tagName(spec.decider.provider) });
+    try d.put(a, &value, "provider", .{ .string = if (spec.decider.generator) |cfg| @tagName(cfg.provider) else if (spec.decider.decision_method == .cascade) "cascade" else @tagName(spec.decider.provider) });
     try d.put(a, &value, "specification_hash", .{ .string = try std.fmt.allocPrint(a, "{x}", .{&hash}) });
     try d.put(a, &value, "source_fingerprint", if (source_fingerprint) |fingerprint| .{ .string = fingerprint } else .null);
     return value;

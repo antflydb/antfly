@@ -319,6 +319,20 @@ concurrent changes return Busy for retry. Existing source/config/override read-s
 and ordered-publication checks fence stale publication. Databases using this policy
 require reader epoch 5; older readers must reject the database before parsing.
 
+**Cascades.** `decider` may be a cascade (`decision_method: cascade`; see
+[the decisions reference](../docs/reference/decisions.md#decider-cascades)): a
+cheap stage judges every REVIEW pair and only in-band pairs escalate. The
+policy hash covers the whole definition (credentials excluded), so editing
+stages or bands re-resolves like any policy change. `classify` checks the
+answer against the stage named in the response's `cascade.answered_by`, and
+requires the trace to list configured stages in order, ending on that stage.
+A response without the trace is invalid. The receipt keeps the normalized
+response, including the trace, under `response`; the `Evidence` layout is
+unchanged. Generated stages get the resolver's per-call batch bounds, and the
+receipt hash mixes in a combined revision of every generated stage.
+Verdict-only stages admit only 0/1 thresholds. Catalogs with a cascade policy
+require reader epoch 30.
+
 **Description inputs.** Extraction mentions may supply `description` and a numeric
 `description_embedding`; candidate document fields supply the corresponding text
 and vector. The existing cosine comparator handles explicitly supplied description vectors.
