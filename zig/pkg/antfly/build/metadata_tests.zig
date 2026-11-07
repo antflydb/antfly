@@ -40,6 +40,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
+    const query_artifact_tests = b.addTest(.{
+        .name = "metadata-query-artifact-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{ "metadata.lake", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-metadata-query-artifacts-test", "Verify query store ownership codecs and metadata snapshot recovery")
+        .dependOn(&addFilteredTestRunArtifact(b, query_artifact_tests).step);
     const online_merge_driver_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "metadata.online_merge_driver.", "metadata module compiles" },

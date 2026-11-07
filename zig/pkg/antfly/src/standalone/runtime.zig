@@ -5326,16 +5326,7 @@ pub fn runFromIterator(
         secret_store_initialized = true;
     }
 
-    var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(
-            alloc,
-            setup_io.io(),
-            config_path,
-            &secret_store,
-            .standalone,
-        )
-    else
-        null;
+    var loaded_config: ?antfly.common.config.Config = try loadStandaloneConfig(alloc, setup_io.io(), cli.config_path, &secret_store);
     defer if (loaded_config) |*cfg| cfg.deinit();
     if (loaded_config) |*cfg| try applyHotStandbyConfigDefaults(alloc, &cli, cfg);
 
@@ -12426,6 +12417,33 @@ test "standalone runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
     try std.testing.expectEqualStrings(expected_extension_store, resolved.extension_package_store_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/secrets.json", resolved.secret_store_path);
+}
+
+// Background maintenance uses the same defaults whether or not a config file
+// was supplied. In particular, a null API node_config silently disables GC.
+fn loadStandaloneConfig(alloc: std.mem.Allocator, io: std.Io, path: ?[]const u8, secret_store: ?*antfly.common.secrets.FileStore) !antfly.common.config.Config {
+    if (path) |config_path| return antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, io, config_path, secret_store, .standalone);
+    return antfly.common.config.Config.parseFromSliceWithSecretsForDeployment(alloc, "{}", secret_store, .standalone);
+}
+
+test "standalone without config supplies default artifact collection policy" {
+    var config = try loadStandaloneConfig(std.testing.allocator, std.testing.io, null, null);
+    defer config.deinit();
+    try std.testing.expectEqual(antfly.common.config.DeploymentMode.standalone, config.deployment_mode);
+    try std.testing.expect(config.lake_indexes.artifact_gc.enabled);
+    try std.testing.expect(!config.lake_indexes.artifact_gc.dry_run);
+    try std.testing.expectEqual(@as(u64, 30_000), config.lake_indexes.artifact_gc.interval_ms);
+    // Supplying defaults must not override an explicit operator policy.
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("standalone-gc-config");
+    defer directory.cleanup();
+    try ensureDirPath(std.testing.io, directory.path());
+    const path = try std.fs.path.join(std.testing.allocator, &.{ directory.path(), "config.json" });
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "{\"lake_indexes\":{\"artifact_gc\":{\"enabled\":false,\"dry_run\":true}}}" });
+    var explicit = try loadStandaloneConfig(std.testing.allocator, std.testing.io, path, null);
+    defer explicit.deinit();
+    try std.testing.expect(!explicit.lake_indexes.artifact_gc.enabled);
+    try std.testing.expect(explicit.lake_indexes.artifact_gc.dry_run);
 }
 
 test "standalone resolves the default secret store before full config parsing" {
