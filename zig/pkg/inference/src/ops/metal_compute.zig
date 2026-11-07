@@ -54915,7 +54915,7 @@ const PreparedDenseRegionFixture = struct {
             defer profile.deinitChecked() catch unreachable;
             try std.testing.expect(try profile.ensureScope(.{ .operation = .graph_execution, .implementation = implementation, .program = &graph }));
             const request = region.Prepare{ .allocator = a, .implementation = implementation, .policy_key = profile.policy_key, .execution_profile = profile.profile, .graph = &graph, .reachable = reachable, .node_order = nodes[0..count], .last_use = last_use, .partition_index = 0, .partition_nodes = nodes[0..count], .node_facts = facts };
-            try std.testing.checkAllAllocationFailures(a, prepare, .{ cb, request });
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(a, prepare, .{ cb, request });
             var selected = (try functions.prepareRegionRoutes.?(cb.ptr, request)) orelse return error.MissingPreparedRegion;
             var selected_live = true;
             defer if (selected_live) selected.deinit();

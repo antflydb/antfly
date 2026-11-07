@@ -4238,5 +4238,5 @@ test "private Native preparation consumes one Pool only after publication and ma
 
 test "private Native preparation preserves caller cleanup through every allocation failure" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, privateNativePreparationCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, privateNativePreparationCase, .{});
 }

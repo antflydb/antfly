@@ -987,6 +987,7 @@ test "Metal literal Shared staging keeps Private bank immutable and warm credit 
     const Memory = @import("../runtime/tier/memory.zig");
     const Domain = @import("../runtime/tier/admission_domain.zig");
     const Sink = @import("retirement_sink.zig");
+    const Retirement = @import("resource_retirement.zig");
     const Prepared = @import("prepared_storage_admission.zig").Prepared;
     const domain = try Domain.Domain.create();
     defer domain.release();
@@ -1069,6 +1070,13 @@ test "Metal literal Shared staging keeps Private bank immutable and warm credit 
     prepared.releaseAfterExecution(&epoch_a);
     prepared_live = false;
     guard_a.finish();
+    // SDK death and B-end only make the Charge eligible. Refund runs on an
+    // outside CPU poll; the background poller may already own that callback.
+    var stage_polls: usize = 0;
+    while (pin.controller().snapshot().backend_scratch_bytes != physical and stage_polls < 2000) : (stage_polls += 1) {
+        Retirement.pollRetirementChargesCPU();
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
     try std.testing.expectEqual(physical, pin.controller().snapshot().backend_scratch_bytes);
     // A foreign live frame must not convert construction to asynchronous copy.
     const refused_destination = (try ops.physical_storage.Lease.createTracked(a, cb, 16, null, .constant)).?;
@@ -1119,6 +1127,8 @@ test "Metal literal Shared staging keeps Private bank immutable and warm credit 
     owners[0].lease.?.releaseWithBoundary(&epoch_b);
     owners[0].lease = null;
     guard_b.finish();
+    Retirement.pollRetirementChargesCPU();
+    // Polling cannot refund the Private bank while its actual held view lives.
     try std.testing.expectEqual(physical, pin.controller().snapshot().backend_scratch_bytes);
     var guard_c = try sink.enter();
     defer guard_c.finish();
@@ -1127,6 +1137,11 @@ test "Metal literal Shared staging keeps Private bank immutable and warm credit 
     cb.freeWithBoundary(held.?, &epoch_c);
     held = null;
     guard_c.finish();
+    var final_polls: usize = 0;
+    while (pin.controller().snapshot().backend_scratch_bytes != 0 and final_polls < 2000) : (final_polls += 1) {
+        Retirement.pollRetirementChargesCPU();
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
     try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
 }
 
