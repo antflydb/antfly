@@ -6962,6 +6962,7 @@ pub const NativeFile = struct {
         const previous = self.activeCheckpoint();
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
+        errdefer self.resetBareCommitManifestWindow();
 
         const page_id = try page_allocator.allocate();
         try page_allocator.writePage(page_id, .data, contents);
@@ -7162,6 +7163,7 @@ pub const NativeFile = struct {
         var local_pages: PageAllocator = undefined;
         if (!self.stagingTransaction()) local_pages = try self.pageAllocatorFromFreeMap(previous);
         defer if (!self.stagingTransaction()) local_pages.deinit();
+        errdefer if (!self.stagingTransaction()) self.resetBareCommitManifestWindow();
         const pages = if (self.stagingTransaction()) &(try self.transactionWrites()).pages else &local_pages;
         var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined, .batch = .{ .file = self, .options = options } };
         defer builder.deinit();
@@ -7354,6 +7356,7 @@ pub const NativeFile = struct {
         var local_pages: PageAllocator = undefined;
         if (self.transaction_pages == null) local_pages = try self.pageAllocatorFromFreeMap(previous);
         defer if (self.transaction_pages == null) local_pages.deinit();
+        errdefer if (self.transaction_pages == null) self.resetBareCommitManifestWindow();
         const page_allocator = self.transaction_pages orelse &local_pages;
         page_allocator.pack_records = self.header.packed_records and (mutations.len > 1 or self.transaction_pages != null);
         var editor = IndexEditor.init(self, previous, roots.index);
@@ -7537,6 +7540,7 @@ pub const NativeFile = struct {
         var next_root_page = roots.history;
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
+        errdefer self.resetBareCommitManifestWindow();
         var key_index = roots.index;
 
         var external_value_root_page: u64 = 0;
@@ -7609,6 +7613,7 @@ pub const NativeFile = struct {
         var next_root_page = roots.history;
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
+        errdefer self.resetBareCommitManifestWindow();
         var editor = IndexEditor.init(self, previous, roots.index);
         editor.accounting_pages = &page_allocator;
         defer editor.deinit();
@@ -8696,6 +8701,7 @@ pub const NativeFile = struct {
         var local_pages: PageAllocator = undefined;
         if (self.transaction_pages == null) local_pages = try self.pageAllocatorFromFreeMap(previous);
         defer if (self.transaction_pages == null) local_pages.deinit();
+        errdefer if (self.transaction_pages == null) self.resetBareCommitManifestWindow();
         const page_allocator = self.transaction_pages orelse &local_pages;
         page_allocator.pack_records = self.header.packed_records and (mutations.len > 1 or self.transaction_pages != null);
         // Release the document editor before building the namespace index.
@@ -8888,6 +8894,7 @@ pub const NativeFile = struct {
         var local: PageAllocator = undefined;
         if (self.transaction_pages == null) local = try self.pageAllocatorFromFreeMap(previous);
         defer if (self.transaction_pages == null) local.deinit();
+        errdefer if (self.transaction_pages == null) self.resetBareCommitManifestWindow();
         const pages = self.transaction_pages orelse &local;
         pages.pack_records = true;
         var editor = IndexEditor.init(self, previous, previous.document_index_root_page);
@@ -12488,6 +12495,27 @@ pub const NativeFile = struct {
 
     pub fn commitTransaction(self: *NativeFile) !void {
         return self.commitTransactionWithDurability(true);
+    }
+
+    /// Reset accumulated manifest tracking when a bare (no caller-owned
+    /// transaction) commit fails before it publishes. A transactional
+    /// commit's failure is covered by `commitTransactionWithDurability`'s
+    /// own `errdefer` (see its comment: dropping entries from this and any
+    /// earlier non-durable attempt in the same since-last-durable window is
+    /// always safe, since the next durable commit just falls back to
+    /// presynced). A bare commit has no such errdefer and no
+    /// `abortTransaction` call to lean on -- there is no transaction to
+    /// abort -- so without this, a page noted (`PageWriteBatch.flushCount`'s
+    /// hook) before a later step in the same bare commit fails would sit in
+    /// `self.manifest_builder` until some *unrelated* later commit durably
+    /// publishes and resets it, at best wasting memory and at worst (a
+    /// `reserved_page` left set) silently steering that unrelated commit
+    /// away from building a manifest of its own.
+    fn resetBareCommitManifestWindow(self: *NativeFile) void {
+        if (manifest_commits_enabled) {
+            self.manifest_builder.deinit(self.allocator);
+            self.manifest_builder = .{};
+        }
     }
 
     /// Reserve a manifest page for a bare (no caller-owned transaction)
