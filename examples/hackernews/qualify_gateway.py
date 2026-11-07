@@ -21,8 +21,10 @@ This does not restart infrastructure or establish archive-scale qualification.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 import time
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -37,6 +39,20 @@ def save(path, value):
         json.dump(value, output, indent=2)
         output.write("\n")
     temporary.replace(path)
+
+
+def timing_evidence(headers, elapsed):
+    # Accept only our numeric metric, never retain raw response/auth headers.
+    value = headers.get("Server-Timing", "") if headers else ""
+    match = re.fullmatch(r"antfly_upstream;dur=([0-9]+(?:\.[0-9]+)?)", value)
+    if match:
+        seconds = float(match[1]) / 1000
+        if math.isfinite(seconds) and 0 <= seconds <= elapsed + 0.001:
+            return {
+                "backend_seconds": seconds,
+                "outside_backend_seconds": max(0, elapsed - seconds),
+            }
+    return {}
 
 
 def probe(base, route, payload, authorization=None):
@@ -59,11 +75,15 @@ def probe(base, route, payload, authorization=None):
                 raise ValueError("Response too large")
             result = json.loads(raw)
             status = response.status
-        return result, {"status": status, "seconds": time.monotonic() - started}
+            elapsed = time.monotonic() - started
+            timing = timing_evidence(response.headers, elapsed)
+        return result, {"status": status, "seconds": elapsed, **timing}
     except HTTPError as error:
         status = error.code
+        elapsed = time.monotonic() - started
+        timing = timing_evidence(error.headers, elapsed)
         error.close()
-        return None, {"status": status, "seconds": time.monotonic() - started}
+        return None, {"status": status, "seconds": elapsed, **timing}
     except (OSError, ValueError) as error:
         return None, {
             "transport_error": type(error).__name__,
@@ -91,11 +111,25 @@ def main():
     parser.add_argument("--query", default="database")
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument(
+        "--search-first",
+        action="store_true",
+        help="Search before health/readiness so those probes do not warm the gateway",
+    )
+    parser.add_argument(
+        "--max-search-seconds",
+        type=float,
+        help="Fail a separate latency gate if any observed search exceeds this duration; requests are never retried",
+    )
+    parser.add_argument(
         "--runtime-image",
         required=True,
         help="Operator-observed exact image@sha256:digest",
     )
     args = parser.parse_args()
+    if args.max_search_seconds is not None and (
+        not math.isfinite(args.max_search_seconds) or args.max_search_seconds <= 0
+    ):
+        parser.error("Search latency limit must be finite and positive")
     authorization = authorization_headers(
         {"ANTFLY_AUTHORIZATION": os.environ.get("HN_GATEWAY_AUTHORIZATION", "")}
     ).get("Authorization")
@@ -112,6 +146,8 @@ def main():
         "checks": [],
         "smoke_passed": False,
         "archive_qualified": False,
+        "search_first": args.search_first,
+        "max_search_seconds": args.max_search_seconds,
     }
     previous = json.loads(args.resume_from.read_text()) if args.resume_from else None
     if previous and (
@@ -121,12 +157,17 @@ def main():
     ):
         parser.error("Resume requires successful evidence for this gateway and image")
     save(args.output, record)
-    for route in ("/health", "/ready"):
-        result, evidence = probe(base, route, None, authorization)
-        record["checks"].append({"route": route, **evidence})
-        save(args.output, record)
-        if not result or evidence.get("status") != 200:
-            parser.exit(1, "Gateway health/readiness failed; evidence retained\n")
+
+    def health_checks():
+        for route in ("/health", "/ready"):
+            result, evidence = probe(base, route, None, authorization)
+            record["checks"].append({"route": route, **evidence})
+            save(args.output, record)
+            if not result or evidence.get("status") != 200:
+                parser.exit(1, "Gateway health/readiness failed; evidence retained\n")
+
+    if not args.search_first:
+        health_checks()
     originals = (
         {entry["view"]: entry for entry in previous["checks"] if "view" in entry}
         if previous
@@ -141,6 +182,8 @@ def main():
                 payload["recent_since"] = original["recent_since"]
         result, evidence = probe(base, "/api/search", payload, authorization)
         entry = {"view": view, "request": payload, **evidence}
+        if args.max_search_seconds is not None:
+            entry["latency_passed"] = evidence["seconds"] <= args.max_search_seconds
         record["checks"].append(entry)
         # Persist transport/HTTP failures before inspecting their payload.
         save(args.output, record)
@@ -169,9 +212,20 @@ def main():
             save(args.output, record)
             parser.exit(1, "Search validation failed; evidence retained\n")
         time.sleep(0.6)  # Stay below the gateway's default aggregate admission rate.
+    if args.search_first:
+        health_checks()
     record["smoke_passed"] = True
+    if args.max_search_seconds is not None:
+        record["latency_passed"] = all(
+            entry["latency_passed"] for entry in record["checks"] if "view" in entry
+        )
     record["completed_at"] = time.time()
     save(args.output, record)
+    if record.get("latency_passed") is False:
+        parser.exit(
+            1,
+            "Functional smoke passed; search latency gate failed; evidence retained\n",
+        )
     print(
         json.dumps(
             {

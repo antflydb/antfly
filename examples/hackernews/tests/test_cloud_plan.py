@@ -28,6 +28,7 @@ def test_separate_object_tables_and_scoped_cloud_keys():
     tables = native_plan("antfly-showcases", archive, current)
     for name in ("archive-table.json", "current-table.json"):
         assert tables[name]["storage"] == {"engine": "object"}
+        assert tables[name]["schema"]["base_source"]["object_mutability"] == "immutable"
         assert "num_shards" not in tables[name]
         assert tables[name]["indexes"]["body_text"] == {
             "type": "full_text",
