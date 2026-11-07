@@ -9,6 +9,7 @@ A monorepo containing TypeScript/JavaScript packages for Antfly.
 | [@antfly/sdk](packages/sdk) | TypeScript SDK for the Antfly and Antfly inference APIs | [![npm](https://img.shields.io/npm/v/@antfly/sdk.svg)](https://www.npmjs.com/package/@antfly/sdk) |
 | [@antfly/langchain](packages/langchain) | LangChain.js retrieval, persistent stores, graph tools and multimodal workflows | Release candidate |
 | [@antfly/langgraph-store](packages/langgraph-store) | Persistent LangGraph.js long-term memory | Release candidate |
+| [@antfly/ai-sdk](packages/ai-sdk) | Antfly provider, tools and chat history persistence for the Vercel AI SDK | Release candidate |
 | [@antfly/components](packages/components) | React components for building search interfaces | [![npm](https://img.shields.io/npm/v/@antfly/components.svg)](https://www.npmjs.com/package/@antfly/components) |
 
 ## Quick Start
@@ -129,6 +130,8 @@ packages/design-system/  → @antfly/design-system (shadcn/ui-based shared
 packages/graph/          → @antfly/graph (force-directed graph component)
 packages/web/            → @antfly/web (local browser inference via Antfly WASM
                            and WebGPU; UI in Colony)
+packages/ai-sdk/         → @antfly/ai-sdk (Antfly provider, tools and chat
+                           history persistence for the Vercel AI SDK)
 packages/embedded/       → @antfly/embedded (Node binding for local Antfly
                            databases and inference over the libantfly C ABI)
                            with platform packages embedded-darwin-arm64,

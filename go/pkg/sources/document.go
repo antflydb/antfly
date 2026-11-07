@@ -46,6 +46,24 @@ type Document struct {
 type NormalizationError struct{ Code, Detail string }
 
 func (e *NormalizationError) Error() string { return e.Detail }
+
+// relativeKeyFor resolves an item's key relative to its source's root. A
+// connector that reports one (local, S3, GCS: see their RelativeKey doc
+// comment) uses it as-is. Otherwise it falls back to the item's native ID --
+// item.ID with the connector's own "scheme://job/<sourceID>/" ownership
+// prefix stripped -- which is exactly right for providers with no path-like
+// key of their own (Drive, GitHub, and other collaboration surfaces): their
+// identity already is their native ID, and moving such an item across
+// providers is never a meaningful operation to begin with.
+func relativeKeyFor(sourceID string, item Item) string {
+	if item.RelativeKeySet || item.RelativeKey != "" {
+		return item.RelativeKey
+	}
+	if _, rest, ok := strings.Cut(item.ID, "://job/"+sourceID+"/"); ok {
+		return rest
+	}
+	return item.ID
+}
 func Normalize(sourceID string, item Item, data []byte, permissions Permissions, now time.Time) (Document, error) {
 	fail := func(code, detail string) (Document, error) { return Document{}, &NormalizationError{code, detail} }
 	if item.Revision == "" || len(item.Revision) > 4096 || !utf8.ValidString(item.Revision) || strings.ContainsRune(item.Revision, 0) {
@@ -95,6 +113,7 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 	metadata["provider"] = item.SourceKind
 	metadata["source_id"] = sourceID
 	metadata["identity"] = item.ID
+	metadata["relative_key"] = relativeKeyFor(sourceID, item)
 	return Document{Version: SourceRecordVersion, Kind: "text", MIMEType: "text/plain", URI: parsed.String(), Path: path, Content: string(data), Revision: item.Revision, IndexedAt: now.Unix(), Permissions: permissions, Metadata: metadata}, nil
 }
 

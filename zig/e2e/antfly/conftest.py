@@ -1257,7 +1257,13 @@ def _data_command(
 
 class StatefulAntflyServer:
     def __init__(
-        self, binary: str, host: str, port: int, *, auth_enabled: bool = False
+        self,
+        binary: str,
+        host: str,
+        port: int,
+        *,
+        auth_enabled: bool = False,
+        data_config: dict | None = None,
     ):
         self.binary = binary
         self.host = host
@@ -1277,6 +1283,12 @@ class StatefulAntflyServer:
             )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
+            self.data_config_path = None
+            if data_config is not None:
+                self.data_config_path = self.root / "data-config.json"
+                self.data_config_path.write_text(
+                    json.dumps(data_config), encoding="utf-8"
+                )
             self.replica_root = self.root / "data-replicas"
             self.metadata_log_path = self.root / "metadata.log"
             self.data_log_path = self.root / "data.log"
@@ -1343,6 +1355,8 @@ class StatefulAntflyServer:
             root=self.root,
             auth_enabled=self.auth_enabled,
         )
+        if self.data_config_path is not None:
+            data_command.extend(["--config", str(self.data_config_path)])
         self.data_proc = self.port_reservations.handoff_to(
             (self.port, self.data_raft_port),
             lambda: subprocess.Popen(

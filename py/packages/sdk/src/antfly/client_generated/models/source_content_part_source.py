@@ -20,7 +20,7 @@ class SourceContentPartSource:
         uri (str): HTTP(S) URL. Treat source media URLs as private.
         mime_type (str): image/png, image/jpeg, image/webp, image/gif, or an audio/* or video/* type.
         version (str): Quoted strong ETag. The fetch fails if the source no longer has this version.
-        length (int): Exact object length.
+        length (int): Exact object length. Images are limited by the 16 MiB request size.
         version_kind (SourceContentPartSourceVersionKind | Unset):  Default:
             SourceContentPartSourceVersionKind.STRONG_ETAG.
     """

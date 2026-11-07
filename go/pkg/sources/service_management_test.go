@@ -162,6 +162,54 @@ func TestSourceScopedRunStartsAfterSiblingConnectionIsRevoked(t *testing.T) {
 	require.Equal(t, "completed", waitServiceJob(t, s, run.Id).State)
 }
 
+func TestManagementCarriesIdentityAndRekeys(t *testing.T) {
+	s, _, _ := serviceFixture(t)
+	path := "/sources/" + s.profile.Sources[0].ID
+	get := managementCall(s, "GET", path, "", nil)
+	require.Equal(t, 200, get.Code, get.Body.String())
+	var current management.Source
+	require.NoError(t, json.Unmarshal(get.Body.Bytes(), &current))
+	require.False(t, current.Rekeys, "rekeys only appears on a PUT response")
+
+	current.Identity.Namespace = "chosen"
+	put := managementCall(s, "PUT", path, "", current)
+	require.Equal(t, 200, put.Code, put.Body.String())
+	var updated management.Source
+	require.NoError(t, json.Unmarshal(put.Body.Bytes(), &updated))
+	require.Equal(t, "chosen", updated.Identity.Namespace)
+
+	// A namespace is immutable, and once set a connection change can't re-key.
+	updated.Rekeys = false
+	updated.Identity.Namespace = "other"
+	changed := managementCall(s, "PUT", path, "", updated)
+	require.GreaterOrEqual(t, changed.Code, 400, changed.Body.String())
+
+	updated.Identity.Namespace = "chosen"
+	updated.Config["changed"] = true
+	again := managementCall(s, "PUT", path, "", updated)
+	require.Equal(t, 200, again.Code, again.Body.String())
+	var final management.Source
+	require.NoError(t, json.Unmarshal(again.Body.Bytes(), &final))
+	require.Equal(t, "chosen", final.Identity.Namespace)
+	require.False(t, final.Rekeys)
+}
+
+func TestManagementCreatedSourceGetsNamespaceWithoutRekey(t *testing.T) {
+	s, _, _ := serviceFixture(t)
+	get := managementCall(s, "GET", "/sources/"+s.profile.Sources[0].ID, "", nil)
+	var created management.Source
+	require.NoError(t, json.Unmarshal(get.Body.Bytes(), &created))
+	created.Id = "00000000-0000-4000-8000-0000000000aa"
+	created.Name = "created"
+	created.Identity = management.SourceIdentity{}
+	put := managementCall(s, "PUT", "/sources/"+created.Id, "", created)
+	require.Equal(t, 200, put.Code, put.Body.String())
+	var out management.Source
+	require.NoError(t, json.Unmarshal(put.Body.Bytes(), &out))
+	require.NotEmpty(t, out.Identity.Namespace)
+	require.False(t, out.Rekeys)
+}
+
 func TestManagementSourcePagesBoundEncodedBytes(t *testing.T) {
 	s, _, _ := serviceFixture(t)
 	s.mu.Lock()

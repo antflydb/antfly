@@ -8000,6 +8000,7 @@ fn isUnicodeWhitespace(cp: u21) bool {
 /// the outer slice but must not free the inner string contents.
 fn bertPreTokenize(allocator: std.mem.Allocator, text: []const u8, handle_chinese_chars: bool) ![][]const u8 {
     var words = std.ArrayListUnmanaged([]const u8).empty;
+    defer words.deinit(allocator);
     var start: usize = 0;
     var i: usize = 0;
 
@@ -8055,6 +8056,7 @@ fn bertPreTokenize(allocator: std.mem.Allocator, text: []const u8, handle_chines
 
 fn bertPreTokenizeWithOffsets(allocator: std.mem.Allocator, text: []const u8, handle_chinese_chars: bool) ![]PreTokenSpan {
     var words = std.ArrayListUnmanaged(PreTokenSpan).empty;
+    defer words.deinit(allocator);
     var start: usize = 0;
     var i: usize = 0;
 
@@ -9498,6 +9500,19 @@ test "encode for model handles splade wordpiece tokenizer fixture" {
     try std.testing.expectEqual(@as(i32, 0), result.ids[4]);
     try std.testing.expectEqual(@as(i32, 1), result.attention_mask[0]);
     try std.testing.expectEqual(@as(i32, 0), result.attention_mask[4]);
+}
+
+fn bertPreTokenizerAllocationFailure(allocator: std.mem.Allocator) !void {
+    const text = "Hello, world! Test. 中文";
+    const words = try bertPreTokenize(allocator, text, true);
+    defer allocator.free(words);
+    const spans = try bertPreTokenizeWithOffsets(allocator, text, true);
+    defer allocator.free(spans);
+    try std.testing.expectEqual(words.len, spans.len);
+}
+
+test "bert pre-tokenizer refunds every failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, bertPreTokenizerAllocationFailure, .{});
 }
 
 test "bert pre-tokenizer" {

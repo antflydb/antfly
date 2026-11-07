@@ -48,6 +48,8 @@ rollback_installation() {
     rollback_target fish "${FISH_TARGET:-}"
     rollback_target zsh "${ZSH_TARGET:-}"
     rollback_target bash "${BASH_TARGET:-}"
+    rollback_target assets "${ASSETS_TARGET:-}"
+    rollback_target header "${HEADER_TARGET:-}"
     rollback_target lib "${LIB_TARGET:-}"
     rollback_target binary "${BIN_TARGET:-}"
 }
@@ -350,9 +352,12 @@ EOF
         INSTALL_DIR="$HOME/.local/bin"
         LIB_DIR="$HOME/.local/lib/antfly"
     fi
+    PREFIX="${INSTALL_DIR%/bin}"
 
     BIN_TARGET="$INSTALL_DIR/antfly"
     LIB_TARGET=""
+    HEADER_TARGET=""
+    ASSETS_TARGET=""
     BASH_TARGET=""
     ZSH_TARGET=""
     FISH_TARGET=""
@@ -360,6 +365,26 @@ EOF
     chmod +x "$EXTRACT_DIR/antfly"
     if [ -d "$EXTRACT_DIR/lib" ]; then
         LIB_TARGET="$LIB_DIR"
+    fi
+    if [ -f "$EXTRACT_DIR/include/antfly.h" ]; then
+        HEADER_TARGET="$PREFIX/include/antfly.h"
+    fi
+    if [ -d "$EXTRACT_DIR/share/antfly/antfarm" ]; then
+        # Replace only this runtime-owned leaf, not sibling installed versions.
+        ASSETS_TARGET="$PREFIX/share/antfly/antfarm"
+    fi
+    if [ -f "$EXTRACT_DIR/lib/pkgconfig/libantfly.pc" ]; then
+        # Libraries live in lib/antfly rather than the archive's lib directory.
+        # Keep the metadata relocatable while matching the installed prefix.
+        PKGCONFIG_PATH="$EXTRACT_DIR/lib/pkgconfig/libantfly.pc"
+        while IFS= read -r LINE || [ -n "$LINE" ]; do
+            case "$LINE" in
+                prefix=*) printf '%s\n' 'prefix=${pcfiledir}/../../..' ;;
+                libdir=*) printf '%s\n' 'libdir=${prefix}/lib/antfly' ;;
+                *) printf '%s\n' "$LINE" ;;
+            esac
+        done < "$PKGCONFIG_PATH" > "$PKGCONFIG_PATH.new"
+        mv "$PKGCONFIG_PATH.new" "$PKGCONFIG_PATH"
     fi
     if [ -f "$EXTRACT_DIR/completions/antfly.bash" ]; then
         BASH_COMPLETION_DIR="${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions"
@@ -379,6 +404,8 @@ EOF
     TRANSACTION_ACTIVE=1
     prepare_target binary "$EXTRACT_DIR/antfly" "$BIN_TARGET"
     [ -z "$LIB_TARGET" ] || prepare_target lib "$EXTRACT_DIR/lib" "$LIB_TARGET"
+    [ -z "$HEADER_TARGET" ] || prepare_target header "$EXTRACT_DIR/include/antfly.h" "$HEADER_TARGET"
+    [ -z "$ASSETS_TARGET" ] || prepare_target assets "$EXTRACT_DIR/share/antfly/antfarm" "$ASSETS_TARGET"
     [ -z "$BASH_TARGET" ] || prepare_target bash "$EXTRACT_DIR/completions/antfly.bash" "$BASH_TARGET"
     [ -z "$ZSH_TARGET" ] || prepare_target zsh "$EXTRACT_DIR/completions/antfly.zsh" "$ZSH_TARGET"
     [ -z "$FISH_TARGET" ] || prepare_target fish "$EXTRACT_DIR/completions/antfly.fish" "$FISH_TARGET"
@@ -386,6 +413,8 @@ EOF
     status "Activating Antfly $TAG..."
     activate_target binary "$BIN_TARGET"
     [ -z "$LIB_TARGET" ] || activate_target lib "$LIB_TARGET"
+    [ -z "$HEADER_TARGET" ] || activate_target header "$HEADER_TARGET"
+    [ -z "$ASSETS_TARGET" ] || activate_target assets "$ASSETS_TARGET"
     [ -z "$BASH_TARGET" ] || activate_target bash "$BASH_TARGET"
     [ -z "$ZSH_TARGET" ] || activate_target zsh "$ZSH_TARGET"
     [ -z "$FISH_TARGET" ] || activate_target fish "$FISH_TARGET"
@@ -396,6 +425,8 @@ EOF
     TRANSACTION_ACTIVE=0
     finalize_target binary "$BIN_TARGET"
     [ -z "$LIB_TARGET" ] || finalize_target lib "$LIB_TARGET"
+    [ -z "$HEADER_TARGET" ] || finalize_target header "$HEADER_TARGET"
+    [ -z "$ASSETS_TARGET" ] || finalize_target assets "$ASSETS_TARGET"
     [ -z "$BASH_TARGET" ] || finalize_target bash "$BASH_TARGET"
     [ -z "$ZSH_TARGET" ] || finalize_target zsh "$ZSH_TARGET"
     [ -z "$FISH_TARGET" ] || finalize_target fish "$FISH_TARGET"

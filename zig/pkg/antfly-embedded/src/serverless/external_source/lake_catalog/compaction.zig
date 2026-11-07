@@ -24,6 +24,7 @@ const rows = @import("row_commit.zig");
 const iceberg = @import("../iceberg_avro.zig");
 const avro = @import("avro_writer.zig");
 const parquet = @import("parquet_writer.zig");
+const bucket = @import("bucket.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const Selection = struct {
@@ -115,17 +116,30 @@ fn selectBounded(a: A, table: t.Table, files: rows.Files, max_rows: u64, max_byt
     if (all and paths.items.len == 0 and max_delete_sequence > 0) rewrites_deletes = true;
     return .{ .manifests = manifests.items, .files = paths.items, .all_data = all, .rewrites_deletes = rewrites_deletes, .input_rows = count, .input_bytes = size };
 }
-pub const Output = struct { uri: []const u8, rows: u64, bytes: u64 };
-pub fn writeOutput(a: A, table: t.Table, files: rows.Files, operation: []const u8, part: u64, live: []const V) !Output {
+pub const Output = struct { uri: []const u8, rows: u64, bytes: u64, spec_id: ?i32 = null, bucket_value: ?u32 = null };
+pub fn writeOutputs(a: A, table: t.Table, files: rows.Files, operation: []const u8, part: u64, live: []const V) ![]const Output {
     const root = try m.parse(a, table.metadata_json);
-    const data = try parquet.encode(a, try rows.schema(a, root), live, files.context);
-    const uri = try rows.upload(a, files, try std.fmt.allocPrint(a, "data/antfly-compact-{s}-{d}-{s}.parquet", .{ t.digestHex(operation), part, t.digestHex(data) }), data);
-    return .{ .uri = uri, .rows = live.len, .bytes = data.len };
+    const schema = try rows.schema(a, root);
+    const layout = try bucket.defaultSpec(root, schema);
+    const groups = if (layout) |spec| try bucket.group(a, spec, live) else &[_]bucket.Group{.{ .bucket = null, .rows = live }};
+    var result: std.ArrayList(Output) = .empty;
+    for (groups, 0..) |group, ordinal| {
+        if (group.rows.len == 0) continue;
+        const data = try parquet.encode(a, schema, group.rows, files.context);
+        const uri = try rows.upload(a, files, try std.fmt.allocPrint(a, "data/antfly-compact-{s}-{d}-{d}-{s}.parquet", .{ t.digestHex(operation), part, ordinal, t.digestHex(data) }), data);
+        try result.append(a, .{ .uri = uri, .rows = group.rows.len, .bytes = data.len, .spec_id = if (layout) |spec| spec.id else null, .bucket_value = group.bucket });
+    }
+    return result.toOwnedSlice(a);
+}
+pub fn writeOutput(a: A, table: t.Table, files: rows.Files, operation: []const u8, part: u64, live: []const V) !Output {
+    const outputs = try writeOutputs(a, table, files, operation, part, live);
+    if (outputs.len != 1) return error.InvalidLakeCompaction;
+    return outputs[0];
 }
 pub fn prepare(a: A, table: t.Table, files: rows.Files, selection: Selection, live: []const V, timestamp: i64) !rows.Prepared {
     if (live.len > selection.input_rows) return error.InvalidLakeCompaction;
     const operation = try std.json.Stringify.valueAlloc(a, .{ "compaction-v1", table.metadata_location, selection.manifests }, .{});
-    const output: []const Output = if (live.len == 0) &.{} else &.{try writeOutput(a, table, files, operation, 0, live)};
+    const output = try writeOutputs(a, table, files, operation, 0, live);
     return prepareOutputs(a, table, files, selection, output, timestamp);
 }
 /// Final publication only occurs after the complete selected input was scanned.
@@ -192,17 +206,25 @@ pub fn prepareOutputs(a: A, table: t.Table, files: rows.Files, selection: Select
     if (removed != selection.manifests.len) return error.InvalidLakeCompaction;
     var part: usize = 0;
     while (part < outputs.len) {
-        const end = @min(outputs.len, part + 128);
+        const layout: ?bucket.Spec = if (outputs[part].spec_id) |id| blk: {
+            for ((try m.get(root, "partition-specs")).array.items) |spec| {
+                if (try m.int(try m.get(spec, "spec-id")) == id) break :blk (try bucket.parse(spec, s)) orelse return error.InvalidLakeCompaction;
+            }
+            return error.InvalidLakeCompaction;
+        } else null;
+        var end = part + 1;
+        while (end < @min(outputs.len, part + 128) and outputs[end].spec_id == outputs[part].spec_id) : (end += 1) {}
         var records: std.ArrayList(V) = .empty;
         var count: u64 = 0;
         for (outputs[part..end]) |output| {
             if (output.rows == 0 or output.bytes == 0) return error.InvalidLakeCompaction;
+            if (layout) |spec| if (output.bucket_value) |value| if (value >= spec.count) return error.InvalidLakeCompaction;
             count = try std.math.add(u64, count, output.rows);
-            try records.append(a, try json(a, .{ .status = 1, .snapshot_id = snapshot, .sequence_number = sequence, .file_sequence_number = sequence, .data_file = .{ .content = 0, .file_path = output.uri, .file_format = "PARQUET", .partition = V{ .object = .empty }, .record_count = output.rows, .file_size_in_bytes = output.bytes } }));
+            try records.append(a, try json(a, .{ .status = 1, .snapshot_id = snapshot, .sequence_number = sequence, .file_sequence_number = sequence, .data_file = .{ .content = 0, .file_path = output.uri, .file_format = "PARQUET", .partition = if (layout) |spec| try spec.partition(a, output.bucket_value) else V{ .object = .empty }, .record_count = output.rows, .file_size_in_bytes = output.bytes } }));
         }
-        const manifest = try avro.ocf(a, avro.entry_schema, records.items, &.{ .{ .key = "schema", .value = try std.json.Stringify.valueAlloc(a, s, .{}) }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = try std.fmt.allocPrint(a, "{d}", .{spec_id}) }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = "data" } });
+        const manifest = try avro.ocf(a, if (layout) |spec| try spec.entrySchema(a) else avro.entry_schema, records.items, &.{ .{ .key = "schema", .value = try std.json.Stringify.valueAlloc(a, s, .{}) }, .{ .key = "partition-spec", .value = if (layout) |spec| try std.json.Stringify.valueAlloc(a, spec.fields, .{}) else "[]" }, .{ .key = "partition-spec-id", .value = try std.fmt.allocPrint(a, "{d}", .{if (layout) |spec| spec.id else spec_id}) }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = "data" } });
         const path = try rows.upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-compact-{s}-{d}.avro", .{ digest, part }), manifest);
-        try manifests.append(a, try json(a, .{ .manifest_path = path, .manifest_length = manifest.len, .partition_spec_id = spec_id, .content = 0, .sequence_number = sequence, .min_sequence_number = sequence, .added_snapshot_id = snapshot, .added_files_count = records.items.len, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = count, .existing_rows_count = 0, .deleted_rows_count = 0 }));
+        try manifests.append(a, try json(a, .{ .manifest_path = path, .manifest_length = manifest.len, .partition_spec_id = if (layout) |spec| spec.id else spec_id, .content = 0, .sequence_number = sequence, .min_sequence_number = sequence, .added_snapshot_id = snapshot, .added_files_count = records.items.len, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = count, .existing_rows_count = 0, .deleted_rows_count = 0 }));
         part = end;
     }
     const list = try avro.ocf(a, avro.list_schema, manifests.items, &.{ .{ .key = "format-version", .value = "2" }, .{ .key = "snapshot-id", .value = try std.fmt.allocPrint(a, "{d}", .{snapshot}) }, .{ .key = "sequence-number", .value = try std.fmt.allocPrint(a, "{d}", .{sequence}) } });
@@ -306,4 +328,52 @@ test "lake compaction resumable selection and output manifests exceed turn limit
     };
     try std.testing.expectEqual(@as(usize, 2), data_manifests);
     try std.testing.expectEqual(@as(u64, 129), total);
+}
+
+test "lake catalog bucket writes and compaction preserve null partitions and global deletes" {
+    const objectstore = @import("objectstore");
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var authority: @import("managed.zig").Managed = .{ .client = memory.client(), .bucket = "archive", .prefix = "bucketed", .source_uri = "s3://archive/bucketed" };
+    var initial = try authority.create(alloc, "init",
+        \\{"schema":{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id","type":"long","required":true},{"id":2,"name":"key","type":"string","required":false}]},"partition-spec":{"spec-id":3,"fields":[{"source-id":2,"field-id":1000,"name":"key_bucket","transform":"bucket[2147483647]"}]}}
+    , 1);
+    defer initial.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const images = (try std.json.parseFromSliceLeaky(V, a, "[{\"id\":1,\"key\":\"iceberg\"},{\"id\":2,\"key\":null},{\"id\":3,\"key\":\"iceberg\"},{\"id\":4,\"key\":\"other\"}]", .{})).array.items;
+    var changes: [4]rows.Batch.Change = undefined;
+    for (images, &changes) |image, *change| change.* = .{ .op = .upsert, .row = image };
+    const files: rows.Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "bucketed", .uri = "s3://archive/bucketed" };
+    const prepared = try rows.prepare(a, initial, files, .{ .batch_id = "b1", .source = "hook", .epoch = "1", .checkpoint = "a", .key_fields = &.{"id"}, .changes = &changes }, 1, 2);
+    var table = try authority.commit(alloc, .{ .id = "b1", .expected_metadata_location = initial.metadata_location, .body = prepared.body, .timestamp_ms = 2 });
+    defer table.deinit(alloc);
+    const list = try currentList(a, table, files);
+    try std.testing.expectEqual(@as(usize, 2), list.entries.len);
+    const data = try iceberg.parseDataManifestAlloc(a, try rows.read(a, files, list.entries[0].manifest_path));
+    try std.testing.expectEqual(@as(i32, 3), list.entries[0].partition_spec_id);
+    try std.testing.expectEqual(@as(usize, 3), data.entries.len);
+    var nulls: u64 = 0;
+    var vector_rows: u64 = 0;
+    for (data.entries) |file| {
+        try std.testing.expectEqual(@as(u32, 1), file.partition_field_count);
+        if (file.partition_values.len == 0) nulls += file.record_count else if (std.mem.eql(u8, file.partition_values[0].string_value, "1210000089")) vector_rows += file.record_count;
+    }
+    try std.testing.expectEqual(@as(u64, 1), nulls);
+    try std.testing.expectEqual(@as(u64, 2), vector_rows);
+    const deletes = try iceberg.parseDataManifestAlloc(a, try rows.read(a, files, list.entries[1].manifest_path));
+    try std.testing.expectEqual(@as(u32, 0), deletes.entries[0].partition_field_count);
+    try std.testing.expectEqual(@as(i32, 1), deletes.entries[0].equality_ids[0]);
+    const selection = try select(a, table, files, 16, 1024 * 1024);
+    const rewrite = try prepare(a, table, files, selection, images, 3);
+    var compacted = try authority.commit(alloc, .{ .id = "c1", .expected_metadata_location = table.metadata_location, .body = rewrite.body, .timestamp_ms = 3 });
+    defer compacted.deinit(alloc);
+    const after = try currentList(a, compacted, files);
+    try std.testing.expectEqual(@as(usize, 1), after.entries.len);
+    try std.testing.expectEqual(@as(i32, 3), after.entries[0].partition_spec_id);
+    const compact_data = try iceberg.parseDataManifestAlloc(a, try rows.read(a, files, after.entries[0].manifest_path));
+    try std.testing.expectEqual(@as(usize, 3), compact_data.entries.len);
+    for (compact_data.entries) |file| try std.testing.expectEqual(@as(u32, 1), file.partition_field_count);
 }

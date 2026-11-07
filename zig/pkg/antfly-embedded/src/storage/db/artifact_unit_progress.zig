@@ -182,7 +182,7 @@ pub const Prepared = struct {
         if (root == 0 or root != self.record.root) return error.DurableRootIncarnationUnavailable;
         if (!std.meta.eql(self.catalog_stamp, try catalogStamp(txn))) return error.ArtifactCatalogDrift;
         try requireStamp(txn, &self.selected, self.expected);
-        const state = (try @import("artifact_producer_obligations.zig").load(txn)) orelse return error.ArtifactCatalogDrift;
+        const state = (try @import("artifact_producer_obligations.zig").loadMetadata(txn)) orelse return error.ArtifactCatalogDrift;
         try state.requireAuthority(self.record.progress.observation.authority);
         if (state.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
         try self.record.progress.observation.requireCurrent(txn, self.document);

@@ -2615,13 +2615,15 @@ pub fn localArtifactStatsEqual(
 
 pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const TableBackupManifest) !tables_api.CreateTableRequest {
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-    try tables_api.validateStoredIndexesJson(alloc, manifest.indexes_json);
+    const indexes = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    errdefer alloc.free(indexes);
+    try tables_api.validateStoredIndexesJson(alloc, indexes);
     return .{
         // Supported backup manifests contain primary-owned artifacts. Restore
         // must preserve that authority instead of applying fresh-table policy.
         .storage = .{ .dense_embeddings = .primary_lsm },
         .description = if (manifest.description.len > 0) try alloc.dupe(u8, manifest.description) else null,
-        .indexes_json = try alloc.dupe(u8, manifest.indexes_json),
+        .indexes_json = indexes,
         .schema_json = if (manifest.schema_json.len > 0) try alloc.dupe(u8, manifest.schema_json) else null,
         .replication_sources_json = if (manifest.replication_sources_json.len > 0) try alloc.dupe(u8, manifest.replication_sources_json) else null,
     };

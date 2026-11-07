@@ -35,6 +35,12 @@ pub struct Capabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Source {
     pub id: String,
     pub name: String,
@@ -44,6 +50,10 @@ pub struct Source {
     pub state: String,
     pub config: serde_json::Map<String, serde_json::Value>,
     pub permissions: Permissions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<SourceIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rekeys: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_ttl_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

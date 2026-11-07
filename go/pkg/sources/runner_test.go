@@ -107,8 +107,8 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasSuffix(r.URL.Path, "/batch") {
-		if body["sync_level"] != "write" {
-			http.Error(w, "missing write barrier", 400)
+		if body["sync_level"] != "full_index" {
+			http.Error(w, "missing index visibility barrier", 400)
 			return
 		}
 		if inserts, ok := body["inserts"].(map[string]any); ok {

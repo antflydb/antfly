@@ -13,12 +13,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Focused collector ownership and bounded embedding contracts. The normal
+//! Focused collector/publication ownership and bounded embedding contracts. The normal
 //! storage shards still own these tests; this root avoids HTTP discovery when
 //! qualifying allocation failures or provider batch behavior independently.
 pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = @import("local_test_sources.zig");
 test {
+    _ = antfly_sources.physical_db;
     _ = @import("antfly_local_sources").storage_db_result_collectors;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;
+    _ = @import("antfly_local_sources").storage_db_artifact_chunk_vector_publication;
+    _ = @import("antfly_local_sources").storage_db_artifact_completion_progress;
+    _ = @import("antfly_local_sources").storage_db_artifact_publication;
+    _ = @import("antfly_local_sources").storage_db_artifact_producer_input;
 }

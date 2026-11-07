@@ -85,6 +85,22 @@ pub const PluginInitializeArgs = extern struct {
     extension_start: ?*anyopaque,
 };
 
+pub const NamedValue = extern struct {
+    struct_size: usize = @sizeOf(NamedValue),
+    extension_start: ?*anyopaque = null,
+    name: [*]const u8,
+    name_size: usize,
+    type: enum(c_int) { string = 0, int64 = 1, int64_list = 2, float = 3, boolean = 4 },
+    value: extern union {
+        string_value: [*]const u8,
+        int64_value: i64,
+        int64_array_value: [*]const i64,
+        float_value: f32,
+        bool_value: bool,
+    },
+    value_size: usize = 1,
+};
+
 pub const ClientCreateArgs = extern struct {
     struct_size: usize,
     extension_start: ?*anyopaque,
@@ -170,11 +186,46 @@ pub const ExecutableDeserializeAndLoadArgs = extern struct {
     overridden_serialized_compile_options_size: usize,
 };
 
+pub const ExecutableGetCompiledMemoryStatsArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: ?*PjrtExecutable,
+    generated_code_size_in_bytes: i64,
+    argument_size_in_bytes: i64,
+    output_size_in_bytes: i64,
+    alias_size_in_bytes: i64,
+    temp_size_in_bytes: i64,
+    host_generated_code_size_in_bytes: i64,
+    host_argument_size_in_bytes: i64,
+    host_output_size_in_bytes: i64,
+    host_alias_size_in_bytes: i64,
+    host_temp_size_in_bytes: i64,
+    peak_memory_in_bytes: i64,
+    total_size_in_bytes: i64,
+    total_allocation_bytes: i64,
+    indefinite_allocations: i64,
+    peak_unpadded_heap_bytes: i64,
+};
+
+pub const ClientPlatformNameArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    client: ?*PjrtClient,
+    platform_name: ?[*]const u8,
+    platform_name_size: usize,
+};
+
 pub const LoadedExecutableGetExecutableArgs = extern struct {
     struct_size: usize,
     extension_start: ?*anyopaque,
     loaded_executable: ?*PjrtLoadedExecutable,
-    executable: ?*PjrtExecutable, // out, not owned
+    executable: ?*PjrtExecutable, // out, caller owns via Executable_Destroy
+};
+
+pub const ExecutableDestroyArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: ?*PjrtExecutable,
 };
 
 pub const LoadedExecutableExecuteArgs = extern struct {
@@ -200,7 +251,7 @@ pub const BufferToHostBufferArgs = extern struct {
     struct_size: usize,
     extension_start: ?*anyopaque,
     src: ?*PjrtBuffer,
-    host_layout: ?*anyopaque,
+    host_layout: ?*const BufferMemoryLayout,
     dst: ?*anyopaque,
     dst_size: usize,
     event: ?*PjrtEvent, // out
@@ -243,7 +294,7 @@ pub const ExecuteOptions = extern struct {
     num_recv_ops: usize,
     launch_id: c_int,
     // 4 bytes auto-padding
-    non_donatable_input_indices: ?*const i64,
+    non_donatable_input_indices: ?[*]const i64,
     num_non_donatable_input_indices: usize,
     // Fields added in PJRT API 0.83+
     context: ?*anyopaque,
@@ -281,26 +332,62 @@ pub const Api = extern struct {
     pub const FN_ERROR_DESTROY = 0;
     pub const FN_ERROR_MESSAGE = 1;
     pub const FN_PLUGIN_INITIALIZE = 3;
-    const FN_EVENT_DESTROY = 5;
-    const FN_EVENT_AWAIT = 8;
-    const FN_CLIENT_CREATE = 10;
-    const FN_CLIENT_DESTROY = 11;
-    const FN_CLIENT_ADDRESSABLE_DEVICES = 16;
-    const FN_CLIENT_COMPILE = 20;
-    const FN_CLIENT_BUFFER_FROM_HOST = 22;
-    const FN_EXEC_SERIALIZE = 49;
-    const FN_LOADED_EXEC_DESTROY = 50;
-    const FN_LOADED_EXEC_GET_EXECUTABLE = 51;
-    const FN_LOADED_EXEC_EXECUTE = 55;
-    const FN_EXEC_DESERIALIZE_AND_LOAD = 56;
-    const FN_BUFFER_DESTROY = 58;
-    const FN_BUFFER_ON_DEVICE_SIZE = 64;
-    const FN_BUFFER_TO_HOST = 70;
+    pub const FN_EVENT_DESTROY = 5;
+    pub const FN_EVENT_AWAIT = 8;
+    pub const FN_CLIENT_CREATE = 10;
+    pub const FN_CLIENT_DESTROY = 11;
+    pub const FN_CLIENT_PLATFORM_NAME = 12;
+    pub const FN_CLIENT_ADDRESSABLE_DEVICES = 16;
+    pub const FN_CLIENT_COMPILE = 20;
+    pub const FN_CLIENT_BUFFER_FROM_HOST = 22;
+    pub const FN_EXEC_DESTROY = 40;
+    pub const FN_EXEC_NUM_OUTPUTS = 44;
+    pub const FN_EXEC_SERIALIZE = 49;
+    pub const FN_LOADED_EXEC_DESTROY = 50;
+    pub const FN_LOADED_EXEC_GET_EXECUTABLE = 51;
+    pub const FN_LOADED_EXEC_EXECUTE = 55;
+    pub const FN_EXEC_DESERIALIZE_AND_LOAD = 56;
+    pub const FN_BUFFER_DESTROY = 58;
+    pub const FN_BUFFER_ELEMENT_TYPE = 59;
+    pub const FN_BUFFER_DIMENSIONS = 60;
+    pub const FN_BUFFER_ON_DEVICE_SIZE = 64;
+    pub const FN_BUFFER_TO_HOST = 70;
+    pub const FN_EXEC_OUTPUT_TYPES = 90;
+    pub const FN_EXEC_OUTPUT_DIMENSIONS = 91;
+    pub const FN_EXEC_COMPILED_MEMORY_STATS = 96;
 
     // ── Typed accessors ────────────────────────────────────────────
 
     fn castFn(comptime T: type, ptr: *const anyopaque) T {
         return @ptrCast(@alignCast(ptr));
+    }
+
+    fn hasFunction(self: *const Api, index: usize) bool {
+        const required = @offsetOf(Api, "_fns") + (index + 1) * @sizeOf(?*const anyopaque);
+        return self.struct_size >= required and self._fns[index] != null;
+    }
+
+    pub fn hasCompiledMemoryStats(self: *const Api) bool {
+        return self.hasFunction(FN_EXEC_COMPILED_MEMORY_STATS) and self.hasOwnedExecutableAccess();
+    }
+
+    pub fn hasOwnedExecutableAccess(self: *const Api) bool {
+        return self.hasFunction(FN_LOADED_EXEC_GET_EXECUTABLE) and self.hasFunction(FN_EXEC_DESTROY);
+    }
+
+    pub fn executableDestroy(self: *const Api, args: *ExecutableDestroyArgs) ?*PjrtError {
+        const f = castFn(*const fn (*ExecutableDestroyArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_DESTROY].?);
+        return f(args);
+    }
+
+    pub fn executableGetCompiledMemoryStats(self: *const Api, args: *ExecutableGetCompiledMemoryStatsArgs) ?*PjrtError {
+        const f = castFn(*const fn (*ExecutableGetCompiledMemoryStatsArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_COMPILED_MEMORY_STATS].?);
+        return f(args);
+    }
+
+    pub fn clientPlatformName(self: *const Api, args: *ClientPlatformNameArgs) ?*PjrtError {
+        const f = castFn(*const fn (*ClientPlatformNameArgs) callconv(.c) ?*PjrtError, self._fns[FN_CLIENT_PLATFORM_NAME].?);
+        return f(args);
     }
 
     pub fn errorDestroy(self: *const Api, args: *ErrorDestroyArgs) void {
@@ -354,14 +441,31 @@ pub const Api = extern struct {
     }
 
     pub fn hasExecutableSerialization(self: *const Api) bool {
-        return self._fns[FN_EXEC_SERIALIZE] != null and
-            self._fns[FN_LOADED_EXEC_GET_EXECUTABLE] != null and
-            self._fns[FN_EXEC_DESERIALIZE_AND_LOAD] != null;
+        return self.hasFunction(FN_EXEC_SERIALIZE) and self.hasOwnedExecutableAccess() and
+            self.hasFunction(FN_EXEC_DESERIALIZE_AND_LOAD);
     }
 
     pub fn loadedExecutableDestroy(self: *const Api, args: *LoadedExecutableDestroyArgs) ?*PjrtError {
         const f = castFn(*const fn (*LoadedExecutableDestroyArgs) callconv(.c) ?*PjrtError, self._fns[FN_LOADED_EXEC_DESTROY].?);
         return f(args);
+    }
+
+    pub fn executableNumOutputs(self: *const Api, args: *ExecutableNumOutputsArgs) ?*PjrtError {
+        const f = castFn(*const fn (*ExecutableNumOutputsArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_NUM_OUTPUTS].?);
+        return f(args);
+    }
+
+    pub fn hasOutputShapes(self: *const Api) bool {
+        return self.hasOwnedExecutableAccess() and self.hasFunction(FN_EXEC_OUTPUT_TYPES) and self.hasFunction(FN_EXEC_OUTPUT_DIMENSIONS);
+    }
+    pub fn executableOutputTypes(self: *const Api, args: *ExecutableOutputElementTypesArgs) ?*PjrtError {
+        return castFn(*const fn (*ExecutableOutputElementTypesArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_OUTPUT_TYPES].?)(args);
+    }
+    pub fn executableOutputDimensions(self: *const Api, args: *ExecutableOutputDimensionsArgs) ?*PjrtError {
+        return castFn(*const fn (*ExecutableOutputDimensionsArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_OUTPUT_DIMENSIONS].?)(args);
+    }
+    pub fn hasOutputCount(self: *const Api) bool {
+        return self.hasOwnedExecutableAccess() and self.hasFunction(FN_EXEC_NUM_OUTPUTS);
     }
 
     pub fn executableSerialize(self: *const Api, args: *ExecutableSerializeArgs) ?*PjrtError {
@@ -384,6 +488,21 @@ pub const Api = extern struct {
         return f(args);
     }
 
+    pub fn bufferElementType(self: *const Api, args: *BufferElementTypeArgs) ?*PjrtError {
+        const f = castFn(*const fn (*BufferElementTypeArgs) callconv(.c) ?*PjrtError, self._fns[FN_BUFFER_ELEMENT_TYPE].?);
+        return f(args);
+    }
+    pub fn bufferDimensions(self: *const Api, args: *BufferDimensionsArgs) ?*PjrtError {
+        const f = castFn(*const fn (*BufferDimensionsArgs) callconv(.c) ?*PjrtError, self._fns[FN_BUFFER_DIMENSIONS].?);
+        return f(args);
+    }
+    pub fn hasBufferShape(self: *const Api) bool {
+        return self.hasFunction(FN_BUFFER_ELEMENT_TYPE) and self.hasFunction(FN_BUFFER_DIMENSIONS);
+    }
+    pub fn hasBufferReadback(self: *const Api) bool {
+        return self.hasBufferShape() and self.hasFunction(FN_BUFFER_TO_HOST);
+    }
+
     pub fn bufferDestroy(self: *const Api, args: *BufferDestroyArgs) ?*PjrtError {
         const f = castFn(*const fn (*BufferDestroyArgs) callconv(.c) ?*PjrtError, self._fns[FN_BUFFER_DESTROY].?);
         return f(args);
@@ -402,3 +521,63 @@ pub const Api = extern struct {
 
 /// Entry point function exported by PJRT plugins.
 pub const GetPjrtApiFn = *const fn () callconv(.c) *const Api;
+
+pub const ExecutableNumOutputsArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: *PjrtExecutable,
+    num_outputs: usize,
+};
+
+pub const BufferElementTypeArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    buffer: ?*PjrtBuffer,
+    buffer_type: BufferType,
+};
+pub const BufferDimensionsArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    buffer: ?*PjrtBuffer,
+    dims: ?[*]const i64,
+    num_dims: usize,
+};
+
+pub const ExecutableOutputElementTypesArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: ?*PjrtExecutable,
+    output_types: ?[*]const BufferType,
+    num_output_types: usize,
+};
+pub const ExecutableOutputDimensionsArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: ?*PjrtExecutable,
+    num_outputs: usize,
+    dims: ?[*]const i64,
+    dim_sizes: ?[*]const usize,
+};
+
+/// Upstream layout union, including both members to preserve C size/alignment.
+pub const BufferMemoryLayoutTiled = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    minor_to_major: ?[*]const i64,
+    minor_to_major_size: usize,
+    tile_dims: ?[*]const i64,
+    tile_dim_sizes: ?[*]const usize,
+    num_tiles: usize,
+};
+pub const BufferMemoryLayoutStrides = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    byte_strides: ?[*]const i64,
+    num_byte_strides: usize,
+};
+pub const BufferMemoryLayout = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    layout: extern union { tiled: BufferMemoryLayoutTiled, strides: BufferMemoryLayoutStrides },
+    layout_type: c_int,
+};

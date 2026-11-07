@@ -42,7 +42,7 @@ pub const Scheduler = struct {
         };
         // Never hold the scheduler mutex across a possibly blocking admission.
         const encoded = hint.encode();
-        try dispatcher.enqueue(dispatcher.ptr, hint.namespace, &encoded);
+        try dispatcher.enqueueCommand(hint.namespace, &encoded);
         self.cursor.store(hint.created_index, .release);
         return true;
     }

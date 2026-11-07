@@ -75,7 +75,7 @@ pub const Prepared = struct {
     cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null,
 };
 pub const Cache = @import("lake_metadata_memo.zig").Memo(Prepared);
-fn scopeDomain(table: u64, identity: [32]u8) [32]u8 {
+pub fn scopeDomain(table: u64, identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("native-lake-recent-vector-generations-v1");
     hash.update(&identity);

@@ -42,6 +42,9 @@ pub const ManagedReadRuntimeConfig = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
+    /// Unresolved node credential for `inference_api_url`; see
+    /// `reranking_runtime.Options.inference_api_key`.
+    inference_api_key: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -142,6 +145,7 @@ pub fn applyReranker(
     const dependencies: reranking_runtime.Options = .{
         .antfly_provider = runtime_cfg.antfly_provider,
         .secret_store = runtime_cfg.secret_store,
+        .inference_api_key = runtime_cfg.inference_api_key,
         .capability_cache = runtime_cfg.remote_capability_cache,
         .execution = execution_context.Context{
             .default_endpoint = runtime_cfg.inference_api_url,

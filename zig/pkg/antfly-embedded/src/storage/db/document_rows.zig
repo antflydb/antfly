@@ -30,6 +30,7 @@ const scalar = @import("../../sql/scalar.zig");
 const View = @import("../relational_read_view.zig").View;
 
 pub const Session = struct {
+    privacy: ?@import("privacy_read.zig").PolicySnapshot = null,
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     range_proofs: ?[]const @import("../range_protection.zig").Proof = null,
     alloc: std.mem.Allocator,
@@ -165,6 +166,7 @@ pub const Session = struct {
     /// All output belongs to the bounded caller arena.
     pub fn normalizeRows(self: *Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNormalizeRows", .{ self, alloc, writes });
+        if (self.privacy) |policy| if (policy.prepared.policy.mode != .monitor) return error.UnsupportedSqlExecution;
         if (writes.len > 4096) return error.InvalidArgument;
         const result = try alloc.alloc(types.BatchWrite, writes.len);
         // Parse/validator scratch is row-local, not retained for the batch.
@@ -274,7 +276,8 @@ pub const Session = struct {
                     }
                     break :version 0;
                 };
-                const root = try std.json.parseFromSliceLeaky(std.json.Value, temporary, bytes, .{ .parse_numbers = false });
+                const visible = if (session.privacy) |policy| try @import("privacy_read.zig").project(temporary, policy, key, bytes, &session.txn) else bytes;
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, temporary, visible, .{ .parse_numbers = false });
                 if (session.filter) |*filter| if (!try filter.matchesJson(temporary, key, root)) return .@"continue";
                 if (session.conditions.len != 0) {
                     const condition_row = try session.condition_projection.projectValue(temporary, key, 0, root);

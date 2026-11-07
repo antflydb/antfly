@@ -36,6 +36,13 @@ pub const Manager = struct {
     /// Scoped allocation owners retain the enclosing statement's disk and FD
     /// admission. Children close before this borrowed owner is destroyed.
     quota_parent: ?*Manager = null,
+    /// A task reserves its entire disk/FD envelope before acquiring a durable
+    /// execution lease. Its independent manager cannot compete with siblings.
+    reservation_parent: ?*Manager = null,
+    reservation_bytes: u64 = 0,
+    reserved_bytes: u64 = 0,
+    reserved_files: usize = 0,
+    max_files: usize = 64,
     payload_cache_mutex: std.atomic.Mutex = .unlocked,
     payload_caches: ?*PayloadCache = null,
     payload_reclaim_cursor: ?*PayloadCache = null,
@@ -76,10 +83,37 @@ pub const Manager = struct {
     pub fn scoped(self: *Manager, a: Allocator) Manager {
         return .{ .page_residency_bytes = self.page_residency_bytes, .alloc = a, .io = self.io, .context = self.context, .checkpoint = self.checkpoint, .root = self.root, .max_bytes = self.max_bytes, .max_record_bytes = self.max_record_bytes, .array_limits = self.array_limits, .buffer_bytes = self.buffer_bytes, .async_writes = self.async_writes, .compression = self.compression, .quota_parent = self };
     }
+    /// Nonblocking process admission. Busy callers retry elsewhere without
+    /// claiming a task or spending its durable execution attempt budget.
+    pub fn admit(self: *Manager, a: Allocator, bytes: u64) ?Manager {
+        std.debug.assert(self.quota_parent == null and self.reservation_parent == null);
+        self.lock();
+        defer self.mutex.unlock();
+        const limit = @min(bytes, self.max_bytes);
+        if (limit > self.max_bytes -| self.live_bytes -| self.reserved_bytes or 64 > self.max_files -| self.files -| self.reserved_files) return null;
+        self.reserved_bytes += limit;
+        self.reserved_files += 64;
+        var child = self.scoped(a);
+        child.quota_parent = null;
+        child.max_bytes = limit;
+        child.reservation_parent = self;
+        child.reservation_bytes = limit;
+        return child;
+    }
+    fn releaseAdmission(self: *Manager) void {
+        if (self.reservation_parent) |parent| {
+            std.debug.assert(self.files == 0 and self.live_bytes == 0);
+            parent.lock();
+            defer parent.mutex.unlock();
+            parent.reserved_bytes -= self.reservation_bytes;
+            parent.reserved_files -= 64;
+            self.reservation_parent = null;
+        }
+    }
     fn reserveFile(self: *Manager) !void {
         self.lock();
         defer self.mutex.unlock();
-        if (self.files >= 64 or self.max_bytes == 0) return error.SqlProgramLimitExceeded;
+        if (self.files + self.reserved_files >= self.max_files or self.max_bytes == 0) return error.SqlProgramLimitExceeded;
         if (self.quota_parent) |parent| try parent.reserveFile();
         self.files += 1;
         self.peak_files = @max(self.peak_files, self.files);
@@ -337,7 +371,7 @@ pub const Manager = struct {
     fn reserve(self: *Manager, bytes: u64) !void {
         self.lock();
         defer self.mutex.unlock();
-        if (bytes > self.max_bytes -| self.live_bytes) return error.SqlProgramLimitExceeded;
+        if (bytes > self.max_bytes -| self.live_bytes -| self.reserved_bytes) return error.SqlProgramLimitExceeded;
         if (self.quota_parent) |parent| try parent.reserve(bytes);
         self.live_bytes += bytes;
         self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
@@ -345,7 +379,7 @@ pub const Manager = struct {
     pub fn fileHeadroom(self: *Manager) usize {
         self.lock();
         defer self.mutex.unlock();
-        return if (self.quota_parent) |parent| @min(64 - self.files, parent.fileHeadroom()) else 64 - self.files;
+        return if (self.quota_parent) |parent| @min(self.max_files -| self.files -| self.reserved_files, parent.fileHeadroom()) else self.max_files -| self.files -| self.reserved_files;
     }
     pub fn admissionStats(self: *Manager) struct { peak_files: usize, peak_bytes: u64, max_bytes: u64 } {
         self.lock();
@@ -421,7 +455,7 @@ pub const Manager = struct {
         defer self.mutex.unlock();
         if (self.max_bytes == 0) return error.SqlProgramLimitExceeded;
         try self.open();
-        if (self.files >= 64) return error.SqlProgramLimitExceeded;
+        if (self.files + self.reserved_files >= self.max_files) return error.SqlProgramLimitExceeded;
         if (self.quota_parent) |parent| try parent.reserveFile();
         errdefer if (self.quota_parent) |parent| parent.closeFile(0);
         if (self.quota_parent) |parent| self.sequence = parent.nextId() else self.sequence += 1;
@@ -437,6 +471,8 @@ pub const Manager = struct {
         return .{ .manager = self, .file = file, .id = self.sequence };
     }
     pub fn deinit(self: *Manager) void {
+        defer self.releaseAdmission();
+        std.debug.assert(self.reserved_bytes == 0 and self.reserved_files == 0);
         std.debug.assert(self.payload_cache_users == 0 and self.payload_budget_count == 0);
         if (self.execution_pages) |owner| {
             owner.deinit();
@@ -1378,6 +1414,30 @@ pub const ColumnarBlock = struct {
         const indices = try a.alloc(u32, self.count());
         for (indices, 0..) |*id, row| id.* = @intCast((try self.dictionaryIdentity(row, column, keys)).?);
         return .{ .dictionary = .{ .values = values, .indices = indices } };
+    }
+    /// Borrow the encoded payload without building a scalar row matrix.
+    pub fn batch(self: *const ColumnarBlock) @import("execution_batch.zig").Batch {
+        const Reader = struct {
+            fn block(ptr: *anyopaque) *const ColumnarBlock {
+                return @ptrCast(@alignCast(ptr));
+            }
+            fn cell(ptr: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
+                return block(ptr).cell(row, column);
+            }
+            fn frozen(ptr: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                return block(ptr).frozenJson(row, column, false);
+            }
+            fn json(ptr: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+                return block(ptr).encodedJson(row, column, false);
+            }
+            fn dictionary(ptr: *anyopaque, a: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
+                return block(ptr).dictionaryColumn(a, column, false);
+            }
+            fn identity(ptr: *anyopaque, row: usize, column: usize) anyerror!?u64 {
+                return block(ptr).dictionaryIdentity(row, column, false);
+            }
+        };
+        return .{ .reader = .{ .ptr = @ptrCast(@constCast(self)), .read = Reader.cell, .read_frozen = Reader.frozen, .read_json = Reader.json, .read_dictionary = Reader.dictionary, .read_identity = Reader.identity, .count = self.count(), .width = self.values.len } };
     }
     pub fn keyCell(self: ColumnarBlock, row: usize, column: usize) !Datum {
         if (row >= self.count() or column >= self.keys.len) return error.InvalidSqlSpill;

@@ -772,6 +772,12 @@ pub const SparseEmbedder = struct {
     recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     foreground_bounded: bool = false,
 
+    /// The provider generation behind this name, when it can report one.
+    pub fn captureRevision(self: SparseEmbedder, a: Allocator, name: []const u8) !?[32]u8 {
+        const resolve = self.cache_revision_fn orelse return null;
+        return resolve(self.ptr, a, name);
+    }
+
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
         defer sanitized.deinit(alloc);
