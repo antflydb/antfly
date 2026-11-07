@@ -367,7 +367,10 @@ pub const Repository = struct {
     fn reuseLinked(self: *Repository, a: A, io: std.Io, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
         var guard = try linkedLock(a, io, try self.linkedNamespace(a, namespace), cancellation);
         defer guard.deinit();
-        const source = try self.linkedRoot(a, previous, namespace);
+        const source = self.linkedRoot(a, previous, namespace) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return null,
+            else => return err,
+        };
         const held = linkedProof(a, io, source, previous, namespace, cancellation) catch |err| switch (err) {
             error.CatalogGenerationChanged, error.FileNotFound => return null,
             else => return err,
@@ -377,7 +380,13 @@ pub const Repository = struct {
         const target = try self.linkedRoot(a, request, namespace);
         try fs.createDirPathPortable(io, std.fs.path.dirname(target).?);
         cut.validate(a, io, target, request, namespace, cancellation) catch |err| switch (err) {
-            error.CatalogGenerationChanged => try linkGenerationAs(a, io, source, target, previous, request, namespace, cancellation),
+            error.CatalogGenerationChanged => linkGenerationAs(a, io, source, target, previous, request, namespace, cancellation) catch |link_err| {
+                try cancellation.check();
+                // A source may expire during the bounded link operation. Its
+                // optional proof cannot revoke the caller's fresh request.
+                if (previous.expires_ms <= cut.nowMs()) return null;
+                return link_err;
+            },
             else => return err,
         };
         try self.register(a, namespace, cancellation);
@@ -2469,4 +2478,69 @@ test "external lake native transient hints cannot fail a sealed publication and 
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, repository.chunkedCapability().publishReusable(io, next_root, next_request, namespace, .none));
     try std.testing.expectEqual(error.AccessDenied, repositoryFailure("read", error.AccessDenied, .none));
     try std.testing.expectEqual(error.TlsBadRecordMac, repositoryFailure("read", error.TlsBadRecordMac, .none));
+}
+
+test "external lake native reuse falls back when its basis expires behind collection lock" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-expired-reuse-basis");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const parent = try repository.linkedNamespace(a, namespace);
+    defer a.free(parent);
+    var guard = try Repository.linkedLock(a, io, parent, .none);
+    var guarded = true;
+    defer if (guarded) guard.deinit();
+    const Worker = struct {
+        repository: *Repository,
+        previous: cut.Request,
+        request: cut.Request,
+        started: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        proof: ?port.ReuseProof = null,
+        fn run(self: *@This(), executor_io: std.Io, ns: Namespace) void {
+            self.previous.expires_ms = cut.nowMs() + 100;
+            self.previous.validate(cut.nowMs()) catch |err| {
+                self.failure = err;
+                self.started.set(executor_io);
+                return;
+            };
+            self.started.set(executor_io);
+            self.proof = self.repository.capability().reuse(executor_io, self.previous, self.request, ns, .{ .sequence = 1, .digest = @splat(1), .manifest_checksum = @splat(1) }, .none) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var worker: Worker = .{
+        .repository = &repository,
+        .previous = .{ .id = &@as([64]u8, @splat('a')), .table_id = 7, .expires_ms = cut.nowMs() + 500, .create = true },
+        .request = .{ .id = &@as([64]u8, @splat('b')), .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true },
+    };
+    var task = try io.concurrent(Worker.run, .{ &worker, io, namespace });
+    var awaited = false;
+    defer if (!awaited) {
+        if (guarded) {
+            guard.deinit();
+            guarded = false;
+        }
+        task.await(io);
+    };
+    worker.started.wait(io) catch |err| {
+        guard.deinit();
+        guarded = false;
+        task.await(io);
+        awaited = true;
+        return err;
+    };
+    try io.sleep(.fromMilliseconds(@intCast(worker.previous.expires_ms -| cut.nowMs() + 10)), .awake);
+    guard.deinit();
+    guarded = false;
+    task.await(io);
+    awaited = true;
+    try std.testing.expect(worker.failure == null);
+    try std.testing.expect(worker.proof == null);
+    try worker.request.validate(cut.nowMs());
 }
