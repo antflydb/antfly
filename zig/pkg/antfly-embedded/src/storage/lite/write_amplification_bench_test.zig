@@ -45,6 +45,18 @@ const dense_dims: usize = 128;
 const sparse_terms: usize = 32;
 const dense_index_name = "dense_vec_wamp_v0";
 const sparse_index_name = "sparse_vec_wamp_v0";
+const algebraic_index_name = "algebraic_wamp_v0";
+// Representative algebraic config: one group-by field plus an HLL
+// cardinality materialization over it, matching the shape used by
+// `storage/db/algebraic/index.zig`'s own "materializes approximate
+// per-group cardinality" test. `full_index` sync level (the only level
+// that forces synchronous algebraic visibility: see
+// `syncLevelRequiresDerivedVisibility` in `storage/db/mutation_commit.zig`)
+// requires a write's algebraic facts and this sketch to be visible before
+// the batch call returns.
+const algebraic_config_json =
+    \\{"version":1,"table":"docs","group_fields":[{"name":"region","path":"region","type":"string"},{"name":"customer","path":"customer","type":"string"}],"hll_cardinalities":[{"name":"customers_by_region","group_by":["region"],"value_field":"customer"}]}
+;
 
 // ---------------------------------------------------------------------------
 // Instrumented std.Io: the harness's own leaf IO counting layer. Delegates
@@ -105,7 +117,7 @@ fn countingIo() std.Io {
 /// `_embeddings` (see `insertOneDenseVector`/`insertOneSparseVector`), so no
 /// embedder runs and no inference happens on the write path -- this harness
 /// measures only the index-storage write amplification, not model latency.
-const Mode = enum { primary_only, full_text, dense_vector, sparse_vector };
+const Mode = enum { primary_only, full_text, dense_vector, sparse_vector, algebraic };
 
 const Fixture = struct {
     alloc: std.mem.Allocator,
@@ -143,6 +155,7 @@ const Fixture = struct {
             .primary_only, .full_text => {},
             .dense_vector => try addExternalVectorIndex(alloc, handle, dense_index_name, false),
             .sparse_vector => try addExternalVectorIndex(alloc, handle, sparse_index_name, true),
+            .algebraic => try addAlgebraicIndex(alloc, handle),
         }
 
         return .{ .alloc = alloc, .directory = directory, .path = path, .runtime = runtime, .handle = handle };
@@ -272,6 +285,40 @@ fn addExternalVectorIndex(alloc: std.mem.Allocator, handle: *anyopaque, comptime
     const body = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"kind\":\"{s}\",\"config_json\":{s}}}", .{ index_name, kind, inner_json });
     defer alloc.free(body);
     try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_add_index_json(handle, .fromSlice(body)));
+}
+
+/// Creates the representative algebraic index (`algebraic_config_json`)
+/// through the same public `antfly_db_add_index_json` seam the SDKs use.
+fn addAlgebraicIndex(alloc: std.mem.Allocator, handle: *anyopaque) !void {
+    const inner_json = try jsonString(alloc, algebraic_config_json);
+    defer alloc.free(inner_json);
+    const body = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"kind\":\"algebraic\",\"config_json\":{s}}}", .{ algebraic_index_name, inner_json });
+    defer alloc.free(body);
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_add_index_json(handle, .fromSlice(body)));
+}
+
+/// One document write exercising the algebraic index's group fields --
+/// deterministic region/customer pair so repeated writes (same 128-key
+/// cycle as `payload`/`insertOne`) touch a bounded, repeating set of HLL
+/// cardinality groups instead of growing one unboundedly.
+fn insertOneAlgebraic(alloc: std.mem.Allocator, handle: *anyopaque, key: []const u8, seed: usize, sync_level: []const u8) !void {
+    const key_json = try jsonString(alloc, key);
+    defer alloc.free(key_json);
+    const regions = [_][]const u8{ "west", "east", "north", "south" };
+    const region = regions[seed % regions.len];
+    var customer_buf: [32]u8 = undefined;
+    const customer = try std.fmt.bufPrint(&customer_buf, "cust{d}", .{seed % 37});
+    const sync_level_json = try jsonString(alloc, sync_level);
+    defer alloc.free(sync_level_json);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"inserts\":{{{s}:{{\"region\":\"{s}\",\"customer\":\"{s}\"}}}},\"sync_level\":{s}}}",
+        .{ key_json, region, customer, sync_level_json },
+    );
+    defer alloc.free(body);
+    var output: capi_types.Buffer = .{};
+    defer api.antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi_types.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(body), &output));
 }
 
 /// Deterministic, cheap-to-generate dense vector: no embedder runs, so the
@@ -738,6 +785,79 @@ fn measureConcurrentVector(alloc: std.mem.Allocator, comptime name: []const u8, 
     return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
 }
 
+/// Single-writer algebraic mode: one document per transaction, acked at
+/// `full_index` -- the sync level that requires this index's own facts (and
+/// its HLL cardinality sketch) to be visible before the batch call returns.
+fn measureSingleWriterAlgebraic(alloc: std.mem.Allocator, comptime name: []const u8, updates: usize) !ModeReport {
+    var fixture = try Fixture.open(alloc, name, .algebraic);
+    defer fixture.close();
+
+    var key_buffer: [32]u8 = undefined;
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..updates) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % 128});
+        try insertOneAlgebraic(alloc, fixture.handle, key, i, "full_index");
+    }
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
+const ConcurrentAlgebraicWorker = struct {
+    alloc: std.mem.Allocator,
+    handle: *anyopaque,
+    worker: usize,
+    updates_per_writer: usize,
+    barrier: *Barrier,
+    err: ?anyerror = null,
+
+    fn run(self: *ConcurrentAlgebraicWorker) void {
+        wal_trace.registerCallingThread();
+        var key_buffer: [32]u8 = undefined;
+        for (0..self.updates_per_writer) |i| {
+            self.barrier.wait();
+            const key = std.fmt.bufPrint(&key_buffer, "w{d}-doc-{d}", .{ self.worker, i % 128 }) catch |err| {
+                self.err = err;
+                return;
+            };
+            const seed = self.worker * 1_000_003 + i;
+            insertOneAlgebraic(self.alloc, self.handle, key, seed, "full_index") catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    }
+};
+
+/// Real concurrent threads issuing algebraic writes, mirroring
+/// `measureConcurrentVector`'s barrier-synchronized contention shape but for
+/// `measureSingleWriterAlgebraic`'s workload.
+fn measureConcurrentAlgebraic(alloc: std.mem.Allocator, comptime name: []const u8, writers: usize, updates_per_writer: usize) !ModeReport {
+    var fixture = try Fixture.open(alloc, name, .algebraic);
+    defer fixture.close();
+
+    wal_trace.reset();
+    var barrier = Barrier{ .participants = writers };
+    var workers = try alloc.alloc(ConcurrentAlgebraicWorker, writers);
+    defer alloc.free(workers);
+    var threads = try alloc.alloc(std.Thread, writers);
+    defer alloc.free(threads);
+    for (0..writers) |w| workers[w] = .{
+        .alloc = alloc,
+        .handle = fixture.handle,
+        .worker = w,
+        .updates_per_writer = updates_per_writer,
+        .barrier = &barrier,
+    };
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    for (0..writers) |w| threads[w] = try std.Thread.spawn(.{}, ConcurrentAlgebraicWorker.run, .{&workers[w]});
+    for (threads) |thread| thread.join();
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    for (workers) |worker| if (worker.err) |err| return err;
+    return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
+}
+
 // ---------------------------------------------------------------------------
 // Relational write-surface modes (lite-single-commit-write-path.md §3.3c):
 // secondary indexes, unique constraints, foreign keys, and SQL INSERT/UPDATE
@@ -1179,6 +1299,10 @@ const StagesJson = struct {
     relational_intent_write: StageJson,
     relational_intent_resolve: StageJson,
     relational_coordinator_hint: StageJson,
+    algebraic_apply: StageJson,
+    algebraic_bulk_finish: StageJson,
+    algebraic_hll_maintenance: StageJson,
+    algebraic_adaptive: StageJson,
     other: StageJson,
 };
 
@@ -1254,6 +1378,10 @@ fn modeJson(mode: ModeReport) ModeJson {
             .relational_intent_write = stageJson(mode, .relational_intent_write),
             .relational_intent_resolve = stageJson(mode, .relational_intent_resolve),
             .relational_coordinator_hint = stageJson(mode, .relational_coordinator_hint),
+            .algebraic_apply = stageJson(mode, .algebraic_apply),
+            .algebraic_bulk_finish = stageJson(mode, .algebraic_bulk_finish),
+            .algebraic_hll_maintenance = stageJson(mode, .algebraic_hll_maintenance),
+            .algebraic_adaptive = stageJson(mode, .algebraic_adaptive),
             .other = stageJson(mode, .other),
         },
         .background_ops = .{
@@ -1292,6 +1420,16 @@ const ReportJson = struct {
     dense_vector_8_writers: ModeJson,
     sparse_vector: ModeJson,
     sparse_vector_8_writers: ModeJson,
+    /// Algebraic mode: one document per transaction against a representative
+    /// group-by + HLL-cardinality algebraic index config, acked at
+    /// `full_index`. Unlike full-text/dense/sparse, algebraic facts already
+    /// live in the primary DocStore (see `storage/db/algebraic/index.zig`'s
+    /// `storagePrefixAlloc`'s `\x00\x00__algebraic__:` prefix) -- there is no
+    /// separate storage backend here, only the single-commit write-path
+    /// question of whether the fact apply and the primary write share one
+    /// native commit.
+    algebraic: ModeJson,
+    algebraic_8_writers: ModeJson,
 };
 
 test "lite write amplification report" {
@@ -1308,6 +1446,8 @@ test "lite write amplification report" {
     const dense_concurrent = try measureConcurrentVector(alloc, "lite-write-amp-dense-concurrent", false, default_writers, updates / default_writers);
     const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse", true, updates);
     const sparse_concurrent = try measureConcurrentVector(alloc, "lite-write-amp-sparse-concurrent", true, default_writers, updates / default_writers);
+    const algebraic = try measureSingleWriterAlgebraic(alloc, "lite-write-amp-algebraic", updates);
+    const algebraic_concurrent = try measureConcurrentAlgebraic(alloc, "lite-write-amp-algebraic-concurrent", default_writers, updates / default_writers);
 
     std.debug.print("lite write amplification report (updates={d}, text_bytes={d}, dense_dims={d}, sparse_terms={d}):\n", .{ updates, text_bytes, dense_dims, sparse_terms });
     printStageTable("primary-only", primary);
@@ -1320,6 +1460,8 @@ test "lite write amplification report" {
     printStageTable("dense-vector-visible, 8 writers", dense_concurrent);
     printStageTable("sparse-vector-visible", sparse);
     printStageTable("sparse-vector-visible, 8 writers", sparse_concurrent);
+    printStageTable("algebraic-visible", algebraic);
+    printStageTable("algebraic-visible, 8 writers", algebraic_concurrent);
 
     const report: ReportJson = .{
         .text_bytes = text_bytes,
@@ -1335,6 +1477,8 @@ test "lite write amplification report" {
         .dense_vector_8_writers = modeJson(dense_concurrent),
         .sparse_vector = modeJson(sparse),
         .sparse_vector_8_writers = modeJson(sparse_concurrent),
+        .algebraic = modeJson(algebraic),
+        .algebraic_8_writers = modeJson(algebraic_concurrent),
     };
     const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
     defer alloc.free(json_text);
