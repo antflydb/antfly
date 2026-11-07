@@ -31,6 +31,25 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const native_query_maintenance_filters = [_][]const u8{
+        "db native checkpoint warming",
+        "db idle dense query captures",
+        "external lake native warming",
+        "source vector payloads debt policy bounds background deferral",
+        "source vector payloads background verification defers small copies",
+        "source pin cleanup supervisor preserves bounded backoff",
+        "sparse background compaction retires fully deleted inputs",
+        "text merge scheduler completion cannot retire a superseding task",
+    };
+    const native_query_maintenance_tests = b.addTest(.{
+        .name = "native-query-maintenance-tests",
+        .root_module = antfly_test_mod,
+        .filters = &native_query_maintenance_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-storage-native-query-maintenance-test", "Run idle native query capture and warming regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, native_query_maintenance_tests, &native_query_maintenance_filters).step);
     const row_preparation_filters = [_][]const u8{
         "prepared relational",
         "relational durable preparation",

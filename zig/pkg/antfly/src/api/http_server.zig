@@ -6638,6 +6638,24 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    // Expired query state must be collectable while the table is idle, not
+    // only when reconciliation or a later request happens to visit it.
+    fn collectExpiredLakeQueryArtifacts(self: *ApiHttpServer, a: std.mem.Allocator, store: *@import("lake_index_store.zig").Store, table: u64, now: u64, request: api_operation.RequestContext) !void {
+        const config = self.cfg.node_config orelse return;
+        if (config.lake_indexes.artifact_gc.dry_run) return;
+        const identity = try @import("native_retained_cut.zig").storeIdentity(a, store.locator);
+        var artifacts = store.artifactStore();
+        const cancel = request.cancellation;
+        _ = try @import("lake_sql_retained_cut.zig").collectBounded(&artifacts, table, identity, now, @min(128, config.lake_indexes.artifact_gc.max_deleted), cancel);
+        try @import("lake_retained_cut.zig").collect(&artifacts, 0, identity, now, cancel);
+        try @import("lake_retained_cut.zig").collect(&artifacts, table, store.identity, now, cancel);
+        try @import("lake_recent_vectors.zig").collect(store, table, .{
+            .io = self.embedding_provider_runtime.io,
+            .deadline_ns = request.deadline_ns,
+            .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(cancel.ptr, cancel.is_cancelled_fn),
+        });
+    }
+
     /// Exactly one bounded metadata work item and artifact-store pass. DROP
     /// tombstones remain enumerable; collection never depends on live tables.
     /// The scheduling owner serializes this cursor and drains it on shutdown.
@@ -6707,8 +6725,7 @@ pub const ApiHttpServer = struct {
         var store = try @import("lake_index_store.zig").Store.openRetainedNative(a, config, self.cfg.secret_store, binding.locator, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
         if (!config.lake_indexes.artifact_gc.dry_run) {
-            var sql_artifacts = store.artifactStore();
-            _ = try @import("lake_sql_retained_cut.zig").collectBounded(&sql_artifacts, item.table_id, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), platform_time.realtimeNs() / std.time.ns_per_ms, @min(128, config.lake_indexes.artifact_gc.max_deleted), cancel);
+            try self.collectExpiredLakeQueryArtifacts(a, &store, item.table_id, platform_time.realtimeNs() / std.time.ns_per_ms, request);
         }
         var collector: @import("lake_index_gc.zig").Collector = .{
             .a = a,
@@ -60265,6 +60282,61 @@ test "resolver curation HTTP remote owner calls retain deadlines and cancellatio
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .cancellation = CancellationToken.fromAtomic(&canceled) }));
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "external lake idle maintenance collects retained cursors and expired jobs without requests" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const retained = @import("lake_retained_cut.zig");
+    const envelope = @import("lake_generation_envelope.zig");
+    var directory = try TestDirectory.init("idle-lake-query-gc");
+    defer directory.cleanup();
+    var config = try common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var store = try @import("lake_index_store.zig").Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    var artifacts = store.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const now = platform_time.realtimeNs() / std.time.ns_per_ms;
+    const identity = try @import("native_retained_cut.zig").storeIdentity(a, store.locator);
+    const old = try retained.saveCursor(scratch, &artifacts, identity, io, "{\"sources\":[]}", now, .none);
+    const fresh = try retained.saveCursor(scratch, &artifacts, identity, io, "{\"sources\":[]}", now + 60_000, .none);
+    const old_id = try envelope.artifactId("source2:", old);
+    const fresh_id = try envelope.artifactId("source2:", fresh);
+    var client = store.opened.client;
+    for ([_][]const u8{ "recent-search", "row-enrichment" }) |kind| {
+        const key = try std.fmt.allocPrint(scratch, "{s}{s}{s}/7/expired.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind });
+        var saved = try client.putObject(store.opened.bucket, key, "{\"expires_ms\":1}", .{});
+        saved.deinit(client.allocator);
+        const active_key = try std.fmt.allocPrint(scratch, "{s}{s}{s}/7/active.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind });
+        const active_bytes = try std.json.Stringify.valueAlloc(scratch, .{ .expires_ms = @as(u64, 1), .lease_until_ms = now + 60_000 }, .{});
+        var active = try client.putObject(store.opened.bucket, active_key, active_bytes, .{});
+        active.deinit(client.allocator);
+    }
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .deployment_mode = .standalone, .lake_artifact_gc_enabled = false }, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    const after_expiry = now + retained.max_ttl_ms + 30_001;
+    config.lake_indexes.artifact_gc.dry_run = true;
+    try server.collectExpiredLakeQueryArtifacts(scratch, &store, 7, after_expiry, .{});
+    a.free(try artifacts.getAlloc(old_id));
+    config.lake_indexes.artifact_gc.dry_run = false;
+    try server.collectExpiredLakeQueryArtifacts(scratch, &store, 7, after_expiry, .{});
+    try std.testing.expectError(error.FileNotFound, artifacts.getAlloc(old_id));
+    a.free(try artifacts.getAlloc(fresh_id));
+    for ([_][]const u8{ "recent-search", "row-enrichment" }) |kind| {
+        const key = try std.fmt.allocPrint(scratch, "{s}{s}{s}/7/expired.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind });
+        try std.testing.expectError(error.FileNotFound, client.getObject(store.opened.bucket, key, .{}));
+        const active_key = try std.fmt.allocPrint(scratch, "{s}{s}{s}/7/active.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", kind });
+        var active = try client.getObject(store.opened.bucket, active_key, .{});
+        active.deinit(client.allocator);
+    }
 }
 
 test "external lake native server resumes bounded collection across maintenance passes" {
