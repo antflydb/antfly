@@ -91,6 +91,31 @@ pub const Stage = enum(u8) {
     // `.artifact_link` for text segments. Zero for the write-amplification
     // harness's caller-supplied (no-inference) edge writes.
     graph_artifact,
+    // Dense/HBC attribution (lite-single-commit-write-path.md §3.3a): a
+    // single-document, caller-supplied-vector write on Lite's
+    // `.native_catalog` dense backend reaches THREE distinct native commits
+    // beyond the primary document write itself (`.primary_commit`) --
+    // `hbc_adapter.zig`'s `batchInsertWithMetadataOptions`/`batchApplyOptions`
+    // call (vector row + posting-list update + any root/centroid node
+    // rewrite, all staged into ONE native transaction by the HBC library
+    // itself) and `saveProjectionCheckpointMetadata`'s own separate commit.
+    // Pushed at the antfly-embedded call site that invokes into the HBC
+    // library/vectorindex adapter, so it wins over
+    // `native_catalog_backend.zig`'s generic `.main_txn_commit` fallback
+    // (see `scopeDefault`) without needing any vectorindex-library change.
+    hbc_vector_commit,
+    // `index_manager.zig`'s `commitDenseVectorMappingsWithRollback`: the
+    // dense-vector-id <-> document-key mapping record and `_embeddings`
+    // artifact write, against the PRIMARY docstore (not HBC's own
+    // `.native_catalog` backend) -- a second, separate round trip per
+    // write, distinct from `.primary_commit`'s own original-document commit.
+    hbc_metadata_commit,
+    // `hbc_adapter.zig`'s `saveProjectionCheckpointMetadata`: the dense
+    // index's projection-checkpoint/catch-up-progress KV record, against
+    // HBC's own `.native_catalog` backend. Safe to lose and redo per
+    // §3.2a's ride-along table ("Catch-up progress"); see
+    // `HBCIndex.saveProjectionCheckpointMetadata`'s ride-along durability.
+    hbc_checkpoint_commit,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;
@@ -179,6 +204,26 @@ pub const Scope = struct {
 
 pub fn scope(stage: Stage) Scope {
     if (!enabled) return .{ .active = false };
+    pushStage(stage);
+    return .{ .active = true };
+}
+
+/// Like `scope`, but only pushes `stage` when no scope is already active on
+/// this thread -- i.e. it is a *fallback* tag, not an override. Use this for
+/// a generic/shared commit site (one that many different callers reach,
+/// like `native_catalog_backend.zig`'s `NamespaceTxn.commit` or
+/// `docstore.zig`'s `commitStaged`) so that any caller who already pushed a
+/// more specific tag (e.g. `.hbc_vector_commit`, `.progress`) keeps
+/// attribution, instead of the generic site's own push shadowing it.
+/// `currentStage()` always returns the innermost (most recently pushed) tag,
+/// so without this, a caller's specific tag pushed before calling into a
+/// shared commit helper would otherwise be overwritten by that helper's own
+/// generic push for the duration of the actual sync/write/commit. Returns a
+/// `Scope` with `active = false` when deferring, so `Scope.end()` correctly
+/// does nothing for a scope that never pushed.
+pub fn scopeDefault(stage: Stage) Scope {
+    if (!enabled) return .{ .active = false };
+    if (stage_depth != 0) return .{ .active = false };
     pushStage(stage);
     return .{ .active = true };
 }
@@ -328,4 +373,45 @@ test "write amplification trace scopes attribute to the right stage and lane" {
     const after = snapshot();
     try std.testing.expectEqual(@as(u64, 1), after.stage(.replay_retirement).sync_background);
     try std.testing.expectEqual(@as(u64, 0), after.stage(.replay_retirement).sync_calling_thread);
+}
+
+test "scopeDefault defers to an already-active caller tag instead of shadowing it" {
+    // Regression test for the attribution bug `scopeDefault` fixes: a
+    // generic/shared commit helper (e.g. `native_catalog_backend.zig`'s
+    // `NamespaceTxn.commit`, `docstore.zig`'s `commitStaged`) used to push
+    // its own tag unconditionally with plain `scope`, which -- because
+    // `currentStage()` returns the innermost (most recently pushed) tag --
+    // always shadowed whatever more specific tag a caller had already
+    // pushed before calling into it. `scopeDefault` only pushes when no
+    // scope is active, so the caller's own tag survives.
+    reset();
+    registerCallingThread();
+    {
+        const outer = scope(.hbc_checkpoint_commit);
+        defer outer.end();
+        {
+            // Simulates a shared commit helper's own fallback push while a
+            // caller-specific tag is already active: must be a no-op.
+            const inner = scopeDefault(.main_txn_commit);
+            defer inner.end();
+            recordSync();
+            recordCommit();
+        }
+    }
+    const report = snapshot();
+    try std.testing.expectEqual(@as(u64, 1), report.stage(.hbc_checkpoint_commit).sync_calling_thread);
+    try std.testing.expectEqual(@as(u64, 1), report.stage(.hbc_checkpoint_commit).commits_calling_thread);
+    try std.testing.expectEqual(@as(u64, 0), report.stage(.main_txn_commit).sync_calling_thread);
+    try std.testing.expectEqual(@as(u64, 0), report.stage(.main_txn_commit).commits_calling_thread);
+
+    // With nothing already active, scopeDefault pushes normally (the
+    // sparse/dense-without-an-outer-wrap case: nothing shadows it, so the
+    // generic tag is exactly right).
+    {
+        const only = scopeDefault(.main_txn_commit);
+        defer only.end();
+        recordSync();
+    }
+    const after = snapshot();
+    try std.testing.expectEqual(@as(u64, 1), after.stage(.main_txn_commit).sync_calling_thread);
 }

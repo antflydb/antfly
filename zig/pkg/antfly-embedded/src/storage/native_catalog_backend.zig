@@ -510,7 +510,15 @@ pub const Backend = struct {
             // this backend's own readers see them right away) but does not
             // force a sync; see `setDurable`.
             if (self.pending.items.len != 0) {
-                const trace_scope = wal_trace.scope(.main_txn_commit);
+                // `scopeDefault`, not `scope`: a caller that already pushed
+                // a more specific tag (e.g. `hbc_adapter.zig`'s
+                // `.hbc_vector_commit`/`.hbc_checkpoint_commit`) must keep
+                // attribution for this commit's actual sync/write, instead
+                // of this generic fallback shadowing it -- see
+                // `write_amplification_trace.zig`'s `scopeDefault` doc
+                // comment and its own "defers to an already-active caller
+                // tag" regression test.
+                const trace_scope = wal_trace.scopeDefault(.main_txn_commit);
                 defer trace_scope.end();
                 try self.backend.sink.submit(self.backend.sink.ptr, self.backend.scope, self.pending.items, self.durable);
                 wal_trace.recordCommit();
