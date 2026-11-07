@@ -1216,6 +1216,12 @@ pub const OwnedForegroundTextPublication = struct {
         defer if (analysis_owned) entry.analysis_mutex.unlockExclusive();
         if (current.generation() != manager.writePlanGeneration() or !manager.foregroundTextServiceableAssumeCatalogLocked(self.config.name)) return null;
         const native = self.native orelse return null;
+        // Inline publication shares the replay producer's durable fan-out
+        // budget. Recheck the actual prepared inventory under final admission;
+        // a request cannot bypass backpressure by choosing the foreground path.
+        const segment_limit = manager.text_merge_segment_limit.load(.acquire);
+        if (segment_limit != 0) if (native.snapshot) |candidate|
+            if (candidate.snapshot.segments.len > segment_limit) return null;
         native.bindTarget(&entry.persistent) catch |err| switch (err) {
             error.EnrichmentWaitCanceled => return null,
             else => return err,
@@ -22071,6 +22077,12 @@ pub const IndexManager = struct {
         if (!entry.analysis_mutex.tryLockShared()) return null;
         defer entry.analysis_mutex.unlockShared();
         if (current.generation() != self.writePlanGeneration() or !self.foregroundTextServiceableAssumeCatalogLocked(config.name)) return null;
+        const segment_limit = self.text_merge_segment_limit.load(.acquire);
+        if (segment_limit != 0) {
+            const snapshot = entry.persistent.acquireSnapshot();
+            defer snapshot.release();
+            if (snapshot.segments.len +| built.staged.len > segment_limit) return null;
+        }
         var scope = (try store.runtime_store.nativePublicationScope(self.alloc)) orelse return null;
         defer scope.deinit(self.alloc);
         var read = try store.beginReadTxn();

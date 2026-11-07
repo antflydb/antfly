@@ -82,6 +82,7 @@ pub const RecoverableRetryCounters = struct {
             error.PostingWalTooLarge,
             error.PostingRowBackpressure,
             error.PersistentDescriptorAdmissionExhausted,
+            error.TextMergeProducerDeferred,
             error.TextMergeBackpressureTimeout,
             error.TextMergeBackpressureUnavailable,
             error.TextMergeRuntimeShutdown,
@@ -119,6 +120,7 @@ pub fn isRecoverableAdmissionError(err: anyerror) bool {
         error.PostingWalTooLarge,
         error.PostingRowBackpressure,
         error.PersistentDescriptorAdmissionExhausted,
+        error.TextMergeProducerDeferred,
         error.TextMergeBackpressureTimeout,
         error.TextMergeBackpressureUnavailable,
         error.TextMergeRuntimeShutdown,
@@ -430,6 +432,7 @@ test "recoverable retry counters preserve failure reasons" {
 }
 
 test "text merge admission failures remain recoverable for derived replay" {
+    try std.testing.expect(isRecoverableAdmissionError(error.TextMergeProducerDeferred));
     try std.testing.expect(isRecoverableAdmissionError(error.TextMergeBackpressureTimeout));
     try std.testing.expect(isRecoverableAdmissionError(error.TextMergeBackpressureUnavailable));
     try std.testing.expect(isRecoverableAdmissionError(error.TextMergeRuntimeShutdown));

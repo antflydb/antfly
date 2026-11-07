@@ -859,7 +859,7 @@ const PlatformTextMergeRuntime = struct {
                 }
                 if (self.config.defer_producer_to_owner) {
                     self.mutex.unlock(io);
-                    return error.EnrichmentWaitCanceled;
+                    return error.TextMergeProducerDeferred;
                 }
                 if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
                 if (!recorded_wait) {
@@ -967,7 +967,7 @@ const PlatformTextMergeRuntime = struct {
             }
             if (self.config.defer_producer_to_owner) {
                 self.mutex.unlock(io);
-                return error.EnrichmentWaitCanceled;
+                return error.TextMergeProducerDeferred;
             }
             if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
             // The shared byte dimension imposes cross-index FIFO whenever it

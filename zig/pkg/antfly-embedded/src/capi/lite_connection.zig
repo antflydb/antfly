@@ -1641,6 +1641,7 @@ pub const Owner = struct {
         replay_backpressure_waits: u64 = 0,
         replay_refused_preparation_ns: u64 = 0,
         replay_index_groups: u64 = 0,
+        replay_capacity_yields: u64 = 0,
         replay_publication_overhead_ns: u64 = 0,
         replay_index_admission_ns: u64 = 0,
         replay_metadata_admission_ns: u64 = 0,
@@ -3889,8 +3890,14 @@ pub const Owner = struct {
         const detached_started = @import("antfly_platform").time.monotonicNs();
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
         var maintenance_error: ?anyerror = null;
+        var source_capacity_yield = false;
         var maintenance_error_phase: MaintenanceFailurePhase = .source;
-        if (run_source) store.prepareAllocatorVerification(&self.verification_cancel) catch |err| {
+        // Source preparation reads an independently retained immutable cut.
+        // Verifying allocation on that old wrapper would require a quiet tip
+        // before read-only work could start. Indexed publication instead rebases
+        // and authenticates the current allocator under its writer admission.
+        // Legacy files still need their detached graph proof.
+        if (run_source and !store.file.header.indexed_reclamation) store.prepareAllocatorVerification(&self.verification_cancel) catch |err| {
             maintenance_error = err;
         };
         const proof_finished = @import("antfly_platform").time.monotonicNs();
@@ -3899,11 +3906,22 @@ pub const Owner = struct {
         // broad capture. Unrelated serving writes may rebase this turn, while
         // changes to any selected shadow generation still reject publication.
         const projected = if (run_source and maintenance_error == null) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
+            if (err == error.TextMergeProducerDeferred) {
+                source_capacity_yield = true;
+                break :blk false;
+            }
             maintenance_error = err;
             break :blk false;
         } else false;
         var retain_artifact_runtime = !run_database and root.db_live and self.maintenance_retained_logical != null;
-        var pending = if (maintenance_error != null) true else if (run_source and !projected) database.runBackgroundTurnWithCancellation(cancellation, if (shadow_scopes.items.len != 0) .shadow else if (split_index_work) .replay else .complete) catch |err| blk: {
+        var pending = if (maintenance_error != null or source_capacity_yield) true else if (run_source and !projected) database.runBackgroundTurnWithCancellation(cancellation, if (shadow_scopes.items.len != 0) .shadow else if (split_index_work) .replay else .complete) catch |err| blk: {
+            // Capacity is scheduler control flow, not a stale source. Keep
+            // its immutable runtime and service the merges that return credits.
+            // Treating it as a source failure skips that service indefinitely.
+            if (err == error.TextMergeProducerDeferred) {
+                source_capacity_yield = true;
+                break :blk true;
+            }
             maintenance_error = err;
             break :blk true;
         } else projected;
@@ -3913,7 +3931,7 @@ pub const Owner = struct {
         // its own continuation. An artifact-only turn must never re-run source
         // providers, replay, relational sweeps or status snapshot publication.
         const source_more = run_source and (pending or projected or publication.index_inputs_changed or maintenance_error != null);
-        const source_completed = run_source and maintenance_error == null;
+        const source_completed = run_source and maintenance_error == null and !source_capacity_yield;
         const source_advanced = if (source_completed) replay_progress.?.advanced(database) else false;
         // The schedule map can grow while the owner gate is released.
         var artifact_more = !run_database and captured_artifact_pending;
@@ -4074,6 +4092,7 @@ pub const Owner = struct {
 
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
+        self.publication_stats.replay_capacity_yields +|= @intFromBool(source_capacity_yield);
         self.publication_stats.maintenance_capture_ns +|= detached_started -| turn_started;
         self.publication_stats.maintenance_proof_ns +|= proof_finished -| detached_started;
         self.publication_stats.maintenance_replay_ns +|= replay_finished -| proof_finished;
@@ -7296,7 +7315,7 @@ test "capi native asynchronous text merge preserves resource retry hints across 
     // the very lane which stages the independent construction's result.
     try pending.database.initOptionalTextMergeRuntime(.{ .enabled = true, .max_pending_segments = 1, .max_pending_bytes = 0, .manual_producer_assistance = true, .defer_producer_to_owner = true });
     const started = @import("antfly_platform").time.monotonicNs();
-    try std.testing.expectError(error.EnrichmentWaitCanceled, pending.database.text_merge_runtime.?.acquireProducerPermit("text", 1, 0));
+    try std.testing.expectError(error.TextMergeProducerDeferred, pending.database.text_merge_runtime.?.acquireProducerPermit("text", 1, 0));
     try std.testing.expect(@import("antfly_platform").time.monotonicNs() -| started < std.time.ns_per_s);
     test_private_merge_budget_failures.store(1, .release);
     test_pause_private_merge.store(false, .release);
@@ -11512,4 +11531,149 @@ test "capi native allocator proof timed handoffs retain verification without adm
         try fixture.expectWritten(.batch, true);
         try std.testing.expectEqual(walks_before + 1, owner.publication_stats.allocator_proof_walks);
     }
+}
+
+test "capi native detached source preparation does not require a stale allocator proof" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("source-read-without-writer-proof", 5000, .batch);
+    defer fixture.deinit();
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "captured-source", .value = "{\"text\":\"captured source remains valid\"}" }}, .sync_level = .write });
+    const owner = fixture.connection.owner;
+    const Probe = struct {
+        fixture: *AdmissionFollowupFixture,
+        fired: bool = false,
+        failure: ?anyerror = null,
+        fn notify(ptr: *anyopaque, root: *h.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fired) return;
+            const publication = root.maintenance_publication orelse return;
+            if (publication.source_read == null) return;
+            self.fired = true;
+            self.check(root) catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This(), root: *h.Handle) !void {
+            // Only primary state changes. The captured source and its index
+            // inputs remain valid; final publication must acquire a current
+            // checked allocator rather than authenticate an obsolete cut.
+            try self.fixture.writeReplaySource(.{ .writes = &.{.{ .key = "unrelated-a", .value = "{\"text\":\"unrelated primary a\"}" }}, .sync_level = .write });
+            {
+                var lease = try self.fixture.connection.acquire();
+                defer {
+                    lease.close();
+                    self.fixture.connection.gate.mutex.unlock(h.handleLockIo());
+                }
+                const current = try self.fixture.connection.owner.refresh();
+                const store = root.owned_lite_backend.?.native_docstore.?;
+                try store.refreshIndexPublicationCheckpoint(current.owned_lite_backend.?.native_docstore.?.file.header);
+                // Model an evicted verification capability independently of
+                // the immutable source read retained by this turn.
+                store.file.free_pages_verified = false;
+            }
+            try self.fixture.writeReplaySource(.{ .writes = &.{.{ .key = "unrelated-b", .value = "{\"text\":\"unrelated primary b\"}" }}, .sync_level = .write });
+        }
+    };
+    var probe: Probe = .{ .fixture = &fixture };
+    owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_capture = null;
+    const failures = owner.publication_stats.maintenance_failures.source;
+    const publications = owner.publication_stats.replay_index_groups;
+    for (0..16) |_| {
+        _ = owner.maintenanceTurn() catch |err| switch (err) {
+            error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged => true,
+            else => return err,
+        };
+        if (probe.failure) |err| return err;
+        if (probe.fired) break;
+    }
+    try std.testing.expect(probe.fired);
+    try std.testing.expectEqual(failures, owner.publication_stats.maintenance_failures.source);
+    try std.testing.expect(owner.publication_stats.replay_index_groups > publications);
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const current = try owner.refresh();
+    try std.testing.expect((try current.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
+test "capi native replay capacity yield starts a merge before any result is pending" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("replay-capacity-starts-merge", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    const owner = fixture.connection.owner;
+    owner.test_text_merge_segment_limit = 12;
+    defer owner.test_text_merge_segment_limit = null;
+    var live_before: u32 = 0;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        const entry = root.db.core.index_manager.textIndexEntry("text").?;
+        for (0..12) |i| {
+            var key: [32]u8 = undefined;
+            var writer = segment_mod.SegmentWriter.init(std.testing.allocator);
+            defer writer.deinit();
+            try writer.addStoredDoc(try std.fmt.bufPrint(&key, "capacity-{d}", .{i}), "{}");
+            const bytes = try writer.build();
+            defer std.testing.allocator.free(bytes);
+            try entry.persistent.indexSegment(bytes);
+        }
+        live_before = entry.persistent.snapshot().liveDocCount();
+    }
+    try std.testing.expect(owner.pending_text_merge == null);
+    try fixture.writeReplaySource(.{ .writes = &.{.{ .key = "capacity-replay-source", .value = "{\"text\":\"source after capacity is restored\"}" }}, .sync_level = .write });
+    const failures_before = owner.publication_stats.maintenance_failures.source;
+    for (0..512) |_| {
+        _ = try owner.maintenanceTurn();
+        if (owner.publication_stats.text_merge_jobs_applied != 0 and owner.publication_stats.replay_index_groups != 0) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(owner.publication_stats.replay_capacity_yields != 0);
+    try std.testing.expect(owner.publication_stats.text_merge_jobs_started != 0);
+    try std.testing.expect(owner.publication_stats.text_merge_jobs_applied != 0);
+    try std.testing.expect(owner.publication_stats.replay_index_groups != 0);
+    try std.testing.expectEqual(failures_before, owner.publication_stats.maintenance_failures.source);
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const root = try owner.refresh();
+    try std.testing.expectEqual(live_before + 1, root.db.core.index_manager.textIndexEntry("text").?.persistent.snapshot().liveDocCount());
+    try std.testing.expect((try root.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
+test "capi native foreground text shares the replay segment capacity" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("foreground-text-capacity", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    const owner = fixture.connection.owner;
+    for (0..8) |i| {
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const root = try owner.refresh();
+            root.db.core.index_manager.text_merge_segment_limit.store(2, .release);
+        }
+        var key: [32]u8 = undefined;
+        const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice(try std.fmt.bufPrint(&key, "capacity-{d}", .{i})), .value = .fromSlice("{\"text\":\"bounded foreground publication\"}"), .is_delete = false }};
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(fixture.id, &writes, writes.len, null, 0, 0, 0));
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        const snapshot = root.db.core.index_manager.textIndexEntry("text").?.persistent.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expect(snapshot.segments.len <= 2);
+    }
+    try std.testing.expectEqual(@as(u64, 8), owner.current.?.db.core.store.lastReplaySequence(0));
+    try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
 }

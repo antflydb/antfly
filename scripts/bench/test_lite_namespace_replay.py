@@ -32,6 +32,25 @@ def sample(seconds, applied, target):
     }
 
 
+class ProgressSamplingTests(unittest.TestCase):
+    def test_capacity_and_progress_share_one_admission(self):
+        class DB:
+            calls = 0
+
+            def stats(self):
+                self.calls += 1
+                return {
+                    "indexes": [{"name": "text", "doc_count": 7}],
+                    "text_merge": {"active_segments": 3},
+                }
+
+        db = DB()
+        snapshot = db.stats()
+        self.assertEqual(bench.progress(db, snapshot=snapshot)[0]["doc_count"], 7)
+        self.assertEqual(snapshot["text_merge"]["active_segments"], 3)
+        self.assertEqual(db.calls, 1)
+
+
 class CounterDeltaTests(unittest.TestCase):
     def test_attributes_nested_writer_holds_without_subtracting_maxima(self):
         before = {

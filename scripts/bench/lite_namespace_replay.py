@@ -49,7 +49,9 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def progress(db):
+def progress(db, *, snapshot=None):
+    if snapshot is None:
+        snapshot = db.stats()
     return [
         {
             key: index.get(key)
@@ -63,7 +65,7 @@ def progress(db):
                 "term_count",
             )
         }
-        for index in db.stats()["indexes"]
+        for index in snapshot["indexes"]
     ]
 
 
@@ -438,7 +440,10 @@ def worker(args):
             batch += 1
             if args.active_seconds and time.monotonic() >= next_sample:
                 sample_began = time.monotonic()
-                indexes = progress(db)
+                # Capture capacity and progress in one stats call. A second
+                # admission can change the scheduling behavior being measured.
+                index_stats = db.stats()
+                indexes = progress(db, snapshot=index_stats)
                 resolvers = resolver_progress(db) if args.resolver_backfill else []
                 enrichment = (
                     db.pending_work_stats()["enrichment"]
@@ -453,6 +458,7 @@ def worker(args):
                         "successful_batches": batch - len(failures),
                         "file_bytes": path.stat().st_size,
                         "indexes": indexes,
+                        "text_merge": index_stats.get("text_merge"),
                         "resolver_progress": resolvers,
                         "enrichment": enrichment,
                     }

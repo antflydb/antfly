@@ -78588,7 +78588,7 @@ test "db atomic text producer admission charges oversized groups and retains bac
     var atomic = try runtime.acquireAtomicProducerPermit("text", 8, 0);
     defer atomic.release();
     try std.testing.expectEqual(@as(u64, 8), runtime.producer_segment_reservations);
-    try std.testing.expectError(error.EnrichmentWaitCanceled, runtime.acquireProducerPermit("text", 1, 0));
+    try std.testing.expectError(error.TextMergeProducerDeferred, runtime.acquireProducerPermit("text", 1, 0));
     atomic.release();
     try std.testing.expectEqual(@as(u64, 0), runtime.producer_segment_reservations);
     var normal = try runtime.acquireProducerPermit("text", 1, 0);

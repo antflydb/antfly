@@ -1,639 +1,203 @@
-# Native index publication
-
-The Lite index LSM is a logical index-state machine inside the native file. It
-must not become an independent physical durability domain. An LSM WAL record is
-still useful as a recovery encoding; writing that record, installing its
-immutable inputs and publishing its replay continuation must share one native
-checkpoint.
-
-## Ownership and commit boundary
-
-Preparation owns immutable artifact bytes, deletion bitmaps and a prepared
-replacement snapshot. Large artifacts use bounded unpublished construction
-leases, so staging does not monopolize writer admission. Artifacts up to 256 KiB
-stay in provider-owned memory, independent of request scratch, and join the
-activation transaction directly. Larger artifacts use a construction lease that protects
-the immutable reader before a public alias exists.
-
-Under the checked final writer admission, a publication validates the captured
-index generation, fragment identity, input fingerprint and segment-ID frontier.
-It allocates replacement readers and memory before attempting durability. A
-borrowed participant travels explicitly through the namespace transaction and
-LSM WAL append. The native storage host stages that participant's artifact links
-and the encoded WAL append in one native transaction. The participant has no
-commit, abort or in-memory activation capability. Unsupported storage providers
-refuse this operation; a sequence of independent writes is not a fallback.
-
-WAL directory initialization, rotation and pressure relief do not receive this
-participant. The participant belongs only to the actual activation record. LSM
-memtable activation follows successful native publication; index snapshot
-activation follows successful LSM commit. Every artifact needed by a committed
-activation therefore exists in the same durable checkpoint.
-
-A prepared replacement guards new retained snapshot captures across the external
-commit and in-memory activation. The native participant arms this guard after
-LSM pressure relief and candidate preparation. It releases it after installing the
-successor pointer, or on abort after the owner has classified/fenced the failed
-publication. This prevents newly visible primary progress from authorizing a
-new capture of the old in-memory index. Previously retained snapshots continue
-to represent their original cut. Contended capture waits yield the CPU.
-
-## Index-specific admission
-
-A table-wide index identity is too broad for detached text work: eager graph
-publication can change it after every text preparation, even though no text
-input changed. Revision 12 therefore gives each `/indexes/<name>` domain a
-random durable mutation identity. Its bounded hash key lives outside the virtual
-file namespace. File writes, appends, deletes and both domains of a cross-index
-rename stage their identities in the same native transaction as their effects.
-An aborted transaction restores both; unchanged inline file writes do not
-advance the identity or create another checkpoint.
-
-The replay publication port names its target index. The maintenance turn captures
-owned identities before releasing admission and compares the selected identity
-against the current inode under its final writer lease. Catalog, namespace,
-incarnation and recovery validation still apply, including after allocator-only
-admission has already adopted a newer header. Changes to other indexes still
-invalidate whole-runtime cache reuse and unscoped operations; they no longer
-invalidate this prepared text publication. The selected witness is refreshed
-before releasing the lease, so later pieces recognize the worker's own writes.
-A witness-read failure after commit invalidates future reuse rather than
-returning a retryable error for a committed publication.
-
-The signature change excludes writers that do not maintain these identities.
-Older file revisions keep conservative admission until writable-owner migration.
-This is a scoped publication fix, not a replacement for validating merge inputs
-or for qualifying sustained mixed-index traffic. The [Debug correctness receipt](scoped-replay-admission-debug.json)
-records the full native/C API results and remaining qualification. Local regressions inject a
-foreign index mutation before each text publication, retain target-replacement
-refusal, and verify durable fragment progress across runtime replacement.
-
-## Refusal and uncertainty
-
-A prepublication failure aborts all staged links and the WAL append. Prepared
-immutable inputs remain available for another attempt. Alias collisions never
-permit overwriting or deleting a foreign artifact. A later attempt may allocate
-another numerical segment ID.
-
-A publication error that may have committed fences the native owner and its
-serving wrappers. The old in-memory snapshot remains active, but must not be
-used to claim the new request failed before commit. A fresh owner reconciles the
-checkpoint and WAL. Ordinary file-WAL tail repair must not truncate this atomic
-native publication: it could remove activation state from a successful commit.
-
-## Primary progress
-
-The physical activation includes its exact fragment continuation. A partial
-fragment cannot advance the coarse primary watermark. Joining coarse progress
-requires proving that every preceding fragment and required consumer effect is
-complete, preserving the catalog identity and revocation rules used by existing
-projection metadata. Advisory status must describe the prepared successor, not
-the old in-memory snapshot. The implementation joins complete-fragment primary
-progress and its physical index seal through a namespace-scoped metadata participant. It rechecks the
-captured authority, including epoch and catalog digest, inside the native
-transaction and uses the existing progress/revocation rules. A later coarse
-flush skips progress already covered by that atomic publication. Diagnostic
-status remains advisory and is refreshed by the separate status service.
-These changes still require correctness and performance qualification.
-
-## Verification
-
-Require one native checkpoint for an already initialized multi-artifact
-activation, preserved old snapshots, deletion/overwrite correctness, exact
-fragment resume after reopening, collision safety, participant-stage rollback,
-allocation failure and native durability failures. An uncertain commit must
-recover complete activation state and preserve its artifact leases. Existing
-WAL crash models and native allocator/reclamation checks remain required.
-
-Operation counts are local feedback. Final throughput, tail latency, active
-storage plateau, strict index visibility and unchanged-importer contention are
-qualified separately on wolfspider using the retained baseline receipts.
-
-## Explicit drains and finite replay credit
-
-Explicit native drains use bounded producer, independent-consumer and dependent-
-consumer turns, followed by physical retirement after releasing source reads.
-The connection rotates all namespaces sharing the native replay ledger before
-revisiting one namespace. It retains the original producer interval when auditing
-terminal failures, so an advanced cursor cannot hide an earlier failed request.
-Strict idle finalization follows the bounded service round. No quota or visibility
-timeout is raised to permit progress.
-
-The local regression previously retained 13,282 bytes of a 13,425-byte consumer
-allowance after two output publications, with producer progress still zero. The
-next output could not fit while the producer held the drain. Interleaved service
-now finishes that fixture and verifies physical reclamation between outputs.
-
-Explicit drains and compaction must not wait for a detached replay continuation
-while holding its writer publication gate. A refused continuation borrow unwinds
-all runtime-local work, releases admission, and yields before reacquiring and
-refreshing the foreground runtime. Durable progress remains authoritative across
-that handoff; callers never replay a document mutation to resolve this wait.
-
-A fair explicit round also advances pending graph replacement construction and
-cutover using their existing finite work budgets. Merely reporting a pending
-replacement would prevent idle finalization from ever servicing it. Background
-scheduling retains blocked resolver debt for a later wake; explicit drains finish
-after runnable consumers settle and leave the blocked outcome visible. The
-configured stuck-index diagnostic is checked between explicit rounds as well.
-
-Memory-backed artifacts use the same resource-accounted decoded-lease contract as
-native range sources. Resident bytes reserve host capacity before allocation;
-a declined reservation selects bounded file staging. Decoded leases independently
-retain the immutable bytes and their resource owner after the runtime closes.
-Optional cache rejection refunds metadata before the normal decoding fallback.
-
-## Producer completion and committed-effect progress
-
-A producer's source watermark and an index's committed-effect watermark answer
-separate questions. A multi-document source record can produce several output
-publications before the producer completes that record. Each output has its own
-durable journal sequence. Index replay must consume those committed effects
-without waiting for the unfinished source record; otherwise finite output
-credits can form a circular wait. A synchronized visibility request first fences
-source completion, then captures and fences the resulting publication cut.
-Advancing an index watermark alone never proves future producer output complete.
-
-Native retirement uses a durable cut for each hint lane. Multiple indexes of the
-same kind contribute their minimum cut. Enrichment, resolution and promotion
-retain their own input lanes. Repair and graph-replacement readers retain all
-lanes, and failed catalog loads authorize no reclamation. A canonical payload
-can disappear only after every relevant consumer acknowledges it and every
-reference is physically deleted, including deletions in the same transaction.
-Legacy records without explicit hints retain the conservative uniform minimum.
-Continuation state becomes clean only for the exact set of cuts it examined.
-
-The integrated retry workset writes `ESQ4`, with explicit empty-document and
-fragment cursor fields. Its decoder accepts the earlier `ESQ2` header and both
-unreleased `ESQ3` layouts using exact lengths and bounded slot counts. Empty-key
-and fragment cursors cannot be claimed simultaneously. This preserves main's
-opaque empty-document IDs together with authenticated seekable discovery.
-
-## Immutable inputs across admission yields
-
-A changed foreground tip can refuse artifact publication after source replay
-completed successfully. That refusal invalidates mutable actors and captured
-publication authority. It does not invalidate immutable bytes protected by a
-live durable value lease. Before closing the refused runtime, preserve its
-immutable inputs under the existing file-wide entry, byte, range and time bounds.
-No primary epoch or mutable DB state is retained by this handoff. Exact current
-path/inode/value identity is checked again before any pooled source is reused.
-An uncertain outcome on either the detached or serving owner clears the handoff.
-Shutdown does not extend it. Source and decoded-lease resource owners continue
-to outlive any retained readers independently of the closed runtime.
-
-
-## Direct native namespace stage
-
-Hosted Native providers can open transactional namespaces directly in the native
-catalog. New persistent text main stores and logical WALs consume this capability;
-filesystem, memory and existing LSM roots keep their previous backend. A namespace
-layout marker is published with its first mutations. No empty native root may
-supersede existing LSM metadata. Native revision 13 fences older binaries before
-they could mistake these namespaces for empty LSMs.
-
-Namespace keys preserve byte ordering through bounded-component hex encoding.
-This keeps arbitrary binary names and keys compatible with generation manifests
-and repair without making the virtual filesystem responsible for the transaction.
-All main metadata, artifact activation and joined projection progress still share
-one native checkpoint. Prepared replacements can release the writer mutex before
-admission; binding checks the retained base and each deletion revision. Aborting a
-detached replacement does not dereference its former writer.
-
-Immutable leased sources keep their existing bounded handoff pool across runtime
-replacement. C API native visibility acknowledgements notify bounded retirement
-service; physical deletion remains the condition for returning replay credits.
-
-The direct backend is an architectural prerequisite, not evidence that the
-primary/index durability gap has closed. An intermediate 128-update diagnostic
-still recorded 544 foreground syncs. That receipt predates the checked one-sync
-protocol and typed semantic retirement, described in
-[native-commit-proofs.md](native-commit-proofs.md). Combining foreground primary
-and index publication and batching posting deltas remain outstanding. The direct
-namespace stage itself makes no end-to-end or optimized performance claim.
-
-Current-stage Debug validation and explicit qualification limits are recorded in
-[direct-native-namespaces-debug.json](direct-native-namespaces-debug.json).
-
-## Prepared namespace participation in primary publication
-
-A namespace write transaction can detach into an owned prepared publication.
-Detachment refuses live cursors, materializes the write descriptors and successor
-generation before admission, and closes the metadata snapshot before the writer
-queue. Its retained backend and IO owner remain alive until the prepared handle
-is released. It has staging authority; it cannot commit or activate a runtime.
-
-The primary native transaction accepts this capability independently of its
-restricted document-metadata observer. The native host validates inode, file
-namespace and the exact captured namespace generation, then stages the namespace
-and artifact changes beside the primary write set. An injected staging error
-rolls the entire transaction back. A stale namespace witness refuses publication
-without leaving the primary changes committed.
-
-Persistent text publication also accepts a synchronous primary committer. Its
-namespace witness is captured before reading the segment frontier and fragment
-position, and retained throughout preparation. The caller publishes primary
-changes, index metadata, immutable aliases and progress in one checkpoint.
-Prepared reader activation follows durable success; uncertain primary outcomes
-propagate the group's captured decision back to the originating caller and
-fence the serving owner. An already applied replay fragment cannot silently
-skip an attached primary commit.
-
-This is the shared publication mechanism. Foreground callers still need to
-supply their text plans before admission and use this mechanism; merely exposing
-the capability does not eliminate the remaining separate primary/index commits.
-Commit cohorts must compose same-index plans before staging. Queuing separate
-prepared replacements that each hold the same writer mutex through durability
-would deadlock a shared group and is not a supported coalescing strategy.
-
-Hosted graph forward/reverse stores and sparse metadata now select the direct
-native namespace provider for new roots. Existing LSM roots retain their
-existing authority. Scalar namespace views retain read snapshots across fork
-and owner shutdown, preserve ordered binary keys, and keep transaction-wide
-write serialization explicit. Their native transactions provide durability;
-there is no inner manifest or WAL to sync or maintain.
-
-Revision 14 fences the additional native graph, sparse and HBC metadata roots.
-Revision-13 namespace data remains readable, and writable owners migrate through
-the existing generation-replacement protocol before publishing new namespace
-mutations. A version-13 binary must not open a new native graph root as an empty
-LSM. Existing logical-identity and allocator/recovery encodings remain intact.
-
-Ordinary native text segment insertion and deletion use the same prepared
-activation machinery as replay. Small artifacts, active metadata and immutable
-replacement snapshots publish in one native checkpoint. Large unpublished
-construction remains bounded. Ordinary mutations leave the replay fragment
-unchanged. Deletion prepares private bitmap replacements before durability,
-instead of exposing an in-place tombstone and attempting to undo it on failure.
-
-
-## Bounded resident sources during reopen
-
-Small native text artifacts retain the same owned-memory policy on cold/runtime
-reopen as during publication. The optional resident-source capability copies at
-most 256 KiB under a short logical read pin, hashes the owned bytes and releases
-the pin. The resulting immutable source and decoded-cache leases retain their
-resource/IO owner independently of DB and Store lifetime. They need no durable
-alias, marker, inode fence or retained native extent.
-
-Resident allocation reserves memory before copying. Size or optional residency
-refusal selects the established range-backed source; corruption, cancellation
-and operational read errors propagate. Large artifacts keep bounded native ranges
-and their exact leases. Providers can expose either capability independently;
-the generic mapped/heap fallback remains available when both are absent.
-
-This removes durable lease publications for small artifacts when maintenance
-reconstructs a runtime. It does not remove the need to bind primary and index
-updates together or to compose posting deltas before freezing segments.
-
-## Owned text builds and grouped native activation
-
-Native text projection plans now retain an independent build-resource capability.
-It owns the IO service and ResourceManager lifetime, an analysis-cache reference,
-and deep copies of analyzer, sort and spool configuration. Building a captured
-window requires no live DB, index entry, Store or primary snapshot. A regression
-closes all those owners before building multilingual postings. Foreign providers
-without this optional capability keep their existing fenced build path.
-
-`PersistentIndex.prepareNativePublication` separates namespace, artifact and
-replacement-snapshot preparation from the primary commit. Its handle closes the
-native metadata transaction and detaches the writer snapshot before returning.
-The caller retains index lifecycle admission and local storage serialization;
-multiple indexes must be acquired in consistent catalog order. This is a
-synchronous publication capability, not a lifetime-independent cached runtime.
-
-`commitNativePublications` stages all handles through one primary committer.
-Exact namespace witnesses and detached snapshot/deletion revisions are checked
-inside the host transaction. Failure activates none of the indexes. Uncertainty
-fences every possibly affected index and preserves the host's outcome. After
-success, all replacement snapshots are installed before any external reader
-fence is released. Both activation phases are allocation-free and infallible.
-Existing replay-with-primary publication uses this path too.
-
-A two-index regression covers injected failure, a foreign mutation to the
-second namespace, and successful primary/index publication in one checkpoint.
-An independent index test checks the intermediate activation state: after the
-first snapshot is installed, readers of both indexes remain fenced until the
-second installation completes.
-
-Foreground primary/text routing and an ordered same-index request cohort remain
-separate integration work. This API intentionally refuses duplicate target
-indexes in one group: logical effects for a shared index must be composed before
-preparing its single replacement. It does not make separately prepared stale
-replacements composable, nor does it establish end-to-end performance.
-
-
-Resident sources also participate in bounded handoff. An allocation-free weak
-pool holds at most 128 entries and owns no references itself. Reuse requires the
-same database path, digest, length and full content comparison; native page
-addresses are insufficient because resident copies retain no page leases.
-Registration and final release share a mutex, preventing resurrection after the
-last reference. A file owner's working set may retain these copies alongside
-leased ranges within its existing memory/count/expiry limits. Resident copies
-add no physical range charge. Changing bytes cannot reuse an old decoded cache,
-including under an artificially forced digest collision.
-
-
-Detached builds require an owned resource lifetime as well as copied config.
-The native backend explicitly marks managers it transfers to the registry on
-close. A borrowed external ResourceManager cannot establish that guarantee, so
-its stager declines detached building and retains the fenced compatibility path.
-Positive and negative ownership regressions cover both cases.
-
-When a private merge exhausts its build budget, recording a smaller merge width
-also makes that namespace's artifact debt runnable and wakes the owner. The
-owner applies a 100 ms retry delay, so persistent pressure cannot cause a
-zero-delay worker loop. Progress no longer depends on a later write or an idle
-poll rediscovering the debt. The regression checks both explicit scheduling and
-the bounded delay before verifying the smaller retry.
-
-Exact-commit Debug validation for this stage is recorded in
-[owned-native-publication-debug.json](owned-native-publication-debug.json).
-It qualifies the listed correctness and ownership checks; foreground integration
-and final end-to-end performance qualification are still pending.
-
-### Native document identity binding
-
-Revision 16 separates the authoritative ordinal column from immutable posting
-bytes. `native_publication_value.Value` owns a fixed address and length. Its
-producer initializes the buffer before preparing namespace mutations, then seals
-it with release ordering after primary identity assignment. Reads and native
-namespace staging require the matching acquire-ordered seal. An unbound buffer
-fails before host publication; it never produces a retryable post-commit error.
-
-The `AFTSADM2` active marker contains the segment ID, physical length, exact AFSM
-footer, optional `AFTSADM1` navigation and mandatory ordinal column, protected by
-an outer checksum. Large navigation falls back to source admission while keeping
-the identity column. Readers accept legacy inline ordinals. Scalar lookup,
-ordinal cursors, query-bound readers and compaction all prefer the native binding.
-Deletion-only replacements retain the column and republish it with their bitmap.
-Compaction can fold it back into an ordinary inline column.
-
-`prepareNativeTextSegment` retains owned preparation resources and copies keys in
-physical segment order. `prepareNativePublication` allocates the final metadata
-buffer and replacement snapshot before native writer admission. The owner binds
-its authoritative ordinals before `commitNativePublications`. Primary changes,
-metadata, activation and all participating indexes then share the host commit.
-The ordinary document batch and SQL paths still need to consume this prepared
-foreground capability; this component alone does not unify those entry points
-or implement publication cohorts.
-
-Publication values retain the native resource owner and charge their complete
-buffer/state reservation until their final snapshot reference disappears.
-Decoded columns retain the actual source accounting owner, including sources
-reused from retired runtimes. Namespace cursor snapshots retain their own value
-references; overwriting a pending key cannot invalidate an existing cursor.
-The namespace's inode, file namespace and generation witness remains exact even
-when the value is bound later.
-
-### Preparation across runtime replacement
-
-`WritePlanSnapshot` now shares immutable foreground text configurations for its
-catalog epoch. They own schema, analyzer configuration, projection options and
-build resources. Document projection can produce an owned `TextPublicationPlan`
-without a live manager; segment construction follows separately, allowing a
-publisher to combine compatible request deltas before freezing posting segments.
-The configuration witness compares complete serialized semantics rather than
-process-local index counters. Schema refresh and newly observed analyzer claims
-invalidate this shared extraction epoch.
-
-`prepareOwnedNativePublication` releases both storage serialization and mutable
-runtime references. Its namespace mutations, replacement snapshot, deletion
-information and resource capability remain owned until activation or abort.
-After a runtime refresh, `bindTarget` accepts only the same inode, file namespace,
-index root and semantic namespace generation. The host independently validates
-that namespace before staging primary/index effects. Replacing a runtime does
-not make a changed namespace admissible.
-
-An independently retained snapshot accounting capability survives the original
-writer and backend. Rebinding a prepared snapshot never attaches its caches to
-an unretained replacement manager. Epoch assignment occurs at actual activation.
-The tests cover resident artifacts and large staged extents, complete backend
-replacement, one-checkpoint primary/index publication and snapshots retained
-after both backends have closed.
-
-Read-only snapshots acquire `Storage.acquireImmutableResources` independently of
-writable artifact staging. This retains their allocator/accounting lifetime
-without granting a mutation capability or requiring a writable sidecar directory.
-A borrowed external ResourceManager still cannot escape its caller's lifetime;
-providers decline detached ownership when they cannot retain that owner.
-
-Native participants have two transaction phases. The host validates owned read
-witnesses before applying primary postimages, then stages index and metadata
-changes against those postimages in the same transaction. Composite publishers
-forward both phases. This avoids a metadata witness conflicting with the
-request's own primary writes; a refusal rolls back the complete native group.
-
-
-### Independent native staging and physical retirement
-
-Foreground preparation binds progress to the actual assigned source sequence,
-including reservation gaps. Its root metadata participant also validates the
-captured committed source tip before primary staging, so unchanged index metadata
-cannot authorize skipping another writer's pending record.
-
-Resident staging uses captured resource, inode and file-namespace identities;
-copying bytes and preparing authoritative ordinal columns need no live Store.
-Large staging acquires an independently retained path gate before opening its
-own native writer. Each turn appends at most 1 MiB of unpublished construction
-bytes and checks the exact inode and persisted file namespace. The final turn
-transfers the construction's existing durable lease into an immutable Source.
-The gate retains file-lifetime IO and allocator-cache resources, without retaining
-a mutable Owner, Connection or Store. Existing replay workers retain their
-lifecycle-admitted staging path; owned foreground preparation uses this service.
-
-Native retirement discovers and settles at most 64 current markers per atomic
-physical publication. It keeps active aliases, removes stale retirement markers,
-and leaves semantic namespace generations unchanged. A detached index snapshot
-is no longer cleanup authority. Refused sweeps preserve the cursor and back off
-from one millisecond to one second; maintenance readiness includes that deadline.
-
-The component evidence and remaining qualification are in
-[owned-publication-service-debug.json](owned-publication-service-debug.json).
-These contracts do not establish end-to-end performance. Primary-effect readsets,
-same-index commit cohorts and durable posting-delta buffering remain separate
-integration work.
-
-
-### Owned primary postimages and shared wait budgets
-
-Document-mode plans now own their exact stored postimages, including stripping
-catalog-selected direct vector fields. Preparation computes SHA256 content proofs
-and projection/source-value certificates before writer admission. A synchronous
-DocStore batch borrows those proofs only when document identity, row kind and
-actual bytes match; other writes retain authoritative proof computation. Actual
-mutation revisions are still assigned in the transaction. Request-owned proof
-storage survives through commit or abort and is never retained by the engine.
-
-Catalog captures and every bounded detached artifact turn now debit one request's
-remaining contention budget. Active mapping, hashing, allocator proof work and IO
-do not consume that waiting budget. Failed preparation releases registry pins.
-The timeout regression keeps the gate held until refusal, then checks that a later
-request can acquire it. Component evidence is recorded in
-[owned-primary-content-debug.json](owned-primary-content-debug.json).
-
-This does not finish same-index publication cohorts, SQL preparation integration,
-or durable normalized posting-delta windows. No end-to-end throughput claim is
-made from these component tests.
-
-
-### Adopt atomically published progress
-
-A live Debug trace exposed a missing activation edge: sixteen indexed writes
-published primary plus text state together, then their visibility waits performed
-sixteen additional text replay publications. The durable root checkpoint was
-current while the serving executor's cached replay watermark was behind.
-
-Successful owned publication now adopts the selected registrations' committed
-frontier while their catalog/apply fence still identifies the exact indexes.
-Manual waits can use that frontier immediately. Threaded workers receive a
-separate atomic frontier, discard superseded private captures and drain their
-sessions before installing it into mutable worker state. They do not re-persist a
-frontier certified by this publication. Ordinary worker progress retains forced
-visibility validation. No retained bytes are credited by progress adoption;
-physical consumer retirement remains authoritative.
-
-The expanded runtime and C API component gates are recorded in
-[publication-progress-debug.json](publication-progress-debug.json). Live performance
-qualification of the rebuilt candidate, commit cohorts and durable normalized
-posting-delta windows remain outstanding.
-
-### Durable normalized posting windows
-
-Revision 17 adds segment-v7 containers for bounded analyzed document contributions.
-Small prepared native publications append term bytes, frequencies, position deltas
-and norms without building a frozen dictionary, FST or posting blocks. Typed fields,
-stored values and authoritative document ordinals retain their existing contracts.
-Queries read owned immutable posting arrays directly, including deferred positions,
-phrase scoring and term-pattern enumeration. Iterators retain their context after
-scope closure. Physical byte diagnostics report the retained delta representation.
-
-The owner freezes publication-order prefixes at 256 contributed documents, 4 MiB
-or 32 fragments. Producer segment and byte admission also bounds work while freezing
-is in flight; a deliberately smaller segment watermark lowers the fragment trigger
-and permits a mixed pair to drain rather than deadlocking. Ordinary tier compaction
-excludes incomplete tails. Freezing consumes normalized postings without reanalysis
-and emits the ordinary segment-v6 format. Oversized private builds use the existing
-spillable frozen compiler before any artifact escapes. Frequencies must fit the
-frozen representation. Revision-16 signatures remain readable, while writable
-owners upgrade atomically before enabling the new representation.
-
-[The component receipt](normalized-posting-tail-debug.json) includes successful
-reader, ownership, publication and reopen checks. It also records negative
-performance evidence: the current Debug measurement reduced the closed indexed
-fixture size but did not improve latency or background sync count. Primary-only
-writes also still generate frequent background syncs. Those physical publications
-need attribution and coalescing; this stage does not establish end-to-end performance
-qualification or complete SQL preparation integration.
-
-### Physical work coalescing and maintenance durability
-
-A current-candidate sync-stack diagnostic attributed extra background publications
-to journal deletion and allocator reclamation, including in primary-only writes.
-The owner now distinguishes an explicit retirement drain from a coalesced background
-turn. Notifications preserve the first debt's deadline. Record/byte pressure and
-an exhausted bounded scan budget bypass the delay; a final clean scan does not
-force another immediate publication. Source acknowledgement returns no credits.
-Deletion still uses the checked consumer bounds and returns physical credits only
-after its atomic batch commits. Allocator retirement shares the bounded work policy.
-
-Verified maintenance uses the existing checked postimage protocol, rather than
-forming a separate two-sync durability boundary. Unverified maintenance retains
-the conservative protocol, and private namespace rebinding explicitly suppresses
-new proof creation while dropping old proofs. Native regressions cover torn
-maintenance postimages, logical-identity preservation, unverified fallback and
-absence of an unearned allocator certificate.
-
-[The Debug receipt](physical-service-debug.json) records the full native gate,
-C API coverage and operation counts. For 128 writes, background syncs fell from
-110 to 25 without an index and from 129 to 66 with an index; foreground syncs
-remained 128. Telemetry and shared-host timing prevent a controlled latency claim.
-The indexed run still captured 95 background source turns, including roughly
-2.07 seconds constructing their snapshots. Removing redundant source/runtime
-construction and completing owned SQL preparation remain necessary before final
-end-to-end qualification.
-
-## Separate covered source observation from physical service
-
-A new source sequence is a notification, not proof that an index consumer still
-has work. The native owner checks durable consumer watermarks before selecting
-source service. After a successful source pass, a document/text-only namespace
-can retain a compact scheduling witness: namespace incarnation, nonzero metadata
-identity, the schema/resolver/table/policy control fingerprints, and per-index
-analyzer and managed-admission controls. A matching witness and caught-up durable
-consumers permit observation of a later sequence without reopening a source DB.
-Startup, expired audits, changed controls, repairs, transitions, generated work,
-resolvers, group sources, relational storage and mixed indexes retain source
-service. These hints never replace publication validation.
-
-Covered source observation does not delete journal bytes or refund credits.
-Journal retirement keeps its oldest coalescing deadline and its consumer clamps;
-journal pressure and the existing text window/tier policy can request immediate
-service. Bounded native journal and text-retirement metadata work use the admitted
-serving owner. That slice does not build segments, call providers or invoke a
-nested LSM. Required merges then capture their independently owned inputs from
-the resulting checkpoint. Detached cleanup must not reject a merge before its
-construction starts. A turn with neither source nor artifact work schedules no
-replacement DB: physical allocator service owns a separate raw-store lane.
-
-The local operation-count diagnostic confirmed the source-selection mechanism:
-128 indexed writes went from 95 source turns to one. Its intermediate artifact
-path still rebuilt runtimes and yielded repeatedly; that diagnostic is evidence
-for separating physical service, not final end-to-end performance qualification.
-
-## Owned relational postimages
-
-Autocommit relational INSERT/UPDATE can capture immutable schema and write-plan
-views, release file admission, and run the existing defaults/generated/CHECK,
-extraction and row-packing pipeline through a CPU-only port with no DB receiver.
-The resulting row authority is single-use. Commit checks the namespace and
-incarnation, complete schema and catalog contents, physical-layout equivalence,
-and exact key/value/JSON-null provenance before consuming it. A numeric schema
-version alone cannot authorize transfer between independent registries.
-
-Transferred regions retain their allocator receiver through commit cleanup;
-primary/index effects and predicates still use the ordinary atomic mutation
-pipeline. SQL's request allocator accounts for retained preparation. Active
-sessions, coordinated constraints, generated-provider templates and split-shadow
-work retain their authoritative paths. The initial
-[Debug receipt](owned-relational-rows-debug.json) records ownership/fault tests
-and SDK validation; normalization sharing follows below.
-
-## Prepared merge activation under active writes
-
-Merge capture uses the current admitted checkpoint, while immutable segment
-construction and private output staging run outside writer admission. Final
-publication reopens the current index inventory under a fresh admitted checkpoint
-and validates source identities before activation. Newly appended segments are
-retained. File-backed deletion coordinates are resolved outside admission; the
-final transaction verifies cumulative deletion witnesses and requests another
-lookup pass if necessary. Resolved source coordinates remain cached across
-re-adoption, with bounded task accounting and retry-safe bitmap ownership.
-
-Prepared linked segments retain their runtime until they are destroyed, and
-cleanup that owns native aliases runs before releasing writer admission. Ready
-publication runs before optional cleanup, preventing unrelated maintenance from
-starving completed work. The [Debug receipt](prepared-merge-publication-debug.json)
-records five applied merges with no discards during the current-only hot-write
-diagnostic, plus lifecycle and file-backed lookup validation. This is not final
-performance qualification.
-
-## Shared SQL normalization and commit authority
-
-Eligible autocommit relational normalization prepares owned packed rows outside
-writer admission and renders SQL postimages from that authority. The SQL request
-retains the authority until final mutation cleanup. Commit matches the exact row
-bytes and JSON-null provenance together with namespace/incarnation, schema and
-index-catalog witnesses before consuming it once. Normalization and RETURNING
-therefore do not require another row pack solely to commit the same values.
-Changed conflict postimages and unsupported preparation use the independently
-validated path. Active transaction sessions retain their existing session-owned
-staging rather than borrowing a shorter SQL request lifetime.
-
-Admission counters count physical entries: a SQL mutation can enter, release for
-CPU preparation, and re-enter to validate and publish. The slow-proof regression
-still requires one allocator proof capture and immediate subsequent reuse.
-Allocation-failure normalization cleanup and file-backed merge lookup are included
-in the default C API gate. The [current Debug receipt](shared-sql-authority-debug.json)
-records the full C API/native gates and SDK checks. Final optimized performance
-qualification remains separate.
+# Lite native publication architecture
+
+Lite's native transaction engine owns the durable checkpoint, recovery,
+allocator, snapshots and physical reclamation. Document changes and text-index
+activation share this engine; an index's metadata layer does not create a
+second physical durability domain.
+
+## Request ownership and admission
+
+Requests own parsed values, immutable schema/catalog views, prepared postimages,
+posting inputs and content proofs before entering the writer lane. Captured
+plans retain namespace/incarnation and relevant revision witnesses. Final
+admission checks those witnesses against current state. Predicates and transforms
+retain their ordinary atomic concurrency checks; an old prepared postimage
+cannot authorize a mutation of a changed document or recreated table.
+
+Queued publication requests form bounded cohorts before acquiring writer gates.
+Each member retains its own sequence, predicates and outcome. Unsupported cohort
+shapes use the ordinary ordered publication path. Cancellation before publication
+can refuse work; cancellation after a durable write cannot make the write
+retryable. A request's contention budget counts waiting rather than expensive
+proof or preparation work, and spans its admission handoffs.
+
+SQL normalization can retain an owned packed relational row authority. The final
+mutation reuses that authority only for exact key/value/JSON-null provenance,
+schema/layout and catalog witnesses. Conflict postimages that change those bytes
+require new preparation. SQL RETURNING does not require repacking the same row
+solely for commit. Session staging retains session-owned state; it never borrows
+a shorter SQL request allocation. Coordinated constraints and unsupported owned
+plans retain authoritative validation rather than weakening concurrency rules.
+
+## One durable primary and text publication
+
+New native-hosted text metadata uses transactional native namespaces. Immutable
+posting artifacts remain useful, but their activation, deletion metadata,
+projection progress and the primary change can join one native transaction.
+Existing metadata layouts retain conservative compatibility; creating an empty
+new root must never hide an existing index.
+
+A prepared native participant stages effects into the coordinator's transaction.
+It cannot independently commit or activate in-memory state. Exact index/source
+identities, deletion revisions, input fingerprints and segment-ID frontiers are
+checked before durable publication. All fallible preparation and replacement
+allocation precedes commit. In-memory activation follows durable success, with
+snapshot capture fenced across the durable-to-memory transition.
+
+Small prepared artifacts can join activation directly. Larger immutable artifacts
+use bounded unpublished construction leases before an admitted activation links
+them. A collision never authorizes replacing or deleting a foreign artifact.
+A possibly committed publication fences its runtime until fresh recovery
+reconciles the checkpoint; it does not report a retryable pre-commit refusal.
+
+Checked allocator ownership and publication proofs enable one synchronization
+boundary per native commit group. Unverified legacy state keeps its conservative
+barriers until authenticated. Recovery and failure injection rules are described
+in [native-commit-proofs.md](native-commit-proofs.md); removing a synchronization
+call without those proofs is not a valid optimization.
+
+## Posting windows independent of RPC boundaries
+
+Native text writes retain bounded, durable normalized posting deltas rather than
+forcing an FST build for every request. Readers can query these deltas directly.
+The window bounds document space, bytes and fragment count; freezing it produces
+an ordinary immutable posting segment. Tokenization and field/analyzer semantics
+are preserved, including non-English input.
+
+Primary document identities are assigned by the native transaction. Immutable
+posting bytes cannot substitute a guessed ordinal or retain an unstable buffer.
+Prepared value ownership and sealing bind those identities before publication.
+Old snapshots retain the exact posting and deletion state they captured.
+
+## Bounded asynchronous replay and credits
+
+Expensive consumers use ordered, seekable canonical journal chunks. Continuations
+select the next document family without decoding and sorting the entire original
+request again. A family's overwrite, deletion and artifact effects stay together.
+Consumer references identify shared canonical payloads instead of duplicating
+whole records for every consumer.
+
+Source completion and committed-effect progress are distinct. A producer can
+publish several output fragments before finishing a source record. Independent
+consumers must be able to consume those committed outputs, releasing finite
+output credits without waiting for the unfinished producer. Full visibility waits
+first fence source completion and then fence the resulting output cut.
+
+Reclamation uses the minimum required frontier for every relevant consumer lane.
+Repair and replacement readers retain their required lanes; failed catalog loads
+never authorize deletion. Advancing a cursor alone does not refund bytes. Credits
+return only after every required reference and physical retained payload has been
+deleted. Partial continuation accounting follows physical ownership rather than
+pretending a retained whole record is free.
+
+Text producer capacity is shared by the foreground and replay paths. The owned
+foreground plan checks the current per-index segment limit before capture and
+checks the actual replacement inventory again under final admission. Declining
+this optional fast path leaves the primary write and canonical journal intact.
+
+A detached replay producer reports a distinct capacity yield. The owner retains
+valid immutable inputs and runs the artifact service that restores headroom;
+it does not classify capacity as a stale-source failure and skip that service.
+A ready merge takes priority over another source attempt. Capacity yields do not
+mark the captured source target serviced or imply that replay has completed.
+
+Source preparation reads an independently retained immutable cut. It does not
+require an allocator proof for that obsolete cut to match a moving writer tip.
+The admitted publisher rebases and authenticates the current allocator before
+mutation. Legacy state retains its detached proof path.
+
+## Separate source work, artifact work and physical service
+
+Replay service has bounded producer and consumer turns. Optional idle maintenance,
+status publication and physical cleanup do not run merely because replay was
+requested. Unchanged advisory status does not require a timestamp-only commit.
+
+An exact covered-source witness can acknowledge a new already-covered text tip
+without reopening every table/index runtime. Metadata and control changes,
+unsupported index mixtures, pending replay, recovery debt or an audit deadline
+invalidate that shortcut. Immutable source/layout caches have explicit entry,
+byte, range and lifetime bounds and exact inode/value identity checks. They do
+not retain a mutable DB actor as though it were immutable.
+
+Physical service has independent deadlines and bounded retirement batches. It
+can reclaim eligible storage while writers remain active, rather than depending
+on a quiet period. Reader frontiers and artifact leases protect exact resources;
+semantic index generations do not change merely because an obsolete physical
+artifact was removed. Foreign allocator state is validated once and its verified
+ledger/digest can transfer to a replacement runtime under exact checkpoint checks.
+
+## Prepared background merges
+
+A merge captures immutable sources and deletion state under a short admitted
+checkpoint. Segment construction and private output staging run outside writer
+admission, with resource admission and lifecycle ownership independent of the
+foreground producer. Structural mutations and shutdown drain all admitted tasks,
+including manual assistance, before releasing their borrowed state.
+
+Ready publication uses a fresh admitted index inventory. It validates immutable
+source identities, preserves newer appended segments and adopts current deletion
+state. File-backed deletion coordinates are resolved outside admission. Final
+publication compares cumulative deletion witnesses and requests another lookup
+pass when necessary. Resolved source coordinates remain cached across re-adoption;
+read/allocation failures retain retry-safe ownership.
+
+Prepared linked readers retain their runtime through destruction. Native alias
+cleanup occurs while the required writer admission is held; private task disposal
+and worker joining occur after releasing the owner gate. A completed merge is
+scheduled before optional cleanup so unrelated maintenance cannot starve activation.
+
+## Snapshots, recovery and outcomes
+
+Snapshot protection uses durable inode-safe coordination identities, not an alias
+pathname assumption. Unsafe aliases retain conservative inode fencing. Bounded
+coordination component names support long database filenames; marker scans stat
+opened descriptors when directory enumeration cannot supply a type. Integrity
+and allocator inspection require metadata protection in addition to a data fence.
+
+Logical checkpoint identities survive publication and replacement correctly.
+Replacement/compaction generations cannot inherit an unrelated clean recovery
+witness. Paged DDL sweeps retain completion across pages, never skip a failed
+namespace check, and affected-namespace admission requires recovery even while
+background sweep work remains bounded.
+
+Pre-commit Busy means no mutation was applied. Post-commit visibility or repair
+failure preserves a committed/pending outcome and its receipt, including raw
+non-idempotent transforms. A cancelled admission sleep cannot re-enter the writer
+lane once more before reporting cancellation.
+
+## Qualification
+
+Component Debug receipts record the native, C API, ownership/fault and SDK gates.
+Performance acceptance requires the unchanged importer, retained logical-field
+parity, active namespace visibility, contended SQL/CLI readers, matched synchronous
+text visibility, and sustained active-write throughput and storage bounds. Idle
+shrink alone does not qualify reclamation. Retained reference receipts are reused;
+reference builds and workloads are not rerun for each candidate.
+
+Final optimized host results are recorded separately from Debug diagnostics and
+from externally owned aggregate CI and full factory qualification. Successful
+case databases are deleted after their dependent checks; receipts and hashes are
+retained rather than a database archive for every run.
+
+The optimized `66f0ff9d54` candidate failed live namespace visibility despite
+preserving acknowledged writes and passing integrity/reopen checks. Local
+reproduction exposed foreground segment fan-out bypassing replay's capacity
+limit and capacity refusal skipping the merge work needed to recover. The new
+capacity handoff passes deterministic lifecycle regressions and a 120-second
+Debug diagnostic with 45 idle namespaces; this does not qualify optimized
+end-to-end throughput. Final optimized qualification must run on the corrected
+candidate before the PR is ready.
+
+The [capacity handoff receipt](replay-capacity-debug.json) records the regressions,
+full Debug gates and diagnostic limits.
+
+Component receipts: [native namespaces](direct-native-namespaces-debug.json),
+[owned publication](owned-native-publication-debug.json),
+[publication service](owned-publication-service-debug.json),
+[primary content](owned-primary-content-debug.json),
+[consumer progress](publication-progress-debug.json),
+[posting windows](normalized-posting-tail-debug.json),
+[physical service](physical-service-debug.json),
+[owned relational rows](owned-relational-rows-debug.json),
+[prepared merges](prepared-merge-publication-debug.json), and
+[shared SQL authority](shared-sql-authority-debug.json).
