@@ -810,6 +810,15 @@ pub const HandleGuard = struct {
     /// waiting on its durability ticket outside the capi locks. `leave`
     /// reacquires both before doing its normal connection bookkeeping.
     writer_lane_released: bool = false,
+    /// True once this guard's entry was admitted through
+    /// `lite_connection.WriterLane.checkout` instead of the ordinary
+    /// `connection.acquire()`/`PathGate` dance: `path_lease` stays null
+    /// (the lane, not this guard, owns the lease) and both
+    /// `releaseWriterLaneBeforeWait` and `leaveWithRegistry` dispatch to
+    /// `WriterLane.checkin` instead of the per-call retain/handoff logic.
+    /// Set only on a successful mutation-intent entry to a writer-mode
+    /// connection; never set on a failed or pinned/read entry.
+    lane_managed: bool = false,
     /// Busy-wait budget left for this export call. The busy timeout bounds
     /// total admission waiting across every re-entry of one call (for
     /// example after inference), not each admission separately. Null means
@@ -821,6 +830,14 @@ pub const HandleGuard = struct {
     pub fn suspendQuery(self: *HandleGuard) void {
         const connection = self.connection orelse return;
         std.debug.assert(self.connection_gate_held and self.entry_error == null);
+        // A lane-managed guard (see `lane_managed`) never holds `path_lease`
+        // or `connection.gate.mutex` itself -- the code below unlocks the
+        // gate mutex unconditionally, which would be unlocking something
+        // this guard never locked. Mutation-intent guards are the only ones
+        // that can be lane-managed, and nothing on that path suspends a
+        // query today; this guards against a future caller doing so by
+        // mistake rather than silently corrupting the gate's ticket state.
+        std.debug.assert(!self.lane_managed);
         const root = connection.current.?;
         root.query_borrows += 1;
         self.suspended_query_root = root;
@@ -866,6 +883,21 @@ pub const HandleGuard = struct {
         // its own (through to attempting the gate/lease next).
         connection.mutex.unlock(io);
         self.writer_lane_released = true;
+        // A lane-managed guard (see `lane_managed`) never holds
+        // `connection.gate.mutex` or a per-call `path_lease` of its own --
+        // `WriterLane.checkout` already released the gate right after
+        // establishing/refreshing the lease, keeping it parked on the
+        // lane instead. Handing the parked lease to the next writer (or
+        // deciding it is time to sync and give it up for a remote waiter)
+        // is exactly what `checkin` does; none of the retain/handoff logic
+        // below (which assumes this guard itself holds the gate) applies.
+        if (self.lane_managed) {
+            const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
+            connection.owner.writer_lane.checkin(connection, store);
+            self.connection_gate_held = false;
+            if (comptime builtin.is_test) if (test_writer_lane_release_hook) |hook| hook.notify(hook.ptr);
+            return;
+        }
         // `connection.gate.mutex`, in contrast, is a ticket queue guarding
         // the kernel-level path lease: unlocking it tells the next ticket
         // holder "the lease is available for you now". That is only true
@@ -950,6 +982,30 @@ pub const HandleGuard = struct {
             return;
         }
         if (guard.connection) |connection| {
+            if (guard.lane_managed) {
+                // This guard never held `connection.gate.mutex` or a
+                // per-call `path_lease` of its own -- `WriterLane.checkout`
+                // /`checkin` own the kernel lease's lifetime instead (see
+                // `lane_managed`'s doc comment), so none of the retain/
+                // handoff bookkeeping below (which assumes this guard
+                // itself holds the gate) applies. All that is left here:
+                // finish the lane handoff if this call never released
+                // early (no hook called `releaseWriterLaneBeforeWait` --
+                // a non-hook write, or one that failed before staging),
+                // the same notifyMutation bookkeeping every write does,
+                // and `connection.mutex`, already dropped if release did run.
+                if (!guard.writer_lane_released) {
+                    const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
+                    connection.owner.writer_lane.checkin(connection, store);
+                }
+                if (guard.entry_error == null) {
+                    if (connection.current) |root| {
+                        if (root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != guard.entry_sequence) connection.notifyMutation();
+                    }
+                }
+                if (!guard.writer_lane_released) connection.mutex.unlock(io);
+                return;
+            }
             // WS3: once `releaseWriterLaneBeforeWait` has run,
             // `connection.mutex` is already unlocked -- this call must not
             // unlock it again below, and critically must not try to lock it
@@ -1215,17 +1271,37 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
         // proving the allocator. Its first lease try must still be allowed;
         // only contention waits consult the deadline. The retry loop checks
         // expiry before starting a new attempt after backoff.
-        if (!pinned) {
-            guard.path_lease = connection.acquire() catch |err| {
+        //
+        // WS3 writer lane: a non-pinned, mutation-intent entry to a
+        // writer-mode connection funnels through `WriterLane.checkout`
+        // instead of `connection.acquire()`/`PathGate` directly, so
+        // back-to-back same-Store writers (even across different
+        // Connections -- see `Owner.writer_lane`) share the kernel lease
+        // instead of each re-acquiring and re-queueing for it. Everything
+        // else (pinned access, reads, and non-writer-mode connections)
+        // keeps the original per-call gate/lease.
+        const lane_eligible = !pinned and intent == .mutation and liteOpenModeCanWrite(connection.options.open_mode);
+        var root: *Handle = undefined;
+        if (lane_eligible) {
+            root = connection.owner.writer_lane.checkout(connection, intent) catch |err| {
                 guard.entry_error = capi.mapError(err);
                 return guard;
             };
-        } else connection.gate.mutex.lockUncancelable(handleLockIo());
-        guard.connection_gate_held = true;
-        const root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease, intent)) catch |err| {
-            guard.entry_error = capi.mapError(err);
-            return guard;
-        };
+            guard.lane_managed = true;
+            guard.connection_gate_held = true;
+        } else {
+            if (!pinned) {
+                guard.path_lease = connection.acquire() catch |err| {
+                    guard.entry_error = capi.mapError(err);
+                    return guard;
+                };
+            } else connection.gate.mutex.lockUncancelable(handleLockIo());
+            guard.connection_gate_held = true;
+            root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease, intent)) catch |err| {
+                guard.entry_error = capi.mapError(err);
+                return guard;
+            };
+        }
         guard.handle = root;
         if (pinned) {
             // Fetch/close may release the final segment reader and invoke its
@@ -10480,21 +10556,24 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     // same-process caller could enter immediately.
     const connection_mutex_free = connection.mutex.tryLock();
     if (connection_mutex_free) connection.mutex.unlock(handleLockIo());
-    // The path gate's lease mutex, in contrast, is deliberately *not*
-    // released here: with no other same-process thread registered to take
-    // the lease over (`QueuedMutex.retainForWaiter`), this writer still
-    // holds the actual kernel-level lease, so releasing the gate mutex
-    // would let an unrelated queued ticket holder believe it is free and
-    // block on a kernel futex this writer has not released -- the
-    // priority inversion `releaseWriterLaneBeforeWait` is written to
-    // avoid. Record it only as a diagnostic, not an assertion.
+    // The path gate's lease mutex is also free here, unlike before the
+    // writer lane existed: `WriterLane.checkout` already released
+    // `connection.gate.mutex` right after establishing/refreshing the
+    // kernel lease, well before this call ever reached
+    // `releaseWriterLaneBeforeWait` -- the lane, not this one call, owns
+    // the lease from then on, so there is nothing left on `PathGate` for
+    // this guard to hold across the durability wait at all. A same-Store
+    // writer that arrives while this one is parked here never touches
+    // `PathGate` either (it polls the lane directly), so gate.mutex being
+    // free carries no priority-inversion risk the way it would have under
+    // the old per-call retain/handoff design.
     const gate_mutex_free = connection.gate.mutex.tryLock();
     if (gate_mutex_free) connection.gate.mutex.unlock(handleLockIo());
     probe.proceed.set(handleLockIo());
     thread.join();
 
     try std.testing.expect(connection_mutex_free);
-    try std.testing.expect(!gate_mutex_free);
+    try std.testing.expect(gate_mutex_free);
     try std.testing.expectEqual(capi.ErrorCode.ok, writer.code);
 }
 
