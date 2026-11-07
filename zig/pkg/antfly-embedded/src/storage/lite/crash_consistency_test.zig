@@ -1176,6 +1176,83 @@ fn runGraphAddIndexMidScenario(allocator: Allocator, path: []const u8, io: std.I
     }, .sync_level = .full_index });
 }
 
+/// Crash-sweep coverage for the graph metric-build pipeline's §3.2a
+/// ride-along conversion (lease acquire/prepare/scan/reduce/publish/cleanup
+/// pages: `graph/graph.zig`'s background call sites now open through
+/// `beginWriteReverseBatchWithOptions(.{ .durability = .ride_along })`
+/// instead of a plain `beginBatch()`).
+///
+/// Admits the graph index with NO metrics in its `config_json` (exactly
+/// `runGraphAddIndexMidScenario`'s own proven-safe shape) and only attaches
+/// `metric_configs` to the already-admitted `GraphIndex` directly,
+/// reaching through `handle.db.core.graphIndex(...)`. Declaring metrics
+/// *at admission time* (`config_json`'s `"metrics"` key) was tried first
+/// and found to hit a pre-existing, unrelated bug: it calls
+/// `notifyGraphMetricConfiguration`, which races the admission commit's own
+/// follow-up native-catalog work and nondeterministically surfaces as
+/// `UnexpectedNativePageKind` or `InvalidNativeAllocator` -- reproduces
+/// identically with the §3.2a ride-along conversion reverted, and
+/// independently of `start_index_workers`, so it is a pre-existing
+/// admission/managed-admission-materialization defect, not something this
+/// change introduced or is positioned to fix. See the handback's
+/// graph-crash-scenario note.
+///
+/// `GraphIndex.runGraphMetric` then drives a build synchronously to
+/// completion on the calling thread, through the very call sites this
+/// change converted, interleaved with ordinary acknowledged edge writes --
+/// the sweep crashes mid-build as often as mid-write. Every one of those
+/// background commits may be lost at a crash -- recomputable from durable
+/// progress, same as any other row in §3.2a's ride-along table -- but
+/// every acknowledged edge write (`sync_level = .full_index`) must
+/// survive, and the reverse index must stay consistent with forward
+/// adjacency: `graph_edge_after`/`assertGraphEdgeConsistent`, same
+/// contract as `runGraphAddIndexMidScenario`. One metric (`degree`) keeps
+/// this scenario's own barrier count close to the other scenarios in this
+/// file -- a build with two metrics and two write/rebuild rounds was tried
+/// first and, past roughly 40 barriers, started tripping an unrelated,
+/// pre-existing `InvalidNativeAllocator`/`UnexpectedNativePageKind`
+/// flakiness that reproduces with no graph or metric involvement at all
+/// (plain `openDbWithIo` + `runUntilIdle` alone, graph.zig fully
+/// reverted); see the handback's graph-crash-scenario note.
+fn runGraphMetricBuildWithCrashScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed body", .searchable_after = "seed" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .full_text });
+
+    try handle.db.addIndex(.{
+        .name = "gr_metric_idx",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    const metrics = [_]graph_mod.GraphMetricConfig{
+        .{ .name = "degree", .kind = .degree, .refresh = .manual },
+    };
+    const entry = handle.db.core.graphIndex("gr_metric_idx") orelse return error.CrashConsistencyMissingGraphIndex;
+    entry.index.metric_configs = &metrics;
+
+    try checkpoints.append(allocator, .{ .expectations = &.{
+        .{
+            .key = "node-a",
+            .before = null,
+            .after = "node-a-marker",
+            .graph_edge_after = .{ .index_name = "gr_metric_idx", .edge_type = "links", .target = "node-b" },
+        },
+        .{ .key = "node-b", .before = null, .after = "node-b-marker" },
+    } });
+    try handle.db.batch(.{ .writes = &.{
+        .{ .key = "node-a", .value = "{\"marker\":\"node-a-marker\",\"_edges\":{\"gr_metric_idx\":{\"links\":[{\"target\":\"node-b\",\"weight\":1.0}]}}}" },
+        .{ .key = "node-b", .value = "{\"marker\":\"node-b-marker\"}" },
+    }, .sync_level = .full_index });
+
+    // Drive the metric build synchronously to completion through its
+    // ride-along commits, still inside the sweep's fault-injected window.
+    var status = try entry.index.runGraphMetric("degree");
+    status.deinit(allocator);
+}
+
 test "crash sweep: primary single doc" {
     var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-single-doc", .run = runPrimarySingleDoc }, .{});
     defer report.deinit();
@@ -1549,6 +1626,18 @@ test "crash sweep: graph add-index mid-scenario" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "graph-add-index-mid-scenario",
         .run = runGraphAddIndexMidScenario,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: graph metric build and compaction mid-scenario" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "graph-metric-build-mid-scenario",
+        .run = runGraphMetricBuildWithCrashScenario,
         .via_db = true,
         .search_index = "body_text",
         .search_field = "body",
