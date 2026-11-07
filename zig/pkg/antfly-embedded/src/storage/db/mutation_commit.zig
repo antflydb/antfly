@@ -159,6 +159,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const prepareInlineSparsePublication = S.prepareInlineSparsePublication;
         const InlineDensePublication = S.InlineDensePublication;
         const prepareInlineDensePublication = S.prepareInlineDensePublication;
+        const InlineAlgebraicPublication = S.InlineAlgebraicPublication;
+        const prepareInlineAlgebraicPublication = S.prepareInlineAlgebraicPublication;
         const attachPreparedUpsertDocumentProjections = S.attachPreparedUpsertDocumentProjections;
         const augmentExtractedWriteWithGraphFieldEdges = S.augmentExtractedWriteWithGraphFieldEdges;
         const augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed = S.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed;
@@ -3657,6 +3659,49 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     inline_dense_publication = null;
                 }
             }
+            // Algebraic workstream: single-commit write path for algebraic
+            // indexes. Unlike full_text, algebraic facts already live in the
+            // primary DocStore (no separate storage backend to migrate), so
+            // the gate here only needs to match the sync level that actually
+            // forces synchronous algebraic visibility: `syncLevelRequiresDerivedVisibility`
+            // below is false for `.enrichments`, so only `.full_index` ever
+            // reaches the untargeted `applyDerivedBatchProfiled` fallback
+            // this is short-circuiting (see that call site further down).
+            // Prepared only up to whatever room is left in `commit_participants`
+            // after `authored_acceptance`/text above -- a publication that
+            // cannot get a slot is aborted immediately (not left prepared)
+            // and simply falls back to the existing non-inline path for that
+            // one index; it must never turn a write that would otherwise
+            // succeed into a failure.
+            var inline_algebraic_publications: [2]?*InlineAlgebraicPublication = @splat(null);
+            var inline_algebraic_handled_names: [2][]const u8 = undefined;
+            var inline_algebraic_publication_count: usize = 0;
+            defer for (inline_algebraic_publications[0..inline_algebraic_publication_count]) |maybe_prepared| {
+                if (maybe_prepared) |prepared| prepared.abort();
+            };
+            if (append_derived_replay and effective_req.sync_level == .full_index and
+                !S.ownerField(self, "executor").*.hasWorkers() and materialized_derived_batch != null)
+            {
+                for (sync_targets.all_indexes) |target_name| {
+                    if (inline_algebraic_publication_count >= inline_algebraic_publications.len) break;
+                    if (commit_participants.len >= @import("../commit_participant.zig").List.max_participants) break;
+                    const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = target_name, .kind = .algebraic };
+                    const prepared = prepareInlineAlgebraicPublication(
+                        S.ownerField(self, "alloc").*,
+                        S.ownerField(self, "core").*.store,
+                        S.ownerField(self, "core").*.index_manager,
+                        materialized_derived_batch.?,
+                        index_ref,
+                    ) catch continue;
+                    commit_participants.append(prepared.participant()) catch {
+                        prepared.abort();
+                        break;
+                    };
+                    inline_algebraic_publications[inline_algebraic_publication_count] = prepared;
+                    inline_algebraic_handled_names[inline_algebraic_publication_count] = target_name;
+                    inline_algebraic_publication_count += 1;
+                }
+            }
             const combined_commit_participant: ?@import("../commit_participant.zig").Participant =
                 if (commit_participants.len != 0) commit_participants.participant() else null;
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -3899,6 +3944,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
                 }
             }
+            // Same durability boundary as the inline text publications just
+            // above, for the algebraic ones.
+            for (inline_algebraic_publications[0..inline_algebraic_publication_count], 0..) |maybe_prepared, i| {
+                if (maybe_prepared) |prepared| {
+                    prepared.install();
+                    inline_algebraic_publications[i] = null;
+                }
+            }
             snapshot_mutation.release();
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
@@ -4027,8 +4080,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (sync_targets.all_indexes.len != 0) {
                             try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.all_indexes, profile);
                         }
-                    } else {
+                    } else if (inline_algebraic_publication_count == 0) {
                         try applyDerivedBatchProfiled(self, materialized_derived_batch.?, profile);
+                    } else {
+                        // Algebraic workstream: every index already published
+                        // inline above (same native transaction as the primary
+                        // commit, already installed above) must not also run
+                        // through this post-commit path -- that would re-apply
+                        // it a second time, same as the full_text case above.
+                        var remaining_targets = std.ArrayListUnmanaged([]const u8).empty;
+                        defer remaining_targets.deinit(S.ownerField(self, "alloc").*);
+                        remaining: for (sync_targets.all_indexes) |target_name| {
+                            for (inline_algebraic_handled_names[0..inline_algebraic_publication_count]) |handled_name| {
+                                if (std.mem.eql(u8, handled_name, target_name)) continue :remaining;
+                            }
+                            try remaining_targets.append(S.ownerField(self, "alloc").*, target_name);
+                        }
+                        if (remaining_targets.items.len != 0) {
+                            try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, remaining_targets.items, profile);
+                        }
                     }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.derived_apply_ns, derived_apply_start_ns);
                 }
