@@ -594,45 +594,62 @@ pub const Backend = struct {
             return .{ .key = entry.key, .value = entry.value };
         }
 
-        fn forward(self: *@This(), found: ?ordered.Entry) !backend_adapter.Entry {
-            const entry = found orelse return error.NotFound;
-            if (!sameNamespace(entry.name, self.namespace.name)) return error.NotFound;
+        // `?Entry` (null at the end), not `error.NotFound`: this concrete
+        // `Cursor` is reachable two ways -- through `backend_erased.
+        // Cursor`'s own bridge (`backend_erased.zig`'s `cursorFrom`), which
+        // already normalizes either convention into `?Entry` at ITS
+        // boundary and tolerates this one unchanged (its `catch |err| if
+        // (err == error.NotFound) return null` simply never triggers
+        // anymore), and directly, unerased, through `Backend.boundWrite`
+        // for an inline publication harvesting `pendingMutations()` before
+        // ever committing (`graph/graph.zig`'s `prepareInlineEdgePublication`,
+        // `sparse/sparse.zig`'s `prepareInlineSparsePublication`). The
+        // latter passes this transaction into generic `txn: anytype`
+        // helpers written against `backend_erased.Cursor`'s own `?Entry`
+        // convention (every other caller of those helpers only ever reaches
+        // them through that erased wrapper), so returning `error.NotFound`
+        // here instead of `null` was a latent type mismatch, invisible
+        // until a caller's cursor-using code was first instantiated
+        // against this concrete, unerased type.
+        fn forward(self: *@This(), found: ?ordered.Entry) !?backend_adapter.Entry {
+            const entry = found orelse return null;
+            if (!sameNamespace(entry.name, self.namespace.name)) return null;
             return entryOf(entry);
         }
 
-        pub fn first(self: *@This()) !backend_adapter.Entry {
+        pub fn first(self: *@This()) !?backend_adapter.Entry {
             return self.forward(try self.inner.seekAtOrAfter(self.tree, self.namespace.name, ""));
         }
 
-        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !backend_adapter.Entry {
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
             return self.forward(try self.inner.seekAtOrAfter(self.tree, self.namespace.name, key));
         }
 
-        pub fn next(self: *@This()) !backend_adapter.Entry {
+        pub fn next(self: *@This()) !?backend_adapter.Entry {
             return self.forward(try self.inner.next());
         }
 
-        pub fn last(self: *@This()) !backend_adapter.Entry {
+        pub fn last(self: *@This()) !?backend_adapter.Entry {
             var found = try self.inner.last(self.tree);
             while (found) |entry| {
                 switch (namespaceOrder(entry.name, self.namespace.name)) {
                     .eq => return entryOf(entry),
                     .gt => found = try self.inner.prev(),
-                    .lt => return error.NotFound,
+                    .lt => return null,
                 }
             }
-            return error.NotFound;
+            return null;
         }
 
-        pub fn prev(self: *@This()) !backend_adapter.Entry {
-            const entry = (try self.inner.prev()) orelse return error.NotFound;
-            if (!sameNamespace(entry.name, self.namespace.name)) return error.NotFound;
+        pub fn prev(self: *@This()) !?backend_adapter.Entry {
+            const entry = (try self.inner.prev()) orelse return null;
+            if (!sameNamespace(entry.name, self.namespace.name)) return null;
             return entryOf(entry);
         }
 
-        pub fn seekAtOrBefore(self: *@This(), key: []const u8) !backend_adapter.Entry {
-            const entry = (try self.inner.seekAtOrBefore(self.tree, self.namespace.name, key)) orelse return error.NotFound;
-            if (!sameNamespace(entry.name, self.namespace.name)) return error.NotFound;
+        pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            const entry = (try self.inner.seekAtOrBefore(self.tree, self.namespace.name, key)) orelse return null;
+            if (!sameNamespace(entry.name, self.namespace.name)) return null;
             return entryOf(entry);
         }
     };
