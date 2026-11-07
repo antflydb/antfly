@@ -139,10 +139,40 @@ const SpinMutex = struct {
 /// Generic fault-injecting `std.Io` wrapper. Heap-allocate with `init` (the
 /// returned pointer must stay stable for the lifetime of any `Io` value
 /// handed out by `io()`) and free with `deinit`.
+/// Process-wide, monotonically increasing identity for every `SimIo`
+/// instance ever created, independent of the `registry` below (which can
+/// only ever name the *current* occupant of a given real `userdata` slot).
+/// Diagnostic logging keys on this id -- not on the `*SimIo` pointer, which
+/// `allocator.destroy` can and does hand straight back out to the next
+/// `init` -- so a log line from a call that fires *after* its own `SimIo`
+/// was `deinit`'d is unambiguous evidence of a leaked caller (most likely a
+/// background worker thread that outlived `DB.close()`) racing a later
+/// sub-run's fresh instance instead of a coincidence of pointer reuse.
+var next_sim_io_id: std.atomic.Value(u64) = .init(1);
+
+/// Toggle for the verbose per-fault/lifecycle diagnostic log lines below.
+/// Off by default so ordinary test runs stay quiet; crash-sweep callers that
+/// are specifically hunting cross-sub-run state leaks flip this on for the
+/// duration of their own run.
+pub var debug_log: bool = false;
+
+fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    if (!debug_log) return;
+    std.debug.print("[sim_io] " ++ fmt ++ "\n", args);
+}
+
 pub const SimIo = struct {
     allocator: Allocator,
     real: Io,
     vtable: Io.VTable,
+
+    /// Stable across this instance's whole lifetime; see `next_sim_io_id`.
+    id: u64 = 0,
+    /// Caller-supplied label (e.g. scenario name + barrier/when/power_loss),
+    /// purely for log readability; set via `setRunLabel` right after
+    /// `init`. Not owned -- callers must keep it alive for this `SimIo`'s
+    /// lifetime (a comptime/static string is simplest).
+    run_label: []const u8 = "",
 
     /// fd (File or Dir handle, both `std.posix.fd_t`) -> logical path. Paths
     /// are exactly the strings callers passed to `dirCreateFile`/`dirOpenFile`
@@ -214,6 +244,7 @@ pub const SimIo = struct {
             .allocator = allocator,
             .real = real,
             .vtable = real.vtable.*,
+            .id = next_sim_io_id.fetchAdd(1, .monotonic),
         };
         self.vtable.dirCreateFile = vtDirCreateFile;
         self.vtable.dirOpenFile = vtDirOpenFile;
@@ -223,10 +254,17 @@ pub const SimIo = struct {
         self.vtable.dirRenamePreserve = vtDirRenamePreserve;
         self.vtable.fileWritePositional = vtFileWritePositional;
         try registerSelf(real.userdata, self);
+        debugLog("init id={d} thread={d} userdata={*}", .{ self.id, std.Thread.getCurrentId(), real.userdata });
         return self;
     }
 
+    /// Caller-supplied label for log readability only; see `run_label`.
+    pub fn setRunLabel(self: *SimIo, label: []const u8) void {
+        self.run_label = label;
+    }
+
     pub fn deinit(self: *SimIo) void {
+        debugLog("deinit id={d} label={s} thread={d} barriers={d}", .{ self.id, self.run_label, std.Thread.getCurrentId(), self.barriers.items.len });
         unregisterSelf(self.real.userdata);
         const a = self.allocator;
         var handle_it = self.handle_paths.valueIterator();
@@ -349,6 +387,7 @@ pub const SimIo = struct {
         if (plan.when != .before) return false;
         self.crashed = true;
         self.crash_barrier = self.barriers.items[self.barriers.items.len - 1];
+        debugLog("crash-before id={d} label={s} thread={d} barrier={d} kind={s} path={s}", .{ self.id, self.run_label, std.Thread.getCurrentId(), sequence, @tagName(kind), path });
         return true;
     }
 
@@ -357,6 +396,7 @@ pub const SimIo = struct {
         if (plan.at_barrier != sequence or plan.when != .after) return false;
         self.crashed = true;
         self.crash_barrier = self.barrierAt(sequence);
+        debugLog("crash-after id={d} label={s} thread={d} barrier={d}", .{ self.id, self.run_label, std.Thread.getCurrentId(), sequence });
         return true;
     }
 
@@ -466,6 +506,23 @@ var registry_allocator: Allocator = std.heap.page_allocator;
 fn registerSelf(real_userdata: ?*anyopaque, self: *SimIo) !void {
     registry_mutex.lock();
     defer registry_mutex.unlock();
+    // A still-registered entry here means the previous `SimIo` for this
+    // same real `userdata` was never `unregisterSelf`'d before this new one
+    // takes its place -- i.e. its owning sub-run's `deinit` has not run yet
+    // (most likely because a background worker thread from that sub-run's
+    // `DB` outlived `DB.close()` and is still mid-flight). `put` would
+    // silently clobber that stale entry; log it unconditionally (not
+    // gated behind `debug_log`) because any later vtable call the leaked
+    // caller makes will be misattributed to *this* new instance instead of
+    // erroring loudly, which is exactly the cross-sub-run state leak this
+    // instrumentation exists to catch.
+    const existing = registry.get(real_userdata);
+    if (existing) |stale| {
+        std.debug.print(
+            "[sim_io] WARNING registerSelf id={d} label={s} thread={d} userdata={*} clobbers still-registered id={d} label={s} -- that sub-run's deinit has not run; a leaked caller will misattribute future calls to this new instance\n",
+            .{ self.id, self.run_label, std.Thread.getCurrentId(), real_userdata, stale.id, stale.run_label },
+        );
+    }
     try registry.put(registry_allocator, real_userdata, self);
 }
 
@@ -502,11 +559,13 @@ fn maybeInjectIoFault(self: *SimIo, kind: IoFaultKind) ?anyerror {
     if (count < plan.at_op) return null;
     if (count > plan.at_op and !plan.repeat) return null;
     if (!plan.repeat) self.io_fault_plan = null;
+    debugLog("io-fault id={d} label={s} thread={d} kind={s} op={d} err={s}", .{ self.id, self.run_label, std.Thread.getCurrentId(), @tagName(kind), count, @errorName(plan.err) });
     return plan.err;
 }
 
 fn vtDirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: Dir.CreateFileOptions) File.OpenError!File {
     const self = selfFrom(userdata);
+    debugLog("dirCreateFile id={d} label={s} thread={d} path={s}", .{ self.id, self.run_label, std.Thread.getCurrentId(), sub_path });
     if (maybeInjectIoFault(self, .create)) |err| return @errorCast(err);
     const delay_ns = simDelayNs(self);
     if (delay_ns != 0) std.Io.sleep(self.real, .fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
@@ -519,6 +578,7 @@ fn vtDirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: 
 
 fn vtDirOpenFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: Dir.OpenFileOptions) File.OpenError!File {
     const self = selfFrom(userdata);
+    debugLog("dirOpenFile id={d} label={s} thread={d} path={s}", .{ self.id, self.run_label, std.Thread.getCurrentId(), sub_path });
     const delay_ns = simDelayNs(self);
     if (delay_ns != 0) std.Io.sleep(self.real, .fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
     const file = try self.real.vtable.dirOpenFile(self.real.userdata, dir, sub_path, opts);
@@ -545,6 +605,7 @@ fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
     if (maybeInjectIoFault(self, .sync)) |err| return @errorCast(err);
 
     self.mutex.lock();
+    if (debug_log) debugLog("fileSync id={d} label={s} thread={d} path={s}", .{ self.id, self.run_label, std.Thread.getCurrentId(), self.pathOf(file.handle) });
     const path = self.allocator.dupe(u8, self.pathOf(file.handle)) catch {
         self.mutex.unlock();
         return error.InputOutput;
