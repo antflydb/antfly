@@ -1,0 +1,1712 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "description": "Public stored view over raw document paths and typed SQL arrays",
+    "schema": {
+      "version": 1,
+      "storage_mode": "document",
+      "default_type": "doc",
+      "document_schemas": {
+        "doc": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "metrics": {
+                "type": "object"
+              },
+              "flags": {
+                "type": "object"
+              },
+              "tags": {
+                "type": "array",
+                "nullable": true
+              },
+              "note": {
+                "type": "keyword",
+                "nullable": true
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "doc:a",
+        "value": {
+          "title": "alpha",
+          "status": "active",
+          "metadata": {
+            "plan": "pro",
+            "region": "west",
+            "billing": {},
+            "flags": []
+          },
+          "metrics": {
+            "score": 60
+          },
+          "flags": {
+            "published": true
+          },
+          "tags": [
+            "urgent",
+            null,
+            "vip"
+          ],
+          "note": "first"
+        }
+      },
+      {
+        "key": "doc:b",
+        "value": {
+          "title": "beta",
+          "status": "active",
+          "metadata": {
+            "plan": "pro",
+            "region": "west-coast"
+          },
+          "metrics": {
+            "score": 20
+          },
+          "flags": {
+            "published": false
+          },
+          "tags": [
+            "vip",
+            "stale"
+          ],
+          "note": "second"
+        }
+      },
+      {
+        "key": "doc:c",
+        "value": {
+          "title": "gamma",
+          "status": "active",
+          "metadata": {
+            "plan": "free",
+            "region": "east"
+          },
+          "metrics": {
+            "score": 15
+          },
+          "flags": {
+            "published": true
+          },
+          "tags": [],
+          "note": null
+        }
+      },
+      {
+        "key": "doc:d",
+        "value": {
+          "title": "delta",
+          "status": "draft",
+          "metadata": {
+            "plan": "team",
+            "region": null
+          },
+          "metrics": {
+            "score": 10
+          },
+          "flags": {
+            "published": false
+          },
+          "tags": null,
+          "note": null
+        }
+      },
+      {
+        "key": "doc:e",
+        "value": {
+          "title": "epsilon",
+          "status": "active",
+          "metadata": {},
+          "metrics": {},
+          "flags": {
+            "published": false
+          },
+          "tags": [
+            "archived"
+          ],
+          "note": "other"
+        }
+      },
+      {
+        "key": "doc:f",
+        "value": {
+          "title": "zeta",
+          "status": "active",
+          "metadata": {
+            "plan": "pro",
+            "region": "internal"
+          },
+          "metrics": {},
+          "flags": {
+            "published": true
+          },
+          "tags": [
+            "urgent"
+          ],
+          "note": "last"
+        }
+      }
+    ],
+    "view_sql": "CREATE VIEW support_view AS SELECT d._id,r.title AS title_text,r.status,r.metadata->>'plan' AS plan,r.metadata->>'region' AS region,(r.metrics->>'score')::numeric AS score,(r.flags->>'published')::boolean AS published,r.tags AS tag_list,r.metadata,r.note FROM docs d CROSS JOIN LATERAL jsonb_to_record(d._doc) AS r(title TEXT,status TEXT,metadata JSONB,metrics JSONB,flags JSONB,tags TEXT[],note TEXT)"
+  },
+  "entries": [
+    {
+      "id": "sql-0797",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0798",
+      "columns": [
+        "_id",
+        "plan",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:f",
+          "pro",
+          null
+        ],
+        [
+          "doc:a",
+          "pro",
+          "60"
+        ],
+        [
+          "doc:b",
+          "pro",
+          "20"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          true
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan, score FROM support_view WHERE plan = 'pro' ORDER BY score DESC LIMIT 3"
+    },
+    {
+      "id": "sql-0799",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 5"
+    },
+    {
+      "id": "sql-0800",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "60"
+        ],
+        [
+          "doc:b",
+          "20"
+        ],
+        [
+          "doc:c",
+          "15"
+        ],
+        [
+          "doc:d",
+          "10"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, score FROM support_view WHERE score >= 10 LIMIT 5"
+    },
+    {
+      "id": "sql-0802",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:d",
+          "team"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE plan IN ('pro', 'team') LIMIT 5"
+    },
+    {
+      "id": "sql-0803",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:e",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE plan IS NULL LIMIT 5"
+    },
+    {
+      "id": "sql-0804",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:c",
+          "free"
+        ],
+        [
+          "doc:d",
+          "team"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE plan IS NOT NULL LIMIT 5"
+    },
+    {
+      "id": "sql-0805",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "60"
+        ],
+        [
+          "doc:b",
+          "20"
+        ],
+        [
+          "doc:c",
+          "15"
+        ],
+        [
+          "doc:d",
+          "10"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, score FROM support_view WHERE score >= 10 LIMIT 5"
+    },
+    {
+      "id": "sql-0806",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:b",
+          "20"
+        ],
+        [
+          "doc:c",
+          "15"
+        ],
+        [
+          "doc:d",
+          "10"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, score FROM support_view WHERE score BETWEEN 10 AND 20 LIMIT 5"
+    },
+    {
+      "id": "sql-0807",
+      "columns": [
+        "_id",
+        "title_text"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "alpha"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, title_text FROM support_view WHERE title_text = 'alpha' LIMIT 5"
+    },
+    {
+      "id": "sql-0808",
+      "columns": [
+        "_id",
+        "published"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          true
+        ],
+        [
+          "doc:c",
+          true
+        ],
+        [
+          "doc:f",
+          true
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        16
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, published FROM support_view WHERE published IS TRUE LIMIT 5"
+    },
+    {
+      "id": "sql-0809",
+      "columns": [
+        "_id",
+        "region"
+      ],
+      "rows": [
+        [
+          "doc:d",
+          null
+        ],
+        [
+          "doc:e",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, region FROM support_view WHERE region IS NULL LIMIT 5"
+    },
+    {
+      "id": "sql-0810",
+      "columns": [
+        "_id",
+        "title_text",
+        "plan",
+        "score",
+        "published",
+        "region"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "alpha",
+          "pro",
+          "60",
+          true,
+          "west"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        25,
+        1700,
+        16,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, title_text, plan, score, published, region FROM support_view WHERE region = 'west' LIMIT 5"
+    },
+    {
+      "id": "sql-0811",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10"
+    },
+    {
+      "id": "sql-0812",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10"
+    },
+    {
+      "id": "sql-0813",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d CROSS JOIN LATERAL UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10"
+    },
+    {
+      "id": "sql-0815",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "stale"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag > 'm' LIMIT 10"
+    },
+    {
+      "id": "sql-0816",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NULL LIMIT 10"
+    },
+    {
+      "id": "sql-0817",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "stale"
+        ],
+        [
+          "doc:e",
+          "archived"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IS NOT NULL LIMIT 10"
+    },
+    {
+      "id": "sql-0818",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "stale"
+        ],
+        [
+          "doc:e",
+          "archived"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag <> 'urgent' LIMIT 10"
+    },
+    {
+      "id": "sql-0819",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "vip"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag NOT IN ('stale', 'archived') LIMIT 10"
+    },
+    {
+      "id": "sql-0820",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "vip"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag LIKE 'v%' LIMIT 10"
+    },
+    {
+      "id": "sql-0821",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "vip"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag ILIKE 'V%' LIMIT 10"
+    },
+    {
+      "id": "sql-0822",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' AND tag <> 'stale' LIMIT 10"
+    },
+    {
+      "id": "sql-0823",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IN ('urgent', 'vip') AND tag NOT IN ('vip') LIMIT 10"
+    },
+    {
+      "id": "sql-0836",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:c",
+          "free"
+        ],
+        [
+          "doc:d",
+          "team"
+        ],
+        [
+          "doc:e",
+          null
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view"
+    },
+    {
+      "id": "sql-0837",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:f",
+          "pro"
+        ],
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' ORDER BY score DESC"
+    },
+    {
+      "id": "sql-0857",
+      "columns": [
+        "_id",
+        "plan_lower"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT _id, lower(plan) AS plan_lower FROM support_view WHERE plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0866",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "60"
+        ],
+        [
+          "doc:b",
+          "60"
+        ],
+        [
+          "doc:f",
+          "60"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, latest.score FROM support_view AS d JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score > 0 ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0872",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          null
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0873",
+      "columns": [
+        "_id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          null
+        ],
+        [
+          "doc:b",
+          "pro"
+        ],
+        [
+          "doc:f",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0874",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "60"
+        ],
+        [
+          "doc:b",
+          "60"
+        ],
+        [
+          "doc:f",
+          "60"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score = 60 ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0875",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          null
+        ],
+        [
+          "doc:b",
+          null
+        ],
+        [
+          "doc:f",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0876",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          null
+        ],
+        [
+          "doc:b",
+          null
+        ],
+        [
+          "doc:f",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC, s.plan ASC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0877",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          null
+        ],
+        [
+          "doc:b",
+          null
+        ],
+        [
+          "doc:f",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.plan ASC, s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10"
+    },
+    {
+      "id": "sql-0878",
+      "columns": [
+        "_id",
+        "score"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "60"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.note = d.note LIMIT 1) AS latest ON true WHERE d._id = 'doc:a' LIMIT 10"
+    },
+    {
+      "id": "sql-0879",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d LEFT JOIN LATERAL UNNEST(d.tag_list) AS tag ON true WHERE tag = 'urgent' LIMIT 10"
+    },
+    {
+      "id": "sql-0880",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:f",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM support_view AS d JOIN LATERAL UNNEST(d.tag_list) AS tag ON tag = 'urgent' LIMIT 10"
+    }
+  ]
+}

@@ -17,6 +17,7 @@
 //! selection and server provenance interpretation belong to ingress adapters.
 const types = @import("types.zig");
 pub const Batch = struct {
+    index_owner_control: ?@import("relational_index_owner_control.zig").Frame = null,
     request: types.BatchRequest,
     receipt: Receipt = .none,
     pub const Receipt = union(enum) {

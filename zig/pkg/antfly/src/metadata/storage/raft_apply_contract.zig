@@ -113,6 +113,10 @@ pub const StandaloneCatalogUpdate = struct {
     /// An exact physical-root proof for native schema finalization, or a
     /// binding-only first registration before any FK publication begins.
     native_owner: ?@import("../standalone_native_owner.zig").Binding = null,
+    /// Signed startup-only reporter CAS for the already admitted native root.
+    /// Possession cannot enroll a key or authorize a publication ACK.
+    native_registration: ?@import("../standalone_native_owner.zig").Registration = null,
+    native_restart: ?@import("../standalone_native_owner.zig").Restart = null,
     import_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
     /// Applied in the same local transaction as the standalone revision and
     /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
@@ -237,23 +241,113 @@ pub const TableTopologyMutation = union(enum) {
     },
 };
 
+pub const ObjectDescriptionCommand = struct {
+    request: @import("antfly_local_sources").system_catalog_domain.ObjectAnnotationRead,
+    expected: @import("antfly_local_sources").system_catalog_domain.object_annotation_store.Expected,
+    description: ?[]const u8,
+
+    pub fn validate(self: @This()) !void {
+        try self.request.validate();
+        try @import("antfly_local_sources").system_catalog_domain.object_annotations.validateDescription(self.description);
+        if (self.expected.object_id == 0 or self.expected.epoch.revision == 0 or std.mem.allEqual(u8, &self.expected.epoch.definition_digest, 0)) return error.InvalidCatalogMutation;
+    }
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.request.guard.deinitOwned(alloc);
+        alloc.free(self.request.key.name);
+        if (self.description) |description| alloc.free(description);
+        self.* = undefined;
+    }
+};
+
+pub const ColumnDescriptionCommand = struct {
+    guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
+    column: @import("antfly_local_sources").system_catalog_column_identities.Description,
+    column_id: u64,
+    epoch: @import("antfly_local_sources").system_catalog_column_identities.Epoch,
+
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        try self.column.validate();
+        if (self.guard.owner.kind != .table or self.guard.hasDefinitionIntent() or self.column_id == 0 or std.mem.allEqual(u8, &self.epoch.digest, 0)) return error.InvalidCatalogMutation;
+    }
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.guard.deinitOwned(alloc);
+        alloc.free(self.column.name);
+        if (self.column.value) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const SystemCatalogCommand = struct {
+    pub const creation_sources_version: u16 = 8;
     version: u16 = 1,
     expected_revision: u64,
     mutation: system_catalog.Mutation,
     topology: ?TableTopologyMutation = null,
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
+    constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+    sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
+    sql_relation: ?@import("../../system_catalog/relations.zig").Prepared = null,
+    sql_catalog_admission: ?@import("../../system_catalog/catalog_mutations.zig").Admission = null,
+    sql_native_index: ?@import("../../system_catalog/native_indexes.zig").Mutation = null,
+    sql_routine: ?@import("../../system_catalog/routines.zig").Mutation = null,
+    sql_type: ?@import("../../system_catalog/named_types.zig").Mutation = null,
+    sql_authorization: ?@import("../../system_catalog/authorization.zig").Mutation = null,
+    sql_cast: ?@import("../../system_catalog/casts.zig").Mutation = null,
+    sql_sequence: ?@import("../../system_catalog/sequence_catalog.zig").Mutation = null,
+    column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation = &.{},
+    creation_sources: []const system_catalog.RelationMutationGuard = &.{},
+    /// Copy native column annotations at the same linearization point as CREATE.
+    creation_comment_sources: []const u64 = &.{},
+    creation_object_comments: []const system_catalog.object_annotations.Copy = &.{},
+
+    pub fn validateCreationSources(self: SystemCatalogCommand) !void {
+        try system_catalog.validateCreationSources(self.creation_sources);
+        try system_catalog.validateCreationCommentSources(self.creation_sources, self.creation_comment_sources);
+        try system_catalog.validateCreationObjectComments(self.creation_sources, self.creation_object_comments);
+        if (self.creation_sources.len == 0) {
+            if (self.version == creation_sources_version) return error.InvalidCatalogMutation;
+            return;
+        }
+        if (self.version != creation_sources_version or self.mutation.kind != .table or self.mutation.action != .create or self.topology == null or self.topology.? != .create or self.placement_update != null or self.sql_view != null or self.sql_sequence != null or self.sql_routine != null or self.sql_type != null or self.sql_cast != null or self.sql_authorization != null or self.sql_native_index != null) return error.InvalidCatalogMutation;
+    }
+
+    pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.sql_catalog_admission != null and self.sql_relation != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_relation = self.sql_relation, .sql_catalog_admission = self.sql_catalog_admission });
+        if (self.sql_catalog_admission != null and self.sql_view != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_view = self.sql_view, .sql_catalog_admission = self.sql_catalog_admission });
+        if (self.sql_catalog_admission != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_object_comments = self.creation_object_comments, .sql_catalog_admission = self.sql_catalog_admission });
+        if (self.sql_native_index != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_native_index = self.sql_native_index });
+        if (self.creation_object_comments.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_object_comments = self.creation_object_comments });
+        if (self.creation_sources.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources });
+        if (self.sql_authorization != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_authorization = self.sql_authorization });
+        if (self.sql_type != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_type = self.sql_type });
+        if (self.sql_cast != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_cast = self.sql_cast });
+        if (self.sql_routine != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_routine = self.sql_routine });
+        if (self.column_sequences.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence, .column_sequences = self.column_sequences });
+        if (self.sql_sequence != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence });
+        if (self.sql_view != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view });
+        // Keep legacy frames byte-for-byte shaped as before while capability
+        // 34 is not activated. Old decoders must not see even a null new field.
+        if (self.constraint_name_admission == null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update });
+        try writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission });
+    }
 };
 
-pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
+pub const CatalogAdmission = struct { incarnation: [16]u8 = @splat(0), meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{}, namespace_id: u64 = 0 };
 
 pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
         .apply_system_catalog,
+        .apply_schema_validation,
+        .apply_table_retirement,
+        .apply_scope_retirement,
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_sql_completion_reference,
         .apply_fk_generation_publication,
+        .begin_relational_index_publication,
+        .decide_relational_index_publication,
+        .ack_relational_index_publication,
         .apply_fk_initial_create,
         .upsert_table,
         .compare_and_replace_table,
@@ -267,19 +361,71 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
 }
 
 const store_report_update = @import("../store_report_update.zig");
+pub const StandaloneRevisionState = struct {
+    revision: u64,
+    /// Last commit that might change the visible catalog projection.
+    projection_revision: u64,
+};
+
+pub const TriggerPolicySchemaPreparation = struct {
+    after: metadata.TableRecord,
+    policy_pair: ?@import("antfly_local_sources").system_catalog_policies.SchemaPair = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.policy_pair) |pair| return writer.write(.{ .after = self.after, .policy_pair = pair });
+        try writer.write(.{ .after = self.after });
+    }
+};
+
 pub const CatalogProjectionRequest = union(enum) {
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
     catalog_read: system_catalog.Read,
     catalog_export: void,
+    catalog_checkpoint: []const u8,
+    catalog_checkpoint_projection: @import("../../system_catalog/projection.zig").Export.NativeCheckpoint,
     catalog_export_standalone_portable: void,
+    sql_snapshot_cohort: @import("../../system_catalog/server_call.zig").SqlSnapshotCohortRequest,
     catalog_list_tables: system_catalog.TableList,
     privacy_due_table: i64,
     table_by_name: []const u8,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
+    catalog_admission_bound: struct { mutation: system_catalog.Mutation, binding_guard: system_catalog.RelationMutationGuard },
     catalog_prepare: SystemCatalogCommand,
+    catalog_bind_column_sequences: SystemCatalogCommand,
+    catalog_column_sequence_handoffs: @import("../column_sequence_handoff.zig").Request,
+    sql_sequence_admission_head: void,
+    sql_column_identities: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
+    sql_object_annotation: @import("antfly_local_sources").system_catalog_domain.ObjectAnnotationRead,
+    relation_replacement_check: struct { guard: system_catalog.RelationMutationGuard, expected: metadata.TableRecord, replacement: metadata.TableRecord },
+    trigger_policy_schema: struct { before: metadata.TableRecord, after: metadata.TableRecord },
+    sql_index_annotations: @import("antfly_local_sources").system_catalog_domain.object_annotations.IndexDescriptionsRead,
+    sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
+    /// Trusted host selected this private projection only after checking both
+    /// retirement grants. The ordinary snapshot never acquires this authority.
+    sql_sequence_retirement_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
+    sql_prepared_read: @import("../../system_catalog/prepared_transactions.zig").Read,
+    sql_lock_read: @import("../../system_catalog/lock_authority.zig").Query,
+    sql_lock_outcome: @import("../../system_catalog/lock_authority.zig").Request,
+    sql_prepared_prepare: @import("../../system_catalog/prepared_transactions.zig").Mutation,
+    sql_prepared_outcome: @import("../../system_catalog/prepared_transactions.zig").Mutation,
+    sql_authorization_read: @import("../../system_catalog/authorization.zig").Read,
+    sql_authorization_outcome: @import("../../system_catalog/authorization.zig").Observation,
+    sql_type_snapshot: @import("../../system_catalog/named_types.zig").SnapshotRequest,
+    sql_type_bindings: @import("../../system_catalog/named_types.zig").BindingsRequest,
+    sql_type_outcome: @import("../../system_catalog/named_types.zig").OutcomeRequest,
+    sql_cast_snapshot: @import("../../system_catalog/casts.zig").SnapshotRequest,
+    sql_cast_outcome: @import("../../system_catalog/casts.zig").OutcomeRequest,
+    sql_native_index_prepare: @import("../../system_catalog/native_indexes.zig").Preparation,
+    sql_catalog_outcome: @import("../../system_catalog/catalog_mutations.zig").Observation,
+    sql_native_index_outcome: @import("../../system_catalog/native_indexes.zig").OutcomeRequest,
+    sql_routine_snapshot: @import("../../system_catalog/routines.zig").SnapshotRequest,
+    sql_routine_outcome: @import("../../system_catalog/routines.zig").OutcomeRequest,
+    sql_sequence_preflight: @import("../../system_catalog/sequence_catalog.zig").Mutation,
+    sql_sequence_outcome: @import("../../system_catalog/sequence_catalog.zig").Mutation,
+    sql_sequence_counter_preflight: @import("../../system_catalog/sequence_catalog.zig").CounterRequest,
+    sql_sequence_counter_outcome: @import("../../system_catalog/sequence_catalog.zig").CounterRequest,
     catalog_resolve_table: system_catalog.Target,
     catalog_resolve_identity: system_catalog.Target,
     catalog_resolve_many: system_catalog.ResolveMany,
@@ -294,12 +440,14 @@ pub const CatalogProjectionRequest = union(enum) {
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,
+    sql_setting_mutation_cut: ?[]const u8,
     sql_setting_snapshot: @import("antfly_local_sources").system_catalog_settings.Scope,
     sql_policy_snapshot: struct { table_id: u64, principal: []const u8, database: []const u8, roles: []const []const u8 },
     sql_policy_install_snapshot: @import("antfly_local_sources").system_catalog_policies.InstallRequest,
     sql_policy_publication_status: u64,
     sql_policy_publication_work: u64,
     sql_policy_begin_command: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
+    sql_policy_definition_command: @import("antfly_local_sources").system_catalog_policies.Command,
     require_policy_index_mutation_allowed: u64,
     require_policy_topology_mutation_allowed: u64,
     sql_completion_reference: [16]u8,
@@ -309,7 +457,28 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_owner_decision: @import("../relational_index_publication.zig").OwnerRequest,
     fk_initial_create_prepare: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest,
+    fk_generation_name_admission: @import("../fk_generation_publication.zig").Plan,
+    table_retirement_work: @import("../table_retirement_ledger.zig").Lookup,
+    table_retirement_queue: u64,
+    table_retirement_effects: @import("../table_retirement_ledger.zig").Lookup,
+    table_retirement_preflight: []const u8,
+    table_retirement_publication_projection: @import("../table_retirement_ledger.zig").Lookup,
+    table_retirement_receipt: @import("../table_retirement_receipt.zig").Request,
+    scope_retirement_work: u64,
+    sql_relation_boot: @import("../sql_relation_boots.zig").Query,
+    sql_relation_boot_preflight: []const u8,
+    sql_relation_lifetimes: @import("../sql_relation_lifetimes.zig").PageRequest,
+    scope_retirement_manifest: @import("../scope_retirement_ledger.zig").Lookup,
+    scope_retirement_preflight: []const u8,
+    scope_retirement_observation: @import("../scope_retirement_wire.zig").Query,
+    scope_retirement_prepare: struct { request: system_catalog.scope_retirement.Prepare, deadline_ns: ?u64 = null },
+    table_retirement_prepare: struct { guard: system_catalog.RelationMutationGuard, deadline_ns: ?u64 = null },
+    relation_create_prepare: struct { request: @import("../relation_create.zig").Request, purpose: @import("../relation_create.zig").Purpose, deadline_ns: ?u64 = null },
+    fk_initial_create_prepare_with_deadline: struct { request: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest, deadline_ns: ?u64 = null },
+    constraint_name_prepare: struct { request: system_catalog.ConstraintNamePreparation, deadline_ns: ?u64 = null },
+    constraint_name_check: struct { request: system_catalog.ConstraintNameCheck, deadline_ns: ?u64 = null },
     fk_initial_child_decision: @import("../fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_status: u64,
     fk_generation_table_locked: u64,
@@ -317,4 +486,80 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    // Additive owned JSON projections; no storage handles cross this boundary.
+    schema_reader_floor: void,
+    standalone_revision_state: void,
+    standalone_native_reporter_observation: @import("../standalone_native_owner.zig").Registration,
+    standalone_native_reporter_progress: u64,
+    standalone_native_owner_binding: void,
+    relational_index_status: @import("../relational_index_publication.zig").StatusRequest,
+    relational_index_prepare: @import("../relational_index_publication.zig").PrepareRequest,
+    relational_index_admission_status: @import("../relational_index_publication.zig").AdmissionRequest,
+    relational_index_begin_preflight: @import("../relational_index_publication.zig").BeginRequest,
+    relational_index_publish_preflight: @import("../relational_index_publication.zig").DecidePublish,
+    relational_index_publish_status: @import("../relational_index_publication.zig").DecidePublish,
+    relational_index_cancel_preflight: @import("../relational_index_publication.zig").CancelDecision,
+    relational_index_cancel_status: @import("../relational_index_publication.zig").CancelDecision,
+    relational_index_owner_ack_status: @import("../relational_index_publication.zig").Ack,
+    relational_index_owner_ack_preflight: []const u8,
+    relational_index_source_accept_status: @import("../relational_index_delivery_journal.zig").Query,
+    relational_index_source_accept_preflight: []const u8,
+    relational_index_source_complete_preflight: []const u8,
+    relational_index_work: @import("../relational_index_work.zig").Query,
+    validate_store_root_enrollment_protocol: void,
+    /// This private projection returns owned raw bytes rather than a JSON
+    /// envelope, preserving ASVI frames across the isolated-owner boundary.
+    schema_validation_owner_read: @import("../schema_validation_read.zig").OwnerReadRequest,
+    schema_validation_discover: @import("../schema_validation_read.zig").DiscoveryRequest,
+    schema_validation_work: @import("../schema_validation_work.zig").Query,
+    schema_validation_publication_projection: @import("../schema_validation_read.zig").Lookup,
+    schema_validation_prepare: @import("../schema_validation_admission.zig").Request,
+    schema_validation_status: @import("../schema_validation_admission.zig").StatusRequest,
+    schema_validation_receipt_read: @import("../schema_validation_receipt.zig").Request,
+    sql_graph_preparation_read: @import("../../system_catalog/graph_preparation.zig").Source,
+    sql_graph_preparation_outcome: @import("../../system_catalog/graph_preparation.zig").Observation,
+    sql_trigger_snapshot: @import("../../system_catalog/trigger_snapshot.zig").Request,
 };
+
+test "system catalog creation sources have a distinct strict command version" {
+    const guard: system_catalog.RelationMutationGuard = .{ .target = .{ .name = "source" }, .logical_table = "source", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(1) };
+    var command: SystemCatalogCommand = .{ .version = SystemCatalogCommand.creation_sources_version, .expected_revision = 0, .mutation = .{ .kind = .table, .action = .create, .name = "destination" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = .{ .name = "table:42", .table_id = 42 }, .ranges = &.{} } }, .creation_sources = &.{guard} };
+    try command.validateCreationSources();
+    command.version = 3;
+    try std.testing.expectError(error.InvalidCatalogMutation, command.validateCreationSources());
+    command.creation_sources = &.{};
+    command.version = SystemCatalogCommand.creation_sources_version;
+    try std.testing.expectError(error.InvalidCatalogMutation, command.validateCreationSources());
+    // The preceding callable/type/authorization command versions remain
+    // independent; a definition read set cannot reinterpret their envelopes.
+    for ([_]u16{ 1, 2, 3, 4, 5, 6, 7 }) |version| {
+        command.version = version;
+        try command.validateCreationSources();
+    }
+}
+
+test "graph preparation private projection selectors fail closed against strict older owner readers" {
+    const graph = @import("../../system_catalog/graph_preparation.zig");
+    const OlderProjectionRequest = union(enum) {
+        sql_trigger_snapshot: @import("../../system_catalog/trigger_snapshot.zig").Request,
+    };
+    const source: graph.Source = .{ .table_id = 7, .epoch = .{ .incarnation = @splat(1), .revision = 2 }, .schema_digest = @splat(2), .indexes = &.{.{ .name = "g", .digest = @splat(3) }} };
+    const mutation: graph.Mutation = .{ .source = source, .admission = .{ .nonce = @splat(4), .head = 0 } };
+    const a = std.testing.allocator;
+    for ([_]CatalogProjectionRequest{ .{ .sql_graph_preparation_read = source }, .{ .sql_graph_preparation_outcome = try graph.observation(a, mutation) } }) |request| {
+        const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(bytes);
+        // This is the exact strict tagged-union parser used by the existing
+        // generic C ABI projection receiver, not permissive feature probing.
+        try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(OlderProjectionRequest, a, bytes, .{}));
+    }
+}
+
+test "row-policy coupled schema private preparation uses strict JSON control projection" {
+    const a = std.testing.allocator;
+    const Older = union(enum) { catalog_meta: void };
+    const request: CatalogProjectionRequest = .{ .trigger_policy_schema = .{ .before = .{ .table_id = 7, .name = "table:pair", .schema_json = "{}" }, .after = .{ .table_id = 7, .name = "table:pair", .schema_json = "{}" } } };
+    const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(bytes);
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Older, a, bytes, .{}));
+}

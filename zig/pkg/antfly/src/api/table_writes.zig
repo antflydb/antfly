@@ -7757,6 +7757,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .options = transactionRecoveryOptionsAdapter,
                 .owns = transactionRecoveryOwnsAdapter,
                 .resolve = transactionRecoveryResolveAdapter,
+                .resolve_external = transactionRecoveryResolveExternalAdapter,
                 .acknowledge = transactionRecoveryAcknowledgeAdapter,
                 .acknowledge_many = acknowledgeRecoveryParticipants,
                 .cleanup = transactionRecoveryCleanupAdapter,
@@ -7783,6 +7784,10 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return self.storageOwnerResolveRecoveryParticipant(txn_id, participant, status, commit_version);
+    }
+
+    fn transactionRecoveryResolveExternalAdapter(ptr: *anyopaque, txn: db_mod.types.TxnId, participant: []const u8, status: db_mod.types.TxnStatus, version: u64, owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner) !void {
+        return resolveExternalRecoveryParticipant(ptr, txn, participant, status, version, owner);
     }
 
     fn transactionRecoveryAcknowledgeAdapter(
@@ -7894,6 +7899,7 @@ pub const ProvisionedTableWriteSource = struct {
             .cutoff_ns = 5 * std.time.ns_per_min,
             .resolver_ctx = self,
             .resolve_participant_fn = resolveRecoveryParticipant,
+            .resolve_external_participant_fn = resolveExternalRecoveryParticipant,
             .replicated_metadata = replicated,
             .owns_recovery_fn = if (replicated) ownsRecovery else null,
             .acknowledge_participant_fn = if (replicated) acknowledgeRecoveryParticipant else null,
@@ -7916,6 +7922,14 @@ pub const ProvisionedTableWriteSource = struct {
         status: db_mod.types.TxnStatus,
         commit_version: u64,
     ) !void {
+        return resolveRecoveryParticipantWithOwner(ptr, txn_id, participant, status, commit_version, null);
+    }
+
+    fn resolveExternalRecoveryParticipant(ptr: *anyopaque, txn_id: db_mod.types.TxnId, participant: []const u8, status: db_mod.types.TxnStatus, commit_version: u64, owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner) !void {
+        return resolveRecoveryParticipantWithOwner(ptr, txn_id, participant, status, commit_version, owner);
+    }
+
+    fn resolveRecoveryParticipantWithOwner(ptr: *anyopaque, txn_id: db_mod.types.TxnId, participant: []const u8, status: db_mod.types.TxnStatus, commit_version: u64, owner: ?@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner) !void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const ref = distributed_txn.parseParticipantRef(participant) orelse return error.InvalidParticipant;
         if (!self.isOpen()) return error.Canceled;
@@ -7932,6 +7946,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .txn_id = txn_id,
                     .status = status,
                     .commit_version = commit_version,
+                    .external_decision_owner = owner,
                 } },
             });
             return;
@@ -7944,6 +7959,7 @@ pub const ProvisionedTableWriteSource = struct {
             .txn_id = txn_id,
             .status = status,
             .commit_version = commit_version,
+            .external_decision_owner = owner,
             .sync_level = .write,
             .restore_staging_scope = ref.restore_staging_scope,
             .restore_staging_plan_id = ref.restore_staging_plan_id,
@@ -17095,10 +17111,19 @@ pub const ProvisionedTableWriteSource = struct {
     /// runtime-status scheduling owned by the control process.
     pub fn publishStorageOwnerDataChange(
         self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
         table_name: []const u8,
+        req: db_mod.types.BatchRequest,
     ) void {
-        self.publishStorageOwnerChange(alloc, table_name, .data);
+        // Validated native lock controls change only durable lock ownership.
+        // They neither invalidate serving rows nor advance index/status work.
+        // In particular they must not borrow cache ownership from a reader
+        // that can already be waiting for this entry's Raft read barrier.
+        if (req.sql_lock != null) return;
+        // This callback runs under data-Raft ownership. Status sampling can
+        // resolve catalog routes and borrow storage owners, so only invalidate
+        // caches and schedule the existing coalesced control-plane refresh.
+        self.invalidateStorageOwnerCaches(table_name);
+        self.notifyLocalChange(table_name, .data);
     }
 
     /// Publish the same control-plane invalidation as the legacy HA apply
@@ -17118,12 +17143,16 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         kind: LocalChangeKind,
     ) void {
+        self.invalidateStorageOwnerCaches(table_name);
+        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+        self.notifyLocalChange(table_name, kind);
+    }
+
+    fn invalidateStorageOwnerCaches(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
-        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-        self.notifyLocalChange(table_name, kind);
     }
 
     /// Publish a lifecycle-only wake after an owner-side visibility barrier.
@@ -17173,7 +17202,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .runtime_status);
     }
 
-    fn notifyLocalIndexRepairDebt(
+    pub fn notifyLocalIndexRepairDebt(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
@@ -20144,6 +20173,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
+            .prepares_rows_atomically = if (self.groupLocalWriteSource()) |local| local.prepares_rows_atomically else !control_only_storage_sources and self.write_cache != null,
             .supports_sql_range_guards = if (self.raft_batcher) |batcher|
                 batcher.vtable.batch_group_routed_with_cancellation != null
             else
@@ -20159,6 +20189,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_metric_action = graphMetricAction,
                 .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .drop_table = dropTable,
+                .sql_maintenance_group = sqlMaintenanceGroup,
+                .sql_maintenance_group_routed = sqlMaintenanceGroupRouted,
+                .sql_maintenance_group_local_routed = sqlMaintenanceGroupLocalRouted,
+                .sql_maintenance_group_local = sqlMaintenanceGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .resolver_operation_group_local = resolverOperationGroupLocal,
                 .commit_transaction = commitTransaction,
@@ -20178,6 +20212,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
                 .batch_group_local = batchGroupLocal,
+                .batch_group_local_routed = batchGroupLocalRouted,
                 .replicated_batch_group_local = replicatedPolicyControlGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
@@ -20185,6 +20220,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_request = txnResolveGroupLocalWithRequest,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_status_group_linearizable = txnStatusGroupLinearizable,
@@ -20214,6 +20250,60 @@ pub const ProvisionedTableWriteSource = struct {
                 .request_table_index_structural_reconcile = requestTableIndexStructuralReconcile,
             },
         };
+    }
+
+    fn sqlMaintenanceGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        try cancellation.check();
+        return sqlMaintenanceGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn sqlMaintenanceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        return sqlMaintenanceGroupLocalRouted(ptr, alloc, fence, group_id, table_name, body, cancellation);
+    }
+
+    fn sqlMaintenanceGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.routeFenceDeadline(fence));
+        if (fence.route.group_id != group_id) return error.TopologyChanged;
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return local_source.sqlMaintenanceGroupLocalRouted(alloc, fence, group_id, table_name, body, cancellation);
+        }
+        if (fence.route.execution == .native_local) return error.CatalogRouteFenceUnsupported;
+        return sqlMaintenanceGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn sqlMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try local_source.sqlMaintenanceGroupLocal(alloc, group_id, table_name, body);
+        }
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            return try cached.db.sqlMaintenanceJson(alloc, body);
+        }
+
+        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror) catch |err| switch (err) {
+            error.FileNotFound => return error.UnknownGroup,
+            else => return err,
+        };
+        defer db.close();
+        return try db.sqlMaintenanceJson(alloc, body);
     }
 
     fn graphMetricMaintenanceGroupLocal(
@@ -21152,6 +21242,9 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn canCoalesceProvisionedGroupBatch(self: *ProvisionedTableWriteSource, group: GroupBatch, req: db_mod.types.BatchRequest) bool {
+        // Native admission is bound to a request's owner and cancellation.
+        // A shared queue cannot substitute another request's authority.
+        if (group.route_fence) |fence| if (fence.route.execution == .native_local) return false;
         if (self.write_cache == null) return false;
         if (group.transforms.items.len != 0) return false;
         if (req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0) return false;
@@ -21520,6 +21613,20 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
         cancellation: db_mod.types.CancellationToken,
     ) !void {
+        if (group.route_fence) |captured| if (captured.route.execution == .native_local) {
+            // The local fast path must consume the same owner-bound route as
+            // the distributed writer. Dropping it turns an authorized native
+            // write into an unbound physical-owner acquisition.
+            var fence = captured;
+            fence.admission_cancellation = cancellation;
+            var grouped_request = req;
+            grouped_request.writes = group.writes.items;
+            grouped_request.deletes = group.deletes.items;
+            grouped_request.transforms = group.transforms.items;
+            if ((try batchGroupLocalRouted(self, alloc, group.group_id, table_name, grouped_request, fence)) == null)
+                return error.TableNotFound;
+            return;
+        };
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
@@ -21598,8 +21705,13 @@ pub const ProvisionedTableWriteSource = struct {
             fence.admission_deadline_ns = context.deadline_ns;
             fence.admission_deadline_io = context.deadline_io;
             fence.admission_cancellation = context.cancellation;
+            try bindRangeActivationOwner(&fence, context);
             if (batcher) |owner| {
                 try owner.batchGroupRoutedWithCancellation(alloc, fence, table, .{ .activate_range_tracking = true }, context.cancellation);
+            } else if (fence.route.execution == .native_local) {
+                // This entry owns routed admission itself; do not recursively
+                // acquire it, or fall back to an unbound native owner.
+                _ = (try batchGroupLocalRouted(self, alloc, route.group_id, table, .{ .activate_range_tracking = true }, fence)) orelse return error.StorageKernelOwnerUnavailable;
             } else {
                 // Standalone owns every local range directly. Hold the same
                 // table admission used by restore and split while validating
@@ -22276,7 +22388,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
-        const commit_version = begin_timestamp + 1;
+        const commit_version = try distributed_txn.commitVersion(begin_timestamp);
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
             self.catalog,
@@ -22324,6 +22436,8 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const atomic_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
+        if (try distributed_txn.executeNativeAtomicBatch(alloc, self.catalog, .{ .ptr = self, .apply = nativeAtomicApply }, tables, nextTxnTimestamp(atomic_io), sync_level, cancellation)) |outcome| return outcome;
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
@@ -22332,6 +22446,12 @@ pub const ProvisionedTableWriteSource = struct {
                 public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
             return err;
         };
+    }
+
+    fn nativeAtomicApply(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, table: []const u8, request: db_mod.types.BatchRequest, cancellation: db_mod.types.CancellationToken) !void {
+        var scoped = route;
+        scoped.admission_cancellation = cancellation;
+        if ((try batchGroupLocalRouted(ptr, alloc, scoped.route.group_id, table, request, scoped)) == null) return error.TableNotFound;
     }
 
     /// A transaction with one participant is already atomic at the shard DB
@@ -22357,7 +22477,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
 
         const table_req = tables[0];
-        if (table_req.range_guards.len != 0) return null;
+        if (table_req.sql_persistence != null) return null;
+        if (table_req.range_guards.len != 0 or table_req.trigger_receipts.len != 0 or table_req.graph_preparation != null or table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
         if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         const has_mutations = table_req.writes.len != 0 or
             table_req.deletes.len != 0 or
@@ -22377,6 +22498,8 @@ pub const ProvisionedTableWriteSource = struct {
             table_req.table_name,
         )) orelse return null;
         defer routing.deinit(alloc);
+        const captured_table = tables_api.findTableByName(&routing.snapshot, table_req.table_name) orelse return null;
+        if (captured_table.sql_persistence != null) return null;
 
         var group_id_opt: ?u64 = null;
         const resolveOpGroup = struct {
@@ -22441,9 +22564,16 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
         const table_req = tables[0];
-        if (table_req.range_guards.len != 0) return null;
+        if (table_req.sql_persistence != null) return null;
+        if (table_req.range_guards.len != 0 or table_req.trigger_receipts.len != 0 or table_req.graph_preparation != null or table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
         if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
-        if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
+        // Keep ordinary single-owner transforms (including _edges projections) in
+        // the existing atomic Raft batch. A coordinated vote requires protected
+        // graph preparation; moving this request there invents that requirement.
+        // Never discard private authority, policy, restore, or integrity evidence.
+        if (table_req.trigger_minter != null or table_req.relation_owner_minter != null or
+            table_req.row_policy_principal_proof.len != 0 or table_req.row_policy_database.len != 0 or table_req.row_policy_admitted_at_seconds != 0 or
+            table_req.relational_integrity_generation_set != null or table_req.restore_staging_scope != null or table_req.restore_staging_plan_id != null or table_req.relational_repair) return null;
 
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(
             alloc,
@@ -22452,6 +22582,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.catalog.budget(null).nowNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
+        if (routing.execution == .native_local) return null;
 
         var selected_route: ?table_catalog.CatalogGroupRoute = null;
         const resolveOpGroup = struct {
@@ -22491,6 +22622,18 @@ pub const ProvisionedTableWriteSource = struct {
             else => return err,
         };
         return .{ .committed = .{ .participant_count = 1 } };
+    }
+
+    fn batchGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, route: metadata_api.CatalogRouteFence) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (route.route.execution != .native_local) return batchGroupLocal(ptr, alloc, group_id, table_name, req);
+        if (route.route.group_id != group_id) return error.TopologyChanged;
+        const deadline = self.catalog.routeFenceDeadline(route) orelse self.catalog.budget(null).nowNs() +| 5 * std.time.ns_per_s;
+        var admission = try self.acquireRoutedWriteAdmission(alloc, table_name, route, deadline, route.admission_cancellation);
+        defer admission.deinit();
+        try enforceReplicationWriteGateOptional(self.replication_write_gate);
+        const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return native.batchGroupLocalRouted(alloc, group_id, table_name, req, route);
     }
 
     fn batchGroupLocal(
@@ -22665,6 +22808,8 @@ pub const ProvisionedTableWriteSource = struct {
         raft_entry: ?db_mod.OrderedApplyReceipt,
     ) !?void {
         const apply_req = req;
+        try @import("antfly_local_sources").storage_db_relational_index_raft_contract.validateBatchRequest(apply_req);
+        if (apply_req.relational_index_owner_control) |command| if (command.fence().owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
         const split_identity_namespace = try validateSplitReplicationForApply(apply_req, group_id);
         const merge_identity_namespace = try validateMergeReplicationForApply(apply_req, group_id);
         try validateMergeCheckpointForApply(apply_req, group_id);
@@ -22686,14 +22831,19 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const owner = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            lockAtomic(&self.local_db_mutex);
-            self.invalidateReadCache(table_name);
-            self.markWriteCacheDirty(table_name);
-            self.local_db_mutex.unlock();
+            if (apply_req.sql_lock == null) {
+                lockAtomic(&self.local_db_mutex);
+                self.invalidateReadCache(table_name);
+                self.markWriteCacheDirty(table_name);
+                self.local_db_mutex.unlock();
+            }
             _ = (try owner.replicatedBatchGroupLocal(alloc, group_id, table_name, apply_req, metadata_source == .local_persisted, raft_entry)) orelse
                 return error.StorageKernelOwnerUnavailable;
-            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-            self.notifyLocalChange(table_name, .data);
+            if (apply_req.sql_lock == null) {
+                if (metadata_source == .catalog)
+                    self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+                self.notifyLocalChange(table_name, .data);
+            }
             return {};
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -22766,7 +22916,7 @@ pub const ProvisionedTableWriteSource = struct {
                     else
                         try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
                 } else if (raft_entry) |entry| {
-                    @import("../storage/server_db_adapter.zig").applyOrdered(&cached.db, apply_req, entry) catch |err| {
+                    @import("../storage/server_db_adapter.zig").applyOrderedGroup(&cached.db, group_id, apply_req, entry) catch |err| {
                         preserve_writer_on_error = err == error.RaftApplyWriterUnavailable;
                         return err;
                     };
@@ -22778,7 +22928,8 @@ pub const ProvisionedTableWriteSource = struct {
                 defer self.local_db_mutex.unlock();
                 self.markWriteCacheDirty(table_name);
             }
-            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            if (metadata_source == .catalog)
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
             self.notifyLocalChange(table_name, .data);
         } else {
             const prepared_identity_namespace = split_identity_namespace orelse merge_identity_namespace;
@@ -22831,7 +22982,7 @@ pub const ProvisionedTableWriteSource = struct {
                     else
                         try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
                 } else if (raft_entry) |entry|
-                    try @import("../storage/server_db_adapter.zig").applyOrdered(&db, apply_req, entry)
+                    try @import("../storage/server_db_adapter.zig").applyOrderedGroup(&db, group_id, apply_req, entry)
                 else
                     try db.batchReplicatedApply(apply_req);
             }
@@ -23314,6 +23465,13 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
+        var guarded_admission: ?RoutedWriteAdmission = null;
+        defer if (guarded_admission) |*admission| admission.deinit();
+        if (context.route_fence) |fence| {
+            if (context.restore_staging_scope != null or fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            const deadline = self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse self.catalog.budget(null).nowNs() +| std.time.ns_per_s * 5;
+            guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
+        }
         // Keep the epoch check and durable begin in the same transition
         // admission window. Otherwise a split can publish after validation
         // but before this transaction becomes visible to the pending-txn
@@ -23325,12 +23483,20 @@ pub const ProvisionedTableWriteSource = struct {
             try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
                 .restore_staging_scope = scope,
                 .restore_staging_plan_id = context.restore_staging_plan_id,
-                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal, .participants = participants } },
+                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal or context.external_decision_owner != null, .external_decision_owner = context.external_decision_owner, .sql_locks = context.sql_locks, .participants = participants } },
             }, context);
             return {};
         }
-        try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        // The exact route lease already validates this table's epoch. Avoid
+        // waiting for an unrelated full administrative projection to catch up.
+        if (context.route_fence == null)
+            try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         try ensurePreDecisionContextActive(context);
+        if (context.route_fence) |fence| if (fence.route.execution == .native_local) {
+            if (context.external_decision_owner == null) return error.InvalidExternalDecisionOwner;
+            const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return native.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, context);
+        };
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
                 .transaction = .{ .begin = .{
@@ -23338,7 +23504,9 @@ pub const ProvisionedTableWriteSource = struct {
                     .begin_timestamp = begin_timestamp,
                     .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
                     .topology_epoch = topology_epoch,
-                    .retain_terminal = retain_terminal,
+                    .retain_terminal = retain_terminal or context.external_decision_owner != null,
+                    .external_decision_owner = context.external_decision_owner,
+                    .sql_locks = context.sql_locks,
                     .participants = participants,
                 } },
             }, context);
@@ -23347,7 +23515,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const owner = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            return try owner.txnBeginGroupLocal(
+            return try owner.txnBeginGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
@@ -23356,10 +23524,11 @@ pub const ProvisionedTableWriteSource = struct {
                 topology_epoch,
                 retain_terminal,
                 participants,
+                context,
             );
         }
         if (self.groupLocalWriteSource()) |owner|
-            return try owner.txnBeginGroupLocal(
+            return try owner.txnBeginGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
@@ -23368,6 +23537,7 @@ pub const ProvisionedTableWriteSource = struct {
                 topology_epoch,
                 retain_terminal,
                 participants,
+                context,
             );
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -23380,7 +23550,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
                 .topology_epoch = topology_epoch,
-                .retain_terminal = retain_terminal,
+                .retain_terminal = retain_terminal or context.external_decision_owner != null,
+                .external_decision_owner = context.external_decision_owner,
+                .sql_locks = context.sql_locks,
                 .participants = participants,
             } } });
             lockAtomic(&self.local_db_mutex);
@@ -23396,7 +23568,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
                 .topology_epoch = topology_epoch,
-                .retain_terminal = retain_terminal,
+                .retain_terminal = retain_terminal or context.external_decision_owner != null,
+                .external_decision_owner = context.external_decision_owner,
+                .sql_locks = context.sql_locks,
                 .participants = participants,
             } } });
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -23427,6 +23601,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
+        try @import("sql_graph_vote.zig").require(alloc, self.catalog, table_name, req.asBatch(txn_id, topology_epoch), context.deadline_ns);
         if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
         var guarded_admission: ?RoutedWriteAdmission = null;
         defer if (guarded_admission) |*admission| admission.deinit();
@@ -23441,55 +23616,19 @@ pub const ProvisionedTableWriteSource = struct {
         try ensurePreDecisionContextActive(context);
         if (req.restore_staging_scope != null) {
             if (req.relational_index_maintenance != null) return error.InvalidBatchRequest;
-            try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
-                .row_policy_principal_proof = req.row_policy_principal_proof,
-                .row_policy_database = req.row_policy_database,
-                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
-                .writes = transactionWritesAsBatchWrites(req.writes),
-                .deletes = req.deletes,
-                .transforms = req.transforms,
-                .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
-                .integrity = req.integrity,
-                .integrity_commands = req.integrity_commands,
-                .range_guards = req.range_guards,
-                .relational_activation = req.relational_activation,
-                .relational_retirement = req.relational_retirement,
-                .relational_index_maintenance = req.relational_index_maintenance,
-                .schema_version = req.schema_version,
-                .relational_schema_version = req.relational_schema_version,
-                .relational_integrity_generation_set = req.relational_integrity_generation_set,
-                .restore_staging_scope = req.restore_staging_scope,
-                .restore_staging_plan_id = req.restore_staging_plan_id,
-                .relational_repair = req.relational_repair,
-            }, context);
+            try self.applyRestoreStagingBatch(alloc, table_name, group_id, req.asBatch(txn_id, topology_epoch), context);
             return {};
         }
-        try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        if (context.route_fence == null)
+            try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         try ensurePreDecisionContextActive(context);
+        if (context.route_fence) |fence| if (fence.route.execution == .native_local) {
+            if (req.external_decision_owner == null) return error.InvalidExternalDecisionOwner;
+            const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return native.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, topology_epoch, req, context);
+        };
         if (self.raft_batcher) |batcher| {
-            try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
-                .row_policy_principal_proof = req.row_policy_principal_proof,
-                .row_policy_database = req.row_policy_database,
-                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
-                .writes = transactionWritesAsBatchWrites(req.writes),
-                .deletes = req.deletes,
-                .transforms = req.transforms,
-                .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
-                .integrity = req.integrity,
-                .integrity_commands = req.integrity_commands,
-                .range_guards = req.range_guards,
-                .relational_activation = req.relational_activation,
-                .relational_retirement = req.relational_retirement,
-                .schema_version = req.schema_version,
-                .relational_schema_version = req.relational_schema_version,
-                .relational_index_maintenance = req.relational_index_maintenance,
-                .relational_integrity_generation_set = req.relational_integrity_generation_set,
-                .restore_staging_scope = req.restore_staging_scope,
-                .restore_staging_plan_id = req.restore_staging_plan_id,
-                .relational_repair = req.relational_repair,
-            }, context);
+            try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.asBatch(txn_id, topology_epoch), context);
             return {};
         }
         if (comptime control_only_storage_sources) {
@@ -23561,6 +23700,16 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        return txnResolveGroupLocalWithRequest(ptr, alloc, group_id, table_name, .{ .txn_id = txn_id, .status = status, .commit_version = commit_version, .topology_epoch = topology_epoch, .sync_level = sync_level }, cancellation);
+    }
+
+    fn txnResolveGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: distributed_txn.TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !?void {
+        if (request.restore_staging_scope != null or request.restore_staging_plan_id != null) return error.InvalidBatchRequest;
+        const txn_id = request.txn_id;
+        const status = request.status;
+        const commit_version = request.commit_version;
+        const topology_epoch = request.topology_epoch;
+        const sync_level = request.sync_level;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
         // Serialize the final epoch validation with split/merge transition
@@ -23571,6 +23720,11 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.endGroupOperation(table_name, group_id);
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        if (request.route_fence) |fence| if (fence.route.execution == .native_local) {
+            if (request.external_decision_owner == null) return error.InvalidExternalDecisionOwner;
+            const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return native.txnResolveGroupLocalWithRequest(alloc, group_id, table_name, request, cancellation);
+        };
         if (self.raft_batcher) |batcher| {
             // Resolution is idempotent and may arrive through a stale hosted
             // route after leadership changes. Use the same leader-aware Raft
@@ -23583,6 +23737,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .txn_id = txn_id,
                     .status = status,
                     .commit_version = commit_version,
+                    .external_decision_owner = request.external_decision_owner,
                 } },
             }, cancellation);
             return {};
@@ -23600,16 +23755,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         if (self.groupLocalWriteSource()) |owner| {
-            if ((try owner.txnResolveGroupLocal(
-                alloc,
-                group_id,
-                table_name,
-                txn_id,
-                status,
-                commit_version,
-                topology_epoch,
-                sync_level,
-            )) == null) return null;
+            if ((try owner.txnResolveGroupLocalWithRequest(alloc, group_id, table_name, request, cancellation)) == null) return null;
             if (status == .committed) {
                 lockAtomic(&self.local_db_mutex);
                 self.markWriteCacheDirty(table_name);
@@ -23629,7 +23775,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, .{
                 .sync_level = sync_level,
-                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version, .external_decision_owner = request.external_decision_owner } },
             }, cancellation);
             // Transaction resolution already honors the requested sync level.
             // In particular, `.write` must not become coupled to an external
@@ -23644,7 +23790,7 @@ pub const ProvisionedTableWriteSource = struct {
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try applyReplicatedTransactionMutationWithCancellation(alloc, &db, table_name, group_id, .{
                 .sync_level = sync_level,
-                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version, .external_decision_owner = request.external_decision_owner } },
             }, cancellation);
             if (status == .committed) try drainManagedDbBeforeClose(&db);
             if (status == .committed) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -25009,6 +25155,18 @@ fn selectHostedBackupFanoutError(result_slots: anytype, workers: anytype, await_
     return await_err;
 }
 
+fn bindRangeActivationOwner(fence: *metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+    if (fence.route.execution != .native_local) return;
+    const descriptor = fence.route.execution.native_local;
+    try descriptor.requireConnectionOwner(context.sql_relation_owner);
+    fence.admission_sql_relation_owner = context.sql_relation_owner;
+    fence.admission_relation_minter = context.sql_relation_owner_minter;
+    if (descriptor.kind == .temporary) {
+        const minter = context.sql_relation_owner_minter orelse return error.SqlTemporaryRelationNotOwned;
+        try descriptor.requireConnectionOwner(minter.owner);
+    }
+}
+
 pub const HostedProvisionedTableWriteSource = struct {
     /// Retains a hosted writer while a production-shaped structural operation
     /// uses the DB directly. The caller must already own the corresponding
@@ -25372,6 +25530,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .cutoff_ns = 5 * std.time.ns_per_min,
             .resolver_ctx = self,
             .resolve_participant_fn = resolveRecoveryParticipant,
+            .resolve_external_participant_fn = resolveExternalRecoveryParticipant,
         };
     }
 
@@ -25382,11 +25541,19 @@ pub const HostedProvisionedTableWriteSource = struct {
         status: db_mod.types.TxnStatus,
         commit_version: u64,
     ) !void {
+        return resolveRecoveryParticipantWithOwner(ptr, txn_id, participant, status, commit_version, null);
+    }
+
+    fn resolveExternalRecoveryParticipant(ptr: *anyopaque, txn_id: db_mod.types.TxnId, participant: []const u8, status: db_mod.types.TxnStatus, commit_version: u64, owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner) !void {
+        return resolveRecoveryParticipantWithOwner(ptr, txn_id, participant, status, commit_version, owner);
+    }
+
+    fn resolveRecoveryParticipantWithOwner(ptr: *anyopaque, txn_id: db_mod.types.TxnId, participant: []const u8, status: db_mod.types.TxnStatus, commit_version: u64, owner: ?@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner) !void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const alloc = std.heap.page_allocator;
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
-        try distributed_txn.resolveParticipant(alloc, worker.worker(), participant, txn_id, status, commit_version);
+        try distributed_txn.resolveParticipantWithOwner(alloc, worker.worker(), participant, txn_id, status, commit_version, owner);
     }
 
     fn shouldDrainAfterBatch(self: *const HostedProvisionedTableWriteSource, sync_level: db_mod.types.SyncLevel) bool {
@@ -25640,7 +25807,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
         return .{
             .ptr = self,
+            // Preserve the local owner's declared preparation capability.
+            // Remote hosted commits use native owner preparation.
+            .prepares_rows_atomically = if (self.groupLocalWriteSource()) |local| local.prepares_rows_atomically else true,
+            // Coordinator capability is independent of an optional local leaf.
+            // Each selected owner must still acknowledge routed activation.
+            .supports_sql_range_guards = true,
             .vtable = &.{
+                .activate_range_tracking = activateRangeTracking,
                 .drop_table = dropTable,
                 .create_index = createIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
@@ -25648,6 +25822,10 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .drop_index = dropIndex,
                 .graph_metric_action = graphMetricAction,
                 .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
+                .sql_maintenance_group = sqlMaintenanceGroup,
+                .sql_maintenance_group_routed = sqlMaintenanceGroupRouted,
+                .sql_maintenance_group_local_routed = sqlMaintenanceGroupLocalRouted,
+                .sql_maintenance_group_local = sqlMaintenanceGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .resolver_operation_group_local = resolverOperationGroupLocal,
                 .accept_committed_index_mutation = acceptCommittedIndexMutation,
@@ -25664,12 +25842,14 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .restore_table = restoreTable,
                 .batch = batch,
                 .batch_group_local = batchGroupLocal,
+                .batch_group_local_routed = batchGroupLocalRouted,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_request = txnResolveGroupLocalWithRequest,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
@@ -25692,6 +25872,134 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
+    }
+
+    /// The marker is an owner-routed Raft command, not an empty grouped
+    /// mutation. Every selected range must acknowledge its exact catalog fence
+    /// before a coordinator can publish retained reads under range protection.
+    fn activateRangeTracking(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const normalized = try context.platformDeadline();
+        try normalized.ensureActive();
+        const route_options: db_mod.types.ScanOptions = .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation };
+        const router = self.router.withBudget(.fromRequest(route_options));
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalog, table, self.catalog.deadlineFrom(.{ .deadline_ns = normalized.deadline_ns }))) orelse return error.TableNotFound;
+        defer routing.deinit(alloc);
+        if (!routing.coversKeyspace() or routing.ranges.len > 256) return error.CatalogGenerationChanged;
+        // A local native owner already has the Raft routing coordinator. Let
+        // it cover the complete cohort once, rather than recursively activate
+        // every table range for each local participant or bypass its admission.
+        for (routing.ranges) |range| {
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, range.group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+            defer route.deinit(alloc);
+            if (route == .local) {
+                const local = self.groupLocalWriteSource() orelse return error.SqlRangeTrackingRequired;
+                if (!local.supports_sql_range_guards) return error.SqlRangeTrackingRequired;
+                return local.activateRangeTracking(alloc, table, normalized);
+            }
+        }
+        var client = self.httpClient(alloc);
+        const body = try encodeRemoteBatchRequest(alloc, .{ .activate_range_tracking = true });
+        defer alloc.free(body);
+        var cancellation = http_common.RequestCancellation.fromToken(normalized.cancellation);
+        for (routing.ranges) |range| {
+            try normalized.ensureActive();
+            const selected = routing.resolveRouteForKey(range.start_key) orelse return error.CatalogGenerationChanged;
+            var fence = routing.fenceForRoute(selected);
+            fence.admission_deadline_ns = normalized.deadline_ns;
+            fence.admission_cancellation = normalized.cancellation;
+            try bindRangeActivationOwner(&fence, normalized);
+            client.relation_owner_route = if (fence.route.execution == .native_local) fence else null;
+            client.relation_owner_purpose = .write;
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, range.group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+            defer route.deinit(alloc);
+            const remote = switch (route) {
+                .remote => |remote| remote,
+                .local => return error.TopologyChanged,
+            };
+            const encoded = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+            defer alloc.free(encoded);
+            const timeout = @min(try normalized.remainingTimeoutMs() orelse internal_batch_forwarding.max_remaining_ms, internal_batch_forwarding.max_remaining_ms);
+            var response = try client.fetchGroupBatchWithForwarding(remote.base_uri, range.group_id, table, body, timeout, .{
+                .remaining_ms = timeout,
+                .forwards_remaining = internal_batch_forwarding.max_forwards,
+                .campaign_allowed = true,
+            }, if (normalized.cancellation.ptr != null) &cancellation else null, encoded);
+            response.deinit(alloc);
+        }
+    }
+
+    fn sqlMaintenanceGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.LeaderUnavailable;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => sqlMaintenanceGroupLocal(ptr, alloc, group_id, table_name, body),
+            .remote => |remote| remote: {
+                var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                var control = http_common.RequestCancellation.fromToken(cancellation);
+                var response = try client.fetchGroupSqlMaintenanceWithCancellation(remote.base_uri, group_id, table_name, body, &control);
+                defer response.deinit(alloc);
+                break :remote try alloc.dupe(u8, response.body);
+            },
+        };
+    }
+
+    fn sqlMaintenanceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        if (fence.route.group_id != group_id) return error.TopologyChanged;
+        var target = (try table_router.resolveCapturedGroupRoute(alloc, self.catalog, self.router, fence, .prefer_leader)) orelse return error.LeaderUnavailable;
+        defer target.deinit(alloc);
+        return switch (target) {
+            .local => sqlMaintenanceGroupLocalRouted(ptr, alloc, fence, group_id, table_name, body, cancellation),
+            .remote => |remote| remote: {
+                var client = self.httpClient(alloc);
+                client.relation_owner_route = fence;
+                var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").api_sql_maintenance_contract.Request, alloc, body, .{});
+                defer parsed.deinit();
+                try parsed.value.validate();
+                client.relation_owner_purpose = if (parsed.value.operation == .statistics) .read else .write;
+                var control = http_common.RequestCancellation.fromToken(cancellation);
+                var response = try client.fetchGroupSqlMaintenanceRoutedWithCancellation(remote.base_uri, fence, group_id, table_name, body, &control);
+                defer response.deinit(alloc);
+                break :remote try alloc.dupe(u8, response.body);
+            },
+        };
+    }
+
+    fn sqlMaintenanceGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.routeFenceDeadline(fence));
+        if (fence.route.group_id != group_id) return error.TopologyChanged;
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return local_source.sqlMaintenanceGroupLocalRouted(alloc, fence, group_id, table_name, body, cancellation);
+        }
+        if (fence.route.execution == .native_local) return error.CatalogRouteFenceUnsupported;
+        return sqlMaintenanceGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn sqlMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try local_source.sqlMaintenanceGroupLocal(alloc, group_id, table_name, body);
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        return try cached.db.sqlMaintenanceJson(alloc, body);
     }
 
     fn graphMetricMaintenanceGroupLocal(
@@ -26280,9 +26588,49 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const atomic_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
+        if (try distributed_txn.executeNativeAtomicBatch(alloc, self.catalog, .{ .ptr = self, .apply = nativeAtomicApply }, tables, nextTxnTimestamp(atomic_io), sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
         return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+    }
+
+    fn batchGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: db_mod.types.BatchRequest, route: metadata_api.CatalogRouteFence) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (route.route.group_id != group or route.route.execution != .native_local) return error.TopologyChanged;
+        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table, route, self.catalog.routeFenceDeadline(route));
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return owner.batchGroupLocalRouted(alloc, group, table, request, route);
+        } else return error.CatalogRouteFenceUnsupported;
+    }
+
+    fn nativeAtomicApply(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: db_mod.types.BatchRequest, cancellation: db_mod.types.CancellationToken) !void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        var route = (try table_router.resolveCapturedGroupRoute(alloc, self.catalog, self.router, fence, .prefer_leader)) orelse return error.LeaderUnavailable;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => {
+                if (comptime control_only_storage_sources) {
+                    const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+                    if ((try owner.batchGroupLocalRouted(alloc, fence.route.group_id, table, request, fence)) == null) return error.TableNotFound;
+                } else return error.CatalogRouteFenceUnsupported;
+            },
+            .remote => |remote| {
+                const body = try encodeStorageKernelBatchRequest(alloc, request);
+                defer alloc.free(body);
+                const encoded = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+                defer alloc.free(encoded);
+                var client = self.httpClient(alloc);
+                client.relation_owner_route = fence;
+                client.relation_owner_purpose = .write;
+                var control = http_common.RequestCancellation.fromToken(cancellation);
+                const budget: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = cancellation };
+                var response = try client.fetchGroupBatchWithForwarding(remote.base_uri, fence.route.group_id, table, body, try budget.remainingTimeoutMs(), null, &control, encoded);
+                defer response.deinit(alloc);
+            },
+        }
     }
 
     fn commitTransactionWithId(
@@ -26340,7 +26688,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
-        const commit_version = begin_timestamp + 1;
+        const commit_version = try distributed_txn.commitVersion(begin_timestamp);
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
             self.catalog,
@@ -26742,7 +27090,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             if (fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
         }
-        if (topology_epoch != 0)
+        if (topology_epoch != 0 and context.route_fence == null)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
@@ -26790,7 +27138,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
                 .topology_epoch = topology_epoch,
-                .retain_terminal = retain_terminal,
+                .retain_terminal = retain_terminal or context.external_decision_owner != null,
+                .external_decision_owner = context.external_decision_owner,
+                .sql_locks = context.sql_locks,
                 .participants = participants,
             } },
         }, topology_epoch, context);
@@ -26818,28 +27168,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
-        return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
-            .row_policy_principal_proof = req.row_policy_principal_proof,
-            .row_policy_database = req.row_policy_database,
-            .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
-            .writes = transactionWritesAsBatchWrites(req.writes),
-            .deletes = req.deletes,
-            .transforms = req.transforms,
-            .predicates = req.predicates,
-            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
-            .integrity = req.integrity,
-            .integrity_commands = req.integrity_commands,
-            .range_guards = req.range_guards,
-            .relational_activation = req.relational_activation,
-            .relational_retirement = req.relational_retirement,
-            .relational_index_maintenance = req.relational_index_maintenance,
-            .schema_version = req.schema_version,
-            .relational_schema_version = req.relational_schema_version,
-            .relational_integrity_generation_set = req.relational_integrity_generation_set,
-            .restore_staging_scope = req.restore_staging_scope,
-            .restore_staging_plan_id = req.restore_staging_plan_id,
-            .relational_repair = req.relational_repair,
-        }, topology_epoch, context);
+        return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, req.asBatch(txn_id, topology_epoch), topology_epoch, context);
     }
 
     fn txnResolveGroupLocal(
@@ -26868,12 +27197,23 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        return txnResolveGroupLocalWithRequest(ptr, alloc, group_id, table_name, .{ .txn_id = txn_id, .status = status, .commit_version = commit_version, .topology_epoch = topology_epoch, .sync_level = sync_level }, cancellation);
+    }
+
+    fn txnResolveGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: distributed_txn.TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !?void {
+        if (request.restore_staging_scope != null or request.restore_staging_plan_id != null) return error.InvalidBatchRequest;
+        const txn_id = request.txn_id;
+        const status = request.status;
+        const commit_version = request.commit_version;
+        const topology_epoch = request.topology_epoch;
+        const sync_level = request.sync_level;
         return try batchGroupLocalFencedWithCancellation(ptr, alloc, group_id, table_name, .{
             .sync_level = sync_level,
             .transaction = .{ .resolve = .{
                 .txn_id = txn_id,
                 .status = status,
                 .commit_version = commit_version,
+                .external_decision_owner = request.external_decision_owner,
             } },
         }, topology_epoch, cancellation);
     }
@@ -27903,15 +28243,6 @@ fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bo
         if (table.predicates.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null) return false;
     }
     return true;
-}
-
-fn tableCommitHasGraphProjectionTransform(table: distributed_txn.TableCommitRequest) !bool {
-    for (table.transforms) |transform| {
-        for (transform.operations) |operation| {
-            if (try db_mod.transform.graphProjectionPath(operation.path) != null) return true;
-        }
-    }
-    return false;
 }
 
 fn statelessBatchRetryDelayNs(attempt: u8) u64 {
@@ -33872,7 +34203,64 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 0), clock.calls);
         }
 
-        test "raft single-group fast path excludes graph projection transforms only" {
+        test "SQL relation lifetime native fast paths retain owner authority by declining both Raft and local shortcuts" {
+            const p = @import("antfly_local_sources").common_topology_records.RelationPersistence;
+            const Catalog = struct {
+                native: [1]metadata_table_manager.TableRecord,
+                calls: usize = 0,
+                fn adminSnapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    var result = try ProvisionedWriteCoalesceTestCatalog.adminSnapshot(undefined);
+                    result.tables = &self.native;
+                    return result;
+                }
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn source(self: *@This()) table_catalog.CatalogSource {
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot, .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot, .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot, .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot } };
+                }
+            };
+            const Effects = struct {
+                calls: usize = 0,
+                fn group(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                }
+                fn routed(raw: *anyopaque, a: std.mem.Allocator, route: metadata_api.CatalogRouteFence, name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+                    return group(raw, a, route.route.group_id, name, req);
+                }
+            };
+            inline for (.{ p.Kind.unlogged, p.Kind.temporary }) |kind| {
+                const descriptor: p.Descriptor = .{ .kind = kind, .owner_node_id = 9, .owner_store_id = 11, .generation_instance = @splat(1), .data_generation = 1, .owner = if (kind == .temporary) .{ .issuer_node_id = 5, .connection_id = @splat(2), .wire_epoch = @splat(3), .execution_instance = @splat(4), .connection_generation = 1, .principal_digest = @splat(5) } else null };
+                var catalog = Catalog{ .native = .{.{ .table_id = 7, .name = "docs", .placement_role = "data", .indexes_json = tables_api.default_indexes_json, .sql_persistence = descriptor }} };
+                var effects: Effects = .{};
+                var local_source = ProvisionedTableWriteSource.init("unused-native-fast-path", catalog.source());
+                defer local_source.deinit();
+                const req: distributed_txn.TableCommitRequest = .{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} };
+                // Even an older caller with no captured optional descriptor
+                // must discover native kind in the existing routing snapshot.
+                try std.testing.expect((try local_source.commitSingleGroupBatch(std.testing.allocator, &.{req}, .write, .none)) == null);
+                var routed_source = ProvisionedTableWriteSource.init("unused-native-fast-path", catalog.source());
+                defer routed_source.deinit();
+                _ = routed_source.withRaftBatcher(.{ .ptr = &effects, .vtable = &.{ .batch_group = Effects.group, .batch_group_routed_with_cancellation = Effects.routed, .batch_group_local = Effects.group } });
+                try std.testing.expect((try routed_source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{req}, .write, .none)) == null);
+                var captured = req;
+                captured.sql_persistence = descriptor;
+                try std.testing.expect((try local_source.commitSingleGroupBatch(std.testing.allocator, &.{captured}, .write, .none)) == null);
+                try std.testing.expect((try routed_source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{captured}, .write, .none)) == null);
+                try std.testing.expectEqual(@as(usize, 0), effects.calls);
+                try std.testing.expect(catalog.calls >= 2);
+            }
+            var ordinary_effects: Effects = .{};
+            var ordinary = ProvisionedTableWriteSource.init("unused-native-fast-path", ProvisionedWriteCoalesceTestCatalog.iface());
+            defer ordinary.deinit();
+            _ = ordinary.withRaftBatcher(.{ .ptr = &ordinary_effects, .vtable = &.{ .batch_group = Effects.group, .batch_group_routed_with_cancellation = Effects.routed, .batch_group_local = Effects.group } });
+            const result = (try ordinary.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }}, .write, .none)) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(result == .committed);
+            try std.testing.expectEqual(@as(usize, 1), ordinary_effects.calls);
+        }
+
+        test "raft single-group fast path retains ordinary graph transforms and rejects protected effects" {
             const Capture = struct {
                 calls: usize = 0,
                 transforms: usize = 0,
@@ -33885,11 +34273,22 @@ fn consumerTests() type {
                     req: db_mod.types.BatchRequest,
                 ) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(req.transaction == null);
+                    try std.testing.expect(req.graph_preparation == null);
+                    try std.testing.expectEqual(@as(usize, 0), req.trigger_receipts.len);
                     self.calls += 1;
                     self.transforms = req.transforms.len;
                 }
 
                 fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+                    try std.testing.expectEqual(@as(u64, 7), route_capability.table_id);
+                    try std.testing.expect(req.transforms.len == 1);
+                    if (req.transforms[0].operations.len == 2) {
+                        try std.testing.expectEqual(.inc, req.transforms[0].operations[0].op);
+                        try std.testing.expectEqualStrings("n", req.transforms[0].operations[0].path);
+                        try std.testing.expectEqual(.push, req.transforms[0].operations[1].op);
+                        try std.testing.expectEqualStrings("$._edges.graph.FRIEND", req.transforms[0].operations[1].path);
+                    }
                     return batchGroup(ptr, allocator, route_capability.route.group_id, table_name, req);
                 }
 
@@ -33916,19 +34315,31 @@ fn consumerTests() type {
                 },
             });
 
-            const graph = try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{
+            const graph_request: distributed_txn.TableCommitRequest = .{
                 .table_name = "docs",
                 .transforms = &.{.{
                     .key = "doc:a",
-                    .operations = &.{.{
-                        .op = .push,
-                        .path = "$._edges.graph.FRIEND",
-                        .value_json = "{\"target\":\"doc:b\"}",
-                    }},
+                    .operations = &.{
+                        .{ .op = .inc, .path = "n", .value_json = "1" },
+                        .{ .op = .push, .path = "$._edges.graph.FRIEND", .value_json = "{\"target\":\"doc:b\"}" },
+                    },
                 }},
-            }}, .write, .none);
-            try std.testing.expect(graph == null);
-            try std.testing.expectEqual(@as(usize, 0), capture.calls);
+            };
+            const graph = (try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{graph_request}, .write, .none)) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(graph == .committed);
+            try std.testing.expectEqual(@as(usize, 1), capture.calls);
+            try std.testing.expectEqual(@as(usize, 1), capture.transforms);
+
+            var protected = graph_request;
+            protected.row_policy_principal_proof = "must-not-drop";
+            try std.testing.expect((try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{protected}, .write, .none)) == null);
+            protected = graph_request;
+            protected.schema_version = 1;
+            try std.testing.expect((try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{protected}, .write, .none)) == null);
+            protected = graph_request;
+            protected.restore_staging_plan_id = @splat(1);
+            try std.testing.expect((try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{protected}, .write, .none)) == null);
+            try std.testing.expectEqual(@as(usize, 1), capture.calls);
 
             const ordinary = (try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{
                 .table_name = "docs",
@@ -33938,7 +34349,7 @@ fn consumerTests() type {
                 }},
             }}, .write, .none)) orelse return error.TestUnexpectedResult;
             try std.testing.expect(ordinary == .committed);
-            try std.testing.expectEqual(@as(usize, 1), capture.calls);
+            try std.testing.expectEqual(@as(usize, 2), capture.calls);
             try std.testing.expectEqual(@as(usize, 1), capture.transforms);
         }
 
@@ -34479,7 +34890,7 @@ fn consumerTests() type {
                 .on_change = Hook.onChange,
             });
 
-            source.publishStorageOwnerDataChange(std.testing.allocator, "docs");
+            source.publishStorageOwnerDataChange("docs", .{});
 
             try std.testing.expectEqual(@as(usize, 1), hook.calls);
             try std.testing.expectEqualStrings("docs", hook.table_name.?);

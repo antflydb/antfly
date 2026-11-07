@@ -45,6 +45,8 @@ pub const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     db_live: bool = true,
+    /// Private boot recovery handles expose native control observations only.
+    storage_owner_lifetime_recovery: bool = false,
     io_lifetime_lease: bool = false,
     /// Public Lite connections borrow a persistent compatible storage owner.
     lite_connection: ?*@import("lite_connection.zig").Connection = null,
@@ -118,10 +120,15 @@ pub const Handle = struct {
     storage_owner_managed_config: local_write.OwnerManagedConfig = .{},
     storage_owner_target_observer: kernel_owner_abi.TargetObserver = .{},
     storage_owner_table_name: ?[]u8 = null,
+    sql_preparation_secret: ?[]u8 = null,
+    sql_preparation_issuer: ?[]u8 = null,
     row_policy_authority_secret: ?[]u8 = null,
     row_policy_authority_issuer: ?[]u8 = null,
     storage_owner_group_id: u64 = 0,
     storage_owner_root_generation: u64 = 0,
+    /// One bounded committed schema preparation per physical owner. Its
+    /// registry pin must be drained on the control lane before owner close.
+    storage_owner_schema_preparing: std.atomic.Value(bool) = .init(false),
     storage_owner_context: ?*anyopaque = null,
     storage_owner_transaction_recovery: ?*anyopaque = null,
     storage_owner_runtime_hooks: ?*anyopaque = null,
@@ -166,6 +173,7 @@ pub const Handle = struct {
     }
 
     pub fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
+        if (self.storage_owner_lifetime_recovery) return error.SqlRelationRecoveryIncomplete;
         const hook = self.readable_lease_hook orelse return;
         try hook.featureReads().prepareSearch(hook.group_id, req);
     }
@@ -191,6 +199,7 @@ pub const Handle = struct {
     }
 
     pub fn prepareLookupRequest(self: *Handle, key: []const u8, opts: db_mod.types.LookupOptions) !void {
+        if (self.storage_owner_lifetime_recovery) return error.SqlRelationRecoveryIncomplete;
         const hook = self.readable_lease_hook orelse return;
         try hook.featureReads().prepareLookup(hook.group_id, key, opts);
     }
@@ -201,6 +210,7 @@ pub const Handle = struct {
         to_key: []const u8,
         opts: db_mod.types.ScanOptions,
     ) !void {
+        if (self.storage_owner_lifetime_recovery) return error.SqlRelationRecoveryIncomplete;
         const hook = self.readable_lease_hook orelse return;
         try hook.featureReads().prepareScan(hook.group_id, from_key, to_key, opts);
     }
@@ -312,6 +322,11 @@ pub fn closeHandle(handle: *Handle) void {
     if (handle.owned_lite_runtime) |*runtime| runtime.deinit();
     if (handle.storage_owner_path) |path| handle.alloc.free(path);
     if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
+    if (handle.sql_preparation_secret) |secret| {
+        @memset(secret, 0);
+        handle.alloc.free(secret);
+    }
+    if (handle.sql_preparation_issuer) |issuer| handle.alloc.free(issuer);
     if (handle.row_policy_authority_secret) |secret| {
         @memset(secret, 0);
         handle.alloc.free(secret);

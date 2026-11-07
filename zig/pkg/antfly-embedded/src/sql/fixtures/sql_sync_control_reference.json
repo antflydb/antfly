@@ -1,0 +1,281 @@
+{
+  "oracle": "PostgreSQL 18 custom GUC lifetime; native visibility verified separately",
+  "cases": [
+    {
+      "id": "sql-0774",
+      "source_entry_sha256": "4d54c0edc61ecc50b620591913f32e60b7b15f5e2aede3f4f458242bd6d16440",
+      "name": "sync level session catalog syntax",
+      "family": "ddl",
+      "sql": "SET antfly.sync_level = 'full_index';",
+      "params": [],
+      "source_expectation": "requires_behavior_review"
+    },
+    {
+      "id": "sql-0775",
+      "source_entry_sha256": "0b7dc043a7af9bf8650a30b25f7cd1fb8010519276c83ec7f0008e481cf16015",
+      "name": "local sync level session catalog syntax",
+      "family": "ddl",
+      "sql": "SET LOCAL antfly.sync_level = 'propose';",
+      "params": [],
+      "source_expectation": "requires_behavior_review"
+    }
+  ],
+  "actions": [
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "write"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": "sql-0774",
+      "sql": "SET antfly.sync_level = 'full_index';",
+      "command_tag": "SET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "full_index"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": "sql-0775",
+      "sql": "SET LOCAL antfly.sync_level = 'propose';",
+      "command_tag": "SET",
+      "rows": [],
+      "notices": [
+        "25P01"
+      ]
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "full_index"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "BEGIN",
+      "command_tag": "BEGIN",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": "sql-0775",
+      "sql": "SET LOCAL antfly.sync_level = 'propose';",
+      "command_tag": "SET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "propose"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SAVEPOINT inner_scope",
+      "command_tag": "SAVEPOINT",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SET antfly.sync_level='full_text'",
+      "command_tag": "SET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "full_text"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "ROLLBACK TO inner_scope",
+      "command_tag": "ROLLBACK",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "propose"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "RELEASE inner_scope",
+      "command_tag": "RELEASE",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "COMMIT",
+      "command_tag": "COMMIT",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "full_index"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "BEGIN",
+      "command_tag": "BEGIN",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SET antfly.sync_level='enrichments'",
+      "command_tag": "SET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SET LOCAL antfly.sync_level='write'",
+      "command_tag": "SET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "COMMIT",
+      "command_tag": "COMMIT",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "enrichments"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "BEGIN",
+      "command_tag": "BEGIN",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SET antfly.sync_level='full_text'",
+      "command_tag": "SET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "ROLLBACK",
+      "command_tag": "ROLLBACK",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "enrichments"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "RESET antfly.sync_level",
+      "command_tag": "RESET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "write"
+        ]
+      ],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SET antfly.sync_level='full_index'",
+      "command_tag": "SET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "RESET ALL",
+      "command_tag": "RESET",
+      "rows": [],
+      "notices": []
+    },
+    {
+      "id": null,
+      "sql": "SHOW antfly.sync_level",
+      "command_tag": "SHOW",
+      "rows": [
+        [
+          "write"
+        ]
+      ],
+      "notices": []
+    }
+  ]
+}

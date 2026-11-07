@@ -39,6 +39,34 @@ pub fn permitsOrdinal(evaluator: *const policies.Evaluator, alloc: std.mem.Alloc
 /// One workspace per retained cursor. Only referenced ordinals are touched
 /// for each row, and temporary cell/predicate allocations reuse the arena's
 /// retained capacity. The full Datum vector is allocated once, not per row.
+/// The logical policy remains bound to its exact schema version and full
+/// digest. A historical AROW retains its actual physical header/layout; only
+/// independently identical native layouts may project its ordinals unchanged.
+pub const IdentityProjection = struct {
+    logical_schema_version: u32,
+    column_count: usize,
+    identity_layout_digest: [32]u8,
+
+    pub fn init(logical: @import("schema_registry.zig").SchemaView, expected_version: u32, expected_digest: [32]u8) !IdentityProjection {
+        const schema = logical.tableSchema().*;
+        const layout = logical.physicalLayout();
+        return fromLayout(schema.version, schema.relational_columns.len, layout, expected_version, expected_digest);
+    }
+
+    pub fn fromLayout(version: u32, count: usize, layout: *const codec.PhysicalLayout, expected_version: u32, expected_digest: [32]u8) !IdentityProjection {
+        if (version != expected_version or layout.schema_version != version or layout.column_count != count or
+            !std.mem.eql(u8, &layout.schema_digest, &expected_digest)) return error.RowPolicyCatalogChanged;
+        return .{ .logical_schema_version = version, .column_count = count, .identity_layout_digest = layout.identity_layout_digest };
+    }
+
+    fn require(self: *const IdentityProjection, evaluator: *const policies.Evaluator, row: codec.OrdinalRowView) !void {
+        if (evaluator.schema_version != self.logical_schema_version or evaluator.column_count != self.column_count or
+            row.table_schema.version > self.logical_schema_version or row.layout.schema_version != row.table_schema.version or
+            row.table_schema.relational_columns.len != self.column_count or row.layout.column_count != self.column_count or
+            !std.mem.eql(u8, &row.layout.identity_layout_digest, &self.identity_layout_digest)) return error.RowPolicyCatalogChanged;
+    }
+};
+
 pub const EvaluationScratch = struct {
     evaluator: *const policies.Evaluator,
     alloc: std.mem.Allocator,
@@ -61,13 +89,22 @@ pub const EvaluationScratch = struct {
         const evaluator = self.evaluator;
         if (row.table_schema.version != evaluator.schema_version or row.table_schema.relational_columns.len != evaluator.column_count)
             return error.RowPolicyCatalogChanged;
+        return self.evaluatePhysicalCells(row);
+    }
+
+    pub fn permitsProjected(self: *EvaluationScratch, row: codec.OrdinalRowView, projection: *const IdentityProjection) !bool {
+        try projection.require(self.evaluator, row);
+        return self.evaluatePhysicalCells(row);
+    }
+
+    fn evaluatePhysicalCells(self: *EvaluationScratch, row: codec.OrdinalRowView) !bool {
+        const evaluator = self.evaluator;
         _ = self.arena.reset(.retain_capacity);
         const scratch = self.arena.allocator();
         for (evaluator.required_columns) |ordinal| {
-            const index: usize = @intCast(ordinal);
-            self.cells[index] = .{};
-            const cell = (try row.findCell(index)) orelse continue;
-            self.cells[index] = .{ .value = try row.materializeCellAlloc(scratch, cell), .sql_null = cell.is_null };
+            const value = (try row.sqlDatumAlloc(scratch, ordinal)) orelse scalar.Datum{};
+            const column = try @import("../../sql/catalog.zig").Column.fromRelational(row.table_schema.relational_columns[ordinal], row.layout.enumView(ordinal));
+            self.cells[ordinal] = try @import("../../sql/document_row.zig").declaredCell(scratch, column, value);
         }
         return evaluator.permitsWithScratch(scratch, self.cells);
     }
@@ -259,7 +296,7 @@ pub const Gate = struct {
         if (state.row_policy_phase == .disabled or state.row_policy_phase == .active) {
             if (state.row_policy_phase == .active and
                 (state.row_policy_generation == 0 or state.row_policy_catalog_epoch == 0 or
-                    state.active_schema_version == 0 or state.storage_mode != .relational or
+                    state.storage_mode != .relational or
                     state.row_policy_generation < self.generation.load(.acquire))) return error.RowPolicyCatalogChanged;
             if (state.row_policy_phase == .disabled and
                 (state.row_policy_generation < self.generation.load(.acquire) or
@@ -273,6 +310,29 @@ pub const Gate = struct {
         return error.RowPolicyCatalogChanged;
     }
 };
+
+test "row-policy gate publishes native zero schema epochs but retains generation guards" {
+    var gate = Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 0 });
+    try gate.beginPreparing(.disabled);
+    try std.testing.expectError(error.RowPolicyCatalogChanged, gate.publishCommitted(.{
+        .mode_initialized = true,
+        .storage_mode = .relational,
+        .active_schema_version = 0,
+        .row_policy_phase = .active,
+        .row_policy_generation = 0,
+        .row_policy_catalog_epoch = 1,
+    }));
+    try gate.publishCommitted(.{
+        .mode_initialized = true,
+        .storage_mode = .relational,
+        .active_schema_version = 0,
+        .row_policy_phase = .active,
+        .row_policy_generation = 1,
+        .row_policy_catalog_epoch = 1,
+    });
+    try std.testing.expectEqual(@as(u32, 0), gate.schema_version.load(.acquire));
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, gate.enterRaw());
+}
 
 test "row-policy gate drains raw leases before publishing a generation" {
     var gate = Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3 });

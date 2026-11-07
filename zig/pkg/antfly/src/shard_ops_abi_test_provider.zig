@@ -149,5 +149,19 @@ export fn restore_persistence_test_provider(out: *@import("api/restore_jobs.zig"
     out.* = Jobs.ReplicatedPersistence.fromLocal(&Fixture.marker, .{ .load = Fixture.load, .get = Fixture.get, .put = Fixture.put, .delete = Fixture.delete, .delete_many = Fixture.deleteMany, .create_with_staging = Fixture.create });
 }
 
+export fn schema_preparation_test_provider(out: *@import("api/schema_validation_preparation.zig").Port, failure: *errors.Status) callconv(.c) void {
+    const Fixture = struct {
+        fn prepare(ptr: *anyopaque, a: std.mem.Allocator, group: u64, table: []const u8, request: @import("api/schema_validation_preparation.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+            try context.ensureActive();
+            try check(ptr, 42);
+            if (group != 17 or !std.mem.eql(u8, table, "rows") or request.group_id != group or !context.schema_validation_authority) return error.InvalidArgument;
+            // Ownership crosses successfully, but the consumer must still
+            // reject a malformed envelope before interpreting any authority.
+            return a.dupe(u8, "not a signed preparation");
+        }
+    };
+    out.* = .{ .ptr = failure, .prepare_fn = Fixture.prepare };
+}
+
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

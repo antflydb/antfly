@@ -714,372 +714,10 @@ const FakeAntflyProvider = struct {
     }
 };
 
-test "public api smoke integration creates table inserts and queries documents" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-full-e2e-root", .{tmp.sub_path});
-    defer std.testing.allocator.free(replica_root);
-    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-full-e2e-catalog.txt", .{tmp.sub_path});
-    defer std.testing.allocator.free(replica_catalog_path);
-    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
-    defer store.deinit();
-    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
-    var svc = try metadata_service.MetadataService.init(std.testing.allocator, .{
-        .host = .{
-            .local_node_id = 1,
-            .metadata_group_id = group_ids.main_metadata_group_id,
-            .replica_root_dir = replica_root,
-            .replica_catalog_path = replica_catalog_path,
-        },
-    }, .{
-        .host = .{
-            .host = .{
-                .descriptor_factory = factory.iface(),
-            },
-        },
-    }, .{});
-    defer svc.deinit();
-
-    _ = try svc.ensureMetadataReplica(.{
-        .group_id = group_ids.main_metadata_group_id,
-        .replica_id = 1,
-        .local_node_id = 1,
-        .bootstrap_mode = .empty,
-    });
-    try svc.campaignMetadataGroup();
-    try svc.runRound();
-    try svc.upsertNode(.{ .node_id = 1 });
-    try svc.upsertStore(.{
-        .store_id = 1,
-        .node_id = 1,
-        .role = "data",
-        .health_class = "healthy",
-        .live = true,
-        .capacity_bytes = 1024 * 1024 * 1024,
-        .available_bytes = 1024 * 1024 * 1024,
-    });
-    try svc.runRound();
-
-    var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
-        replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
-        raft_mod.read_gate.alreadyReadSafeBarrier(),
-    );
-    var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
-        replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
-    );
-    var provisioned_storage = ProvisionedGroupStorage.init(std.testing.allocator);
-    defer {
-        provisioned_write_source.quiesce();
-        provisioned_storage.detachWriteSourceRuntimeHooks();
-        provisioned_storage.deinit();
-        provisioned_write_source.deinit();
-    }
-    try provisioned_storage.attachSources(&provisioned_read_source, &provisioned_write_source);
-    const DirectWriterOwner = struct {
-        fn metadataMayOpenReplicaRoots(_: *anyopaque) bool {
-            return false;
-        }
-    };
-    var direct_writer_owner: u8 = 0;
-    svc.setLocalReplicaRootReconcilePermitHook(.{
-        .ptr = &direct_writer_owner,
-        .vtable = &.{ .should_reconcile = DirectWriterOwner.metadataMayOpenReplicaRoots },
-    });
-    var server = http_server.ApiHttpServer.init(
-        std.testing.allocator,
-        .{ .deployment_mode = .standalone },
-        http_server.StatusSource.fromMetadataService(&svc),
-        provisioned_read_source.source(),
-        provisioned_write_source.source(),
-    );
-    defer server.deinit();
-    var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
-    defer listener.deinit();
-
-    const base_uri = try listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(base_uri);
-
-    var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
-    defer executor.deinit();
-    var client = http_client.ApiHttpClient.init(std.testing.allocator, executor.executor());
-
-    const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
-    defer std.testing.allocator.free(create_body);
-    var created = try client.createTable(base_uri, "docs", create_body);
-    defer created.deinit(std.testing.allocator);
-    var created_table = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, created.body, .{});
-    defer created_table.deinit();
-    try std.testing.expectEqualStrings("docs", created_table.value.name);
-    try std.testing.expectEqualStrings("docs table", created_table.value.description.?);
-    try std.testing.expectEqual(@as(usize, 1), created_table.value.indexes.map.count());
-    try std.testing.expect(created_table.value.indexes.map.get("full_text_index_v0") != null);
-
-    const customers_create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "customers table");
-    defer std.testing.allocator.free(customers_create_body);
-    var created_customers = try client.createTable(base_uri, "customers", customers_create_body);
-    defer created_customers.deinit(std.testing.allocator);
-
-    const addresses_create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "addresses table");
-    defer std.testing.allocator.free(addresses_create_body);
-    var created_addresses = try client.createTable(base_uri, "addresses", addresses_create_body);
-    defer created_addresses.deinit(std.testing.allocator);
-
-    // Creation is direct-local in this harness, while the remainder exercises
-    // the public distributed query contract over those projected groups.
-    server.cfg.deployment_mode = .distributed;
-
-    var rounds: usize = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
-
-    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
-    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
-    try std.testing.expect(projected_ranges.len > 0);
-    const projected_tables = try svc.listProjectedTables(std.testing.allocator);
-    defer svc.freeProjectedTables(std.testing.allocator, projected_tables);
-    const docs_identity = try resolveTestTable(&svc, "docs");
-    defer std.testing.allocator.free(docs_identity.name);
-    const docs_table_id = docs_identity.table_id;
-    const group_id = for (projected_ranges) |range| {
-        if (range.table_id == docs_table_id) break range.group_id;
-    } else return error.TestUnexpectedResult;
-    // The direct-local fixture bypasses the data-host bootstrapper. Publish
-    // the ownership intent it would normally commit so schema progress has a
-    // concrete hosting node and cannot cut over from ownerless evidence.
-    try svc.upsertReplicaIntent(.{
-        .record = .{
-            .group_id = group_id,
-            .replica_id = 1,
-            .local_node_id = 1,
-            .bootstrap_mode = .empty,
-        },
-        .store_id = 1,
-        .peer_node_ids = &.{1},
-    }, null, 0, false);
-    rounds = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
-
-    {
-        var writer = provisioned_write_source.leaseManagedWriterGroupForTransition(group_id) orelse
-            return error.TestUnexpectedResult;
-        defer writer.deinit(std.testing.allocator);
-        try std.testing.expect(writer.db.core.index_manager.textIndex("full_text_index_v0") != null);
-    }
-
-    var table_detail = try client.fetchTable(base_uri, "docs");
-    defer table_detail.deinit(std.testing.allocator);
-    var parsed_detail = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, table_detail.body, .{});
-    defer parsed_detail.deinit();
-    try std.testing.expectEqualStrings("docs", parsed_detail.value.name);
-    try std.testing.expect(parsed_detail.value.indexes.map.get("full_text_index_v0") != null);
-
-    var listed_tables = try client.fetchTables(base_uri, null);
-    defer listed_tables.deinit(std.testing.allocator);
-    var parsed_table_list = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, listed_tables.body, .{});
-    defer parsed_table_list.deinit();
-    try std.testing.expectEqual(@as(usize, 3), parsed_table_list.value.len);
-    var found_docs = false;
-    var found_customers = false;
-    var found_addresses = false;
-    for (parsed_table_list.value) |table| {
-        found_docs = found_docs or std.mem.eql(u8, table.name, "docs");
-        found_customers = found_customers or std.mem.eql(u8, table.name, "customers");
-        found_addresses = found_addresses or std.mem.eql(u8, table.name, "addresses");
-    }
-    try std.testing.expect(found_docs and found_customers and found_addresses);
-
-    var prefixed_tables = try client.fetchTables(base_uri, "do");
-    defer prefixed_tables.deinit(std.testing.allocator);
-    var parsed_prefixed_tables = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, prefixed_tables.body, .{});
-    defer parsed_prefixed_tables.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed_prefixed_tables.value.len);
-
-    var missing_prefix_tables = try client.fetchTables(base_uri, "zzz");
-    defer missing_prefix_tables.deinit(std.testing.allocator);
-    var parsed_missing_prefix_tables = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, missing_prefix_tables.body, .{});
-    defer parsed_missing_prefix_tables.deinit();
-    try std.testing.expectEqual(@as(usize, 0), parsed_missing_prefix_tables.value.len);
-
-    const schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(std.testing.allocator);
-    defer std.testing.allocator.free(schema_body);
-    var updated_schema = try client.updateTableSchema(base_uri, "docs", schema_body);
-    defer updated_schema.deinit(std.testing.allocator);
-    var parsed_updated_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, updated_schema.body, .{});
-    defer parsed_updated_schema.deinit();
-    try std.testing.expect(parsed_updated_schema.value.schema != null);
-    try std.testing.expect(parsed_updated_schema.value.schema.?.document_schemas != null);
-    try std.testing.expect(parsed_updated_schema.value.migration != null);
-    try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
-    try std.testing.expectEqual(@as(?u32, 0), parsed_updated_schema.value.migration.?.read_schema.version);
-
-    var table_detail_after_schema = try client.fetchTable(base_uri, "docs");
-    defer table_detail_after_schema.deinit(std.testing.allocator);
-    var parsed_table_detail_after_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, table_detail_after_schema.body, .{});
-    defer parsed_table_detail_after_schema.deinit();
-    try std.testing.expect(parsed_table_detail_after_schema.value.migration != null);
-    try std.testing.expectEqualStrings("rebuilding", parsed_table_detail_after_schema.value.migration.?.state);
-    try std.testing.expect(parsed_table_detail_after_schema.value.indexes.map.get("full_text_index_v0") != null);
-    try std.testing.expect(parsed_table_detail_after_schema.value.indexes.map.get("full_text_index_v1") != null);
-
-    var index_detail = try client.fetchTableIndex(base_uri, "docs", "full_text_index_v0");
-    defer index_detail.deinit(std.testing.allocator);
-    var parsed_index = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, index_detail.body);
-    defer parsed_index.deinit();
-    try std.testing.expectEqualStrings("full_text_index_v0", parsed_index.value.config.name);
-
-    var listed_indexes_after_schema = try client.fetchTableIndexes(base_uri, "docs");
-    defer listed_indexes_after_schema.deinit(std.testing.allocator);
-    var parsed_listed_indexes_after_schema = try parseJsonBodyIgnoreUnknown([]IndexStatusSummary, std.testing.allocator, listed_indexes_after_schema.body);
-    defer parsed_listed_indexes_after_schema.deinit();
-    try std.testing.expectEqual(@as(usize, 2), parsed_listed_indexes_after_schema.value.len);
-    try std.testing.expectEqualStrings("full_text_index_v0", parsed_listed_indexes_after_schema.value[0].config.name);
-    try std.testing.expectEqualStrings("full_text_index_v1", parsed_listed_indexes_after_schema.value[1].config.name);
-
-    const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(std.testing.allocator, "embed_idx");
-    defer std.testing.allocator.free(create_index_body);
-    var created_index = try client.createTableIndex(base_uri, "docs", "embed_idx", create_index_body);
-    defer created_index.deinit(std.testing.allocator);
-
-    // Index creation is accepted before the writer-owned structural worker
-    // has published its durable generation. Wait on that owner's activity
-    // contract instead of assuming a fixed number of metadata rounds is
-    // enough on a loaded CI runner.
-    var structural_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer structural_wait_io.deinit();
-    var structural_wait_attempts: usize = 0;
-    while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (structural_wait_attempts += 1) {
-        try svc.runRound();
-        structural_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
-    }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
-
-    // This fixture performs data-group writes directly instead of running a
-    // second Raft host. Model the data owner's normal lifecycle explicitly:
-    // verify every locally owned range from durable DB state, publish that
-    // proof to metadata, then let metadata perform the generation cutover.
-    const progress_tables = try svc.listProjectedTables(std.testing.allocator);
-    defer svc.freeProjectedTables(std.testing.allocator, progress_tables);
-    const progress_ranges = try svc.listProjectedRanges(std.testing.allocator);
-    defer svc.freeProjectedRanges(std.testing.allocator, progress_ranges);
-    const local_schema_progress = try metadata_mod.table_provisioner.collectLocalSchemaProgress(
-        std.testing.allocator,
-        replica_root,
-        group_ids.main_metadata_group_id,
-        1,
-        &.{group_id},
-        progress_tables,
-        progress_ranges,
-    );
-    defer std.testing.allocator.free(local_schema_progress);
-    try std.testing.expectEqual(@as(usize, 1), local_schema_progress.len);
-    for (local_schema_progress) |progress| try svc.upsertSchemaProgress(progress);
-
-    var schema_progress_committed = false;
-    rounds = 0;
-    while (rounds < 32) : (rounds += 1) {
-        try svc.runRound();
-        const projected_progress = try svc.listProjectedSchemaProgress(std.testing.allocator);
-        defer svc.freeProjectedSchemaProgress(std.testing.allocator, projected_progress);
-        for (projected_progress) |progress| {
-            if (progress.table_id == docs_table_id and progress.node_id == 1 and progress.schema_version == 1) {
-                schema_progress_committed = true;
-                break;
-            }
-        }
-        if (schema_progress_committed) break;
-    }
-    try std.testing.expect(schema_progress_committed);
-
-    // A production MetadataServer owns this control loop. This lightweight
-    // fixture embeds MetadataService directly, so run the same projected-state
-    // seed and lease-fenced reconciliation explicitly after the data owner has
-    // published its completion proof.
-    var schema_control_loop = metadata_mod.MetadataControlLoop.init(std.testing.allocator);
-    defer schema_control_loop.deinit();
-    try schema_control_loop.stateRef().syncProjected(&svc);
-    try schema_control_loop.stateRef().seedDesiredFromProjected();
-    _ = try svc.reconcilePreparedIfLeaseHeld(&schema_control_loop) orelse
-        return error.ReconcileLeaseNotHeld;
-
-    var schema_migration_finalized = false;
-    rounds = 0;
-    while (rounds < 32) : (rounds += 1) {
-        try svc.runRound();
-        const current_tables = try svc.listProjectedTables(std.testing.allocator);
-        defer svc.freeProjectedTables(std.testing.allocator, current_tables);
-        for (current_tables) |table| {
-            if (table.table_id != docs_table_id) continue;
-            schema_migration_finalized = table.read_schema_json.len == 0;
-            break;
-        }
-        if (schema_migration_finalized) break;
-    }
-    try std.testing.expect(schema_migration_finalized);
-
-    // Apply the committed metadata generation to the resident writer, as the
-    // data runtime's local-replica reconciliation hook does in production.
-    // Without this step the lightweight fixture would retain the pre-cutover
-    // cached writer even though metadata correctly moved reads to v1.
-    var owner_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer owner_wait_io.deinit();
-    var owner_wait_attempts: usize = 0;
-    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
-        try svc.runRound();
-        owner_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
-    }
-    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
-
-    const finalized_tables = try svc.listProjectedTables(std.testing.allocator);
-    defer svc.freeProjectedTables(std.testing.allocator, finalized_tables);
-    const finalized_ranges = try svc.listProjectedRanges(std.testing.allocator);
-    defer svc.freeProjectedRanges(std.testing.allocator, finalized_ranges);
-    _ = try provisioned_write_source.reconcileReplicaRootTablesWithWriteCache(
-        std.testing.allocator,
-        group_ids.main_metadata_group_id,
-        &.{group_id},
-        finalized_tables,
-        finalized_ranges,
-        null,
-    );
-
-    const committed_placements = try svc.listProjectedPlacementIntents(std.testing.allocator);
-    defer svc.freeProjectedPlacementIntents(std.testing.allocator, committed_placements);
-    var found_docs_owner = false;
-    for (committed_placements) |intent| {
-        found_docs_owner = found_docs_owner or
-            (intent.record.group_id == group_id and intent.record.local_node_id == 1);
-    }
-    try std.testing.expect(found_docs_owner);
-
-    var embed_index_detail = try client.fetchTableIndex(base_uri, "docs", "embed_idx");
-    defer embed_index_detail.deinit(std.testing.allocator);
-    var parsed_embed_index = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, embed_index_detail.body);
-    defer parsed_embed_index.deinit();
-    try std.testing.expectEqualStrings("embed_idx", parsed_embed_index.value.config.name);
-
-    var listed_indexes = try client.fetchTableIndexes(base_uri, "docs");
-    defer listed_indexes.deinit(std.testing.allocator);
-    var parsed_index_list = try parseJsonBodyIgnoreUnknown([]IndexStatusSummary, std.testing.allocator, listed_indexes.body);
-    defer parsed_index_list.deinit();
-    try std.testing.expectEqual(@as(usize, 2), parsed_index_list.value.len);
-    var saw_target_index = false;
-    var saw_embedding_index = false;
-    for (parsed_index_list.value) |index| {
-        saw_target_index = saw_target_index or std.mem.eql(u8, index.config.name, "full_text_index_v1");
-        saw_embedding_index = saw_embedding_index or std.mem.eql(u8, index.config.name, "embed_idx");
-    }
-    try std.testing.expect(saw_target_index and saw_embedding_index);
-
-    var stable_table_detail = try client.fetchTable(base_uri, "docs");
-    defer stable_table_detail.deinit(std.testing.allocator);
-    var parsed_stable_table_detail = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, stable_table_detail.body, .{});
-    defer parsed_stable_table_detail.deinit();
-    try std.testing.expect(parsed_stable_table_detail.value.migration == null);
-    try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v0") == null);
-    try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v1") != null);
-
+// Keep query response parsing in a separate frame from schema inspection.
+// In Debug, the full smoke test otherwise retains megabytes of temporaries
+// while status-only DB.open needs its own nested storage initialization frame.
+fn expectSmokeDocumentQueries(client: *http_client.ApiHttpClient, base_uri: []const u8, io: std.Io) !void {
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"inserts":{"doc:a":{"title":"alpha","body":"hello full text world","status":"published","score":10,"created_at":"2026-03-01T00:00:00Z"},"doc:b":{"title":"beta","body":"secondary document","status":"draft","score":3,"created_at":"2026-03-10T00:00:00Z"},"doc:c":{"title":"gamma","body":"hello filtered world","status":"published","score":8,"created_at":"2026-03-20T00:00:00Z"}}}
     );
@@ -1115,11 +753,9 @@ test "public api smoke integration creates table inserts and queries documents" 
     // Batch acknowledgement precedes asynchronous full-text generation
     // publication. Wait on the observable query contract instead of assuming
     // an unloaded scheduler makes the first query see the new generation.
-    var query_visibility_io = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer query_visibility_io.deinit();
     var query = try fetchQueryUntilTotal(
-        &client,
-        query_visibility_io.io(),
+        client,
+        io,
         base_uri,
         "docs",
         query_body,
@@ -1500,6 +1136,374 @@ test "public api smoke integration creates table inserts and queries documents" 
     try std.testing.expect(count_profile_result.took >= 0);
     try std.testing.expectEqual(@as(i64, 1), count_profile_result.profile.?.object.get("shards").?.object.get("total").?.integer);
     try ant_json.testing.expectObjectFieldAbsent(count_profile_result.profile.?, "merge");
+}
+
+test "public api smoke integration creates table inserts and queries documents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-full-e2e-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-full-e2e-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var svc = try metadata_service.MetadataService.init(std.testing.allocator, .{
+        .host = .{
+            .local_node_id = 1,
+            .metadata_group_id = group_ids.main_metadata_group_id,
+            .replica_root_dir = replica_root,
+            .replica_catalog_path = replica_catalog_path,
+        },
+    }, .{
+        .host = .{
+            .host = .{
+                .descriptor_factory = factory.iface(),
+            },
+        },
+    }, .{});
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = group_ids.main_metadata_group_id,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+    try svc.campaignMetadataGroup();
+    try svc.runRound();
+    try svc.upsertNode(.{ .node_id = 1 });
+    try svc.upsertStore(.{
+        .store_id = 1,
+        .node_id = 1,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+        .capacity_bytes = 1024 * 1024 * 1024,
+        .available_bytes = 1024 * 1024 * 1024,
+    });
+    try svc.runRound();
+
+    var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
+        replica_root,
+        table_catalog.CatalogSource.fromMetadataService(&svc),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
+    );
+    var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
+        replica_root,
+        table_catalog.CatalogSource.fromMetadataService(&svc),
+    );
+    var provisioned_storage = ProvisionedGroupStorage.init(std.testing.allocator);
+    defer {
+        provisioned_write_source.quiesce();
+        provisioned_storage.detachWriteSourceRuntimeHooks();
+        provisioned_storage.deinit();
+        provisioned_write_source.deinit();
+    }
+    try provisioned_storage.attachSources(&provisioned_read_source, &provisioned_write_source);
+    const DirectWriterOwner = struct {
+        fn metadataMayOpenReplicaRoots(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var direct_writer_owner: u8 = 0;
+    svc.setLocalReplicaRootReconcilePermitHook(.{
+        .ptr = &direct_writer_owner,
+        .vtable = &.{ .should_reconcile = DirectWriterOwner.metadataMayOpenReplicaRoots },
+    });
+    var server = http_server.ApiHttpServer.init(
+        std.testing.allocator,
+        .{ .deployment_mode = .standalone },
+        http_server.StatusSource.fromMetadataService(&svc),
+        provisioned_read_source.source(),
+        provisioned_write_source.source(),
+    );
+    defer server.deinit();
+    var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
+    defer listener.deinit();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    var executor = std_http_executor.StdHttpExecutor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+    var client = http_client.ApiHttpClient.init(std.testing.allocator, executor.executor());
+
+    const create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "docs table");
+    defer std.testing.allocator.free(create_body);
+    var created = try client.createTable(base_uri, "docs", create_body);
+    defer created.deinit(std.testing.allocator);
+    var created_table = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, created.body, .{});
+    defer created_table.deinit();
+    try std.testing.expectEqualStrings("docs", created_table.value.name);
+    try std.testing.expectEqualStrings("docs table", created_table.value.description.?);
+    try std.testing.expectEqual(@as(usize, 1), created_table.value.indexes.map.count());
+    try std.testing.expect(created_table.value.indexes.map.get("full_text_index_v0") != null);
+
+    const customers_create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "customers table");
+    defer std.testing.allocator.free(customers_create_body);
+    var created_customers = try client.createTable(base_uri, "customers", customers_create_body);
+    defer created_customers.deinit(std.testing.allocator);
+
+    const addresses_create_body = try test_contract_helpers.encodeCreateTableRequest(std.testing.allocator, "addresses table");
+    defer std.testing.allocator.free(addresses_create_body);
+    var created_addresses = try client.createTable(base_uri, "addresses", addresses_create_body);
+    defer created_addresses.deinit(std.testing.allocator);
+
+    // Creation is direct-local in this harness, while the remainder exercises
+    // the public distributed query contract over those projected groups.
+    server.cfg.deployment_mode = .distributed;
+
+    var rounds: usize = 0;
+    while (rounds < 8) : (rounds += 1) try svc.runRound();
+
+    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
+    try std.testing.expect(projected_ranges.len > 0);
+    const projected_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, projected_tables);
+    const docs_identity = try resolveTestTable(&svc, "docs");
+    defer std.testing.allocator.free(docs_identity.name);
+    const docs_table_id = docs_identity.table_id;
+    const group_id = for (projected_ranges) |range| {
+        if (range.table_id == docs_table_id) break range.group_id;
+    } else return error.TestUnexpectedResult;
+    // The direct-local fixture bypasses the data-host bootstrapper. Publish
+    // the ownership intent it would normally commit so schema progress has a
+    // concrete hosting node and cannot cut over from ownerless evidence.
+    try svc.upsertReplicaIntent(.{
+        .record = .{
+            .group_id = group_id,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .empty,
+        },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    }, null, 0, false);
+    rounds = 0;
+    while (rounds < 8) : (rounds += 1) try svc.runRound();
+
+    {
+        var writer = provisioned_write_source.leaseManagedWriterGroupForTransition(group_id) orelse
+            return error.TestUnexpectedResult;
+        defer writer.deinit(std.testing.allocator);
+        try std.testing.expect(writer.db.core.index_manager.textIndex("full_text_index_v0") != null);
+    }
+
+    var table_detail = try client.fetchTable(base_uri, "docs");
+    defer table_detail.deinit(std.testing.allocator);
+    var parsed_detail = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, table_detail.body, .{});
+    defer parsed_detail.deinit();
+    try std.testing.expectEqualStrings("docs", parsed_detail.value.name);
+    try std.testing.expect(parsed_detail.value.indexes.map.get("full_text_index_v0") != null);
+
+    var listed_tables = try client.fetchTables(base_uri, null);
+    defer listed_tables.deinit(std.testing.allocator);
+    var parsed_table_list = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, listed_tables.body, .{});
+    defer parsed_table_list.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed_table_list.value.len);
+    var found_docs = false;
+    var found_customers = false;
+    var found_addresses = false;
+    for (parsed_table_list.value) |table| {
+        found_docs = found_docs or std.mem.eql(u8, table.name, "docs");
+        found_customers = found_customers or std.mem.eql(u8, table.name, "customers");
+        found_addresses = found_addresses or std.mem.eql(u8, table.name, "addresses");
+    }
+    try std.testing.expect(found_docs and found_customers and found_addresses);
+
+    var prefixed_tables = try client.fetchTables(base_uri, "do");
+    defer prefixed_tables.deinit(std.testing.allocator);
+    var parsed_prefixed_tables = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, prefixed_tables.body, .{});
+    defer parsed_prefixed_tables.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_prefixed_tables.value.len);
+
+    var missing_prefix_tables = try client.fetchTables(base_uri, "zzz");
+    defer missing_prefix_tables.deinit(std.testing.allocator);
+    var parsed_missing_prefix_tables = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, missing_prefix_tables.body, .{});
+    defer parsed_missing_prefix_tables.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed_missing_prefix_tables.value.len);
+
+    const schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(std.testing.allocator);
+    defer std.testing.allocator.free(schema_body);
+    var updated_schema = try client.updateTableSchema(base_uri, "docs", schema_body);
+    defer updated_schema.deinit(std.testing.allocator);
+    var parsed_updated_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, updated_schema.body, .{});
+    defer parsed_updated_schema.deinit();
+    try std.testing.expect(parsed_updated_schema.value.schema != null);
+    try std.testing.expect(parsed_updated_schema.value.schema.?.document_schemas != null);
+    try std.testing.expect(parsed_updated_schema.value.migration != null);
+    try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
+    try std.testing.expectEqual(@as(?u32, 0), parsed_updated_schema.value.migration.?.read_schema.version);
+
+    var table_detail_after_schema = try client.fetchTable(base_uri, "docs");
+    defer table_detail_after_schema.deinit(std.testing.allocator);
+    var parsed_table_detail_after_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, table_detail_after_schema.body, .{});
+    defer parsed_table_detail_after_schema.deinit();
+    try std.testing.expect(parsed_table_detail_after_schema.value.migration != null);
+    try std.testing.expectEqualStrings("rebuilding", parsed_table_detail_after_schema.value.migration.?.state);
+    try std.testing.expect(parsed_table_detail_after_schema.value.indexes.map.get("full_text_index_v0") != null);
+    try std.testing.expect(parsed_table_detail_after_schema.value.indexes.map.get("full_text_index_v1") != null);
+
+    var index_detail = try client.fetchTableIndex(base_uri, "docs", "full_text_index_v0");
+    defer index_detail.deinit(std.testing.allocator);
+    var parsed_index = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, index_detail.body);
+    defer parsed_index.deinit();
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed_index.value.config.name);
+
+    var listed_indexes_after_schema = try client.fetchTableIndexes(base_uri, "docs");
+    defer listed_indexes_after_schema.deinit(std.testing.allocator);
+    var parsed_listed_indexes_after_schema = try parseJsonBodyIgnoreUnknown([]IndexStatusSummary, std.testing.allocator, listed_indexes_after_schema.body);
+    defer parsed_listed_indexes_after_schema.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_listed_indexes_after_schema.value.len);
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed_listed_indexes_after_schema.value[0].config.name);
+    try std.testing.expectEqualStrings("full_text_index_v1", parsed_listed_indexes_after_schema.value[1].config.name);
+
+    const create_index_body = try test_contract_helpers.encodeCreateIndexRequest(std.testing.allocator, "embed_idx");
+    defer std.testing.allocator.free(create_index_body);
+    var created_index = try client.createTableIndex(base_uri, "docs", "embed_idx", create_index_body);
+    defer created_index.deinit(std.testing.allocator);
+
+    // Index creation is accepted before the writer-owned structural worker
+    // has published its durable generation. Wait on that owner's activity
+    // contract instead of assuming a fixed number of metadata rounds is
+    // enough on a loaded CI runner.
+    // Sequential waits share one runtime and retire it with this fixture.
+    var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer wait_io.deinit();
+    var structural_wait_attempts: usize = 0;
+    while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (structural_wait_attempts += 1) {
+        try svc.runRound();
+        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
+
+    // This fixture performs data-group writes directly instead of running a
+    // second Raft host. Model the data owner's normal lifecycle explicitly:
+    // verify every locally owned range from durable DB state, publish that
+    // proof to metadata, then let metadata perform the generation cutover.
+    const progress_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, progress_tables);
+    const progress_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, progress_ranges);
+    const local_schema_progress = try metadata_mod.table_provisioner.collectLocalSchemaProgress(
+        std.testing.allocator,
+        replica_root,
+        group_ids.main_metadata_group_id,
+        1,
+        &.{group_id},
+        progress_tables,
+        progress_ranges,
+    );
+    defer std.testing.allocator.free(local_schema_progress);
+    try std.testing.expectEqual(@as(usize, 1), local_schema_progress.len);
+    for (local_schema_progress) |progress| try svc.upsertSchemaProgress(progress);
+
+    var schema_progress_committed = false;
+    rounds = 0;
+    while (rounds < 32) : (rounds += 1) {
+        try svc.runRound();
+        const projected_progress = try svc.listProjectedSchemaProgress(std.testing.allocator);
+        defer svc.freeProjectedSchemaProgress(std.testing.allocator, projected_progress);
+        for (projected_progress) |progress| {
+            if (progress.table_id == docs_table_id and progress.node_id == 1 and progress.schema_version == 1) {
+                schema_progress_committed = true;
+                break;
+            }
+        }
+        if (schema_progress_committed) break;
+    }
+    try std.testing.expect(schema_progress_committed);
+
+    // A production MetadataServer owns this control loop. This lightweight
+    // fixture embeds MetadataService directly, so run the same projected-state
+    // seed and lease-fenced reconciliation explicitly after the data owner has
+    // published its completion proof.
+    var schema_control_loop = metadata_mod.MetadataControlLoop.init(std.testing.allocator);
+    defer schema_control_loop.deinit();
+    try schema_control_loop.stateRef().syncProjected(&svc);
+    try schema_control_loop.stateRef().seedDesiredFromProjected();
+    _ = try svc.reconcilePreparedIfLeaseHeld(&schema_control_loop) orelse
+        return error.ReconcileLeaseNotHeld;
+
+    var schema_migration_finalized = false;
+    rounds = 0;
+    while (rounds < 32) : (rounds += 1) {
+        try svc.runRound();
+        const current_tables = try svc.listProjectedTables(std.testing.allocator);
+        defer svc.freeProjectedTables(std.testing.allocator, current_tables);
+        for (current_tables) |table| {
+            if (table.table_id != docs_table_id) continue;
+            schema_migration_finalized = table.read_schema_json.len == 0;
+            break;
+        }
+        if (schema_migration_finalized) break;
+    }
+    try std.testing.expect(schema_migration_finalized);
+
+    // Apply the committed metadata generation to the resident writer, as the
+    // data runtime's local-replica reconciliation hook does in production.
+    // Without this step the lightweight fixture would retain the pre-cutover
+    // cached writer even though metadata correctly moved reads to v1.
+    var owner_wait_attempts: usize = 0;
+    while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
+        try svc.runRound();
+        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
+
+    const finalized_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, finalized_tables);
+    const finalized_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, finalized_ranges);
+    _ = try provisioned_write_source.reconcileReplicaRootTablesWithWriteCache(
+        std.testing.allocator,
+        group_ids.main_metadata_group_id,
+        &.{group_id},
+        finalized_tables,
+        finalized_ranges,
+        null,
+    );
+
+    const committed_placements = try svc.listProjectedPlacementIntents(std.testing.allocator);
+    defer svc.freeProjectedPlacementIntents(std.testing.allocator, committed_placements);
+    var found_docs_owner = false;
+    for (committed_placements) |intent| {
+        found_docs_owner = found_docs_owner or
+            (intent.record.group_id == group_id and intent.record.local_node_id == 1);
+    }
+    try std.testing.expect(found_docs_owner);
+
+    var embed_index_detail = try client.fetchTableIndex(base_uri, "docs", "embed_idx");
+    defer embed_index_detail.deinit(std.testing.allocator);
+    var parsed_embed_index = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, embed_index_detail.body);
+    defer parsed_embed_index.deinit();
+    try std.testing.expectEqualStrings("embed_idx", parsed_embed_index.value.config.name);
+
+    var listed_indexes = try client.fetchTableIndexes(base_uri, "docs");
+    defer listed_indexes.deinit(std.testing.allocator);
+    var parsed_index_list = try parseJsonBodyIgnoreUnknown([]IndexStatusSummary, std.testing.allocator, listed_indexes.body);
+    defer parsed_index_list.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_index_list.value.len);
+    var saw_target_index = false;
+    var saw_embedding_index = false;
+    for (parsed_index_list.value) |index| {
+        saw_target_index = saw_target_index or std.mem.eql(u8, index.config.name, "full_text_index_v1");
+        saw_embedding_index = saw_embedding_index or std.mem.eql(u8, index.config.name, "embed_idx");
+    }
+    try std.testing.expect(saw_target_index and saw_embedding_index);
+
+    var stable_table_detail = try client.fetchTable(base_uri, "docs");
+    defer stable_table_detail.deinit(std.testing.allocator);
+    var parsed_stable_table_detail = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, stable_table_detail.body, .{});
+    defer parsed_stable_table_detail.deinit();
+    try std.testing.expect(parsed_stable_table_detail.value.migration == null);
+    try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v0") == null);
+    try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v1") != null);
+
+    try expectSmokeDocumentQueries(&client, base_uri, wait_io.io());
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"deletes\":[\"doc:a\",\"doc:c\"]}");
     defer std.testing.allocator.free(delete_body);
@@ -1529,7 +1533,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     owner_wait_attempts = 0;
     while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
         try svc.runRound();
-        owner_wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(!provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id));
 
@@ -3884,6 +3888,13 @@ test "public api integration recreates managed embeddings index after corrupt ar
     try svc.campaignMetadataGroup();
     try svc.runRound();
 
+    // This integration test issues real embedding validation requests. Give
+    // it the same dedicated executor ownership as production so unrelated
+    // parallel tests cannot exhaust the process-global fallback executor.
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    // The write source borrows this runtime through quiesce/deinit, including
+    // listener-start failure cleanup. Its owner must outlive the source.
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
@@ -3894,11 +3905,6 @@ test "public api integration recreates managed embeddings index after corrupt ar
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
     defer provisioned_write_source.deinit();
-    // This integration test issues real embedding validation requests. Give
-    // it the same dedicated executor ownership as production so unrelated
-    // parallel tests cannot exhaust the process-global fallback executor.
-    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
-    defer backend_runtime.deinit();
     provisioned_write_source.backend_runtime = backend_runtime.ptr();
     const probe_retry_io = backend_runtime.ptr().controlIo() orelse return error.BackendRuntimeUnavailable;
     const DirectWriterOwner = struct {

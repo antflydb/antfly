@@ -55,6 +55,10 @@ pub const SnapshotBuilder = struct {
             snapshot: []const u8,
         ) anyerror!void = null,
         apply_batch: *const fn (ptr: *anyopaque, batch: ApplyBatch) anyerror!void,
+        /// A projection with native-owned effects cannot publish applied state
+        /// without its second store. This is an immutable mount requirement,
+        /// not a permission or a bit supplied by the replicated command.
+        requires_apply_delegate: ?*const fn (ptr: *anyopaque) bool = null,
         /// Opt in only for errors that leave a retained Ready safe to replay,
         /// including an already installed snapshot. Never classify corruption
         /// or arbitrary resource failures as expected preparation backpressure.
@@ -76,6 +80,11 @@ pub const SnapshotBuilder = struct {
 
     pub fn applyBatch(self: SnapshotBuilder, batch: ApplyBatch) !void {
         return try self.vtable.apply_batch(self.ptr, batch);
+    }
+
+    pub fn requiresApplyDelegate(self: SnapshotBuilder) bool {
+        const required = self.vtable.requires_apply_delegate orelse return false;
+        return required(self.ptr);
     }
 
     pub fn isApplyRetryable(self: SnapshotBuilder, group_id: u64, err: anyerror) bool {

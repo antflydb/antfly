@@ -1,0 +1,110 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 trigger-function definitions and row-return ABI",
+  "entries": [
+    {
+      "id": "sql-0405",
+      "source_entry_sha256": "733c1fd6e94ade347b5c1a87b9a86faed6dbc196c8394b79e9037b2d69c61210",
+      "sql": "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$",
+      "command_tag": "CREATE FUNCTION"
+    },
+    {
+      "id": "sql-0406",
+      "source_entry_sha256": "917c0a8d1cb62470c19c38397b7cbff45611c0919e148253d1dc4a382bed5927",
+      "sql": "CREATE FUNCTION audit_old_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$",
+      "command_tag": "CREATE FUNCTION"
+    },
+    {
+      "id": "sql-0407",
+      "source_entry_sha256": "8fe3b7a5146de781ddd01a1f40b0130a4aa1ffa1eafcf8439ea0d2ff39fabcc6",
+      "sql": "CREATE FUNCTION audit_null_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$",
+      "command_tag": "CREATE FUNCTION"
+    },
+    {
+      "id": "sql-0408",
+      "source_entry_sha256": "b95f4d9fbb652d377a7ef3bd7f3207df0ecce4973784c83ee2b06c0baecd531f",
+      "sql": "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$",
+      "command_tag": "CREATE FUNCTION"
+    },
+    {
+      "id": "sql-0409",
+      "source_entry_sha256": "60d5cee39440d1518eb2fcfe5488ab7ce5a35181f63a2e91dbbb37d4c4d3254b",
+      "sql": "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$",
+      "command_tag": "CREATE FUNCTION"
+    },
+    {
+      "id": "sql-0410",
+      "source_entry_sha256": "ba7c2834f64f1f462a8c0c9ce6d5e36ef9d7f9b065e2845f25e34154f34d4b0b",
+      "sql": "CREATE FUNCTION audit_perform_arg_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(1); RETURN NEW; END$$",
+      "command_tag": "CREATE FUNCTION"
+    }
+  ],
+  "probes": [
+    {
+      "sql": "SELECT audit_body()",
+      "sqlstate": "0A000"
+    },
+    {
+      "sql": "SELECT audit_old_body()",
+      "sqlstate": "0A000"
+    },
+    {
+      "sql": "SELECT audit_null_body()",
+      "sqlstate": "0A000"
+    },
+    {
+      "sql": "SELECT audit_notice_body()",
+      "sqlstate": "0A000"
+    },
+    {
+      "sql": "SELECT audit_perform_body()",
+      "sqlstate": "0A000"
+    },
+    {
+      "sql": "SELECT audit_perform_arg_body()",
+      "sqlstate": "0A000"
+    },
+    {
+      "sql": "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$",
+      "sqlstate": "42723"
+    },
+    {
+      "sql": "CREATE OR REPLACE FUNCTION audit_body() RETURNS integer LANGUAGE sql AS $$SELECT 1$$",
+      "sqlstate": "42P13"
+    },
+    {
+      "sql": "CREATE FUNCTION invalid_trigger(integer) RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$",
+      "sqlstate": "42P13"
+    },
+    {
+      "sql": "CREATE FUNCTION invalid_trigger() RETURNS trigger LANGUAGE sql AS $$SELECT 1$$",
+      "sqlstate": "42P13"
+    }
+  ],
+  "invocations": [
+    {
+      "id": "sql-0405",
+      "value": "new"
+    },
+    {
+      "id": "sql-0406",
+      "value": "old"
+    },
+    {
+      "id": "sql-0407",
+      "value": "old"
+    },
+    {
+      "id": "sql-0408",
+      "value": "new"
+    },
+    {
+      "id": "sql-0409",
+      "sqlstate": "42883"
+    },
+    {
+      "id": "sql-0410",
+      "sqlstate": "42883"
+    }
+  ]
+}

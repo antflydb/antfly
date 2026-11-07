@@ -155,6 +155,64 @@ pub const RoutePolicy = enum {
     prefer_leader,
 };
 
+/// A native-local group is not a Raft replica set. Its signed catalog
+/// capability selects exactly one physical owner; leader/active-replica
+/// fallbacks would permit stale TEMP/UNLOGGED generations to serve requests.
+fn nativeGroupRoute(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, router: HostedGroupRouter, group_id: u64) !?GroupRoute {
+    const read = catalog.vtable.route_fence orelse return null;
+    const fence = (try read(catalog.ptr, group_id)) orelse return null;
+    if (fence.route.execution != .native_local) return null;
+    try fence.validate();
+    const descriptor = fence.route.execution.native_local;
+    if (descriptor.owner_node_id == router.localNodeId()) return .local;
+    const uri = (try router.nodeBaseUri(alloc, descriptor.owner_node_id)) orelse return error.SqlRelationOwnerUnavailable;
+    return .{ .remote = .{ .node_id = descriptor.owner_node_id, .base_uri = uri } };
+}
+
+pub fn resolveCapturedGroupRoute(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, router: HostedGroupRouter, fence: metadata_api.CatalogRouteFence, policy: RoutePolicy) !?GroupRoute {
+    try router.budget.check();
+    try fence.validate();
+    if (fence.route.execution == .native_local) {
+        const descriptor = fence.route.execution.native_local;
+        if (descriptor.owner_node_id == router.localNodeId()) return .local;
+        const uri = (try router.nodeBaseUri(alloc, descriptor.owner_node_id)) orelse return error.SqlRelationOwnerUnavailable;
+        return .{ .remote = .{ .node_id = descriptor.owner_node_id, .base_uri = uri } };
+    }
+    return resolveGroupRoute(alloc, catalog, router, fence.route.group_id, policy);
+}
+
+/// Private metadata control delivery captures the table's execution kind.
+/// This is a hint only: the receiving job handler verifies its own immutable
+/// namespace and publication authority before opening or mutating storage.
+pub fn resolveTableGroupRoutes(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, router: HostedGroupRouter, table: []const u8, groups: []const u64, policy: RoutePolicy) !?[]GroupRoute {
+    var captured = (try table_catalog.authoritativeTableRoutingSnapshot(alloc, catalog, table, router.budget.clock.deadline_ns)) orelse return null;
+    defer captured.deinit(alloc);
+    if (captured.execution == .raft) return resolveGroupRoutes(alloc, catalog, router, groups, policy);
+    const routes = try alloc.alloc(GroupRoute, groups.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (routes[0..initialized]) |*route| route.deinit(alloc);
+        alloc.free(routes);
+    }
+    for (groups, routes) |group, *out| {
+        const range = for (captured.ranges) |candidate| {
+            if (candidate.group_id == group) break candidate;
+        } else return error.TopologyChanged;
+        const manager = @import("../metadata/table_manager.zig");
+        const range_id = manager.rangeDocIdentityRangeId(range.*);
+        const fence = captured.fenceForRoute(.{ .group_id = group, .range_id = range_id, .identity_namespace = .{ .table_id = captured.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } });
+        out.* = (try resolveCapturedGroupRoute(alloc, catalog, router, fence, policy)) orelse return error.SqlRelationOwnerUnavailable;
+        initialized += 1;
+    }
+    return routes;
+}
+
+pub fn resolveTableGroupRoute(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, router: HostedGroupRouter, table: []const u8, group: u64, policy: RoutePolicy) !?GroupRoute {
+    const routes = (try resolveTableGroupRoutes(alloc, catalog, router, table, &.{group}, policy)) orelse return null;
+    defer alloc.free(routes);
+    return routes[0];
+}
+
 pub fn resolveGroupRoute(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -163,6 +221,7 @@ pub fn resolveGroupRoute(
     policy: RoutePolicy,
 ) !?GroupRoute {
     try router.budget.check();
+    if (try nativeGroupRoute(alloc, catalog, router, group_id)) |route| return route;
     if (router.vtable.resolve_group_routes) |resolve| {
         const routes = (try resolve(router.ptr, alloc, &.{group_id}, policy, router.budget)) orelse return null;
         if (routes.len != 1) {
@@ -230,7 +289,20 @@ pub fn resolveGroupRoutes(
     policy: RoutePolicy,
 ) !?[]GroupRoute {
     try router.budget.check();
-    if (router.vtable.resolve_group_routes) |resolve| {
+    // A request-scoped native capability must bypass even a router's bulk
+    // Raft optimization. Resolve mixed cohorts through the scalar selector.
+    var includes_native = false;
+    if (catalog.vtable.route_fence) |read| {
+        for (group_ids) |group| {
+            if (try read(catalog.ptr, group)) |fence| {
+                if (fence.route.execution == .native_local) {
+                    includes_native = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!includes_native) if (router.vtable.resolve_group_routes) |resolve| {
         const resolved = try resolve(router.ptr, alloc, group_ids, policy, router.budget);
         const routes = resolved orelse return null;
         if (routes.len != group_ids.len) {
@@ -238,7 +310,7 @@ pub fn resolveGroupRoutes(
             return error.InvalidGroupRouteBatch;
         }
         return routes;
-    }
+    };
 
     const routes = try alloc.alloc(GroupRoute, group_ids.len);
     var initialized: usize = 0;
@@ -425,6 +497,53 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "SQL relation lifetime native local routing bypasses active raft replicas and bulk leader fallback" {
+            const Stub = struct {
+                missing: bool = false,
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedRaftCatalogRead;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn fence(_: *anyopaque, group: u64) !?metadata_api.CatalogRouteFence {
+                    return .{ .metadata_group_id = 1, .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{
+                        .group_id = group,
+                        .range_id = 6,
+                        .identity_namespace = .{ .table_id = 3, .shard_id = group, .range_id = 6 },
+                        .execution = .{ .native_local = .{ .kind = .unlogged, .owner_node_id = 7, .owner_store_id = 8, .generation_instance = @splat(9), .data_generation = 10 } },
+                    } };
+                }
+                fn local(_: *anyopaque) u64 {
+                    return 1;
+                }
+                fn status(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+                    return .active;
+                }
+                fn leader(_: *anyopaque, _: u64) ?u64 {
+                    return 1;
+                }
+                fn endpoint(ptr: *anyopaque, a: std.mem.Allocator, node: u64) !?[]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (node != 7) return error.UnexpectedReplicaFallback;
+                    if (self.missing) return null;
+                    return try a.dupe(u8, "http://native-owner");
+                }
+                fn bulk(_: *anyopaque, _: std.mem.Allocator, _: []const u64, _: RoutePolicy, _: RouteBudget) !?[]GroupRoute {
+                    return error.UnexpectedRaftFanout;
+                }
+            };
+            var stub: Stub = .{};
+            const catalog: table_catalog.CatalogSource = .{ .ptr = &stub, .vtable = &.{ .admin_snapshot = Stub.snapshot, .free_admin_snapshot = Stub.free, .route_fence = Stub.fence } };
+            const router: HostedGroupRouter = .{ .ptr = &stub, .vtable = &.{ .local_node_id = Stub.local, .local_status = Stub.status, .group_leader_node_id = Stub.leader, .node_base_uri = Stub.endpoint, .resolve_group_routes = Stub.bulk } };
+            const routes = (try resolveGroupRoutes(std.testing.allocator, catalog, router, &.{ 11, 12 }, .prefer_leader)).?;
+            defer freeGroupRoutes(std.testing.allocator, routes);
+            for (routes) |route| {
+                try std.testing.expect(route == .remote);
+                try std.testing.expectEqual(@as(u64, 7), route.remote.node_id);
+            }
+            stub.missing = true;
+            try std.testing.expectError(error.SqlRelationOwnerUnavailable, resolveGroupRoute(std.testing.allocator, catalog, router, 11, .any_active));
+        }
+
         test "resolve group route allows stale reads on local active replica" {
             const FakeCatalog = struct {
                 fn iface() table_catalog.CatalogSource {

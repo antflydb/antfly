@@ -1,0 +1,2368 @@
+{
+  "reference": "PostgreSQL exact binary and extracted temporal fields",
+  "oracle_major": 18,
+  "server_version": 180006,
+  "server_build": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+  "encoding": "UTF8",
+  "timezone": "UTC",
+  "date_style": "ISO, YMD",
+  "interval_style": "postgres",
+  "entries": [
+    {
+      "kind": "date",
+      "sql": "date '2000-01-01'",
+      "oid": 1082,
+      "binary": "00000000",
+      "text": "2000-01-01",
+      "components": [
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '1969-12-31'",
+      "oid": 1082,
+      "binary": "ffffd532",
+      "text": "1969-12-31",
+      "components": [
+        -10958
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '2000-02-29'",
+      "oid": 1082,
+      "binary": "0000003b",
+      "text": "2000-02-29",
+      "components": [
+        59
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '1900-03-01'",
+      "oid": 1082,
+      "binary": "ffff718f",
+      "text": "1900-03-01",
+      "components": [
+        -36465
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '0001-01-01 BC'",
+      "oid": 1082,
+      "binary": "fff4da8b",
+      "text": "0001-01-01 BC",
+      "components": [
+        -730485
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '4714-11-24 BC'",
+      "oid": 1082,
+      "binary": "ffda97a7",
+      "text": "4714-11-24 BC",
+      "components": [
+        -2451545
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '5874897-12-31'",
+      "oid": 1082,
+      "binary": "7fda970c",
+      "text": "5874897-12-31",
+      "components": [
+        2145031948
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '-infinity'",
+      "oid": 1082,
+      "binary": "80000000",
+      "text": "-infinity",
+      "components": [],
+      "infinity": -1
+    },
+    {
+      "kind": "date",
+      "sql": "date 'infinity'",
+      "oid": 1082,
+      "binary": "7fffffff",
+      "text": "infinity",
+      "components": [],
+      "infinity": 1
+    },
+    {
+      "kind": "date",
+      "sql": "date '1582-10-04'",
+      "oid": 1082,
+      "binary": "fffdacb5",
+      "text": "1582-10-04",
+      "components": [
+        -152395
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '1582-10-15'",
+      "oid": 1082,
+      "binary": "fffdacc0",
+      "text": "1582-10-15",
+      "components": [
+        -152384
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '0001-12-31 BC'",
+      "oid": 1082,
+      "binary": "fff4dbf8",
+      "text": "0001-12-31 BC",
+      "components": [
+        -730120
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "date",
+      "sql": "date '0001-01-01 AD'",
+      "oid": 1082,
+      "binary": "fff4dbf9",
+      "text": "0001-01-01",
+      "components": [
+        -730119
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time",
+      "sql": "time '00:00:00'",
+      "oid": 1083,
+      "binary": "0000000000000000",
+      "text": "00:00:00",
+      "components": [
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time",
+      "sql": "time '24:00:00'",
+      "oid": 1083,
+      "binary": "000000141dd76000",
+      "text": "24:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time",
+      "sql": "time '12:34:56.123456'",
+      "oid": 1083,
+      "binary": "0000000a8bdbfe40",
+      "text": "12:34:56.123456",
+      "components": [
+        45296123456
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time",
+      "sql": "time '23:59:59.999999'",
+      "oid": 1083,
+      "binary": "000000141dd75fff",
+      "text": "23:59:59.999999",
+      "components": [
+        86399999999
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "timetz '00:00:00+00'",
+      "oid": 1266,
+      "binary": "000000000000000000000000",
+      "text": "00:00:00+00",
+      "components": [
+        0,
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "timetz '24:00:00+00'",
+      "oid": 1266,
+      "binary": "000000141dd7600000000000",
+      "text": "24:00:00+00",
+      "components": [
+        86400000000,
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "timetz '12:34:56.123456+05:45'",
+      "oid": 1266,
+      "binary": "0000000a8bdbfe40ffffaf24",
+      "text": "12:34:56.123456+05:45",
+      "components": [
+        45296123456,
+        -20700
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "timetz '00:00:00-15:59:59'",
+      "oid": 1266,
+      "binary": "00000000000000000000e0ff",
+      "text": "00:00:00-15:59:59",
+      "components": [
+        0,
+        57599
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "timetz '23:59:59.999999+15:59:59'",
+      "oid": 1266,
+      "binary": "000000141dd75fffffff1f01",
+      "text": "23:59:59.999999+15:59:59",
+      "components": [
+        86399999999,
+        -57599
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "timetz '01:00:00+05:00'",
+      "oid": 1266,
+      "binary": "00000000d693a400ffffb9b0",
+      "text": "01:00:00+05",
+      "components": [
+        3600000000,
+        -18000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "timetz '01:00:00+05:00:01'",
+      "oid": 1266,
+      "binary": "00000000d693a400ffffb9af",
+      "text": "01:00:00+05:00:01",
+      "components": [
+        3600000000,
+        -18001
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "timetz '01:00:00-00:00:01'",
+      "oid": 1266,
+      "binary": "00000000d693a40000000001",
+      "text": "01:00:00-00:00:01",
+      "components": [
+        3600000000,
+        1
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '2000-01-01 00:00:00'",
+      "oid": 1114,
+      "binary": "0000000000000000",
+      "text": "2000-01-01 00:00:00",
+      "components": [
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '1999-12-31 23:59:59.999999'",
+      "oid": 1114,
+      "binary": "ffffffffffffffff",
+      "text": "1999-12-31 23:59:59.999999",
+      "components": [
+        -1
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '1969-12-31 23:59:59.999999'",
+      "oid": 1114,
+      "binary": "fffca2fec4c81fff",
+      "text": "1969-12-31 23:59:59.999999",
+      "components": [
+        -946684800000001
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '0001-01-01 00:00:00 BC'",
+      "oid": 1114,
+      "binary": "ff1fc63d1bb12000",
+      "text": "0001-01-01 00:00:00 BC",
+      "components": [
+        -63113904000000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '4714-11-24 00:00:00 BC'",
+      "oid": 1114,
+      "binary": "fd0f7cc1411fa000",
+      "text": "4714-11-24 00:00:00 BC",
+      "components": [
+        -211813488000000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '294276-12-31 23:59:59.999999'",
+      "oid": 1114,
+      "binary": "7fffff5bb3b29fff",
+      "text": "294276-12-31 23:59:59.999999",
+      "components": [
+        9223371331199999999
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '-infinity'",
+      "oid": 1114,
+      "binary": "8000000000000000",
+      "text": "-infinity",
+      "components": [],
+      "infinity": -1
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp 'infinity'",
+      "oid": 1114,
+      "binary": "7fffffffffffffff",
+      "text": "infinity",
+      "components": [],
+      "infinity": 1
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '2000-01-01 00:00:00.1'",
+      "oid": 1114,
+      "binary": "00000000000186a0",
+      "text": "2000-01-01 00:00:00.1",
+      "components": [
+        100000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '2000-01-01 00:00:00.01'",
+      "oid": 1114,
+      "binary": "0000000000002710",
+      "text": "2000-01-01 00:00:00.01",
+      "components": [
+        10000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '2000-01-01 00:00:00.001'",
+      "oid": 1114,
+      "binary": "00000000000003e8",
+      "text": "2000-01-01 00:00:00.001",
+      "components": [
+        1000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '2000-01-01 00:00:00.0001'",
+      "oid": 1114,
+      "binary": "0000000000000064",
+      "text": "2000-01-01 00:00:00.0001",
+      "components": [
+        100
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "timestamp '2000-01-01 00:00:00.00001'",
+      "oid": 1114,
+      "binary": "000000000000000a",
+      "text": "2000-01-01 00:00:00.00001",
+      "components": [
+        10
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "timestamptz '2000-01-01 00:00:00+00'",
+      "oid": 1184,
+      "binary": "0000000000000000",
+      "text": "2000-01-01 00:00:00+00",
+      "components": [
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "timestamptz '1969-12-31 23:59:59.999999+00'",
+      "oid": 1184,
+      "binary": "fffca2fec4c81fff",
+      "text": "1969-12-31 23:59:59.999999+00",
+      "components": [
+        -946684800000001
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "timestamptz '2025-01-01 01:30:00+01:30'",
+      "oid": 1184,
+      "binary": "0002cd987ed48000",
+      "text": "2025-01-01 00:00:00+00",
+      "components": [
+        789004800000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "timestamptz '2000-02-29 12:34:56.123456+05:45'",
+      "oid": 1184,
+      "binary": "000004a89aae2f40",
+      "text": "2000-02-29 06:49:56.123456+00",
+      "components": [
+        5122196123456
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "timestamptz '0001-01-01 00:00:00+00 BC'",
+      "oid": 1184,
+      "binary": "ff1fc63d1bb12000",
+      "text": "0001-01-01 00:00:00+00 BC",
+      "components": [
+        -63113904000000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "timestamptz '294276-12-31 23:59:59.999999+00'",
+      "oid": 1184,
+      "binary": "7fffff5bb3b29fff",
+      "text": "294276-12-31 23:59:59.999999+00",
+      "components": [
+        9223371331199999999
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "timestamptz '-infinity'",
+      "oid": 1184,
+      "binary": "8000000000000000",
+      "text": "-infinity",
+      "components": [],
+      "infinity": -1
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "timestamptz 'infinity'",
+      "oid": 1184,
+      "binary": "7fffffffffffffff",
+      "text": "infinity",
+      "components": [],
+      "infinity": 1
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '0'",
+      "oid": 1186,
+      "binary": "00000000000000000000000000000000",
+      "text": "00:00:00",
+      "components": [
+        0,
+        0,
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '1 month 2 days 03:04:05.123456'",
+      "oid": 1186,
+      "binary": "00000002925735800000000200000001",
+      "text": "1 mon 2 days 03:04:05.123456",
+      "components": [
+        1,
+        2,
+        11045123456
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '-1 month 2 days -03:04:05.123456'",
+      "oid": 1186,
+      "binary": "fffffffd6da8ca8000000002ffffffff",
+      "text": "-1 mons +2 days -03:04:05.123456",
+      "components": [
+        -1,
+        2,
+        -11045123456
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '1 year -2 months -3 days 25 hours'",
+      "oid": 1186,
+      "binary": "00000014f46b0400fffffffd0000000a",
+      "text": "10 mons -3 days +25:00:00",
+      "components": [
+        10,
+        -3,
+        90000000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '2147483647 months'",
+      "oid": 1186,
+      "binary": "0000000000000000000000007fffffff",
+      "text": "178956970 years 7 mons",
+      "components": [
+        2147483647,
+        0,
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '-2147483648 days'",
+      "oid": 1186,
+      "binary": "00000000000000008000000000000000",
+      "text": "-2147483648 days",
+      "components": [
+        0,
+        -2147483648,
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '-infinity'",
+      "oid": 1186,
+      "binary": "80000000000000008000000080000000",
+      "text": "-infinity",
+      "components": [],
+      "infinity": -1
+    },
+    {
+      "kind": "interval",
+      "sql": "interval 'infinity'",
+      "oid": 1186,
+      "binary": "7fffffffffffffff7fffffff7fffffff",
+      "text": "infinity",
+      "components": [],
+      "infinity": 1
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '-1 year 2 months 3 days 4 hours'",
+      "oid": 1186,
+      "binary": "000000035a4e900000000003fffffff6",
+      "text": "-10 mons +3 days 04:00:00",
+      "components": [
+        -10,
+        3,
+        14400000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '1 year -2 months 3 days 4 hours'",
+      "oid": 1186,
+      "binary": "000000035a4e9000000000030000000a",
+      "text": "10 mons 3 days 04:00:00",
+      "components": [
+        10,
+        3,
+        14400000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '-1 year -2 months 3 days 4 hours'",
+      "oid": 1186,
+      "binary": "000000035a4e900000000003fffffff2",
+      "text": "-1 years -2 mons +3 days 04:00:00",
+      "components": [
+        -14,
+        3,
+        14400000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '-1 day 2 hours'",
+      "oid": 1186,
+      "binary": "00000001ad274800ffffffff00000000",
+      "text": "-1 days +02:00:00",
+      "components": [
+        0,
+        -1,
+        7200000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '1 month -2 days 3 hours'",
+      "oid": 1186,
+      "binary": "0000000283baec00fffffffe00000001",
+      "text": "1 mon -2 days +03:00:00",
+      "components": [
+        1,
+        -2,
+        10800000000
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '-12 months 3 days'",
+      "oid": 1186,
+      "binary": "000000000000000000000003fffffff4",
+      "text": "-1 years +3 days",
+      "components": [
+        -12,
+        3,
+        0
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '-9223372036854775808 microseconds'",
+      "oid": 1186,
+      "binary": "80000000000000000000000000000000",
+      "text": "-2562047788:00:54.775808",
+      "components": [
+        0,
+        0,
+        -9223372036854775808
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "interval '9223372036854775807 microseconds'",
+      "oid": 1186,
+      "binary": "7fffffffffffffff0000000000000000",
+      "text": "2562047788:00:54.775807",
+      "components": [
+        0,
+        0,
+        9223372036854775807
+      ],
+      "infinity": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 00:00:00.555555')::timestamp(0)",
+      "oid": 1114,
+      "binary": "00000000000f4240",
+      "text": "2000-01-01 00:00:01",
+      "components": [
+        1000000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 00:00:00.555555')::timestamp(1)",
+      "oid": 1114,
+      "binary": "00000000000927c0",
+      "text": "2000-01-01 00:00:00.6",
+      "components": [
+        600000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 1
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 00:00:00.555555')::timestamp(2)",
+      "oid": 1114,
+      "binary": "0000000000088b80",
+      "text": "2000-01-01 00:00:00.56",
+      "components": [
+        560000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 2
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 00:00:00.555555')::timestamp(3)",
+      "oid": 1114,
+      "binary": "0000000000087be0",
+      "text": "2000-01-01 00:00:00.556",
+      "components": [
+        556000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 3
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 00:00:00.555555')::timestamp(4)",
+      "oid": 1114,
+      "binary": "0000000000087a50",
+      "text": "2000-01-01 00:00:00.5556",
+      "components": [
+        555600
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 4
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 00:00:00.555555')::timestamp(5)",
+      "oid": 1114,
+      "binary": "0000000000087a28",
+      "text": "2000-01-01 00:00:00.55556",
+      "components": [
+        555560
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 5
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 00:00:00.555555')::timestamp(6)",
+      "oid": 1114,
+      "binary": "0000000000087a23",
+      "text": "2000-01-01 00:00:00.555555",
+      "components": [
+        555555
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 6
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.444445')::timestamp(0)",
+      "oid": 1114,
+      "binary": "fffffffffff0bdc0",
+      "text": "1999-12-31 23:59:59",
+      "components": [
+        -1000000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.444445')::timestamp(1)",
+      "oid": 1114,
+      "binary": "fffffffffff6d840",
+      "text": "1999-12-31 23:59:59.4",
+      "components": [
+        -600000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 1
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.444445')::timestamp(2)",
+      "oid": 1114,
+      "binary": "fffffffffff77480",
+      "text": "1999-12-31 23:59:59.44",
+      "components": [
+        -560000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 2
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.444445')::timestamp(3)",
+      "oid": 1114,
+      "binary": "fffffffffff78420",
+      "text": "1999-12-31 23:59:59.444",
+      "components": [
+        -556000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 3
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.444445')::timestamp(4)",
+      "oid": 1114,
+      "binary": "fffffffffff785b0",
+      "text": "1999-12-31 23:59:59.4444",
+      "components": [
+        -555600
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 4
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.444445')::timestamp(5)",
+      "oid": 1114,
+      "binary": "fffffffffff785d8",
+      "text": "1999-12-31 23:59:59.44444",
+      "components": [
+        -555560
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 5
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.444445')::timestamp(6)",
+      "oid": 1114,
+      "binary": "fffffffffff785dd",
+      "text": "1999-12-31 23:59:59.444445",
+      "components": [
+        -555555
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 6
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.500000')::timestamp(0)",
+      "oid": 1114,
+      "binary": "fffffffffff0bdc0",
+      "text": "1999-12-31 23:59:59",
+      "components": [
+        -1000000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.500000')::timestamp(1)",
+      "oid": 1114,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 1
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.500000')::timestamp(2)",
+      "oid": 1114,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 2
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.500000')::timestamp(3)",
+      "oid": 1114,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 3
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.500000')::timestamp(4)",
+      "oid": 1114,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 4
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.500000')::timestamp(5)",
+      "oid": 1114,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 5
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '1999-12-31 23:59:59.500000')::timestamp(6)",
+      "oid": 1114,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 6
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 23:59:59.999999')::timestamp(0)",
+      "oid": 1114,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 0
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 23:59:59.999999')::timestamp(1)",
+      "oid": 1114,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 1
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 23:59:59.999999')::timestamp(2)",
+      "oid": 1114,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 2
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 23:59:59.999999')::timestamp(3)",
+      "oid": 1114,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 3
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 23:59:59.999999')::timestamp(4)",
+      "oid": 1114,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 4
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 23:59:59.999999')::timestamp(5)",
+      "oid": 1114,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 5
+    },
+    {
+      "kind": "timestamp",
+      "sql": "(timestamp '2000-01-01 23:59:59.999999')::timestamp(6)",
+      "oid": 1114,
+      "binary": "000000141dd75fff",
+      "text": "2000-01-01 23:59:59.999999",
+      "components": [
+        86399999999
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 6
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 00:00:00.555555')::timestamptz(0)",
+      "oid": 1184,
+      "binary": "00000000000f4240",
+      "text": "2000-01-01 00:00:01+00",
+      "components": [
+        1000000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 00:00:00.555555')::timestamptz(1)",
+      "oid": 1184,
+      "binary": "00000000000927c0",
+      "text": "2000-01-01 00:00:00.6+00",
+      "components": [
+        600000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 1
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 00:00:00.555555')::timestamptz(2)",
+      "oid": 1184,
+      "binary": "0000000000088b80",
+      "text": "2000-01-01 00:00:00.56+00",
+      "components": [
+        560000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 2
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 00:00:00.555555')::timestamptz(3)",
+      "oid": 1184,
+      "binary": "0000000000087be0",
+      "text": "2000-01-01 00:00:00.556+00",
+      "components": [
+        556000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 3
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 00:00:00.555555')::timestamptz(4)",
+      "oid": 1184,
+      "binary": "0000000000087a50",
+      "text": "2000-01-01 00:00:00.5556+00",
+      "components": [
+        555600
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 4
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 00:00:00.555555')::timestamptz(5)",
+      "oid": 1184,
+      "binary": "0000000000087a28",
+      "text": "2000-01-01 00:00:00.55556+00",
+      "components": [
+        555560
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 5
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 00:00:00.555555')::timestamptz(6)",
+      "oid": 1184,
+      "binary": "0000000000087a23",
+      "text": "2000-01-01 00:00:00.555555+00",
+      "components": [
+        555555
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 6
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.444445')::timestamptz(0)",
+      "oid": 1184,
+      "binary": "fffffffffff0bdc0",
+      "text": "1999-12-31 23:59:59+00",
+      "components": [
+        -1000000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.444445')::timestamptz(1)",
+      "oid": 1184,
+      "binary": "fffffffffff6d840",
+      "text": "1999-12-31 23:59:59.4+00",
+      "components": [
+        -600000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 1
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.444445')::timestamptz(2)",
+      "oid": 1184,
+      "binary": "fffffffffff77480",
+      "text": "1999-12-31 23:59:59.44+00",
+      "components": [
+        -560000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 2
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.444445')::timestamptz(3)",
+      "oid": 1184,
+      "binary": "fffffffffff78420",
+      "text": "1999-12-31 23:59:59.444+00",
+      "components": [
+        -556000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 3
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.444445')::timestamptz(4)",
+      "oid": 1184,
+      "binary": "fffffffffff785b0",
+      "text": "1999-12-31 23:59:59.4444+00",
+      "components": [
+        -555600
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 4
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.444445')::timestamptz(5)",
+      "oid": 1184,
+      "binary": "fffffffffff785d8",
+      "text": "1999-12-31 23:59:59.44444+00",
+      "components": [
+        -555560
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 5
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.444445')::timestamptz(6)",
+      "oid": 1184,
+      "binary": "fffffffffff785dd",
+      "text": "1999-12-31 23:59:59.444445+00",
+      "components": [
+        -555555
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd",
+      "precision": 6
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.500000')::timestamptz(0)",
+      "oid": 1184,
+      "binary": "fffffffffff0bdc0",
+      "text": "1999-12-31 23:59:59+00",
+      "components": [
+        -1000000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.500000')::timestamptz(1)",
+      "oid": 1184,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5+00",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 1
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.500000')::timestamptz(2)",
+      "oid": 1184,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5+00",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 2
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.500000')::timestamptz(3)",
+      "oid": 1184,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5+00",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 3
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.500000')::timestamptz(4)",
+      "oid": 1184,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5+00",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 4
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.500000')::timestamptz(5)",
+      "oid": 1184,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5+00",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 5
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '1999-12-31 23:59:59.500000')::timestamptz(6)",
+      "oid": 1184,
+      "binary": "fffffffffff85ee0",
+      "text": "1999-12-31 23:59:59.5+00",
+      "components": [
+        -500000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff85ee0",
+      "precision": 6
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 23:59:59.999999')::timestamptz(0)",
+      "oid": 1184,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00+00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 23:59:59.999999')::timestamptz(1)",
+      "oid": 1184,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00+00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 1
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 23:59:59.999999')::timestamptz(2)",
+      "oid": 1184,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00+00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 2
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 23:59:59.999999')::timestamptz(3)",
+      "oid": 1184,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00+00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 3
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 23:59:59.999999')::timestamptz(4)",
+      "oid": 1184,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00+00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 4
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 23:59:59.999999')::timestamptz(5)",
+      "oid": 1184,
+      "binary": "000000141dd76000",
+      "text": "2000-01-02 00:00:00+00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 5
+    },
+    {
+      "kind": "timestamp_tz",
+      "sql": "(timestamptz '2000-01-01 23:59:59.999999')::timestamptz(6)",
+      "oid": 1184,
+      "binary": "000000141dd75fff",
+      "text": "2000-01-01 23:59:59.999999+00",
+      "components": [
+        86399999999
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 6
+    },
+    {
+      "kind": "time",
+      "sql": "(time '00:00:00.555555')::time(0)",
+      "oid": 1083,
+      "binary": "00000000000f4240",
+      "text": "00:00:01",
+      "components": [
+        1000000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 0
+    },
+    {
+      "kind": "time",
+      "sql": "(time '00:00:00.555555')::time(1)",
+      "oid": 1083,
+      "binary": "00000000000927c0",
+      "text": "00:00:00.6",
+      "components": [
+        600000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 1
+    },
+    {
+      "kind": "time",
+      "sql": "(time '00:00:00.555555')::time(2)",
+      "oid": 1083,
+      "binary": "0000000000088b80",
+      "text": "00:00:00.56",
+      "components": [
+        560000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 2
+    },
+    {
+      "kind": "time",
+      "sql": "(time '00:00:00.555555')::time(3)",
+      "oid": 1083,
+      "binary": "0000000000087be0",
+      "text": "00:00:00.556",
+      "components": [
+        556000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 3
+    },
+    {
+      "kind": "time",
+      "sql": "(time '00:00:00.555555')::time(4)",
+      "oid": 1083,
+      "binary": "0000000000087a50",
+      "text": "00:00:00.5556",
+      "components": [
+        555600
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 4
+    },
+    {
+      "kind": "time",
+      "sql": "(time '00:00:00.555555')::time(5)",
+      "oid": 1083,
+      "binary": "0000000000087a28",
+      "text": "00:00:00.55556",
+      "components": [
+        555560
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 5
+    },
+    {
+      "kind": "time",
+      "sql": "(time '00:00:00.555555')::time(6)",
+      "oid": 1083,
+      "binary": "0000000000087a23",
+      "text": "00:00:00.555555",
+      "components": [
+        555555
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23",
+      "precision": 6
+    },
+    {
+      "kind": "time",
+      "sql": "(time '23:59:59.999999')::time(0)",
+      "oid": 1083,
+      "binary": "000000141dd76000",
+      "text": "24:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 0
+    },
+    {
+      "kind": "time",
+      "sql": "(time '23:59:59.999999')::time(1)",
+      "oid": 1083,
+      "binary": "000000141dd76000",
+      "text": "24:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 1
+    },
+    {
+      "kind": "time",
+      "sql": "(time '23:59:59.999999')::time(2)",
+      "oid": 1083,
+      "binary": "000000141dd76000",
+      "text": "24:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 2
+    },
+    {
+      "kind": "time",
+      "sql": "(time '23:59:59.999999')::time(3)",
+      "oid": 1083,
+      "binary": "000000141dd76000",
+      "text": "24:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 3
+    },
+    {
+      "kind": "time",
+      "sql": "(time '23:59:59.999999')::time(4)",
+      "oid": 1083,
+      "binary": "000000141dd76000",
+      "text": "24:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 4
+    },
+    {
+      "kind": "time",
+      "sql": "(time '23:59:59.999999')::time(5)",
+      "oid": 1083,
+      "binary": "000000141dd76000",
+      "text": "24:00:00",
+      "components": [
+        86400000000
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 5
+    },
+    {
+      "kind": "time",
+      "sql": "(time '23:59:59.999999')::time(6)",
+      "oid": 1083,
+      "binary": "000000141dd75fff",
+      "text": "23:59:59.999999",
+      "components": [
+        86399999999
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff",
+      "precision": 6
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '00:00:00.555555+05:45')::timetz(0)",
+      "oid": 1266,
+      "binary": "00000000000f4240ffffaf24",
+      "text": "00:00:01+05:45",
+      "components": [
+        1000000,
+        -20700
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23ffffaf24",
+      "precision": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '00:00:00.555555+05:45')::timetz(1)",
+      "oid": 1266,
+      "binary": "00000000000927c0ffffaf24",
+      "text": "00:00:00.6+05:45",
+      "components": [
+        600000,
+        -20700
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23ffffaf24",
+      "precision": 1
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '00:00:00.555555+05:45')::timetz(2)",
+      "oid": 1266,
+      "binary": "0000000000088b80ffffaf24",
+      "text": "00:00:00.56+05:45",
+      "components": [
+        560000,
+        -20700
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23ffffaf24",
+      "precision": 2
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '00:00:00.555555+05:45')::timetz(3)",
+      "oid": 1266,
+      "binary": "0000000000087be0ffffaf24",
+      "text": "00:00:00.556+05:45",
+      "components": [
+        556000,
+        -20700
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23ffffaf24",
+      "precision": 3
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '00:00:00.555555+05:45')::timetz(4)",
+      "oid": 1266,
+      "binary": "0000000000087a50ffffaf24",
+      "text": "00:00:00.5556+05:45",
+      "components": [
+        555600,
+        -20700
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23ffffaf24",
+      "precision": 4
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '00:00:00.555555+05:45')::timetz(5)",
+      "oid": 1266,
+      "binary": "0000000000087a28ffffaf24",
+      "text": "00:00:00.55556+05:45",
+      "components": [
+        555560,
+        -20700
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23ffffaf24",
+      "precision": 5
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '00:00:00.555555+05:45')::timetz(6)",
+      "oid": 1266,
+      "binary": "0000000000087a23ffffaf24",
+      "text": "00:00:00.555555+05:45",
+      "components": [
+        555555,
+        -20700
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23ffffaf24",
+      "precision": 6
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '23:59:59.999999-15:59:59')::timetz(0)",
+      "oid": 1266,
+      "binary": "000000141dd760000000e0ff",
+      "text": "24:00:00-15:59:59",
+      "components": [
+        86400000000,
+        57599
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff0000e0ff",
+      "precision": 0
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '23:59:59.999999-15:59:59')::timetz(1)",
+      "oid": 1266,
+      "binary": "000000141dd760000000e0ff",
+      "text": "24:00:00-15:59:59",
+      "components": [
+        86400000000,
+        57599
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff0000e0ff",
+      "precision": 1
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '23:59:59.999999-15:59:59')::timetz(2)",
+      "oid": 1266,
+      "binary": "000000141dd760000000e0ff",
+      "text": "24:00:00-15:59:59",
+      "components": [
+        86400000000,
+        57599
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff0000e0ff",
+      "precision": 2
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '23:59:59.999999-15:59:59')::timetz(3)",
+      "oid": 1266,
+      "binary": "000000141dd760000000e0ff",
+      "text": "24:00:00-15:59:59",
+      "components": [
+        86400000000,
+        57599
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff0000e0ff",
+      "precision": 3
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '23:59:59.999999-15:59:59')::timetz(4)",
+      "oid": 1266,
+      "binary": "000000141dd760000000e0ff",
+      "text": "24:00:00-15:59:59",
+      "components": [
+        86400000000,
+        57599
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff0000e0ff",
+      "precision": 4
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '23:59:59.999999-15:59:59')::timetz(5)",
+      "oid": 1266,
+      "binary": "000000141dd760000000e0ff",
+      "text": "24:00:00-15:59:59",
+      "components": [
+        86400000000,
+        57599
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff0000e0ff",
+      "precision": 5
+    },
+    {
+      "kind": "time_tz",
+      "sql": "(timetz '23:59:59.999999-15:59:59')::timetz(6)",
+      "oid": 1266,
+      "binary": "000000141dd75fff0000e0ff",
+      "text": "23:59:59.999999-15:59:59",
+      "components": [
+        86399999999,
+        57599
+      ],
+      "infinity": 0,
+      "source_binary": "000000141dd75fff0000e0ff",
+      "precision": 6
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '0.555555 seconds')::interval(0)",
+      "oid": 1186,
+      "binary": "00000000000f42400000000000000000",
+      "text": "00:00:01",
+      "components": [
+        0,
+        0,
+        1000000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a230000000000000000",
+      "precision": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '0.555555 seconds')::interval(1)",
+      "oid": 1186,
+      "binary": "00000000000927c00000000000000000",
+      "text": "00:00:00.6",
+      "components": [
+        0,
+        0,
+        600000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a230000000000000000",
+      "precision": 1
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '0.555555 seconds')::interval(2)",
+      "oid": 1186,
+      "binary": "0000000000088b800000000000000000",
+      "text": "00:00:00.56",
+      "components": [
+        0,
+        0,
+        560000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a230000000000000000",
+      "precision": 2
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '0.555555 seconds')::interval(3)",
+      "oid": 1186,
+      "binary": "0000000000087be00000000000000000",
+      "text": "00:00:00.556",
+      "components": [
+        0,
+        0,
+        556000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a230000000000000000",
+      "precision": 3
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '0.555555 seconds')::interval(4)",
+      "oid": 1186,
+      "binary": "0000000000087a500000000000000000",
+      "text": "00:00:00.5556",
+      "components": [
+        0,
+        0,
+        555600
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a230000000000000000",
+      "precision": 4
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '0.555555 seconds')::interval(5)",
+      "oid": 1186,
+      "binary": "0000000000087a280000000000000000",
+      "text": "00:00:00.55556",
+      "components": [
+        0,
+        0,
+        555560
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a230000000000000000",
+      "precision": 5
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '0.555555 seconds')::interval(6)",
+      "oid": 1186,
+      "binary": "0000000000087a230000000000000000",
+      "text": "00:00:00.555555",
+      "components": [
+        0,
+        0,
+        555555
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a230000000000000000",
+      "precision": 6
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.555555 seconds')::interval(0)",
+      "oid": 1186,
+      "binary": "fffffffffff0bdc00000000000000000",
+      "text": "-00:00:01",
+      "components": [
+        0,
+        0,
+        -1000000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd0000000000000000",
+      "precision": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.555555 seconds')::interval(1)",
+      "oid": 1186,
+      "binary": "fffffffffff6d8400000000000000000",
+      "text": "-00:00:00.6",
+      "components": [
+        0,
+        0,
+        -600000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd0000000000000000",
+      "precision": 1
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.555555 seconds')::interval(2)",
+      "oid": 1186,
+      "binary": "fffffffffff774800000000000000000",
+      "text": "-00:00:00.56",
+      "components": [
+        0,
+        0,
+        -560000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd0000000000000000",
+      "precision": 2
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.555555 seconds')::interval(3)",
+      "oid": 1186,
+      "binary": "fffffffffff784200000000000000000",
+      "text": "-00:00:00.556",
+      "components": [
+        0,
+        0,
+        -556000
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd0000000000000000",
+      "precision": 3
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.555555 seconds')::interval(4)",
+      "oid": 1186,
+      "binary": "fffffffffff785b00000000000000000",
+      "text": "-00:00:00.5556",
+      "components": [
+        0,
+        0,
+        -555600
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd0000000000000000",
+      "precision": 4
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.555555 seconds')::interval(5)",
+      "oid": 1186,
+      "binary": "fffffffffff785d80000000000000000",
+      "text": "-00:00:00.55556",
+      "components": [
+        0,
+        0,
+        -555560
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd0000000000000000",
+      "precision": 5
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.555555 seconds')::interval(6)",
+      "oid": 1186,
+      "binary": "fffffffffff785dd0000000000000000",
+      "text": "-00:00:00.555555",
+      "components": [
+        0,
+        0,
+        -555555
+      ],
+      "infinity": 0,
+      "source_binary": "fffffffffff785dd0000000000000000",
+      "precision": 6
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '1 month -2 days 0.555555 seconds')::interval(0)",
+      "oid": 1186,
+      "binary": "00000000000f4240fffffffe00000001",
+      "text": "1 mon -2 days +00:00:01",
+      "components": [
+        1,
+        -2,
+        1000000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23fffffffe00000001",
+      "precision": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '1 month -2 days 0.555555 seconds')::interval(1)",
+      "oid": 1186,
+      "binary": "00000000000927c0fffffffe00000001",
+      "text": "1 mon -2 days +00:00:00.6",
+      "components": [
+        1,
+        -2,
+        600000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23fffffffe00000001",
+      "precision": 1
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '1 month -2 days 0.555555 seconds')::interval(2)",
+      "oid": 1186,
+      "binary": "0000000000088b80fffffffe00000001",
+      "text": "1 mon -2 days +00:00:00.56",
+      "components": [
+        1,
+        -2,
+        560000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23fffffffe00000001",
+      "precision": 2
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '1 month -2 days 0.555555 seconds')::interval(3)",
+      "oid": 1186,
+      "binary": "0000000000087be0fffffffe00000001",
+      "text": "1 mon -2 days +00:00:00.556",
+      "components": [
+        1,
+        -2,
+        556000
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23fffffffe00000001",
+      "precision": 3
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '1 month -2 days 0.555555 seconds')::interval(4)",
+      "oid": 1186,
+      "binary": "0000000000087a50fffffffe00000001",
+      "text": "1 mon -2 days +00:00:00.5556",
+      "components": [
+        1,
+        -2,
+        555600
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23fffffffe00000001",
+      "precision": 4
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '1 month -2 days 0.555555 seconds')::interval(5)",
+      "oid": 1186,
+      "binary": "0000000000087a28fffffffe00000001",
+      "text": "1 mon -2 days +00:00:00.55556",
+      "components": [
+        1,
+        -2,
+        555560
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23fffffffe00000001",
+      "precision": 5
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '1 month -2 days 0.555555 seconds')::interval(6)",
+      "oid": 1186,
+      "binary": "0000000000087a23fffffffe00000001",
+      "text": "1 mon -2 days +00:00:00.555555",
+      "components": [
+        1,
+        -2,
+        555555
+      ],
+      "infinity": 0,
+      "source_binary": "0000000000087a23fffffffe00000001",
+      "precision": 6
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.000001 seconds')::interval(0)",
+      "oid": 1186,
+      "binary": "00000000000000000000000000000000",
+      "text": "00:00:00",
+      "components": [
+        0,
+        0,
+        0
+      ],
+      "infinity": 0,
+      "source_binary": "ffffffffffffffff0000000000000000",
+      "precision": 0
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.000001 seconds')::interval(1)",
+      "oid": 1186,
+      "binary": "00000000000000000000000000000000",
+      "text": "00:00:00",
+      "components": [
+        0,
+        0,
+        0
+      ],
+      "infinity": 0,
+      "source_binary": "ffffffffffffffff0000000000000000",
+      "precision": 1
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.000001 seconds')::interval(2)",
+      "oid": 1186,
+      "binary": "00000000000000000000000000000000",
+      "text": "00:00:00",
+      "components": [
+        0,
+        0,
+        0
+      ],
+      "infinity": 0,
+      "source_binary": "ffffffffffffffff0000000000000000",
+      "precision": 2
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.000001 seconds')::interval(3)",
+      "oid": 1186,
+      "binary": "00000000000000000000000000000000",
+      "text": "00:00:00",
+      "components": [
+        0,
+        0,
+        0
+      ],
+      "infinity": 0,
+      "source_binary": "ffffffffffffffff0000000000000000",
+      "precision": 3
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.000001 seconds')::interval(4)",
+      "oid": 1186,
+      "binary": "00000000000000000000000000000000",
+      "text": "00:00:00",
+      "components": [
+        0,
+        0,
+        0
+      ],
+      "infinity": 0,
+      "source_binary": "ffffffffffffffff0000000000000000",
+      "precision": 4
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.000001 seconds')::interval(5)",
+      "oid": 1186,
+      "binary": "00000000000000000000000000000000",
+      "text": "00:00:00",
+      "components": [
+        0,
+        0,
+        0
+      ],
+      "infinity": 0,
+      "source_binary": "ffffffffffffffff0000000000000000",
+      "precision": 5
+    },
+    {
+      "kind": "interval",
+      "sql": "(interval '-0.000001 seconds')::interval(6)",
+      "oid": 1186,
+      "binary": "ffffffffffffffff0000000000000000",
+      "text": "-00:00:00.000001",
+      "components": [
+        0,
+        0,
+        -1
+      ],
+      "infinity": 0,
+      "source_binary": "ffffffffffffffff0000000000000000",
+      "precision": 6
+    }
+  ],
+  "comparisons": [
+    {
+      "kind": "date",
+      "left": "80000000",
+      "right": "ffffd533",
+      "order": -1
+    },
+    {
+      "kind": "date",
+      "left": "fff4da8b",
+      "right": "fff4dbf9",
+      "order": -1
+    },
+    {
+      "kind": "date",
+      "left": "7fffffff",
+      "right": "80000000",
+      "order": 1
+    },
+    {
+      "kind": "time",
+      "left": "0000000000000000",
+      "right": "000000141dd76000",
+      "order": -1
+    },
+    {
+      "kind": "time",
+      "left": "0000000000000001",
+      "right": "0000000000000002",
+      "order": -1
+    },
+    {
+      "kind": "time_tz",
+      "left": "00000000d693a400fffff1f0",
+      "right": "000000000000000000000000",
+      "order": -1
+    },
+    {
+      "kind": "time_tz",
+      "left": "000000000000000000000000",
+      "right": "00000000d693a400fffff1f0",
+      "order": 1
+    },
+    {
+      "kind": "time_tz",
+      "left": "000000141dd7600000000000",
+      "right": "000000000000000000000000",
+      "order": 1
+    },
+    {
+      "kind": "time_tz",
+      "left": "000000141dc81dc00000e0ff",
+      "right": "0000000000000000ffff1f01",
+      "order": 1
+    },
+    {
+      "kind": "timestamp",
+      "left": "fffca2fec4c81fff",
+      "right": "fffca2fec4c82000",
+      "order": -1
+    },
+    {
+      "kind": "timestamp",
+      "left": "8000000000000000",
+      "right": "fd0f7cc1411fa000",
+      "order": -1
+    },
+    {
+      "kind": "timestamp_tz",
+      "left": "ffffffff296c5c00",
+      "right": "ffffffff296c5c00",
+      "order": 0
+    },
+    {
+      "kind": "timestamp_tz",
+      "left": "7fffffffffffffff",
+      "right": "7fffff5bb3b29fff",
+      "order": 1
+    },
+    {
+      "kind": "interval",
+      "left": "00000000000000000000000000000001",
+      "right": "00000000000000000000001e00000000",
+      "order": 0
+    },
+    {
+      "kind": "interval",
+      "left": "0000000000000000000000000000000c",
+      "right": "00000000000000000000016800000000",
+      "order": 0
+    },
+    {
+      "kind": "interval",
+      "left": "00000000000000000000000100000000",
+      "right": "000000141dd760000000000000000000",
+      "order": 0
+    },
+    {
+      "kind": "interval",
+      "left": "0000000000000000ffffffe200000001",
+      "right": "00000000000000000000000000000000",
+      "order": 0
+    },
+    {
+      "kind": "interval",
+      "left": "00000000000000000000000000000001",
+      "right": "00000000000000000000001f00000000",
+      "order": -1
+    },
+    {
+      "kind": "interval",
+      "left": "80000000000000008000000080000000",
+      "right": "80000000000000000000000000000000",
+      "order": -1
+    },
+    {
+      "kind": "interval",
+      "left": "7fffffffffffffff7fffffff7fffffff",
+      "right": "7fffffffffffffff0000000000000000",
+      "order": 1
+    },
+    {
+      "kind": "interval",
+      "left": "80000000000000007fffffff7fffffff",
+      "right": "00000000000000000000000000000000",
+      "order": 1
+    }
+  ]
+}

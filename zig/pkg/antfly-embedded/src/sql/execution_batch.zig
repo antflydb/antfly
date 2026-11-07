@@ -733,12 +733,13 @@ pub const Batch = union(enum) {
                 const value = try v.source.cell(a, v.selection[index], v.ordinals[column]);
                 if (column >= v.types.len) return error.InvalidSqlBackendResponse;
                 const type_ = v.types[column];
-                break :blk try @import("describe.zig").coerceDatum(a, value, type_.kind orelse return error.InvalidSqlBackendResponse, type_.element_type);
+                if (type_.kind == null) return error.InvalidSqlBackendResponse;
+                break :blk try @import("describe.zig").coerceDatumTyped(a, value, type_);
             },
             .columns => |v| blk: {
                 const definition = v.definitions[column];
                 const value = try v.page.typedCell(a, index, definition.name, definition.element_type == .numeric);
-                break :blk try @import("describe.zig").coerceDatum(a, value, definition.type, definition.element_type);
+                break :blk try @import("describe.zig").coerceDatumTyped(a, value, scalar.columnType(definition));
             },
         };
     }
@@ -995,4 +996,42 @@ test "SQL scalar row descriptors reuse bounded storage without retiring expressi
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL mutation temporal batches preserve exact borrowed domains through selection and projection" {
+    const temporal = @import("temporal_value.zig");
+    const values = [_]temporal.Value{
+        .{ .date = .{ .days = 0 } },
+        .{ .time = .{ .micros = 12345 } },
+        .{ .time_tz = .{ .time = .{ .micros = 12345 }, .seconds_west = 5400 } },
+        .{ .timestamp = .{ .micros = 0 } },
+        .{ .timestamp_tz = .{ .micros = 0 } },
+        .{ .interval = .{ .months = 1, .days = 2, .micros = 3 } },
+    };
+    var none: std.heap.FixedBufferAllocator = .init(&.{});
+    for (&values) |*value| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const source: Batch = .{ .rows = &.{ &.{scalar.Datum.typedTemporal(value)}, &.{.{}}, &.{scalar.Datum.json(.{ .string = "invalid-unselected" })} } };
+        var mapped: Batch = .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .types = &.{.{ .kind = .datetime, .temporal_kind = value.kind() }}, .selection = &.{ 0, 1 } } };
+        var columns: Batch = .{ .columns = .{ .page = .{ .native = .{ .values = &source, .names = &.{"v"} }, .selection = &.{ 0, 1 } }, .definitions = &.{.{ .name = "v", .type = .datetime, .temporal_kind = value.kind() }} } };
+        for ([_]*const Batch{ &mapped, &columns }) |batch| {
+            // Coercion borrows both typed payloads and SQL NULLs without a
+            // heap, and never decodes the invalid unselected source row.
+            try std.testing.expect((try batch.cell(none.allocator(), 0, 0)).temporal() == value);
+            try std.testing.expect((try batch.cell(none.allocator(), 1, 0)).sql_null);
+            const selected = try batch.select(arena.allocator(), &.{ 1, 0, 0 });
+            const projected = try selected.project(arena.allocator(), 0);
+            try std.testing.expect((try projected.cell(none.allocator(), 0, 0)).sql_null);
+            try std.testing.expect((try projected.cell(none.allocator(), 1, 0)).temporal() == value);
+            try std.testing.expect((try projected.cell(none.allocator(), 2, 0)).temporal() == value);
+        }
+        for (std.enums.values(temporal.Kind)) |wrong| {
+            if (wrong == value.kind()) continue;
+            mapped.mapped.types = &.{.{ .kind = .datetime, .temporal_kind = wrong }};
+            columns.columns.definitions = &.{.{ .name = "v", .type = .datetime, .temporal_kind = wrong }};
+            try std.testing.expectError(error.SqlTypeMismatch, mapped.cell(none.allocator(), 0, 0));
+            try std.testing.expectError(error.SqlTypeMismatch, columns.cell(none.allocator(), 0, 0));
+        }
+    }
 }

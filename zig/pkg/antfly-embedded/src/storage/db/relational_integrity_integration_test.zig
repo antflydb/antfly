@@ -1710,6 +1710,107 @@ fn generationSet(db: *db_mod.DB) ![32]u8 {
     return @import("relational_integrity_activation.zig").generationSet(loaded);
 }
 
+test "relational integrity scoped standby historical CHECK replay preserves admission and cold images" {
+    const alloc = std.testing.allocator;
+    const restore = @import("restore_staging.zig");
+    const effects = @import("replication_effects.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prior_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"validated","column":"k","op":"gte","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"k":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"historical","column":"n","op":"gte","value":0,"not_valid":true},{"name":"validated","column":"k","op":"gte","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"k":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const source_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/historical-source", .{tmp.sub_path});
+    const replica_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/historical-standby", .{tmp.sub_path});
+    const source_options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    {
+        var source = try db_mod.DB.open(alloc, source_path, source_options);
+        defer source.close();
+        try source.setSchemaJson(alloc, prior_schema);
+        try source.batch(.{ .timestamp_ns = 42, .writes = &.{.{ .key = "historical", .value = "{\"n\":-1,\"k\":2}" }} });
+        try source.setSchemaJson(alloc, schema);
+    }
+    var readonly = source_options;
+    readonly.open_mode = .query_readonly;
+    var source = try db_mod.DB.open(alloc, source_path, readonly);
+    defer source.close();
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var replica = try db_mod.DB.open(alloc, replica_path, options);
+    var open = true;
+    defer if (open) replica.close();
+    try replica.setSchemaJson(alloc, schema);
+    const encoded = try @import("../schema.zig").serializeSchema(a, replica.core.schema.?);
+    const scope: restore.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = options.identity_namespace.?, .target_schema_digest = restore.digest(encoded) };
+    try replica.reserveRestoreStagingScoped(alloc, scope);
+    const Replay = struct {
+        fn run(db: *db_mod.DB, request: @import("types.zig").BatchRequest, sequence: u64) !void {
+            const payload = try effects.encodeBatchMutationRequestAlloc(std.testing.allocator, request);
+            defer std.testing.allocator.free(payload);
+            try replication_ingress.applyRecord(db, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = sequence, .previous_lsn = sequence - 1, .payload = payload });
+        }
+    };
+    var sequence: u64 = 1;
+    try Replay.run(&replica, .{ .restore_staging = .{ .begin = scope } }, sequence);
+    var imported = false;
+    for (0..16) |_| {
+        var page = try replica.prepareRestoreStagingPage(alloc, scope, &source, 128, .none);
+        defer page.deinit();
+        const request = page.batch orelse break;
+        sequence += 1;
+        if (request.writes.len != 0) {
+            try std.testing.expectEqual(@as(usize, 1), request.writes.len);
+            try std.testing.expectEqualStrings("historical", request.writes[0].key);
+            // Exercise the actual import command and immutable source row.
+            // A validated rule still rejects corrupt historical bytes.
+            var invalid = request;
+            invalid.writes = &.{.{ .key = "historical", .value = "{\"n\":-1,\"k\":-2}" }};
+            try std.testing.expectError(error.RelationalCheckViolation, Replay.run(&replica, invalid, sequence));
+            try std.testing.expect(!try replica.replicationMutationAlreadyApplied(sequence));
+            var wrong_scope = request;
+            wrong_scope.restore_staging.?.import_page.scope = @splat(9);
+            try std.testing.expectError(error.InvalidRestoreStagingCommand, Replay.run(&replica, wrong_scope, sequence));
+            imported = true;
+        }
+        try Replay.run(&replica, request, sequence);
+        try Replay.run(&replica, request, sequence); // Lost acknowledgement.
+        if (page.phase == .imported) break;
+    }
+    try std.testing.expect(imported);
+    var status = (try replica.restoreStagingStatus(alloc)) orelse return error.MissingRestoreProgress;
+    defer status.deinit();
+    try std.testing.expectEqual(.imported, status.value.phase);
+    // The scope-only replay channel is intentionally restricted to integrity
+    // metadata. Do not broaden it to import arbitrary primary row images.
+    const forbidden: @import("types.zig").BatchRequest = .{ .restore_staging_scope = scope.digest(), .relational_schema_version = 2, .writes = &.{.{ .key = "forbidden", .value = "{\"n\":1,\"k\":2}" }} };
+    try std.testing.expectError(error.InvalidIntegrityKey, Replay.run(&replica, forbidden, sequence + 1));
+    var live: @import("types.zig").BatchRequest = .{ .relational_schema_version = 2, .writes = &.{.{ .key = "historical", .value = "{\"n\":-1,\"k\":2}" }} };
+    live.restore_staging_scope = null;
+    try std.testing.expectError(error.RelationalCheckViolation, Replay.run(&replica, live, sequence + 1));
+    try std.testing.expect(!try replica.replicationMutationAlreadyApplied(sequence + 1));
+    var before = (try replica.lookup(alloc, "historical", .{ .restore_staging_scope = scope.digest(), .include_primary_digest = true })) orelse return error.MissingHistoricalRow;
+    defer before.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 42), before.version);
+    var logical = try std.json.parseFromSlice(struct { n: i64, k: i64 }, alloc, before.json, .{});
+    defer logical.deinit();
+    try std.testing.expectEqual(@as(i64, -1), logical.value.n);
+    try std.testing.expectEqual(@as(i64, 2), logical.value.k);
+    replica.close();
+    open = false;
+    var reopened = try db_mod.DB.open(alloc, replica_path, options);
+    defer reopened.close();
+    try std.testing.expect(try reopened.replicationMutationAlreadyApplied(sequence));
+    var cold = (try reopened.lookup(alloc, "historical", .{ .restore_staging_scope = scope.digest(), .include_primary_digest = true })) orelse return error.MissingHistoricalRow;
+    defer cold.deinit(alloc);
+    try std.testing.expectEqualStrings(before.json, cold.json);
+    try std.testing.expectEqual(before.version, cold.version);
+    try std.testing.expectEqual(before.expected_content_digest, cold.expected_content_digest);
+}
+
 test "relational integrity scoped two phase resolution mirrors binary claims through HA" {
     const alloc = std.testing.allocator;
     const restore = @import("restore_staging.zig");

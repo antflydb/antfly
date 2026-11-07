@@ -30,6 +30,9 @@ const sql_schema_json =
 ;
 
 const Fixture = struct {
+    // The returned server borrows this stable executor until server.deinit;
+    // each test destroys its server before releasing the enclosing fixture.
+    api_io: ?*std.Io.Threaded = null,
     logical_name: []const u8 = "rows",
     second_logical_name: ?[]const u8 = null,
     unknown: bool = false,
@@ -44,6 +47,7 @@ const Fixture = struct {
     job_key: ?[]u8 = null,
     job_value: ?[]u8 = null,
     plan: ?[]u8 = null,
+    staging_job: ?[]u8 = null,
     tables: [2]records.TableRecord = .{ .{ .table_id = 100, .name = "physical", .min_ranges = 1, .indexes_json = "{}" }, .{ .table_id = 101, .name = "physical_archive", .min_ranges = 1, .indexes_json = "{}" } },
     ranges: [2]records.RangeRecord = .{ .{ .table_id = 100, .group_id = 200, .range_id = 200, .doc_identity_shard_id = 200, .doc_identity_range_id = 200, .start_key = "", .end_key = null }, .{ .table_id = 101, .group_id = 201, .range_id = 201, .doc_identity_shard_id = 201, .doc_identity_range_id = 201, .start_key = "", .end_key = null } },
 
@@ -55,17 +59,29 @@ const Fixture = struct {
         return @ptrCast(@alignCast(ptr));
     }
     pub fn deinit(self: *@This()) void {
+        if (self.api_io) |io| {
+            io.deinit();
+            alloc.destroy(io);
+        }
         if (self.job_key) |value| alloc.free(value);
         if (self.job_value) |value| alloc.free(value);
         if (self.plan) |value| alloc.free(value);
+        if (self.staging_job) |value| alloc.free(value);
     }
     fn status(_: *anyopaque) !metadata.MetadataStatus {
         return .{ .metadata_group_id = 1, .metrics = .{} };
     }
-    fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+    fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self = cast(ptr);
         self.catalog_reads += 1;
         return switch (call) {
+            .setting_snapshot => |scope| std.json.Stringify.valueAlloc(a, @import("antfly_local_sources").sql_setting_catalog.RawSnapshot{ .scope = scope, .epoch = 7, .definitions = &.{} }, .{}),
+            .sql_column_sequence_handoffs => |query| blk: {
+                try std.testing.expect(context.setting_admin);
+                // This fixture has no identity columns or owned sequences.
+                // Preserve the exact planned targets across catalog enrichment.
+                break :blk std.json.Stringify.valueAlloc(a, query.targets, .{});
+            },
             .snapshot => blk: {
                 const resources = try a.alloc(domain.Resource, 2 + self.tableCount());
                 resources[0] = domain.default_database;
@@ -214,6 +230,18 @@ const Fixture = struct {
         if (self.job_key) |stored| if (std.mem.eql(u8, stored, key)) return try a.dupe(u8, self.job_value.?);
         return null;
     }
+    fn getStaging(ptr: *anyopaque, a: std.mem.Allocator, id: [16]u8, context: operation.RequestContext) !?[]u8 {
+        try context.ensureActive();
+        if (!context.setting_admin) return error.Forbidden;
+        const self = cast(ptr);
+        const bytes = self.staging_job orelse return null;
+        var stored = try std.json.parseFromSlice(stages.Job, a, bytes, .{});
+        defer stored.deinit();
+        if (!std.mem.eql(u8, &stored.value.plan.id, &id)) return null;
+        // Match actual administrative readback: immutable retained Job bytes,
+        // not a newly reconstructed plan or a mutable public job summary.
+        return try a.dupe(u8, bytes);
+    }
     fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, _: u64) ![]u8 {
         const self = cast(ptr);
         try std.testing.expectEqual(self.tableCount(), self.owner_reads);
@@ -222,9 +250,20 @@ const Fixture = struct {
         defer decoded.deinit();
         try decoded.value.validate(a);
         try std.testing.expectEqual(decoded.value.targets.len, self.summary_reads);
-        self.job_key = try alloc.dupe(u8, key);
-        self.job_value = try alloc.dupe(u8, value);
-        self.plan = try alloc.dupe(u8, plan);
+        const owned = owned: {
+            const owned_key = try alloc.dupe(u8, key);
+            errdefer alloc.free(owned_key);
+            const owned_value = try alloc.dupe(u8, value);
+            errdefer alloc.free(owned_value);
+            const owned_plan = try alloc.dupe(u8, plan);
+            errdefer alloc.free(owned_plan);
+            const retained = try std.json.Stringify.valueAlloc(alloc, stages.Job{ .plan = decoded.value, .plan_digest = try decoded.value.digest(a), .state = .importing }, .{});
+            break :owned .{ .key = owned_key, .value = owned_value, .plan = owned_plan, .staging = retained };
+        };
+        self.job_key = owned.key;
+        self.job_value = owned.value;
+        self.plan = owned.plan;
+        self.staging_job = owned.staging;
         self.admissions += 1;
         if (self.unknown) return error.MetadataMutationOutcomeUnknown;
         return a.dupe(u8, value);
@@ -249,9 +288,21 @@ const Fixture = struct {
         return self.serverWith(null, null);
     }
     fn serverWith(self: *@This(), manager: ?*@import("../usermgr/mod.zig").UserManager, runtime: ?*@import("antfly_local_sources").storage_background_runtime.BackendRuntime) !http.ApiHttpServer {
-        var result = http.ApiHttpServer.init(alloc, .{ .user_manager = manager, .backend_runtime = runtime }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .supports_query_definitions = true } }, .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } }, null);
+        if (self.api_io == null) {
+            const io = try alloc.create(std.Io.Threaded);
+            io.* = std.Io.Threaded.init(alloc, .{});
+            self.api_io = io;
+        }
+        const io = self.api_io.?.io();
+        var result = http.ApiHttpServer.init(alloc, .{ .user_manager = manager, .backend_runtime = runtime, .imported_runtime_io = .{
+            .api = io,
+            .api_network = if (runtime) |owner| owner.apiNetworkIo() else io,
+            .api_filesystem = if (runtime) |owner| owner.apiFilesystemIo() else io,
+            .durable = if (runtime) |owner| owner.io() else io,
+        } }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .get_restore_staging = getStaging, .supports_query_definitions = true } }, .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } }, null);
         errdefer result.deinit();
-        result.restore_job_store.io = std.testing.io;
+        try std.testing.expect(result.sharedApiIo() != null);
+        result.restore_job_store.io = io;
         try result.restore_job_store.attachReplicated(self.persistence());
         // No owner mutation capability is provided. Admission must only
         // persist the compound metadata proposal, never dispatch live writes.
@@ -319,6 +370,7 @@ test "SQL TRUNCATE prepared statement uses mounted durable generation admission"
                 prepared += 1;
             }
             if (tag == 'E') {
+                errdefer std.debug.print("prepared TRUNCATE error payload: {s}\n", .{payload});
                 try std.testing.expect(std.mem.indexOf(u8, payload, "55000") != null);
                 try std.testing.expect(std.mem.indexOf(u8, payload, "restore_job_id") != null);
                 pending += 1;
@@ -598,6 +650,16 @@ test "SQL TRUNCATE native admission persists fresh plan and reconciles unknown r
         try std.testing.expectEqual(.queued, job.value.phase);
         var plan = try std.json.parseFromSlice(stages.Plan, alloc, fixture.plan.?, .{});
         defer plan.deinit();
+        const retained_bytes = (try server.source.getRestoreStaging(alloc, plan.value.id, .{ .setting_admin = true })).?;
+        defer alloc.free(retained_bytes);
+        var retained = try std.json.parseFromSlice(stages.Job, alloc, retained_bytes, .{});
+        defer retained.deinit();
+        try std.testing.expectEqualSlices(u8, &try plan.value.digest(arena.allocator()), &retained.value.plan_digest);
+        try std.testing.expectEqual(.importing, retained.value.state);
+        var foreign_id = plan.value.id;
+        foreign_id[0] ^= 1;
+        try std.testing.expectEqual(null, try server.source.getRestoreStaging(alloc, foreign_id, .{ .setting_admin = true }));
+        try std.testing.expectError(error.Forbidden, server.source.getRestoreStaging(alloc, plan.value.id, .{}));
         const target = plan.value.targets[0];
         try std.testing.expect(target.empty_generation and target.table.table_id != 100);
         try std.testing.expectEqual(@as(u64, 100), target.replace.?.table.table_id);

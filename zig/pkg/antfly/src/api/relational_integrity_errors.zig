@@ -15,7 +15,24 @@
 
 //! Stable internal prepare responses. Keeping the participant's typed reason
 //! lets the coordinator distinguish failed validation from retryable fences.
-pub const Error = error{
+pub const ConstraintRejection = error{
+    RelationalCheckViolation,
+    ConstraintValidationFailed,
+    ForeignKeyMatchFullViolation,
+    UniqueConstraintViolation,
+    TemporalOverlapViolation,
+    TemporalEmptyRange,
+    ForeignKeyParentMissing,
+    ForeignKeyReferenced,
+};
+
+pub fn constraintRejection(err: anyerror) bool {
+    inline for (@typeInfo(ConstraintRejection).error_set.error_names.?) |name|
+        if (err == @field(ConstraintRejection, name)) return true;
+    return false;
+}
+
+pub const Error = ConstraintRejection || @import("../usermgr/mod.zig").row_policy_authority.MutationRejection || error{
     RestoreStagingScopeChanged,
     RestoreStagingInProgress,
     RestoreStagingCanceled,
@@ -43,6 +60,8 @@ pub const Error = error{
     ForeignKeyReferenced,
     GenerationRetired,
     UniqueConstraintViolation,
+    TemporalOverlapViolation,
+    TemporalEmptyRange,
     ForeignKeyActionInProgress,
     PreparedGenerationChanged,
     PreparedReadSetChanged,

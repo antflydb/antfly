@@ -104,7 +104,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
     options.required_capability = "restore.read";
     var optional_location = if (source.peer_descriptor == null) try backups.openBackupLocationWithOptions(alloc, source.location, options) else null;
     defer if (optional_location) |*location| location.deinit(alloc);
-    if (source.artifact.format == .portable and (source.artifact.cohort_seal != null or source.artifact.rewrite != null)) {
+    if (source.artifact.format == .portable and (source.artifact.cohort_seal != null or source.artifact.rewrite != null or source.artifact.repository_schema_digest != null)) {
         const work_path = try std.fmt.allocPrint(alloc, "{s}.materializing", .{env.cache_path});
         defer alloc.free(work_path);
         const complete = if (source.peer_descriptor != null) peer: {
@@ -118,6 +118,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         var decoder = try db.DB.open(alloc, files, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .prefer_existing_identity_namespace = false, .primary_backend = .{ .lsm = .{} }, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
         {
             defer decoder.close();
+            try requireRepositorySchema(alloc, &decoder, source.artifact);
             if (program) |compiled| {
                 try decoder.requireRewriteSourceManifest(alloc, compiled, context.cancellation);
             }
@@ -147,7 +148,10 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         defer alloc.free(files);
         if (!try materialization.hasScope(alloc, env.io, files, input.scope)) {
             var decoder = try db.DB.open(alloc, files, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .prefer_existing_identity_namespace = false, .primary_backend = .{ .lsm = .{} }, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
-            decoder.close();
+            {
+                defer decoder.close();
+                try requireRepositorySchema(alloc, &decoder, source.artifact);
+            }
             const candidate_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
             defer alloc.free(candidate_marker);
             _ = try native_backup.writeFileDurable(env.io, candidate_marker, &input.scope.digest());
@@ -260,6 +264,13 @@ fn releaseSourceAt(alloc: std.mem.Allocator, env: Environment, scope: staging.Sc
     if (try candidate.publish() != .durable) return error.RestoreSourceDurabilityUncertain;
 }
 
+fn nativeEmptyReceipt(target: *db.DB, expected: ?@import("antfly_local_sources").storage_db_native_empty_generation.Install) !?@import("antfly_local_sources").storage_db_native_empty_generation.Receipt {
+    var read = try target.core.store.beginProbeTxn();
+    defer read.abort();
+    if (expected) |command| return @import("antfly_local_sources").storage_db_native_empty_generation.requireInstalled(&read, command);
+    return @import("antfly_local_sources").storage_db_native_empty_generation.load(&read);
+}
+
 /// Caller holds an exact resident owner lease and a ReadIndex barrier. The
 /// persisted reservation has already authenticated the entire source scope.
 /// Publication also requires the metadata job's committed publication proof.
@@ -275,13 +286,14 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     // Metadata/owner receipts survive restart; physical index coverage belongs
     // to this replica. Recheck it before acknowledging recovered readiness.
     // Cancellation must remain available even when a projection is broken.
-    if ((input.action == .status or input.action == .validate or input.action == .install_generation_admissions or input.action == .publish) and
+    if ((input.action == .status or input.action == .validate or input.action == .install_generation_admissions or input.action == .install_native_empty or input.action == .publish) and
         (before.value.phase == .validated or before.value.phase == .published))
     {
         if (!try target.prepareRestoreStagingIndexesStep(alloc, input.scope.digest())) return error.RestoreValidationPending;
     }
     if (input.action == .status) {
         const admission_receipt = try target.restoreGenerationAdmissionReceipt();
+        const native_empty = try nativeEmptyReceipt(target, null);
         const admission_digest: ?staging.Digest = if (admission_receipt) |receipt|
             if (std.mem.eql(u8, &receipt.scope, &input.scope.digest())) receipt.logical_digest else null
         else
@@ -293,7 +305,16 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             defer transition.deinit();
             break :blk try @import("antfly_local_sources").storage_rewrite_tail_spool.resumeOffset(alloc, env.io, env.cache_path, input.scope, progress.sequence);
         } else 0;
-        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .generation_admission_receipt = admission_digest, .rewrite = before.value.rewrite, .tail_next = resume_offset };
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .generation_admission_receipt = admission_digest, .native_empty_receipt = if (native_empty) |receipt| receipt.install_digest else null, .native_empty_commit = native_empty, .rewrite = before.value.rewrite, .tail_next = resume_offset };
+    }
+    if (input.action == .install_native_empty) {
+        if (try nativeEmptyReceipt(target, input.native_empty_install.?)) |receipt| {
+            const command = input.native_empty_install.?;
+            if (!std.mem.eql(u8, &receipt.scope, &input.scope.digest()) or receipt.origin_kind != command.origin.kind() or !std.mem.eql(u8, &receipt.origin_digest, &try command.origin.digest()) or
+                !std.mem.eql(u8, &receipt.install_digest, &try command.digest())) return error.RestoreStagingScopeChanged;
+            return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .native_empty_receipt = receipt.install_digest, .native_empty_commit = receipt };
+        }
+        if (before.value.phase != .validated) return error.RestoreStagingInProgress;
     }
     if (input.action == .install_generation_admissions) {
         if (try target.restoreGenerationAdmissionReceipt()) |receipt| {
@@ -301,7 +322,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             if (!std.mem.eql(u8, &receipt.scope, &command.scope) or
                 !std.mem.eql(u8, &receipt.logical_digest, &try @import("antfly_local_sources").storage_db_restore_staging_contract.admissionReceiptDigest(command)))
                 return error.RestoreStagingScopeChanged;
-            return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .generation_admission_receipt = receipt.logical_digest };
+            return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .generation_admission_receipt = receipt.logical_digest };
         }
         if (before.value.phase != .validated) return error.RestoreStagingInProgress;
     }
@@ -317,8 +338,8 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
         target.rewrite_tail_cache.clear();
         target.rewrite_tail_cache.mutex.unlock(env.io);
-        if (phase == .published or phase == .canceled) try releaseSource(alloc, env, input.scope);
-        return .{ .phase = phase, .rows = before.value.rows, .receipt = before.value.receipt() };
+        if (phase == .published or phase == .canceled) if (input.scope.population == null) try releaseSource(alloc, env, input.scope);
+        return .{ .phase = phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population };
     };
     if (before.value.phase == .canceled or before.value.phase == .published) return error.RestoreStagingScopeChanged;
     // Snapshot import is an idempotent advance operation, not a read followed
@@ -326,12 +347,12 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     // batch: on a reserved owner this turn only admits the scope, and the
     // returned committed receipt lets the next turn transfer/import its data.
     // Never attempt source IO before that admission has durably committed.
-    const admit_snapshot = input.action == .import_page and input.source != null and before.value.phase == .reserved;
+    const admit_import = input.action == .import_page and (input.source != null or input.population_page != null or input.population_complete != null) and before.value.phase == .reserved;
     if (input.action == .import_page and input.source != null and
         before.value.rewrite != null and before.value.rewrite.?.snapshot_complete)
     {
         target.restore_decoder_cache.retire(env.io);
-        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite };
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .rewrite = before.value.rewrite };
     }
     if (input.action == .begin and before.value.phase != .reserved) {
         // The caller already obtained a ReadIndex barrier and an exact owner
@@ -339,16 +360,24 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         // original reply was lost. Re-proposing begin would only append another
         // Raft entry/outbox record for every bounded snapshot page.
         if (!input.scope.target_namespace.eql(target.core.identity_namespace)) return error.RestoreStagingScopeChanged;
-        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite };
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .rewrite = before.value.rewrite };
     }
     var tail_next: u32 = 0;
     var source_next_offset: u64 = 0;
     switch (input.action) {
         .begin => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context),
         .install_generation_admissions => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .install_generation_admissions = input.generation_admissions.? } }, context),
+        .install_native_empty => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .install_native_empty = input.native_empty_install.? } }, context),
         .import_page => import: {
-            if (admit_snapshot) {
+            if (admit_import) {
                 try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context);
+                break :import;
+            }
+            if (input.scope.population != null) {
+                const incoming: @import("antfly_local_sources").storage_db_relational_population_staging.Input = if (input.population_page) |page| .{ .page = page } else .{ .complete = input.population_complete.? };
+                var prepared = try @import("antfly_local_sources").storage_db_relational_population_staging.prepare(alloc, target, input.scope, incoming);
+                defer prepared.deinit();
+                if (prepared.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
                 break :import;
             }
             if (input.rewrite_finish) |receipt| {
@@ -444,7 +473,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 cache.expireLocked(env.io);
                 if (cache.getLocked(cache_key) == null) {
                     cache.clearLocked();
-                    if (!try ensureSource(alloc, env, input, target.core.byteRange(), context, &source_next_offset, program)) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite, .source_next_offset = source_next_offset };
+                    if (!try ensureSource(alloc, env, input, target.core.byteRange(), context, &source_next_offset, program)) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .population = before.value.population, .rewrite = before.value.rewrite, .source_next_offset = source_next_offset };
                     // The owner cache outlives this request arena. Both the
                     // wrapper and its LSM allocations belong to the resident
                     // target allocator, including one-shot fallback cleanup.
@@ -498,10 +527,11 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
         target.rewrite_tail_cache.clear();
         target.rewrite_tail_cache.mutex.unlock(env.io);
-        try releaseSource(alloc, env, input.scope);
+        if (input.scope.population == null) try releaseSource(alloc, env, input.scope);
     }
     const admission_receipt = if (input.action == .install_generation_admissions) try target.restoreGenerationAdmissionReceipt() else null;
-    return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .generation_admission_receipt = if (admission_receipt) |receipt| receipt.logical_digest else null, .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
+    const native_empty = if (input.action == .install_native_empty) try nativeEmptyReceipt(target, input.native_empty_install.?) else null;
+    return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .population = after.value.population, .generation_admission_receipt = if (admission_receipt) |receipt| receipt.logical_digest else null, .native_empty_receipt = if (native_empty) |receipt| receipt.install_digest else null, .native_empty_commit = native_empty, .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
 }
 
 test "restore owner verified decoder rewrite history compiles once across production tail pages" {
@@ -656,6 +686,10 @@ test "restore owner verified decoder rewrite history compiles once across produc
 
 test "restore owner verified decoder is reused across pages and terminal cleanup revokes import" {
     try testVerifiedDecoder(false);
+}
+
+test "restore owner independent repository snapshot resumes without a synthetic cohort seal and preserves source identity and schema" {
+    try testVerifiedDecoderOrigin(true, true);
 }
 
 test "restore owner verified decoder portable resumes and preserves vector projections" {
@@ -858,7 +892,20 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, request, .{}));
 }
 
+fn requireRepositorySchema(alloc: std.mem.Allocator, decoder: *db.DB, artifact: @import("../metadata/restore_staging.zig").SourceArtifact) !void {
+    const expected = artifact.repository_schema_digest orelse return;
+    const schema = (try decoder.getSchemaJson(alloc)) orelse return error.RestoreSourceProofMissing;
+    defer alloc.free(schema);
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema, &actual, .{});
+    if (!std.mem.eql(u8, &actual, &expected)) return error.BackupIntegrityFailure;
+}
+
 fn testVerifiedDecoder(comptime portable: bool) !void {
+    return testVerifiedDecoderOrigin(portable, false);
+}
+
+fn testVerifiedDecoderOrigin(comptime portable: bool, comptime repository: bool) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -883,11 +930,14 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     try source.setSchemaJson(alloc, row_schema);
     try source.addIndex(dense_index);
     try source.batch(.{ .sync_level = .full_index, .writes = &.{ .{ .key = "a", .value = "{\"v\":1,\"embedding\":[1,0]}" }, .{ .key = "b", .value = "{\"v\":2,\"embedding\":[0,1]}" }, .{ .key = "c", .value = "{\"v\":3,\"embedding\":[1,1]}" } } });
-    const source_identity = try source.relationalTopologyIdentity();
-    const source_fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 101, .owner_group_id = 101, .admission_epoch = source_identity.next_epoch, .namespace = source_identity.namespace, .catalog_digest = source_identity.catalog_digest };
-    try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .begin }, null);
-    const seal = try source.sealBackupCohort("source-pin", source_fence, .none);
-    try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .release }, null);
+    const seal: ?@import("antfly_local_sources").storage_db_native_backup_seal.Handle = if (repository) null else seal: {
+        const source_identity = try source.relationalTopologyIdentity();
+        const source_fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 101, .owner_group_id = 101, .admission_epoch = source_identity.next_epoch, .namespace = source_identity.namespace, .catalog_digest = source_identity.catalog_digest };
+        try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .begin }, null);
+        const captured = try source.sealBackupCohort("source-pin", source_fence, .none);
+        try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .release }, null);
+        break :seal captured;
+    };
     const artifact_path = if (portable) try std.fmt.allocPrint(alloc, "{s}/source.afb", .{root}) else try std.fmt.allocPrint(alloc, "{s}.snapshots/source-image", .{source_path});
     defer alloc.free(artifact_path);
     if (portable) {
@@ -895,10 +945,10 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
         defer file.close(std.testing.io);
         var buffer: [64 * 1024]u8 = undefined;
         var writer = file.writer(std.testing.io, &buffer);
-        try source.exportBackupCohortPortable(seal, &writer.interface, .{}, .none);
+        if (repository) try @import("antfly_local_sources").storage_portable_backup.exportPortableToWriter(alloc, source.core.store, &writer.interface) else try source.exportBackupCohortPortable(seal.?, &writer.interface, .{}, .none);
         try writer.interface.flush();
         try file.sync(std.testing.io);
-    } else _ = try source.exportBackupCohort(seal, "source-image", .none);
+    } else _ = try source.exportBackupCohort(seal.?, "source-image", .none);
     var integrity = try backups.artifactIntegrityAlloc(alloc, std.testing.io, if (portable) .portable else .native, artifact_path);
     defer integrity.deinit(alloc);
     var artifact_digest: [32]u8 = undefined;
@@ -940,6 +990,11 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     var apply: Apply = .{ .target = &target };
     const env: Environment = .{ .io = std.testing.io, .runtime = &runtime, .location_options = .{ .filesystem_io = std.testing.io }, .cache_path = cache_path, .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
     var artifact: metadata_staging.SourceArtifact = .{ .target_group_id = 102, .source_namespace = source_namespace, .format = if (portable) .portable else .native, .snapshot_path = if (portable) "source.afb" else "source.snapshots/source-image", .artifact_size_bytes = integrity.size_bytes, .artifact_sha256 = artifact_digest, .cohort_seal = seal };
+    if (repository) {
+        var source_schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(row_schema, &source_schema_digest, .{});
+        artifact.repository_schema_digest = source_schema_digest;
+    }
     if (!portable) {
         var manifest_integrity = try backups.nativeGenerationManifestIntegrityAllocWithCancellation(alloc, std.testing.io, artifact_path, .none);
         defer manifest_integrity.deinit(alloc);
@@ -947,6 +1002,28 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
         artifact.native_manifest_sha256 = try alloc.dupe(u8, manifest_integrity.sha256);
     }
     defer if (!portable) alloc.free(artifact.native_manifest_sha256);
+    if (repository) {
+        // The repository checksum is genuinely valid. Mutate only each
+        // claimed source identity and require the real archive decoder to
+        // reject it before the unpublished source can acquire a durable mark.
+        const archive = try std.Io.Dir.cwd().openFile(std.testing.io, artifact_path, .{});
+        defer archive.close(std.testing.io);
+        for ([_]enum { namespace, schema }{ .namespace, .schema }) |bad| {
+            const reject_path = try std.fmt.allocPrint(alloc, "{s}/reject-{s}", .{ root, @tagName(bad) });
+            defer alloc.free(reject_path);
+            var rejected = try db.DB.open(alloc, reject_path, .{ .backend_runtime = &runtime, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+            defer rejected.close();
+            var proof: @import("antfly_local_sources").storage_portable_backup.RepositorySnapshotProof = .{ .namespace = source_namespace, .schema_digest = artifact.repository_schema_digest.?, .artifact_digest = artifact.artifact_sha256 };
+            if (bad == .namespace) proof.namespace.range_id += 1 else proof.schema_digest[0] ^= 1;
+            for (0..500) |_| {
+                const complete = @import("antfly_local_sources").storage_portable_backup.importRepositorySnapshotFilePage(alloc, rejected.core.store, std.testing.io, archive, integrity.size_bytes, proof, @splat(9), 1, .none) catch |failure| {
+                    try std.testing.expectEqual(error.BackupIntegrityFailure, failure);
+                    break;
+                };
+                if (complete) return error.ForgedRepositorySnapshotAccepted;
+            } else return error.RepositoryProofDidNotConverge;
+        }
+    }
     scope.source_descriptor_digest = try artifact.digest(alloc);
     try target.reserveRestoreStagingScoped(alloc, scope);
     const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{root});
@@ -1058,4 +1135,308 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     defer nearest.deinit();
     try std.testing.expectEqual(@as(usize, 1), nearest.hits.len);
     try std.testing.expectEqualStrings("b", nearest.hits[0].id);
+}
+
+test "restore owner SQL population commits bounded typed rows and completion through native replay and reopen" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const local = @import("antfly_local_sources");
+    const population = local.storage_db_relational_population_contract;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const path = try std.fmt.allocPrint(owned, "{s}/rows", .{root});
+    var runtime = try db.background_runtime.BackendRuntime.init(a, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    const options: db.OpenOptions = .{ .backend_runtime = &runtime, .identity_namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    var target = try db.DB.open(a, path, options);
+    var live = true;
+    defer if (live) target.close();
+    var create = try local.sql_compiler.compile(a, "CREATE TABLE population(n BIGINT,j JSONB)", .{});
+    defer create.deinit();
+    const declaration = try local.sql_ddl_runtime.createSchemaAlloc(owned, create.statement.create_table);
+    try target.setSchemaJson(a, declaration);
+    const schema = try local.storage_schema.serializeSchema(owned, target.core.schema.?);
+    const binding: population.Binding = .{ .capture_id = @splat(1), .definition = @splat(2), .source_definition = @splat(3), .target_schema = staging.digest(schema), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 42, .partition = 22 };
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = try binding.digest(), .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .target_namespace = options.identity_namespace.?, .target_schema_digest = binding.target_schema, .population = binding };
+    try target.reserveRestoreStagingScoped(a, scope);
+    const Apply = struct {
+        target: *db.DB,
+        scope: staging.Digest,
+        index: u64 = 0,
+        lose_reply: bool = false,
+        fn propose(raw: *anyopaque, input: db.types.BatchRequest, context: operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            var batch = input;
+            batch.restore_staging_scope = self.scope;
+            try @import("server_db_adapter.zig").applyOrdered(self.target, batch, .{ .term = 1, .index = self.index + 1 });
+            self.index += 1;
+            if (self.lose_reply) {
+                self.lose_reply = false;
+                return error.InjectedPopulationReplyLoss;
+            }
+        }
+    };
+    var apply: Apply = .{ .target = &target, .scope = scope.digest() };
+    const env: Environment = .{ .io = io, .runtime = &runtime, .location_options = .{}, .cache_path = try std.fmt.allocPrint(owned, "{s}/unused-source", .{root}), .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
+    var response = try executeResident(a, &target, env, .{ .scope = scope, .action = .begin }, .{});
+    try std.testing.expectEqual(@as(u64, 0), response.population.?.rows);
+    try std.testing.expectError(error.RestoreStagingInProgress, executeResident(a, &target, env, .{ .scope = scope, .action = .validate }, .{}));
+    var offset: u64 = 0;
+    while (offset < 257) {
+        const count: usize = @intCast(@min(128, 257 - offset));
+        const rows = try owned.alloc(population.Row, count);
+        for (rows, 0..) |*row, index| row.* = .{ .ordinal = offset + index, .document = try std.fmt.allocPrint(owned, "{{\"n\":{d},\"j\":null}}", .{offset + index}), .json_null_fields = if ((offset + index) % 2 == 0) &.{"j"} else &.{} };
+        const cursor = response.population.?;
+        const page: population.Page = .{ .binding = cursor.binding, .sequence = cursor.pages, .first_row = cursor.rows, .previous = cursor.chain, .rows = rows };
+        const request: Request = .{ .scope = scope, .action = .import_page, .population_page = page };
+        if (offset == 0) {
+            // A changed body cannot borrow an already-prepared delivery receipt.
+            var prepared = try local.storage_db_relational_population_staging.prepare(a, &target, scope, .{ .page = page });
+            defer prepared.deinit();
+            var corrupted = prepared.batch.?;
+            const changed = try owned.dupe(db.types.BatchWrite, corrupted.writes);
+            changed[0].value = "{\"n\":999,\"j\":null}";
+            corrupted.writes = changed;
+            corrupted.restore_staging_scope = scope.digest();
+            try std.testing.expectError(error.InvalidRelationPopulation, @import("server_db_adapter.zig").applyOrdered(&target, corrupted, .{ .term = 1, .index = apply.index + 1 }));
+            apply.lose_reply = true;
+            try std.testing.expectError(error.InjectedPopulationReplyLoss, executeResident(a, &target, env, request, .{}));
+        }
+        response = try executeResident(a, &target, env, request, .{});
+        const applied = apply.index;
+        response = try executeResident(a, &target, env, request, .{});
+        try std.testing.expectEqual(applied, apply.index);
+        offset += count;
+        try std.testing.expectEqual(offset, response.rows);
+        target.close();
+        live = false;
+        target = try db.DB.open(a, path, options);
+        live = true;
+        response = try executeResident(a, &target, env, .{ .scope = scope, .action = .status }, .{});
+        try std.testing.expectEqual(offset, response.population.?.rows);
+        try std.testing.expect(!response.population.?.sealed);
+    }
+    const complete: Request = .{ .scope = scope, .action = .import_page, .population_complete = response.population.?.completion() };
+    apply.lose_reply = true;
+    try std.testing.expectError(error.InjectedPopulationReplyLoss, executeResident(a, &target, env, complete, .{}));
+    const sealed_index = apply.index;
+    response = try executeResident(a, &target, env, complete, .{});
+    try std.testing.expectEqual(sealed_index, apply.index);
+    try std.testing.expect(response.population.?.sealed);
+    try std.testing.expectEqual(staging.Phase.imported, response.phase);
+    response = try executeResident(a, &target, env, .{ .scope = scope, .action = .validate }, .{});
+    try std.testing.expectEqual(staging.Phase.validated, response.phase);
+    response = try executeResident(a, &target, env, .{ .scope = scope, .action = .publish }, .{});
+    try std.testing.expectEqual(staging.Phase.published, response.phase);
+    for (0..257) |ordinal| {
+        const value = (try target.get(a, &population.rowKey(binding.capture_id, ordinal))) orelse return error.MissingPopulationRow;
+        defer a.free(value);
+        var row = try std.json.parseFromSlice(std.json.Value, a, value, .{});
+        defer row.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.value.object.get("n").?.integer);
+    }
+    var typed = try target.beginRelationalRows(a, .{ .fields = &.{ "n", "j" } });
+    defer typed.deinit();
+    var seen: usize = 0;
+    while (true) {
+        var page = try typed.nextTypedPage(a, io, .{ .time_ns = std.time.ns_per_s });
+        defer page.deinit();
+        for (page.rows) |row| {
+            const ordinal = try std.fmt.parseInt(u64, row.key[row.key.len - 16 ..], 16);
+            try std.testing.expectEqualSlices(bool, &.{ false, ordinal % 2 != 0 }, row.sql_nulls.?);
+            seen += 1;
+        }
+        if (!page.more) break;
+    }
+    try std.testing.expectEqual(@as(usize, 257), seen);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(a, &target, env, complete, .{}));
+}
+
+test "restore owner SQL population query delivery resolves lost ACKs and refuses fresh evaluation on recovery" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const local = @import("antfly_local_sources");
+    const population = local.storage_db_relational_population_contract;
+    const delivery = @import("../api/sql_population_delivery.zig");
+    const catalog = local.sql_catalog;
+    const Backend = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: local.sql_ast.Name, _: catalog.Action) !catalog.Table {
+            return error.TableNotFound;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedRowScan;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn ddl(_: *anyopaque, _: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
+            return error.UnexpectedMutation;
+        }
+    };
+    var unused: u8 = 0;
+    const backend: catalog.Backend = .{ .ptr = &unused, .execution_io = io, .vtable = &.{ .resolve = Backend.resolve, .scan = Backend.scan, .mutate = Backend.mutate, .checkpoint = Backend.checkpoint, .ddl = Backend.ddl } };
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    try text.writer.writeAll("CREATE TABLE dst(n,j) AS VALUES ");
+    for (0..257) |i| {
+        if (i != 0) try text.writer.writeByte(',');
+        try text.writer.print("({d}::BIGINT,'null'::JSONB)", .{i});
+    }
+    var compiled = try local.sql_compiler.compile(a, text.written(), .{});
+    defer compiled.deinit();
+    for ([_]bool{ false, true }) |interrupt| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const source = try local.sql_relation_population.Source.init(owned, backend, &compiled, compiled.statement.catalog_ddl.population.?, &.{}, .{ .result_rows = 1 });
+        defer source.deinit();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+        const path = try std.fmt.allocPrint(owned, "{s}/rows", .{root});
+        var runtime = try db.background_runtime.BackendRuntime.init(a, .{ .backend = .manual, .filesystem_io = io });
+        defer runtime.deinit();
+        const options: db.OpenOptions = .{ .backend_runtime = &runtime, .identity_namespace = .{ .table_id = 31, .shard_id = 32, .range_id = 32 }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+        var target = try db.DB.open(a, path, options);
+        var live = true;
+        defer if (live) target.close();
+        try target.setSchemaJson(a, source.schema_json);
+        const native_schema = try local.storage_schema.serializeSchema(owned, target.core.schema.?);
+        const binding: population.Binding = .{ .capture_id = @splat(1), .definition = source.definition, .source_definition = source.source_definition, .target_schema = staging.digest(native_schema), .principal_instance = @splat(5), .catalog_revision = 6, .write_version = 42, .partition = 32 };
+        const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = try binding.digest(), .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .target_namespace = options.identity_namespace.?, .target_schema_digest = binding.target_schema, .population = binding };
+        try target.reserveRestoreStagingScoped(a, scope);
+        const Receiver = struct {
+            target: *db.DB,
+            runtime: *db.background_runtime.BackendRuntime,
+            path: []const u8,
+            cache: []const u8,
+            options: db.OpenOptions,
+            scope: staging.Digest,
+            live: *bool,
+            index: u64 = 0,
+            page_reply_losses: usize = 0,
+            seal_reply_losses: usize = 0,
+            reopen_count: usize = 0,
+            fn propose(raw: *anyopaque, input: db.types.BatchRequest, context: operation.RequestContext) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try context.ensureActive();
+                var batch = input;
+                batch.restore_staging_scope = self.scope;
+                try @import("server_db_adapter.zig").applyOrdered(self.target, batch, .{ .term = 1, .index = self.index + 1 });
+                self.index += 1;
+                if (input.restore_staging) |command| if (command == .import_page) {
+                    const admitted = command.import_page.population.?;
+                    if (admitted == .page and self.page_reply_losses == 0) {
+                        self.page_reply_losses += 1;
+                        return error.InjectedPopulationReplyLoss;
+                    }
+                    if (admitted == .complete and self.seal_reply_losses == 0) {
+                        self.seal_reply_losses += 1;
+                        return error.InjectedPopulationReplyLoss;
+                    }
+                };
+            }
+            fn environment(self: *@This()) Environment {
+                return .{ .io = std.testing.io, .runtime = self.runtime, .location_options = .{}, .cache_path = self.cache, .proposer = .{ .ptr = self, .propose = propose } };
+            }
+            fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: u64, request: Request, context: operation.RequestContext) !Response {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const outcome = executeResident(alloc, self.target, self.environment(), request, context);
+                // Close only after the resident operation unwinds, including
+                // its failed proposal path. Recovered status must come from
+                // durable native progress, never from an in-memory response.
+                if (request.action == .import_page) {
+                    self.target.close();
+                    self.live.* = false;
+                    self.target.* = try db.DB.open(alloc, self.path, self.options);
+                    self.live.* = true;
+                    self.reopen_count += 1;
+                }
+                return outcome;
+            }
+        };
+        var receiver: Receiver = .{ .target = &target, .runtime = &runtime, .path = path, .cache = try std.fmt.allocPrint(owned, "{s}/unused", .{root}), .options = options, .scope = scope.digest(), .live = &live };
+        const destination: delivery.Destination = .{ .port = .{ .ptr = &receiver, .execute_fn = Receiver.execute }, .table = "dst", .group = 32, .scope = scope };
+        const Fault = struct {
+            source: catalog.PopulationSource,
+            calls: usize = 0,
+            fail: bool,
+            fn next(raw: *anyopaque, count: u32) !?[]const population.Row {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.fail and self.calls != 0) return error.QueryCanceled;
+                self.calls += 1;
+                return self.source.next(self.source.ptr, count);
+            }
+            fn finish(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.source.finish(self.source.ptr);
+            }
+            fn iface(self: *@This()) catalog.PopulationSource {
+                var result = self.source;
+                result.ptr = self;
+                result.next = next;
+                result.finish = finish;
+                return result;
+            }
+        };
+        var fault: Fault = .{ .source = source.iface(), .fail = interrupt };
+        if (interrupt) {
+            try std.testing.expectError(error.QueryCanceled, delivery.deliver(a, destination, fault.iface(), .{}));
+            const status = try executeResident(a, &target, receiver.environment(), .{ .scope = scope, .action = .status }, .{});
+            try std.testing.expectEqual(@as(u64, 128), status.population.?.rows);
+            try std.testing.expect(!status.population.?.sealed);
+            const replacement = try local.sql_relation_population.Source.init(owned, backend, &compiled, compiled.statement.catalog_ddl.population.?, &.{}, .{});
+            defer replacement.deinit();
+            try std.testing.expectError(error.SourceSnapshotIncomplete, delivery.deliver(a, destination, replacement.iface(), .{}));
+            try std.testing.expect(replacement.stream == null);
+            try std.testing.expectError(error.RestoreStagingInProgress, executeResident(a, &target, receiver.environment(), .{ .scope = scope, .action = .validate }, .{}));
+            _ = try executeResident(a, &target, receiver.environment(), .{ .scope = scope, .action = .cancel }, .{});
+        } else {
+            const complete = try delivery.deliver(a, destination, fault.iface(), .{});
+            try std.testing.expect(complete.sealed);
+            try std.testing.expectEqual(@as(u64, 257), complete.rows);
+            try std.testing.expectEqual(@as(usize, 1), receiver.page_reply_losses);
+            try std.testing.expectEqual(@as(usize, 1), receiver.seal_reply_losses);
+            try std.testing.expectEqual(@as(usize, 4), receiver.reopen_count);
+            const calls = fault.calls;
+            const replay = try delivery.deliver(a, destination, fault.iface(), .{});
+            try std.testing.expectEqualDeep(complete, replay);
+            try std.testing.expectEqual(calls, fault.calls);
+            _ = try executeResident(a, &target, receiver.environment(), .{ .scope = scope, .action = .validate }, .{});
+            _ = try executeResident(a, &target, receiver.environment(), .{ .scope = scope, .action = .publish }, .{});
+            for (0..257) |ordinal| {
+                const bytes = (try target.get(a, &population.rowKey(binding.capture_id, ordinal))) orelse return error.MissingPopulationRow;
+                defer a.free(bytes);
+                var row = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+                defer row.deinit();
+                try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.value.object.get("n").?.integer);
+                try std.testing.expect(row.value.object.get("j").? == .null);
+            }
+            var typed = try target.beginRelationalRows(a, .{ .fields = &.{ "n", "j" } });
+            defer typed.deinit();
+            var count: usize = 0;
+            while (true) {
+                var page = try typed.nextTypedPage(a, io, .{ .time_ns = std.time.ns_per_s });
+                defer page.deinit();
+                for (page.rows) |row| {
+                    try std.testing.expectEqualSlices(bool, &.{ false, false }, row.sql_nulls.?);
+                    count += 1;
+                }
+                if (!page.more) break;
+            }
+            try std.testing.expectEqual(@as(usize, 257), count);
+        }
+    }
+}
+
+test {
+    _ = @import("../api/sql_population_delivery.zig");
+    _ = @import("../api/sql_population_recovery.zig");
+    _ = @import("sql_population_cohort_test.zig");
 }

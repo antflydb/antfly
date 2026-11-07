@@ -1,0 +1,154 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 enum catalog declarations; typed rows and dependent activation remain unqualified",
+  "before": [
+    {
+      "sql": "CREATE TYPE usage_status AS ENUM ('queued', 'processing', 'done')",
+      "id": "sql-0096",
+      "source_entry_sha256": "bce9c26cfbdf0a45a397a1c5979d445fc4cd22d6421d0c8c935a8b353731e26e",
+      "command_tag": "CREATE TYPE",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TYPE usage_status AS ENUM ('queued', 'processing', 'done')",
+      "sqlstate": "42710",
+      "notices": []
+    },
+    {
+      "sql": "ALTER TYPE usage_status ADD VALUE 'archived'",
+      "id": "sql-0097",
+      "source_entry_sha256": "2d7a19fbb674f0e8af3fdca22118d07ad02a349ce8437551e3027221c8b7eed5",
+      "command_tag": "ALTER TYPE",
+      "notices": []
+    },
+    {
+      "sql": "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done'",
+      "id": "sql-0098",
+      "source_entry_sha256": "90fab4a519ea6302e12f16dbf9353a1585f6b251a387d090c29435520ee86ea1",
+      "command_tag": "ALTER TYPE",
+      "notices": [
+        {
+          "code": "42710",
+          "message": "enum label \"archived\" already exists, skipping"
+        }
+      ]
+    },
+    {
+      "sql": "ALTER TYPE usage_status ADD VALUE 'started' BEFORE 'processing'",
+      "command_tag": "ALTER TYPE",
+      "notices": []
+    },
+    {
+      "sql": "ALTER TYPE usage_status ADD VALUE 'started'",
+      "sqlstate": "42710",
+      "notices": []
+    },
+    {
+      "sql": "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'started' BEFORE 'absent'",
+      "command_tag": "ALTER TYPE",
+      "notices": [
+        {
+          "code": "42710",
+          "message": "enum label \"started\" already exists, skipping"
+        }
+      ]
+    },
+    {
+      "sql": "ALTER TYPE usage_status ADD VALUE 'new' BEFORE 'absent'",
+      "sqlstate": "22023",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TYPE usage_status AS ENUM ('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')",
+      "sqlstate": "42710",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TYPE too_long_enum AS ENUM ('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')",
+      "sqlstate": "42602",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TYPE empty_enum AS ENUM ()",
+      "command_tag": "CREATE TYPE",
+      "notices": []
+    },
+    {
+      "sql": "ALTER TYPE empty_enum ADD VALUE ''",
+      "command_tag": "ALTER TYPE",
+      "notices": []
+    },
+    {
+      "sql": "CREATE SCHEMA enum_tools",
+      "command_tag": "CREATE SCHEMA",
+      "notices": []
+    },
+    {
+      "sql": "SET search_path=enum_tools,public",
+      "command_tag": "SET",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TYPE usage_status AS ENUM ('other')",
+      "command_tag": "CREATE TYPE",
+      "notices": []
+    },
+    {
+      "sql": "ALTER TYPE usage_status ADD VALUE 'another'",
+      "command_tag": "ALTER TYPE",
+      "notices": []
+    },
+    {
+      "sql": "SET search_path=public",
+      "command_tag": "SET",
+      "notices": []
+    }
+  ],
+  "cold": [],
+  "after": [
+    {
+      "sql": "DROP TYPE usage_status",
+      "id": "sql-0099",
+      "source_entry_sha256": "8b61cefd16868c0d8fba7410d37278c0d89194bbdd220cb499874f5aa972f012",
+      "command_tag": "DROP TYPE",
+      "notices": []
+    },
+    {
+      "sql": "DROP TYPE IF EXISTS usage_status CASCADE",
+      "id": "sql-0100",
+      "source_entry_sha256": "2ae11f973cbaf2f12cd1488c865ae536b5a24bad9b17f67a36690b9eec2e81c2",
+      "command_tag": "DROP TYPE",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "type \"usage_status\" does not exist, skipping"
+        }
+      ]
+    },
+    {
+      "sql": "DROP TYPE enum_tools.usage_status",
+      "command_tag": "DROP TYPE",
+      "notices": []
+    },
+    {
+      "sql": "DROP SCHEMA enum_tools",
+      "command_tag": "DROP SCHEMA",
+      "notices": []
+    },
+    {
+      "sql": "DROP TYPE empty_enum",
+      "command_tag": "DROP TYPE",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TYPE usage_status AS ENUM ('fresh')",
+      "command_tag": "CREATE TYPE",
+      "notices": []
+    },
+    {
+      "sql": "DROP TYPE usage_status",
+      "command_tag": "DROP TYPE",
+      "notices": []
+    }
+  ]
+}

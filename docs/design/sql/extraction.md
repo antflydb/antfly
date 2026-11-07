@@ -27,7 +27,10 @@ Page arenas are released between reads. Output and mutation admission limits are
 independent from SQL LIMIT; exceeding a result cap must fail, not silently
 truncate a query. Mutations prepare the entire bounded write set before making
 one native atomic commit, with observed row versions and the bound schema epoch.
-SQL cannot retry an ambiguous mutation automatically.
+SQL cannot retry an ambiguous mutation automatically. A topology-busy prepare
+can report retryable unavailability only after the coordinator proves a durable
+abort; an uncertain abort remains an unknown outcome. Index-creation admission
+also remains distinct from completion of its publication receipt.
 
 Allocation admission applies before allocation to both result arena capacity
 and temporary page storage. Page-count limits also bound scans that return no
@@ -50,15 +53,304 @@ immutable bound relations, retained statement capture, owner-fenced commits and
 current catalog/constraint generations. No legacy adapter fallback may be
 introduced to claim parity.
 
+## Locking cohort closure
+
+All ten valid original locking cases execute through authenticated public SQL
+and native durable owners: table locks (`sql-0080`, `sql-0081`), advisory locks
+(`sql-0089`–`sql-0091`), and row locks (`sql-0173`, `sql-0433`–`sql-0436`).
+`sql-0437` names a relation outside the SELECT range table in `FOR UPDATE OF`;
+its explicit rejection is not positive locking implementation credit. No original
+locking case remains unresolved. The authoritative dispositions and exact test
+names remain in the parity ledger.
+
+An audit across the entire original corpus, rather than only the locking family,
+finds 106 lock-bearing statements: ten implemented, four rejected and 92
+superseded, with zero unresolved. The other three rejected originals
+(`sql-0577`, `sql-0578`, `sql-0618`) attach SELECT row-lock clauses to UPDATE;
+they are invalid PostgreSQL statements, not missing UPDATE locking support.
+
+The native integration gate covers contention, NOWAIT diagnostics, SKIP LOCKED
+refill, write ownership, savepoint release/rollback, failed-transaction cleanup,
+prepared lock custody after connection close, ordinary read barriers, and cold
+metadata/session/data recovery. Contract, authority and ledger gates additionally
+check all table/row conflict modes, key-preserving updates, grant reentrance,
+waiter fairness, hard/soft deadlocks, cancellation, exact replay receipts,
+bounded retirement and owner-incarnation isolation:
+
+```sh
+cd zig
+zig build antfly-api-sql-locking-test \
+  antfly-sql-lock-apply-test \
+  antfly-pessimistic-lock-contract-test \
+  antfly-pessimistic-lock-authority-test \
+  antfly-pessimistic-lock-ledger-test \
+  antfly-pessimistic-lock-native-test \
+  antfly-metadata-sql-prepared-test -Doptimize=Debug -j1
+zig build sql-test \
+  '-Dtest-filter=SQL original row-lock clauses on non-locking SQL surfaces reject before backend access' \
+  -Doptimize=Debug -j1
+```
+
+Prepared identity admission and terminal receipt acknowledgement require the
+strongest included decoder capability. A lock scope requires native lock custody
+support even when its initial participant list is empty; connection or
+notification capabilities cannot weaken that floor.
+
+Independent PostgreSQL oracles qualify the conflict matrices and MVCC rules,
+advisory overloads/void values and lifetimes, and queued-wait/deadlock/cancellation
+semantics. Each script owns a disposable PostgreSQL server:
+
+```sh
+python3 scripts/check_sql_lock_postgres.py
+python3 scripts/check_sql_advisory_values_postgres.py
+python3 scripts/check_sql_advisory_wait_postgres.py
+```
+
+Distributed data APIs open their native node-local session store under the
+persistent replica root by default, independently of metadata-owned restore
+jobs. Explicitly supplied session stores keep their existing ownership. The
+native lock command uses a named operation type so strict archive layout
+fingerprints do not depend on compiler-generated anonymous union identities.
+
+Receiving data leaders obtain their metadata authorization before taking the
+Raft mutex or managed writer admission. Before append they recheck the accepting
+term and replica incarnation and validate the lease against proposal time. The
+native original-case campaign checks that consensus ownership remains available
+at the authorization boundary. Read-admission availability errors consult the
+statement context: an expired or canceled statement returns PostgreSQL `57014`,
+while corruption and uncertain mutation outcomes retain their original errors.
+
+The production-process campaign in `zig/e2e/antfly/test_sql_population.py` runs
+all ten unchanged valid locking originals through the actual Debug archives,
+checks live contention and SKIP LOCKED refill, then restarts separate metadata
+and data processes and reuses the same connection IDs and advisory lock custody.
+Prepared row/table custody is also resolved after its source connection closes
+and both processes restart.
+It also verifies CTAS/materialized refresh and integers above 2^53. Run it with
+`ANTFLY_BIN=zig/zig-out/bin/antfly uv run --project zig/e2e/antfly pytest -q zig/e2e/antfly/test_sql_population.py`
+from the repository root after `(cd zig && zig build antfly -Doptimize=Debug)`.
+
+This closes the original locking cohort; it does not imply that every remaining
+SQL feature or every PostgreSQL lock-bearing query shape is implemented.
+
+The plan-cache gate checks all four row-lock strengths, including NOWAIT and
+SKIP LOCKED, retain write admission on cache hits and unwind every allocation
+failure. Invalid SQL, rather than supported FOR UPDATE syntax, exercises failed
+compilation diagnostics and admission cleanup.
+
+Implicit mutations and lock-bearing reads share one completion owner for
+streamed and materialized execution. Internal write transactions no longer use
+a separate best-effort rollback path. After an error, bounded
+cancellation-independent rollback must drain the native scope and durable
+delivery ACK before removing the reconciliation ID. Failure to prove that completion returns `40003` and
+retains recovery ownership. A proposed decision is never followed by a fresh
+rollback; even a known abort must finish its scope/ACK barrier before becoming
+an ordinary statement failure. Cancellation is checked again after cleanup,
+including admission failures from native lock controls rather than row cursors.
+Only proven read-admission errors receive that classification; corruption,
+permission failures and uncertain mutations keep their own outcomes.
+Explicit transactions use the same final deadline check without changing a live
+admitted operation into a pre-admission error; the failed transaction still
+requires ROLLBACK. The process campaign covers both read forms in both lifetimes.
+Reconciliation-required errors also bypass error-path sequence flushing: a new
+session-state write must not mask the original uncertain outcome or receipt.
+Known failures continue to preserve PostgreSQL's nontransactional sequence state.
+The same bounded cleanup context covers sequence persistence and native rollback,
+then restores the canceled request context. Each failure path runs exactly once.
+A definite integrity-read availability failure becomes a known-not-applied busy
+mutation only after that cleanup is proved; it never receives the read-admission
+classification that permits automatic SQL replay. Failed explicit-statement
+cleanup instead retains the transaction receipt and returns an unknown outcome.
+Integrity preparation preserves the original caller deadline across UNIQUE/FK
+owners and COPY rather than imposing a fresh five-second phase deadline. Only
+unbudgeted internal callers receive that bounded default. Mounted-owner clients
+forward their existing finite transport budget, including requests without an
+explicit timeout override, and keep response/cleanup headroom within that budget.
+Transport-borrowed sequence state retains its existing publication owner on
+both clean and dirty completion; the SQL adapter must not inspect connection
+publication fences it never captured. The sequence regression gate exercises
+this error path through pgwire as well as direct owner qualification.
+Timeout probes keep one outer transport deadline across proven pre-admission
+retries and cap each forwarded SQL deadline to leave completion headroom. Neither
+budget is extended, and ambiguous operations are never replayed.
+The merged-main Debug qualification passes the 17-test public locking gate,
+eight sequence-effect regressions, four COPY regressions, and all lower-level
+lock/prepared/storage targets (137 successful build steps, 60 executed tests).
+The independent PostgreSQL checks pass 406 assertions. The newly built Debug
+server also passes the actual metadata/data-process locking and restart campaign
+in 73 seconds. These checks preserve original-case dispositions rather than
+awarding new credit for shared fixes.
+
+Native lock transport handles brief owner-publication contention inside the
+existing request budget: bounded admission retries allocate no new effect, and
+readback retries repeat only the exact immutable native query. Unknown proposals
+are not retried. A lost Raft reply maps to non-retryable `40003`, retains the
+existing explicit or implicit transaction receipt, and never triggers an
+error-path sequence write. The original-case campaign injects both admission
+contention and a lost post-apply row-acquisition reply on the selected connection.
+Background recovery controls cannot consume those faults. Failed-root cleanup
+must durably retire both the earlier grant and the acquisition whose reply was
+lost, while retaining the error's reconciliation receipt and failed SQL shell
+until explicit ROLLBACK.
+Committed compiled-owner apply invalidates reader caches and enqueues the
+existing coalesced status refresh. It never synchronously samples runtime status:
+that path may resolve catalog routing or borrow other storage owners while the
+caller holds the data-Raft mutex. The existing maintenance lane refreshes those
+facts after consensus ownership is released. Native lock controls change only
+durable lock ownership: they neither invalidate unchanged serving rows nor
+schedule index/status work. A deterministic guard holds the row-cache mutex
+across descriptor-pinned notification and descriptor-free lock apply, proving
+these controls cannot deadlock a reader waiting for its Raft read barrier.
+Ordinary mutations still invalidate caches and schedule status refresh.
+Native ordered replay inspection uses a nonblocking shared apply lease. SQL
+lock mutation admission also tries both snapshot and exclusive apply ownership
+before touching the store; contention returns `RaftApplyWriterUnavailable` and
+releases every acquired lease. The progress driver retains the exact entry and
+its receipt, rather than waiting on a foreground owner with the Raft mutex held.
+`antfly-sql-lock-apply-test` exercises these fences and receipt replay with real
+storage ownership; ordinary non-Raft lock mutations retain blocking admission.
+Retryable writer admission is a declared, lossless identity across both native
+failure envelopes. The locking gate checks both mappings, so ordinary contention
+cannot silently become an undeclared error and stop the progress driver.
+
+Native view-resource filters share the storage compiler's logical value
+predicates, including nested arrays, Unicode matching and boolean composition.
+Required output fields come from the compiled predicate; unrelated typed outputs
+are not converted into the authorization row. Caller and delegated filters
+remain intersected before rows reach an outer projection or nested view.
+
+Prepared native filters and SQL descriptions own arenas at stable addresses.
+Their lazy regex runners and bound view providers may allocate after the builder
+returns or the owning value moves into a cache; retaining a stack arena's
+allocator is invalid. The graph-admission gate checks moves, released JSON,
+cache reuse and allocation failures. The mounted view-lifecycle gate exercises
+hidden filter columns and nested view RLS across complete owner restart.
+
+Scalar Top-K batches reuse one charged descriptor vector instead of retaining
+one temporary row vector per competitive candidate. Already-coerced scalar
+output columns also supply single-column sort keys directly. Winner payloads
+remain owned by the operator before the input page retires. Regression coverage
+keeps the sort/group/join pipeline within its original 256 KiB limit and checks
+zero producer-page growth across 96 competitive rows plus allocation failures.
+
+## Native GIN index custody
+
+Single-column SQL GIN declarations with explicit `jsonb_path_ops` or `array_ops`
+use the existing native algebraic sidecar lifecycle. SQL binds the operator
+class against the immutable relational column layout before committing the
+index. An incompatible column returns PostgreSQL SQLSTATE `42804` and acquires
+no SQL name. PostgreSQL GIN does not support `INCLUDE`; the original covering-GIN
+source contract is superseded against that behavior, not counted as a
+supported covering index.
+
+The SQL namespace record owns each GIN field/operator-class definition alongside
+its index name. Version 2 of that record is gated by metadata decoder capability
+165. The physical algebraic configuration retains its existing strict format;
+SQL annotations are never injected into runtime worker configuration. Namespace
+updates, native configuration and replayable catalog outcomes commit together.
+Source digests bind the definition as well as its incarnation, so substituting
+an operator class or field cannot preserve the prior source identity.
+
+Schema regeneration preserves index incarnations and validates retained GIN
+bindings. Generic schema writers refuse missing or incompatible sources before
+publication; committed invalid mutations have deterministic refusal semantics
+without poisoning subsequent Raft entries. Generic index deletion prunes the
+SQL name and typed definition together. Lost acknowledgement recovery observes
+the original durable outcome even after that name is dropped and recreated.
+
+Algebraic replay resolves journal keys through the shared sorted document
+collector. Relational rows use their native primary namespace and pinned schema
+layout to produce owned logical values; a missing required live row blocks
+checkpoint advancement. This shares document and typed-row replay machinery
+rather than treating packed rows as JSON or silently skipping their keys.
+
+Managed algebraic generations store facts in primary KV under a generation
+namespace. Native backup and retained-query capture pin the matching active-root
+locator as owned metadata while the catalog is fenced. Captured readers then
+select the same immutable primary namespace. The data remains in the common
+primary checkpoint; no separate GIN restore stream or corpus-sized copy is
+introduced under the apply lock.
+
+Catalog completion and physical sidecar readiness remain distinct. Public
+`/indexes` status reports the existing worker backfill and mutation watermarks.
+Typed SQL predicates retain their primary-row/residual execution path: this
+work does not claim a new GIN candidate-selection plan or query speedup. Default
+operator-class inference, expression indexes and multicolumn GIN are separate
+coverage, not implied by these explicit single-column declarations.
+
+The focused Debug gates are:
+
+```sh
+cd zig
+zig build sql-test '-Dtest-filter=SQL GIN' -Doptimize=Debug -j1
+zig build antfly-metadata-logic-test '-Dtest-filter=SQL GIN' -Doptimize=Debug -j1
+zig build replay-document-integration-test -Doptimize=Debug -j1
+zig build antfly-api-sql-native-index-test \
+  '-Dtest-filter=mounted SQL original GIN indexes' \
+  '-Dtest-filter=mounted SQL original native full-text indexes' \
+  -Doptimize=Debug -j1
+cd ..
+python3 scripts/check_sql_gin_postgres.py
+```
+
+The native campaign executes the unchanged originals, waits for real backfill,
+reads exact per-row canonical facts from each named sidecar through the native
+partials reader, checks typed postimages after updates and unrelated schema
+evolution, qualifies lost acknowledgements, cold-reopens the native owners and
+reuses retired names. SQL arrays retain their lossless dimensions/values/nulls
+envelope; the physical witness follows its flat values while SQL predicates
+retain the declared array semantics. This gate does not use the legacy
+algebraic `total_indexed` field as a cardinality proof: the current stats path
+does not populate that field.
+The PostgreSQL oracle independently checks the declarations, operator classes,
+invalid `INCLUDE`, incompatible column diagnostics and matching postimages.
+
+The two valid original GIN cases (`sql-0719`, `sql-0721`) are implemented.
+`sql-0720` is superseded because its covering-GIN expectation disagrees with
+PostgreSQL. All three have executable native and PostgreSQL evidence in the
+parity ledger; no original GIN case remains unresolved.
+
+## Ancestor retirement
+
+Schema/database DROP activation is in progress in
+[scope retirement](scope-retirement.md). Native capture pins scoped membership,
+physical definition images and range identities, and the reservation journal
+qualifies exact replay, native write faults and cold custody. Public coordinator,
+complete dependency fences and final publication remain unfinished; the three
+original ancestor-drop cases retain unresolved dispositions.
+
+## Concurrent index DDL
+
+Nonunique `CREATE INDEX CONCURRENTLY` installs the ordinary live native index
+generation. Mutations maintain that generation atomically with their rows while
+bounded, durable backfill pages reconcile historical candidates. SQL completion
+uses the shared `/indexes` collector to require the exact table/schema identity,
+comparison fingerprint and complete current owner coverage, including a second
+metadata cut. A first ready shard or constraint-enforcement status is insufficient.
+HTTP may return a pending or admission-unknown table/schema receipt within its
+observation budget; callers inspect `/indexes` rather than replaying the DDL.
+
+Single-index `DROP INDEX CONCURRENTLY` uses the same guarded schema and
+index-owned constraint retirement as ordinary DROP. Preparation waits for a
+cached full dependency/range cut to reflect completed read-layout retirement;
+this is read-only observation before admission. Old physical snapshots retain
+their original generation through drop and name reuse. Concurrent index DDL
+rejects transaction blocks with `25001`. Concurrent UNIQUE creation remains
+unsupported because its current private publication protocol fences writers.
+External lake indexes retain their separate publication path and do not claim
+this native concurrent-build contract.
+
 ## Capability surface
 
 | Surface | Available shape | Remaining boundary |
 | --- | --- | --- |
 | Reads and operators | Joins, sets, CTEs, aggregates/windows, typed batch kernels, spill-backed blocking operators and pgwire continuation pages | Exact original-case adjudication; broader correlated/lateral shapes; remote workloads rather than only local kernel benchmarks |
 | Mutations | Native/document DML, joined UPDATE/DELETE, read-only CTE sources, MERGE, normalized RETURNING and guarded UNIQUE conflict ownership | Data-modifying CTE dataflow; broader demand-masked/correlated conflict subqueries and index membership proofs; MERGE partial/expression-key probe planning |
+| Locking | Native table/row locks, NOWAIT/SKIP LOCKED and session/transaction advisory locks; savepoint ownership, prepared custody and cold recovery | Original locking cohort closed; PostgreSQL-compatible invalid target rejection remains explicit |
+| COPY | [Transactional text, CSV and binary COPY](copy-input.md), pgwire STDIN/STDOUT and globally authorized server files/PROGRAM; bounded decoding/batches, typed filters/defaults and native atomic completion | COPY FREEZE and non-UTF8; active RLS input uses INSERT |
 | Recursion | Bounded linear delta worklists, typed deduplication and captured physical sources | Mutual/nonlinear recursion, recursive aggregates/windows and nullable-side recursive self joins reject explicitly |
 | Sessions and protocols | READ COMMITTED sessions/savepoints, durable HTTP prepared/connection resources, pgwire scroll/hold cursors, typed settings and ordered multi-namespace lookup | Stronger-isolation provider activation/fault coverage, TTL visibility contract, guarded Lite sessions, restart/failover ownership and complete setting/policy parity; HTTP has no connection-owned cursor resource |
-| Catalog and retirement | Native schema/index/constraint DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Owned sequences/serial declarations, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
+| Catalog and retirement | Native schema/index/constraint, serial/identity defaults and owned-sequence DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Sequence-aware initial FK creation and counter-aware table-archive imports, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
 | Row policies | Versioned settings/policy catalog, owner proofs and guarded publication, including native/standby component coverage | Every public protected route, revocation/restore and promoted-primary fault/security validation; unsupported providers remain closed |
 | Typed values | Typed rows, lossless SQL arrays (public envelopes, pgwire OIDs, stored `sql_array` columns), precise builtin widths, exact NUMERIC with precision/scale modifiers | Array DDL beyond declarations, element-changing durable casts, non-NULL SQL array defaults, array-valued ordered keys, temporal domains, non-C collations |
 | Lake SQL | Read-only Parquet/Iceberg attachments, snapshot/version pinning, pruning, bounded typed cursors, shared caches and spill | Remote end-to-end performance/recovery evidence; writes, nested/binary inference and native SQL decimal semantics are not claimed |
@@ -89,7 +381,7 @@ case receives release credit because an overlapping component test passed.
 ## Schema format and reader capabilities
 
 Every durable SQL-visible type or expression feature advances the native runtime
-schema format (`storage_format_version`, currently 25, in
+schema format (`storage_format_version` in
 `zig/pkg/antfly-embedded/src/storage/schema.zig`). Serialization refuses to
 downgrade a schema that requires a newer format, and the transactional catalog
 refuses to bind a schema whose requirement exceeds the catalog's advertised
@@ -117,7 +409,31 @@ metadata decoder capability 22 and reader protocols 23–26 (see
 [remote table serving](../../../zig/REMOTE_TABLE_SERVING.md)); the expanded
 ordered-artifact protocols 15 and 17 are not advertised.
 
+Runtime-status wire profiles are separate from these topology capabilities:
+v19 carries media output counters, and v20 adds source authority and native
+commit cuts. Rolling negotiation retains v19 media fields while withholding
+source-authority observations until the named v20 profile is ready.
+
 ## Statement execution
+
+### Cursor protocol and retained output
+
+SQL cursors use the same authenticated typed reads as ordinary queries. DECLARE
+requires an explicit native read-query descriptor; result columns alone cannot
+authorize execution, because mutations may have RETURNING columns. BINARY,
+SCROLL, sensitivity spelling and WITH HOLD compose without changing stored row
+representations. Simple FETCH follows BINARY; extended Bind controls its own
+format vector.
+
+Extended FETCH evaluates its requested range as one statement before sending
+continuation pages, preserving PostgreSQL's cursor-position and completion-count
+semantics. A portal retains an immutable range over connection-budgeted typed
+pages. Existing scroll rows are shared rather than copied; forward-only streams
+materialize only the FETCH result under the same row/byte quotas. Results remain
+valid after cursor CLOSE and name reuse. Shared references do not retain native
+read snapshots after exhaustion. Cold-owner tests compare exact original SQL,
+column OIDs, formats, row bytes and completion tags against PostgreSQL; allocation
+fault tests verify ownership and budget reclamation.
 
 ### Reads and operators
 
@@ -169,10 +485,67 @@ ordered-artifact protocols 15 and 17 are not advertised.
   database/namespace/table scope; aliases hide the original name.
 - Table references accept ONLY across SELECT, INSERT, UPDATE, DELETE, MERGE and
   TRUNCATE; without inheritance it names the same exact table.
-- Dry-run EXPLAIN binds the inner query or mutation under its real authority and
-  renders bounded text or versioned JSON from the immutable bound plan. It opens
-  no row cursor and executes no mutation. ANALYZE and fabricated cost estimates
-  fail explicitly.
+- EXPLAIN binds under the inner statement's authority and renders bounded text
+  or versioned native logical-plan JSON. Planning alone opens no row cursor and
+  executes no mutation. SELECT ANALYZE executes once through the normal typed
+  operators, preserves authorized volatile effects, drains every projected cell
+  and discards result payloads with
+  resettable scratch. Result-response row limits do not truncate the measured
+  query; scan, memory, spill, cancellation and authorization limits still apply.
+  Mutation ANALYZE remains explicitly unsupported.
+- EXPLAIN options use PostgreSQL defaults and Boolean grammar. TIMING OFF removes
+  per-operator clock reads independently of SUMMARY. COSTS uses the declared
+  native estimate model when metadata supports it; absent estimates stay unknown.
+  BUFFERS reports coordinator memory and temporary spill bytes, with explicit
+  units. Provider storage/cache I/O and journal/WAL counts remain unavailable,
+  never synthetic zero. SETTINGS exposes the authorized settings epoch and
+  execution limits, without arbitrary setting values or policy secrets. Native
+  JSON describes Antfly's logical plan and inclusive pull-boundary measurements;
+  it does not impersonate PostgreSQL physical nodes, buffer blocks or WAL units.
+- Binding precedes a bounded, request-owned immutable expression pass shared by
+  execution, streamed reads and EXPLAIN. Custom plans use the owned typed
+  parameter frame. Constant-false subplan demand and unused pure derived outputs
+  suppress unreachable evaluation; group keys, HAVING, ordering and side effects
+  stay live. Stable/volatile functions are never executed during preparation.
+
+### Exact indexed document predicates
+
+Native `full_text_search(...)` document/view queries use an exact postings
+producer. A ranked top-K search followed by residual SQL filtering can
+omit valid rows, and primary scans cannot establish mandatory index readiness.
+The retained source must pair one primary transaction with a frozen full-text
+inventory and deletion cut after its selected derived watermark reaches that
+primary cut. Later updates, deletes, compaction and index retirement must not
+change cursor membership. The text writer's ordinary snapshot intentionally
+shares live deletion masks; retaining it alone does not supply this contract.
+Catalog and analysis leases protect index-entry relocation during preparation
+and capture; neither lease remains held while paging.
+
+The selector pulls one segment bitmap at a time with bounded memory, explicit
+work per pull, deadline/cancellation checks, and empty nonterminal pages. It
+retains physical readers through compaction and resolves only selected document
+identities. Existing document pages remain responsible for primary visibility,
+TTL, mandatory authorization, typed projection and residual SQL evaluation.
+Normal and bound view queries must use this producer through the existing
+retained routed-read machinery. Unsupported placement or provider capability
+must reject before output; it cannot fall back to a capped search or skip a
+required index. Catalog generation, attribute/schema and index readiness guards
+remain mandatory across prepared execution and cold reopen.
+
+The mounted production campaign closes 15 original indexed-read contracts,
+including lateral array expansion and unbounded COUNT, with full result/OID/NULL
+comparisons before and after catalog/owner restart and mandatory caller filters.
+Its PostgreSQL witness explicitly lowers the Antfly-only implicit-document text
+predicate to field-scoped PostgreSQL text matching; it never claims PostgreSQL
+implements that extension or executes the lowering on Antfly. Owner admission
+requires an exact query digest, including across routed retained-read transport;
+older or mixed owners cannot silently supply unfiltered rows.
+
+Only positive WHERE conjuncts over one unambiguous document source are selected.
+Row bounds, aggregation, shared physical materialization, outer joins and security
+barriers remain guarded. Ranked search, stronger delayed snapshots and staged
+mutation overlays are separate capabilities. Ordinary WHERE clauses retain the
+allocation-free path through predicate extraction.
 
 ### Mutations
 
@@ -186,6 +559,24 @@ ordered-artifact protocols 15 and 17 are not advertised.
   Document UPDATE preserves undeclared fields from the full raw preimage;
   exact-byte row digests prevent stale writes even when custom TTL timestamps
   are unchanged.
+- Mutation targets use assignment-domain binding, separate from read-column
+  qualification. Unquoted `metadata.profile` denotes a composite-field target;
+  JSONB, arrays and scalar columns are not composites (`42804`), and an absent
+  root receives `42703`. A quoted `"metadata.profile"` remains one column name.
+  INSERT source binding, UPDATE, ON CONFLICT and MERGE share this boundary before
+  source execution. It allocates no memory; ordinary INSERT columns retain their
+  existing single schema lookup.
+- A constant-time check on the immutable validator selects document preparation.
+  Unconstrained native JSON tables retain their streaming validation fast path
+  and scalar/array values; malformed transaction rows fail before intent
+  admission. Declared document schemas use owned typed preparation.
+- Whole-document patches still pass through the native pinned-schema preparation
+  boundary. An invalid late candidate rejects the entire SQL mutation or REST
+  batch without changing primary bytes, versions or content digests. The
+  document-integrity campaign exercises those outcomes before and after both
+  metadata and data-owner recovery. Its PostgreSQL oracle declares Antfly's
+  patch/schema-validation extensions explicitly; ordinary assignment-indirection
+  diagnostics come directly from PostgreSQL.
 - Multi-row `INSERT ... VALUES` uses a flat VALUES source with ordered arms;
   adjacent literal-only arms share a typed row block, and only one nonliteral arm
   iterator is active. Scalar subqueries in VALUES use the bounded INSERT-source
@@ -196,6 +587,17 @@ ordered-artifact protocols 15 and 17 are not advertised.
   recomputes generated columns. Generated columns accept only DEFAULT. The
   omission mask keeps DEFAULT distinct from explicit SQL NULL through binding
   and RETURNING.
+- Scalar mutation binding checks known source families against assignment
+  targets before physical preparation. An expected result hint cannot reinterpret
+  an incompatible type; INSERT source boundaries report the same assignment
+  diagnostic. Contexts retain builtin widths, NUMERIC modifiers and precise
+  temporal kinds across ordinary, joined, conflict and MERGE mutations.
+  RETURNING retains those kinds in its public column metadata.
+- Mapped execution batches and borrowed column pages use complete typed
+  descriptors. Already typed temporal cells and SQL NULLs remain borrowed through
+  selection/projection; no JSON conversion or allocation is needed to preserve
+  their identity. Parameter-frame binding checks the precise temporal kind before
+  execution, while implicit and explicit timestamptz descriptors remain equivalent.
 - Explicit ROW and parenthesized tuple assignments lower to one simultaneous
   assignment plan; duplicate targets and arity mismatch fail during compilation.
   A row-valued subquery assignment binds positional outputs through one guarded
@@ -524,9 +926,12 @@ public contract returns 202 with a pending receipt.
   with a fresh read-index barrier. An unsupported pre-cutover attempt follows
   durable cancellation; a capability mismatch after irreversible cutover is a
   recovery error that must retain fences.
-- RESTART IDENTITY uses the fresh owner generation. There is no owned sequence or
-  serial declaration and generated row IDs are opaque, so no counter exists to
-  reset; future owned sequences must join the same staging plan and publication.
+- Document RESTART IDENTITY uses a fresh owner generation; opaque document
+  IDs do not use SQL sequence counters. Its original SQL is qualified through
+  completed publication, key reuse and cold-owner recovery. Owned SQL sequences
+  exist separately: serial/identity defaults and transactional counter
+  ownership/generation/reset handoff must join the same staging publication;
+  this document does not claim that unfinished boundary.
 - Graph-index cutover: the old owner closes graph reader, mutation, maintenance
   and worker-snapshot admission under its catalog/apply locks, drains schedule
   pins and persists a Raft-bound seal whose digest binds the active source
@@ -915,6 +1320,65 @@ target reported a 14.46 GB compiler peak against its 13.96 GB reservation. The
 isolated `sql-numeric-test` target does not fix either
 ([history](history/typed-values-log-2026-10.md)).
 
+## Sequence execution
+
+`nextval`, `currval`, `lastval` and `setval` use the existing native catalog
+allocator and exact nonce-bound acknowledgement journal. Scalar evaluation
+suspends on a lazy demand; the execution owner performs I/O and resumes with
+one shared resource budget. Successful volatile siblings are not re-executed.
+Statements without sequence calls retain their ordinary binding path.
+
+Literal names capture catalog incarnation and immutable object identity.
+Connection state separates issued values from compact, process-local cached
+leases. HTTP connections persist issued `currval`/`lastval` before result
+publication; pgwire owns those values and allocations for its connection
+lifetime. `setval(..., false)` clears the caller's cache without changing its
+`currval`; `setval(..., true)` updates that sequence's current value without
+selecting a new `lastval` owner. Rollback/savepoints preserve issued values,
+DISCARD SEQUENCES has a
+separate cache epoch, and cold owners burn unconsumed leases. MERGE's
+stateful predicate and selected assignment execute together per row; deferred
+ordered outputs also use row evaluation. Other decision expressions keep their
+batch path.
+
+`antfly-api-sql-sequence-effects-test` qualifies real HTTP connections, pgwire
+prepared resources, implicit MERGE transactions, lost/forged acknowledgement
+handling, document TRUNCATE publication and independently reopened owners.
+The serial/identity originals (`sql-0318` through `sql-0320`) are also qualified
+through atomic native table/owned-sequence/default publication, shared mutation
+preparation, counter handoff, checkpoint restoration and independent cold owners.
+Their scope and remaining broader limits are recorded in the parity ledger.
+
+
+## Prepared transactions
+
+`PREPARE TRANSACTION`, `COMMIT PREPARED` and `ROLLBACK PREPARED` use the existing
+native transaction coordinator with a durable, database/principal-bound GID
+registry. Admission freezes the plan and participant manifest before the first
+native BEGIN. The registry records a first-wins decision before phase two;
+prepared native votes have no automatic expiry decision. Owner-specific receipts
+and compact session outcomes distinguish durable completion from lost replies.
+
+Commit activates every native participant barrier before resolving rows. Old
+pinned cuts remain readable; new reads wait while a cohort is partially active.
+O(1) catalog reservation counters protect affected tables and databases. Recovery
+uses bounded pages and bounded `std.Io` fanout, leaving indefinitely prepared GIDs
+out of the background work queue until an explicit decision arrives.
+
+The mounted public campaign compares the three unchanged originals with
+PostgreSQL 18 and complete metadata/session/data-owner restarts. Native storage,
+registry and distributed-delivery gates exercise cancellation, exact authority,
+late enlistment fences and cold receipts. Public listing/observation history,
+permanent API-owner loss administration and logical-backup policy remain open;
+this is not a claim of complete PostgreSQL prepared-transaction operations or
+quorum failover qualification.
+
+Table lifetime semantics are tracked separately. The existing population oracle's
+`--persistence` mode verifies nine unchanged TEMP, UNLOGGED and LIKE originals
+against independent PostgreSQL sessions and real clean/crash restarts. Their
+reference is `sql_persistence_reference.json`; the native paths remain guarded
+and unqualified until they implement the same lifecycle contracts.
+
 ## Open work
 
 - Original-corpus adjudication until `make sql-parity-release-check` passes.
@@ -923,8 +1387,8 @@ isolated `sql-numeric-test` target does not fix either
 - MERGE cross-owner/failover fault matrix and partial/expression-key probes.
 - Stronger-isolation deployment and fault validation; TTL visibility contract;
   guarded Lite sessions.
-- Owned sequences/serial declarations; TRUNCATE and FK promoted-standby and
-  repeated-soak gates (see TRUNCATE known gaps).
+- Broader counter-aware table-archive import and initial identity/FK publication;
+  TRUNCATE and FK promoted-standby and repeated-soak gates (see TRUNCATE known gaps).
 - Complete route-wide policy/session validation, revocation/restore and
   promoted-primary security workloads.
 - Typed-value gaps listed under [Exact NUMERIC](#exact-numeric) and
@@ -945,3 +1409,292 @@ isolated `sql-numeric-test` target does not fix either
 - [Typed rows, arrays, precise types and exact NUMERIC log](history/typed-values-log-2026-10.md)
 - [Regex backend and scalar activation log](history/regex-implementation-log.md)
 - [Ordered artifact activation gate log](../ordered-artifacts/history/activation-gate-log.md)
+
+
+### Ordered table-name admission and implicit INSERT targets
+
+Unqualified DROP TABLE, table RENAME, and SET TABLESPACE resolve the bounded
+search path in one names-only catalog cut. Namespace visibility and live table
+administration use the same authorization helpers as other catalog operations.
+The first visible relation determines the target; a wrong object kind does not
+fall through to another namespace. Ingress forwards its exact owner and metadata
+incarnation proof to a private native admission operation. That operation checks
+the proof and reads the catalog revision in the same storage transaction, before
+topology preparation or proposal. Unrelated catalog writes do not invalidate an
+unchanged owner. The existing catalog revision and topology preconditions fence
+the ensuing durable command. An ambiguous proposal is never automatically replayed.
+
+An INSERT without a target list binds its target prefix from the pinned
+relational schema's declaration order. This includes generated and identity
+positions, whose existing DEFAULT and OVERRIDING rules still apply. Missing
+trailing positions use native row preparation. Document tables require explicit
+targets because dynamic fields and aliases do not define a relational ordinal
+layout. Binding owns the inferred names; cached compiler syntax stays immutable.
+VALUES, SELECT, wildcard sources, scalar subqueries, parameters, and ON CONFLICT
+then share the existing typed mutation pipeline. Source-width discovery remains
+symbolic and cannot publish provisional parameter types. Direct VALUES parameters
+inherit assignment domains before set-type resolution, while subqueries keep
+PostgreSQL's own inference boundaries. A masked DEFAULT source slot has a typed
+NULL placeholder and is evaluated only by native preparation. DEFAULT cells also
+consume the compiler's node budget.
+
+HTTP connections persist a compact, owned search path through the existing
+connection and transaction records. Active and post-commit values are distinct:
+SET LOCAL lasts only for the transaction, ordinary SET survives a proven commit,
+and savepoint rollback restores both values. RESET ALL and DISCARD ALL restore
+the connection namespace baseline. Savepoints and path settings survive cold
+owner recovery without reacquiring a lost data snapshot. HTTP and pgwire share
+ordered relation lookup; prepared resources retain their captured path and
+exact relation bindings. Authorization failures remain terminal lookup results.
+The PostgreSQL campaign covers these controls and resumes a durable control-only
+transaction and savepoint after restarting the native owners.
+
+The placement fixture uses a table without key constraints: automatic whole-table
+constraint retirement remains separate work. The same mounted campaign verifies
+that dropping a UNIQUE-constrained table is definitely rejected before proposal,
+preserves its data/schema through restart, and returns the existing `0A000`
+retirement diagnostic. Private forwarding preserves that exact non-admission
+instead of reporting an unknown commit outcome.
+
+
+### Definition-copy admission and sequence authority
+
+Definition-copy creation carries a bounded set of independently authorized source
+owners in the existing native catalog command. Each source pins its physical
+schema identity, logical name and catalog incarnation. Metadata validates the
+read set before selecting constraint/sequence names, again during preparation,
+and in the same write transaction as destination publication. A global catalog
+revision alone is insufficient: physical schema publication can advance without
+changing that revision. Command version 8 and metadata capability 120 distinguish
+this contract from routine, cast, type and authorization commands (versions 4–7).
+The native regression covers stale schemas, cold replay, name reuse, and atomic
+creation of an independent destination identity sequence.
+
+Sequence-default allocation independently verifies the persisted default in the
+same metadata read as the attribute and sequence. An existing attribute and
+`OWNED BY` edge cannot authorize a detached default. Execution retains authority
+by sequence incarnation/ID **and destination table/attribute**, while counter
+leases remain keyed by sequence identity. Implicit identity privileges cannot be
+selected using another destination's proof. Restart tests retain the default
+removal and reject the stale allocation request.
+
+`LIKE` parsing retains source order, insertion offsets, and all PostgreSQL
+INCLUDING/EXCLUDING options with last-option precedence. Ordinary relational
+column declarations now pass through the existing schema builder and native CREATE
+publication. Source grants use the existing resolver; one bounded metadata cut
+captures the complete source-definition guard set. Destination conditionals check
+committed existence before looking up missing sources. Copied index and UNIQUE
+names are new destination declarations, not transferred namespace ownership.
+
+Identity configuration is read in batches of at most 64 descriptors under the
+same catalog revision and incarnation. START, increment, integer width, bounds,
+cache and cycle configuration become fresh creation intents. The native containing
+transaction assigns destination attributes and independent sequence IDs; running
+source counter values and leases never copy. A copied SERIAL default instead
+references the original sequence. It remains guarded until ordinary dependency
+edges, RESTRICT/CASCADE retirement, and destination-attribute handoff are wired
+without resetting or borrowing ownership of that counter. Native column comments
+now copy from the attribute registry in the containing CREATE transaction. Index
+comment transfer remains open; property descriptions alone do not implement
+catalog comments.
+
+The persistence oracle includes repeatable LIKE lifecycle probes for default and
+generated values, fresh identity/shared SERIAL counters, deferred UNIQUE checks,
+CHECK/NOT NULL copying, FK omission, comments, source authorization, ordered mixed
+sources, option exclusion, conditional creation, TRUNCATE and retirement. A
+SELECT-granted role can copy a definition even when RLS hides every source row;
+the destination starts without the source's policies or RLS flags. These
+are supplemental evidence for the unchanged original, not additional inventory
+cases. TEMP/UNLOGGED publication and the trigger cohort remain open; the original
+locking cohort is now closed by the dedicated native and PostgreSQL gates above.
+This admission/authority work adds no implementation credit by itself.
+
+
+### Identity defaults preserve SQL grant and policy authority
+
+Implicit identity allocation uses the table's bound SQL privilege mask, native
+credential caps, current user incarnation, and the independently verified native
+sequence/attribute binding. Its execution owner retains only the compact grant
+projection; statement schemas, row buffers, and planner state are not retained
+for authorization. Explicit sequence calls and SERIAL defaults keep ordinary
+sequence permission checks. DEFAULT lowering marks its internal target preimage
+source, so adding that source cannot manufacture a SELECT requirement for an
+UPDATE-only command. Predicates and RETURNING column expressions retain their
+read requirements.
+
+Integrity proof caches belong to an immutable write or transaction admission
+scope. Creating one before installing the SQL grant provider would lose that
+authority during coordinated sequence-backed writes. The scope initializes its
+cache at its final address, releases it after synchronous preparation, and signs
+one proof per physical participant. Known participants reuse the immutable table
+ID, database, and schema version already held by that admission, avoiding reverse
+name resolution and a second catalog lookup. This witness is routing information,
+not permission: the current provider must still sign it, and declining a known
+binding fails closed. Discovered participants retain catalog discovery and the
+previous integrity-read authority. Transient discovery/signing buffers are freed
+after each miss; only the final token and database enter the retained cache. A proof
+cannot be reused by a different admission frame merely because it names the same
+table. This uses the existing request callbacks and native policy proofs.
+
+The mounted authorization campaign exercises INSERT/UPDATE-only identity writes,
+explicit sequence and SELECT denial, policy-approved/rejected rows, table-grant
+and membership revocation, durable counter gaps, and cold continuation. Its
+supplemental PostgreSQL oracle performs a real clean restart and supplies the
+expected row identities and counter states. Native RLS also filters administrative
+observers; the fixture explicitly grants its independent observer the policy role.
+That does not add SELECT or native table permissions to the mutation credential.
+The unchanged authorization originals remain separate from these additional
+checks; this integration work creates no additional inventory credit.
+
+
+### Durable string lengths and definition-copy recovery
+
+The mounted declaration-copy campaign now covers ordered multi-source properties,
+PK/NOT NULL/CHECK enforcement, defaults and generated expressions, option
+exclusion, conditional missing-source behavior, current SQL-only SELECT grants,
+revocation, and independence from source rows and RLS policies. It observes the
+existing policy publication/owner ACK barrier before probing row visibility.
+Complete cold metadata, session and data-owner reopen retains copied rows,
+constraints and independent identity counters. The SELECT-only source caller can
+create and use its fresh identity without an extra source-sequence grant.
+
+The persistence oracle's exact source uses `CHECK (length(status)>0)`. SQL read
+support did not previously imply durable-expression support. Native `length`,
+`octet_length`, and `bit_length` now return PostgreSQL int32 results, propagate SQL
+NULL, and distinguish UTF-8 code points from bytes/bits. Character counting
+validates UTF-8 in one allocation-free pass with bounded cancellation polling.
+Schema semantic/encoding version 42 records the feature independently of physical
+row format. Existing owner reader requirements gate publication and cold decode;
+a version-41 reader cannot accept it. Public OpenAPI and generated clients expose
+the three expression operations.
+
+Seven focused Debug checks and the complete mounted declaration/identity campaign
+pass without skips, failures or leaks. The nine-original real PostgreSQL
+persistence oracle remains reproducible. The creation gate includes this mounted
+campaign, sharing the existing compiled owner rather than introducing another CI
+build. Native column comments join the authenticated source read set, are read
+again in the containing CREATE transaction, and publish with fresh destination
+attribute identities. No post-CREATE comment request is issued. The native race
+and cold tests cover concurrent source edits; the mounted campaign covers option
+exclusion and independence from later source-comment removal. The combined
+creation/source gates pass 60 tests without skips, failures or leaks. The complete
+Debug SQL gate passes 1,660 local and 243 server tests, with four optional
+benchmark skips and no failures or leaks. This does not qualify sql-0369 yet: its full oracle also checks shared
+SERIAL retirement and native index comments. The remaining TEMP/UNLOGGED lifetimes and
+other previously open cohorts retain their original blocking dispositions.
+
+
+### Shared sequence retirement must use the existing publication barriers
+
+Native metadata now distinguishes the referencing destination attribute from
+a sequence's actual OWNED BY attribute. Table preparation derives the complete
+outgoing set from the schema and stable attribute directory before the first
+write. Forward rows use a compact fixed-width binding tuple; reverse rows index
+sequence to table/attribute and retain the semantic binding fingerprint. Both
+directions publish in the containing table transaction. Unchanged schemas skip
+this work; unchanged bindings produce no directory writes. Ordinary removal and
+staged generation replacement remove the old outgoing set atomically with the
+replacement. The existing owned-counter handoff remains a separate operation.
+
+Each sequence also has a transactional reference count and monotonic revision.
+Unchanged bindings do not advance it; even an add/remove cycle changes the
+revision. A zero-count tombstone remains while the sequence exists and is
+reclaimed on sequence deletion. Prepared changes retain deltas and rebase them
+inside the transaction, so multiple table participants sharing a sequence cannot
+overwrite one another's summary. Complete discovery streams reverse edges,
+retains at most 128 table IDs, checks cancellation and the forward fingerprints,
+and returns that stamp. Future retirement admission can compare it with one
+point read before rejoining exact schema-owner guards. It grants no privilege,
+ownership or publication authority.
+
+Snapshot and native checkpoint verification share the same closure checks.
+Actual table bindings, stable attributes, forward/reverse rows, sequence routing
+and incarnation, and per-sequence counts must agree. Reverse verification binary
+searches encoded forward frames; scratch state is bounded by one schema rather
+than all primary rows or quadratic decoded copies. Protocol 123 fences this
+directory as part of the unreleased column-sequence cohort. Handoff preparation
+negotiates its capability before the linearizable cut.
+
+Twelve targeted Debug checks pass without skips, failures or leaks, including
+real metadata creation, no-op preparation, reference removal, TRUNCATE,
+metadata snapshot restore, and cold owners. Additional assertions cover missing
+forward/reverse/summary rows, invented attributes, multiple referencing tables,
+bounded/canceled discovery, and add/remove revision safety. The external
+reference is constructed through the private native test store; public borrowed
+default creation remains guarded. A copied ordinary default must ultimately bind
+the existing sequence identity, while identity copies continue to create
+independently owned sequences. Neither a borrowed reference nor TRUNCATE of its
+destination may transfer ownership or reset the shared counter.
+
+The column-default snapshot now attests the complete persisted binding
+fingerprint, including its generation mode, under protocol 122. Native metadata
+derives it from the actual stored default; ingress verifies it before choosing
+implicit identity privileges or reserving a counter value. The statement cache
+key includes every semantic fingerprint field: sequence incarnation/ID, sequence
+namespace, destination table/attribute and generation. Cache hits therefore need
+no per-row cryptographic hash. ALWAYS and BY DEFAULT cannot share an entry merely
+because both permit implicit identity privileges. Ordinary shared defaults will
+continue to require ordinary sequence privileges; their activation remains
+guarded until the dependency and retirement machinery below is complete.
+
+The proof RPC negotiates protocol readiness before its linearizable metadata
+read, and revalidates that readiness before the native snapshot. A failed upgrade
+does not read a proof or allocate a value. Ordinary sequence reads keep their
+existing capability path. Eighteen targeted Debug checks pass without skips,
+failures or leaks, covering native generation forgery, namespace/mode cache
+isolation, capability ordering/denial, sequence effects, owned identity handoff,
+copied identities and cold owners.
+
+Direct sequence DROP now checks the reference directory during read-only
+admission. A live dependency is a durable SQL rejection (2BP01), including exact
+cold retries; it cannot remove the descriptor/counter and strand a default.
+Owned table/attribute retirement also checks external references before its first
+write. The resource-deletion boundary independently refuses live references so a
+missing caller guard aborts the transaction rather than publishing corruption.
+A final unused sequence may reclaim its zero-count directory tombstone.
+An indexed owner-attribute lookup also rejects explicit ownership changes of
+identity sequences (0A000), including OWNED BY NONE and reassignment to the same
+column. Those decisions are retained SQL outcomes; ordinary SERIAL ownership
+changes continue through the existing native catalog/counter transaction.
+
+The physical owner now has a distinct `sequence_default_removal` purpose. Its
+identity-bound selector derives one canonical schema successor, removing only
+ordinary defaults for that sequence and advancing the schema epoch. Identity
+column dependencies cannot be removed through this purpose. Exact postimage
+verification preserves every unrelated declaration; compiled index/constraint
+generations remain unchanged. Native progress and authenticated row audits use
+zero-row completion, while install/release retain the existing owner fences,
+receipts, historical layouts and cancellation machinery. This is the physical
+half of retirement, not a catalog-deletion grant or completed public CASCADE.
+
+The remaining coordinator must reserve the complete
+reference cohort and remove defaults through the existing signed schema-owner
+publication/ACK ledger. Default removal changes no stored row values, so it must
+use compatible in-place schema publication rather than copying primary rows via
+a restore job. The accepting writer must independently validate the complete
+reference set and canonical postimages. Reservations must reject new references
+until publication or durable cancellation, and resume after leader loss. Catalog
+retirement, reference cleanup, schema publication and the terminal outcome must
+share that ledger's existing durability and owner barriers. DROP of an owning
+table additionally retires its owned sequence through that same protected cut;
+external referencing tables survive CASCADE with their defaults removed. Restore
+must remap destination attributes separately from sequence ownership and validate
+external references before activation. These are implementation requirements,
+not claims of completed native support or additional inventory credit.
+
+The next coordinator change belongs in the common schema-validation plan and
+ledger, alongside the existing named-type finalizer. Give sequence retirement
+its own typed descriptor/stamp and active-resource reservation; do not represent
+a sequence as a named type or add another background-job protocol. Admission
+must compare the captured stamp, exact live descriptor and every participant's
+actual schema/range cut. The number of matching references in those exact
+preimages must equal the native count, proving complete membership without a
+catalog-wide or primary-row scan. A count or digest alone is insufficient.
+The active reservation must block new table references and competing sequence
+mutations until the common job releases or durably cancels. Pending SQL outcomes
+should point at this common job rather than duplicating schemas/owner arrays.
+Only after all physical owners install may one transaction publish every
+postimage and remove the counter/descriptor, ownership edge and final summary.
+The common release barrier, not an early catalog reply, certifies terminal
+success. Fresh sequence creation needs explicit pending-resource validation so
+this check cannot stage an orphan resource before a rejected table publication.

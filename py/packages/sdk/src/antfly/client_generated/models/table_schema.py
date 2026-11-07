@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
     from ..models.relational_index_definition import RelationalIndexDefinition
     from ..models.relational_unique_constraint import RelationalUniqueConstraint
+    from ..models.sql_named_type_layout import SQLNamedTypeLayout
     from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
     from ..models.ttl_config import TtlConfig
 
@@ -29,6 +30,9 @@ class TableSchema:
     """Schema definition for a table with multiple document types
 
     Attributes:
+        named_types (list[SQLNamedTypeLayout] | Unset): Server-resolved immutable SQL type layouts, sorted by catalog
+            ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its
+            active definition. Retained by backups and schema epochs for deterministic cold decoding.
         version (int | Unset): Backend-managed schema generation used for migrations. Omit it from create and update
             requests.
         storage_mode (TableStorageMode | Unset): Storage representation for the table. Omission selects "document".
@@ -54,14 +58,25 @@ class TableSchema:
             4096 expression nodes, and 4 MiB of literal data. Evaluation has
             a shared 4 MiB allocation budget across all column expressions.
             Restore verifies stored results instead of silently recomputing
-            them. Changing, adding, or removing generated semantics through
-            an existing table's schema update requires explicit rewrite=true
+            them. On relational tables, changing, adding, or removing generated
+            semantics through a schema update requires explicit rewrite=true
             on the PUT or PATCH schema route. This returns a durable restore
             job and replaces the complete authorized dependency cohort only
             after distributed transformation and validation. Ordinary schema
             updates reject these changes, even when a table appears empty.
             Declaration reordering and default-only changes remain allowed.
-            Relational tables only.
+            Supported by relational and document tables. Document declarations
+            require one enforced document type and target declared root fields.
+            Expressions may read persisted declared roots; SQL virtual fields
+            and transport directives cannot be expression sources.
+            SQL NULL removes the generated member; a JSON null datum remains
+            present. Unknown members are preserved. SQL column assignments to
+            generated roots or their aliases are rejected, while whole-document
+            writes replace submitted generated members with computed values.
+            Document producer definitions are immutable through schema-update
+            routes, including rewrite=true. Changing these definitions requires
+            a replacement table and explicit data migration; ordinary restore
+            preserves and verifies existing computed values.
         checks (list[RelationalCheckConstraint] | Unset): Named scalar CHECK constraints for a relational schema. This
             is
             part of the complete schema: omission or [] declares no checks.
@@ -91,6 +106,7 @@ class TableSchema:
             evaluated in order to determine how those fields should be indexed.
     """
 
+    named_types: list[SQLNamedTypeLayout] | Unset = UNSET
     version: int | Unset = UNSET
     storage_mode: TableStorageMode | Unset = UNSET
     base_source: ExternalLakeTableSource | Unset = UNSET
@@ -111,6 +127,13 @@ class TableSchema:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.ttl_config import TtlConfig
+
+        named_types: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.named_types, Unset):
+            named_types = []
+            for named_types_item_data in self.named_types:
+                named_types_item = named_types_item_data.to_dict()
+                named_types.append(named_types_item)
 
         version = self.version
 
@@ -194,6 +217,8 @@ class TableSchema:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if named_types is not UNSET:
+            field_dict["named_types"] = named_types
         if version is not UNSET:
             field_dict["version"] = version
         if storage_mode is not UNSET:
@@ -238,10 +263,20 @@ class TableSchema:
         from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
         from ..models.relational_index_definition import RelationalIndexDefinition
         from ..models.relational_unique_constraint import RelationalUniqueConstraint
+        from ..models.sql_named_type_layout import SQLNamedTypeLayout
         from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
         from ..models.ttl_config import TtlConfig
 
         d = dict(src_dict)
+        _named_types = d.pop("named_types", UNSET)
+        named_types: list[SQLNamedTypeLayout] | Unset = UNSET
+        if _named_types is not UNSET:
+            named_types = []
+            for named_types_item_data in _named_types:
+                named_types_item = SQLNamedTypeLayout.from_dict(named_types_item_data)
+
+                named_types.append(named_types_item)
+
         version = d.pop("version", UNSET)
 
         _storage_mode = d.pop("storage_mode", UNSET)
@@ -354,6 +389,7 @@ class TableSchema:
                 dynamic_templates.append(dynamic_templates_item)
 
         table_schema = cls(
+            named_types=named_types,
             version=version,
             storage_mode=storage_mode,
             base_source=base_source,

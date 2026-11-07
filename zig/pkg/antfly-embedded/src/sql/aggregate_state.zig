@@ -75,10 +75,10 @@ pub const Column = struct {
     spec: operators.AggregateSpec,
     values: Values,
     pub fn init(spec: operators.AggregateSpec) Column {
-        return .{ .spec = spec, .values = if (spec.distinct or spec.kind == .pattern_set) .{ .dynamic = .empty } else if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) .{ .exact = .empty } else if (spec.input_element == .numeric and (spec.kind == .min or spec.kind == .max)) .{ .fixed = .empty } else switch (spec.kind) {
+        return .{ .spec = spec, .values = if (spec.distinct or spec.kind == .pattern_set or spec.kind == .array_agg) .{ .dynamic = .empty } else if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) .{ .exact = .empty } else if (spec.input_element == .numeric and (spec.kind == .min or spec.kind == .max)) .{ .fixed = .empty } else switch (spec.kind) {
             .count => .{ .counts = .empty },
             .sum => if (spec.input_type == .integer) .{ .integers = .empty } else .{ .numbers = .empty },
-            .avg => .{ .numbers = .empty },
+            .avg => if (operators.Aggregate.integerAverage(spec.kind, spec.input_type, spec.input_element)) .{ .integers = .empty } else .{ .numbers = .empty },
             .bool_and, .bool_or => .{ .booleans = .empty },
             .min, .max => switch (spec.input_type orelse .json) {
                 .integer => .{ .integers = .empty },
@@ -87,7 +87,7 @@ pub const Column = struct {
                 .string => .{ .bytes = .empty },
                 else => .{ .dynamic = .empty },
             },
-            .pattern_set => unreachable,
+            .pattern_set, .array_agg => unreachable,
         } };
     }
     const PageView = struct { column: Column, lease: paging.Pager.Lease };
@@ -465,7 +465,7 @@ pub const Column = struct {
                 if (counts.items[id] > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
             },
             .integers => |*integers| {
-                if (self.spec.kind != .sum) {
+                if (self.spec.kind != .sum and !operators.Aggregate.integerAverage(self.spec.kind, self.spec.input_type, self.spec.input_element)) {
                     for (ids, values) |id, value| try self.update(a, id, value);
                     return;
                 }
@@ -983,7 +983,7 @@ pub const Column = struct {
                 if (values.items[index] > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
             },
             .integers => |*values| {
-                if (self.spec.kind != .sum) return error.InvalidSqlBackendResponse;
+                if (self.spec.kind != .sum and !operators.Aggregate.integerAverage(self.spec.kind, self.spec.input_type, self.spec.input_element)) return error.InvalidSqlBackendResponse;
                 const target = &values.items[index];
                 target.sum = std.math.add(i128, target.sum, state.integer_sum) catch return error.SqlNumericOutOfRange;
                 target.count = std.math.add(u64, target.count, state.count) catch return error.SqlNumericOutOfRange;
@@ -1012,6 +1012,12 @@ pub const Column = struct {
             else => unreachable,
         };
         return (try self.snapshot(std.heap.page_allocator, index)).finish();
+    }
+    pub fn finishOutput(self: *const Column, result: A, index: usize) !Datum {
+        if (self.spec.kind == .array_agg) return self.values.dynamic.items[index].finishOutput(result);
+        if (!operators.Aggregate.integerNumericOutput(self.spec.kind, self.spec.input_type, self.spec.input_element)) return self.finish(index);
+        const state = try self.snapshot(result, index);
+        return state.finishOutput(result);
     }
 };
 

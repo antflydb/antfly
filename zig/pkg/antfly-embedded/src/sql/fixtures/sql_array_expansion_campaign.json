@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "entries": [
+    {"id":"unnest-alias","sql":"SELECT * FROM unnest(ARRAY[1,2]) t"},
+    {"id":"unnest-zip","sql":"SELECT * FROM unnest(ARRAY[1,NULL,3]::int[], ARRAY['a']::text[], ARRAY[true,false]) WITH ORDINALITY t(x,y,z,n)"},
+    {"id":"unnest-bounds","sql":"SELECT * FROM unnest('[-1:0][5:6]={{1,2},{3,NULL}}'::int[]) WITH ORDINALITY t(v,n)"},
+    {"id":"unnest-null","sql":"SELECT * FROM unnest(NULL::text[]) WITH ORDINALITY"},
+    {"id":"unnest-empty","sql":"SELECT * FROM unnest(ARRAY[]::int[])"},
+    {"id":"unnest-null-zip","sql":"SELECT * FROM unnest(NULL::int[], ARRAY['x','y']) t(a,b)"},
+    {"id":"unnest-partial-alias","sql":"SELECT * FROM unnest(ARRAY[1,2], ARRAY[3]) t(x)"},
+    {"id":"unnest-schema","sql":"SELECT * FROM pg_catalog.unnest(ARRAY[1,2]) t(x)"},
+    {"id":"unnest-numeric","sql":"SELECT * FROM unnest(ARRAY['9007199254740993.125'::numeric]) t"},
+    {"id":"unnest-json-null","sql":"SELECT * FROM unnest(ARRAY['null'::jsonb, NULL::jsonb, '{\"a\":1}'::jsonb]) WITH ORDINALITY t(v,n)"},
+    {"id":"unnest-uuid","sql":"SELECT * FROM unnest(ARRAY['550e8400-e29b-41d4-a716-446655440000'::uuid]) t"},
+    {"id":"unnest-lateral","sql":"SELECT d._id, tag FROM things d, unnest(string_to_array(d._id || ' urgent', ' ')) AS tag WHERE tag = 'urgent' ORDER BY d._id"},
+    {"id":"unnest-cross-lateral","sql":"SELECT d._id, tag FROM things d CROSS JOIN LATERAL unnest(string_to_array(d._id || ' urgent', ' ')) AS tag WHERE tag = 'urgent' ORDER BY d._id"},
+    {"id":"unnest-inner-lateral","sql":"SELECT d._id, tag FROM things d JOIN LATERAL unnest(string_to_array(d._id || ' urgent', ' ')) AS tag ON true WHERE tag = 'urgent' ORDER BY d._id"},
+    {"id":"unnest-left-lateral","sql":"SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(CASE WHEN d._id = '1' THEN ARRAY[]::text[] ELSE ARRAY[NULL]::text[] END) WITH ORDINALITY t(v,n) ON true ORDER BY d._id"},
+    {"id":"unnest-stored","sql":"SELECT d._id, tag FROM things d, unnest(d.tags) AS tag ORDER BY d._id, tag NULLS FIRST"},
+    {"id":"unnest-stored-left","sql":"SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(d.tags) WITH ORDINALITY t(v,n) ON true ORDER BY d._id, t.n"}
+  ]
+}

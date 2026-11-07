@@ -123,6 +123,7 @@ pub const OwnedLookupOptions = struct {
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
     group_source_query_json: []const u8 = "",
+    sql_lock_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
     opts: @import("antfly_local_sources").storage_db_types.LookupOptions = .{},
 
@@ -130,6 +131,7 @@ pub const OwnedLookupOptions = struct {
         if (self.relational_integrity_jobs_json.len != 0) alloc.free(self.relational_integrity_jobs_json);
         if (self.relational_activation_json.len != 0) alloc.free(self.relational_activation_json);
         if (self.group_source_query_json.len != 0) alloc.free(self.group_source_query_json);
+        if (self.sql_lock_query_json.len != 0) alloc.free(self.sql_lock_query_json);
         if (self.relational_index_status_json.len != 0) alloc.free(self.relational_index_status_json);
         if (self.relational_topology_json.len != 0) alloc.free(self.relational_topology_json);
         for (self.fields) |field| alloc.free(field);
@@ -202,6 +204,9 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             if (seen or !std.mem.eql(u8, part, "_relational_integrity_catalog=true")) return error.InvalidQueryRequest;
             seen = true;
             result.opts.relational_integrity_catalog = true;
+        } else if (std.mem.startsWith(u8, part, "_json_null_fields=")) {
+            if (result.opts.include_json_null_fields or !std.mem.eql(u8, part, "_json_null_fields=true")) return error.InvalidQueryRequest;
+            result.opts.include_json_null_fields = true;
         } else if (std.mem.startsWith(u8, part, "_privacy_policy_version=")) {
             if (result.opts.privacy_policy_version != null) return error.InvalidQueryRequest;
             const value = part["_privacy_policy_version=".len..];
@@ -234,6 +239,12 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             result.group_source_query_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_group_source=".len..]);
             if (result.group_source_query_json.len == 0 or result.group_source_query_json.len > 65536) return error.InvalidQueryRequest;
             result.opts.group_source_query_json = result.group_source_query_json;
+        } else if (std.mem.startsWith(u8, part, "_sql_lock=")) {
+            if (seen) return error.InvalidQueryRequest;
+            seen = true;
+            result.sql_lock_query_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_sql_lock=".len..]);
+            if (result.sql_lock_query_json.len == 0 or result.sql_lock_query_json.len > 32768) return error.InvalidQueryRequest;
+            result.opts.sql_lock_query_json = result.sql_lock_query_json;
         } else if (std.mem.startsWith(u8, part, "_relational_index_status=")) {
             if (seen) return error.InvalidQueryRequest;
             seen = true;
@@ -282,6 +293,14 @@ test "relational row query control modes require authenticated internal parsing"
     defer public_primary.deinit(alloc);
     try std.testing.expect(!public_primary.opts.include_primary_digest);
     try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_primary_digest=true&_primary_digest=true"));
+    var typed = try parseInternalLookupOptions(alloc, "_json_null_fields=true");
+    defer typed.deinit(alloc);
+    try std.testing.expect(typed.opts.include_json_null_fields);
+    var public_typed = try parseLookupOptions(alloc, "_json_null_fields=true");
+    defer public_typed.deinit(alloc);
+    try std.testing.expect(!public_typed.opts.include_json_null_fields);
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_json_null_fields=true&_json_null_fields=true"));
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_json_null_fields=false"));
     const query = "_relational_activation=%7B%22mode%22%3A%22status%22%7D";
     var internal = try parseInternalLookupOptions(alloc, query);
     defer internal.deinit(alloc);

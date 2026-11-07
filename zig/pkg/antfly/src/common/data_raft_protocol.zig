@@ -40,10 +40,61 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 26;
-/// Version 26 binds generated vector publications to resolved model revisions
-/// and admits catalog-aware grouped-source activation.
-pub const batch_execution_identity_protocol_version: u16 = 26;
+pub const batch_protocol_version: u16 = batch_coupled_schema_policy_protocol_version;
+pub const batch_coupled_schema_policy_protocol_version: u16 = 35;
+/// Prepared graph attachments change both the root batch and intent payload.
+/// Serving remains independent: parsing a reserved barrier never admits it.
+pub const batch_graph_transaction_protocol_version: u16 = 34;
+pub const maximum_decodable_batch_protocol_version: u16 = batch_coupled_schema_policy_protocol_version;
+
+/// Semantic data7 includes the graph batch34 decoder. Every production store
+/// report uses the compiled semantic version; overrides cannot split this pair.
+pub fn graphCapabilityCoupled(data_version: u16, batch_version: u16) bool {
+    return (data_version < 7 or batch_version >= batch_graph_transaction_protocol_version) and
+        (data_version < 8 or batch_version >= batch_coupled_schema_policy_protocol_version);
+}
+
+test "graph capability requires batch34 and never treats the decoder ceiling as serving support" {
+    const testing = @import("std").testing;
+    try testing.expect(graphCapabilityCoupled(6, 33));
+    try testing.expect(!graphCapabilityCoupled(7, 33));
+    try testing.expect(graphCapabilityCoupled(7, 34));
+    try testing.expect(!graphCapabilityCoupled(8, 34));
+    try testing.expect(graphCapabilityCoupled(8, 35));
+    try testing.expect(maximum_decodable_batch_protocol_version >= batch_protocol_version);
+}
+/// Document retirement binds the exact source definition under the apply
+/// writer and persists a source-only proof without a relational catalog.
+pub const batch_document_retirement_protocol_version: u16 = 33;
+/// Version 32 combines execution-bound vector publications and grouped catalog
+/// activation with SQL's independently allocated v26-v31 barriers. A pre-merge
+/// SQL decoder advertising v31 does not implement these publication payloads.
+pub const batch_execution_identity_protocol_version: u16 = 32;
+/// Native row/table grants and their frozen 2PC references must be decoded by
+/// every applying replica before the first private lock command is admitted.
+pub const batch_sql_lock_protocol_version: u16 = 31;
+/// Version 29 carries externally decided votes, admission deadlines and
+/// irreversible read activation. Old members must never ignore these fields.
+pub const batch_external_transaction_protocol_version: u16 = 29;
+/// Version 28 admits metadata-authenticated whole-table deletion fencing and
+/// retire-only FK controls under stable row policies. Older replicas must not
+/// ignore that marker or reinterpret it as an ordinary topology operation.
+pub const batch_sql_drop_control_protocol_version: u16 = 28;
+/// Version 26 carries one tagged private-index effect per entry, including
+/// fixed build/verification pages and terminal controls. It does not advertise
+/// complete public index-publication support. Cancellation GC carries fixed
+/// cursor/count or claim-prefix commitments, never borrowed selection pointers.
+pub const batch_index_owner_control_protocol_version: u16 = 26;
+/// Version 27 carries validation-only schema controls. Owner preparation runs
+/// off the progress lane and committed dispatch shares the ordinary apply
+/// boundary. Every applying member still needs the durable activation barrier.
+pub const batch_schema_owner_control_protocol_version: u16 = 27;
+/// Origin-bearing replica snapshots belong to that same all-member barrier.
+/// Do not send a new envelope merely because the local binary can decode it.
+pub const native_snapshot_origin_protocol_version = batch_schema_owner_control_protocol_version;
+pub fn nativeSnapshotOriginEnabled(activated_protocol: u16) bool {
+    return activated_protocol >= native_snapshot_origin_protocol_version;
+}
 /// Version 25 carries leader-planned LEANN records (`_leann_record`), which
 /// replicas persist and apply verbatim in log order. Older peers cannot
 /// treat them as empty batches.

@@ -1,0 +1,653 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Fixed-memory decoder admission for table requirements nested in catalog,
+//! FK and restore envelopes. Schema/row strings are validated but never copied.
+const std = @import("std");
+
+/// A malformed control envelope cannot safely advertise its feature subset.
+/// Scan once with bounded memory before choosing a historical decoder floor.
+/// Opaque strings are checked as JSON tokens, never decoded into another DOM.
+pub fn requiresStrongestDecoder(bytes: []const u8) bool {
+    if (bytes.len > 64 * 1024 * 1024) return true;
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
+    defer scanner.deinit();
+    if ((scanner.peekNextTokenType() catch return true) != .object_begin) return true;
+    var depth: usize = 0;
+    while (true) switch (scanner.next() catch return true) {
+        .object_begin, .array_begin => {
+            depth += 1;
+            if (depth >= 128) return true;
+        },
+        .object_end, .array_end => {
+            if (depth == 0) return true;
+            depth -= 1;
+        },
+        .end_of_document => return depth != 0,
+        else => {},
+    };
+}
+
+/// Canonical SQL job purpose and captured source attachments select the
+/// TRUNCATE proof decoder before admission, even if a malformed producer
+/// omitted the preparation bytes.
+/// This is a bounded sender projection, not metadata execution authority.
+pub fn requiresSqlTruncatePreparation(job_json: []const u8, plan_json: []const u8) bool {
+    if (job_json.len > 64 * 1024 or plan_json.len > 32 * 1024 * 1024) return true;
+    var region: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    const Header = struct { source_kind: []const u8 = "", idempotency_namespace: []const u8 = "" };
+    const header = std.json.parseFromSliceLeaky(Header, a, job_json, .{ .ignore_unknown_fields = true }) catch return true;
+    if (!std.mem.eql(u8, header.source_kind, "empty_generation") or !std.mem.startsWith(u8, header.idempotency_namespace, "sql-truncate:")) return false;
+    const TruncatePlanProjection = struct {
+        targets: []const struct { replace: ?struct { table: struct { schema_json: []const u8 = "" } } = null },
+    };
+    const plan = std.json.parseFromSliceLeaky(TruncatePlanProjection, a, plan_json, .{ .ignore_unknown_fields = true, .max_value_len = 32 * 1024 * 1024 }) catch return true;
+    for (plan.targets) |target| if (target.replace) |old| {
+        if (@import("restore_staging.zig").hasTruncateAttachments(a, old.table.schema_json) catch return true) return true;
+    };
+    return false;
+}
+
+pub fn requiresTruncatePreparation(bytes: []const u8) bool {
+    return requiresMarker(bytes, "truncate_preparation");
+}
+
+pub fn requiresCoupledSchemaPolicy(bytes: []const u8) bool {
+    return requiresMarker(bytes, "schema_pair") or requiresMarker(bytes, "policy_pair");
+}
+
+pub fn requiresSqlAuthorization(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_authorization") or requiresMarker(bytes, "sql_owner");
+}
+
+/// A comment is a tagged type operation. Inspect structural keys only: user
+/// annotation text and opaque source strings cannot raise or hide this floor.
+pub fn requiresTypeRetirement(bytes: []const u8) bool {
+    return requiresMarker(bytes, "type_retirement");
+}
+
+pub fn requiresRetirementCohort(bytes: []const u8) bool {
+    return requiresMarker(bytes, "retirement_root");
+}
+
+pub fn requiresSequenceRetirement(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sequence_change") or requiresMarker(bytes, "sequence_retirement") or requiresMarker(bytes, "sequence_active");
+}
+
+pub fn requiresTypeCohort(bytes: []const u8) bool {
+    return requiresMarker(bytes, "type_change");
+}
+
+pub fn requiresSqlDomainEpoch(bytes: []const u8) bool {
+    return requiresMarker(bytes, "set_domain_not_null");
+}
+
+pub fn requiresSqlDomain(bytes: []const u8) bool {
+    return requiresSqlType(bytes) and requiresMarker(bytes, "create_domain");
+}
+
+pub fn requiresSqlTypeComments(bytes: []const u8) bool {
+    return requiresSqlType(bytes) and requiresMarker(bytes, "comment");
+}
+
+pub fn requiresSqlType(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_type");
+}
+pub fn requiresSqlCast(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_cast");
+}
+
+pub fn requiresScopeRetirementAuthority(bytes: []const u8) bool {
+    return requiresMarker(bytes, "scope_retirement") or requiresMarker(bytes, "scope_begin") or requiresMarker(bytes, "scope_child") or
+        requiresMarker(bytes, "document_source") or requiresMarker(bytes, "document_schema_digest");
+}
+
+pub fn requiresSqlRelationPersistence(bytes: []const u8) bool {
+    return requiresMarker(bytes, "native_retired") or requiresMarker(bytes, "native_retirements") or requiresMarker(bytes, "native_participant") or requiresMarker(bytes, "schema_only") or requiresMarker(bytes, "sql_persistence") or requiresMarker(bytes, "sql_temporary_owner") or requiresMarker(bytes, "native_pin") or requiresMarker(bytes, "native_reset") or requiresMarker(bytes, "native_empty_source") or requiresMarker(bytes, "native_empty_install") or requiresMarker(bytes, "native_loss_generations") or requiresMarker(bytes, "lost_generation") or requiresMarker(bytes, "temporary_owner") or requiresMarker(bytes, "native_loss_requested") or requiresMarker(bytes, "native_losses") or requiresMarker(bytes, "native_loss") or requiresMarker(bytes, "reserve_lost_temporary") or requiresMarker(bytes, "source_lost") or requiresMarker(bytes, "temporary_abandonment") or requiresMarker(bytes, "reserve_abandoned_temporary") or requiresMarker(bytes, "native_empty_origin") or requiresMarker(bytes, "schema_only_snapshot") or requiresMarker(bytes, "native_empty_acceptance") or requiresMarker(bytes, "install_native_empty") or requiresMarker(bytes, "image_attempt") or requiresMarker(bytes, "reserve_empty") or requiresMarker(bytes, "initialized_empty") or requiresMarker(bytes, "retire_unpublished") or requiresMarker(bytes, "unpublished_retirement") or requiresMarker(bytes, "recovery_capture");
+}
+
+pub fn requiresSqlNotifications(bytes: []const u8) bool {
+    return requiresMarker(bytes, "@sql-notifications");
+}
+
+pub fn requiresSqlCatalogJournal(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_catalog_admission");
+}
+
+pub fn requiresSqlCommandFence(bytes: []const u8) bool {
+    return requiresMarker(bytes, "command_fence");
+}
+
+pub fn requiresSqlNativeIndex(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_native_index") or requiresMarker(bytes, "sql_native_indexes_json");
+}
+
+pub fn requiresLogicalRelations(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_relation_id") or requiresMarker(bytes, "logical_relation_id");
+}
+
+pub fn requiresSqlTableTriggers(bytes: []const u8) bool {
+    return requiresLogicalRelations(bytes) or requiresMarker(bytes, "sql_triggers") or requiresMarker(bytes, "trigger_handoff") or requiresMarker(bytes, "trigger_source_columns_digest") or requiresMarker(bytes, "routine_mappings") or requiresMarker(bytes, "routine_actor");
+}
+
+pub fn requiresSqlTriggerFunction(bytes: []const u8) bool {
+    return requiresSqlRoutine(bytes) and requiresMarker(bytes, "returns_trigger");
+}
+
+pub fn requiresSqlRoutine(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_routine");
+}
+
+pub fn requiresMaterializedRefresh(bytes: []const u8) bool {
+    return requiresMarker(bytes, "refresh_identity");
+}
+
+pub fn requiresMaterializedView(bytes: []const u8) bool {
+    return requiresMarker(bytes, "materialized_view") or requiresMarker(bytes, "sql_materialized_view_id") or requiresMarker(bytes, "materialized");
+}
+
+pub fn requiresPopulation(bytes: []const u8) bool {
+    return requiresMarker(bytes, "population");
+}
+
+test "relational integrity restore staging population decoder marker ignores opaque source strings" {
+    for ([_][]const u8{ "{}", "{\"population\":null}", "{\"schema_json\":\"population capture_id\"}" }) |legacy|
+        try std.testing.expect(!requiresPopulation(legacy));
+    for ([_][]const u8{ "{\"plan\":{\"targets\":[{\"population\":{}}]}}", "{\"popul\\u0061tion\":{}}", "{" }) |current|
+        try std.testing.expect(requiresPopulation(current));
+}
+
+pub fn requiresPublication(bytes: []const u8) bool {
+    return requiresMarker(bytes, "schema_reader_requirements");
+}
+
+pub fn requiresColumnTransforms(bytes: []const u8) bool {
+    return requiresMarker(bytes, "column_transforms");
+}
+
+pub fn requiresTextGenerationBinding(bytes: []const u8) bool {
+    return requiresMarker(bytes, "full_text_read_index");
+}
+
+/// One bounded token walk handles both command envelopes and stored records.
+/// Quoted payload strings are never mistaken for authoritative field names.
+pub fn requiresHistoricalReferences(bytes: []const u8) bool {
+    return requiresMarker(bytes, "historical_reference_coverage") or requiresMarker(bytes, "reference_coverage_ready");
+}
+
+pub fn requiresNativeService(bytes: []const u8) bool {
+    return requiresMarker(bytes, "native_service");
+}
+
+pub fn requiresResourceComments(bytes: []const u8) bool {
+    return requiresMarker(bytes, "@catalog-resource-comments");
+}
+
+test "system catalog resource comments decoder projects actions without copying annotation text" {
+    for ([_][]const u8{ "{}", "{\"mutation\":{\"action\":\"rename\",\"description\":null}}", "{\"description\":\"action comment\"}" }) |bytes| try std.testing.expect(!requiresResourceComments(bytes));
+    for ([_][]const u8{ "{\"mutation\":{\"action\":\"comment\",\"description\":null}}", "{\"mutation\":{\"act\\u0069on\":\"comm\\u0065nt\"}}", "{" }) |bytes| try std.testing.expect(requiresResourceComments(bytes));
+}
+
+pub fn requiresDatabaseDefaults(bytes: []const u8) bool {
+    return requiresMarker(bytes, "database_defaults_only") or requiresMarker(bytes, "reset_database_defaults") or requiresMarker(bytes, "command_fence");
+}
+
+pub fn requiresRoleDefaults(bytes: []const u8) bool {
+    return requiresMarker(bytes, "@sql-role-defaults");
+}
+
+test "SQL role defaults decoder projects escaped fields and ignores JSON payloads" {
+    for ([_][]const u8{
+        "{}",
+        "{\"role_defaults\":[]}",
+        "{\"role_defaults\":[{\"principal\":\"alice\",\"database\":\"main\"}]}",
+        "{\"value\":{\"string\":\"database principal_instance role_defaults_only\"}}",
+    }) |legacy| try std.testing.expect(!requiresRoleDefaults(legacy));
+    for ([_][]const u8{
+        "{\"change\":{\"put\":{\"role_defaults\":[{\"database\":\"\"}]}}}",
+        "{\"role_defaults\":[{\"database\":\"main\",\"principal_instance\":[1]}]}",
+        "{\"role_defaults\":[{\"principal_\\u0069nstance\":null}]}",
+        "{\"role_defaults_only\":false}",
+        "{\"role_defaults_only\":true}",
+        "{",
+    }) |current| try std.testing.expect(requiresRoleDefaults(current));
+}
+
+/// Explicit identity handoffs must survive every accepting decoder. Project
+/// envelope fields, never strings embedded in user schema/expression payloads.
+pub fn requiresObjectRenames(bytes: []const u8) bool {
+    return requiresMarker(bytes, "object_renames") or requiresMarker(bytes, "object_rename_guard") or requiresMarker(bytes, "creation_object_comments") or requiresMarker(bytes, "object_rename");
+}
+
+test "system catalog object rename decoder projection handles escaped fields and opaque payloads" {
+    for ([_][]const u8{ "{}", "{\"schema_json\":\"object_renames\"}", "{\"object_renames\":null}" }) |bytes|
+        try std.testing.expect(!requiresObjectRenames(bytes));
+    for ([_][]const u8{ "{", "{\"object_renames\":[]}", "{\"plan\":{\"object_rename_guard\":{}}}", "{\"object_\\u0072enames\":[]}" }) |bytes|
+        try std.testing.expect(requiresObjectRenames(bytes));
+}
+
+pub fn requiresInitialCounterEffects(bytes: []const u8) bool {
+    return requiresMarker(bytes, "counter_effects");
+}
+
+fn requiresMarker(bytes: []const u8, comptime marker: []const u8) bool {
+    if (bytes.len > 64 * 1024 * 1024) return true;
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
+    defer scanner.deinit();
+    if ((scanner.peekNextTokenType() catch return true) != .object_begin) return true;
+    if (walk(void, .marker, marker, &scanner, fixed.allocator(), 0) catch return true) return true;
+    return (scanner.next() catch return true) != .end_of_document;
+}
+
+/// Project requirements at preparation, not from jsonStringify (whose error
+/// set only admits writer failures). Leave envelope syntax/shape errors to its
+/// existing domain decoder; never replace legacy error identities. A recognized
+/// non-null requirement is always checked against the supplied shared contract.
+pub fn validatePublication(comptime Requirements: type, bytes: []const u8) !void {
+    if (bytes.len > 64 * 1024 * 1024) return error.InvalidSchemaReaderRequirements;
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
+    defer scanner.deinit();
+    if ((scanner.peekNextTokenType() catch return) != .object_begin) return;
+    _ = walk(Requirements, .validate, "schema_reader_requirements", &scanner, fixed.allocator(), 0) catch |err| switch (err) {
+        error.InvalidSchemaReaderRequirements => return err,
+        else => return,
+    };
+}
+
+const Projection = enum { marker, validate, newer_readers };
+
+/// Project only authoritative requirement objects; encoded schemas and row
+/// strings are skipped without allocation. Invalid envelopes stay conservative.
+pub fn requiresClockReaders(bytes: []const u8) bool {
+    const Requirements = struct { semantic_version: u32 = 0, encoding_version: u32 = 0 };
+    if (bytes.len > 64 * 1024 * 1024) return true;
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
+    defer scanner.deinit();
+    if ((scanner.peekNextTokenType() catch return true) != .object_begin) return true;
+    if (walk(Requirements, .newer_readers, "schema_reader_requirements", &scanner, fixed.allocator(), 0) catch return true) return true;
+    return (scanner.next() catch return true) != .end_of_document;
+}
+
+test "system catalog schema reader publication projects clock versions without reading opaque payloads" {
+    for ([_][]const u8{
+        "{}",                                                                                 "{\"schema_reader_requirements\":null}",
+        "{\"schema_reader_requirements\":{\"semantic_version\":33,\"encoding_version\":33}}", "{\"schema_json\":\"schema_reader_requirements semantic_version 34\"}",
+    }) |legacy| try std.testing.expect(!requiresClockReaders(legacy));
+    for ([_][]const u8{
+        "{\"schema_reader_requirements\":{\"semantic_version\":34,\"encoding_version\":33}}",
+        "{\"plan\":{\"targets\":[{\"table\":{\"schema_reader_requirements\":{\"semantic_version\":13,\"encoding_version\":34}}}]}}",
+        "{\"schema_reader_\\u0072equirements\":{\"semantic_version\":34,\"encoding_version\":34}}",
+        "{",
+    }) |current| try std.testing.expect(requiresClockReaders(current));
+}
+
+fn walk(comptime Requirements: type, comptime mode: Projection, comptime marker_name: []const u8, scanner: *std.json.Scanner, alloc: std.mem.Allocator, depth: usize) !bool {
+    if (depth >= 128) return error.InvalidMetadataTransitionEncoding;
+    var found = false;
+    switch (try scanner.peekNextTokenType()) {
+        .object_begin => {
+            _ = try scanner.next();
+            while (try scanner.peekNextTokenType() != .object_end) {
+                const key = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
+                const Marker = enum { none, present, non_null, empty_database, comment_action };
+                const Match = struct {
+                    fn keyKind(name: []const u8) Marker {
+                        if (comptime std.mem.eql(u8, marker_name, "@sql-notifications")) {
+                            inline for (.{ "notification_plan", "notification_control", "notification_generation", "notification_bind", "notification_offer", "notification_ack", "notification_gc" }) |notification| if (std.mem.eql(u8, name, notification)) return .non_null;
+                            return .none;
+                        }
+                        if (comptime std.mem.eql(u8, marker_name, "@catalog-resource-comments")) return if (std.mem.eql(u8, name, "action")) .comment_action else .none;
+                        if (comptime std.mem.eql(u8, marker_name, "@sql-role-defaults")) {
+                            if (std.mem.eql(u8, name, "principal_instance") or std.mem.eql(u8, name, "role_defaults_only") or std.mem.eql(u8, name, "database_id")) return .present;
+                            if (std.mem.eql(u8, name, "database")) return .empty_database;
+                            return .none;
+                        }
+                        return if (std.mem.eql(u8, name, marker_name)) .non_null else .none;
+                    }
+                };
+                const marker = switch (key) {
+                    .string => |value| Match.keyKind(value),
+                    .allocated_string => |value| blk: {
+                        const equal = Match.keyKind(value);
+                        alloc.free(value);
+                        break :blk equal;
+                    },
+                    else => return error.InvalidMetadataTransitionEncoding,
+                };
+                if (marker == .present) return true;
+                if (marker == .comment_action and try scanner.peekNextTokenType() == .string) {
+                    const value = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
+                    const comment = switch (value) {
+                        .string => |text| std.mem.eql(u8, text, "comment"),
+                        .allocated_string => |text| blk: {
+                            defer alloc.free(text);
+                            break :blk std.mem.eql(u8, text, "comment");
+                        },
+                        else => return error.InvalidMetadataTransitionEncoding,
+                    };
+                    if (comment) return true;
+                    continue;
+                }
+                if (marker == .empty_database and try scanner.peekNextTokenType() == .string) {
+                    const value = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
+                    const empty = switch (value) {
+                        .string => |bytes| bytes.len == 0,
+                        .allocated_string => |bytes| blk: {
+                            const is_empty = bytes.len == 0;
+                            alloc.free(bytes);
+                            break :blk is_empty;
+                        },
+                        else => return error.InvalidMetadataTransitionEncoding,
+                    };
+                    if (empty) return true;
+                    continue;
+                }
+                if (marker == .non_null and try scanner.peekNextTokenType() != .null) {
+                    if (comptime mode == .marker) return true;
+                    const requirement = std.json.innerParse(Requirements, alloc, scanner, .{ .allocate = .alloc_if_needed, .max_value_len = 1024 }) catch
+                        return error.InvalidSchemaReaderRequirements;
+                    if (comptime mode == .newer_readers) {
+                        if (requirement.semantic_version >= 34 or requirement.encoding_version >= 34) return true;
+                    } else {
+                        if (!requirement.valid()) return error.InvalidSchemaReaderRequirements;
+                        found = true;
+                    }
+                } else if (try walk(Requirements, mode, marker_name, scanner, alloc, depth + 1)) {
+                    if (comptime mode != .validate) return true;
+                    found = true;
+                }
+            }
+            _ = try scanner.next();
+        },
+        .array_begin => {
+            _ = try scanner.next();
+            while (try scanner.peekNextTokenType() != .array_end) {
+                if (try walk(Requirements, mode, marker_name, scanner, alloc, depth + 1)) {
+                    if (comptime mode != .validate) return true;
+                    found = true;
+                }
+            }
+            _ = try scanner.next();
+        },
+        .string, .number, .true, .false, .null => try scanner.skipValue(),
+        else => return error.InvalidMetadataTransitionEncoding,
+    }
+    return found;
+}
+
+test "system catalog schema reader publication projection skips payloads and finds escaped nested markers" {
+    try std.testing.expect(!requiresPublication("{\"schema_reader_requirements\":null}"));
+    try std.testing.expect(!requiresPublication("{\"payload\":\"schema_reader_requirements\"}"));
+    try std.testing.expect(requiresPublication("{\"plan\":{\"targets\":[{\"table\":{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":31}}}]}}"));
+    try std.testing.expect(requiresPublication("{\"table\":{\"schema_reader_\\u0072equirements\":{}}}"));
+    for ([_][]const u8{ "", "{", "[]", "{\"schema_reader_requirements\":false}", "{}{}", "{\"a\":null,}", "{\"a\":null,\"b\":[}" }) |invalid|
+        try std.testing.expect(requiresPublication(invalid));
+    const large = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(large);
+    @memset(large, '"');
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .plan = .{ .child = .{ .schema_json = large }, .table = .{ .schema_reader_requirements = @as(?u32, null) } } }, .{});
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(!requiresPublication(bytes));
+}
+
+test "system catalog USING rewrite decoder projection skips expression payloads and recognizes escaped markers" {
+    try std.testing.expect(!requiresColumnTransforms("{\"expression_json\":\"column_transforms\"}"));
+    try std.testing.expect(!requiresColumnTransforms("{\"column_transforms\":null}"));
+    try std.testing.expect(requiresColumnTransforms("{\"plan\":{\"targets\":[{\"rewrite\":{\"column_\\u0074ransforms\":[{}]}}]}}"));
+    try std.testing.expect(requiresColumnTransforms("{"));
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, 128 * 1024);
+    defer a.free(large);
+    @memset(large, '"');
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .source_schema = large, .targets = &.{.{ .rewrite = .{ .column_transforms = &.{.{ .column = "n", .expression_json = large }} } }} }, .{});
+    defer a.free(bytes);
+    try std.testing.expect(requiresColumnTransforms(bytes));
+}
+
+test "system catalog schema reader publication validation checks every pair and preserves envelope decoding" {
+    // The wire layer delegates semantics to its supplied contract. The native
+    // codec suite additionally exercises this with the actual shared type.
+    const FixtureRequirements = struct {
+        semantic_version: u32,
+        encoding_version: u32,
+        pub fn valid(self: @This()) bool {
+            return self.semantic_version == 30 and self.encoding_version == 31;
+        }
+    };
+    try validatePublication(FixtureRequirements, "{\"plan\":{\"table\":{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":31}}}}");
+    try validatePublication(FixtureRequirements, "{\"schema_reader_requirements\":null}");
+    try validatePublication(FixtureRequirements, "{"); // The domain decoder still owns envelope syntax.
+    for ([_][]const u8{
+        "{\"schema_reader_requirements\":{}}",
+        "{\"schema_reader_requirements\":false}",
+        "{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":0}}",
+        "{\"schema_reader_requirements\":{\"semantic_version\":32,\"encoding_version\":31}}",
+        "{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":31,\"future\":true}}",
+        "{\"tables\":[{\"schema_reader_requirements\":{\"semantic_version\":30,\"encoding_version\":31}},{\"schema_reader_requirements\":{}}]}",
+    }) |invalid| try std.testing.expectError(error.InvalidSchemaReaderRequirements, validatePublication(FixtureRequirements, invalid));
+}
+
+test "FK historical reference decoder marker is explicit escaped and bounded" {
+    try std.testing.expect(!requiresHistoricalReferences("{}"));
+    try std.testing.expect(!requiresHistoricalReferences("{\"schema_json\":\"historical_reference_coverage\"}"));
+    try std.testing.expect(requiresHistoricalReferences("{\"plan\":{\"historical_reference_coverage\":true}}"));
+    try std.testing.expect(requiresHistoricalReferences("{\"plan\":{\"historical_reference_\\u0063overage\":true}}"));
+    try std.testing.expect(requiresHistoricalReferences("{"));
+}
+
+test "relational integrity restore staging refresh decoder marker ignores source text and ordinary materializations" {
+    for ([_][]const u8{ "{}", "{\"materialized_view\":{\"refresh_identity\":null}}", "{\"source_json\":\"refresh_identity\"}" }) |bytes|
+        try std.testing.expect(!requiresMaterializedRefresh(bytes));
+    for ([_][]const u8{ "{\"materialized_view\":{\"refresh_identity\":{}}}", "{\"refresh_ident\\u0069ty\":{}}", "{" }) |bytes|
+        try std.testing.expect(requiresMaterializedRefresh(bytes));
+}
+
+test "SQL routine catalog decoder marker ignores quoted bodies and requires explicit callable publication" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_routine\"}", "{\"sql_routine\":null}" }) |bytes| try std.testing.expect(!requiresSqlRoutine(bytes));
+    for ([_][]const u8{ "{\"sql_routine\":{}}", "{\"sql_rout\\u0069ne\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlRoutine(bytes));
+}
+
+test "SQL routine catalog database cast decoder marker cannot hide publication in source text" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_cast\"}", "{\"sql_cast\":null}" }) |bytes| try std.testing.expect(!requiresSqlCast(bytes));
+    for ([_][]const u8{ "{\"sql_cast\":{}}", "{\"sql_ca\\u0073t\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlCast(bytes));
+}
+
+test "SQL routine catalog named type decoder marker ignores strings and recognizes escaped fields" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_type\"}", "{\"sql_type\":null}" }) |bytes| try std.testing.expect(!requiresSqlType(bytes));
+    for ([_][]const u8{ "{\"sql_type\":{}}", "{\"sql_t\\u0079pe\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlType(bytes));
+}
+
+test "SQL routine catalog type comments require their own decoder floor even for removal" {
+    for ([_][]const u8{
+        "{}",
+        "{\"sql_type\":{\"operation\":{\"add_enum\":{\"label\":\"comment\"}}}}",
+        "{\"comment\":{\"description\":\"sql_type\"}}",
+        "{\"source_json\":\"sql_type comment\"}",
+    }) |bytes| try std.testing.expect(!requiresSqlTypeComments(bytes));
+    for ([_][]const u8{
+        "{\"sql_type\":{\"operation\":{\"comment\":{\"description\":null}}}}",
+        "{\"sql_t\\u0079pe\":{\"operation\":{\"comm\\u0065nt\":{}}}}",
+        "{",
+    }) |bytes| try std.testing.expect(requiresSqlTypeComments(bytes));
+}
+
+test "schema validation publication type epoch decoder ignores opaque strings and retains escaped structural markers" {
+    for ([_][]const u8{ "{}", "{\"type_change\":null}", "{\"schema_json\":\"type_change\"}" }) |bytes| try std.testing.expect(!requiresTypeCohort(bytes));
+    for ([_][]const u8{ "{\"plan\":{\"type_change\":{}}}", "{\"type_cha\\u006ege\":{}}", "{" }) |bytes| try std.testing.expect(requiresTypeCohort(bytes));
+}
+
+test "system catalog schema reader publication identifies retirement structurally and rejects escaped downgrade" {
+    for ([_][]const u8{
+        "{}",
+        "{\"annotation\":\"type_retirement\"}",
+        "{\"type_retirement\":null}",
+        "{\"plan_json\":\"{\\\"type_retirement\\\":{}}\"}",
+    }) |bytes| try std.testing.expect(!requiresTypeRetirement(bytes));
+    for ([_][]const u8{
+        "{\"type_retirement\":{}}",
+        "{\"plan\":{\"type_retirement\":{}}}",
+        "{\"type_retir\\u0065ment\":{}}",
+        "{",
+    }) |bytes| try std.testing.expect(requiresTypeRetirement(bytes));
+}
+
+test "presentation SQL domain decoder fences structural declarations independently of user strings" {
+    for ([_][]const u8{
+        "{}",
+        \\{"sql_type":{"operation":{"comment":{"description":"create_domain"}}}}
+        ,
+        \\{"create_domain":{},"source_json":"sql_type"}
+        ,
+    }) |bytes| try std.testing.expect(!requiresSqlDomain(bytes));
+    for ([_][]const u8{
+        \\{"sql_type":{"operation":{"create_domain":{}}}}
+        ,
+        \\{"sql_type":{"operation":{"create_\u0064omain":{}}}}
+        ,
+    }) |bytes| try std.testing.expect(requiresSqlDomain(bytes));
+}
+
+test "presentation control decoder classification checks complete bounded envelope syntax" {
+    for ([_][]const u8{
+        "{}", " {\"nested\":[1,true,null,{\"text\":\"type_retirement create_domain\"}]} ",
+    }) |bytes| try std.testing.expect(!requiresStrongestDecoder(bytes));
+    for ([_][]const u8{
+        "{",                                                    "[]", "null", "", "{}{}", "{\"type_retirement\":{}} trailing",
+        "{\"sql_type\":{\"operation\":{\"create_domain\":{}}}",
+    }) |bytes| try std.testing.expect(requiresStrongestDecoder(bytes));
+    var nested: [128 * 6 + 2]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&nested);
+    for (0..128) |_| try stream.writeAll("{\"a\":");
+    try stream.writeAll("0");
+    for (0..128) |_| try stream.writeAll("}");
+    try std.testing.expect(requiresStrongestDecoder(stream.buffered()));
+}
+
+pub fn requiresInitialCreationCopy(bytes: []const u8) bool {
+    return requiresMarker(bytes, "creation_copy") or requiresMarker(bytes, "copy_effects");
+}
+
+test "initial FK copy decoder markers are structural and ignore source note text" {
+    try std.testing.expect(requiresInitialCreationCopy("{\"plan\":{\"creation_copy\":{}}}"));
+    try std.testing.expect(requiresInitialCreationCopy("{\"plan\":{\"copy_effects\":{}}}"));
+    try std.testing.expect(requiresInitialCreationCopy("{\"plan\":{\"creation_\\u0063opy\":{}}}"));
+    try std.testing.expect(!requiresInitialCreationCopy("{\"note\":\"creation_copy and copy_effects\"}"));
+    try std.testing.expect(!requiresInitialCreationCopy("{\"plan\":{\"counter_effects\":{}}}"));
+}
+
+pub fn requiresInitialCounterSources(bytes: []const u8) bool {
+    return requiresMarker(bytes, "source_inputs");
+}
+
+test "SQL routine catalog trigger decoder ignores source text and recognizes escaped contract fields" {
+    for ([_][]const u8{ "{}", "{\"sql_routine\":{\"body\":\"returns_trigger\"}}", "{\"returns_trigger\":true}" }) |bytes| try std.testing.expect(!requiresSqlTriggerFunction(bytes));
+    for ([_][]const u8{ "{\"sql_routine\":{\"definition\":{\"returns_trigger\":true}}}", "{\"sql_rout\\u0069ne\":{\"returns_tri\\u0067ger\":true}}", "{" }) |bytes| try std.testing.expect(requiresSqlTriggerFunction(bytes));
+}
+
+test "SQL native index capability markers cover mutation and retained table names" {
+    for ([_][]const u8{ "{}", "{\"body\":\"sql_native_index\"}" }) |bytes| try std.testing.expect(!requiresSqlNativeIndex(bytes));
+    for ([_][]const u8{ "{\"sql_native_index\":{}}", "{\"sql_native_indexes_json\":\"owned\"}", "{\"sql_native_ind\\u0065x\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlNativeIndex(bytes));
+}
+
+test "SQL command fence decoder projection finds escaped fields without parsing source text" {
+    for ([_][]const u8{ "{}", "{\"command_fence\":null}", "{\"source_json\":\"command_fence\"}" }) |bytes|
+        try std.testing.expect(!requiresSqlCommandFence(bytes));
+    for ([_][]const u8{ "{\"admission\":{\"command_fence\":{}}}", "{\"request\":{\"command_\\u0066ence\":{}}}", "{" }) |bytes|
+        try std.testing.expect(requiresSqlCommandFence(bytes));
+}
+
+test "SQL command fence decoder catalog journal cannot be hidden in escaped fields or source text" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_catalog_admission\"}", "{\"sql_catalog_admission\":null}" }) |bytes| try std.testing.expect(!requiresSqlCatalogJournal(bytes));
+    for ([_][]const u8{ "{\"sql_catalog_admission\":{}}", "{\"sql_catalog_admiss\\u0069on\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlCatalogJournal(bytes));
+}
+
+test "SQL notification decoder admission follows frozen intents and exact control markers not payload text" {
+    for ([_][]const u8{ "{}", "{\"notification_plan\":null}", "{\"notification_generation\":null}", "{\"payload\":\"notification_control notification_ack\"}" }) |legacy| try std.testing.expect(!requiresSqlNotifications(legacy));
+    for ([_][]const u8{ "{\"notification_control\":true}", "{\"notification_generation\":2}", "{\"notification_gen\\u0065ration\":2}", "{\"operation\":{\"notification_gc\":{}}}", "{\"identity\":{\"notification_plan\":{}}}", "{" }) |current| try std.testing.expect(requiresSqlNotifications(current));
+}
+
+test "SQL database defaults decoder gates scoped baseline mutations without matching string payloads" {
+    for ([_][]const u8{ "{}", "{\"description\":\"database_defaults_only\"}", "{\"role_defaults_only\":true}" }) |bytes| try std.testing.expect(!requiresDatabaseDefaults(bytes));
+    for ([_][]const u8{ "{\"database_defaults_only\":true}", "{\"database_defaults_\\u006fnly\":true}", "{" }) |bytes| try std.testing.expect(requiresDatabaseDefaults(bytes));
+}
+
+test "SQL scope retirement termination decoder projection ignores payloads and recognizes escaped authority fields" {
+    for ([_][]const u8{ "{}", "{\"scope_retirement\":null}", "{\"payload\":\"scope_retirement\"}", "{\"scope_child\":null}", "{\"payload\":\"scope_begin\"}" }) |bytes|
+        try std.testing.expect(!requiresScopeRetirementAuthority(bytes));
+    for ([_][]const u8{ "{", "{\"scope_retirement\":{}}", "{\"scope_retire\\u006dent\":{}}", "{\"scope_begin\":{}}", "{\"begin\":{\"manifest\":{\"scope_child\":{}}}}" }) |bytes|
+        try std.testing.expect(requiresScopeRetirementAuthority(bytes));
+}
+
+test "document retirement decoder projection follows source identity markers not user payloads" {
+    for ([_][]const u8{ "{}", "{\"document_schema_digest\":null}", "{\"payload\":\"document_source document_schema_digest\"}" }) |bytes| try std.testing.expect(!requiresScopeRetirementAuthority(bytes));
+    for ([_][]const u8{ "{\"document_source\":false}", "{\"document_source\":true}", "{\"document_sou\\u0072ce\":true}", "{\"document_schema_digest\":[1]}", "{\"summary\":{\"document_source\":true}}" }) |bytes| try std.testing.expect(requiresScopeRetirementAuthority(bytes));
+}
+
+test "SQL relation lifetime compact scope receipts retain the native decoder requirement" {
+    try std.testing.expect(requiresSqlRelationPersistence("{\"temporary_owner\":{\"connection_generation\":1}}"));
+    try std.testing.expect(!requiresSqlRelationPersistence("{\"payload\":\"temporary_owner\"}"));
+}
+
+test "SQL native prepared retirement markers demand the persistence reader without matching user strings" {
+    for ([_][]const u8{ "{\"native_retired\":[{\"member\":0}]}", "{\"native_retirements\":[{\"member\":0}]}", "{\"route\":{\"native_participant\":{\"table_id\":4}}}" }) |bytes| try std.testing.expect(requiresSqlRelationPersistence(bytes));
+    for ([_][]const u8{ "{}", "{\"native_retired\":null}", "{\"payload\":\"native_retired native_retirements native_participant\"}" }) |bytes| try std.testing.expect(!requiresSqlRelationPersistence(bytes));
+}
+
+test "SQL logical relation identity requires structural metadata174 and ignores nil or opaque text" {
+    inline for (.{ "{}", "{\"sql_relation_id\":null}", "{\"source_json\":\"sql_relation_id logical_relation_id\"}" }) |bytes| try std.testing.expect(!requiresLogicalRelations(bytes));
+    inline for (.{ "{\"sql_relation_id\":7}", "{\"logical_relation_id\":7}", "{\"sql_relat\\u0069on_id\":7}" }) |bytes| {
+        try std.testing.expect(requiresLogicalRelations(bytes));
+        try std.testing.expect(requiresSqlTableTriggers(bytes));
+    }
+}
+
+test "SQL TRUNCATE preparation marker distinguishes actual plans from ordinary strings and omission" {
+    try std.testing.expect(requiresTruncatePreparation("{\"plan\":{\"truncate_preparation\":{\"format_version\":1}}}"));
+    try std.testing.expect(!requiresTruncatePreparation("{\"plan\":{\"truncate_preparation\":null}}"));
+    try std.testing.expect(!requiresTruncatePreparation("{\"source_location\":\"truncate_preparation\"}"));
+}
+
+test "SQL TRUNCATE preparation sender recognizes required source attachments without upgrading reset or plain plans" {
+    var region: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    const triggers = @import("antfly_local_sources").sql_catalog.triggers;
+    const before: triggers.State = .{ .metadata_incarnation = @splat(9), .table_id = 7, .generation = 1 };
+    const function = @import("antfly_local_sources").sql_catalog.routines.records.RoutineReference{ .id = 9, .namespace_id = 2, .database = "antfly", .namespace = "public", .name = "notice" };
+    const truncate_state = try triggers.prepare(a, before, .{ .name = "truncate", .timing = .before, .events = .{ .truncate = true }, .level = .statement, .function = function }, false);
+    const insert_state = try triggers.prepare(a, before, .{ .name = "insert", .timing = .before, .events = .{ .insert = true }, .level = .statement, .function = function }, false);
+    const sql_job = "{\"source_kind\":\"empty_generation\",\"idempotency_namespace\":\"sql-truncate:basic:owner\"}";
+    const reset_job = "{\"source_kind\":\"empty_generation\",\"idempotency_namespace\":\"native-unlogged-recovery\"}";
+    const schema = try std.fmt.allocPrint(a, "{{\"sql_triggers\":{s}}}", .{try truncate_state.encode(a)});
+    const insert_schema = try std.fmt.allocPrint(a, "{{\"sql_triggers\":{s}}}", .{try insert_state.encode(a)});
+    const affected = try std.json.Stringify.valueAlloc(a, .{ .targets = &.{.{ .replace = .{ .table = .{ .schema_json = schema } } }} }, .{});
+    defer a.free(affected);
+    const plain = try std.json.Stringify.valueAlloc(a, .{ .targets = &.{.{ .replace = .{ .table = .{ .schema_json = insert_schema } } }} }, .{});
+    defer a.free(plain);
+    try std.testing.expect(requiresSqlTruncatePreparation(sql_job, affected));
+    try std.testing.expect(!requiresSqlTruncatePreparation(reset_job, affected));
+    try std.testing.expect(!requiresSqlTruncatePreparation(sql_job, plain));
+    try std.testing.expect(!requiresSqlTruncatePreparation("{\"source_kind\":\"query_population\"}", affected));
+}

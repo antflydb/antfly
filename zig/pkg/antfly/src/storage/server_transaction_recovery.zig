@@ -27,6 +27,17 @@ const background_runtime_mod = @import("antfly_local_sources").storage_backgroun
 
 pub const Config = @import("server_transaction_recovery_contract.zig").Config;
 
+fn resolveParticipant(config: Config, txn: transactions_mod.TxnSummary, participant: []const u8) !void {
+    const ctx = config.resolver_ctx orelse return error.MissingParticipantResolver;
+    if (txn.external_decision_owner) |owner| {
+        const resolve = config.resolve_external_participant_fn orelse return error.ExternalTransactionDecisionRequired;
+        try resolve(ctx, txn.txn_id, participant, txn.status, txn.commit_version, owner);
+    } else {
+        const resolve = config.resolve_participant_fn orelse return error.MissingParticipantResolver;
+        try resolve(ctx, txn.txn_id, participant, txn.status, txn.commit_version);
+    }
+}
+
 const AcknowledgementWindow = struct {
     members: [64][]const u8 = undefined,
     count: usize = 0,
@@ -143,6 +154,11 @@ fn runRecoveryPageWithConfig(
     transaction: for (page.items) |txn| {
         summary.recovery.scanned_records += 1;
         if (txn.status == .pending) {
+            if (txn.external_decision_owner) |owner| {
+                try owner.validate();
+                summary.recovery.kept_recent_pending += 1;
+                continue;
+            }
             const cutoff = now_ns -| config.cutoff_ns;
             if (txn.coordinator_known and txn.coordinator and txn.created_at > 0 and txn.created_at < cutoff) {
                 const participants = try manager.getParticipants(alloc, txn.txn_id);
@@ -182,13 +198,7 @@ fn runRecoveryPageWithConfig(
         if (has_intents or has_replication_outbox) {
             if (config.replicated_metadata) {
                 summary.notification_attempts += 1;
-                config.resolve_participant_fn.?(
-                    config.resolver_ctx.?,
-                    txn.txn_id,
-                    owner_participant.?,
-                    txn.status,
-                    txn.commit_version,
-                ) catch {
+                resolveParticipant(config, txn, owner_participant.?) catch {
                     summary.notification_failures += 1;
                     local_effects_resolved = false;
                 };
@@ -223,16 +233,17 @@ fn runRecoveryPageWithConfig(
             // Retained coordinators use their self-acknowledgement as the
             // durable handoff from the API session registry. Recovery must not
             // invent it during the advertised retry window. Once that window
-            // has elapsed, the API session has expired and storage must release
-            // the topology fence even if its node-local registry was lost.
+            // has elapsed, an ordinary API session has expired and storage may
+            // release its topology fence. External GIDs require the explicit
+            // durable metadata handoff regardless of age.
             if (txn.status == .committed and txn.coordinator and txn.retain_terminal and owner_participant != null and
-                std.mem.eql(u8, participant, owner_participant.?) and txn.finalized_at >= retained_cutoff)
+                std.mem.eql(u8, participant, owner_participant.?) and (txn.external_decision_owner != null or txn.finalized_at >= retained_cutoff))
             {
                 all_resolved = false;
                 continue;
             }
             summary.notification_attempts += 1;
-            config.resolve_participant_fn.?(config.resolver_ctx.?, txn.txn_id, participant, txn.status, txn.commit_version) catch {
+            resolveParticipant(config, txn, participant) catch {
                 summary.notification_failures += 1;
                 all_resolved = false;
                 continue;
@@ -246,7 +257,7 @@ fn runRecoveryPageWithConfig(
         if (!try acknowledgements.flush(&manager, config, txn.txn_id, owner_participant, &summary)) all_resolved = false;
         if (config.replicated_metadata and all_resolved) {
             const cutoff = now_ns -| config.cutoff_ns;
-            if (txn.finalized_at < (if (txn.retain_terminal) retained_cutoff else cutoff)) {
+            if (transactions_mod.terminalRetentionElapsed(txn, cutoff, retained_cutoff)) {
                 config.cleanup_transaction_fn.?(
                     config.resolver_ctx.?,
                     txn.txn_id,
@@ -554,6 +565,14 @@ test "transaction recovery runtime recoverOnce works with lsm backend store" {
 }
 
 test "transaction recovery delegates stale coordinator abort to replicated resolver" {
+    try staleCoordinatorRecovery(false);
+}
+
+test "transaction recovery external decision owner prevents replicated timeout abort" {
+    try staleCoordinatorRecovery(true);
+}
+
+fn staleCoordinatorRecovery(external: bool) !void {
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});
     defer backend.close();
@@ -563,14 +582,17 @@ test "transaction recovery delegates stale coordinator abort to replicated resol
     const txn_id: transactions_mod.TxnId = @splat(7);
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
     defer manager.deinit();
-    try manager.initTransactionWithParticipantsCreatedAtAndRole(
+    const external_owner: ?transactions_mod.ExternalDecisionOwner = if (external) .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 } else null;
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
         txn_id,
         10_000,
         1_000,
         &.{ "table2:4:docs:group:7", "table2:4:docs:group:8" },
         true,
+        external,
+        .{ .external_decision_owner = external_owner },
     );
-    try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
+    try manager.writeIntentsExtraBatch(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{}, .{ .external_decision_owner = external_owner });
 
     const Recorder = struct {
         calls: usize = 0,
@@ -593,8 +615,8 @@ test "transaction recovery delegates stale coordinator abort to replicated resol
         .resolver_ctx = &recorder,
         .resolve_participant_fn = Recorder.resolve,
     });
-    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
-    try std.testing.expectEqual(@as(u64, 1), stats.notification_attempts);
+    try std.testing.expectEqual(@as(usize, if (external) 0 else 1), recorder.calls);
+    try std.testing.expectEqual(@as(u64, if (external) 0 else 1), stats.notification_attempts);
     try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_id));
 }
@@ -877,8 +899,7 @@ pub fn runDbRecoveryOnce(self: *@import("antfly_source_root").antfly_sources.phy
             config,
         );
     }
-    const resolve_participant = config.resolve_participant_fn orelse return error.MissingParticipantResolver;
-    const resolver_ctx = config.resolver_ctx orelse return error.MissingParticipantResolver;
+    if (config.resolve_participant_fn == null or config.resolver_ctx == null) return error.MissingParticipantResolver;
     const now_ns = config.clock.nowRealtimeNs();
     const resolved_finalized = try self.recoverFinalizedTransactionIntents(now_ns);
 
@@ -907,7 +928,7 @@ pub fn runDbRecoveryOnce(self: *@import("antfly_source_root").antfly_sources.phy
         for (unresolved) |participant| {
             recovery_stats.notification_attempts += 1;
             const is_local = if (config.local_participant) |local| std.mem.eql(u8, local, participant) else false;
-            if (!is_local) resolve_participant(resolver_ctx, txn.txn_id, participant, txn.status, txn.commit_version) catch {
+            if (!is_local) resolveParticipant(config, txn, participant) catch {
                 recovery_stats.notification_failures += 1;
                 continue;
             };
@@ -1037,3 +1058,62 @@ pub const test_support = if (builtin.is_test) struct {
         return OwnedServerRuntime.owner(runtime.external.?.ptr).runtime.config;
     }
 } else struct {};
+
+test "transaction recovery external terminal delivery preserves admission and uncertain debt" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{});
+    defer store.deinit();
+    var manager = try transactions_mod.TxnManager.init(a, &store);
+    defer manager.deinit();
+    const id: transactions_mod.TxnId = @splat(63);
+    const admission: transactions_mod.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{ "coordinator", "follower" }, true, true, .{ .external_decision_owner = admission });
+    try manager.writeIntentsExtraBatch(id, &.{}, &.{}, .{ .external_decision_owner = admission });
+    try manager.activateExternalDecision(id, admission, .{});
+    _ = try manager.resolveIntentsWithExtraBatch(id, .committed, 20, .{ .external_decision_owner = admission });
+    const Recorder = struct {
+        fail: bool = true,
+        calls: usize = 0,
+        fn ordinary(_: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {
+            return error.UnexpectedOrdinaryResolution;
+        }
+        fn external(ptr: *anyopaque, txn: transactions_mod.TxnId, _: []const u8, status: transactions_mod.TxnStatus, version: u64, owner: transactions_mod.ExternalDecisionOwner) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(id, txn);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
+            try std.testing.expectEqual(@as(u64, 20), version);
+            try std.testing.expect(admission.eql(owner));
+            self.calls += 1;
+            if (self.fail) return error.Timeout;
+        }
+    };
+    var recorder: Recorder = .{};
+    var config: Config = .{ .enabled = true, .resolver_ctx = &recorder, .resolve_participant_fn = Recorder.ordinary };
+    const unsupported = try runRecoveryPageWithConfig(a, store, config, 30, null, 1);
+    try std.testing.expectEqual(@as(u64, 1), unsupported.notification_failures);
+    config.resolve_external_participant_fn = Recorder.external;
+    const uncertain = try runRecoveryPageWithConfig(a, store, config, 30, null, 1);
+    try std.testing.expectEqual(@as(u64, 1), uncertain.notification_failures);
+    const debt = try manager.getUnresolvedParticipants(a, id);
+    defer transactions_mod.freeParticipantList(a, debt);
+    try std.testing.expectEqual(@as(usize, 2), debt.len);
+    recorder.fail = false;
+    const complete = try runRecoveryPageWithConfig(a, store, config, 30, null, 1);
+    try std.testing.expectEqual(@as(u64, 1), complete.notification_successes);
+    const drained = try manager.getUnresolvedParticipants(a, id);
+    defer transactions_mod.freeParticipantList(a, drained);
+    try std.testing.expectEqual(@as(usize, 1), drained.len);
+    try std.testing.expectEqualStrings("coordinator", drained[0]);
+    try std.testing.expectEqual(@as(usize, 2), recorder.calls);
+    // Expiry of an ordinary retry window cannot substitute for the GID
+    // registry's durable terminal handoff, including after all remote ACKs.
+    const later = try runRecoveryPageWithConfig(a, store, config, std.math.maxInt(u64), null, 1);
+    try std.testing.expectEqual(@as(u64, 0), later.notification_attempts);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try manager.getTransactionStatus(id));
+    try manager.markParticipantResolved(id, "coordinator");
+    _ = try runRecoveryPageWithConfig(a, store, config, std.math.maxInt(u64), null, 1);
+    try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(id));
+    try std.testing.expectError(error.ExternalTransactionAdmissionExpired, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{ "coordinator", "follower" }, true, true, .{ .external_decision_owner = admission }));
+}

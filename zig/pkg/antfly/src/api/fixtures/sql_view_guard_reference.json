@@ -1,0 +1,195 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL and source-declared document domains",
+  "source_commit": "79644dfa1605e8da0f486d021d1c1393577d6265",
+  "seeds": [
+    {
+      "key": "doc:a",
+      "value": {
+        "title": "alpha",
+        "metadata": {
+          "plan": "pro"
+        }
+      }
+    },
+    {
+      "key": "doc:b",
+      "value": {
+        "title": "17",
+        "metadata": {
+          "plan": "free"
+        }
+      }
+    }
+  ],
+  "number_view": "CREATE VIEW support_view AS SELECT d._id,r.title::numeric AS title_as_number FROM docs d CROSS JOIN LATERAL jsonb_to_record(d._doc) AS r(title TEXT)",
+  "plan_view": "CREATE VIEW support_view AS SELECT d._id,r.metadata->>'plan' AS plan FROM docs d CROSS JOIN LATERAL jsonb_to_record(d._doc) AS r(metadata JSONB)",
+  "entries": [
+    {
+      "id": "sql-0853",
+      "sql": "SELECT _id, title_as_number FROM support_view WHERE title_as_number > 10 LIMIT 5",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"document_sql_view_mapping_catalog\",\"sql_plan\":\"invalid:read:reason=document_sql_view_mapping_catalog\",\"execution_plan\":\"\"}",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"title_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"title_as_number\",\"path\":\"title\",\"type\":\"numeric\"}]}},\"title_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"title\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sqlstate": "22P02"
+    },
+    {
+      "id": "sql-0854",
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"document_sql_view_mapping_catalog\",\"sql_plan\":\"invalid:read:reason=document_sql_view_mapping_catalog\",\"execution_plan\":\"\"}",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"missing_fts\"],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "result": {
+        "id": "sql-0854",
+        "columns": [
+          "_id",
+          "plan"
+        ],
+        "rows": [
+          [
+            "doc:a",
+            "pro"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-0855",
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"document_sql_view_mapping_catalog\",\"sql_plan\":\"invalid:read:reason=document_sql_view_mapping_catalog\",\"execution_plan\":\"\"}",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_generation\":8,\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "result": {
+        "id": "sql-0855",
+        "columns": [
+          "_id",
+          "plan"
+        ],
+        "rows": [
+          [
+            "doc:a",
+            "pro"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-0856",
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"document_sql_view_mapping_catalog\",\"sql_plan\":\"invalid:read:reason=document_sql_view_mapping_catalog\",\"execution_plan\":\"\"}",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"stale-schema\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "result": {
+        "id": "sql-0856",
+        "columns": [
+          "_id",
+          "plan"
+        ],
+        "rows": [
+          [
+            "doc:a",
+            "pro"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-0859",
+      "sql": "SELECT _id, title FROM support_view WHERE plan = 'pro' LIMIT 10",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"read_query\",\"native_model\":\"query_request\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"document_sql_view_mapping_unsupported\",\"sql_plan\":\"unsupported:read:requires=document_sql_view_mapping_unsupported\",\"execution_plan\":\"\"}",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sqlstate": "42703"
+    }
+  ],
+  "valid_numeric_result": {
+    "id": "sql-0853",
+    "columns": [
+      "_id",
+      "title_as_number"
+    ],
+    "rows": [
+      [
+        "doc:b",
+        17
+      ],
+      [
+        "doc:a",
+        23
+      ]
+    ],
+    "sql_nulls": [
+      [
+        false,
+        false
+      ],
+      [
+        false,
+        false
+      ]
+    ],
+    "column_oids": [
+      25,
+      1700
+    ],
+    "affected": 0
+  }
+}

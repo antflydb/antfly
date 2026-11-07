@@ -46,6 +46,8 @@ const Fixture = struct {
     source: http.StatusSource = undefined,
     non_raft: bool = false,
     owner_count: usize = 3,
+    population_mode: bool = false,
+    population_names: [3][]const u8 = @splat(""),
     node_config: ?*const @import("antfly_local_sources").common_config.Config = null,
     dbs: [3]*db.DB = undefined,
     scopes: [3]native.Scope = undefined,
@@ -114,9 +116,9 @@ const Fixture = struct {
     fn sourceIo(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, request: @import("online_merge_io.zig").contract.Request, context: operation.RequestContext) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.source_operations += 1;
-        const i = try index(name);
+        const i = try self.tableIndex(name);
         const original = self.donors[i];
-        try std.testing.expectEqual(@as(u64, 20) + i, group);
+        if (!self.population_mode) try std.testing.expectEqual(@as(u64, 20) + i, group);
         try std.testing.expect(original.core.identity_namespace.eql(request.scope.fence.namespace));
         // Deterministic manual executor: materialize the same production pin,
         // without introducing an asynchronous worker into this failure fixture.
@@ -129,7 +131,7 @@ const Fixture = struct {
         return @import("antfly_local_sources").storage_db_online_merge_io.executeJson(original, alloc, input, context.cancellation);
     }
     fn destinationIndex(self: *@This(), name: []const u8, scope: ?[32]u8, plan_id: ?[16]u8, group: ?u64) !usize {
-        const i = try index(name);
+        const i = try self.tableIndex(name);
         if (!self.target_open[i]) return error.RestoreStagingScopeChanged;
         const expected = self.scopes[i];
         if (!std.mem.eql(u8, &(scope orelse return error.RestoreStagingScopeChanged), &expected.digest()) or
@@ -160,14 +162,16 @@ const Fixture = struct {
             self.destination_handoff_writes += 1;
             return {};
         }
-        const i = try index(name);
+        const i = try self.tableIndex(name);
+        if (self.population_mode) self.donor_indices[i] = @max(self.donor_indices[i], self.indices[i]);
         self.donor_indices[i] += 1;
         if (self.non_raft) try self.donors[i].batch(request) else try @import("../storage/server_db_adapter.zig").applyOrdered(&self.donors[i], request, .{ .index = self.donor_indices[i], .term = 1 });
+        if (self.population_mode) self.indices[i] = self.donor_indices[i];
         return {};
     }
     fn sourceLookup(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, key: []const u8, opts: db.types.LookupOptions, _: read_gate.ReadConsistency) !?reads.LookupResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const original = self.donors[try index(name)];
+        const original = self.donors[try self.tableIndex(name)];
         const result = (try original.lookup(alloc, key, opts)) orelse return null;
         return .{ .json = result.json, .version = 0 };
     }
@@ -210,6 +214,7 @@ const Fixture = struct {
         self.scopes[i] = scope;
         self.dbs[i].* = try db.DB.open(self.alloc, self.target_paths[i], .{ .backend_runtime = self.runtime, .identity_namespace = scope.target_namespace, .online_source_authority = if (self.non_raft) .native else .raft, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
         self.target_open[i] = true;
+        if (self.population_mode) self.donors[i] = self.dbs[i];
         try self.dbs[i].setSchemaJson(self.alloc, target.table.schema_json);
         try self.dbs[i].reserveRestoreStagingScoped(self.alloc, scope);
         const bootstrap = try stages.ownerBootstrapForRangeIndex(self.alloc, job.value.plan, job.value.plan_digest, target, 0);
@@ -275,6 +280,19 @@ const Fixture = struct {
     fn uri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
         return null;
     }
+    fn tableIndex(self: *Fixture, name: []const u8) !usize {
+        if (self.population_mode) {
+            for (self.population_names, 0..) |stored, i| if (std.mem.eql(u8, stored, name)) return i;
+            if (!std.mem.startsWith(u8, name, "table:")) return error.TableNotFound;
+            for (&self.population_names, 0..) |*stored, i| if (stored.len == 0) {
+                stored.* = try self.facts_alloc.?.dupe(u8, name);
+                self.owner_count = @max(self.owner_count, i + 1);
+                return i;
+            };
+            return error.TableNotFound;
+        }
+        return index(name);
+    }
     fn index(name: []const u8) !usize {
         for ([_][]const u8{ "parent", "child", "docs" }, 0..) |value, i| if (std.mem.eql(u8, value, name)) return i;
         return error.TableNotFound;
@@ -308,7 +326,7 @@ const Fixture = struct {
     fn owner(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, group: u64, request: owner_api.Request, context: operation.RequestContext) !owner_api.Response {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.owner_calls += 1;
-        const i = try index(name);
+        const i = try self.tableIndex(name);
         if (self.rewrite_mode) try self.provisionRewrite(i, request.scope);
         try std.testing.expectEqual(self.scopes[i].target_namespace.shard_id, group);
         // Only publication and validation assert the metadata phase. A
@@ -323,7 +341,8 @@ const Fixture = struct {
                 self.validation_route_gaps -= 1;
                 return error.GroupLeaderUnavailable;
             }
-            for (self.dbs[0..self.owner_count]) |target| {
+            for (self.dbs[0..self.owner_count], 0..) |target, slot| {
+                if (self.population_mode and (!self.target_open[slot] or !std.mem.eql(u8, &self.scopes[slot].plan_id, &request.scope.plan_id))) continue;
                 var state = (try target.restoreStagingStatus(alloc)).?;
                 defer state.deinit();
                 try std.testing.expect(state.value.phase == .imported or state.value.phase == .validated);
@@ -355,7 +374,7 @@ const Fixture = struct {
                 self.materialization_max_ns = @max(self.materialization_max_ns, elapsed_ns);
             }
         }
-        if (request.action == .validate or request.action == .install_generation_admissions) {
+        if (request.action == .validate or request.action == .install_generation_admissions or request.action == .install_native_empty) {
             self.validation_owner_calls += 1;
             const elapsed_ns = @import("antfly_platform").time.monotonicNs() - owner_started_ns;
             self.validation_owner_elapsed_ns +|= elapsed_ns;
@@ -375,7 +394,7 @@ const Fixture = struct {
             .begin => 0,
             .import_page => if (result.rows != 0 or result.phase == .imported) 2 else 0,
             .validate => if (result.phase == .validated) 4 else 0,
-            .install_generation_admissions => 0,
+            .install_generation_admissions, .install_native_empty => 0,
             .publish => 8,
             .cancel => 16,
             .status => 0,
@@ -400,7 +419,7 @@ const Fixture = struct {
     fn lookup(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, key: []const u8, opts: db.types.LookupOptions, consistency: read_gate.ReadConsistency) !?reads.LookupResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
-        const i = try index(name);
+        const i = try self.tableIndex(name);
         var scoped = opts;
         scoped.restore_staging_scope = try self.private_catalog.?.source().restoreScopeForGroup(name, self.scopes[i].target_namespace.shard_id);
         const row = (try self.dbs[i].lookup(alloc, key, scoped)) orelse return null;
@@ -430,19 +449,19 @@ const Fixture = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const participant = try distributed.participantIdForGroupScoped(alloc, name, group, request.restore_staging_scope, request.restore_staging_plan_id);
         defer alloc.free(participant);
-        _ = try self.dbs[try index(name)].beginTransactionScoped(request.txn_id, request.begin_timestamp, request.begin_timestamp, request.participants, std.mem.eql(u8, participant, request.participants[0]), false, request.restore_staging_scope);
+        _ = try self.dbs[try self.tableIndex(name)].beginTransactionScoped(request.txn_id, request.begin_timestamp, request.begin_timestamp, request.participants, std.mem.eql(u8, participant, request.participants[0]), false, request.restore_staging_scope);
     }
     fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, name: []const u8, request: distributed.TxnPrepareRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try self.dbs[try index(name)].writeTransaction(request.txn_id, request.req);
+        try self.dbs[try self.tableIndex(name)].writeTransaction(request.txn_id, request.req);
     }
     fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, name: []const u8, request: distributed.TxnResolveRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try self.dbs[try index(name)].resolveTransactionIntents(request.txn_id, request.status, request.commit_version);
+        try self.dbs[try self.tableIndex(name)].resolveTransactionIntents(request.txn_id, request.status, request.commit_version);
     }
     fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, name: []const u8, id: db.types.TxnId) !db.types.TxnStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return self.dbs[try index(name)].getTransactionStatus(id);
+        return self.dbs[try self.tableIndex(name)].getTransactionStatus(id);
     }
     fn commit(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const contract.TableCommitRequest, sync: db.types.SyncLevel, cancel: db.types.CancellationToken) !?contract.CommitOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -505,9 +524,16 @@ const RewritePersistence = struct {
     fn createWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
         try std.testing.expectEqual(@as(u64, 1), term);
         const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.proposeTransitionCommand(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan } });
+        try metadata_service.ensureQueryPopulationDecoderWithContext(svc, plan, .{});
+        svc.proposeTransitionCommand(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan } }) catch |err| {
+            std.debug.print("compound staging fixture proposal: {s}\n", .{@errorName(err)});
+            return err;
+        };
         try svc.runRound();
-        return (try get(ptr, alloc, key)) orelse error.RestoreJobCommitNotApplied;
+        return (try get(ptr, alloc, key)) orelse {
+            std.debug.print("compound staging fixture did not admit the plan\n", .{});
+            return error.RestoreJobCommitNotApplied;
+        };
     }
 };
 
@@ -1274,4 +1300,579 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         defer active_result.deinit();
         try std.testing.expectEqual(@as(u32, 1), active_result.total_hits);
     }
+}
+
+/// One request-owned SQL producer, real Raft metadata admission, native LSM
+/// output and the same recovery/validation/publication worker as backups.
+pub const PopulationScenario = enum { populated, no_data, abandoned };
+
+pub fn runPopulation(comptime Driver: type, scenario: PopulationScenario) !void {
+    const abandoned = scenario == .abandoned;
+    const row_count: usize = if (scenario == .no_data) 0 else 129;
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io });
+    defer runtime.deinit();
+    var api_runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io, .borrowed_io = .{ .general = std.testing.io, .api = std.testing.io } });
+    defer api_runtime.deinit();
+    var raft = raft_engine.core.MemoryStorage.init(alloc);
+    defer raft.deinit();
+    var fixture: Fixture = .{ .alloc = alloc, .raft = &raft, .runtime = &runtime, .owner_count = 1, .restart_after_commit = true, .root = root, .facts_alloc = a, .non_raft = false };
+    var allocated: usize = 0;
+    defer {
+        for (fixture.dbs[0..allocated], 0..) |target, i| {
+            if (fixture.target_open[i]) target.close();
+            alloc.destroy(target);
+        }
+    }
+    var svc = try metadata_service.MetadataService.init(alloc, .{ .host = .{ .local_node_id = 1, .metadata_group_id = 1988, .replica_root_dir = try std.fmt.allocPrint(a, "{s}/metadata", .{root}), .replica_catalog_path = try std.fmt.allocPrint(a, "{s}/metadata-catalog", .{root}) } }, .{ .host = .{ .host = .{ .descriptor_factory = .{ .ptr = &fixture, .vtable = &.{ .build_descriptor = Fixture.descriptor, .free_descriptor = Fixture.freeDescriptor } } } } }, .{});
+    defer svc.deinit();
+    _ = try svc.ensureMetadataReplica(.{ .group_id = 1988, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+    try svc.campaignMetadataGroup();
+    try svc.runRound();
+    const source = http.StatusSource.fromMetadataService(&svc);
+    fixture.source = source;
+    var node_config = try Driver.nodeConfig(alloc);
+    defer node_config.deinit();
+    fixture.node_config = &node_config;
+    var server = http.ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .backend_runtime = &api_runtime, .node_config = &node_config, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.sourceIo }, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } } }, source, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.sourceLookup, .lookup_group_local = Fixture.destinationLookup, .scan = Fixture.scan, .query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.sourceBatch } });
+    defer server.deinit();
+    server.restore_job_store.deinit();
+    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
+    try server.restore_job_store.attachReplicated(restore_jobs.ReplicatedPersistence.fromLocal(&svc, .{ .load = RewritePersistence.load, .get = RewritePersistence.get, .put = RewritePersistence.put, .delete = RewritePersistence.delete, .delete_many = RewritePersistence.deleteMany, .create_with_staging = RewritePersistence.createWithStaging }));
+    try server.restore_job_store.prepareReplicatedLeadership(alloc, 1);
+    server.restore_leadership_term.store(1, .release);
+
+    const local = @import("antfly_local_sources");
+    const sql = local.sql_catalog;
+    const population = local.storage_db_relational_population_contract;
+    const Backend = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: local.sql_ast.Name, _: sql.Action) !sql.Table {
+            return error.TableNotFound;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: sql.Table, _: sql.Scan) !sql.Page {
+            return error.UnexpectedRowScan;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: sql.Table, _: []const sql.Mutation) !sql.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn ddl(_: *anyopaque, _: sql.DdlAllocators, _: sql.Ddl) !sql.DdlOutcome {
+            return error.UnexpectedMutation;
+        }
+    };
+    var unused: u8 = 0;
+    const backend: sql.Backend = .{ .ptr = &unused, .execution_io = std.testing.io, .vtable = &.{ .resolve = Backend.resolve, .scan = Backend.scan, .mutate = Backend.mutate, .checkpoint = Backend.checkpoint, .ddl = Backend.ddl } };
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    try text.writer.writeAll("CREATE TABLE parent(n,j) AS VALUES ");
+    for (0..129) |i| {
+        if (i != 0) try text.writer.writeByte(',');
+        try text.writer.print("({d}::BIGINT,{s}::JSONB)", .{ i, if (i % 2 == 0) "'null'" else "NULL" });
+    }
+    if (scenario == .no_data) try text.writer.writeAll(" WITH NO DATA");
+    var compiled = try local.sql_compiler.compile(a, text.written(), .{});
+    defer compiled.deinit();
+    const producer = try local.sql_relation_population.Source.init(a, backend, &compiled, compiled.statement.catalog_ddl.population.?, &.{}, .{ .result_rows = 1 });
+    defer producer.deinit();
+    const job_id = try restore_jobs.jobIdForIdempotency(a, "population-worker", "one");
+    const plan_id = try stages.idForAttempt(job_id, 1);
+    const capture: population.Capture = .{ .capture_id = @splat(1), .definition = producer.definition, .source_definition = producer.source_definition, .target_schema = try stages.runtimeSchemaDigestForTable(a, producer.schema_json), .principal_instance = @splat(5), .catalog_revision = 0, .write_version = 42, .expires_at_ms = if (abandoned) 1 else 9000000000000 };
+    const target: stages.Target = .{ .source_table_id = 0, .population = capture, .table = .{ .table_id = 19, .name = "parent", .schema_json = producer.schema_json, .indexes_json = "{}" }, .catalog_binding = .{ .kind = .table, .id = 19, .parent_id = local.system_catalog_domain.default_namespace_id, .name = "parent", .storage_name = "parent" }, .ranges = &.{.{ .table_id = 19, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }} };
+    const plan: stages.Plan = .{ .id = plan_id, .cohort_digest = producer.definition, .targets = &.{target} };
+    const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
+    try svc.upsertStore(.{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = tables.SchemaReaderCapabilities.current, .relational_topology_protocol_version = tables.query_population_protocol_version });
+    try svc.runRound();
+    var registered = (try source.adminSnapshot()).?;
+    try std.testing.expectEqual(@as(usize, 1), registered.stores.len);
+    try std.testing.expectEqual(tables.query_population_protocol_version, registered.stores[0].relational_topology_protocol_version);
+    source.freeAdminSnapshot(&registered);
+    // Resolve the same built-in default namespace that ordinary SQL DDL
+    // uses; no test-only catalog writes.
+    _ = try source.systemCatalog(a, .{}, .{ .resolve_many = .{} });
+    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = .query_population, .backup_id = "population", .location = "metadata://query-population", .connection = "internal", .idempotency_namespace = "population-worker", .idempotency_key = "one", .table_names = &.{"parent"}, .destination_authorization_principal = local.api_stored_destination_authorization.auth_disabled_principal, .generation_plan_json = plan_json });
+    const scope = try stages.ownerScope(a, plan, try plan.digest(a), target, target.ranges[0]);
+    fixture.scopes[0] = scope;
+    fixture.target_paths[0] = try std.fmt.allocPrint(a, "{s}/population", .{root});
+    fixture.cache_paths[0] = try std.fmt.allocPrint(a, "{s}/decoder", .{root});
+    fixture.dbs[0] = try alloc.create(db.DB);
+    allocated = 1;
+    fixture.dbs[0].* = try db.DB.open(alloc, fixture.target_paths[0], .{ .backend_runtime = &runtime, .identity_namespace = scope.target_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+    fixture.target_open[0] = true;
+    try fixture.dbs[0].setSchemaJson(alloc, target.table.schema_json);
+    try fixture.dbs[0].reserveRestoreStagingScoped(alloc, scope);
+    try fixture.dbs[0].installRestoreStagingBootstrap(alloc, try stages.ownerBootstrapForRangeIndex(alloc, plan, try plan.digest(a), target, 0));
+    const Interrupted = struct {
+        source: sql.PopulationSource,
+        pulls: usize = 0,
+        fn next(ptr: *anyopaque, max_rows: u32) !?[]const population.Row {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.pulls != 0) return error.Cancelled;
+            self.pulls += 1;
+            return self.source.next(self.source.ptr, max_rows);
+        }
+        fn finish(_: *anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var interrupted: Interrupted = .{ .source = producer.iface() };
+    var input = producer.iface();
+    if (abandoned) {
+        input.ptr = &interrupted;
+        input.next = Interrupted.next;
+        input.finish = Interrupted.finish;
+    }
+    const delivery = @import("sql_population_delivery.zig");
+    const delivered = delivery.deliver(alloc, .{ .port = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .table = "parent", .group = 701, .scope = scope }, input, .{});
+    if (abandoned) try std.testing.expectError(error.Cancelled, delivered) else {
+        const cursor = try delivered;
+        try std.testing.expect(cursor.sealed);
+        try std.testing.expectEqual(@as(u64, @intCast(row_count)), cursor.rows);
+    }
+    const producer_imports = fixture.imports;
+    var hidden = (try source.adminSnapshot()).?;
+    try std.testing.expectEqual(@as(usize, 0), hidden.tables.len);
+    source.freeAdminSnapshot(&hidden);
+    for (0..600) |_| {
+        try Driver.work(&server, job_id);
+        const bytes = (try server.restore_job_store.load(a, job_id)).?;
+        const state = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{});
+        if (restore_jobs.isTerminal(state.value.phase)) {
+            try std.testing.expectEqual(if (abandoned) restore_jobs.Phase.failed else .succeeded, state.value.phase);
+            try std.testing.expectEqual(if (abandoned) restore_jobs.StagingResolution.canceled else .published, state.value.staging_resolution);
+            break;
+        }
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    } else {
+        std.debug.print("population worker stalled: {s}\n", .{(try server.restore_job_store.load(a, job_id)).?});
+        return error.PopulationWorkerDidNotComplete;
+    }
+    // Recovery never issues a backup read or another query import request.
+    try std.testing.expectEqual(producer_imports, fixture.imports);
+    try std.testing.expectEqual(@as(usize, 0), fixture.source_operations);
+    var visible = (try source.adminSnapshot()).?;
+    defer source.freeAdminSnapshot(&visible);
+    try std.testing.expectEqual(@as(usize, if (abandoned) 0 else 1), visible.tables.len);
+    if (!abandoned) {
+        var reader = try fixture.dbs[0].beginRelationalRows(alloc, .{ .fields = &.{ "n", "j" } });
+        defer reader.deinit();
+        var count: usize = 0;
+        while (true) {
+            var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+            defer page.deinit();
+            for (page.rows) |row| {
+                const ordinal = try std.fmt.parseInt(u64, row.key[row.key.len - 16 ..], 16);
+                try std.testing.expectEqualSlices(u8, &population.rowKey(capture.capture_id, ordinal), row.key);
+                try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.typed.?.object.get("n").?.integer);
+                try std.testing.expectEqualSlices(bool, &.{ false, ordinal % 2 != 0 }, row.sql_nulls.?);
+                count += 1;
+            }
+            if (!page.more) break;
+        }
+        try std.testing.expectEqual(row_count, count);
+    }
+}
+
+/// Unchanged original SQL enters the mounted HTTP handler. Source scans use
+/// real immutable native read views; destination jobs use real metadata Raft.
+pub fn runPopulationPublic(comptime Driver: type, case_id: []const u8, document: bool) !void {
+    return runPopulationPublicMode(Driver, case_id, document, true, false);
+}
+pub fn runPopulationPublicEmpty(comptime Driver: type, document: bool) !void {
+    return runPopulationPublicMode(Driver, "sql-0351", document, false, false);
+}
+pub fn runPopulationPublicRefresh(comptime Driver: type, case_id: []const u8, document: bool, initially_populated: bool) !void {
+    return runPopulationPublicMode(Driver, case_id, document, initially_populated, true);
+}
+fn runPopulationPublicMode(comptime Driver: type, case_id: []const u8, document: bool, with_data: bool, refresh: bool) !void {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io });
+    defer runtime.deinit();
+    var api_runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io, .borrowed_io = .{ .general = std.testing.io, .api = std.testing.io } });
+    defer api_runtime.deinit();
+    var raft = raft_engine.core.MemoryStorage.init(alloc);
+    defer raft.deinit();
+    var fixture: Fixture = .{ .alloc = alloc, .raft = &raft, .runtime = &runtime, .owner_count = 1, .population_mode = true, .rewrite_mode = true, .restart_after_commit = true, .root = root, .facts_alloc = a, .non_raft = false };
+    var allocated: usize = 0;
+    defer {
+        for (fixture.dbs[0..allocated], 0..) |target, i| {
+            if (fixture.target_open[i]) target.close();
+            alloc.destroy(target);
+        }
+    }
+    var svc = try metadata_service.MetadataService.init(alloc, .{ .host = .{ .local_node_id = 1, .metadata_group_id = 1988, .replica_root_dir = try std.fmt.allocPrint(a, "{s}/metadata", .{root}), .replica_catalog_path = try std.fmt.allocPrint(a, "{s}/metadata-catalog", .{root}) } }, .{ .host = .{ .host = .{ .descriptor_factory = .{ .ptr = &fixture, .vtable = &.{ .build_descriptor = Fixture.descriptor, .free_descriptor = Fixture.freeDescriptor } } } } }, .{});
+    defer svc.deinit();
+    _ = try svc.ensureMetadataReplica(.{ .group_id = 1988, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+    try svc.campaignMetadataGroup();
+    try svc.runRound();
+    const source = http.StatusSource.fromMetadataService(&svc);
+    fixture.source = source;
+    var node_config = try Driver.nodeConfig(alloc);
+    defer node_config.deinit();
+    fixture.node_config = &node_config;
+    var server = http.ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .backend_runtime = &api_runtime, .node_config = &node_config, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.sourceIo }, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } } }, source, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.sourceLookup, .lookup_group_local = Fixture.destinationLookup, .scan = Fixture.scan, .query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.sourceBatch } });
+    defer server.deinit();
+    server.restore_job_store.deinit();
+    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
+    try server.restore_job_store.attachReplicated(restore_jobs.ReplicatedPersistence.fromLocal(&svc, .{ .load = RewritePersistence.load, .get = RewritePersistence.get, .put = RewritePersistence.put, .delete = RewritePersistence.delete, .delete_many = RewritePersistence.deleteMany, .create_with_staging = RewritePersistence.createWithStaging }));
+    try server.restore_job_store.prepareReplicatedLeadership(alloc, 1);
+    server.restore_leadership_term.store(1, .release);
+
+    const local = @import("antfly_local_sources");
+    const SourceTables = @import("sql_parity_sources.zig").Tables(2);
+    var inputs: SourceTables = .{ .records = undefined, .reads = undefined };
+    const profile = try std.json.parseFromSliceLeaky(struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } }, a, local.sql_parity_fixtures.read_campaign_profile, .{ .ignore_unknown_fields = true });
+    var original = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source", .{root}), .{ .backend_runtime = &runtime, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+    defer original.close();
+    var source_schema = profile.schema;
+    if (document) {
+        try source_schema.object.put(a, "storage_mode", .{ .string = "document" });
+        // Document JSON values use their structural schema types; the logical
+        // source values stay identical to the PostgreSQL campaign profile.
+        const properties = &source_schema.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object;
+        try properties.getPtr("tags").?.object.put(a, "type", .{ .string = "array" });
+        try properties.getPtr("metadata").?.object.put(a, "type", .{ .string = "object" });
+    }
+    const schema = try std.json.Stringify.valueAlloc(a, source_schema, .{});
+    try original.setSchemaJson(alloc, schema);
+    const source_writes = try a.alloc(db.types.BatchWrite, profile.rows.len);
+    for (profile.rows, source_writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+    try original.batch(.{ .timestamp_ns = 42, .writes = source_writes });
+    inputs.records[0] = .{ .table_id = 7, .name = "usage_records", .schema_json = schema, .indexes_json = "{}" };
+    inputs.reads[0] = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init("usage_records", 7, &original, read_gate.alreadyReadSafeBarrier());
+    inputs.records[1] = .{ .table_id = 0, .name = "" };
+    inputs.reads[1] = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init("", 0, &original, read_gate.alreadyReadSafeBarrier());
+    server.table_reads = inputs.source();
+    try svc.upsertTable(inputs.records[0]);
+    try svc.upsertStore(.{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .schema_reader = tables.SchemaReaderCapabilities.current, .relational_topology_protocol_version = tables.relational_topology_protocol_version });
+    try svc.runRound();
+    for (0..fixture.dbs.len) |i| {
+        fixture.dbs[i] = try alloc.create(db.DB);
+        allocated += 1;
+        fixture.target_paths[i] = try std.fmt.allocPrint(a, "{s}/destination-{d}", .{ root, i });
+        fixture.cache_paths[i] = try std.fmt.allocPrint(a, "{s}/decoder-{d}", .{ root, i });
+    }
+    const inventory = try std.json.parseFromSliceLeaky(struct { entries: []const struct { id: []const u8, sql: []const u8 } }, a, local.sql_parity_fixtures.inventory, .{ .ignore_unknown_fields = true });
+    const oracle = try std.json.parseFromSliceLeaky(struct {
+        inventory_sha256: []const u8,
+        profile_sha256: []const u8,
+        materialized_diagnostics: []const struct { populated: bool, probes: []const struct { sql: []const u8, code: ?[]const u8 } },
+        entries: []const struct { id: []const u8, source_entry_sha256: []const u8, sql: []const u8, command_tag: []const u8, sqlstate: ?[]const u8 = null, columns: []const []const std.json.Value, rows: []const []const std.json.Value, repeat_command_tag: ?[]const u8 = null, repeat_rows: ?[]const []const std.json.Value = null },
+    }, a, local.sql_parity_fixtures.population_reference, .{ .ignore_unknown_fields = true });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(local.sql_parity_fixtures.inventory, &digest, .{});
+    try std.testing.expectEqualStrings(oracle.inventory_sha256, &std.fmt.bytesToHex(digest, .lower));
+    std.crypto.hash.sha2.Sha256.hash(local.sql_parity_fixtures.read_campaign_profile, &digest, .{});
+    try std.testing.expectEqualStrings(oracle.profile_sha256, &std.fmt.bytesToHex(digest, .lower));
+    const reference = for (oracle.entries) |entry| {
+        if (std.mem.eql(u8, entry.id, case_id)) break entry;
+    } else return error.MissingPopulationReference;
+    const statement = for (inventory.entries) |entry| {
+        if (std.mem.eql(u8, entry.id, case_id)) break entry.sql;
+    } else return error.MissingOriginalCase;
+    try std.testing.expectEqualStrings(reference.sql, statement);
+    var handler: @import("httpx_handler.zig").AntflyApiHandler = .{ .api_server = &server };
+    const Request = @import("httpx").Request;
+    var request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = if (with_data) statement else try std.fmt.allocPrint(a, "{s} WITH NO DATA", .{statement}) }, .{});
+    var request_context: @import("httpx").Context = .init(alloc, std.testing.io, &request);
+    defer request_context.deinit();
+    var response = try handler.executeSQL(&request_context);
+    defer response.deinit();
+    if (response.status.code != 200 and response.status.code != 202) {
+        std.debug.print("public population {s} status={d}: {s}\n", .{ case_id, response.status.code, response.body orelse "" });
+        return error.PopulationHttpFailed;
+    }
+    const body = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body.?, .{});
+    const receipt = body.object.get("ddl_receipt") orelse return error.MissingPopulationReceipt;
+    const job_id = try std.fmt.parseInt(u64, receipt.object.get("restore_job_id").?.string, 10);
+    for (0..600) |_| {
+        try Driver.work(&server, job_id);
+        const encoded = (try server.restore_job_store.load(a, job_id)).?;
+        const state = try std.json.parseFromSliceLeaky(restore_jobs.JobState, a, encoded, .{});
+        if (restore_jobs.isTerminal(state.phase)) {
+            if (state.phase != .succeeded) std.debug.print("population {s} failed: {s}\n", .{ case_id, encoded });
+            try std.testing.expectEqual(restore_jobs.Phase.succeeded, state.phase);
+            break;
+        }
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.PopulationWorkerDidNotComplete;
+    const empty = !with_data or std.mem.eql(u8, case_id, "sql-0365");
+    const expected_count = if (empty) 0 else reference.rows.len;
+    const target_schema = (try fixture.dbs[0].getSchemaJson(a)).?;
+    var parsed_schema = try @import("tables.zig").parseValidatedTableSchema(a, target_schema);
+    defer parsed_schema.deinit(a);
+    const typed_schema = try @import("tables.zig").deriveRuntimeTableSchema(a, parsed_schema);
+    defer local.storage_schema.freeSchema(a, typed_schema);
+    try std.testing.expectEqual(reference.columns.len, typed_schema.relational_columns.len);
+    for (typed_schema.relational_columns, reference.columns) |column, expected| {
+        try std.testing.expectEqualStrings(expected[0].string, column.name);
+        try std.testing.expectEqualStrings("text", expected[1].string);
+        try std.testing.expectEqual(local.storage_schema.RelationalColumnType.string, column.column_type);
+        try std.testing.expect(column.allows_null and !expected[2].bool);
+    }
+    const field_names = try a.alloc([]const u8, reference.columns.len);
+    for (reference.columns, field_names) |column, *name| name.* = column[0].string;
+    var reader = try fixture.dbs[0].beginRelationalRows(alloc, .{ .fields = field_names });
+    var reader_open = true;
+    defer if (reader_open) reader.deinit();
+    var actual_count: usize = 0;
+    var seen = try a.alloc(bool, reference.rows.len);
+    @memset(seen, false);
+    while (true) {
+        var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        defer page.deinit();
+        for (page.rows) |row| {
+            const object = row.typed.?.object;
+            const identifier = object.get(field_names[0]).?;
+            var matched = false;
+            for (reference.rows, 0..) |expected_row, index| {
+                if (identifier != .string or !std.mem.eql(u8, identifier.string, expected_row[0].string)) continue;
+                for (field_names, expected_row, row.sql_nulls.?) |field, expected, is_null| {
+                    const actual = object.get(field) orelse .null;
+                    try std.testing.expectEqual(expected == .null, is_null);
+                    if (expected == .null) try std.testing.expect(actual == .null) else try std.testing.expectEqualStrings(expected.string, actual.string);
+                }
+                try std.testing.expect(!seen[index]);
+                seen[index] = true;
+                matched = true;
+                break;
+            }
+            try std.testing.expect(matched);
+            actual_count += 1;
+        }
+        if (!page.more) break;
+    }
+    try std.testing.expectEqual(expected_count, actual_count);
+    if (empty) {
+        try std.testing.expectEqual(@as(usize, 0), inputs.native_reads.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 0), inputs.captures);
+    }
+    if (reference.repeat_command_tag) |expected_tag| {
+        const before_reads = inputs.native_reads.load(.monotonic);
+        const before_captures = inputs.captures;
+        const before_imports = fixture.imports;
+        var repeated_context: @import("httpx").Context = .init(alloc, std.testing.io, &request);
+        defer repeated_context.deinit();
+        var repeated = try handler.executeSQL(&repeated_context);
+        defer repeated.deinit();
+        try std.testing.expectEqual(@as(u16, 200), repeated.status.code);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, repeated.body.?, .{});
+        try std.testing.expectEqualStrings(expected_tag, value.object.get("command_tag").?.string);
+        try std.testing.expectEqual(@as(i64, 0), value.object.get("rows_affected").?.integer);
+        try std.testing.expectEqual(before_reads, inputs.native_reads.load(.monotonic));
+        try std.testing.expectEqual(before_captures, inputs.captures);
+        try std.testing.expectEqual(before_imports, fixture.imports);
+        try std.testing.expectEqual(reference.rows.len, reference.repeat_rows.?.len);
+    }
+    if (std.mem.startsWith(u8, case_id, "sql-035")) {
+        // A published generation stays immutable after the fixture reopens it.
+        try std.testing.expectError(error.MaterializedViewReadOnly, fixture.dbs[0].batch(.{ .writes = &.{.{ .key = "forged", .value = "{}" }} }));
+        try std.testing.expectError(error.MaterializedViewReadOnly, fixture.dbs[0].batch(.{ .deletes = &.{"forged"} }));
+        const encoded = (try server.restore_job_store.load(a, job_id)).?;
+        const job = try std.json.parseFromSliceLeaky(restore_jobs.JobState, a, encoded, .{});
+        const staged = (try source.getRestoreStaging(a, try stages.idForAttempt(job_id, job.staging_attempt_id), .{})).?;
+        const stage = try std.json.parseFromSliceLeaky(stages.Job, a, staged, .{});
+        inputs.records[1] = stage.plan.targets[0].table;
+        inputs.reads[1] = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init(inputs.records[1].name, inputs.records[1].table_id, fixture.dbs[0], read_gate.alreadyReadSafeBarrier());
+        var read_request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer read_request.deinit();
+        read_request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = "SELECT * FROM usage_records_mv ORDER BY 1" }, .{});
+        var read_context: @import("httpx").Context = .init(alloc, std.testing.io, &read_request);
+        defer read_context.deinit();
+        var selected = try handler.executeSQL(&read_context);
+        defer selected.deinit();
+        if (selected.status.code != (if (with_data) @as(u16, 200) else 400)) std.debug.print("materialized read {s} status={d}: {s}\n", .{ case_id, selected.status.code, selected.body orelse "" });
+        try std.testing.expectEqual(@as(u16, if (with_data) 200 else 400), selected.status.code);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, selected.body.?, .{});
+        if (with_data) {
+            const actual_rows = value.object.get("rows").?.array.items;
+            try std.testing.expectEqual(reference.rows.len, actual_rows.len);
+            for (actual_rows, reference.rows) |actual, expected| {
+                try std.testing.expectEqual(expected.len, actual.array.items.len);
+                for (actual.array.items, expected) |cell, wanted| {
+                    if (wanted == .null) try std.testing.expect(cell == .null) else try std.testing.expectEqualStrings(wanted.string, cell.string);
+                }
+            }
+        } else try std.testing.expectEqualStrings("55000", value.object.get("code").?.string);
+
+        const diagnostics = for (oracle.materialized_diagnostics) |entry| {
+            if (entry.populated == with_data) break entry;
+        } else return error.MissingPopulationReference;
+        for (diagnostics.probes) |probe| {
+            if (probe.code == null) continue;
+            const rejected_sql = probe.sql;
+            var rejected_request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer rejected_request.deinit();
+            rejected_request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = rejected_sql }, .{});
+            var rejected_context: @import("httpx").Context = .init(alloc, std.testing.io, &rejected_request);
+            defer rejected_context.deinit();
+            var rejected = try handler.executeSQL(&rejected_context);
+            defer rejected.deinit();
+            const diagnostic = try std.json.parseFromSliceLeaky(std.json.Value, a, rejected.body.?, .{});
+            try std.testing.expectEqual(@as(u16, if (std.mem.eql(u8, probe.code.?, "0A000")) 501 else 400), rejected.status.code);
+            try std.testing.expectEqualStrings(probe.code.?, diagnostic.object.get("code").?.string);
+        }
+        const txn = try fixture.dbs[0].beginTransaction(999);
+        try std.testing.expectError(error.MaterializedViewReadOnly, fixture.dbs[0].writeTransaction(txn, .{ .writes = &.{.{ .key = "forged", .value = "{}" }} }));
+        try fixture.dbs[0].abortTransaction(txn, 1000);
+
+        if (refresh) {
+            reader.deinit();
+            reader_open = false;
+            const prior_bytes = try source.systemCatalog(a, .{}, .{ .resolve_many = .{ .sql_sources = &.{.{ .view_id = stage.plan.targets[0].materialized_view.?.id }} } });
+            const prior_snapshot = try std.json.parseFromSliceLeaky(local.system_catalog_domain.ResolvedMany, a, prior_bytes, .{});
+            const prior = try @import("../system_catalog/views.zig").Record.decode(a, prior_snapshot.sql_sources[0].?.value.view.source_json);
+            const changed = for (profile.rows) |row| {
+                if (std.mem.eql(u8, row.value.object.get("id").?.string, "u5")) break row;
+            } else return error.MissingSourceRow;
+            var next = changed.value;
+            try next.object.put(a, "status", .{ .string = "refreshed" });
+            try original.batch(.{ .timestamp_ns = 1000, .writes = &.{.{ .key = changed.key, .value = try std.json.Stringify.valueAlloc(a, next, .{}) }} });
+            const refresh_reference = for (oracle.entries) |entry| {
+                if (std.mem.eql(u8, entry.id, "sql-0356")) break entry;
+            } else return error.MissingPopulationReference;
+            const refresh_sql = for (inventory.entries) |entry| {
+                if (std.mem.eql(u8, entry.id, "sql-0356")) break entry.sql;
+            } else return error.MissingOriginalCase;
+            try std.testing.expectEqualStrings(refresh_reference.sql, refresh_sql);
+            var refresh_request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer refresh_request.deinit();
+            refresh_request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = refresh_sql }, .{});
+            var refresh_context: @import("httpx").Context = .init(alloc, std.testing.io, &refresh_request);
+            defer refresh_context.deinit();
+            var refreshed = try handler.executeSQL(&refresh_context);
+            defer refreshed.deinit();
+            if (refreshed.status.code != 200 and refreshed.status.code != 202) std.debug.print("refresh public failure {s}\n", .{refreshed.body orelse ""});
+            try std.testing.expect(refreshed.status.code == 200 or refreshed.status.code == 202);
+            const admitted_refresh = try std.json.parseFromSliceLeaky(std.json.Value, a, refreshed.body.?, .{});
+            const refresh_job = try std.fmt.parseInt(u64, admitted_refresh.object.get("ddl_receipt").?.object.get("restore_job_id").?.string, 10);
+            for (0..600) |_| {
+                try Driver.work(&server, refresh_job);
+                const state_bytes = (try server.restore_job_store.load(a, refresh_job)).?;
+                const state = try std.json.parseFromSliceLeaky(restore_jobs.JobState, a, state_bytes, .{});
+                if (restore_jobs.isTerminal(state.phase)) {
+                    if (state.phase != .succeeded) std.debug.print("refresh job failure {s}\n", .{state_bytes});
+                    try std.testing.expectEqual(restore_jobs.Phase.succeeded, state.phase);
+                    break;
+                }
+                try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+            } else return error.PopulationWorkerDidNotComplete;
+            const after_bytes = try source.systemCatalog(a, .{}, .{ .resolve_many = .{ .sql_sources = &.{ .{ .view_id = prior.value.id }, .{ .table_id = prior.value.materialization.?.table_id } } } });
+            const after = try std.json.parseFromSliceLeaky(local.system_catalog_domain.ResolvedMany, a, after_bytes, .{});
+            const replacement = try @import("../system_catalog/views.zig").Record.decode(a, after.sql_sources[0].?.value.view.source_json);
+            try std.testing.expect(after.sql_sources[1] == null);
+            try std.testing.expectEqual(prior.value.id, replacement.value.id);
+            try std.testing.expectEqual(prior.value.generation, replacement.value.generation);
+            try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, prior.value.attributes, .{}), try std.json.Stringify.valueAlloc(a, replacement.value.attributes, .{}));
+            try std.testing.expectEqualStrings(try prior.value.definition.encode(a), try replacement.value.definition.encode(a));
+            try std.testing.expect(replacement.value.materialization.?.table_id != prior.value.materialization.?.table_id);
+            const replacement_job = (try source.getRestoreStaging(a, try stages.idForAttempt(refresh_job, 1), .{})).?;
+            const replacement_plan = try std.json.parseFromSliceLeaky(stages.Job, a, replacement_job, .{});
+            inputs.records[1] = replacement_plan.plan.targets[0].table;
+            const replacement_slot = try fixture.tableIndex(inputs.records[1].name);
+            inputs.reads[1] = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init(inputs.records[1].name, inputs.records[1].table_id, fixture.dbs[replacement_slot], read_gate.alreadyReadSafeBarrier());
+            var selected_context: @import("httpx").Context = .init(alloc, std.testing.io, &read_request);
+            defer selected_context.deinit();
+            var selected_refresh = try handler.executeSQL(&selected_context);
+            defer selected_refresh.deinit();
+            if (selected_refresh.status.code != 200) std.debug.print("refreshed read failure {s}\n", .{selected_refresh.body orelse ""});
+            try std.testing.expectEqual(@as(u16, 200), selected_refresh.status.code);
+            const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, selected_refresh.body.?, .{});
+            try std.testing.expectEqual(refresh_reference.rows.len, actual.object.get("rows").?.array.items.len);
+            for (actual.object.get("rows").?.array.items, refresh_reference.rows) |row, expected| for (row.array.items, expected) |cell, wanted| {
+                if (wanted == .null) try std.testing.expect(cell == .null) else try std.testing.expectEqualStrings(wanted.string, cell.string);
+            };
+            const before_captures = inputs.captures;
+            const empty_job = try completePopulationPublic(Driver, &server, &handler, a, "REFRESH MATERIALIZED VIEW usage_records_mv WITH NO DATA");
+            try std.testing.expectEqual(before_captures, inputs.captures);
+            const empty_bytes = try source.systemCatalog(a, .{}, .{ .resolve_many = .{ .sql_sources = &.{.{ .view_id = prior.value.id }} } });
+            const empty_snapshot = try std.json.parseFromSliceLeaky(local.system_catalog_domain.ResolvedMany, a, empty_bytes, .{});
+            const empty_record = try @import("../system_catalog/views.zig").Record.decode(a, empty_snapshot.sql_sources[0].?.value.view.source_json);
+            try std.testing.expect(!empty_record.value.materialization.?.populated);
+            try std.testing.expectEqual(prior.value.generation, empty_record.value.generation);
+            try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, prior.value.attributes, .{}), try std.json.Stringify.valueAlloc(a, empty_record.value.attributes, .{}));
+            try std.testing.expect(empty_record.value.materialization.?.table_id != replacement.value.materialization.?.table_id);
+            const empty_plan_bytes = (try source.getRestoreStaging(a, try stages.idForAttempt(empty_job, 1), .{})).?;
+            const empty_plan = try std.json.parseFromSliceLeaky(stages.Job, a, empty_plan_bytes, .{});
+            inputs.records[1] = empty_plan.plan.targets[0].table;
+            const empty_slot = try fixture.tableIndex(inputs.records[1].name);
+            inputs.reads[1] = @import("antfly_source_root").antfly_sources.table_reads.BoundTableReadSource.init(inputs.records[1].name, inputs.records[1].table_id, fixture.dbs[empty_slot], read_gate.alreadyReadSafeBarrier());
+            var empty_context: @import("httpx").Context = .init(alloc, std.testing.io, &read_request);
+            defer empty_context.deinit();
+            var empty_read = try handler.executeSQL(&empty_context);
+            defer empty_read.deinit();
+            try std.testing.expectEqual(@as(u16, 400), empty_read.status.code);
+            const diagnostic = try std.json.parseFromSliceLeaky(std.json.Value, a, empty_read.body.?, .{});
+            try std.testing.expectEqualStrings("55000", diagnostic.object.get("code").?.string);
+        }
+
+        // Execute the unchanged DROP originals (0358/0359), retaining the
+        // native reader above across metadata retirement to exercise its lease.
+        const drop_id = if (std.mem.eql(u8, case_id, "sql-0352")) "sql-0359" else "sql-0358";
+        const drop_sql = for (inventory.entries) |entry| {
+            if (std.mem.eql(u8, entry.id, drop_id)) break entry.sql;
+        } else return error.MissingOriginalCase;
+        const drop_reference = for (oracle.entries) |entry| {
+            if (std.mem.eql(u8, entry.id, drop_id)) break entry;
+        } else return error.MissingPopulationReference;
+        try std.testing.expectEqualStrings(drop_reference.sql, drop_sql);
+        var drop_request = try Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer drop_request.deinit();
+        drop_request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = drop_sql }, .{});
+        var drop_context: @import("httpx").Context = .init(alloc, std.testing.io, &drop_request);
+        defer drop_context.deinit();
+        var dropped = try handler.executeSQL(&drop_context);
+        defer dropped.deinit();
+        if (dropped.status.code != 200) std.debug.print("materialized drop {s}: {s}\n", .{ drop_id, dropped.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 200), dropped.status.code);
+        const drop_value = try std.json.parseFromSliceLeaky(std.json.Value, a, dropped.body.?, .{});
+        try std.testing.expectEqualStrings(drop_reference.command_tag, drop_value.object.get("command_tag").?.string);
+        var snapshot = (try source.adminSnapshot()).?;
+        defer source.freeAdminSnapshot(&snapshot);
+        for (snapshot.tables) |table| try std.testing.expect(table.table_id != inputs.records[1].table_id);
+        for (snapshot.ranges) |range| try std.testing.expect(range.table_id != inputs.records[1].table_id);
+        const missing_bytes = try source.systemCatalog(a, .{}, .{ .resolve_many = .{ .sql_sources = &.{.{ .name = .{ .database = "default", .namespace = "public", .table = "usage_records_mv" } }} } });
+        const missing = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").system_catalog_domain.ResolvedMany, a, missing_bytes, .{});
+        try std.testing.expect(missing.sql_sources[0] == null);
+    }
+}
+
+fn completePopulationPublic(comptime Driver: type, server: *http.ApiHttpServer, handler: *@import("httpx_handler.zig").AntflyApiHandler, arena: std.mem.Allocator, statement: []const u8) !u64 {
+    const a = std.testing.allocator;
+    var request = try @import("httpx").Request.init(a, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = try std.json.Stringify.valueAlloc(arena, .{ .statement = statement }, .{});
+    var context: @import("httpx").Context = .init(a, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.executeSQL(&context);
+    defer response.deinit();
+    if (response.status.code != 200 and response.status.code != 202) std.debug.print("population lifecycle failure {s}\n", .{response.body orelse ""});
+    try std.testing.expect(response.status.code == 200 or response.status.code == 202);
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, response.body.?, .{});
+    const job = try std.fmt.parseInt(u64, value.object.get("ddl_receipt").?.object.get("restore_job_id").?.string, 10);
+    for (0..600) |_| {
+        try Driver.work(server, job);
+        const encoded = (try server.restore_job_store.load(arena, job)).?;
+        const state = try std.json.parseFromSliceLeaky(restore_jobs.JobState, arena, encoded, .{});
+        if (restore_jobs.isTerminal(state.phase)) {
+            if (state.phase != .succeeded) std.debug.print("population lifecycle job failure {s}\n", .{encoded});
+            try std.testing.expectEqual(restore_jobs.Phase.succeeded, state.phase);
+            return job;
+        }
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.PopulationWorkerDidNotComplete;
 }

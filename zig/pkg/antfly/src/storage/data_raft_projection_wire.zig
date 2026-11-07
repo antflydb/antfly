@@ -19,6 +19,10 @@
 
 const std = @import("std");
 
+/// Hard envelope for single-entry control-lane recovery. Larger families need
+/// their own streaming contract, not an unbounded projection allocation.
+pub const max_committed_entry_bytes: usize = 128 * 1024 * 1024;
+
 pub const TopologyRejection = enum(u8) { busy = 1, scope_changed = 2 };
 
 const magic = "AFRP";

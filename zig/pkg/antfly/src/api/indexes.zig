@@ -83,7 +83,8 @@ pub fn addIndexToTableIndexesJsonWithIo(
 ) ![]u8 {
     try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
     try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, index_json);
-    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name) or
+        !@import("antfly_local_sources").api_index_metadata.isValidIndexName(index_name)) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});

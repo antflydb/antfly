@@ -20,6 +20,11 @@ import {
   type OrdinaryPaths,
 } from "./memory.js";
 import type { components, paths } from "./public-api.js";
+import {
+  sqlCatalogObjectKinds,
+  sqlCatalogOperationKinds,
+  sqlCatalogOperationStates,
+} from "./sql-catalog-contract.generated.js";
 import { parseSSEFrames } from "./sse.js";
 import type {
   AntflyAuth,
@@ -53,6 +58,7 @@ import type {
   GlobalQueryRequest,
   IndexMaintenanceRequest,
   IndexMaintenanceResponse,
+  IndexPublicationStatus,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -90,8 +96,12 @@ import type {
   RetrievalAgentStreamCallbacks,
   RunResearchJobOptions,
   ScanKeysRequest,
+  SchemaValidationStatus,
+  SQLCatalogOperationReceipt,
   SQLConnectionOpenRequest,
   SQLConnectionResponse,
+  SQLNotificationPage,
+  SQLNotificationPollRequest,
   SQLDiagnostic,
   SQLPreparedExecutionRequest,
   SQLPreparedResponse,
@@ -112,10 +122,32 @@ export interface RestoreOptions {
   idempotencyKey?: string;
 }
 
+function validSQLCatalogReceipt(value: unknown): value is SQLCatalogOperationReceipt {
+  if (typeof value !== "object" || value === null) return false;
+  const receipt = value as SQLCatalogOperationReceipt;
+  return (
+    sqlCatalogObjectKinds.includes(receipt.kind) &&
+    sqlCatalogOperationKinds.includes(receipt.operation) &&
+    sqlCatalogOperationStates.includes(receipt.state) &&
+    [receipt.database, receipt.namespace, receipt.name, receipt.recovery_token].every(
+      (field) => typeof field === "string" && field.length > 0
+    ) &&
+    new TextEncoder().encode(receipt.recovery_token).length <= 8192 &&
+    [receipt.object_id, receipt.generation, receipt.catalog_revision].every(
+      (field) =>
+        field === undefined ||
+        (typeof field === "string" &&
+          /^(0|[1-9][0-9]{0,19})$/.test(field) &&
+          BigInt(field) <= 18446744073709551615n)
+    )
+  );
+}
+
 export class SQLExecutionError extends Error {
   constructor(
     public readonly status: number,
-    public readonly diagnostic: SQLDiagnostic
+    public readonly diagnostic: SQLDiagnostic,
+    public readonly catalogReceipt?: SQLCatalogOperationReceipt
   ) {
     super(`SQL execution failed (${diagnostic.code}): ${diagnostic.message}`);
     this.name = "SQLExecutionError";
@@ -186,6 +218,13 @@ export interface RestoreJobPage {
 export interface IndexOperations {
   list(tableName: string): Promise<IndexStatus[]>;
   get(tableName: string, indexName: string): Promise<IndexStatus>;
+  /** Observe a retained exact job without replaying DDL; published is not current query readiness. */
+  publication(
+    tableName: string,
+    indexName: string,
+    token: string,
+    options?: QueryExecutionOptions & { scope?: { database: string; namespace: string } }
+  ): Promise<IndexPublicationStatus>;
   create(tableName: string, indexName: string, config: CreateIndexRequest): Promise<CreatedIndex>;
   drop(tableName: string, indexName: string): Promise<true>;
   /** Resume the identical proof request after a partial/lost acknowledgement; proofs are never refreshed automatically. */
@@ -936,7 +975,7 @@ export class AntflyClient {
     return `${normalizeBaseUrl(this.config.baseUrl)}${path}`;
   }
 
-  private async postBoundedJSON<T>(
+  private async requestBoundedJSON<T>(
     path: string,
     body: unknown,
     options: WriteOptions | undefined,
@@ -1173,7 +1212,7 @@ export class AntflyClient {
     method: "POST" | "DELETE" | "GET" = "POST",
     extraHeaders?: Record<string, string>
   ): Promise<T | undefined> {
-    const { data } = await this.postBoundedJSON<T>(
+    const { data } = await this.requestBoundedJSON<T>(
       path,
       request,
       {
@@ -1191,6 +1230,27 @@ export class AntflyClient {
       true,
       (status, body) => {
         if (typeof body !== "object" || body === null) return undefined;
+        const receipt = (body as SQLResponse).catalog_receipt;
+        if (validSQLCatalogReceipt(receipt)) {
+          const diagnostic = receipt.diagnostic;
+          return new SQLExecutionError(
+            status,
+            {
+              ...(diagnostic &&
+              typeof diagnostic.code === "string" &&
+              diagnostic.code.length === 5 &&
+              typeof diagnostic.message === "string"
+                ? diagnostic
+                : {
+                    code: "40003",
+                    message:
+                      "SQL catalog outcome is unknown; observe the recovery token without replaying DDL",
+                  }),
+              retryable: false,
+            },
+            receipt
+          );
+        }
         const diagnostic = body as SQLDiagnostic;
         if (
           typeof diagnostic.code !== "string" ||
@@ -1226,6 +1286,29 @@ export class AntflyClient {
     return this.sqlResponse(await this.sqlRequest<SQLResponse>("/db/v1/sql", request, options));
   }
 
+  /** Observe a retained catalog outcome. Never resubmit uncertain DDL. */
+  async getSQLCatalogOperation(
+    recoveryToken: string,
+    options?: WriteOptions
+  ): Promise<SQLCatalogOperationReceipt> {
+    if (
+      typeof recoveryToken !== "string" ||
+      !recoveryToken.length ||
+      new TextEncoder().encode(recoveryToken).length > 8192
+    ) {
+      throw new Error("SQL recovery token must contain 1..8192 bytes");
+    }
+    const receipt = await this.sqlRequest<SQLCatalogOperationReceipt>(
+      "/db/v1/sql/operations/status",
+      { recovery_token: recoveryToken },
+      options
+    );
+    if (!validSQLCatalogReceipt(receipt) || receipt.recovery_token !== recoveryToken) {
+      throw new Error("Invalid SQL catalog receipt");
+    }
+    return receipt;
+  }
+
   /** Open a durable, principal-bound SQL connection on this API node. Keep its owner for routing. */
   async openSQLConnection(
     request: SQLConnectionOpenRequest = {},
@@ -1251,6 +1334,62 @@ export class AntflyClient {
     )
       throw new Error("Invalid SQL connection response");
     return data;
+  }
+
+  /** Receive committed LISTEN events. Retain the cursor and acknowledge only consumed pages. */
+  async pollSQLNotifications(
+    connectionId: string,
+    request: SQLNotificationPollRequest = {},
+    options?: WriteOptions
+  ): Promise<SQLNotificationPage> {
+    if (!/^[0-9a-f]{32}$/.test(connectionId))
+      throw new Error("SQL connection ID must be 32 lowercase hexadecimal characters");
+    if (
+      request.acknowledge !== undefined &&
+      (typeof request.acknowledge !== "string" || !/^[0-9a-f]{20}$/.test(request.acknowledge))
+    )
+      throw new Error("Invalid SQL notification acknowledgement cursor");
+    if (
+      request.limit !== undefined &&
+      (!Number.isInteger(request.limit) || request.limit < 1 || request.limit > 128)
+    )
+      throw new Error("SQL notification limit must be between 1 and 128");
+    const page = await this.sqlRequest<SQLNotificationPage>(
+      `/db/v1/sql/connections/${connectionId}/notifications`,
+      request,
+      { ...options, maxResponseBytes: Math.min(options?.maxResponseBytes ?? 1 << 20, 1 << 20) }
+    );
+    const encoder = new TextEncoder();
+    let bytes = 0;
+    if (
+      !page ||
+      !Array.isArray(page.notifications) ||
+      page.notifications.length > (request.limit ?? 128) ||
+      typeof page.pending !== "boolean" ||
+      (page.cursor !== undefined &&
+        (typeof page.cursor !== "string" || !/^[0-9a-f]{20}$/.test(page.cursor))) ||
+      (page.notifications.length > 0 && page.cursor === undefined)
+    )
+      throw new Error("Invalid SQL notification page");
+    for (const event of page.notifications) {
+      if (
+        !event ||
+        typeof event.channel !== "string" ||
+        typeof event.payload !== "string" ||
+        event.channel.includes("\0") ||
+        event.payload.includes("\0") ||
+        !Number.isInteger(event.sender_pid) ||
+        event.sender_pid <= 0 ||
+        event.sender_pid > 2147483647
+      )
+        throw new Error("Invalid SQL notification event");
+      const channelBytes = encoder.encode(event.channel).length;
+      const payloadBytes = encoder.encode(event.payload).length;
+      bytes += channelBytes + payloadBytes;
+      if (channelBytes < 1 || channelBytes > 63 || payloadBytes > 7999 || bytes > 65536)
+        throw new Error("SQL notification page exceeds delivery bounds");
+    }
+    return page;
   }
 
   /** Close an idle SQL connection on its owner. Unknown mutation outcomes are never replayed. */
@@ -2069,7 +2208,7 @@ export class AntflyClient {
     request: MultiBatchRequest,
     options?: WriteOptions
   ): Promise<MultiBatchResult> {
-    const { data } = await this.postBoundedJSON<MultiBatchResult>(
+    const { data } = await this.requestBoundedJSON<MultiBatchResult>(
       "/db/v1/batch",
       request,
       options,
@@ -2094,7 +2233,7 @@ export class AntflyClient {
     request: LinearMergeRequest,
     options?: WriteOptions
   ): Promise<LinearMergeResult> {
-    const { data } = await this.postBoundedJSON<LinearMergeResult>(
+    const { data } = await this.requestBoundedJSON<LinearMergeResult>(
       `/db/v1/tables/${encodeURIComponent(tableName)}/merge`,
       request,
       options,
@@ -2109,6 +2248,51 @@ export class AntflyClient {
    * Table operations
    */
   tables = {
+    /** Observe an exact schema job without replaying DDL, including after a restart. */
+    schemaPublication: async (
+      tableName: string,
+      token: string,
+      options?: QueryExecutionOptions & { scope?: { database: string; namespace: string } }
+    ): Promise<SchemaValidationStatus> => {
+      if (token.length !== 182 || !/^[A-Za-z0-9_-]{182}$/.test(token))
+        throw new Error("Invalid schema validation token");
+      let prefix = "/db/v1";
+      if (options?.scope) {
+        prefix += `/databases/${encodeURIComponent(options.scope.database)}/namespaces/${encodeURIComponent(options.scope.namespace)}`;
+      }
+      const { data, status } = await this.requestBoundedJSON<SchemaValidationStatus>(
+        `${prefix}/tables/${encodeURIComponent(tableName)}/schema/publication`,
+        undefined,
+        { signal: options?.signal, maxResponseBytes: 16 * 1024 },
+        "Failed to observe schema validation",
+        "Encoding schema validation",
+        false,
+        undefined,
+        undefined,
+        "GET",
+        undefined,
+        { "X-Antfly-Schema-Validation-Token": token }
+      );
+      if (
+        status !== 200 ||
+        !data ||
+        data.schema_validation_token !== token ||
+        !["admission_unknown", "pending", "succeeded", "failed", "canceled"].includes(data.state) ||
+        !Number.isInteger(data.active_schema_version) ||
+        data.active_schema_version < 0 ||
+        data.active_schema_version > 0xffffffff ||
+        (data.state === "succeeded" &&
+          (data.phase !== "succeeded" ||
+            !Number.isInteger(data.owner_count) ||
+            (data.owner_count ?? 0) < 1 ||
+            (data.owner_count ?? 0) > 4096 ||
+            data.owner_count !== data.ready ||
+            data.owner_count !== data.installed ||
+            data.owner_count !== data.released))
+      )
+        throw new Error("Schema validation response identity or completion mismatch");
+      return data;
+    },
     /**
      * List all tables
      */
@@ -2259,7 +2443,7 @@ export class AntflyClient {
       request: BatchRequest,
       options?: WriteOptions
     ): Promise<BatchResult> => {
-      const { data } = await this.postBoundedJSON<BatchResult>(
+      const { data } = await this.requestBoundedJSON<BatchResult>(
         `/db/v1/tables/${encodeURIComponent(tableName)}/batch`,
         request,
         options,
@@ -2309,7 +2493,7 @@ export class AntflyClient {
         request: RelationalRowMutationRequest,
         options?: WriteOptions
       ): Promise<BatchResult> => {
-        const { data } = await this.postBoundedJSON<BatchResult>(
+        const { data } = await this.requestBoundedJSON<BatchResult>(
           `/db/v1/tables/${encodeURIComponent(tableName)}/rows/mutate`,
           request,
           options,
@@ -2329,7 +2513,7 @@ export class AntflyClient {
         request: RelationalConstraintRetirementRequest,
         options?: WriteOptions
       ): Promise<RelationalConstraintRetryResponse> => {
-        const { data: result } = await this.postBoundedJSON<RelationalConstraintRetryResponse>(
+        const { data: result } = await this.requestBoundedJSON<RelationalConstraintRetryResponse>(
           `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/retire`,
           request,
           options,
@@ -2347,7 +2531,7 @@ export class AntflyClient {
         request: RelationalRowMutationRequest,
         options?: WriteOptions
       ): Promise<BatchResult> => {
-        const { data: result } = await this.postBoundedJSON<BatchResult>(
+        const { data: result } = await this.requestBoundedJSON<BatchResult>(
           `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/repair`,
           request,
           options,
@@ -2364,7 +2548,7 @@ export class AntflyClient {
         request: RelationalConstraintRetryRequest,
         options?: WriteOptions
       ): Promise<RelationalConstraintRetryResponse> => {
-        const { data: result } = await this.postBoundedJSON<RelationalConstraintRetryResponse>(
+        const { data: result } = await this.requestBoundedJSON<RelationalConstraintRetryResponse>(
           `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/retry`,
           request,
           options,
@@ -2850,7 +3034,7 @@ export class AntflyClient {
     // Keep the submitted proof and its acknowledgement expectation stable even
     // when the caller reuses/mutates their request while awaiting this operation.
     const body = { ...request, owners: request.owners.map((owner) => ({ ...owner })) };
-    const { data, status } = await this.postBoundedJSON<IndexMaintenanceResponse>(
+    const { data, status } = await this.requestBoundedJSON<IndexMaintenanceResponse>(
       `/db/v1/tables/${encodeURIComponent(tableName)}/indexes/${encodeURIComponent(indexName)}/${action}`,
       body,
       { signal: options?.signal, maxRequestBytes: 128 * 1024, maxResponseBytes: 32 * 1024 },
@@ -3723,6 +3907,39 @@ export class AntflyClient {
   };
 
   indexes: IndexOperations = {
+    publication: async (tableName, indexName, token, options) => {
+      if (token.length !== 171 || !/^[A-Za-z0-9_-]{171}$/.test(token))
+        throw new Error("Invalid index publication token");
+      let prefix = "/db/v1";
+      if (options?.scope) {
+        prefix += `/databases/${encodeURIComponent(options.scope.database)}/namespaces/${encodeURIComponent(options.scope.namespace)}`;
+      }
+      const { data, status } = await this.requestBoundedJSON<IndexPublicationStatus>(
+        `${prefix}/tables/${encodeURIComponent(tableName)}/indexes/${encodeURIComponent(indexName)}/publication`,
+        undefined,
+        { signal: options?.signal, maxResponseBytes: 16 * 1024 },
+        "Failed to observe index publication",
+        "Encoding index publication",
+        false,
+        undefined,
+        undefined,
+        "GET",
+        undefined,
+        { "X-Antfly-Index-Publication-Token": token }
+      );
+      if (
+        status !== 200 ||
+        !data ||
+        data.publication_token !== token ||
+        data.index_name !== indexName ||
+        data.index_type !== "relational" ||
+        typeof data.replication_pending !== "boolean" ||
+        !["admission_unknown", "pending", "published", "failed", "canceled"].includes(data.state) ||
+        (data.replication_pending && data.state !== "admission_unknown")
+      )
+        throw new Error("Index publication response identity or confirmation mismatch");
+      return data;
+    },
     retry: (tableName, indexName, request, options) =>
       this.maintainIndex("retry", tableName, indexName, request, options),
     repair: (tableName, indexName, request, options) =>

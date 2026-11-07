@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 86;
+pub const abi_version: u32 = 92;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -805,6 +805,141 @@ pub const Status = enum(u32) {
     ambiguous_gcs_connection = 846,
     invalid_connection_credentials = 847,
     raft_apply_writer_unavailable = 848,
+    catalog_occupancy_not_ready = 984,
+    immutable_relational_index_definition_conflict = 849,
+    invalid_index_publication_candidate = 850,
+    invalid_private_index_cancellation = 851,
+    invalid_private_index_claim_inventory = 852,
+    invalid_private_index_claim_receipt = 853,
+    invalid_private_index_inputs = 854,
+    invalid_private_index_native_receipt = 855,
+    invalid_private_index_owner_job = 856,
+    invalid_relational_index_progress = 857,
+    missing_relational_index_definitions = 858,
+    private_index_cancellation_pending = 859,
+    private_index_cancellation_required = 860,
+    private_index_job_required = 861,
+    private_index_owner_job_changed = 862,
+    private_index_publication_canceled = 863,
+    private_index_publication_required = 864,
+    relational_index_catalog_schema_mismatch = 865,
+    sql_invalid_power_argument = 866,
+    invalid_schema_reader_requirements = 867,
+    private_index_root_recovery_required = 868,
+    invalid_relational_index_budget = 869,
+    private_index_claim_backlog_full = 870,
+    unsupported_native_index_owner = 871,
+    invalid_schema_validation_job = 872,
+    schema_validation_job_changed = 873,
+    schema_validation_job_required = 874,
+    schema_validation_runtime_recovery_required = 875,
+    invalid_schema_owner_control = 876,
+    invalid_schema_validation_page_command = 877,
+    invalid_nullability_replay = 878,
+    schema_validation_canceled = 879,
+    schema_validation_not_ready = 880,
+    schema_validation_publication_required = 881,
+    schema_validation_cancellation_required = 882,
+    invalid_ordered_apply_receipt = 883,
+    conflicting_ordered_apply_receipt = 884,
+    index_owner_receipt_changed = 885,
+    invalid_sql_view_record = 886,
+    sql_view_cycle = 887,
+    sql_view_column_rename = 888,
+    sql_view_column_type_changed = 889,
+    sql_view_column_dropped = 890,
+    sql_dependent_objects_exist = 891,
+    sql_program_limit_exceeded = 892,
+    relational_check_violation = 893,
+    foreign_key_match_full_violation = 894,
+    conflicting_data_apply_batch = 895,
+    invalid_data_apply_batch = 896,
+    split_source_projection_not_ready = 897,
+    apply_store_group_retired = 898,
+    apply_store_shutting_down = 899,
+    schema_validation_command_rejected = 900,
+    schema_validation_preparation_changed = 901,
+    corrupt_schema_apply_outcome = 902,
+    invalid_native_backup_origin = 903,
+    native_backup_origin_mismatch = 904,
+    sequence_catalog_state_required = 905,
+    undefined_column = 906,
+    foreign_key_validation_required = 907,
+    temporal_overlap_violation = 908,
+    temporal_empty_range = 909,
+    table_transition_active = 910,
+    invalid_relation_population = 911,
+    relation_population_page_too_large = 912,
+    relation_population_changed = 913,
+    materialized_view_read_only = 914,
+    maintenance_busy = 915,
+    invalid_sql_backend_response = 916,
+    invalid_sql_parameters = 917,
+    unknown_sql_column = 918,
+    duplicate_sql_column = 919,
+    unsupported_sql_execution = 920,
+    invalid_external_decision_owner = 921,
+    external_transaction_decision_required = 922,
+    external_transaction_decision_changed = 923,
+    external_transaction_role_required = 924,
+    external_transaction_commit_not_activated = 925,
+    external_transaction_admission_expired = 926,
+    invalid_prepared_transaction_id = 927,
+    invalid_prepared_transaction_phase = 928,
+    sql_prepared_transaction_already_exists = 929,
+    sql_prepared_transaction_not_found = 930,
+    sql_prepared_transaction_wrong_database = 931,
+    sql_prepared_transaction_capacity_exceeded = 932,
+    invalid_sequence_default_references = 933,
+    invalid_sequence_outcome = 934,
+    invalid_sequence_state = 935,
+    invalid_sequence_definition = 936,
+    sql_index_not_found = 937,
+    sql_constraint_not_found = 938,
+    catalog_generation_exhausted = 939,
+    sql_index_already_exists = 940,
+    sql_constraint_already_exists = 941,
+    invalid_lock_class = 942,
+    invalid_lock_effect = 943,
+    invalid_lock_owner = 944,
+    invalid_lock_record = 945,
+    invalid_lock_resource = 946,
+    invalid_lock_scope = 947,
+    lock_effect_changed = 948,
+    lock_effect_expired = 949,
+    lock_effect_out_of_order = 950,
+    lock_limit_exceeded = 951,
+    lock_owner_busy = 952,
+    lock_owner_changed = 953,
+    lock_owner_not_registered = 954,
+    lock_plan_limit_exceeded = 955,
+    sql_database_in_use = 957,
+    scope_retirement_changed = 958,
+    invalid_scope_retirement = 959,
+    sequence_admission_conflict = 960,
+    invalid_table_retirement_manifest = 961,
+    extension_owned_object = 962,
+    invalid_sql_trigger_definition = 963,
+    invalid_sql_trigger_manifest = 964,
+    sql_trigger_context_required = 965,
+    sql_trigger_returned_no_value = 966,
+    sql_trigger_return_value_required = 967,
+    sql_trigger_declared_arguments = 968,
+    sql_trigger_sql_language = 969,
+    invalid_sql_relation_persistence = 970,
+    sql_relation_owner_changed = 971,
+    sql_temporary_relation_not_owned = 972,
+    invalid_sql_temporary_namespace = 973,
+    sql_relation_persistence_foreign_key_mismatch = 974,
+    sql_relation_recovery_incomplete = 975,
+    sql_relation_owner_unavailable = 976,
+    sql_trigger_coordination_required = 977,
+    sql_prepared_durability_unavailable = 978,
+    invalid_prepared_graph_effects = 979,
+    // 980-982 remain reserved for the separate generation transaction profile.
+    commit_decision_unknown = 983,
+    // 984 is reserved for the merged main catalog-occupancy identity.
+    invalid_participant = 985,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -844,13 +979,31 @@ pub const FailureIdentity = extern struct {
     }
 };
 
+test "concurrent main and SQL statuses retain distinct wire identities" {
+    const std_test = @import("std");
+    try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
+    try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.document_artifact_publication_failed));
+    try std_test.testing.expectEqual(@as(u32, 834), @backingInt(Status.grouped_source_owner_changed));
+    // Main owns 838-848; SQL catalog occupancy appends after existing IDs.
+    try std_test.testing.expectEqual(@as(u32, 838), @backingInt(Status.unsupported_exact_sort));
+    try std_test.testing.expectEqual(@as(u32, 839), @backingInt(Status.invalid_document_checkpoint));
+    try std_test.testing.expectEqual(@as(u32, 840), @backingInt(Status.too_many_active_jobs));
+    try std_test.testing.expectEqual(@as(u32, 984), @backingInt(Status.catalog_occupancy_not_ready));
+}
+
+test "released native value search Status identifiers retain their numeric values" {
+    const testing = @import("std").testing;
+    try testing.expectEqual(@as(u32, 835), @backingInt(Status.value_verification_requires_scan));
+    try testing.expectEqual(@as(u32, 836), @backingInt(Status.value_verification_limit_exceeded));
+}
+
 test "released main Status identifiers retain their exact names and numeric values" {
     @setEvalBranchQuota(10_000);
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Status).@"enum".field_names, @typeInfo(Status).@"enum".field_values) |reflected_name, field_value| {
-        if (field_value <= 532) {
+        if (field_value <= 837) {
             for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
@@ -858,6 +1011,6 @@ test "released main Status identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 464), count);
-    try std_test.testing.expectEqual(@as(u64, 0x6c3bb5270c6956ea), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 768), count);
+    try std_test.testing.expectEqual(@as(u64, 0x3d720d41936e164f), fingerprint);
 }

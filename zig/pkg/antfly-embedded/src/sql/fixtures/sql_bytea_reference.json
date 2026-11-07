@@ -1,0 +1,6573 @@
+{
+  "read": {
+    "format": 2,
+    "reference": "PostgreSQL exact SQL",
+    "profile": {
+      "schema": {
+        "version": 1,
+        "storage_mode": "relational",
+        "default_type": "row",
+        "document_schemas": {
+          "row": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "keyword"
+                }
+              },
+              "required": [
+                "id"
+              ]
+            }
+          }
+        }
+      },
+      "rows": [
+        {
+          "key": "0",
+          "value": {
+            "id": "0"
+          }
+        },
+        {
+          "key": "1",
+          "value": {
+            "id": "1"
+          }
+        },
+        {
+          "key": "2",
+          "value": {
+            "id": "2"
+          }
+        },
+        {
+          "key": "3",
+          "value": {
+            "id": "3"
+          }
+        },
+        {
+          "key": "4",
+          "value": {
+            "id": "4"
+          }
+        },
+        {
+          "key": "5",
+          "value": {
+            "id": "5"
+          }
+        },
+        {
+          "key": "6",
+          "value": {
+            "id": "6"
+          }
+        }
+      ]
+    },
+    "entries": [
+      {
+        "id": "sql-0274",
+        "columns": [
+          "id",
+          "decoded"
+        ],
+        "rows": [
+          [
+            "0",
+            {
+              "source": "decoded"
+            }
+          ],
+          [
+            "1",
+            {
+              "source": "decoded"
+            }
+          ],
+          [
+            "2",
+            {
+              "source": "decoded"
+            }
+          ],
+          [
+            "3",
+            {
+              "source": "decoded"
+            }
+          ],
+          [
+            "4",
+            {
+              "source": "decoded"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "affected": 0
+      }
+    ],
+    "excluded": []
+  },
+  "scalars": [
+    {
+      "sql": "convert_from(convert_to('café','UTF8'),'UTF8')",
+      "value": "café",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "to_jsonb(convert_to('café','UTF8'))",
+      "value": "\\x636166c3a9",
+      "oid": 3802,
+      "sqlstate": null
+    },
+    {
+      "sql": "jsonb_build_object('raw',convert_to('café','UTF8'))",
+      "value": {
+        "raw": "\\x636166c3a9"
+      },
+      "oid": 3802,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x636166e9'::bytea,'LATIN1')",
+      "value": "café",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x80e9'::bytea,'LATIN1')",
+      "value": "é",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x80e9'::bytea,'WIN1252')",
+      "value": "€é",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to('€é','WIN1252')",
+      "value": "\\x80e9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xefbbbf6869'::bytea,'UTF8')",
+      "value": "﻿hi",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from(NULL::bytea,'UTF8')",
+      "value": null,
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('foo'::bytea,NULL)",
+      "value": null,
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(NULL::text,'UTF8')",
+      "value": null,
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x'::bytea,'UTF-8')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xff'::bytea,'UTF8')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22021"
+    },
+    {
+      "sql": "convert_from('\\x00'::bytea,'UTF8')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22021"
+    },
+    {
+      "sql": "convert_from('\\xc080'::bytea,'UTF8')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22021"
+    },
+    {
+      "sql": "convert_from('\\xeda080'::bytea,'UTF8')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22021"
+    },
+    {
+      "sql": "convert_from('\\x81'::bytea,'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_to('😀','LATIN1')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_from('','no_such_encoding')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "sql": "convert_from('x'::text,'UTF8')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "42883"
+    },
+    {
+      "sql": "'\\x0'::bytea",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "sql": "'\\x0 0'::bytea",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "sql": "'\\400'::bytea",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P02"
+    },
+    {
+      "sql": "'\\x00 7f\t80ff'::bytea",
+      "value": "\\x007f80ff",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x00'::bytea,'LATIN1')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22021"
+    },
+    {
+      "sql": "convert_to(convert_from('\\x00'::bytea,'LATIN1'),'LATIN1')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22021"
+    },
+    {
+      "sql": "convert_from('\\x01'::bytea,'LATIN1')",
+      "value": "\u0001",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x01'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x01",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x02'::bytea,'LATIN1')",
+      "value": "\u0002",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x02'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x02",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x03'::bytea,'LATIN1')",
+      "value": "\u0003",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x03'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x03",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x04'::bytea,'LATIN1')",
+      "value": "\u0004",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x04'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x04",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x05'::bytea,'LATIN1')",
+      "value": "\u0005",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x05'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x05",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x06'::bytea,'LATIN1')",
+      "value": "\u0006",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x06'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x06",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x07'::bytea,'LATIN1')",
+      "value": "\u0007",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x07'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x07",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x08'::bytea,'LATIN1')",
+      "value": "\b",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x08'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x08",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x09'::bytea,'LATIN1')",
+      "value": "\t",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x09'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x09",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0a'::bytea,'LATIN1')",
+      "value": "\n",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x0a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0b'::bytea,'LATIN1')",
+      "value": "\u000b",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x0b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0c'::bytea,'LATIN1')",
+      "value": "\f",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x0c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0d'::bytea,'LATIN1')",
+      "value": "\r",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x0d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0e'::bytea,'LATIN1')",
+      "value": "\u000e",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x0e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0f'::bytea,'LATIN1')",
+      "value": "\u000f",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x0f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x10'::bytea,'LATIN1')",
+      "value": "\u0010",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x10'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x10",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x11'::bytea,'LATIN1')",
+      "value": "\u0011",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x11'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x11",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x12'::bytea,'LATIN1')",
+      "value": "\u0012",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x12'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x12",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x13'::bytea,'LATIN1')",
+      "value": "\u0013",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x13'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x13",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x14'::bytea,'LATIN1')",
+      "value": "\u0014",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x14'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x14",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x15'::bytea,'LATIN1')",
+      "value": "\u0015",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x15'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x15",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x16'::bytea,'LATIN1')",
+      "value": "\u0016",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x16'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x16",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x17'::bytea,'LATIN1')",
+      "value": "\u0017",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x17'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x17",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x18'::bytea,'LATIN1')",
+      "value": "\u0018",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x18'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x18",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x19'::bytea,'LATIN1')",
+      "value": "\u0019",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x19'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x19",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1a'::bytea,'LATIN1')",
+      "value": "\u001a",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x1a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1b'::bytea,'LATIN1')",
+      "value": "\u001b",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x1b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1c'::bytea,'LATIN1')",
+      "value": "\u001c",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x1c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1d'::bytea,'LATIN1')",
+      "value": "\u001d",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x1d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1e'::bytea,'LATIN1')",
+      "value": "\u001e",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x1e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1f'::bytea,'LATIN1')",
+      "value": "\u001f",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x1f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x20'::bytea,'LATIN1')",
+      "value": " ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x20'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x20",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x21'::bytea,'LATIN1')",
+      "value": "!",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x21'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x21",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x22'::bytea,'LATIN1')",
+      "value": "\"",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x22'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x22",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x23'::bytea,'LATIN1')",
+      "value": "#",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x23'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x23",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x24'::bytea,'LATIN1')",
+      "value": "$",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x24'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x24",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x25'::bytea,'LATIN1')",
+      "value": "%",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x25'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x25",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x26'::bytea,'LATIN1')",
+      "value": "&",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x26'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x26",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x27'::bytea,'LATIN1')",
+      "value": "'",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x27'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x27",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x28'::bytea,'LATIN1')",
+      "value": "(",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x28'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x28",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x29'::bytea,'LATIN1')",
+      "value": ")",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x29'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x29",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2a'::bytea,'LATIN1')",
+      "value": "*",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x2a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2b'::bytea,'LATIN1')",
+      "value": "+",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x2b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2c'::bytea,'LATIN1')",
+      "value": ",",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x2c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2d'::bytea,'LATIN1')",
+      "value": "-",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x2d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2e'::bytea,'LATIN1')",
+      "value": ".",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x2e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2f'::bytea,'LATIN1')",
+      "value": "/",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x2f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x30'::bytea,'LATIN1')",
+      "value": "0",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x30'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x30",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x31'::bytea,'LATIN1')",
+      "value": "1",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x31'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x31",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x32'::bytea,'LATIN1')",
+      "value": "2",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x32'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x32",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x33'::bytea,'LATIN1')",
+      "value": "3",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x33'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x33",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x34'::bytea,'LATIN1')",
+      "value": "4",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x34'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x34",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x35'::bytea,'LATIN1')",
+      "value": "5",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x35'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x35",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x36'::bytea,'LATIN1')",
+      "value": "6",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x36'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x36",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x37'::bytea,'LATIN1')",
+      "value": "7",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x37'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x37",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x38'::bytea,'LATIN1')",
+      "value": "8",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x38'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x38",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x39'::bytea,'LATIN1')",
+      "value": "9",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x39'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x39",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3a'::bytea,'LATIN1')",
+      "value": ":",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x3a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3b'::bytea,'LATIN1')",
+      "value": ";",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x3b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3c'::bytea,'LATIN1')",
+      "value": "<",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x3c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3d'::bytea,'LATIN1')",
+      "value": "=",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x3d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3e'::bytea,'LATIN1')",
+      "value": ">",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x3e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3f'::bytea,'LATIN1')",
+      "value": "?",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x3f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x40'::bytea,'LATIN1')",
+      "value": "@",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x40'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x40",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x41'::bytea,'LATIN1')",
+      "value": "A",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x41'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x41",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x42'::bytea,'LATIN1')",
+      "value": "B",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x42'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x42",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x43'::bytea,'LATIN1')",
+      "value": "C",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x43'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x43",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x44'::bytea,'LATIN1')",
+      "value": "D",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x44'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x44",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x45'::bytea,'LATIN1')",
+      "value": "E",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x45'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x45",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x46'::bytea,'LATIN1')",
+      "value": "F",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x46'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x46",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x47'::bytea,'LATIN1')",
+      "value": "G",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x47'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x47",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x48'::bytea,'LATIN1')",
+      "value": "H",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x48'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x48",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x49'::bytea,'LATIN1')",
+      "value": "I",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x49'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x49",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4a'::bytea,'LATIN1')",
+      "value": "J",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x4a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4b'::bytea,'LATIN1')",
+      "value": "K",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x4b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4c'::bytea,'LATIN1')",
+      "value": "L",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x4c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4d'::bytea,'LATIN1')",
+      "value": "M",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x4d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4e'::bytea,'LATIN1')",
+      "value": "N",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x4e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4f'::bytea,'LATIN1')",
+      "value": "O",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x4f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x50'::bytea,'LATIN1')",
+      "value": "P",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x50'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x50",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x51'::bytea,'LATIN1')",
+      "value": "Q",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x51'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x51",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x52'::bytea,'LATIN1')",
+      "value": "R",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x52'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x52",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x53'::bytea,'LATIN1')",
+      "value": "S",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x53'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x53",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x54'::bytea,'LATIN1')",
+      "value": "T",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x54'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x54",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x55'::bytea,'LATIN1')",
+      "value": "U",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x55'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x55",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x56'::bytea,'LATIN1')",
+      "value": "V",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x56'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x56",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x57'::bytea,'LATIN1')",
+      "value": "W",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x57'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x57",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x58'::bytea,'LATIN1')",
+      "value": "X",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x58'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x58",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x59'::bytea,'LATIN1')",
+      "value": "Y",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x59'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x59",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5a'::bytea,'LATIN1')",
+      "value": "Z",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x5a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5b'::bytea,'LATIN1')",
+      "value": "[",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x5b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5c'::bytea,'LATIN1')",
+      "value": "\\",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x5c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5d'::bytea,'LATIN1')",
+      "value": "]",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x5d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5e'::bytea,'LATIN1')",
+      "value": "^",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x5e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5f'::bytea,'LATIN1')",
+      "value": "_",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x5f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x60'::bytea,'LATIN1')",
+      "value": "`",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x60'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x60",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x61'::bytea,'LATIN1')",
+      "value": "a",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x61'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x61",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x62'::bytea,'LATIN1')",
+      "value": "b",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x62'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x62",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x63'::bytea,'LATIN1')",
+      "value": "c",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x63'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x63",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x64'::bytea,'LATIN1')",
+      "value": "d",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x64'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x64",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x65'::bytea,'LATIN1')",
+      "value": "e",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x65'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x65",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x66'::bytea,'LATIN1')",
+      "value": "f",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x66'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x66",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x67'::bytea,'LATIN1')",
+      "value": "g",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x67'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x67",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x68'::bytea,'LATIN1')",
+      "value": "h",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x68'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x68",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x69'::bytea,'LATIN1')",
+      "value": "i",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x69'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x69",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6a'::bytea,'LATIN1')",
+      "value": "j",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x6a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6b'::bytea,'LATIN1')",
+      "value": "k",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x6b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6c'::bytea,'LATIN1')",
+      "value": "l",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x6c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6d'::bytea,'LATIN1')",
+      "value": "m",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x6d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6e'::bytea,'LATIN1')",
+      "value": "n",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x6e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6f'::bytea,'LATIN1')",
+      "value": "o",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x6f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x70'::bytea,'LATIN1')",
+      "value": "p",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x70'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x70",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x71'::bytea,'LATIN1')",
+      "value": "q",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x71'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x71",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x72'::bytea,'LATIN1')",
+      "value": "r",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x72'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x72",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x73'::bytea,'LATIN1')",
+      "value": "s",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x73'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x73",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x74'::bytea,'LATIN1')",
+      "value": "t",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x74'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x74",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x75'::bytea,'LATIN1')",
+      "value": "u",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x75'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x75",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x76'::bytea,'LATIN1')",
+      "value": "v",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x76'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x76",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x77'::bytea,'LATIN1')",
+      "value": "w",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x77'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x77",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x78'::bytea,'LATIN1')",
+      "value": "x",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x78'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x78",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x79'::bytea,'LATIN1')",
+      "value": "y",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x79'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x79",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7a'::bytea,'LATIN1')",
+      "value": "z",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x7a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7b'::bytea,'LATIN1')",
+      "value": "{",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x7b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7c'::bytea,'LATIN1')",
+      "value": "|",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x7c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7d'::bytea,'LATIN1')",
+      "value": "}",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x7d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7e'::bytea,'LATIN1')",
+      "value": "~",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x7e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7f'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x7f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x80'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x80'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x80",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x81'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x81'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x81",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x82'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x82'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x82",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x83'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x83'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x83",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x84'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x84'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x84",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x85'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x85'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x85",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x86'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x86'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x86",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x87'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x87'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x87",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x88'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x88'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x88",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x89'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x89'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x89",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8a'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x8a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8b'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x8b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8c'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x8c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8d'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x8d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8e'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x8e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8f'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x8f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x90'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x90'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x90",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x91'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x91'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x91",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x92'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x92'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x92",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x93'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x93'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x93",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x94'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x94'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x94",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x95'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x95'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x95",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x96'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x96'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x96",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x97'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x97'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x97",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x98'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x98'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x98",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x99'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x99'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x99",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9a'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9a'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x9a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9b'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9b'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x9b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9c'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9c'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x9c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9d'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9d'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x9d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9e'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9e'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x9e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9f'::bytea,'LATIN1')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9f'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\x9f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa0'::bytea,'LATIN1')",
+      "value": " ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa0'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa1'::bytea,'LATIN1')",
+      "value": "¡",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa1'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa2'::bytea,'LATIN1')",
+      "value": "¢",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa2'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa3'::bytea,'LATIN1')",
+      "value": "£",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa3'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa4'::bytea,'LATIN1')",
+      "value": "¤",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa4'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa5'::bytea,'LATIN1')",
+      "value": "¥",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa5'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa6'::bytea,'LATIN1')",
+      "value": "¦",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa6'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa7'::bytea,'LATIN1')",
+      "value": "§",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa7'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa8'::bytea,'LATIN1')",
+      "value": "¨",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa8'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa9'::bytea,'LATIN1')",
+      "value": "©",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa9'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xa9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xaa'::bytea,'LATIN1')",
+      "value": "ª",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xaa'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xaa",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xab'::bytea,'LATIN1')",
+      "value": "«",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xab'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xab",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xac'::bytea,'LATIN1')",
+      "value": "¬",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xac'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xac",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xad'::bytea,'LATIN1')",
+      "value": "­",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xad'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xad",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xae'::bytea,'LATIN1')",
+      "value": "®",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xae'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xae",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xaf'::bytea,'LATIN1')",
+      "value": "¯",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xaf'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xaf",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb0'::bytea,'LATIN1')",
+      "value": "°",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb0'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb1'::bytea,'LATIN1')",
+      "value": "±",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb1'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb2'::bytea,'LATIN1')",
+      "value": "²",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb2'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb3'::bytea,'LATIN1')",
+      "value": "³",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb3'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb4'::bytea,'LATIN1')",
+      "value": "´",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb4'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb5'::bytea,'LATIN1')",
+      "value": "µ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb5'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb6'::bytea,'LATIN1')",
+      "value": "¶",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb6'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb7'::bytea,'LATIN1')",
+      "value": "·",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb7'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb8'::bytea,'LATIN1')",
+      "value": "¸",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb8'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb9'::bytea,'LATIN1')",
+      "value": "¹",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb9'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xb9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xba'::bytea,'LATIN1')",
+      "value": "º",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xba'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xba",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbb'::bytea,'LATIN1')",
+      "value": "»",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbb'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xbb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbc'::bytea,'LATIN1')",
+      "value": "¼",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbc'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xbc",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbd'::bytea,'LATIN1')",
+      "value": "½",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbd'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xbd",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbe'::bytea,'LATIN1')",
+      "value": "¾",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbe'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xbe",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbf'::bytea,'LATIN1')",
+      "value": "¿",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbf'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xbf",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc0'::bytea,'LATIN1')",
+      "value": "À",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc0'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc1'::bytea,'LATIN1')",
+      "value": "Á",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc1'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc2'::bytea,'LATIN1')",
+      "value": "Â",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc2'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc3'::bytea,'LATIN1')",
+      "value": "Ã",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc3'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc4'::bytea,'LATIN1')",
+      "value": "Ä",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc4'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc5'::bytea,'LATIN1')",
+      "value": "Å",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc5'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc6'::bytea,'LATIN1')",
+      "value": "Æ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc6'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc7'::bytea,'LATIN1')",
+      "value": "Ç",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc7'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc8'::bytea,'LATIN1')",
+      "value": "È",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc8'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc9'::bytea,'LATIN1')",
+      "value": "É",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc9'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xc9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xca'::bytea,'LATIN1')",
+      "value": "Ê",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xca'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xca",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xcb'::bytea,'LATIN1')",
+      "value": "Ë",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xcb'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xcb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xcc'::bytea,'LATIN1')",
+      "value": "Ì",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xcc'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xcc",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xcd'::bytea,'LATIN1')",
+      "value": "Í",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xcd'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xcd",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xce'::bytea,'LATIN1')",
+      "value": "Î",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xce'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xce",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xcf'::bytea,'LATIN1')",
+      "value": "Ï",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xcf'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xcf",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd0'::bytea,'LATIN1')",
+      "value": "Ð",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd0'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd1'::bytea,'LATIN1')",
+      "value": "Ñ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd1'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd2'::bytea,'LATIN1')",
+      "value": "Ò",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd2'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd3'::bytea,'LATIN1')",
+      "value": "Ó",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd3'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd4'::bytea,'LATIN1')",
+      "value": "Ô",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd4'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd5'::bytea,'LATIN1')",
+      "value": "Õ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd5'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd6'::bytea,'LATIN1')",
+      "value": "Ö",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd6'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd7'::bytea,'LATIN1')",
+      "value": "×",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd7'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd8'::bytea,'LATIN1')",
+      "value": "Ø",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd8'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd9'::bytea,'LATIN1')",
+      "value": "Ù",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd9'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xd9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xda'::bytea,'LATIN1')",
+      "value": "Ú",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xda'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xda",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdb'::bytea,'LATIN1')",
+      "value": "Û",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xdb'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xdb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdc'::bytea,'LATIN1')",
+      "value": "Ü",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xdc'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xdc",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdd'::bytea,'LATIN1')",
+      "value": "Ý",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xdd'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xdd",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xde'::bytea,'LATIN1')",
+      "value": "Þ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xde'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xde",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdf'::bytea,'LATIN1')",
+      "value": "ß",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xdf'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xdf",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe0'::bytea,'LATIN1')",
+      "value": "à",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe0'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe1'::bytea,'LATIN1')",
+      "value": "á",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe1'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe2'::bytea,'LATIN1')",
+      "value": "â",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe2'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe3'::bytea,'LATIN1')",
+      "value": "ã",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe3'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe4'::bytea,'LATIN1')",
+      "value": "ä",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe4'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe5'::bytea,'LATIN1')",
+      "value": "å",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe5'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe6'::bytea,'LATIN1')",
+      "value": "æ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe6'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe7'::bytea,'LATIN1')",
+      "value": "ç",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe7'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe8'::bytea,'LATIN1')",
+      "value": "è",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe8'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe9'::bytea,'LATIN1')",
+      "value": "é",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe9'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xe9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xea'::bytea,'LATIN1')",
+      "value": "ê",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xea'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xea",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xeb'::bytea,'LATIN1')",
+      "value": "ë",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xeb'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xeb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xec'::bytea,'LATIN1')",
+      "value": "ì",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xec'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xec",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xed'::bytea,'LATIN1')",
+      "value": "í",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xed'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xed",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xee'::bytea,'LATIN1')",
+      "value": "î",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xee'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xee",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xef'::bytea,'LATIN1')",
+      "value": "ï",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xef'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xef",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf0'::bytea,'LATIN1')",
+      "value": "ð",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf0'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf1'::bytea,'LATIN1')",
+      "value": "ñ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf1'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf2'::bytea,'LATIN1')",
+      "value": "ò",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf2'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf3'::bytea,'LATIN1')",
+      "value": "ó",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf3'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf4'::bytea,'LATIN1')",
+      "value": "ô",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf4'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf5'::bytea,'LATIN1')",
+      "value": "õ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf5'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf6'::bytea,'LATIN1')",
+      "value": "ö",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf6'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf7'::bytea,'LATIN1')",
+      "value": "÷",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf7'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf8'::bytea,'LATIN1')",
+      "value": "ø",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf8'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf9'::bytea,'LATIN1')",
+      "value": "ù",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf9'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xf9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfa'::bytea,'LATIN1')",
+      "value": "ú",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfa'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xfa",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfb'::bytea,'LATIN1')",
+      "value": "û",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfb'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xfb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfc'::bytea,'LATIN1')",
+      "value": "ü",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfc'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xfc",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfd'::bytea,'LATIN1')",
+      "value": "ý",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfd'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xfd",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfe'::bytea,'LATIN1')",
+      "value": "þ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfe'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xfe",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xff'::bytea,'LATIN1')",
+      "value": "ÿ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xff'::bytea,'LATIN1'),'LATIN1')",
+      "value": "\\xff",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x00'::bytea,'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22021"
+    },
+    {
+      "sql": "convert_to(convert_from('\\x00'::bytea,'WIN1252'),'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22021"
+    },
+    {
+      "sql": "convert_from('\\x01'::bytea,'WIN1252')",
+      "value": "\u0001",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x01'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x01",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x02'::bytea,'WIN1252')",
+      "value": "\u0002",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x02'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x02",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x03'::bytea,'WIN1252')",
+      "value": "\u0003",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x03'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x03",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x04'::bytea,'WIN1252')",
+      "value": "\u0004",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x04'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x04",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x05'::bytea,'WIN1252')",
+      "value": "\u0005",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x05'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x05",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x06'::bytea,'WIN1252')",
+      "value": "\u0006",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x06'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x06",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x07'::bytea,'WIN1252')",
+      "value": "\u0007",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x07'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x07",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x08'::bytea,'WIN1252')",
+      "value": "\b",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x08'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x08",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x09'::bytea,'WIN1252')",
+      "value": "\t",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x09'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x09",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0a'::bytea,'WIN1252')",
+      "value": "\n",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x0a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0b'::bytea,'WIN1252')",
+      "value": "\u000b",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x0b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0c'::bytea,'WIN1252')",
+      "value": "\f",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x0c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0d'::bytea,'WIN1252')",
+      "value": "\r",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0d'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x0d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0e'::bytea,'WIN1252')",
+      "value": "\u000e",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x0e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x0f'::bytea,'WIN1252')",
+      "value": "\u000f",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x0f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x0f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x10'::bytea,'WIN1252')",
+      "value": "\u0010",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x10'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x10",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x11'::bytea,'WIN1252')",
+      "value": "\u0011",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x11'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x11",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x12'::bytea,'WIN1252')",
+      "value": "\u0012",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x12'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x12",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x13'::bytea,'WIN1252')",
+      "value": "\u0013",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x13'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x13",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x14'::bytea,'WIN1252')",
+      "value": "\u0014",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x14'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x14",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x15'::bytea,'WIN1252')",
+      "value": "\u0015",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x15'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x15",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x16'::bytea,'WIN1252')",
+      "value": "\u0016",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x16'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x16",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x17'::bytea,'WIN1252')",
+      "value": "\u0017",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x17'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x17",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x18'::bytea,'WIN1252')",
+      "value": "\u0018",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x18'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x18",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x19'::bytea,'WIN1252')",
+      "value": "\u0019",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x19'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x19",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1a'::bytea,'WIN1252')",
+      "value": "\u001a",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x1a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1b'::bytea,'WIN1252')",
+      "value": "\u001b",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x1b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1c'::bytea,'WIN1252')",
+      "value": "\u001c",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x1c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1d'::bytea,'WIN1252')",
+      "value": "\u001d",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1d'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x1d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1e'::bytea,'WIN1252')",
+      "value": "\u001e",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x1e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x1f'::bytea,'WIN1252')",
+      "value": "\u001f",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x1f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x1f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x20'::bytea,'WIN1252')",
+      "value": " ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x20'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x20",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x21'::bytea,'WIN1252')",
+      "value": "!",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x21'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x21",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x22'::bytea,'WIN1252')",
+      "value": "\"",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x22'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x22",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x23'::bytea,'WIN1252')",
+      "value": "#",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x23'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x23",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x24'::bytea,'WIN1252')",
+      "value": "$",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x24'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x24",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x25'::bytea,'WIN1252')",
+      "value": "%",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x25'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x25",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x26'::bytea,'WIN1252')",
+      "value": "&",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x26'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x26",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x27'::bytea,'WIN1252')",
+      "value": "'",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x27'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x27",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x28'::bytea,'WIN1252')",
+      "value": "(",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x28'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x28",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x29'::bytea,'WIN1252')",
+      "value": ")",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x29'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x29",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2a'::bytea,'WIN1252')",
+      "value": "*",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x2a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2b'::bytea,'WIN1252')",
+      "value": "+",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x2b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2c'::bytea,'WIN1252')",
+      "value": ",",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x2c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2d'::bytea,'WIN1252')",
+      "value": "-",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2d'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x2d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2e'::bytea,'WIN1252')",
+      "value": ".",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x2e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x2f'::bytea,'WIN1252')",
+      "value": "/",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x2f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x2f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x30'::bytea,'WIN1252')",
+      "value": "0",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x30'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x30",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x31'::bytea,'WIN1252')",
+      "value": "1",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x31'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x31",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x32'::bytea,'WIN1252')",
+      "value": "2",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x32'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x32",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x33'::bytea,'WIN1252')",
+      "value": "3",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x33'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x33",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x34'::bytea,'WIN1252')",
+      "value": "4",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x34'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x34",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x35'::bytea,'WIN1252')",
+      "value": "5",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x35'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x35",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x36'::bytea,'WIN1252')",
+      "value": "6",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x36'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x36",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x37'::bytea,'WIN1252')",
+      "value": "7",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x37'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x37",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x38'::bytea,'WIN1252')",
+      "value": "8",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x38'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x38",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x39'::bytea,'WIN1252')",
+      "value": "9",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x39'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x39",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3a'::bytea,'WIN1252')",
+      "value": ":",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x3a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3b'::bytea,'WIN1252')",
+      "value": ";",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x3b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3c'::bytea,'WIN1252')",
+      "value": "<",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x3c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3d'::bytea,'WIN1252')",
+      "value": "=",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3d'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x3d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3e'::bytea,'WIN1252')",
+      "value": ">",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x3e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x3f'::bytea,'WIN1252')",
+      "value": "?",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x3f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x3f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x40'::bytea,'WIN1252')",
+      "value": "@",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x40'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x40",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x41'::bytea,'WIN1252')",
+      "value": "A",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x41'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x41",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x42'::bytea,'WIN1252')",
+      "value": "B",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x42'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x42",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x43'::bytea,'WIN1252')",
+      "value": "C",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x43'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x43",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x44'::bytea,'WIN1252')",
+      "value": "D",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x44'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x44",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x45'::bytea,'WIN1252')",
+      "value": "E",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x45'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x45",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x46'::bytea,'WIN1252')",
+      "value": "F",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x46'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x46",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x47'::bytea,'WIN1252')",
+      "value": "G",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x47'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x47",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x48'::bytea,'WIN1252')",
+      "value": "H",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x48'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x48",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x49'::bytea,'WIN1252')",
+      "value": "I",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x49'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x49",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4a'::bytea,'WIN1252')",
+      "value": "J",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x4a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4b'::bytea,'WIN1252')",
+      "value": "K",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x4b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4c'::bytea,'WIN1252')",
+      "value": "L",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x4c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4d'::bytea,'WIN1252')",
+      "value": "M",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4d'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x4d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4e'::bytea,'WIN1252')",
+      "value": "N",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x4e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x4f'::bytea,'WIN1252')",
+      "value": "O",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x4f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x4f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x50'::bytea,'WIN1252')",
+      "value": "P",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x50'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x50",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x51'::bytea,'WIN1252')",
+      "value": "Q",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x51'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x51",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x52'::bytea,'WIN1252')",
+      "value": "R",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x52'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x52",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x53'::bytea,'WIN1252')",
+      "value": "S",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x53'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x53",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x54'::bytea,'WIN1252')",
+      "value": "T",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x54'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x54",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x55'::bytea,'WIN1252')",
+      "value": "U",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x55'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x55",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x56'::bytea,'WIN1252')",
+      "value": "V",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x56'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x56",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x57'::bytea,'WIN1252')",
+      "value": "W",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x57'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x57",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x58'::bytea,'WIN1252')",
+      "value": "X",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x58'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x58",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x59'::bytea,'WIN1252')",
+      "value": "Y",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x59'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x59",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5a'::bytea,'WIN1252')",
+      "value": "Z",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x5a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5b'::bytea,'WIN1252')",
+      "value": "[",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x5b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5c'::bytea,'WIN1252')",
+      "value": "\\",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x5c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5d'::bytea,'WIN1252')",
+      "value": "]",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5d'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x5d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5e'::bytea,'WIN1252')",
+      "value": "^",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x5e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x5f'::bytea,'WIN1252')",
+      "value": "_",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x5f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x5f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x60'::bytea,'WIN1252')",
+      "value": "`",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x60'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x60",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x61'::bytea,'WIN1252')",
+      "value": "a",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x61'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x61",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x62'::bytea,'WIN1252')",
+      "value": "b",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x62'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x62",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x63'::bytea,'WIN1252')",
+      "value": "c",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x63'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x63",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x64'::bytea,'WIN1252')",
+      "value": "d",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x64'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x64",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x65'::bytea,'WIN1252')",
+      "value": "e",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x65'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x65",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x66'::bytea,'WIN1252')",
+      "value": "f",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x66'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x66",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x67'::bytea,'WIN1252')",
+      "value": "g",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x67'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x67",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x68'::bytea,'WIN1252')",
+      "value": "h",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x68'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x68",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x69'::bytea,'WIN1252')",
+      "value": "i",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x69'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x69",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6a'::bytea,'WIN1252')",
+      "value": "j",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x6a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6b'::bytea,'WIN1252')",
+      "value": "k",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x6b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6c'::bytea,'WIN1252')",
+      "value": "l",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x6c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6d'::bytea,'WIN1252')",
+      "value": "m",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6d'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x6d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6e'::bytea,'WIN1252')",
+      "value": "n",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x6e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x6f'::bytea,'WIN1252')",
+      "value": "o",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x6f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x6f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x70'::bytea,'WIN1252')",
+      "value": "p",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x70'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x70",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x71'::bytea,'WIN1252')",
+      "value": "q",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x71'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x71",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x72'::bytea,'WIN1252')",
+      "value": "r",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x72'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x72",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x73'::bytea,'WIN1252')",
+      "value": "s",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x73'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x73",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x74'::bytea,'WIN1252')",
+      "value": "t",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x74'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x74",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x75'::bytea,'WIN1252')",
+      "value": "u",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x75'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x75",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x76'::bytea,'WIN1252')",
+      "value": "v",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x76'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x76",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x77'::bytea,'WIN1252')",
+      "value": "w",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x77'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x77",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x78'::bytea,'WIN1252')",
+      "value": "x",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x78'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x78",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x79'::bytea,'WIN1252')",
+      "value": "y",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x79'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x79",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7a'::bytea,'WIN1252')",
+      "value": "z",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x7a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7b'::bytea,'WIN1252')",
+      "value": "{",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x7b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7c'::bytea,'WIN1252')",
+      "value": "|",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x7c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7d'::bytea,'WIN1252')",
+      "value": "}",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7d'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x7d",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7e'::bytea,'WIN1252')",
+      "value": "~",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x7e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7f'::bytea,'WIN1252')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x7f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x7f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x80'::bytea,'WIN1252')",
+      "value": "€",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x80'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x80",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x81'::bytea,'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_to(convert_from('\\x81'::bytea,'WIN1252'),'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_from('\\x82'::bytea,'WIN1252')",
+      "value": "‚",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x82'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x82",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x83'::bytea,'WIN1252')",
+      "value": "ƒ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x83'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x83",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x84'::bytea,'WIN1252')",
+      "value": "„",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x84'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x84",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x85'::bytea,'WIN1252')",
+      "value": "…",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x85'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x85",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x86'::bytea,'WIN1252')",
+      "value": "†",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x86'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x86",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x87'::bytea,'WIN1252')",
+      "value": "‡",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x87'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x87",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x88'::bytea,'WIN1252')",
+      "value": "ˆ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x88'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x88",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x89'::bytea,'WIN1252')",
+      "value": "‰",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x89'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x89",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8a'::bytea,'WIN1252')",
+      "value": "Š",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x8a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8b'::bytea,'WIN1252')",
+      "value": "‹",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x8b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8c'::bytea,'WIN1252')",
+      "value": "Œ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x8c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8d'::bytea,'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8d'::bytea,'WIN1252'),'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_from('\\x8e'::bytea,'WIN1252')",
+      "value": "Ž",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x8e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x8f'::bytea,'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_to(convert_from('\\x8f'::bytea,'WIN1252'),'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_from('\\x90'::bytea,'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_to(convert_from('\\x90'::bytea,'WIN1252'),'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_from('\\x91'::bytea,'WIN1252')",
+      "value": "‘",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x91'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x91",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x92'::bytea,'WIN1252')",
+      "value": "’",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x92'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x92",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x93'::bytea,'WIN1252')",
+      "value": "“",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x93'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x93",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x94'::bytea,'WIN1252')",
+      "value": "”",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x94'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x94",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x95'::bytea,'WIN1252')",
+      "value": "•",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x95'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x95",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x96'::bytea,'WIN1252')",
+      "value": "–",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x96'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x96",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x97'::bytea,'WIN1252')",
+      "value": "—",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x97'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x97",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x98'::bytea,'WIN1252')",
+      "value": "˜",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x98'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x98",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x99'::bytea,'WIN1252')",
+      "value": "™",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x99'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x99",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9a'::bytea,'WIN1252')",
+      "value": "š",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9a'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x9a",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9b'::bytea,'WIN1252')",
+      "value": "›",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9b'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x9b",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9c'::bytea,'WIN1252')",
+      "value": "œ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9c'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x9c",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9d'::bytea,'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9d'::bytea,'WIN1252'),'WIN1252')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22P05"
+    },
+    {
+      "sql": "convert_from('\\x9e'::bytea,'WIN1252')",
+      "value": "ž",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9e'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x9e",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x9f'::bytea,'WIN1252')",
+      "value": "Ÿ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\x9f'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\x9f",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa0'::bytea,'WIN1252')",
+      "value": " ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa0'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa1'::bytea,'WIN1252')",
+      "value": "¡",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa1'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa2'::bytea,'WIN1252')",
+      "value": "¢",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa2'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa3'::bytea,'WIN1252')",
+      "value": "£",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa3'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa4'::bytea,'WIN1252')",
+      "value": "¤",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa4'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa5'::bytea,'WIN1252')",
+      "value": "¥",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa5'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa6'::bytea,'WIN1252')",
+      "value": "¦",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa6'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa7'::bytea,'WIN1252')",
+      "value": "§",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa7'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa8'::bytea,'WIN1252')",
+      "value": "¨",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa8'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xa9'::bytea,'WIN1252')",
+      "value": "©",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xa9'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xa9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xaa'::bytea,'WIN1252')",
+      "value": "ª",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xaa'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xaa",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xab'::bytea,'WIN1252')",
+      "value": "«",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xab'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xab",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xac'::bytea,'WIN1252')",
+      "value": "¬",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xac'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xac",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xad'::bytea,'WIN1252')",
+      "value": "­",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xad'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xad",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xae'::bytea,'WIN1252')",
+      "value": "®",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xae'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xae",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xaf'::bytea,'WIN1252')",
+      "value": "¯",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xaf'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xaf",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb0'::bytea,'WIN1252')",
+      "value": "°",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb0'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb1'::bytea,'WIN1252')",
+      "value": "±",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb1'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb2'::bytea,'WIN1252')",
+      "value": "²",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb2'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb3'::bytea,'WIN1252')",
+      "value": "³",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb3'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb4'::bytea,'WIN1252')",
+      "value": "´",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb4'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb5'::bytea,'WIN1252')",
+      "value": "µ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb5'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb6'::bytea,'WIN1252')",
+      "value": "¶",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb6'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb7'::bytea,'WIN1252')",
+      "value": "·",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb7'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb8'::bytea,'WIN1252')",
+      "value": "¸",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb8'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xb9'::bytea,'WIN1252')",
+      "value": "¹",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xb9'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xb9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xba'::bytea,'WIN1252')",
+      "value": "º",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xba'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xba",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbb'::bytea,'WIN1252')",
+      "value": "»",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbb'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xbb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbc'::bytea,'WIN1252')",
+      "value": "¼",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbc'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xbc",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbd'::bytea,'WIN1252')",
+      "value": "½",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbd'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xbd",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbe'::bytea,'WIN1252')",
+      "value": "¾",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbe'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xbe",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xbf'::bytea,'WIN1252')",
+      "value": "¿",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xbf'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xbf",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc0'::bytea,'WIN1252')",
+      "value": "À",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc0'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc1'::bytea,'WIN1252')",
+      "value": "Á",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc1'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc2'::bytea,'WIN1252')",
+      "value": "Â",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc2'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc3'::bytea,'WIN1252')",
+      "value": "Ã",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc3'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc4'::bytea,'WIN1252')",
+      "value": "Ä",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc4'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc5'::bytea,'WIN1252')",
+      "value": "Å",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc5'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc6'::bytea,'WIN1252')",
+      "value": "Æ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc6'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc7'::bytea,'WIN1252')",
+      "value": "Ç",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc7'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc8'::bytea,'WIN1252')",
+      "value": "È",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc8'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc9'::bytea,'WIN1252')",
+      "value": "É",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xc9'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xc9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xca'::bytea,'WIN1252')",
+      "value": "Ê",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xca'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xca",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xcb'::bytea,'WIN1252')",
+      "value": "Ë",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xcb'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xcb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xcc'::bytea,'WIN1252')",
+      "value": "Ì",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xcc'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xcc",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xcd'::bytea,'WIN1252')",
+      "value": "Í",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xcd'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xcd",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xce'::bytea,'WIN1252')",
+      "value": "Î",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xce'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xce",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xcf'::bytea,'WIN1252')",
+      "value": "Ï",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xcf'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xcf",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd0'::bytea,'WIN1252')",
+      "value": "Ð",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd0'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd1'::bytea,'WIN1252')",
+      "value": "Ñ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd1'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd2'::bytea,'WIN1252')",
+      "value": "Ò",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd2'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd3'::bytea,'WIN1252')",
+      "value": "Ó",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd3'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd4'::bytea,'WIN1252')",
+      "value": "Ô",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd4'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd5'::bytea,'WIN1252')",
+      "value": "Õ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd5'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd6'::bytea,'WIN1252')",
+      "value": "Ö",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd6'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd7'::bytea,'WIN1252')",
+      "value": "×",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd7'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd8'::bytea,'WIN1252')",
+      "value": "Ø",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd8'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xd9'::bytea,'WIN1252')",
+      "value": "Ù",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xd9'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xd9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xda'::bytea,'WIN1252')",
+      "value": "Ú",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xda'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xda",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdb'::bytea,'WIN1252')",
+      "value": "Û",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xdb'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xdb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdc'::bytea,'WIN1252')",
+      "value": "Ü",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xdc'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xdc",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdd'::bytea,'WIN1252')",
+      "value": "Ý",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xdd'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xdd",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xde'::bytea,'WIN1252')",
+      "value": "Þ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xde'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xde",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdf'::bytea,'WIN1252')",
+      "value": "ß",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xdf'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xdf",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe0'::bytea,'WIN1252')",
+      "value": "à",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe0'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe1'::bytea,'WIN1252')",
+      "value": "á",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe1'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe2'::bytea,'WIN1252')",
+      "value": "â",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe2'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe3'::bytea,'WIN1252')",
+      "value": "ã",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe3'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe4'::bytea,'WIN1252')",
+      "value": "ä",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe4'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe5'::bytea,'WIN1252')",
+      "value": "å",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe5'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe6'::bytea,'WIN1252')",
+      "value": "æ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe6'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe7'::bytea,'WIN1252')",
+      "value": "ç",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe7'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe8'::bytea,'WIN1252')",
+      "value": "è",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe8'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe9'::bytea,'WIN1252')",
+      "value": "é",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xe9'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xe9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xea'::bytea,'WIN1252')",
+      "value": "ê",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xea'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xea",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xeb'::bytea,'WIN1252')",
+      "value": "ë",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xeb'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xeb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xec'::bytea,'WIN1252')",
+      "value": "ì",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xec'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xec",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xed'::bytea,'WIN1252')",
+      "value": "í",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xed'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xed",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xee'::bytea,'WIN1252')",
+      "value": "î",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xee'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xee",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xef'::bytea,'WIN1252')",
+      "value": "ï",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xef'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xef",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf0'::bytea,'WIN1252')",
+      "value": "ð",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf0'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf0",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf1'::bytea,'WIN1252')",
+      "value": "ñ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf1'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf1",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf2'::bytea,'WIN1252')",
+      "value": "ò",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf2'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf2",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf3'::bytea,'WIN1252')",
+      "value": "ó",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf3'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf3",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf4'::bytea,'WIN1252')",
+      "value": "ô",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf4'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf4",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf5'::bytea,'WIN1252')",
+      "value": "õ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf5'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf5",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf6'::bytea,'WIN1252')",
+      "value": "ö",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf6'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf6",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf7'::bytea,'WIN1252')",
+      "value": "÷",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf7'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf7",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf8'::bytea,'WIN1252')",
+      "value": "ø",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf8'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf8",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf9'::bytea,'WIN1252')",
+      "value": "ù",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xf9'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xf9",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfa'::bytea,'WIN1252')",
+      "value": "ú",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfa'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xfa",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfb'::bytea,'WIN1252')",
+      "value": "û",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfb'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xfb",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfc'::bytea,'WIN1252')",
+      "value": "ü",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfc'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xfc",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfd'::bytea,'WIN1252')",
+      "value": "ý",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfd'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xfd",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xfe'::bytea,'WIN1252')",
+      "value": "þ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xfe'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xfe",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xff'::bytea,'WIN1252')",
+      "value": "ÿ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_to(convert_from('\\xff'::bytea,'WIN1252'),'WIN1252')",
+      "value": "\\xff",
+      "oid": 17,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x01'::bytea,'UTF8')",
+      "value": "\u0001",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\x7f'::bytea,'UTF8')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xc280'::bytea,'UTF8')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xdfbf'::bytea,'UTF8')",
+      "value": "߿",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xe0a080'::bytea,'UTF8')",
+      "value": "ࠀ",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xed9fbf'::bytea,'UTF8')",
+      "value": "퟿",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xee8080'::bytea,'UTF8')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xefbfbf'::bytea,'UTF8')",
+      "value": "￿",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf0908080'::bytea,'UTF8')",
+      "value": "𐀀",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "sql": "convert_from('\\xf48fbfbf'::bytea,'UTF8')",
+      "value": "􏿿",
+      "oid": 25,
+      "sqlstate": null
+    }
+  ],
+  "queries": [
+    {
+      "sql": "SELECT convert_to('café','UTF8') AS b",
+      "rows": [
+        [
+          "\\x636166c3a9"
+        ]
+      ],
+      "oids": [
+        17
+      ]
+    },
+    {
+      "sql": "SELECT b,count(*) FROM (VALUES (convert_to('a','UTF8')),(convert_to('b','UTF8')),(convert_to('a','UTF8')),(NULL::bytea)) v(b) GROUP BY b ORDER BY b NULLS LAST",
+      "rows": [
+        [
+          "\\x61",
+          "2"
+        ],
+        [
+          "\\x62",
+          "1"
+        ],
+        [
+          null,
+          "1"
+        ]
+      ],
+      "oids": [
+        17,
+        20
+      ]
+    },
+    {
+      "sql": "SELECT l.b FROM (VALUES (convert_to('a','UTF8')),(convert_to('b','UTF8'))) l(b) JOIN (VALUES (convert_to('b','UTF8'))) r(b) ON l.b=r.b",
+      "rows": [
+        [
+          "\\x62"
+        ]
+      ],
+      "oids": [
+        17
+      ]
+    },
+    {
+      "sql": "SELECT DISTINCT b FROM (VALUES ('\\x00'::bytea),('\\xff'::bytea),('\\x'::bytea),(NULL::bytea),('\\x00ff'::bytea),('\\x00'::bytea)) v(b) ORDER BY b NULLS FIRST",
+      "rows": [
+        [
+          null
+        ],
+        [
+          "\\x"
+        ],
+        [
+          "\\x00"
+        ],
+        [
+          "\\x00ff"
+        ],
+        [
+          "\\xff"
+        ]
+      ],
+      "oids": [
+        17
+      ]
+    },
+    {
+      "sql": "SELECT convert_to('€é','WIN1252') AS b",
+      "rows": [
+        [
+          "\\x80e9"
+        ]
+      ],
+      "oids": [
+        17
+      ]
+    }
+  ]
+}

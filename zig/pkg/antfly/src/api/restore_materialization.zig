@@ -81,7 +81,7 @@ pub fn step(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocat
 /// by an atomic logical-object/row cursor inside a disposable LSM decoder.
 pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("antfly_local_sources").storage_docstore.ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, byte_budget: usize) !bool {
     if (byte_budget == 0 or byte_budget > chunk_bytes or source.format != .portable or !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
-    if ((source.cohort_seal == null) == (source.rewrite == null)) return error.RestoreSourceProofMissing;
+    if (@as(u8, @intFromBool(source.cohort_seal != null)) + @intFromBool(source.rewrite != null) + @intFromBool(source.repository_schema_digest != null) != 1) return error.RestoreSourceProofMissing;
     try cancellation.check();
     try fs.createDirPathPortable(io, root);
     const state_path = try std.fmt.allocPrint(alloc, "{s}/progress", .{root});
@@ -135,14 +135,14 @@ pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *b
 /// or the peer transport's exact immutable certificate verification.
 pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("antfly_local_sources").storage_docstore.ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     try cancellation.check();
-    if (source.format != .portable or (source.cohort_seal == null) == (source.rewrite == null) or
+    if (source.format != .portable or (@as(u8, @intFromBool(source.cohort_seal != null)) + @intFromBool(source.rewrite != null) + @intFromBool(source.repository_schema_digest != null) != 1) or
         !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
     const decoder = @import("antfly_local_sources").storage_portable_decoder;
     const proof: decoder.Proof = if (source.rewrite) |rewrite| .{ .source_copy = .{
         .scope = rewrite.source_scope orelse return error.RestoreSourceProofMissing,
         .applied_index = rewrite.source_applied_index,
         .retained_start = rewrite.retained_start,
-    } } else .{ .cohort = .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace } };
+    } } else if (source.repository_schema_digest) |schema_digest| .{ .repository_snapshot = .{ .namespace = scope.source_namespace, .schema_digest = schema_digest, .artifact_digest = source.artifact_sha256 } } else .{ .cohort = .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace } };
     return decoder.step(alloc, io, artifact, .{ .proof = proof, .artifact_size = source.artifact_size_bytes, .scope = scope.digest(), .owner_range = owner_range, .root = root }, cancellation);
 }
 
@@ -180,6 +180,20 @@ pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.B
     Sha.hash(raw, &manifest_digest, .{});
     if (raw.len != source.native_manifest_size_bytes or !std.mem.eql(u8, &std.fmt.bytesToHex(manifest_digest, .lower), source.native_manifest_sha256)) return error.BackupArtifactIntegrityMismatch;
     var loaded = try native.parseManifestBytes(alloc, raw);
+    if (source.repository_schema_digest != null) {
+        const origin = loaded.value().primary.origin orelse {
+            loaded.deinit();
+            return error.RestoreSourceProofMissing;
+        };
+        const namespace = origin.namespace orelse {
+            loaded.deinit();
+            return error.RestoreSourceProofMissing;
+        };
+        if (!namespace.eql(source.source_namespace)) {
+            loaded.deinit();
+            return error.BackupIntegrityFailure;
+        }
+    }
     var keep = false;
     defer if (!keep) loaded.deinit();
     if (source.cohort_seal) |seal| {

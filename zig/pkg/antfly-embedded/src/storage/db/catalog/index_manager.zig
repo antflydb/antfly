@@ -2714,6 +2714,9 @@ pub const IndexManager = struct {
 
         fn recycleRawReadState(self: *@This()) void {
             self.clearRawCacheKeys();
+            // Residency fallback cannot replace a query/repair visibility cut
+            // with a current-tip read. Keep its real retained-byte accounting.
+            if (self.read_txn_kind == .snapshot) return;
             if (self.read_txn) |*txn| {
                 txn.abort();
                 self.read_txn = null;
@@ -2733,9 +2736,19 @@ pub const IndexManager = struct {
             self.observeWorkingBytes();
         }
 
-        fn recycleRawReadStateIfNeeded(self: *@This()) void {
+        fn recycleRawReadStateIfNeeded(self: *@This()) !void {
             if (!self.recycle_raw_reads) return;
             if (self.raw_cache_key_bytes +| self.raw_read_value_bytes >= self.rawReadLimitBytes()) {
+                if (self.read_txn_kind == .snapshot) {
+                    const read = if (self.read_txn) |*value| value else return error.ReadSnapshotForkUnsupported;
+                    const replacement = try read.forkBorrowedRead();
+                    self.clearRawCacheKeys();
+                    read.abort();
+                    self.read_txn = replacement;
+                    self.raw_read_value_bytes = 0;
+                    self.observeWorkingBytes();
+                    return;
+                }
                 self.recycleRawReadState();
             }
         }
@@ -2778,7 +2791,7 @@ pub const IndexManager = struct {
         }
 
         fn get(self: *@This(), store: *docstore_mod.DocStore, key: []const u8) ![]const u8 {
-            self.recycleRawReadStateIfNeeded();
+            try self.recycleRawReadStateIfNeeded();
             if (self.cache_raw_values) {
                 if (self.raw_cache.get(key)) |cached| {
                     self.raw_cache_hits += 1;
@@ -2800,7 +2813,7 @@ pub const IndexManager = struct {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);
             if (keys.len == 0) return;
-            self.recycleRawReadStateIfNeeded();
+            try self.recycleRawReadStateIfNeeded();
 
             const miss_keys = try self.context.manager.alloc.alloc([]const u8, keys.len);
             defer self.context.manager.alloc.free(miss_keys);
@@ -2973,6 +2986,7 @@ pub const IndexManager = struct {
     };
 
     threadlocal var active_dense_vector_load_session: ?*DenseVectorLoadSession = null;
+    threadlocal var active_dense_repair_read: ?*DenseRepairRead = null;
     /// One builder owns this scratch and must keep its address stable after
     /// first use. Only leaf-local keys/request descriptors live here; returned
     /// projections always borrow the caller's separately owned payload buffer.
@@ -4217,6 +4231,25 @@ pub const IndexManager = struct {
         index.setBypassExternalVectorCache(true);
     }
 
+    fn acquireVectorBlockGenerationForRead(self: *IndexManager) ?*SharedVectorBlockGeneration {
+        if (active_dense_vector_load_session) |session| {
+            // A retained primary cut cannot fall forward to an unrelated
+            // native generation. Query bundles already pin their generation;
+            // repair may intentionally have only its immutable primary read.
+            if (session.context.manager == self and session.read_txn_kind == .snapshot and
+                session.snapshot_generation == null) return null;
+        }
+        return self.acquireVectorBlockGeneration();
+    }
+
+    fn denseResidentReadAllowed(entry: *const DenseIndex) bool {
+        const scope = active_dense_repair_read orelse return true;
+        // Heap decoded entries do not carry the retained primary cut. Repair
+        // may reuse an exactly bound immutable generation, not an unversioned
+        // decoded value populated by another request.
+        return scope.entry != entry;
+    }
+
     fn allocateDenseCaptureIncarnation(self: *IndexManager) u64 {
         const incarnation = self.next_dense_capture_incarnation.fetchAdd(1, .monotonic);
         // Reaching this after 2^64 index replacements would make an old token
@@ -4638,6 +4671,16 @@ pub const IndexManager = struct {
         mutations: []const hbc_mod.ExperimentalExactVectorMutation,
         covered_source_sequence: u64,
     ) !bool {
+        return self.publishVectorBlockMutationWalFromRead(entry, mutations, covered_source_sequence, null);
+    }
+
+    fn publishVectorBlockMutationWalFromRead(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        mutations: []const hbc_mod.ExperimentalExactVectorMutation,
+        covered_source_sequence: u64,
+        source_read: ?*docstore_mod.DocStore.Txn,
+    ) !bool {
         const started_ns = platform_time.monotonicNs();
         if (mutations.len == 0) return false;
         const storage = self.vector_block_storage orelse return false;
@@ -4653,7 +4696,12 @@ pub const IndexManager = struct {
         if (store.manifest == null or store.covered_source_sequence != current_coverage) return false;
         const batch_id = try store.nextBatchId();
         const primary = self.primary_store orelse return error.MissingPrimaryStore;
-        var primary_txn = if (self.source_payload_store != null) try primary.beginProbeTxn() else try primary.beginReadTxn();
+        var primary_txn = if (source_read) |read|
+            try read.forkBorrowedRead()
+        else if (self.source_payload_store != null)
+            try primary.beginProbeTxn()
+        else
+            try primary.beginReadTxn();
         defer primary_txn.abort();
 
         const records = try self.alloc.alloc(vector_block_store_mod.BatchRecord, mutations.len);
@@ -9303,6 +9351,25 @@ pub const IndexManager = struct {
                 .backend_root = "reverse",
                 .checkpoint = .{ .lsm = checkpoints.reverse },
             });
+        }
+        // Algebraic facts live in primary KV, but a managed generation's
+        // namespace is selected by its active-root pointer. Filesystem index
+        // checkpoints are flattened below; these primary namespaces cannot be
+        // renamed during capture. Retain the selected namespace as small owned
+        // metadata, without an off-fence read of the mutable live pointer.
+        for (self.algebraic_indexes.items) |*entry| {
+            var parts = std.mem.splitScalar(u8, entry.index.storageNamespace(), '/');
+            const generation = parts.next() orelse return error.InvalidIndexRootPointer;
+            const name = parts.next() orelse return error.InvalidIndexRootPointer;
+            if (parts.next() != null or !std.mem.eql(u8, name, entry.config.name)) return error.InvalidIndexRootPointer;
+            if (std.mem.eql(u8, generation, canonical_algebraic_generation)) continue;
+            const active = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}", .{ generation, name }));
+            if (!validRelativeRepairIndexRoot(name, active)) return error.InvalidIndexRootPointer;
+            const relative = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "indexes/{s}/{s}", .{ name, active_index_root_pointer_file }));
+            // The immutable primary checkpoint owns the facts. V1 here is a
+            // namespace locator, not a promise of another physical backend.
+            const payload = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}{s}\n", .{ active_index_root_pointer_magic_v1, active }));
+            try native_specs.append(self.alloc, .{ .relative_path = relative, .source = .{ .bytes = payload } });
         }
         // Retain manifested files independently of the live index owners.
         // Snapshot refs protect compaction, but a catalog replacement can close
@@ -18432,12 +18499,38 @@ pub const IndexManager = struct {
         lease: DensePostingCaptureLease,
         applied_sequence: u64,
     ) !void {
+        return self.finishDensePostingSidecarCaptureLeaseWithRead(name, lease, applied_sequence, null);
+    }
+
+    /// Retain repair source authority through physical revision/reference
+    /// certification without activating its routing snapshot for publication.
+    pub fn finishDensePostingSidecarCaptureLeaseByNameFromRead(
+        self: *IndexManager,
+        name: []const u8,
+        lease: DensePostingCaptureLease,
+        applied_sequence: u64,
+        source_read: *docstore_mod.DocStore.Txn,
+    ) !void {
+        const primary = self.primary_store orelse return error.MissingPrimaryStore;
+        if (try primary.lastReplaySequenceFromTxn(source_read, 0) != applied_sequence)
+            return error.RepairSourceChanged;
+        return self.finishDensePostingSidecarCaptureLeaseWithRead(name, lease, applied_sequence, source_read);
+    }
+
+    fn finishDensePostingSidecarCaptureLeaseWithRead(
+        self: *IndexManager,
+        name: []const u8,
+        lease: DensePostingCaptureLease,
+        applied_sequence: u64,
+        source_read: ?*docstore_mod.DocStore.Txn,
+    ) !void {
         if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
         const entry = try self.validateDensePostingCaptureLease(name, lease);
         if (!self.densePostingSidecarEnabledForEntry(entry)) return;
         try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{
             .consume_owned_source_capture = true,
             .capture_lease = lease.capture,
+            .source_read = source_read,
         });
     }
 
@@ -18492,6 +18585,7 @@ pub const IndexManager = struct {
     const DensePostingPersistOptions = struct {
         consume_owned_source_capture: bool = false,
         capture_lease: ?hbc_mod.ExperimentalPostingCaptureLease = null,
+        source_read: ?*docstore_mod.DocStore.Txn = null,
     };
 
     fn persistDensePostingSidecarByNameWithOptions(
@@ -18564,10 +18658,11 @@ pub const IndexManager = struct {
         var vector_mutations_published = false;
         if (self.vector_block_storage != null and exact_vector_mutations.len != 0) {
             self.lockAtomicWithBackoff(&self.vector_block_build_mu);
-            vector_mutations_published = self.publishVectorBlockMutationWal(
+            vector_mutations_published = self.publishVectorBlockMutationWalFromRead(
                 entry,
                 exact_vector_mutations,
                 applied_sequence,
+                options.source_read,
             ) catch |err| blk: {
                 // The primary artifact transaction has already committed and
                 // remains exact. Fence the stale projection below and let
@@ -18899,6 +18994,67 @@ pub const IndexManager = struct {
             return self.source.context.manager.lookupDenseDocKeyByVectorIdTxn(&self.source.read_txn.?, self.entry.config.name, vector_id);
         }
     };
+
+    /// One synchronous repair wave, not a corpus-sized cache. The caller owns
+    /// the index apply lane and keeps the parent source read alive. Forked
+    /// cursor/payload scratch is released after each bounded chunk or finish.
+    pub const DenseRepairRead = struct {
+        entry: *DenseIndex,
+        source: DenseVectorLoadSession,
+        preload_read: ?docstore_mod.DocStore.Txn = null,
+        previous_repair: ?*DenseRepairRead = null,
+        previous: ?*DenseVectorLoadSession = null,
+        previous_bypass: bool = false,
+        active: bool = false,
+
+        pub fn activate(self: *@This()) void {
+            std.debug.assert(!self.active);
+            self.previous = active_dense_vector_load_session;
+            self.previous_repair = active_dense_repair_read;
+            active_dense_repair_read = self;
+            self.previous_bypass = self.entry.index.bypassExternalVectorCache();
+            self.entry.index.setBypassExternalVectorCache(true);
+            active_dense_vector_load_session = &self.source;
+            self.active = true;
+        }
+        pub fn deactivate(self: *@This()) void {
+            std.debug.assert(self.active and active_dense_vector_load_session == &self.source);
+            active_dense_vector_load_session = self.previous;
+            active_dense_repair_read = self.previous_repair;
+            self.entry.index.setBypassExternalVectorCache(self.previous_bypass);
+            self.active = false;
+        }
+        pub fn deinit(self: *@This()) void {
+            std.debug.assert(!self.active);
+            if (self.preload_read) |*read| read.abort();
+            self.source.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn captureDenseRepairRead(self: *IndexManager, name: []const u8, source: *docstore_mod.DocStore.Txn) !DenseRepairRead {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        const context = entry.vector_loader_context orelse return error.IndexNotFound;
+        var fork = try source.forkBorrowedRead();
+        errdefer fork.abort();
+        const sequence = try (self.primary_store orelse return error.IndexNotFound).lastReplaySequenceFromTxn(source, 0);
+        const generation = self.acquireVectorBlockGeneration();
+        const exact_generation = if (generation) |value| blk: {
+            if (!self.vector_block_projection_dirty.load(.acquire) and vectorBlockGenerationExactAtSequence(value, sequence)) break :blk value;
+            value.release();
+            break :blk null;
+        } else null;
+        return .{ .entry = entry, .source = .{
+            .context = context,
+            .read_txn = fork,
+            .read_txn_kind = .snapshot,
+            .snapshot_generation = exact_generation,
+            .recycle_raw_reads = true,
+            .cache_raw_values = false,
+            .cache_vectors = false,
+            .block_cache_admission = .transient,
+        } };
+    }
 
     /// Called under the DB apply read fence and an index catalog lease. Only
     /// a caught-up, authoritative float32 source can enter this fast path.
@@ -23300,7 +23456,7 @@ pub const IndexManager = struct {
                 if (self.resource_manager) |manager| persistent.attachResourceManager(manager);
                 var persistent_moved = false;
                 errdefer if (!persistent_moved) persistent.close();
-                const runtime_schema = loadRuntimeSchemaForTextIndex(self.alloc, store, cfg.name) catch |err| {
+                const runtime_schema = loadRuntimeSchemaForPersistentTextIndex(self.alloc, store, cfg.name, &persistent) catch |err| {
                     std.log.warn("full_text open failed step=runtime_schema name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -29502,6 +29658,15 @@ pub const IndexManager = struct {
         unreadable_artifact_keys: *std.ArrayListUnmanaged([]const u8),
         elided: ?*std.ArrayListUnmanaged(ElidedDenseArtifact),
     ) !bool {
+        if (active_dense_repair_read) |scope| {
+            if (scope.source.context.manager == self and std.mem.eql(u8, scope.entry.config.name, index_name)) {
+                // Batch insert items borrow these floats until HBC commits.
+                // Give them independent scratch: routing may recycle its own
+                // same-cut reader while those insert views are still live.
+                if (scope.preload_read == null) scope.preload_read = try scope.source.read_txn.?.forkBorrowedRead();
+                return self.preloadDenseEmbeddingArtifactVectorsFromTxn(index_name, dims, writes, keep_write, &scope.preload_read.?, out_vectors, fallback_scratch, unreadable_artifact_keys, elided);
+            }
+        }
         return try self.preloadDenseEmbeddingArtifactVectorsFromTxn(
             index_name,
             dims,
@@ -30963,7 +31128,7 @@ pub const IndexManager = struct {
                     continue;
                 }
             }
-            if (entry.index.borrowCachedVector(vector_ids[i])) |cached_handle| {
+            if (if (denseResidentReadAllowed(entry)) entry.index.borrowCachedVector(vector_ids[i]) else null) |cached_handle| {
                 var handle = cached_handle;
                 defer handle.deinit();
                 const cached = handle.view();
@@ -31062,6 +31227,76 @@ pub const IndexManager = struct {
         );
     }
 
+    /// Repair may start from primary rows without any derived vector artifacts.
+    /// Read bounded, sorted waves from the retained source, projecting typed
+    /// vector cells directly. Only artifact-only rows need the scalar fallback;
+    /// finish the borrowed row wave before that fallback can recycle scratch.
+    fn loadDenseRepairPrimaryMatrix(
+        loader: *DenseVectorLoadContext,
+        entry: *DenseIndex,
+        session: *DenseVectorLoadSession,
+        vector_ids: []const u64,
+        metadata: []const ?[]const u8,
+        positions: []const usize,
+        matrix: []f32,
+        scratch: []f32,
+        dims: usize,
+        index: *hbc_mod.HBCIndex,
+        transform: hbc_mod.HBCIndex.ExternalVectorTransformFn,
+    ) !void {
+        const manager = loader.manager;
+        const store = manager.primary_store orelse return error.NotFound;
+        var schema_views = SchemaViewSet.init(manager);
+        defer schema_views.deinit();
+        const wave_size = 64;
+        var offset: usize = 0;
+        while (offset < vector_ids.len) {
+            const wave_count = @min(wave_size, vector_ids.len - offset);
+            var reads: [wave_size]DenseArtifactReadKey = undefined;
+            var keys: [wave_size][]const u8 = undefined;
+            var values: [wave_size]?[]const u8 = undefined;
+            var fallback: [wave_size]bool = @splat(false);
+            var owned: usize = 0;
+            defer for (reads[0..owned]) |read| manager.alloc.free(read.key);
+            for (0..wave_count) |i| {
+                const slot = offset + i;
+                const start = std.math.mul(usize, positions[slot], dims) catch return error.BufferTooSmall;
+                const end = std.math.add(usize, start, dims) catch return error.BufferTooSmall;
+                if (end > matrix.len) return error.BufferTooSmall;
+                const doc_key = metadata[slot] orelse return error.NotFound;
+                const key = if (manager.relational_base_rows)
+                    try relational_store.keyAlloc(manager.alloc, doc_key)
+                else
+                    try internal_keys.documentKeyAlloc(manager.alloc, doc_key);
+                reads[i] = DenseArtifactReadKey.init(key, slot);
+                owned += 1;
+            }
+            std.mem.sort(DenseArtifactReadKey, reads[0..wave_count], {}, DenseArtifactReadKey.lessThan);
+            for (reads[0..wave_count], 0..) |read, i| keys[i] = read.key;
+            try session.getManySorted(store, keys[0..wave_count], values[0..wave_count]);
+            for (reads[0..wave_count], values[0..wave_count], 0..) |read, maybe_raw, i| {
+                const vector = if (maybe_raw) |raw|
+                    try manager.extractDenseVectorFromStoredAlloc(manager.alloc, read.key, raw, entry.field_name, @intCast(dims), &schema_views)
+                else
+                    null;
+                if (vector) |value| {
+                    defer manager.alloc.free(value);
+                    const start = positions[read.position] * dims;
+                    _ = transform(index, value, matrix[start..][0..dims]);
+                } else fallback[i] = true;
+            }
+            for (reads[0..wave_count], fallback[0..wave_count]) |read, needed| {
+                if (!needed) continue;
+                const slot = read.position;
+                const vector = try manager.loadDenseVectorArtifactForHbcIntoScratch(store, metadata[slot].?, entry.config.name, session, scratch);
+                if (vector.len != dims) return error.InvalidVectorDimensions;
+                const start = positions[slot] * dims;
+                _ = transform(index, vector, matrix[start..][0..dims]);
+            }
+            offset += wave_count;
+        }
+    }
+
     fn loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(
         ctx: *anyopaque,
         vector_ids: []const u64,
@@ -31082,6 +31317,17 @@ pub const IndexManager = struct {
         if (vector_ids.len != metadata.len or vector_ids.len != matrix_positions.len) return error.InvalidArgument;
         if (dims == 0) return error.InvalidVectorDimensions;
         if (scratch.len < dims) return error.BufferTooSmall;
+
+        // An explicit replay base still owns previous-vector authority. Only
+        // ordinary source-snapshot construction projects current primary rows.
+        if (replay_base == null and !entry.external and entry.chunk_name == null and
+            entry.embedding_name == null and entry.embedding_names.len == 0)
+        {
+            if (active_dense_repair_read) |scope| {
+                if (scope.entry == entry)
+                    return loadDenseRepairPrimaryMatrix(loader, entry, &scope.source, vector_ids, metadata, matrix_positions, matrix, scratch, dims, index, transform);
+            }
+        }
 
         const load_session = blk: {
             const session = active_dense_vector_load_session orelse break :blk null;
@@ -31119,7 +31365,7 @@ pub const IndexManager = struct {
                     continue;
                 }
             }
-            if (entry.index.borrowCachedVector(vector_ids[i])) |cached_handle| {
+            if (if (denseResidentReadAllowed(entry)) entry.index.borrowCachedVector(vector_ids[i]) else null) |cached_handle| {
                 var handle = cached_handle;
                 defer handle.deinit();
                 const cached = handle.view();
@@ -31146,7 +31392,7 @@ pub const IndexManager = struct {
         // behind postings; query readiness still requires sequence equality.
         const vector_block_generation = blk: {
             const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse break :blk null;
-            const generation = manager.acquireVectorBlockGeneration() orelse break :blk null;
+            const generation = manager.acquireVectorBlockGenerationForRead() orelse break :blk null;
             if (replay_base) |base| {
                 // Exact capture certifies every changed vector before its
                 // topology mutation. Unchanged keys may therefore use the
@@ -31273,7 +31519,7 @@ pub const IndexManager = struct {
             var local_txn: ?docstore_mod.DocStore.Txn = null;
             defer if (local_txn) |*txn| txn.abort();
             const txn = if (load_session) |session| blk: {
-                session.recycleRawReadStateIfNeeded();
+                try session.recycleRawReadStateIfNeeded();
                 session.ensureDecodedResidencyCapacity(key_count, dims);
                 session.raw_batch_reads += 1;
                 session.raw_cache_misses += key_count;
@@ -31358,7 +31604,7 @@ pub const IndexManager = struct {
                 }
             }
         }
-        const generation = loader.manager.acquireVectorBlockGeneration() orelse return false;
+        const generation = loader.manager.acquireVectorBlockGenerationForRead() orelse return false;
         const supported = generation.opened.store.covered_source_sequence == sequence and
             (generation.opened.scorePrecision() == .bounded_float16 or
                 generation.opened.scorePrecision() == .authoritative_float32_with_bounded_float16);
@@ -31376,7 +31622,7 @@ pub const IndexManager = struct {
         if (active_dense_projection_build_session != null)
             return error.DenseProjectionBuildAlreadyActive;
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
-        const generation = loader.manager.acquireVectorBlockGeneration() orelse return error.Unsupported;
+        const generation = loader.manager.acquireVectorBlockGenerationForRead() orelse return error.Unsupported;
         errdefer generation.release();
         if (generation.source_snapshot) |*snapshot| {
             if (snapshot.store.wal_has_mutations) return error.Unsupported;
@@ -31466,7 +31712,7 @@ pub const IndexManager = struct {
         const generation = if (build_session) |session|
             session.generation
         else blk: {
-            const acquired = manager.acquireVectorBlockGeneration() orelse return error.Unsupported;
+            const acquired = manager.acquireVectorBlockGenerationForRead() orelse return error.Unsupported;
             release_generation = true;
             break :blk acquired;
         };
@@ -31623,7 +31869,7 @@ pub const IndexManager = struct {
         const sequence = scratch.source_sequence orelse return false;
         if (session.native_vector_generation != null and session.native_vector_source_sequence != sequence) return false;
         var release = session.native_vector_generation == null;
-        const generation = session.native_vector_generation orelse manager.acquireVectorBlockGeneration() orelse return false;
+        const generation = session.native_vector_generation orelse manager.acquireVectorBlockGenerationForRead() orelse return false;
         defer if (release) generation.release();
         if (generation.opened.store.covered_source_sequence != sequence or generation.opened.scorePrecision() != .authoritative_float32) return false;
         const bindings = generation.member_bindings orelse return false;
@@ -31783,7 +32029,7 @@ pub const IndexManager = struct {
             // the matching CURRENT generation for this exact-completion
             // batch instead of forcing every candidate through metadata/key
             // resolution merely to establish a lease.
-            const current = loader.manager.acquireVectorBlockGeneration() orelse return;
+            const current = loader.manager.acquireVectorBlockGenerationForRead() orelse return;
             release_generation = true;
             break :blk current;
         };
@@ -32139,7 +32385,7 @@ pub const IndexManager = struct {
                     null
             else
                 null;
-            const generation = session_generation orelse manager.acquireVectorBlockGeneration() orelse {
+            const generation = session_generation orelse manager.acquireVectorBlockGenerationForRead() orelse {
                 if (error_bounds != null) return error.Unsupported;
                 break :blk null;
             };
@@ -32263,7 +32509,7 @@ pub const IndexManager = struct {
                 // artifact store rather than trusting a potentially stale
                 // decoded cache entry.
                 if (vector_block_generation == null) {
-                    if (entry.index.borrowCachedVector(vector_ids[i])) |cached_handle| {
+                    if (if (denseResidentReadAllowed(entry)) entry.index.borrowCachedVector(vector_ids[i]) else null) |cached_handle| {
                         var handle = cached_handle;
                         defer handle.deinit();
                         const cached = handle.view();
@@ -35599,32 +35845,7 @@ fn appendObservedFieldAnalyzers(
     cfg: *introducer_mod.TextAnalysisConfig,
     observed: []const mapper.ObservedFieldAnalyzer,
 ) !void {
-    if (observed.len == 0) return;
-
-    const FieldAnalyzer = std.meta.Child(@TypeOf(cfg.field_analyzers));
-    const original_len = cfg.field_analyzers.len;
-    const combined = try alloc.alloc(FieldAnalyzer, original_len + observed.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (combined[original_len..initialized]) |item| {
-            alloc.free(item.field_name);
-            alloc.free(item.analyzer_name);
-        }
-        alloc.free(combined);
-    }
-
-    for (cfg.field_analyzers, 0..) |item, i| combined[i] = item;
-    initialized = original_len;
-    for (observed) |item| {
-        combined[initialized] = .{
-            .field_name = try alloc.dupe(u8, item.field_name),
-            .analyzer_name = try alloc.dupe(u8, item.analyzer_name),
-        };
-        initialized += 1;
-    }
-
-    if (cfg.field_analyzers.len > 0) alloc.free(cfg.field_analyzers);
-    cfg.field_analyzers = combined;
+    try text_analysis_config.appendObservedFieldAnalyzers(alloc, cfg, observed);
 }
 
 fn mergeObservedTextFieldAnalyzers(
@@ -35702,33 +35923,21 @@ fn mergeObservedTextFieldAnalyzers(
         observed_initialized += 1;
     }
 
-    const FieldAnalyzer = std.meta.Child(@TypeOf(entry.text_analysis.field_analyzers));
-    const original_analysis_len = entry.text_analysis.field_analyzers.len;
-    const expanded_analysis = try self.alloc.alloc(FieldAnalyzer, original_analysis_len + additions.items.len);
-    var analysis_initialized = original_analysis_len;
-    var analysis_published = false;
-    defer if (!analysis_published) {
-        for (expanded_analysis[original_analysis_len..analysis_initialized]) |item| {
-            self.alloc.free(item.field_name);
-            self.alloc.free(item.analyzer_name);
-        }
-        self.alloc.free(expanded_analysis);
-    };
-    for (entry.text_analysis.field_analyzers, 0..) |item, i| expanded_analysis[i] = item;
-    for (additions.items, 0..) |item, i| {
-        const field_name = try self.alloc.dupe(u8, item.field_name);
-        errdefer self.alloc.free(field_name);
-        const analyzer_name = try self.alloc.dupe(u8, item.analyzer_name);
-        errdefer self.alloc.free(analyzer_name);
-        expanded_analysis[original_analysis_len + i] = .{
-            .field_name = field_name,
-            .analyzer_name = analyzer_name,
-        };
-        analysis_initialized += 1;
-    }
-
+    // Recompose against the immutable declaration, rather than appending raw
+    // observed mappings to the live analysis. Observations may inherit a
+    // schema analyzer that an explicit index configuration overrides.
+    var composed_analysis = try parseTextAnalysisForIndexConfig(self.alloc, entry.config.config_json, entry.runtime_schema);
+    defer introducer_mod.freeTextAnalysisConfig(self.alloc, composed_analysis);
+    try appendObservedFieldAnalyzers(self.alloc, &composed_analysis, expanded_observed);
+    // Prepared projections can retain pointers to custom analyzer objects.
+    // Observations change only field mappings, not those immutable resources.
     var candidate_analysis = entry.text_analysis;
-    candidate_analysis.field_analyzers = expanded_analysis;
+    candidate_analysis.field_analyzers = composed_analysis.field_analyzers;
+    composed_analysis.field_analyzers = &.{};
+    var analysis_published = false;
+    defer if (!analysis_published) introducer_mod.freeTextAnalysisConfig(self.alloc, .{
+        .field_analyzers = candidate_analysis.field_analyzers,
+    });
     try publishFullTextMetadata(
         store,
         self.alloc,
@@ -35738,13 +35947,15 @@ fn mergeObservedTextFieldAnalyzers(
     );
 
     const previous_observed = entry.observed_field_analyzers;
-    const previous_analysis = entry.text_analysis.field_analyzers;
+    const previous_analysis = entry.text_analysis;
     entry.observed_field_analyzers = expanded_observed;
-    entry.text_analysis.field_analyzers = expanded_analysis;
+    entry.text_analysis = candidate_analysis;
     observed_published = true;
     analysis_published = true;
     if (previous_observed.len > 0) self.alloc.free(previous_observed);
-    if (previous_analysis.len > 0) self.alloc.free(previous_analysis);
+    introducer_mod.freeTextAnalysisConfig(self.alloc, .{
+        .field_analyzers = previous_analysis.field_analyzers,
+    });
 }
 
 fn containsObservedFieldAnalyzer(
@@ -35823,6 +36034,45 @@ fn loadRuntimeSchemaForTextIndex(alloc: Allocator, store: anytype, index_name: [
 
     defer schema_mod.freeSchema(alloc, active_schema);
     return try schema_mod.loadSchemaVersion(store, alloc, explicit_version.?);
+}
+
+/// Named indexes do not encode their projection epoch in their name. A
+/// validation-only schema publication leaves their immutable postings and
+/// provenance untouched. Reopen may retain that epoch only after comparing
+/// the complete text projection, ignoring solely the logical schema version.
+/// The caller still verifies the generation/config/fingerprint witness against
+/// the selected historical schema; this never adopts an unproven generation.
+fn loadRuntimeSchemaForPersistentTextIndex(alloc: Allocator, store: anytype, index_name: []const u8, persistent: *persistent_mod.PersistentIndex) !?schema_mod.TableSchema {
+    const current = (try loadRuntimeSchemaForTextIndex(alloc, store, index_name)) orelse return null;
+    var current_owned = true;
+    defer if (current_owned) schema_mod.freeSchema(alloc, current);
+    if (textIndexSchemaVersion(index_name) != null or !persistent.hasPhysicalSegments()) {
+        current_owned = false;
+        return current;
+    }
+    const encoded = try persistent.readGenerationMetadataAlloc(alloc, persistent_mod.text_projection_provenance_meta_key);
+    defer if (encoded) |bytes| alloc.free(bytes);
+    if (encoded) |bytes| {
+        const provenance = try TextProjectionProvenance.decode(bytes);
+        if (provenance.schema_version) |version| {
+            if (version != current.version) {
+                const historical = (try schema_mod.loadSchemaVersion(store, alloc, version)) orelse return error.TextProjectionProvenanceMismatch;
+                var historical_owned = true;
+                defer if (historical_owned) schema_mod.freeSchema(alloc, historical);
+                var normalized = current;
+                normalized.version = historical.version;
+                const current_projection = try schema_mod.serializeTextProjectionSchema(alloc, normalized);
+                defer alloc.free(current_projection);
+                const historical_projection = try schema_mod.serializeTextProjectionSchema(alloc, historical);
+                defer alloc.free(historical_projection);
+                if (!std.mem.eql(u8, current_projection, historical_projection)) return error.TextProjectionProvenanceMismatch;
+                historical_owned = false;
+                return historical;
+            }
+        }
+    }
+    current_owned = false;
+    return current;
 }
 
 fn textIndexSchemaVersion(index_name: []const u8) ?u32 {
@@ -41857,6 +42107,44 @@ test "full text dictionary publication rejects duplicate semantic owners" {
     try std.testing.expectEqual(algebraic_mod.lexical.DictionaryLayoutKind.lexicon_postings_rows, registry_entry.layout);
 }
 
+test "observed analyzer publication preserves custom analyzer resources" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const config =
+        \\{"analysis_config":{"field_analyzers":{"title":"tri_edge_analyzer"},"token_filters":{"tri_edge":{"type":"edge_ngram","config":{"min":3,"max":5}}},"analyzers":{"tri_edge_analyzer":{"type":"custom","config":{"tokenizer":"unicode","token_filters":["to_lower","tri_edge"]}}}}}
+    ;
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "ft_v1", .kind = .full_text, .config_json = config }});
+    const entry = manager.textIndexEntry("ft_v1").?;
+    const pinned = introducer_mod.resolveAnalyzerName("tri_edge_analyzer", entry.text_analysis).?;
+    const filters = pinned.filters.ptr;
+    for ([_][]const u8{ "body", "summary" }) |field| {
+        const observed = [_]mapper.ObservedFieldAnalyzer{.{
+            .field_name = @constCast(field),
+            .analyzer_name = @constCast("standard"),
+        }};
+        try mergeObservedTextFieldAnalyzers(&manager, &store, entry, &observed);
+        try std.testing.expect(pinned == introducer_mod.resolveAnalyzerName("tri_edge_analyzer", entry.text_analysis).?);
+        try std.testing.expect(filters == pinned.filters.ptr);
+        const tokens = try pinned.analyze(alloc, "Mixed");
+        defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+        try std.testing.expectEqual(@as(usize, 3), tokens.len);
+        try std.testing.expectEqualStrings("mix", tokens[0].term);
+        try std.testing.expectEqualStrings("mixe", tokens[1].term);
+        try std.testing.expectEqualStrings("mixed", tokens[2].term);
+    }
+    try std.testing.expectEqual(@as(usize, 3), entry.text_analysis.field_analyzers.len);
+}
+
 test "observed full text analyzers publish shared dictionary ownership" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -42839,6 +43127,81 @@ test "non-empty schema-less text generation fails closed when a schema appears" 
     );
 }
 
+test "named text generation retains proven projection across validation epochs and rejects incompatible history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const fields = [_]schema_mod.FullTextField{.{ .path = "state", .emitted_name = "state", .analyzer = "standard" }};
+    const documents = [_]schema_mod.FullTextDocument{.{ .name = "product", .fields = &fields }};
+    const initial: schema_mod.TableSchema = .{ .version = 1, .default_type = "product", .full_text_documents = &documents };
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, initial));
+    const history_key = try schema_mod.schemaVersionKeyAlloc(alloc, 1);
+    defer alloc.free(history_key);
+    const history_bytes = try schema_mod.serializeSchema(alloc, initial);
+    defer alloc.free(history_bytes);
+    var original_witness: []u8 = undefined;
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "named_text", .kind = .full_text, .config_json = "{}" }});
+        try manager.indexBatch(&store, &.{.{ .key = "doc:a", .value = "{\"state\":\"Published State\"}" }});
+        const entry = manager.textIndexEntry("named_text").?;
+        original_witness = (try entry.persistent.readGenerationMetadataAlloc(alloc, persistent_mod.text_projection_provenance_meta_key)).?;
+    }
+    defer alloc.free(original_witness);
+    var successor = initial;
+    successor.version = 2;
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, successor));
+    {
+        var reopened = try IndexManager.init(alloc, path);
+        defer reopened.deinit();
+        reopened.updateRange(.{ .start = "", .end = "" });
+        try reopened.load(&store);
+        const entry = reopened.textIndexEntry("named_text") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(u32, 1), entry.runtime_schema.?.version);
+        const witness = (try entry.persistent.readGenerationMetadataAlloc(alloc, persistent_mod.text_projection_provenance_meta_key)).?;
+        defer alloc.free(witness);
+        try std.testing.expectEqualSlices(u8, original_witness, witness);
+        const Faults = struct {
+            fn run(a: Allocator, source: *docstore_mod.DocStore, persistent: *persistent_mod.PersistentIndex) !void {
+                const loaded = (try loadRuntimeSchemaForPersistentTextIndex(a, source, "named_text", persistent)).?;
+                defer schema_mod.freeSchema(a, loaded);
+                try std.testing.expectEqual(@as(u32, 1), loaded.version);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(alloc, Faults.run, .{ &store, &entry.persistent });
+    }
+    // Provenance alone cannot stand in for a missing immutable layout.
+    try store.delete(history_key);
+    {
+        var reopened = try IndexManager.init(alloc, path);
+        defer reopened.deinit();
+        reopened.updateRange(.{ .start = "", .end = "" });
+        try reopened.load(&store);
+        try std.testing.expect(reopened.textIndexEntry("named_text") == null);
+        try std.testing.expectEqualStrings("TextProjectionProvenanceMismatch", reopened.loadFailure("named_text").?);
+    }
+    try store.put(history_key, history_bytes);
+    const changed_fields = [_]schema_mod.FullTextField{.{ .path = "state", .emitted_name = "state", .analyzer = "keyword" }};
+    const changed_documents = [_]schema_mod.FullTextDocument{.{ .name = "product", .fields = &changed_fields }};
+    successor.version = 3;
+    successor.full_text_documents = &changed_documents;
+    try std.testing.expect(try schema_mod.saveSchema(&store, alloc, successor));
+    var rejected = try IndexManager.init(alloc, path);
+    defer rejected.deinit();
+    rejected.updateRange(.{ .start = "", .end = "" });
+    try rejected.load(&store);
+    try std.testing.expect(rejected.textIndexEntry("named_text") == null);
+    try std.testing.expectEqualStrings("TextProjectionProvenanceMismatch", rejected.loadFailure("named_text").?);
+}
+
 test "non-empty text generation without provenance fails closed" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -43244,6 +43607,66 @@ test "observed full text analyzer metadata reads legacy analyzer-only format" {
     try std.testing.expect(!decoded[1].doc_values);
     try std.testing.expect(!decoded[1].sortable);
     try std.testing.expect(!decoded[1].include_in_all);
+}
+
+test "dense repair read retains source cut across scratch recycling and native generation mismatch" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/repair-read", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var native_storage = lsm_backend_mod.MemoryStorage.init(a);
+    defer native_storage.deinit();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    manager.setVectorBlockStorage(native_storage.storage());
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "v", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}" }});
+    try std.testing.expect(try manager.tryPrepareFreshDenseVectorCaptureBase(manager.denseIndex("v").?, 0));
+    try store.put("fixture-payload", "old");
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    var scope = try manager.captureDenseRepairRead("v", &read);
+    defer scope.deinit();
+    {
+        scope.activate();
+        defer scope.deactivate();
+        try std.testing.expect(!IndexManager.denseResidentReadAllowed(scope.entry));
+        try std.testing.expectEqualStrings("old", try scope.source.get(&store, "fixture-payload"));
+        scope.preload_read = try scope.source.read_txn.?.forkBorrowedRead();
+        const insertion_view = try scope.preload_read.?.get("fixture-payload");
+        try store.put("fixture-payload", "new");
+        scope.source.raw_read_value_bytes = scope.source.rawReadLimitBytes();
+        try scope.source.recycleRawReadStateIfNeeded();
+        try std.testing.expectEqualStrings("old", insertion_view);
+        try std.testing.expectEqualStrings("old", try scope.source.get(&store, "fixture-payload"));
+        // Residency fallback must retain the same source snapshot too.
+        scope.source.useLsmResidency();
+        try std.testing.expectEqualStrings("old", try scope.source.get(&store, "fixture-payload"));
+    }
+    const record = try @import("../derived/derived_types.zig").encodeLogRecord(a, .{ .sequence = 1 });
+    defer a.free(record);
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.setReplayOpaque(1, record);
+        try batch.commit();
+    }
+    store.observeExternalReplayCommit(1);
+    const stale_generation = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
+    defer stale_generation.release();
+    try std.testing.expect(stale_generation.opened.store.covered_source_sequence != store.lastReplaySequence(0));
+    var fresh = try store.beginReadTxn();
+    defer fresh.abort();
+    var mismatched = try manager.captureDenseRepairRead("v", &fresh);
+    defer mismatched.deinit();
+    mismatched.activate();
+    defer mismatched.deactivate();
+    try std.testing.expect(mismatched.source.snapshot_generation == null);
+    try std.testing.expect(manager.acquireVectorBlockGenerationForRead() == null);
+    try std.testing.expectEqualStrings("new", try mismatched.source.get(&store, "fixture-payload"));
 }
 
 test "dense bulk-ingest uses recursive bulk build for large empty index batch" {
@@ -49965,6 +50388,144 @@ test "graph projection preserves numeric literals in configured templates" {
     try std.testing.expectEqualStrings("{\"score\":1.0000000000000001,\"large\":18446744073709551615}", cfg.artifact_sources[0].mapping.metadata_template_json);
     for ([_][]const u8{ "{\"max_edges_per_document\":-1}", "{\"max_edges_per_document\":1.5}", "{\"max_edges_per_document\":1000001}", "{\"metrics\":{\"pagerank\":{\"max_iterations\":1.5}}}" }) |raw| {
         try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, raw));
+    }
+}
+
+test "dense repair native WAL certifies the pinned artifact revision rather than the live tip" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/repair-certification", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var native = lsm_backend_mod.MemoryStorage.init(a);
+    defer native.deinit();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    manager.primary_store = &store;
+    manager.setVectorBlockStorage(native.storage());
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "v", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}" }});
+    const entry = manager.denseIndex("v").?;
+    try manager.prepareFreshDenseVectorCaptureBase(entry, 0);
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc:a", "v");
+    defer a.free(key);
+    const old = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &.{ 1, 2 });
+    defer a.free(old);
+    try store.put(key, old);
+    var source = try store.beginReadTxn();
+    defer source.abort();
+    const changed = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &.{ 9, 10 });
+    defer a.free(changed);
+    try store.put(key, changed);
+    try std.testing.expect(try manager.publishVectorBlockMutationWalFromRead(entry, &.{.{
+        .kind = .upsert,
+        .vector_id = 1,
+        .metadata = @constCast("doc:a"),
+        .vector = @constCast(&[_]f32{ 1, 2 }),
+    }}, 0, &source));
+    const generation = manager.acquireVectorBlockGeneration() orelse return error.TestUnexpectedResult;
+    defer generation.release();
+    const found = try generation.opened.get(key, 0, std.hash.XxHash64.hash(0, old));
+    switch (found) {
+        .vector => |value| {
+            try std.testing.expectEqual(std.hash.XxHash64.hash(0, old), value.revision);
+            try std.testing.expect(value.revision != std.hash.XxHash64.hash(0, changed));
+            var scratch: [2]f32 = undefined;
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, try value.decodeExactInto(&scratch));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const lease = (try manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions("v", .{})).?;
+    defer manager.cancelDensePostingSidecarCaptureLeaseByName("v", lease) catch {};
+    try std.testing.expectError(error.RepairSourceChanged, manager.finishDensePostingSidecarCaptureLeaseByNameFromRead("v", lease, 1, &source));
+    try manager.validateDensePostingCaptureLeaseByName("v", lease);
+}
+
+test "dense repair primary matrix projects bounded source-only waves without derived artifacts" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/primary-matrix", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    manager.primary_store = &store;
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "v", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}" }});
+    const entry = manager.denseIndex("v").?;
+    const count = 137;
+    var names: [count][16]u8 = undefined;
+    var metadata: [count]?[]const u8 = undefined;
+    var ids: [count]u64 = undefined;
+    var positions: [count]usize = undefined;
+    for (0..count) |i| {
+        const name = try std.fmt.bufPrint(&names[i], "doc:{d:0>3}", .{i});
+        metadata[i] = name;
+        ids[i] = @intCast(i + 1);
+        positions[i] = count - 1 - i;
+        const key = try internal_keys.documentKeyAlloc(a, name);
+        defer a.free(key);
+        var value_buf: [64]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "{{\"embedding\":[{d},1]}}", .{i});
+        try store.put(key, value);
+    }
+    var source = try store.beginReadTxn();
+    defer source.abort();
+    // Live primary rows disagree, and there are no implicit artifacts at
+    // either cut. A repair must not use current rows or native/resident data.
+    for (metadata) |name| {
+        const key = try internal_keys.documentKeyAlloc(a, name.?);
+        defer a.free(key);
+        try store.put(key, "{\"embedding\":[999,999]}");
+    }
+    var scope = try manager.captureDenseRepairRead("v", &source);
+    defer scope.deinit();
+    scope.activate();
+    defer scope.deactivate();
+    const Transform = struct {
+        fn copy(_: *hbc_mod.HBCIndex, input: []const f32, output: []f32) []const f32 {
+            @memcpy(output, input);
+            return output;
+        }
+    };
+    var matrix: [count * 2]f32 = @splat(-1);
+    var scratch: [2]f32 = undefined;
+    try IndexManager.loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(entry.vector_loader_context.?, &ids, &metadata, &positions, &matrix, &scratch, 2, entry.index, Transform.copy, true);
+    for (0..count) |i| {
+        const start = positions[i] * 2;
+        try std.testing.expectEqual(@as(f32, @floatFromInt(i)), matrix[start]);
+        try std.testing.expectEqual(@as(f32, 1), matrix[start + 1]);
+    }
+    try std.testing.expectEqual(@as(usize, 3), scope.source.raw_batch_reads);
+    try std.testing.expectEqual(@as(usize, 0), scope.source.raw_scalar_reads);
+    try std.testing.expectEqual(@as(usize, 0), scope.source.vector_cache.count());
+    {
+        const key = try internal_keys.documentKeyAlloc(a, "artifact-only");
+        defer a.free(key);
+        try store.put(key, "{}");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "artifact-only", "v");
+        defer a.free(artifact_key);
+        const artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &.{ 7, 8 });
+        defer a.free(artifact);
+        try store.put(artifact_key, artifact);
+        var mixed_source = try store.beginReadTxn();
+        defer mixed_source.abort();
+        const changed = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &.{ 9, 10 });
+        defer a.free(changed);
+        try store.put(artifact_key, changed);
+        const missing_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "missing-at-source", "v");
+        defer a.free(missing_key);
+        try store.put(missing_key, changed);
+        var mixed_scope = try manager.captureDenseRepairRead("v", &mixed_source);
+        defer mixed_scope.deinit();
+        mixed_scope.activate();
+        defer mixed_scope.deactivate();
+        var mixed_matrix: [4]f32 = undefined;
+        try IndexManager.loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(entry.vector_loader_context.?, &.{ 1000, 1001 }, &.{ "artifact-only", metadata[0].? }, &.{ 1, 0 }, &mixed_matrix, &scratch, 2, entry.index, Transform.copy, true);
+        try std.testing.expectEqualSlices(f32, &.{ 999, 999, 7, 8 }, &mixed_matrix);
+        try std.testing.expectError(error.NotFound, IndexManager.loadDenseVectorsForHbcBatchIntoTransformedMatrixWithReplay(entry.vector_loader_context.?, &.{1002}, &.{"missing-at-source"}, &.{0}, &mixed_matrix, &scratch, 2, entry.index, Transform.copy, true));
     }
 }
 

@@ -534,7 +534,10 @@ fn verifyStandaloneMetadataTopology(alloc: Allocator, store: *@import("../../met
     // The active program may differ from mutable policy drafts. Verify its
     // immutable metadata snapshot survived materialization before any owner
     // can be made routable by the promoted seed.
-    const exported_bytes = store.exportSystemCatalog(scratch, group_id) catch |err| switch (err) {
+    const exported_bytes = (if (topology.catalog.native_checkpoint) |checkpoint|
+        store.projectHotStandbyCheckpointCatalog(scratch, group_id, checkpoint)
+    else
+        store.exportSystemCatalog(scratch, group_id)) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.SeedMetadataTopologyMismatch,
     };
@@ -966,6 +969,80 @@ test "storage.ha protected owner seed accepts serving program and rejects stale 
     var stale = active_program;
     stale.policy_generation = 2;
     try std.testing.expectError(error.SeedReplicaPolicyMismatch, verifyReplicaRowPolicy(alloc, db_path, replica, &.{stale}));
+}
+
+test "storage.ha system catalog seed encoding retains immutable active policy programs" {
+    const alloc = std.testing.allocator;
+    const policies = @import("antfly_local_sources").system_catalog_policies;
+    const owner: policies.Publication.OwnerIdentity = .{ .group_id = 77, .descriptor_digest = @splat(4) };
+    const pending: policies.Publication.OwnerAck = .{ .owner = owner, .catalog_epoch = 2, .phase = .pending_install, .applied_term = 1, .applied_index = 2, .bundle_digest = @splat(5) };
+    var serving = pending;
+    serving.phase = .serving_install;
+    serving.applied_index = 3;
+    const publication: policies.Publication = .{
+        .table_id = 7,
+        .schema_version = 1,
+        .schema_digest = @splat(3),
+        .generation = 1,
+        .catalog_epoch = 2,
+        .phase = .active,
+        .required_owners = &.{owner},
+        .acknowledged_owners = &.{pending},
+        .serving_acknowledged_owners = &.{serving},
+    };
+    // No policy records is a real enabled/default-deny program, not disabled.
+    const program: policies.InstallSnapshot = .{
+        .table_id = 7,
+        .schema_version = 1,
+        .schema_digest = @splat(3),
+        .policy_generation = 1,
+        .catalog_epoch = 2,
+        .phase = .active,
+        .records = &.{},
+        .settings = &.{},
+    };
+    var tables = [_]topology_records.TableRecord{.{ .table_id = 7, .name = "table:7" }};
+    const exported: @import("../../system_catalog/projection.zig").Export = .{
+        .epoch = 7,
+        .tables = &tables,
+        .ranges = &.{},
+        .system_catalog = .{ .revision = 2, .next_id = 8, .resources = &.{.{ .kind = .table, .id = 7, .parent_id = 2, .name = "events", .storage_name = "table:7" }}, .policy_publications = &.{publication} },
+        .policy_install_snapshots = &.{program},
+    };
+    const borrowed = LogicalCatalog.fromExport(exported);
+    try std.testing.expect(borrowed.policy_install_snapshots.ptr == exported.policy_install_snapshots.ptr);
+    try validateLogicalCatalog(alloc, 4, borrowed);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, borrowed, .{});
+    defer alloc.free(bytes);
+    var decoded = try std.json.parseFromSlice(LogicalCatalog, alloc, bytes, .{});
+    defer decoded.deinit();
+    try validateLogicalCatalog(alloc, 4, decoded.value);
+    try std.testing.expectEqualDeep(program, decoded.value.policy_install_snapshots[0]);
+    try std.testing.expectEqualDeep(publication, decoded.value.system_catalog.?.policy_publications[0]);
+    decoded.value.policy_install_snapshots = &.{};
+    try std.testing.expectError(error.InvalidSeedTopology, validateLogicalCatalog(alloc, 4, decoded.value));
+}
+
+test "sequence catalog seed projection requires the exact native artifact even without live sequences" {
+    const a = std.testing.allocator;
+    const checkpoint: @import("../../system_catalog/projection.zig").Export.NativeCheckpoint = .{ .size_bytes = 1234, .sha256 = @splat(7) };
+    const hex = std.fmt.bytesToHex(checkpoint.sha256, .lower);
+    var topology: Topology = .{ .generation = "sequence-cut", .catalog = .{ .epoch = 1, .tables = &.{}, .ranges = &.{}, .system_catalog = .{}, .native_checkpoint = checkpoint }, .replicas = &.{} };
+    try std.testing.expectError(error.InvalidStandaloneMetadataCheckpoint, seed_topology.validateCatalogCheckpoint(topology));
+    topology.standalone_metadata = .{ .path = standalone_metadata_name, .size_bytes = checkpoint.size_bytes, .sha256 = &hex };
+    try seed_topology.validateCatalogCheckpoint(topology);
+    try validateLogicalCatalog(a, 4, topology.catalog);
+    const bytes = try std.json.Stringify.valueAlloc(a, topology, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(Topology, a, bytes, .{});
+    defer decoded.deinit();
+    try seed_topology.validateCatalogCheckpoint(decoded.value);
+    try std.testing.expectEqualDeep(checkpoint, decoded.value.catalog.native_checkpoint.?);
+    topology.standalone_metadata.?.size_bytes += 1;
+    try std.testing.expectError(error.InvalidStandaloneMetadataCheckpoint, seed_topology.validateCatalogCheckpoint(topology));
+    topology.standalone_metadata.?.size_bytes = checkpoint.size_bytes;
+    topology.standalone_metadata.?.sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(error.InvalidStandaloneMetadataCheckpoint, seed_topology.validateCatalogCheckpoint(topology));
 }
 
 test "storage.ha system catalog seed versions require complete logical identities" {

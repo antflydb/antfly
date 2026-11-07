@@ -57,6 +57,20 @@ pub const Context = struct {
             return;
         }
         self.remaining -= count;
+        try self.pollCheckpoint(count);
+    }
+
+    /// Poll an already-admitted operation without spending its quota twice.
+    /// Parent ownership and sticky cancellation are identical to charge().
+    pub fn pollCheckpoint(self: *Context, count: u64) !void {
+        if (self.failure) |err| return err;
+        if (self.parent) |parent| {
+            parent.pollCheckpoint(count) catch |err| {
+                self.failure = err;
+                return err;
+            };
+            return;
+        }
         if (count >= 256 -| self.since_poll) {
             try self.poll();
         } else self.since_poll += @intCast(count);
@@ -705,8 +719,18 @@ pub fn subtract(ctx: *Context, left: Value, right: Value) !Owned {
 /// Allocation-free exact integer view for comparisons and coercion planning.
 /// The caller's five groups cover every i64, including its negative minimum.
 pub fn integerView(value: i64, storage: *[5]u16) Value {
+    return integerViewWidth(i64, 5, value, storage);
+}
+
+/// SUM(int8) uses an exact i128 transition; do not narrow through i64 or f64
+/// when constructing its PostgreSQL NUMERIC result.
+pub fn integer128View(value: i128, storage: *[10]u16) Value {
+    return integerViewWidth(i128, 10, value, storage);
+}
+
+fn integerViewWidth(comptime T: type, comptime width: usize, value: T, storage: *[width]u16) Value {
     if (value == 0) return .{};
-    var remaining_integer: u64 = @abs(value);
+    var remaining_integer: @Int(.unsigned, @bitSizeOf(T)) = @abs(value);
     var first: usize = storage.len;
     while (remaining_integer != 0) : (remaining_integer /= base) {
         first -= 1;
@@ -715,6 +739,22 @@ pub fn integerView(value: i64, storage: *[5]u16) Value {
     var last: usize = storage.len;
     while (storage[last - 1] == 0) last -= 1;
     return .{ .digits = storage[first..last], .weight = @intCast(storage.len - first - 1), .negative = value < 0 };
+}
+
+test "SQL exact NUMERIC wide integer views cover i128 endpoints without allocation" {
+    var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+    var comparison: Context = .{ .alloc = no_memory.allocator() };
+    var parsing: Context = .{ .alloc = std.testing.allocator };
+    for ([_]i128{ 0, 1, -1, 10000, -100000000, 18446744073709551614, std.math.minInt(i128), std.math.maxInt(i128) }) |integer| {
+        var digits: [10]u16 = undefined;
+        const view = integer128View(integer, &digits);
+        try validateCanonical(&comparison, view);
+        var text: [41]u8 = undefined;
+        var expected = try parse(&parsing, try std.fmt.bufPrint(&text, "{d}", .{integer}));
+        defer expected.deinit();
+        try std.testing.expectEqual(std.math.Order.eq, try order(&comparison, view, expected.value));
+        try std.testing.expectEqual(@as(u16, 0), view.scale);
+    }
 }
 
 test "SQL exact NUMERIC integer views cover i64 endpoints and trimmed groups without allocation" {

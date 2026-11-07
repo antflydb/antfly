@@ -1622,10 +1622,13 @@ individual compile reservations.
 Native Apple Silicon CPU Debug qualification on 2026-10-16 (Zig 0.17.0,
 macOS SDK 26.3.1) measured public-api-parity at 18,029,035,520 bytes,
 exceeding its 15 GiB authored reservation. Its native Darwin Debug floor
-is now 22 GiB, retaining more than 25% headroom. The floor never lowers an
-authored claim and does not apply to cross-host builds, release modes or
-other test objects. A 30 GiB local compiler budget can still overlap it
-with smaller work, but cannot admit another 15 GiB API compile alongside it.
+was raised to 22 GiB, retaining more than 25% headroom. Qualification on
+2026-11-02 with SDK 26.5 measured 23,968,071,680 bytes for the expanded
+public API graph, raising that floor to 28 GiB with at least 25% headroom.
+The floor never lowers an authored claim and does not apply to cross-host
+builds, release modes or other test objects. A 30 GiB local compiler budget can
+still overlap it with 2 GiB work, but cannot admit another 15 GiB API compile
+alongside it.
 The same qualification measured the API document identity/restore root at
 14,373,978,112 bytes against its former 12 GiB claim. Its native Darwin Debug
 floor is 18 GiB with the same profile guards and headroom. The object now has

@@ -32,6 +32,15 @@ pub const Recipe = struct {
     schema_json: []const u8,
     read_schema_json: []const u8,
     indexes_json: []const u8,
+    full_text_read_index: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.full_text_read_index) |version| {
+            try jw.write(.{ .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .full_text_read_index = version });
+        } else {
+            try jw.write(.{ .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json });
+        }
+    }
 };
 pub fn validateCover(table_id: u64, cover: []const Range) !void {
     if (cover.len == 0 or cover.len > 4096 or cover[0].start_key.len != 0 or cover[cover.len - 1].end_key != null) return error.CatalogGenerationChanged;

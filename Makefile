@@ -39,7 +39,7 @@ build: ## Build the Zig antfly binary and copy it to ./antfly.
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 	cp zig/zig-out/bin/antfly ./antfly
 
-generate: graph-identifier-generate provider-matrix-generate ## Regenerate openapi.yaml, Zig modules, SDKs, and the antfarm build.
+generate: graph-identifier-generate provider-matrix-generate sql-catalog-contract-generate ## Regenerate openapi.yaml, Zig modules, SDKs, and the antfarm build.
 	$(SCRIPTS_PY) scripts/generate_sources_clients.py
 	$(SCRIPTS_PY) scripts/generate_memory_openapi.py --zig $(ZIG)
 	$(SCRIPTS_PY) scripts/join_public_openapi.py openapi.yaml
@@ -95,7 +95,7 @@ zig-checksums-check:
 	python3 -m unittest discover -s scripts/ci -p test_check_zig_checksum_usage.py
 	python3 scripts/ci/check_zig_checksum_usage.py
 
-zig-generated-check: graph-identifier-check provider-matrix-check
+zig-generated-check: graph-identifier-check provider-matrix-check sql-catalog-contract-check
 	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py scripts/test_graph_query_error_contract.py
 	$(ZIG_MAKE) generated-check
 
@@ -187,7 +187,8 @@ minikube-restart: minikube-delete minikube-start ## Delete and recreate Minikube
 # SQL Extraction Audits (intentionally outside default build/test gates)
 # ====================================================================================
 
-.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check
+.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check sql-catalog-lifecycle-oracle-check sql-default-lifecycle-oracle-check sql-table-creation-oracle-check
+.PHONY: sql-expression-index-oracle-check
 
 sql-parity-inventory-check: ## Audit SQL parity inventory.
 	python3 scripts/check_sql_parity_inventory.py
@@ -197,3 +198,25 @@ sql-parity-evidence-check: ## Audit SQL parity evidence.
 
 sql-parity-release-check: ## Audit SQL parity release readiness.
 	python3 scripts/check_sql_parity_inventory.py --release
+
+sql-prepared-transaction-oracle-check: ## Check PostgreSQL prepared GID restart, commit and rollback contracts.
+	$(SCRIPTS_PY) scripts/generate_sql_prepared_transaction_reference.py --check
+
+sql-catalog-lifecycle-oracle-check: ## Check PostgreSQL catalog lifecycle contracts.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_catalog_lifecycle.py
+
+sql-default-lifecycle-oracle-check: ## Check exact PostgreSQL default DDL and future mutation contracts.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_default_lifecycle.py
+
+sql-table-creation-oracle-check: ## Check PostgreSQL generated/default CREATE and complete mutation postimages.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_table_creation_lifecycle.py
+
+sql-expression-index-oracle-check: ## Check PostgreSQL expression/partial index volatility and mutation postimages.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_expression_index_lifecycle.py
+
+.PHONY: sql-catalog-contract-generate sql-catalog-contract-check
+sql-catalog-contract-generate:
+	$(SCRIPTS_PY) scripts/generate_sql_catalog_contract.py
+
+sql-catalog-contract-check:
+	$(SCRIPTS_PY) scripts/generate_sql_catalog_contract.py --check

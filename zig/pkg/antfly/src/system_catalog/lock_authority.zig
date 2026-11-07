@@ -1,0 +1,684 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Metadata authority adapter. External decisions remain in the shared native
+//! prepared registry; neither expiry nor a claimed vote is resolution evidence.
+const std = @import("std");
+const local = @import("antfly_local_sources");
+pub const scopes = local.storage_pessimistic_lock_authority;
+pub const locks = local.storage_pessimistic_lock_contract;
+pub const prepared = @import("prepared_transactions.zig");
+pub const outcomes = prepared.outcomes;
+const A = std.mem.Allocator;
+pub const max_bytes = 16384;
+pub const decoder_version: u16 = @import("../metadata/topology_protocol.zig").sql_native_lock_custody_version;
+pub const Ref = struct { backend: locks.Backend, command: scopes.Command };
+pub const EffectInput = struct { command: scopes.Command, effect: scopes.ledger.Effect };
+const recovery = @import("../metadata/sql_relation_recovery.zig");
+pub const NativeRetirement = struct {
+    generation: u64,
+    query: recovery.Query,
+    source_group_id: u64,
+    decision: ?scopes.DecisionRef = null,
+    handoff: bool = false,
+};
+const DataRetirement = struct { generation: u64, native: local.storage_pessimistic_lock_control.Snapshot };
+pub const Request = struct {
+    abandoned_private: ?@import("../metadata/abandoned_temporary_retirement.zig").Selection = null,
+    scope_retirement: ?@import("../metadata/scope_retirement_ledger.zig").SourceControl = null,
+    notification_generation: ?u64 = null,
+    admission: outcomes.Admission,
+    incarnation: [16]u8,
+    standalone: bool,
+    database: u64,
+    actor: prepared.Actor,
+    backend: locks.Backend,
+    operation: union(enum) {
+        notification_gc: struct { scope: @import("sql_notifications.zig").Scope, steps: u8 = 1 },
+        notification_bind: struct { command: scopes.Command, connection: [32]u8, generation: u64, sender_pid: i32 },
+        notification_offer: struct { connection: [32]u8, generation: u64, cursor: local.sql_ast.notifications.Cursor, maximum: u16 = 128 },
+        notification_ack: struct { connection: [32]u8, generation: u64, cursor: local.sql_ast.notifications.Cursor },
+        register: scopes.Registration,
+        begin: scopes.Command,
+        finish: scopes.Command,
+        renew: struct { expected_expiry: u64, expires_at_ms: u64, observed_at_ms: u64 },
+        fence: scopes.Fence,
+        bind: struct { command: scopes.Command, transaction: [16]u8 },
+        data_enroll: struct { command: scopes.Command, transaction: [16]u8, spec: scopes.Data.Spec },
+        data_ack: struct { generation: u64, command: scopes.Command, native: local.storage_pessimistic_lock_control.Snapshot },
+        data_retire: DataRetirement,
+        data_handoff: DataRetirement,
+        native_retire: NativeRetirement,
+        release: scopes.Transaction,
+        /// Exact unadmitted purpose, retained locally before dispatch.
+        /// Native journal absence/rejection, not that local claim, authorizes cleanup.
+        release_unadmitted: prepared.Mutation,
+        effect: EffectInput,
+        cancel: EffectInput,
+        step: EffectInput,
+        close_step,
+    },
+    pub fn jsonStringify(self: Request, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Request).@"struct".field_names) |field| {
+            const omit = (comptime std.mem.eql(u8, field, "notification_generation")) and self.notification_generation == null or
+                (comptime std.mem.eql(u8, field, "scope_retirement")) and self.scope_retirement == null or
+                (comptime std.mem.eql(u8, field, "abandoned_private")) and self.abandoned_private == null;
+            if (!omit) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+    pub fn requiredDecoderVersion(self: Request) u16 {
+        if (self.abandoned_private != null) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
+        if (self.operation == .native_retire) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
+        if (self.scope_retirement != null) return @import("../metadata/topology_protocol.zig").sql_scope_retirement_version;
+        if (self.notification_generation != null or self.operation == .notification_gc or self.operation == .notification_bind or self.operation == .notification_offer or self.operation == .notification_ack) return @import("../metadata/topology_protocol.zig").sql_notifications_version;
+        return decoder_version;
+    }
+    pub fn validate(self: Request) !void {
+        if (self.abandoned_private) |selection| {
+            try selection.validate();
+            if (selection.generation == null or self.operation != .data_retire or self.operation.data_retire.generation != selection.generation.? or
+                self.actor.session_user.kind != .bootstrap or self.actor.current_role != null or self.scope_retirement != null) return error.InvalidCatalogMutation;
+        }
+        if (self.scope_retirement) |root| {
+            try root.root.validate();
+            if (root.expected_after) |backend| try backend.validate();
+            if (root.root.reference.kind != .database or root.root.reference.database != self.database or
+                self.operation != .fence or self.operation.fence != .close or
+                self.actor.session_user.kind != .bootstrap or self.actor.current_role != null) return error.InvalidCatalogMutation;
+        }
+        if (self.notification_generation) |generation| if (generation < 2 or self.operation != .finish) return error.InvalidCatalogMutation;
+        try self.admission.validate();
+        try self.actor.validate();
+        try self.backend.validate();
+        if (self.database == 0 or !std.mem.eql(u8, &self.backend.incarnation, &self.incarnation)) return error.InvalidCatalogMutation;
+        switch (self.operation) {
+            .register => |value| if (!value.lease.backend.eql(self.backend) or value.standalone != self.standalone) return error.InvalidCatalogMutation,
+            .effect, .cancel, .step => |value| {
+                try value.command.validate();
+                try value.effect.validate();
+                if (!value.effect.backend.eql(self.backend)) return error.InvalidCatalogMutation;
+                if (self.operation == .cancel and value.effect.action != .acquire) return error.InvalidCatalogMutation;
+                if (self.operation == .step and value.effect.action != .control) return error.InvalidCatalogMutation;
+                if (value.effect.action == .control) switch (value.effect.action.control) {
+                    .prepare, .close => return error.InvalidCatalogMutation,
+                    else => {},
+                } else if (value.effect.action.class() != .advisory) return error.InvalidCatalogMutation;
+            },
+            .begin, .finish => |command| try command.validate(),
+            .bind => |value| try value.command.validate(),
+            .data_enroll => |value| {
+                try value.command.validate();
+                try value.spec.validate(.{ .home = .metadata, .group = value.spec.route.metadata_group_id, .incarnation = self.incarnation });
+                if (std.mem.allEqual(u8, &value.transaction, 0)) return error.InvalidCatalogMutation;
+            },
+            .data_ack => |value| {
+                if (value.generation == 0) return error.InvalidCatalogMutation;
+                try value.command.validate();
+            },
+            .data_retire, .data_handoff => |value| if (value.generation == 0) return error.InvalidCatalogMutation,
+            .native_retire => |value| {
+                try value.query.physical_pin.validate();
+                if (value.generation == 0 or value.source_group_id == 0 or value.query.table_id != value.query.physical_pin.table_id or
+                    (value.handoff and value.decision == null) or self.actor.session_user.kind != .bootstrap or self.actor.current_role != null) return error.InvalidCatalogMutation;
+                if (value.decision) |decision| try decision.validate();
+            },
+            .release_unadmitted => |original| {
+                try original.validate();
+                if (original.operation != .admit or !std.mem.eql(u8, &original.incarnation, &self.incarnation) or original.standalone != self.standalone or original.database_id != self.database) return error.InvalidCatalogMutation;
+                const ref = original.operation.admit.identity.lock_scope orelse return error.InvalidCatalogMutation;
+                if (!ref.backend.eql(self.backend)) return error.InvalidCatalogMutation;
+            },
+            .renew => |value| if (value.observed_at_ms >= value.expected_expiry) return error.CatalogGenerationChanged,
+            .fence => |reason| if (reason == .expired and self.actor.session_user.kind != .bootstrap) return error.Forbidden,
+            else => {},
+        }
+    }
+};
+pub fn principalDigest(a: A, principal: prepared.Principal) ![32]u8 {
+    try principal.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, principal, .{});
+    defer a.free(bytes);
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update("antfly/sql-lock-principal/v1");
+    hasher.update(bytes);
+    var result: [32]u8 = undefined;
+    hasher.final(&result);
+    return result;
+}
+pub fn commandDigest(a: A, request: Request) ![32]u8 {
+    try request.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(bytes);
+    var result: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &result, .{});
+    return result;
+}
+pub fn semanticError(err: anyerror) anyerror {
+    return switch (err) {
+        error.LockOwnerBusy => error.CatalogPublicationProofPending,
+        error.LockOwnerChanged, error.LockOwnerNotRegistered, error.LockEffectChanged, error.LockEffectOutOfOrder, error.LockEffectExpired => error.CatalogGenerationChanged,
+        error.InvalidLockRecord => error.InvalidCatalogRecord,
+        error.InvalidLockOwner, error.InvalidLockScope, error.InvalidLockEffect, error.InvalidLockResource => error.InvalidCatalogMutation,
+        error.LockLimitExceeded => error.CatalogCommandTooLarge,
+        else => err,
+    };
+}
+pub const Context = struct {
+    a: A,
+    actor: prepared.Actor,
+    database: u64,
+    standalone: bool,
+    maintenance: bool = false,
+    starting_command: bool = false,
+    unadmitted: ?prepared.Mutation = null,
+    prepared_operation: ?[16]u8 = null,
+    /// Populated only after the accepting metadata writer checks the current
+    /// catalog binding, schema, physical route and transition fences.
+    enrollment: ?scopes.Data.Spec = null,
+    data_proof: ?local.storage_pessimistic_lock_control.Snapshot = null,
+    native_retirement: ?NativeRetirement = null,
+    /// Only the accepting metadata writer may supply this proof after reading
+    /// the canonical job/checkpoint within the same transaction.
+    verified_retirement: ?recovery.RetiredGeneration = null,
+    handoff: bool = false,
+    fn nativeParticipant(self: Context, root: scopes.Record, part: scopes.Data.Participant) !struct { scope: scopes.Record, owner: scopes.ledger.Owner } {
+        try self.requireOwner(root);
+        const native = self.data_proof orelse return error.Forbidden;
+        const scope = native.scope orelse return error.LockOwnerBusy;
+        const owner = native.owner orelse return error.LockOwnerBusy;
+        const ns = part.admission.binding.namespace;
+        try scope.validate(ns);
+        try owner.validate(ns);
+        var registration = try part.admission.registration();
+        registration.lease.expires_at_ms = scope.registration.lease.expires_at_ms;
+        if (!std.meta.eql(registration, scope.registration) or !std.meta.eql(owner.lease, scope.registration.lease)) return error.LockOwnerChanged;
+        return .{ .scope = scope, .owner = owner };
+    }
+    pub fn requireDataCompletion(self: Context, _: anytype, _: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant) !void {
+        const native = try self.nativeParticipant(root, part);
+        if (native.scope.command != null or !std.meta.eql(native.scope.completed, @as(?scopes.Command, try part.admission.command())) or native.owner.waiting != null or native.owner.job != null) return error.LockOwnerBusy;
+    }
+    pub fn requireDataRetirement(self: Context, txn: anytype, ns: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant) !void {
+        if (self.native_retirement) |retirement| return self.requireNativeRetirement(txn, ns, root, part, retirement);
+        if (self.data_proof) |proof| if (proof.scope == null and proof.owner == null) {
+            return self.requireAbsentDataRetirement(txn, ns, root, part, proof);
+        };
+        const native = try self.nativeParticipant(root, part);
+        if (self.handoff) {
+            const proof = self.data_proof.?;
+            const frozen = proof.frozen orelse return error.LockOwnerBusy;
+            const prepared_record = try prepared.readOperation(self.a, txn, ns.group, frozen.ref.decision.operation) orelse return error.CatalogPublicationProofPending;
+            const ref = prepared_record.identity.lock_scope orelse return error.InvalidLockScope;
+            if (!ref.backend.eql(root.registration.lease.backend) or !std.mem.eql(u8, &prepared_record.identity.txn_id, &part.admission.transaction)) return error.InvalidLockScope;
+            var found = false;
+            for (prepared_record.participants) |item| if (try item.lockReference(prepared_record.identity, self.a)) |expected| {
+                if (std.meta.eql(expected, frozen.ref)) {
+                    found = true;
+                    break;
+                }
+            };
+            if (!found or frozen.ref.admission.generation != part.admission.generation or !frozen.ref.admission.binding.eql(part.admission.binding)) return error.InvalidLockScope;
+            const destination = proof.prepared_owner orelse return error.LockOwnerBusy;
+            const expected_lease = try scopes.preparedLease(part.admission.binding.namespace, root.registration.lease.database, root.registration.lease.node, frozen.ref.decision);
+            if (!std.meta.eql(destination.lease, expected_lease) or destination.state != .prepared or destination.job != null or destination.waiting != null or
+                !std.meta.eql(destination.transaction, @as(?[16]u8, prepared_record.identity.txn_id)) or native.scope.transaction != null or native.owner.resources != 0 or
+                !std.meta.eql(native.scope.released_transaction, @as(?scopes.Transaction, .{ .id = prepared_record.identity.txn_id, .decision = frozen.ref.decision }))) return error.LockOwnerBusy;
+            return;
+        }
+        if (native.scope.state != .retired or native.scope.transaction != null or native.owner.state != .retired or native.owner.resources != 0 or native.owner.waiting != null or native.owner.job != null) return error.LockOwnerBusy;
+        if (self.data_proof.?.frozen) |frozen| if (!frozen.retired or !std.mem.eql(u8, &frozen.ref.admission.transaction, &part.admission.transaction)) return error.LockOwnerBusy;
+    }
+    fn requireAbsentDataRetirement(self: Context, txn: anytype, ns: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant, proof: local.storage_pessimistic_lock_control.Snapshot) !void {
+        try self.requireOwner(root);
+        if (self.handoff or proof.prepared_owner != null or proof.receipt != null or proof.row_result != null or proof.resource != null or proof.bound_control != null or proof.intent_owner != null) return error.LockOwnerBusy;
+        const frozen = proof.frozen orelse return error.LockOwnerBusy;
+        if (!frozen.retired or frozen.ref.admission.generation != part.admission.generation or
+            !frozen.ref.admission.binding.eql(part.admission.binding) or
+            !std.mem.eql(u8, &frozen.ref.admission.transaction, &part.admission.transaction)) return error.InvalidLockScope;
+        var selected = root;
+        if (selected.transaction == null) selected.transaction = selected.released_transaction;
+        const transaction = selected.transaction orelse return error.InvalidLockScope;
+        if (!std.meta.eql(transaction.decision, @as(?scopes.DecisionRef, frozen.ref.decision))) return error.InvalidLockScope;
+        const canonical = try self.record(txn, ns, selected, frozen.ref.decision);
+        try canonical.validate(self.a);
+        const decision = canonical.decision orelse return error.LockOwnerBusy;
+        if (decision.status != .aborted or (canonical.phase != .resolved and canonical.phase != .retired)) return error.LockOwnerBusy;
+        try frozen.ref.validate(canonical.identity.txn_id, try canonical.identity.owner(self.a));
+        if (!std.meta.eql(canonical.identity.lock_scope.?.command, frozen.ref.admission.parent_command)) return error.InvalidLockScope;
+        for (canonical.participants) |member| {
+            const expected = (try member.lockReference(canonical.identity, self.a)) orelse continue;
+            if (!std.meta.eql(expected, frozen.ref) or !std.mem.eql(u8, member.table_name, part.spec.table_name)) continue;
+            if (!std.meta.eql(member.schema_version, part.spec.schema_version)) return error.InvalidLockScope;
+            switch (member.route.route.execution) {
+                .native_local => if (member.route.native_participant == null or part.spec.route.native_participant == null) return error.InvalidLockScope,
+                // Permanent custody is certified by the existing ordered
+                // writer/read-index Ref. It must never claim a native Pin.
+                .raft => if (member.route.native_participant != null or part.spec.route.native_participant != null) return error.InvalidLockScope,
+            }
+            const captured = try std.json.Stringify.valueAlloc(self.a, member.route, .{});
+            const enrolled = try std.json.Stringify.valueAlloc(self.a, part.spec.route, .{});
+            if (!std.mem.eql(u8, captured, enrolled)) return error.InvalidLockScope;
+            return;
+        }
+        return error.InvalidLockScope;
+    }
+    fn requireNativeRetirement(self: Context, txn: anytype, ns: scopes.ledger.Namespace, root: scopes.Record, part: scopes.Data.Participant, retirement: NativeRetirement) !void {
+        try self.requireOwner(root);
+        const proof = self.verified_retirement orelse return error.Forbidden;
+        const route = part.spec.route;
+        if (route.route.execution != .native_local) return error.InvalidLockScope;
+        const captured = route.native_participant orelse return error.InvalidLockScope;
+        if (retirement.generation != part.admission.generation or retirement.query.table_id != route.table_id or !captured.eql(retirement.query.physical_pin) or retirement.source_group_id != route.route.group_id) return error.InvalidLockScope;
+        try proof.requireCaptured(ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), retirement.source_group_id, captured);
+        if (!proof.beforeBinding().binding.descriptor.eql(route.route.execution.native_local)) return error.InvalidLockScope;
+        if (retirement.decision) |decision| {
+            const found = try prepared.readOperation(self.a, txn, ns.group, decision.operation) orelse return error.CatalogPublicationProofPending;
+            const owner = try found.identity.owner(self.a);
+            const source = found.identity.lock_scope orelse return error.InvalidLockScope;
+            const session = found.identity.session orelse return error.InvalidLockScope;
+            if (!std.mem.eql(u8, &owner.admission_digest, &decision.admission) or !source.backend.eql(root.registration.lease.backend) or
+                !std.mem.eql(u8, &found.identity.txn_id, &part.admission.transaction) or found.identity.database_id != root.registration.lease.database or
+                session.owner_node_id != root.registration.lease.node or session.standalone != root.registration.standalone or
+                session.connection_id == null or !std.mem.eql(u8, &session.connection_id.?, &root.registration.connection)) return error.InvalidLockScope;
+            var matched = false;
+            for (found.participants) |member| if (try member.lockReference(found.identity, self.a)) |reference| {
+                if (reference.admission.generation != part.admission.generation or !reference.admission.binding.eql(part.admission.binding)) continue;
+                if (member.route.route.execution != .native_local or member.route.native_participant == null or
+                    !member.route.native_participant.?.eql(captured) or !member.route.route.execution.native_local.eql(route.route.execution.native_local)) return error.InvalidLockScope;
+                matched = true;
+                break;
+            };
+            if (!matched) return error.InvalidLockScope;
+            if (retirement.handoff) {
+                if (!found.hasPreparedLocks() or found.phase != .locking) return error.InvalidPreparedTransactionPhase;
+            } else if (found.decision == null) return error.InvalidPreparedTransactionPhase;
+            // Physical loss extinguished this generation's grants. This only
+            // detaches its directory slot; it manufactures no native vote or
+            // prepared owner, and every healthy participant still resolves.
+            return;
+        }
+        if (retirement.handoff or (root.state == .active and !root.releasing)) return error.LockOwnerBusy;
+        for ([_]?scopes.Transaction{ root.transaction, root.released_transaction }) |entry| if (entry) |transaction| {
+            if (transaction.decision != null and std.mem.eql(u8, &transaction.id, &part.admission.transaction)) return error.LockOwnerBusy;
+        };
+    }
+
+    pub fn requireDataEnrollment(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, spec: scopes.Data.Spec) !void {
+        try self.requireOwner(value);
+        const checked = self.enrollment orelse return error.Forbidden;
+        if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(self.a, checked, .{}), try std.json.Stringify.valueAlloc(self.a, spec, .{}))) return error.Forbidden;
+    }
+    fn requireOwner(self: Context, value: scopes.Record) !void {
+        if (value.registration.standalone != self.standalone or value.registration.lease.database != self.database) return error.Forbidden;
+        if (self.maintenance and self.actor.session_user.kind == .bootstrap and self.actor.current_role == null) return;
+        if (!std.mem.eql(u8, &try principalDigest(self.a, self.actor.session_user), &value.registration.lease.principal)) return error.Forbidden;
+    }
+    pub fn requireRegistration(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Registration) !void {
+        try value.validate(ns);
+        try self.requireOwner(.{ .registration = value });
+        // Exact registration replay observes its existing native owner. A new
+        // backend cannot enter a database after retirement has reserved it.
+        if (try scopes.read(self.a, txn, ns, value.lease.backend) == null)
+            try @import("../metadata/scope_retirement_admission.zig").requireConnectionAdmission(txn, ns.group, value.lease.database);
+    }
+    pub fn requireRead(self: Context, value: scopes.Record) !void {
+        try self.requireOwner(value);
+    }
+    pub fn requireCommand(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, command: scopes.Command) !void {
+        try self.requireOwner(value);
+        // Retirement cannot strand an already admitted body's FINISH, abort,
+        // delivery ACK or exact replay. Only admission of a new body is fenced.
+        if (self.starting_command and value.command == null and command.sequence >= value.next_command)
+            try @import("../metadata/scope_retirement_admission.zig").requireConnectionAdmission(txn, ns.group, value.registration.lease.database);
+    }
+    pub fn requireTransaction(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, id: [16]u8) !void {
+        try self.requireOwner(value);
+        if (std.mem.allEqual(u8, &id, 0)) return error.InvalidLockScope;
+    }
+    pub fn requireRenewal(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, _: u64, _: u64) !void {
+        try self.requireOwner(value);
+    }
+    pub fn requireFence(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record, _: scopes.Fence) !void {
+        try self.requireOwner(value);
+    }
+    fn record(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, decision: scopes.DecisionRef) !prepared.Record {
+        const found = try prepared.readOperation(self.a, txn, ns.group, decision.operation) orelse return error.InvalidPreparedTransactionPhase;
+        const owner = try found.identity.owner(self.a);
+        const transaction = value.transaction orelse return error.InvalidLockScope;
+        const session = found.identity.session orelse return error.InvalidLockScope;
+        const ref = found.identity.lock_scope orelse return error.InvalidLockScope;
+        if (!std.mem.eql(u8, &owner.admission_digest, &decision.admission) or !std.mem.eql(u8, &found.identity.txn_id, &transaction.id) or
+            found.identity.database_id != value.registration.lease.database or session.owner_node_id != value.registration.lease.node or
+            session.connection_id == null or !std.mem.eql(u8, &session.connection_id.?, &value.registration.connection) or
+            session.standalone != value.registration.standalone or !ref.backend.eql(value.registration.lease.backend)) return error.InvalidLockScope;
+        return found;
+    }
+    pub fn requireSeal(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, decision: scopes.DecisionRef) !void {
+        try self.requireOwner(value);
+        const found = try self.record(txn, ns, value, decision);
+        if (value.command == null or !std.meta.eql(found.identity.lock_scope.?.command, value.command.?)) return error.InvalidLockScope;
+    }
+    fn requireUnadmitted(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, expected: scopes.Transaction, original: prepared.Mutation) !void {
+        const identity = original.operation.admit.identity;
+        const session = identity.session orelse return error.InvalidLockScope;
+        const ref = identity.lock_scope orelse return error.InvalidLockScope;
+        if (expected.decision != null or !std.mem.eql(u8, &expected.id, &identity.txn_id) or
+            !ref.backend.eql(value.registration.lease.backend) or session.connection_id == null or
+            !std.mem.eql(u8, &session.connection_id.?, &value.registration.connection) or session.owner_node_id != value.registration.lease.node or
+            session.standalone != value.registration.standalone or identity.database_id != value.registration.lease.database or
+            !std.mem.eql(u8, &try principalDigest(self.a, original.actor.session_user), &value.registration.lease.principal)) return error.InvalidLockScope;
+        if (value.state == .active and !std.meta.eql(value.command, @as(?scopes.Command, ref.command))) return error.LockOwnerChanged;
+        // These point reads and the release share the accepting native writer.
+        // An admitted or delivered purpose can only use its real decision.
+        if (try prepared.readOperation(self.a, txn, ns.group, identity.operation_id) != null or
+            try prepared.readReceipt(self.a, txn, ns.group, identity.operation_id) != null) return error.LockOwnerBusy;
+        const journal: prepared.outcomes.Store(@TypeOf(txn.*)) = .{ .txn = txn, .group = ns.group, .incarnation = ns.incarnation };
+        const outcome = try journal.lookup(self.a, original.admission, try prepared.commandDigest(self.a, original));
+        if (outcome) |known| {
+            if (known != .rejected) return error.LockOwnerBusy;
+        } else {
+            // Eviction alone is not a proof. The immutable old admission head
+            // must permanently prevent a delayed admission of this same body.
+            const head = try journal.head(self.a);
+            if (head < original.admission.head or head - original.admission.head < prepared.outcomes.retained) return error.LockOwnerBusy;
+        }
+    }
+    pub fn requireResolution(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, expected: scopes.Transaction) !void {
+        try self.requireOwner(value);
+        if (self.unadmitted) |original| try self.requireUnadmitted(txn, ns, value, expected, original);
+        if (value.transaction == null and std.meta.eql(value.released_transaction, @as(?scopes.Transaction, expected))) return;
+        if (!std.meta.eql(value.transaction, @as(?scopes.Transaction, expected))) return error.LockOwnerChanged;
+        const decision = expected.decision orelse {
+            // Active rollback needs an independently checked rejected admission.
+            // Expiry cleanup may retire an unsealed transaction only AFTER its
+            // command was fenced, so no future native admission can install.
+            if (value.state == .active and self.unadmitted == null) return error.LockOwnerBusy;
+            return;
+        };
+        if (try prepared.readOperation(self.a, txn, ns.group, decision.operation)) |_| {
+            const found = try self.record(txn, ns, value, decision);
+            if (found.phase != .resolved and found.phase != .retired) return error.LockOwnerBusy;
+            return;
+        }
+        const receipt = try prepared.readReceipt(self.a, txn, ns.group, decision.operation) orelse return error.LockOwnerBusy;
+        if (receipt.progress == .resolving or (receipt.status != .committed and receipt.status != .aborted) or !std.mem.eql(u8, &receipt.owner.admission_digest, &decision.admission) or !std.mem.eql(u8, &receipt.txn_id, &expected.id)) return error.LockOwnerBusy;
+    }
+    pub fn requireRetirement(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record) !void {
+        try self.requireOwner(value);
+        if (value.transaction != null) return error.LockOwnerBusy;
+    }
+    pub fn requirePreparedHandoff(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, from: scopes.ledger.Lease, to: scopes.ledger.Lease, id: [16]u8) !void {
+        try self.requireOwner(value);
+        const transaction = value.transaction orelse return error.InvalidLockScope;
+        const found = try self.record(txn, ns, value, transaction.decision orelse return error.InvalidLockScope);
+        if (!found.hasPreparedLocks() or (found.phase != .locking and !(found.phase == .resolved and found.decision.?.status == .aborted)) or
+            !std.meta.eql(from, value.registration.lease) or !std.mem.eql(u8, &found.identity.txn_id, &id) or
+            !std.meta.eql(to, try found.identity.preparedLockLease(self.a, ns.group))) return error.InvalidLockScope;
+    }
+    pub fn requirePreparedResolution(self: Context, txn: anytype, ns: scopes.ledger.Namespace, lease: scopes.ledger.Lease, id: [16]u8) !void {
+        const found = try prepared.readOperation(self.a, txn, ns.group, self.prepared_operation orelse return error.InvalidLockScope) orelse return error.InvalidLockScope;
+        if (!found.hasPreparedLocks() or found.phase != .resolved or found.identity.database_id != self.database or
+            !std.mem.eql(u8, &found.identity.txn_id, &id) or !std.meta.eql(lease, try found.identity.preparedLockLease(self.a, ns.group))) return error.InvalidLockScope;
+        try found.identity.session.?.requireRealm(self.standalone);
+    }
+};
+pub fn apply(a: A, txn: anytype, group: u64, request: Request) !?outcomes.LockEffect {
+    return applyWithEnrollment(a, txn, group, request, null);
+}
+pub fn applyWithEnrollment(a: A, txn: anytype, group: u64, request: Request, checked: ?scopes.Data.Spec) !?outcomes.LockEffect {
+    return applyWithEnrollmentAndRetirement(a, txn, group, request, checked, null);
+}
+pub fn applyWithEnrollmentAndRetirement(a: A, txn: anytype, group: u64, request: Request, checked: ?scopes.Data.Spec, verified_retirement: ?recovery.RetiredGeneration) !?outcomes.LockEffect {
+    try request.validate();
+    const ns: scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
+    if (request.scope_retirement) |root| {
+        const retirement = @import("../metadata/scope_retirement_ledger.zig");
+        if (root.root.group != group) return error.Forbidden;
+        const head = (try retirement.head(txn, root.root)) orelse return error.CatalogGenerationChanged;
+        if (!head.force or head.progress.phase != .draining_connections or
+            !std.mem.eql(u8, &head.metadata_incarnation, &request.incarnation)) return error.Forbidden;
+        const lease = (try retirement.member(txn, group, .database, request.database)) orelse return error.CatalogGenerationChanged;
+        if (!std.meta.eql(lease.lookup, root.root) or lease.intent != .retire or !std.mem.eql(u8, &lease.metadata_incarnation, &head.metadata_incarnation)) return error.CatalogGenerationChanged;
+        const source = try scopes.read(a, txn, ns, request.backend) orelse return error.LockOwnerNotRegistered;
+        if (source.registration.lease.database != root.root.reference.database) return error.Forbidden;
+        // The worker's service principal is not the SQL issuer. Database
+        // ownership alone cannot terminate somebody else's privileged backend.
+        if (head.creator.kind != .bootstrap and !std.mem.eql(u8, &try principalDigest(a, head.creator), &source.registration.lease.principal)) return error.Forbidden;
+        const current = try retirement.sourceCursor(txn, root.root);
+        if (!std.meta.eql(if (current) |value| @as(?locks.Backend, value.backend) else null, root.expected_after)) return error.CatalogGenerationChanged;
+    }
+    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence or request.operation == .data_ack or request.operation == .data_retire or request.operation == .data_handoff or request.operation == .native_retire, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null, .enrollment = checked };
+    var command_context = context;
+    command_context.starting_command = request.operation == .begin;
+    var checked_context = context;
+    checked_context.handoff = request.operation == .data_handoff;
+    checked_context.native_retirement = if (request.operation == .native_retire) request.operation.native_retire else null;
+    checked_context.verified_retirement = verified_retirement;
+    checked_context.data_proof = switch (request.operation) {
+        .data_ack => |value| value.native,
+        .data_retire, .data_handoff => |value| value.native,
+        else => null,
+    };
+    var receipt: ?scopes.ledger.Receipt = null;
+    switch (request.operation) {
+        .notification_gc => |value| {
+            if (request.actor.session_user.kind != .bootstrap or request.actor.current_role != null) return error.Forbidden;
+            if (value.steps == 0 or value.steps > 4 or value.scope.group != group or value.scope.database != request.database or !std.mem.eql(u8, &value.scope.incarnation, &request.incarnation)) return error.InvalidCatalogMutation;
+            for (0..value.steps) |_| if (!try @import("sql_notifications.zig").gcStep(a, txn, value.scope)) break;
+        },
+        .notification_bind => |value| {
+            const root = try scopes.guard(a, txn, ns, request.backend, value.command, context);
+            if (!std.mem.eql(u8, &root.registration.connection, &value.connection)) return error.Forbidden;
+            try @import("sql_notifications.zig").bind(a, txn, group, .{ .backend = request.backend, .connection = value.connection, .generation = value.generation, .sender_pid = value.sender_pid });
+        },
+        .notification_offer => |value| {
+            const root = (try scopes.read(a, txn, ns, request.backend)) orelse return error.InvalidLockScope;
+            if (!try requireNotificationConnection(a, txn, root, value.generation, context, false)) return error.SqlInvalidParameterValue;
+            if (!std.mem.eql(u8, &root.registration.connection, &value.connection)) return error.Forbidden;
+            try @import("sql_notifications.zig").offer(a, txn, group, value.connection, value.generation, value.cursor, value.maximum);
+        },
+        .notification_ack => |value| {
+            const root = (try scopes.read(a, txn, ns, request.backend)) orelse return error.InvalidLockScope;
+            if (!try requireNotificationConnection(a, txn, root, value.generation, context, true)) return error.SqlInvalidParameterValue;
+            if (!std.mem.eql(u8, &root.registration.connection, &value.connection)) return error.Forbidden;
+            try @import("sql_notifications.zig").acknowledge(a, txn, group, value.connection, value.generation, value.cursor);
+        },
+        .register => |value| try scopes.register(a, txn, ns, value, context),
+        .begin => |command| _ = try scopes.begin(a, txn, ns, request.backend, command, command_context),
+        .finish => |command| {
+            try scopes.finish(a, txn, ns, request.backend, command, context);
+            if (request.notification_generation) |generation| try @import("sql_notifications.zig").resetBinding(a, txn, group, request.backend, generation);
+        },
+        .bind => |value| try scopes.bindTransaction(a, txn, ns, request.backend, value.command, value.transaction, context),
+        .data_enroll => |value| _ = try scopes.Data.enroll(a, txn, ns, request.backend, value.command, value.transaction, checked orelse return error.Forbidden, context),
+        .data_ack => |value| try scopes.Data.acknowledge(a, txn, ns, request.backend, value.generation, value.command, checked_context),
+        .data_retire, .data_handoff => |value| try scopes.Data.retire(a, txn, ns, request.backend, value.generation, checked_context),
+        .native_retire => |value| try scopes.Data.retire(a, txn, ns, request.backend, value.generation, checked_context),
+        .release => |value| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, value, context),
+        .release_unadmitted => |original| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, .{ .id = original.operation.admit.identity.txn_id }, context),
+        .renew => |value| try scopes.renew(a, txn, ns, request.backend, value.expected_expiry, value.expires_at_ms, context),
+        .fence => |reason| try scopes.fence(a, txn, ns, request.backend, reason, context),
+        .effect => |value| receipt = try scopes.applyEffect(a, txn, ns, request.backend, value.command, value.effect, context),
+        .cancel => |value| receipt = try scopes.cancelEffect(a, txn, ns, request.backend, value.command, value.effect, context),
+        .step => |value| receipt = try scopes.advanceEffect(a, txn, ns, request.backend, value.command, value.effect, context),
+        .close_step => {
+            if (try scopes.closeStep(a, txn, ns, request.backend, context)) try @import("sql_notifications.zig").retireBinding(a, txn, group, request.backend);
+        },
+    }
+    if (request.scope_retirement) |control|
+        try @import("../metadata/scope_retirement_ledger.zig").stageSourceCursor(txn, control, request.backend);
+    const result = receipt orelse return null;
+    const effect = switch (request.operation) {
+        .effect, .cancel, .step => |value| value.effect,
+        else => unreachable,
+    };
+    return .{ .receipt = result, .wait_resource = if (result.outcome == .pending and effect.action == .acquire) (try scopes.ledger.readResourceStamp(a, txn, ns, effect.action.resource())) orelse return error.InvalidLockRecord else null };
+}
+
+/// Poll/ACK do not execute SQL, acquire a command ticket, or advance a transaction.
+/// Both the native source and connection must attest an idle delivery boundary.
+pub fn requireNotificationConnection(a: A, txn: anytype, root: scopes.Record, generation: u64, context: Context, allow_transaction: bool) !bool {
+    try context.requireRead(root);
+    const binding = (try @import("sql_notifications.zig").readBinding(a, txn, root.registration.group, root.registration.lease.backend)) orelse return false;
+    if (binding.generation != generation or !std.mem.eql(u8, &binding.connection, &root.registration.connection) or !binding.backend.eql(root.registration.lease.backend)) return error.CatalogGenerationChanged;
+    if (root.state != .active or (!allow_transaction and root.transaction != null) or root.releasing or root.command != null) return error.SqlConnectionBusy;
+    if (try @import("sql_notifications.zig").listener(a, txn, root.registration.group, binding.connection, generation)) |value| {
+        if (value.scope.group != root.registration.group or value.scope.database != root.registration.lease.database or !std.mem.eql(u8, &value.scope.incarnation, &root.registration.lease.backend.incarnation)) return error.InvalidCatalogRecord;
+    }
+    return true;
+}
+
+pub fn scopeAllGroupsPrefix() []const u8 {
+    return "\x00\x00__metadata__:sql_lock_scope:";
+}
+pub fn scopePrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}{x:0>16}:", .{ scopeAllGroupsPrefix(), group });
+}
+pub fn workPrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_work:{x:0>16}:", .{group});
+}
+pub fn connectionPrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_connection:{x:0>16}:", .{group});
+}
+pub fn ledgerPrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_locks:{x:0>16}:", .{group});
+}
+
+pub const Query = struct {
+    incarnation: [16]u8,
+    standalone: bool,
+    actor: prepared.Actor,
+    database: u64,
+    backend: ?locks.Backend = null,
+    work: ?struct { observed_at_ms: u64, after: ?scopes.Work = null, wrap: bool = false } = null,
+    effect: ?scopes.ledger.Effect = null,
+    /// Bounded ingress anchor: one database lookup, no backend/work scan.
+    discovery: ?[]const u8 = null,
+    notification_work: ?struct { after: ?[32]u8 = null } = null,
+    abandoned_private: ?@import("../metadata/abandoned_temporary_retirement.zig").Selection = null,
+    database_work: ?struct { after: ?locks.Backend = null, wrap: bool = false } = null,
+    notifications: ?struct { generation: u64, maximum: u16 = 128 } = null,
+    participant: ?union(enum) {
+        generation: u64,
+        route: struct { spec: scopes.Data.Spec, transaction: [16]u8 },
+    } = null,
+    pub fn requiredDecoderVersion(self: Query) u16 {
+        if (self.abandoned_private != null) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
+        return if (self.database_work != null) @import("../metadata/topology_protocol.zig").sql_scope_retirement_version else decoder_version;
+    }
+    pub fn validate(self: Query) !void {
+        try self.actor.validate();
+        const selectors = @as(u8, @intFromBool(self.backend != null)) + @as(u8, @intFromBool(self.work != null)) + @as(u8, @intFromBool(self.discovery != null)) + @as(u8, @intFromBool(self.notification_work != null)) + @as(u8, @intFromBool(self.database_work != null)) + @as(u8, @intFromBool(self.abandoned_private != null));
+        if (selectors != 1 or (self.backend != null and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
+        if (self.abandoned_private) |selection| {
+            try selection.validate();
+            if (self.actor.session_user.kind != .bootstrap or self.actor.current_role != null or self.database == 0 or
+                self.participant != null or self.notifications != null or self.effect != null) return error.Forbidden;
+        }
+        if (self.database_work) |selection| {
+            if (self.database == 0 or self.actor.session_user.kind != .bootstrap or self.actor.current_role != null) return error.Forbidden;
+            if (selection.after) |backend| {
+                try backend.validate();
+                if (!std.mem.eql(u8, &backend.incarnation, &self.incarnation)) return error.InvalidCatalogMutation;
+            }
+        }
+        if (self.notification_work != null and (self.database != 0 or self.actor.session_user.kind != .bootstrap or self.actor.current_role != null)) return error.Forbidden;
+        if (self.discovery) |name| {
+            if (self.database != 0 or name.len == 0 or name.len > 256 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidCatalogMutation;
+        }
+        if (self.notifications) |selection| if (self.backend == null or self.participant != null or self.effect != null or selection.generation == 0 or selection.maximum == 0 or selection.maximum > 128) return error.InvalidCatalogMutation;
+        if (self.participant != null and (self.backend == null or self.effect != null)) return error.InvalidCatalogMutation;
+        if (self.participant) |selector| switch (selector) {
+            .generation => |generation| if (generation == 0) return error.InvalidCatalogMutation,
+            .route => |route| {
+                if (std.mem.allEqual(u8, &route.transaction, 0)) return error.InvalidCatalogMutation;
+                try route.spec.validate(.{ .home = .metadata, .group = route.spec.route.metadata_group_id, .incarnation = self.incarnation });
+            },
+        };
+        if (self.effect) |effect| {
+            try effect.validate();
+            if (self.backend == null or !effect.backend.eql(self.backend.?)) return error.InvalidCatalogMutation;
+        }
+        if (self.backend) |backend| {
+            try backend.validate();
+            if (self.database == 0 or !std.mem.eql(u8, &backend.incarnation, &self.incarnation)) return error.InvalidCatalogMutation;
+        }
+        if (self.work != null and (self.actor.session_user.kind != .bootstrap or self.actor.current_role != null)) return error.Forbidden;
+    }
+};
+pub const Snapshot = struct {
+    abandoned_private: ?@import("../metadata/abandoned_temporary_retirement.zig").Work = null,
+    database_after: ?locks.Backend = null,
+    notification_binding: ?@import("sql_notifications.zig").Binding = null,
+    notification_work: ?@import("sql_notifications.zig").Work = null,
+    notifications: ?@import("sql_notifications.zig").Page = null,
+    notification_capable: bool = false,
+
+    group: u64 = local.common_group_ids.main_metadata_group_id,
+    incarnation: [16]u8,
+    standalone: bool,
+    head: u64,
+    scope: ?scopes.Record,
+    owner: ?scopes.ledger.Owner,
+    next_work: ?scopes.Work,
+    receipt: ?scopes.ledger.Receipt = null,
+    wait_resource: ?scopes.ledger.ResourceStamp = null,
+    database_id: ?u64 = null,
+    participant: ?scopes.Data.Participant = null,
+    pub fn jsonStringify(self: Snapshot, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "abandoned_private") or std.mem.eql(u8, field, "database_after") or std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding")) {
+                if (@field(self, field)) |page| {
+                    try writer.objectField(field);
+                    try writer.write(page);
+                }
+            } else if (!(comptime std.mem.eql(u8, field, "notification_capable")) or self.notification_capable) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+};
+
+pub const Observer = struct {
+    registration: scopes.Registration,
+    pub fn requireObservation(self: Observer, _: anytype, lease: scopes.ledger.Lease, effect: scopes.ledger.Effect) !void {
+        if (!std.meta.eql(lease, self.registration.lease) or !effect.backend.eql(lease.backend)) return error.Forbidden;
+    }
+};
+
+test "SQL relation lifetime lost directory retirement requires the accepting metadata proof" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.NotFound;
+        }
+    };
+    var txn: Fake = .{};
+    const incarnation: [16]u8 = @splat(1);
+    const root: scopes.Record = .{ .registration = .{ .group = 1, .lease = .{ .backend = .{ .incarnation = incarnation, .id = @splat(2), .fence = 1 }, .database = 4, .node = 5, .principal = @splat(6), .expires_at_ms = 1000 }, .connection = @splat('a'), .nonce = @splat(8), .standalone = false } };
+    const context: Context = .{ .a = a, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = 4, .standalone = false, .maintenance = true };
+    const retirement: NativeRetirement = .{ .generation = 1, .source_group_id = 7, .query = .{ .table_id = 3, .physical_pin = .{ .physical_root_incarnation = 9, .table_id = 3, .shard_id = 7, .range_id = 8, .data_generation = 1 } } };
+    // No deserialized claim is sufficient. Denial occurs before reading the
+    // native participant or looking up any metadata decision.
+    try std.testing.expectError(error.Forbidden, context.requireNativeRetirement(&txn, .{ .home = .metadata, .group = 1, .incarnation = incarnation }, root, undefined, retirement));
+}

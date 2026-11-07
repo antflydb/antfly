@@ -38,7 +38,7 @@ fn constant(instructions: []const scalar.Instruction, index: u32, depth: usize) 
     if (depth == 32 or index >= instructions.len) return false;
     return switch (instructions[index].operation) {
         .literal, .parameter => true,
-        .cast => |v| constant(instructions, v.operand, depth + 1),
+        .cast => |v| !v.domain_check and constant(instructions, v.operand, depth + 1),
         .unary => |v| constant(instructions, v.operand, depth + 1),
         else => false,
     };
@@ -51,6 +51,7 @@ const Builder = struct {
         if (depth == 32 or self.count == self.steps.len or index >= self.instructions.len) return null;
         for (self.steps[0..self.count], 0..) |step, slot| if (step.index == index) return @intCast(slot);
         const instruction = self.instructions[index];
+        if (instruction.operation == .cast and instruction.operation.cast.domain_check) return null;
         const operation: @FieldType(Step, "operation") = if (constant(self.instructions, index, 0)) .constant else switch (instruction.operation) {
             .column => |ordinal| .{ .column = ordinal },
             .cast => |v| blk: {

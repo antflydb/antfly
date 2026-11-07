@@ -1,0 +1,1972 @@
+{
+  "format": 1,
+  "oracle_major": 18,
+  "reference": "PostgreSQL typed numeric function values and error timing",
+  "entries": [
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": null,
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "0",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "-0.000",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "0.000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "2.5",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "2.5",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "2.5",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "1.255",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "1.255",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "9007199254740993.5",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "9007199254740993.5",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "NaN",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "abs",
+      "input": "1e100",
+      "scale": null,
+      "sql": "abs($1::numeric)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": null,
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "0",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "-0.000",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "2.5",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "3",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "-2",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "1.255",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "2",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "9007199254740993.5",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "9007199254740994",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "NaN",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "ceil",
+      "input": "1e100",
+      "scale": null,
+      "sql": "ceil($1::numeric)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": null,
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "0",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "-0.000",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "2.5",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "2",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "-3",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "1.255",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "9007199254740993.5",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "9007199254740993",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "NaN",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "floor",
+      "input": "1e100",
+      "scale": null,
+      "sql": "floor($1::numeric)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": null,
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": null,
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": null,
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": null,
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "0",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "0",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "0",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "0.00",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "0",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "0.000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-0.000",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-0.000",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-0.000",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "0.00",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-0.000",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "0.000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "2.5",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "2.5",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "3",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "2.5",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "2.50",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "2.5",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "2.500000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-2.5",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-2.5",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "-3",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-2.5",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "-2.50",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-2.5",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "-2.500000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1.255",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1.255",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1.255",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "1.26",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1.255",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "1.255000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "9007199254740993.5",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "9007199254741000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "9007199254740993.5",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "9007199254740994",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "9007199254740993.5",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "9007199254740993.50",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "9007199254740993.5",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "9007199254740993.500000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "NaN",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "NaN",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "NaN",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "NaN",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "Infinity",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "Infinity",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "Infinity",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "Infinity",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-Infinity",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-Infinity",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-Infinity",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "-Infinity",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1e100",
+      "scale": -3,
+      "sql": "round($1::numeric, (-3)::integer)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1e100",
+      "scale": 0,
+      "sql": "round($1::numeric, (0)::integer)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1e100",
+      "scale": 2,
+      "sql": "round($1::numeric, (2)::integer)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.00",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1e100",
+      "scale": 6,
+      "sql": "round($1::numeric, (6)::integer)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": null,
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": null,
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": null,
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": null,
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "0",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "0",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "0",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "0.00",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "0",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "0.000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-0.000",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-0.000",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-0.000",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "0.00",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-0.000",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "0.000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "2.5",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "2.5",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "2",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "2.5",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "2.50",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "2.5",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "2.500000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-2.5",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-2.5",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "-2",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-2.5",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "-2.50",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-2.5",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "-2.500000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1.255",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1.255",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1.255",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "1.25",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1.255",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "1.255000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "9007199254740993.5",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "9007199254740000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "9007199254740993.5",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "9007199254740993",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "9007199254740993.5",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "9007199254740993.50",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "9007199254740993.5",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "9007199254740993.500000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "NaN",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "NaN",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "NaN",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "NaN",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "Infinity",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "Infinity",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "Infinity",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "Infinity",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-Infinity",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-Infinity",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-Infinity",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "-Infinity",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "-Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1e100",
+      "scale": -3,
+      "sql": "trunc($1::numeric, (-3)::integer)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1e100",
+      "scale": 0,
+      "sql": "trunc($1::numeric, (0)::integer)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1e100",
+      "scale": 2,
+      "sql": "trunc($1::numeric, (2)::integer)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.00",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1e100",
+      "scale": 6,
+      "sql": "trunc($1::numeric, (6)::integer)",
+      "expected": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": null,
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "0",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "-0.000",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "2.5",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "-1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "1.255",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "9007199254740993.5",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "NaN",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "-1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sign",
+      "input": "1e100",
+      "scale": null,
+      "sql": "sign($1::numeric)",
+      "expected": "1",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": null,
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "0",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": "0.000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "-0.000",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": "0.000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "2.5",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": "1.581138830084190",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": null,
+      "sqlstate": "2201F"
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "1.255",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": "1.120267825120404",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "9007199254740993.5",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": "94906265.624251561",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "NaN",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": "NaN",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": "Infinity",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": null,
+      "sqlstate": "2201F"
+    },
+    {
+      "domain": "numeric",
+      "function": "sqrt",
+      "input": "1e100",
+      "scale": null,
+      "sql": "sqrt($1::numeric)",
+      "expected": "100000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": null,
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": "0",
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": "-0",
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": "2.5",
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": "4004000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": "4004000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": "NaN",
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": "7ff8000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": "7ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": "7ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "abs",
+      "input": "1e100",
+      "scale": null,
+      "sql": "abs($1::double precision)",
+      "expected": "54b249ad2594c37d",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": null,
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": "0",
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": "-0",
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": "8000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": "2.5",
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": "4008000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": "c000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": "NaN",
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": "7ff8000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": "7ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": "fff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "ceil",
+      "input": "1e100",
+      "scale": null,
+      "sql": "ceil($1::double precision)",
+      "expected": "54b249ad2594c37d",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": null,
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": "0",
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": "-0",
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": "8000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": "2.5",
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": "4000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": "c008000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": "NaN",
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": "7ff8000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": "7ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": "fff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "floor",
+      "input": "1e100",
+      "scale": null,
+      "sql": "floor($1::double precision)",
+      "expected": "54b249ad2594c37d",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": null,
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": "0",
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": "-0",
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": "8000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": "2.5",
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": "4000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": "c000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": "NaN",
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": "7ff8000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": "7ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": "fff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "round",
+      "input": "1e100",
+      "scale": null,
+      "sql": "round($1::double precision)",
+      "expected": "54b249ad2594c37d",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": null,
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": "0",
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": "-0",
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": "8000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": "2.5",
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": "4000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": "c000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": "NaN",
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": "7ff8000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": "7ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": "fff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "trunc",
+      "input": "1e100",
+      "scale": null,
+      "sql": "trunc($1::double precision)",
+      "expected": "54b249ad2594c37d",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": null,
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": "0",
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": "-0",
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": "2.5",
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": "3ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": "bff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": "NaN",
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": "3ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": "bff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sign",
+      "input": "1e100",
+      "scale": null,
+      "sql": "sign($1::double precision)",
+      "expected": "3ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": null,
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": null,
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": "0",
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": "0000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": "-0",
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": "8000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": "2.5",
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": "3ff94c583ada5b53",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": "-2.5",
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": null,
+      "sqlstate": "2201F"
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": "NaN",
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": "7ff8000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": "Infinity",
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": "7ff0000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": "-Infinity",
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": null,
+      "sqlstate": "2201F"
+    },
+    {
+      "domain": "float64",
+      "function": "sqrt",
+      "input": "1e100",
+      "scale": null,
+      "sql": "sqrt($1::double precision)",
+      "expected": "4a511b0ec57e649a",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1.25",
+      "scale": -2147483648,
+      "sql": "round($1::numeric, (-2147483648)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "round",
+      "input": "1.25",
+      "scale": 2147483647,
+      "sql": "round($1::numeric, (2147483647)::integer)",
+      "expected": "1.250000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1.25",
+      "scale": -2147483648,
+      "sql": "trunc($1::numeric, (-2147483648)::integer)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "domain": "numeric",
+      "function": "trunc",
+      "input": "1.25",
+      "scale": 2147483647,
+      "sql": "trunc($1::numeric, (2147483647)::integer)",
+      "expected": "1.250000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "sqlstate": null
+    }
+  ],
+  "strict_errors": [
+    {
+      "sql": "round(NULL::numeric, (1 / $1)::integer)",
+      "sqlstate": "22012"
+    },
+    {
+      "sql": "trunc(NULL::numeric, (1 / $1)::integer)",
+      "sqlstate": "22012"
+    },
+    {
+      "sql": "mod(NULL::numeric, (1 / $1)::numeric)",
+      "sqlstate": "22012"
+    },
+    {
+      "sql": "mod((1 / $1)::numeric, NULL::numeric)",
+      "sqlstate": "22012"
+    }
+  ],
+  "cast_precedence": [
+    {
+      "sql": "-32768::smallint",
+      "expected": null,
+      "sqlstate": "22003"
+    },
+    {
+      "sql": "(-32768)::smallint",
+      "expected": "-32768",
+      "sqlstate": null
+    },
+    {
+      "sql": "-2147483648::integer",
+      "expected": null,
+      "sqlstate": "22003"
+    },
+    {
+      "sql": "(-2147483648)::integer",
+      "expected": "-2147483648",
+      "sqlstate": null
+    },
+    {
+      "sql": "-9223372036854775808::bigint",
+      "expected": null,
+      "sqlstate": "22003"
+    },
+    {
+      "sql": "(-9223372036854775808)::bigint",
+      "expected": "-9223372036854775808",
+      "sqlstate": null
+    },
+    {
+      "sql": "-0.0::double precision",
+      "expected": "-0",
+      "sqlstate": null
+    },
+    {
+      "sql": "+0.0::double precision",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "sql": "(-0.0)::double precision",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "sql": "CAST(-0.0 AS double precision)",
+      "expected": "0",
+      "sqlstate": null
+    },
+    {
+      "sql": "(-0.0::numeric)::double precision",
+      "expected": "0",
+      "sqlstate": null
+    }
+  ]
+}

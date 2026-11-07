@@ -72,7 +72,9 @@ pub fn Session(comptime Source: type) type {
                 const table = for (snapshot.tables) |value| {
                     if (std.mem.eql(u8, value.name, selection.name)) break value;
                 } else return error.TableNotFound;
-                try proofs.append(a, .{ .table_id = table.table_id, .name = table.name, .definition = metadata.tableDefinitionFingerprint(table), .manifest_definition = cohort.manifestDefinition(table.name, table.description, table.schema_json, table.read_schema_json, table.indexes_json, table.replication_sources_json) });
+                const trigger_source = try @import("sql_trigger_backup.zig").capture(a, source, request, table);
+                try proofs.append(a, .{ .schema_only = marker.format == .native and (if (table.sql_persistence) |native| native.kind == .unlogged else false), .table_id = table.table_id, .name = table.name, .definition = metadata.tableDefinitionFingerprint(table), .manifest_definition = cohort.manifestDefinition(table.name, table.description, table.schema_json, table.read_schema_json, table.indexes_json, table.replication_sources_json), .trigger_source_columns_digest = if (trigger_source) |value| value.digest else null });
+                if (proofs.items[proofs.items.len - 1].schema_only) continue;
                 var ranges = std.ArrayListUnmanaged(metadata.RangeRecord).empty;
                 for (snapshot.ranges) |range| if (range.table_id == table.table_id) try ranges.append(a, range);
                 metadata.sortKeyspaceRanges(metadata.RangeRecord, ranges.items);
@@ -100,7 +102,7 @@ pub fn Session(comptime Source: type) type {
             const job: cohort.Job = .{ .id = id, .revision = 1, .backup_id = marker.cluster_backup_id, .attempt_id = marker.attempt_id, .artifact_format = switch (marker.format) {
                 .native => .native,
                 .portable => .portable,
-            }, .location = location, .connection = connection, .tables = proofs.items, .state = .{ .metadata_digest = digest, .owners = owners.items } };
+            }, .location = location, .connection = connection, .tables = proofs.items, .state = .{ .phase = if (owners.items.len == 0) .exporting else .freezing, .metadata_digest = digest, .owners = owners.items } };
             try job.validate();
             const encoded = try std.json.Stringify.valueAlloc(a, job, .{});
             try source.compareAndSetBackupCohort(alloc, .{ .job_id = id, .expected_revision = 0, .value = encoded }, request);
@@ -154,7 +156,7 @@ pub fn Session(comptime Source: type) type {
 
         fn next(self: *Self, phase: cohort.Phase, receipt: ?cohort.SealReceipt) !void {
             const state = self.parsed.value.state;
-            if (state.cursor + 1 == state.owners.len) try self.checkpoint(phase, 0, receipt, null) else try self.checkpoint(state.phase, state.cursor + 1, receipt, null);
+            if (state.owners.len == 0 or state.cursor + 1 == state.owners.len) try self.checkpoint(phase, 0, receipt, null) else try self.checkpoint(state.phase, state.cursor + 1, receipt, null);
         }
 
         fn control(self: *Self, owner: cohort.Owner, action: @FieldType(topology.Command, "action")) !void {
@@ -200,7 +202,7 @@ pub fn Session(comptime Source: type) type {
             if (!diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs())) return;
             const state = self.parsed.value.state;
             std.log.warn("backup cohort action failed action={s} phase={s} owner_ordinal={d} group_id={d} revision={d} class={s}", .{
-                action, @tagName(state.phase), state.cursor, state.owners[state.cursor].fence.owner_group_id, self.parsed.value.revision, @errorName(err),
+                action, @tagName(state.phase), state.cursor, if (state.owners.len == 0) @as(u64, 0) else state.owners[state.cursor].fence.owner_group_id, self.parsed.value.revision, @errorName(err),
             });
         }
 
@@ -209,6 +211,10 @@ pub fn Session(comptime Source: type) type {
         pub fn prepareSlice(self: *Self) !Preparation {
             try self.request.ensureActive();
             const state = self.parsed.value.state;
+            if (state.owners.len == 0) {
+                try state.validate();
+                return if (state.phase == .exporting or state.phase == .publishing or state.phase == .reclaiming or state.phase == .completed) .ready else error.Canceled;
+            }
             const owner = state.owners[state.cursor];
             switch (state.phase) {
                 .freezing => {
@@ -256,6 +262,10 @@ pub fn Session(comptime Source: type) type {
             if (self.parsed.value.state.phase == .publishing) try self.checkpoint(.reclaiming, 0, null, digest);
             if (self.parsed.value.manifest_sha256 == null or !std.mem.eql(u8, &self.parsed.value.manifest_sha256.?, &digest)) return error.BackupCohortChanged;
             while (self.parsed.value.state.phase == .reclaiming) {
+                if (self.parsed.value.state.owners.len == 0) {
+                    try self.checkpoint(.completed, 0, null, null);
+                    continue;
+                }
                 const owner = self.parsed.value.state.owners[self.parsed.value.state.cursor];
                 // Receipts are appended in the immutable owner's ordinal
                 // order and reconstructed in that order by the durable getter.
@@ -276,11 +286,19 @@ pub fn Session(comptime Source: type) type {
             if (self.parsed.value.state.phase == .completed or self.parsed.value.state.phase == .reclaiming) return error.BackupCohortAlreadyCommitted;
             if (self.parsed.value.state.phase != .cancelling and self.parsed.value.state.phase != .cancel_reclaiming and self.parsed.value.state.phase != .cancelled) try self.checkpoint(.cancelling, 0, null, null);
             while (self.parsed.value.state.phase == .cancelling) {
+                if (self.parsed.value.state.owners.len == 0) {
+                    try self.checkpoint(.cancel_reclaiming, 0, null, null);
+                    continue;
+                }
                 const owner = self.parsed.value.state.owners[self.parsed.value.state.cursor];
                 try self.control(owner, .cancel);
                 try self.next(.cancel_reclaiming, null);
             }
             while (self.parsed.value.state.phase == .cancel_reclaiming) {
+                if (self.parsed.value.state.owners.len == 0) {
+                    try self.checkpoint(.cancelled, 0, null, null);
+                    continue;
+                }
                 const owner = self.parsed.value.state.owners[self.parsed.value.state.cursor];
                 const body = try self.pin(owner, .{ .cancel = owner.fence });
                 self.alloc.free(body);

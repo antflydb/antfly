@@ -95,6 +95,8 @@ pub fn executeStorageKernelGraphExpand(
 ) !local_graph.GraphExpandResponse {
     if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelGraphExpand", .{ alloc, db, table_name, req });
     if (req.topology_epoch != 0) return error.InvalidArgument;
+    var raw_graph = try db.beginRawGraphReadLease();
+    defer raw_graph.release();
     const expansions = try alloc.alloc(local_graph.GraphExpansion, req.frontier.len);
     var initialized: usize = 0;
     errdefer {
@@ -131,6 +133,7 @@ pub fn executeStorageKernelGraphExpand(
         };
         initialized += 1;
     }
+    try raw_graph.check();
     return .{ .expansions = expansions };
 }
 
@@ -141,6 +144,8 @@ pub fn executeStorageKernelGraphHydrate(
 ) !local_graph.GraphHydrateResponse {
     if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelGraphHydrate", .{ alloc, db, req });
     if (req.topology_epoch != 0) return error.InvalidArgument;
+    var raw_graph = try db.beginRawGraphReadLease();
+    defer raw_graph.release();
     try validateGraphHydrateResolvedDocFilterForDb(req, db);
     try validateGraphHydrateIncomingIndexIdentity(req, db);
     const search_req = graphHydrateSearchRequest(req);
@@ -207,6 +212,7 @@ pub fn executeStorageKernelGraphHydrate(
         metric_status = try graph_exec_mod.cloneGraphMetricStatusesFromGraph(alloc, graph_statuses);
     }
     try checkQueryDeadline(search_req);
+    try raw_graph.check();
     return .{
         .hits = hits,
         .has_incoming = has_incoming,
@@ -226,6 +232,8 @@ pub fn executeStorageKernelGraphEdges(
 ) !local_graph.GraphEdgesResponse {
     if (comptime storage_engine.enabled) return storage_engine.call("queryExecuteStorageKernelGraphEdges", .{ alloc, db, req });
     if (req.topology_epoch != 0) return error.InvalidArgument;
+    var raw_graph = try db.beginRawGraphReadLease();
+    defer raw_graph.release();
     const control_req = db_mod.types.SearchRequest{
         .identity_read_generation = req.identity_read_generation,
         .execution_deadline_ns = req.execution_deadline_ns orelse local_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
@@ -238,6 +246,7 @@ pub fn executeStorageKernelGraphEdges(
         graph_mod.GraphIndex.freeEdges(alloc, result.edges);
     }
     try checkQueryDeadline(control_req);
+    try raw_graph.check();
     return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
 }
 

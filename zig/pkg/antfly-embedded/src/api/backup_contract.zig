@@ -134,6 +134,7 @@ pub fn tableDefinitionDigest(
     read_schema_json: []const u8,
     indexes_json: []const u8,
     replication_sources_json: []const u8,
+    sql_native_indexes_json: []const u8,
 ) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var encoded_table_id: [8]u8 = undefined;
@@ -145,6 +146,10 @@ pub fn tableDefinitionDigest(
     hashDefinitionField(&hasher, read_schema_json);
     hashDefinitionField(&hasher, indexes_json);
     hashDefinitionField(&hasher, replication_sources_json);
+    if (sql_native_indexes_json.len != 0) {
+        hasher.update("antfly.sql-native-index-names.v1");
+        hashDefinitionField(&hasher, sql_native_indexes_json);
+    }
     return hasher.finalResult();
 }
 
@@ -192,6 +197,11 @@ pub const TableBackupManifest = struct {
     format_version: u32 = format_version,
     format: BackupFormat,
     artifact_integrity_mode: ArtifactIntegrityMode = .declared,
+    /// Native physical/base snapshots preserve UNLOGGED definitions, not their
+    /// crash-volatile rows. Portable logical snapshots retain those rows.
+    /// Version3 makes content and persistence explicit to readers.
+    content_policy: enum { complete, schema_only } = .complete,
+    persistence_kind: ?enum { unlogged } = null,
     backup_id: []const u8,
     table_name: []const u8,
     table_id: u64 = 0,
@@ -199,8 +209,29 @@ pub const TableBackupManifest = struct {
     schema_json: []const u8,
     read_schema_json: []const u8,
     indexes_json: []const u8,
+    sql_native_indexes_json: []const u8 = "",
+    /// Native source attribute identities for executable/catalog dependencies.
+    /// Names/ordinals alone cannot restore UPDATE OF after schema churn.
+    sql_column_identities_json: []const u8 = "",
     replication_sources_json: []const u8,
     shards: []const ShardSnapshot,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return (std.mem.eql(u8, field, "content_policy") and self.content_policy == .complete and self.persistence_kind == null) or
+            (std.mem.eql(u8, field, "persistence_kind") and self.persistence_kind == null) or
+            (std.mem.eql(u8, field, "sql_native_indexes_json") and self.sql_native_indexes_json.len == 0) or
+            (std.mem.eql(u8, field, "sql_column_identities_json") and self.sql_column_identities_json.len == 0);
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!self.nativeJsonSkipField(field)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 
     pub fn deinit(self: *TableBackupManifest, alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.backup_id));
@@ -209,6 +240,8 @@ pub const TableBackupManifest = struct {
         alloc.free(@constCast(self.schema_json));
         alloc.free(@constCast(self.read_schema_json));
         alloc.free(@constCast(self.indexes_json));
+        alloc.free(@constCast(self.sql_native_indexes_json));
+        alloc.free(@constCast(self.sql_column_identities_json));
         alloc.free(@constCast(self.replication_sources_json));
         for (self.shards) |shard| shard.deinit(alloc);
         alloc.free(@constCast(self.shards));

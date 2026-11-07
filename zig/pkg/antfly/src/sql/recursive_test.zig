@@ -57,7 +57,9 @@ test "SQL recursive physical graph shares one capture and builds static edges on
         checks: usize = 0,
         cursors: [1]catalog.Cursor = undefined,
         fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, _: catalog.Action) !catalog.Table {
-            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{ .{ .name = "src", .path = "src", .type = .integer }, .{ .name = "dst", .path = "dst", .type = .integer } } };
+            // The recursive seed is SQL int4; these declared edge columns
+            // must have that same identity, not the storage-default int8.
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{ .{ .name = "src", .path = "src", .type = .integer, .element_type = .int32 }, .{ .name = "dst", .path = "dst", .type = .integer, .element_type = .int32 } } };
         }
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -108,6 +110,137 @@ test "SQL recursive physical graph shares one capture and builds static edges on
         try std.testing.expect(fixture.checks < fixture.count * 100);
         for (result.output.rows, 1..) |row, n| try std.testing.expectEqual(n, try std.fmt.parseInt(usize, row[0].string, 10));
     }
+}
+
+test "SQL recursive prefix demand terminates unbounded reads and preserves blocking consumers" {
+    var fixture: Fixture = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n FROM r LIMIT 5", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{ .scan_rows = 5, .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 5), result.output.rows.len);
+    try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int32), result.output.columns[0].element_type);
+    for (result.output.rows, 1..) |row, value| try std.testing.expectEqual(value, try std.fmt.parseInt(usize, row[0].string, 10));
+
+    var sorted = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n FROM r ORDER BY n LIMIT 1", .{});
+    defer sorted.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, fixture.backend(), &sorted, &.{}, .{ .scan_rows = 16 }));
+
+    var prefix = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 10/(n-1) FROM r) SELECT n FROM r LIMIT 1", .{});
+    defer prefix.deinit();
+    var first = try runtime.execute(std.testing.allocator, fixture.backend(), &prefix, &.{}, .{});
+    defer first.deinit();
+    try std.testing.expectEqualStrings("1", first.output.rows[0][0].string);
+    var failing = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 10/(n-1) FROM r) SELECT n FROM r LIMIT 2", .{});
+    defer failing.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), &failing, &.{}, .{}));
+}
+
+test "SQL recursive prefix ownership survives paused steps scoped retirement and allocator faults" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled, expected: []const []const u8) !void {
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(expected.len, result.output.rows.len * result.output.columns.len);
+            for (result.output.columns) |column| {
+                try std.testing.expectEqualStrings("n", column.name);
+                try std.testing.expectEqual(ast.ColumnType.integer, column.type);
+                try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int32), column.element_type);
+            }
+            var index: usize = 0;
+            for (result.output.rows) |row| for (row) |cell| {
+                try std.testing.expectEqualStrings(expected[index], cell.string);
+                index += 1;
+            };
+        }
+    };
+    const Case = struct { sql: []const u8, expected: []const []const u8 };
+    for ([_]Case{
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n FROM r LIMIT 5", .expected = &.{ "1", "2", "3", "4", "5" } },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT n FROM r ORDER BY n DESC LIMIT 1", .expected = &.{"5"} },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT CASE WHEN n=1 THEN 2 ELSE 1 END FROM r) SELECT n FROM r", .expected = &.{ "1", "2" } },
+        .{ .sql = "SELECT p.n, q.n FROM (VALUES (1),(10)) p(n) CROSS JOIN LATERAL (WITH RECURSIVE r(n) AS (SELECT p.n UNION ALL SELECT n+1 FROM r WHERE n<p.n+1) SELECT n FROM r LIMIT 1) q", .expected = &.{ "1", "1", "10", "10" } },
+        .{ .sql = "SELECT p.n, q.n FROM (VALUES (1),(10)) p(n) CROSS JOIN LATERAL (WITH RECURSIVE r(n) AS (SELECT p.n UNION ALL SELECT n+1 FROM r WHERE n<p.n+1) SELECT n FROM r LIMIT 2) q", .expected = &.{ "1", "1", "1", "2", "10", "10", "10", "11" } },
+        .{ .sql = "SELECT p.n, q.n FROM (VALUES (1),(10)) p(n) CROSS JOIN LATERAL (WITH RECURSIVE r(n) AS (SELECT p.n UNION ALL SELECT n+1 FROM r WHERE n<p.n+2), c AS MATERIALIZED (SELECT n FROM r), nested AS MATERIALIZED (SELECT n FROM c) SELECT n FROM nested LIMIT 2) q", .expected = &.{ "1", "1", "1", "2", "10", "10", "10", "11" } },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ &compiled, case.expected }) catch |err| {
+            std.debug.print("recursive prefix ownership case failed: {s}: {t}\n", .{ case.sql, err });
+            return err;
+        };
+    }
+    var fixture: Fixture = .{};
+    var scoped = try compiler.compile(std.testing.allocator, "SELECT p.n, q.n FROM (VALUES (1),(10)) p(n) CROSS JOIN LATERAL (WITH RECURSIVE r(n) AS (SELECT p.n UNION ALL SELECT n+1 FROM r WHERE n<p.n+1) SELECT n FROM r LIMIT 1) q", .{});
+    defer scoped.deinit();
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), &scoped, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+    for (result.output.rows, [_][]const u8{ "1", "10" }) |row, expected| {
+        try std.testing.expectEqualStrings(expected, row[0].string);
+        try std.testing.expectEqualStrings(expected, row[1].string);
+    }
+}
+
+test "SQL recursive binding pins seed builtin identities and coerces unknown term literals" {
+    const compiler_a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, error_kind: anyerror }{
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+2147483648 FROM r WHERE n<2) SELECT n FROM r", .error_kind = error.SqlRecursiveTypeMismatch },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1::numeric(3,0) UNION ALL SELECT n+1 FROM r WHERE n<2) SELECT n FROM r", .error_kind = error.SqlRecursiveTypeMismatch },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT ARRAY[1] UNION ALL SELECT ARRAY[2::bigint] FROM r WHERE n=ARRAY[1]) SELECT n FROM r", .error_kind = error.SqlRecursiveTypeMismatch },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 'bad' FROM r WHERE n<2) SELECT n FROM r", .error_kind = error.SqlInvalidTextRepresentation },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT '2'::text FROM r WHERE n<2) SELECT n FROM r", .error_kind = error.SqlRecursiveTypeMismatch },
+    }) |case| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(compiler_a, case.sql, .{});
+        defer compiled.deinit();
+        var description = @import("antfly_local_sources").sql_describe.describe(compiler_a, fixture.backend(), &compiled, &.{}) catch |err| {
+            try std.testing.expectEqual(case.error_kind, err);
+            try std.testing.expectEqualStrings(if (err == error.SqlRecursiveTypeMismatch) "42804" else "22P02", @import("antfly_local_sources").sql_errors.describe(err).code);
+            try std.testing.expectEqual(@as(usize, 0), fixture.mutations);
+            continue;
+        };
+        description.deinit();
+        return error.TestExpectedError;
+    }
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled, width: @import("antfly_local_sources").sql_array_value.ElementType) !void {
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, width), result.output.columns[0].element_type);
+            try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("2", result.output.rows[1][0].string);
+        }
+    };
+    for ([_]struct { sql: []const u8, width: @import("antfly_local_sources").sql_array_value.ElementType }{
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1::bigint UNION ALL SELECT 2::integer FROM r WHERE n<2) SELECT n FROM r", .width = .int64 },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT '2' FROM r WHERE n<2) SELECT n FROM r", .width = .int32 },
+    }) |case| {
+        var compiled = try compiler.compile(compiler_a, case.sql, .{});
+        defer compiled.deinit();
+        @import("antfly_platform").allocator.checkAllAllocationFailures(compiler_a, Check.run, .{ &compiled, case.width }) catch |err| {
+            std.debug.print("recursive type case failed: {s}: {t}\n", .{ case.sql, err });
+            return err;
+        };
+    }
+}
+
+test "SQL recursive integer value overflow remains deferred after type admission" {
+    var fixture: Fixture = .{};
+    var first = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 2147483647 UNION ALL SELECT n+1 FROM r) SELECT n FROM r LIMIT 1", .{});
+    defer first.deinit();
+    var prefix = try runtime.execute(std.testing.allocator, fixture.backend(), &first, &.{}, .{});
+    defer prefix.deinit();
+    try std.testing.expectEqualStrings("2147483647", prefix.output.rows[0][0].string);
+    var next = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 2147483647 UNION ALL SELECT n+1 FROM r) SELECT n FROM r LIMIT 2", .{});
+    defer next.deinit();
+    var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, fixture.backend(), &next, &.{});
+    defer description.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, runtime.execute(std.testing.allocator, fixture.backend(), &next, &.{}, .{}));
+    try std.testing.expectEqualStrings("22003", @import("antfly_local_sources").sql_errors.describe(error.SqlNumericOutOfRange).code);
 }
 
 test "SQL recursive worklists preserve delta UNION ALL and distinct cycle semantics" {
@@ -167,7 +300,7 @@ test "SQL recursive admission rejects nonlinear scopes and enforces type work me
     var fixture: Fixture = .{};
     var typed = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 'text' FROM r) SELECT n FROM r", .{});
     defer typed.deinit();
-    try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), &typed, &.{}, .{}));
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, runtime.execute(std.testing.allocator, fixture.backend(), &typed, &.{}, .{}));
     var endless = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM r) SELECT n FROM r", .{});
     defer endless.deinit();
     try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, fixture.backend(), &endless, &.{}, .{ .scan_rows = 16 }));

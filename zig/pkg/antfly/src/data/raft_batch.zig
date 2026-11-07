@@ -21,6 +21,8 @@ const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig"
 
 pub const acknowledge_many_protocol_version = @import("../common/data_raft_protocol.zig").batch_acknowledge_many_protocol_version;
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
+pub const maximum_decodable_protocol_version = @import("../common/data_raft_protocol.zig").maximum_decodable_batch_protocol_version;
+pub const index_owner_control_protocol_version = internal_batch_forwarding.raft_batch_index_owner_control_protocol_version;
 pub const artifact_catalog_protocol_version = internal_batch_forwarding.raft_batch_artifact_catalog_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
@@ -96,6 +98,23 @@ pub fn encodeWithStorageOwnerDescriptor(
     req: db_mod.types.BatchRequest,
     descriptor: ?descriptor_contract.Descriptor,
 ) ![]u8 {
+    return encodeWithStorageOwnerDescriptorOwned(alloc, table_name, req, descriptor) catch |err| switch (err) {
+        // This writer has no external I/O: WriteFailed means its allocator
+        // exhausted memory, not an ambiguous replicated mutation outcome.
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn encodeWithStorageOwnerDescriptorOwned(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.BatchRequest,
+    descriptor: ?descriptor_contract.Descriptor,
+) ![]u8 {
+    if (internal_batch_forwarding.graphTransactionProtocol(req)) |required| {
+        if (protocol_version < required) return error.UnsupportedRaftBatchProtocolVersion;
+    }
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
 
@@ -147,7 +166,10 @@ fn cloneStorageOwnerDescriptor(
 }
 
 pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBatch {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always });
+    // The envelope owns routing, not numeric semantics. Preserve exact tokens
+    // through the shared batch decoder; f64 conversion here irreversibly loses
+    // JSONB display scale and wide integer precision before row preparation.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, batch_api.internal_json_options);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReplicatedBatch;
     const root = parsed.value.object;
@@ -158,13 +180,10 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
     const table_name = try alloc.dupe(u8, table_value.string);
     errdefer alloc.free(table_name);
     if (root.get("protocol_barrier")) |barrier_value| {
-        if (barrier_value != .integer or barrier_value.integer <= 0 or
-            barrier_value.integer > std.math.maxInt(u16))
-        {
-            return error.InvalidReplicatedBatch;
-        }
-        const version: u16 = @intCast(barrier_value.integer);
-        if (version > protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
+        if (barrier_value != .number_string) return error.InvalidReplicatedBatch;
+        const version = std.fmt.parseUnsigned(u16, barrier_value.number_string, 10) catch return error.InvalidReplicatedBatch;
+        if (version == 0) return error.InvalidReplicatedBatch;
+        if (version > maximum_decodable_protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
         if (batch_value != .null) return error.InvalidReplicatedBatch;
         return .{
             .table_name = table_name,
@@ -172,10 +191,11 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
             .protocol_barrier_version = version,
         };
     }
-    const batch_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(batch_value, .{})});
-    defer alloc.free(batch_json);
-    var batch = try batch_api.parseInternalBatchRequest(alloc, batch_json);
+    var batch = try batch_api.parseInternalBatchValue(alloc, batch_value);
     errdefer batch.deinit(alloc);
+    if (internal_batch_forwarding.graphTransactionProtocol(batch.req)) |required| {
+        if (protocol_version < required) return error.UnsupportedRaftBatchProtocolVersion;
+    }
 
     var storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null;
     errdefer if (storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
@@ -203,6 +223,87 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "graph batch34 internal producer transport preserves tuple and explicit ownership" {
+            const a = std.testing.allocator;
+            const request: db_mod.types.BatchRequest = .{ .graph_writes = &.{
+                .{ .index_name = "g", .source = "root", .target = "tuple", .edge_type = "R", .owner = "fact:tuple" },
+                .{ .index_name = "g", .source = "root", .target = "explicit", .edge_type = "R", .edge_id = "relationship", .owner_document = "fact:explicit" },
+            } };
+            const encoded = try encode(a, "docs", request);
+            var encoded_live = true;
+            defer if (encoded_live) a.free(encoded);
+            var decoded = try decode(a, encoded);
+            defer decoded.deinit(a);
+            a.free(encoded);
+            encoded_live = false;
+            try std.testing.expectEqualStrings("docs", decoded.table_name);
+            try std.testing.expectEqualDeep(request.graph_writes, decoded.batch.req.graph_writes);
+            // Decoded fields remain valid after the first transport is gone.
+            const replay = try encode(a, decoded.table_name, decoded.batch.req);
+            defer a.free(replay);
+            var replayed = try decode(a, replay);
+            defer replayed.deinit(a);
+            try std.testing.expectEqualDeep(request.graph_writes, replayed.batch.req.graph_writes);
+        }
+
+        test "graph batch34 rejects unsupported active writers and decoders while preserving ordinary wire bytes" {
+            const alloc = std.testing.allocator;
+            const types = db_mod.types;
+            var req: types.BatchRequest = .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} };
+            const ordinary = try encode(alloc, "docs", req);
+            defer alloc.free(ordinary);
+            var legacy = try decode(alloc, ordinary);
+            defer legacy.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), legacy.batch.req.graph_writes.len);
+            req.transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 1 } };
+            if (protocol_version < 34) {
+                try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(alloc, "docs", req));
+                const raw = try batch_api.encodeBatchRequest(alloc, req);
+                defer alloc.free(raw);
+                const forged = try std.fmt.allocPrint(alloc, "{{\"table\":\"docs\",\"batch\":{s}}}", .{raw});
+                defer alloc.free(forged);
+                try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, decode(alloc, forged));
+            } else {
+                const encoded = try encode(alloc, "docs", req);
+                defer alloc.free(encoded);
+                var decoded = try decode(alloc, encoded);
+                defer decoded.deinit(alloc);
+                try std.testing.expectEqual(@as(?u16, 34), internal_batch_forwarding.graphTransactionProtocol(decoded.batch.req));
+            }
+            var barrier = try decode(alloc, "{\"table\":\"docs\",\"protocol_barrier\":34,\"batch\":null}");
+            defer barrier.deinit(alloc);
+            try std.testing.expectEqual(@as(?u16, 34), barrier.protocol_barrier_version);
+            const future = try std.fmt.allocPrint(alloc, "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}", .{maximum_decodable_protocol_version + 1});
+            defer alloc.free(future);
+            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, decode(alloc, future));
+        }
+
+        test "raft batch round trips table batch payload exact numbers without envelope reparse" {
+            const Check = struct {
+                fn run(alloc: std.mem.Allocator) !void {
+                    const row = "{\"j\":{\"n\":1.2300e2,\"wide\":9007199254740993.2500,\"tiny\":1e-1000},\"null\":null}";
+                    const encoded = try encode(alloc, "docs", .{
+                        .writes = &.{.{ .key = "row", .value = row, .json_null_fields = &.{"null"} }},
+                        .timestamp_ns = 9007199254740993,
+                        .transforms = &.{.{ .key = "other", .operations = &.{.{ .op = .set, .path = "j", .value_json = "{\"n\":1.2300e2}" }} }},
+                    });
+                    var encoded_owned = true;
+                    defer if (encoded_owned) alloc.free(encoded);
+                    var decoded = try decode(alloc, encoded);
+                    defer decoded.deinit(alloc);
+                    // All nested data must outlive the envelope allocation.
+                    alloc.free(encoded);
+                    encoded_owned = false;
+                    try std.testing.expectEqualStrings(row, decoded.batch.req.writes[0].value);
+                    try std.testing.expectEqualStrings("null", decoded.batch.req.writes[0].json_null_fields[0]);
+                    try std.testing.expectEqual(@as(u64, 9007199254740993), decoded.batch.req.timestamp_ns);
+                    try std.testing.expectEqualStrings("{\"n\":1.2300e2}", decoded.batch.req.transforms[0].operations[0].value_json.?);
+                }
+            };
+            try Check.run(std.testing.allocator);
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+        }
+
         test "ordered artifact merge adoption uses private raft batch encoding" {
             const alloc = std.testing.allocator;
             const request: db_mod.types.BatchRequest = .{ .merge_proof_adoption = .{
@@ -276,13 +377,21 @@ fn consumerTests() type {
             const encoded = try std.fmt.allocPrint(
                 std.testing.allocator,
                 "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}",
-                .{protocol_version + 1},
+                .{maximum_decodable_protocol_version + 1},
             );
             defer std.testing.allocator.free(encoded);
             try std.testing.expectError(
                 error.UnsupportedRaftBatchProtocolVersion,
                 decode(std.testing.allocator, encoded),
             );
+        }
+
+        test "raft protocol barrier rejects noninteger and out of range tokens" {
+            for ([_][]const u8{ "0", "-1", "1.0", "1e0", "65536", "\"1\"", "null", "true" }) |token| {
+                const encoded = try std.fmt.allocPrint(std.testing.allocator, "{{\"table\":\"docs\",\"protocol_barrier\":{s},\"batch\":null}}", .{token});
+                defer std.testing.allocator.free(encoded);
+                try std.testing.expectError(error.InvalidReplicatedBatch, decode(std.testing.allocator, encoded));
+            }
         }
 
         test "raft batch envelope detector tolerates whitespace and object field order" {
@@ -595,4 +704,30 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "raft protocol barrier external transaction admission expires only new votes and stamps at the leader" {
+    const owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 200 };
+    const types = @import("antfly_local_sources").storage_db_types;
+    var request: types.BatchRequest = .{ .timestamp_ns = 1, .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 7, .external_decision_owner = owner } } };
+    try std.testing.expectEqual(@as(?u16, @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version), internal_batch_forwarding.externalTransactionProtocol(request));
+    try internal_batch_forwarding.validateExternalVoteAdmission(request, 100);
+    internal_batch_forwarding.materializeExternalVoteTimestamp(&request, 100);
+    try std.testing.expectEqual(@as(u64, 100), request.timestamp_ns);
+    const prepared = try types.TransactionIntentRequest.fromBatch(request);
+    try owner.requireFreshVoteAt(prepared.timestamp_ns);
+    try std.testing.expectError(error.ExternalTransactionAdmissionExpired, internal_batch_forwarding.validateExternalVoteAdmission(request, 200));
+    request.transaction.?.prepare.external_activation = true;
+    try internal_batch_forwarding.validateExternalVoteAdmission(request, 10_000);
+    internal_batch_forwarding.materializeExternalVoteTimestamp(&request, 10_000);
+    try std.testing.expectEqual(@as(u64, 100), request.timestamp_ns);
+    request.transaction = .{ .begin = .{ .txn_id = @splat(4), .begin_timestamp = 5, .created_at_ns = 6, .topology_epoch = 7, .participants = &.{"table:rows:group:8"}, .retain_terminal = true, .external_decision_owner = owner } };
+    try std.testing.expect(internal_batch_forwarding.externalTransactionProtocol(request) != null);
+    try internal_batch_forwarding.validateExternalVoteAdmission(request, 100);
+    internal_batch_forwarding.materializeExternalVoteTimestamp(&request, 101);
+    try std.testing.expectEqual(@as(u64, 101), request.timestamp_ns);
+    try std.testing.expectError(error.ExternalTransactionAdmissionExpired, internal_batch_forwarding.validateExternalVoteAdmission(request, 200));
+    request.transaction = .{ .resolve = .{ .txn_id = @splat(4), .status = .committed, .commit_version = 10_000, .external_decision_owner = owner } };
+    try internal_batch_forwarding.validateExternalVoteAdmission(request, 10_000);
+    try std.testing.expect(internal_batch_forwarding.externalTransactionProtocol(request) != null);
 }

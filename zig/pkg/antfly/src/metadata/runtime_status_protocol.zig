@@ -17,7 +17,9 @@
 /// wire profiles are compatibility surfaces: V12 is the v0.2.0 profile, V15
 /// is the positional profile, V16 adds inference diagnostics, V17 introduces
 /// framed index records and native dense-storage capability, and V18 carries
-/// the storage owner's applied schema epoch for indexless schema cutover. Intermediate development
+/// the storage owner's applied schema epoch for indexless schema cutover. V19
+/// adds media output counters; V20 adds durable source authority and the native
+/// commit cut. Intermediate development
 /// formats must never be advertised, negotiated, read, or written.
 pub const v0_2_0_record_version: u16 = 12;
 pub const positional_record_version: u16 = 15;
@@ -26,7 +28,8 @@ pub const inference_diagnostics_record_version: u16 = 16;
 pub const framed_index_record_version: u16 = 17;
 pub const schema_epoch_record_version: u16 = 18;
 pub const media_output_record_version: u16 = 19;
-pub const current_record_version: u16 = media_output_record_version;
+pub const source_authority_record_version: u16 = 20;
+pub const current_record_version: u16 = source_authority_record_version;
 pub const legacy_record_version: u16 = v0_2_0_record_version;
 
 pub const Profile = enum(u16) {
@@ -35,6 +38,7 @@ pub const Profile = enum(u16) {
     inference_diagnostics = inference_diagnostics_record_version,
     framed_index = framed_index_record_version,
     schema_epoch = schema_epoch_record_version,
+    media_output = media_output_record_version,
     current = current_record_version,
 
     pub fn wireVersion(self: @This()) u16 {
@@ -55,9 +59,10 @@ pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
     return switch (required) {
         .released_v0_2_0 => true,
         .positional => available != .released_v0_2_0,
-        .inference_diagnostics => available == .inference_diagnostics or available == .framed_index or available == .schema_epoch or available == .current,
-        .framed_index => available == .framed_index or available == .schema_epoch or available == .current,
-        .schema_epoch => available == .schema_epoch or available == .current,
+        .inference_diagnostics => available == .inference_diagnostics or available == .framed_index or available == .schema_epoch or available == .media_output or available == .current,
+        .framed_index => available == .framed_index or available == .schema_epoch or available == .media_output or available == .current,
+        .schema_epoch => available == .schema_epoch or available == .media_output or available == .current,
+        .media_output => available == .media_output or available == .current,
         .current => available == .current,
     };
 }
@@ -66,7 +71,7 @@ pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
 /// Version integers identify formats; compatibility is never inferred from
 /// numeric ordering.
 pub fn greatestCommonProfile(left_version: u16, right_version: u16) ?Profile {
-    const candidates = [_]Profile{ .current, .schema_epoch, .framed_index, .inference_diagnostics, .positional, .released_v0_2_0 };
+    const candidates = [_]Profile{ .current, .media_output, .schema_epoch, .framed_index, .inference_diagnostics, .positional, .released_v0_2_0 };
     for (candidates) |candidate| {
         const version = candidate.wireVersion();
         if (profileSatisfies(left_version, version) and
@@ -101,6 +106,43 @@ pub fn isNegotiable(version: u16) bool {
     return profileForVersion(version) != null;
 }
 
+/// The sender explicitly omits a new observation until all metadata decoders
+/// are ready. Proposal admission independently rechecks readiness before the
+/// first durable report activates the codec. Missing always means unknown.
+pub fn projectSourceAuthority(reports: anytype, ready_version: u16) void {
+    if (profileSatisfies(ready_version, source_authority_record_version)) return;
+    for (reports) |*report| report.source_authority = null;
+}
+
+/// A late weaker probe must not erase a stronger proof for the same membership.
+/// Membership replacement discards the prior proof; unknown profiles grant none.
+pub fn mergeReadyVersion(same_membership: bool, previous: u16, observed: u16) u16 {
+    if (!isNegotiable(observed)) return 0;
+    if (same_membership and profileSatisfies(previous, observed)) return previous;
+    return observed;
+}
+
+test "runtime status source authority readiness retains older-profile proofs only within their membership" {
+    try std.testing.expectEqual(@as(u16, 18), mergeReadyVersion(true, 18, 17));
+    try std.testing.expectEqual(source_authority_record_version, mergeReadyVersion(true, 18, source_authority_record_version));
+    try std.testing.expectEqual(source_authority_record_version, mergeReadyVersion(true, source_authority_record_version, media_output_record_version));
+    try std.testing.expectEqual(media_output_record_version, mergeReadyVersion(false, source_authority_record_version, media_output_record_version));
+    try std.testing.expectEqual(@as(u16, 18), mergeReadyVersion(true, 21, 18));
+    try std.testing.expectEqual(@as(u16, 0), mergeReadyVersion(true, source_authority_record_version, 21));
+}
+
+test "runtime status source authority projection requires a ready named profile" {
+    const Report = struct { source_authority: ?u64 = 7 };
+    inline for (.{ @as(u16, 0), @as(u16, 18), @as(u16, 19), @as(u16, 21), @as(u16, 65535) }) |version| {
+        var reports = [_]Report{.{}};
+        projectSourceAuthority(&reports, version);
+        try std.testing.expect(reports[0].source_authority == null);
+    }
+    var reports = [_]Report{.{}};
+    projectSourceAuthority(&reports, source_authority_record_version);
+    try std.testing.expectEqual(@as(?u64, 7), reports[0].source_authority);
+}
+
 test "runtime status exposes only released compatibility profiles" {
     try std.testing.expect(!isSupported(1));
     try std.testing.expect(isSupported(v0_2_0_record_version));
@@ -112,7 +154,8 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expect(isSupported(16));
     try std.testing.expect(isSupported(18));
     try std.testing.expect(isSupported(19));
-    try std.testing.expect(!isSupported(20));
+    try std.testing.expect(isSupported(20));
+    try std.testing.expect(!isSupported(21));
 
     try std.testing.expect(isNegotiable(v0_2_0_record_version));
     try std.testing.expect(isNegotiable(positional_record_version));
@@ -127,6 +170,13 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expectEqual(Profile.inference_diagnostics, profileForVersion(16).?);
     try std.testing.expectEqual(Profile.framed_index, profileForVersion(17).?);
     try std.testing.expectEqual(Profile.schema_epoch, profileForVersion(18).?);
+    try std.testing.expectEqual(Profile.media_output, profileForVersion(19).?);
+    try std.testing.expect(profileSatisfies(19, 18));
+    try std.testing.expect(profileSatisfies(19, 19));
+    try std.testing.expect(!profileSatisfies(18, 19));
+    try std.testing.expect(!profileSatisfies(21, 19));
+    try std.testing.expectEqual(Profile.schema_epoch, greatestCommonProfile(19, 18).?);
+    try std.testing.expectEqual(Profile.media_output, greatestCommonProfile(19, 19).?);
 
     try std.testing.expect(profileSatisfies(12, 12));
     try std.testing.expect(profileSatisfies(15, 12));
@@ -166,3 +216,12 @@ test "runtime status exposes only released compatibility profiles" {
 }
 
 const std = @import("std");
+
+test "runtime status merged source authority negotiates above the shipped media profile" {
+    try std.testing.expectEqual(Profile.current, profileForVersion(20).?);
+    try std.testing.expect(profileSatisfies(20, 19));
+    try std.testing.expect(profileSatisfies(20, 20));
+    try std.testing.expect(!profileSatisfies(19, 20));
+    try std.testing.expectEqual(Profile.media_output, greatestCommonProfile(20, 19).?);
+    try std.testing.expectEqual(Profile.current, greatestCommonProfile(20, 20).?);
+}

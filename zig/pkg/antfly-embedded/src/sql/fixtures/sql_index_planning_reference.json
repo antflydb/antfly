@@ -1,0 +1,234 @@
+{
+  "format": 1,
+  "oracle_major": 18,
+  "timezone": "UTC",
+  "base_sql": "CREATE TABLE index_probe (s text, n int)",
+  "inputs": [
+    {
+      "s": null,
+      "n": null
+    },
+    {
+      "s": "",
+      "n": 0
+    },
+    {
+      "s": "ALPHA",
+      "n": 3
+    }
+  ],
+  "entries": [
+    {
+      "kind": "key",
+      "expression": "concat(s, 'x')",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((concat(s, 'x')))",
+      "sqlstate": "42P17"
+    },
+    {
+      "kind": "key",
+      "expression": "concat_ws('-', s, 'x')",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((concat_ws('-', s, 'x')))",
+      "sqlstate": "42P17"
+    },
+    {
+      "kind": "key",
+      "expression": "lower(s)",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((lower(s)))",
+      "rows": [
+        null,
+        "",
+        "alpha"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "CASE WHEN false THEN concat(s, 'x') ELSE s END",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((CASE WHEN false THEN concat(s, 'x') ELSE s END))",
+      "rows": [
+        null,
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "coalesce(s, 'ok', concat(s, 'x'))",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((coalesce(s, 'ok', concat(s, 'x'))))",
+      "rows": [
+        "ok",
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "to_jsonb(s)",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((to_jsonb(s)))",
+      "sqlstate": "42P17"
+    },
+    {
+      "kind": "predicate",
+      "expression": "true",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE true",
+      "rows": [
+        null,
+        "0",
+        "3"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "false",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE false",
+      "rows": [],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "NULL::boolean",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE NULL::boolean",
+      "rows": [],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "s IS NULL OR concat(s, 'x') IS NULL OR true",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE s IS NULL OR concat(s, 'x') IS NULL OR true",
+      "rows": [
+        null,
+        "0",
+        "3"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "n > 0 AND concat(s, 'x') IS NULL",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE n > 0 AND concat(s, 'x') IS NULL",
+      "sqlstate": "42P17"
+    },
+    {
+      "kind": "predicate",
+      "expression": "CASE WHEN false THEN concat(s, 'x') IS NULL ELSE n > 0 END",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE CASE WHEN false THEN concat(s, 'x') IS NULL ELSE n > 0 END",
+      "rows": [
+        "3"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "n > 0 AND true",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE n > 0 AND true",
+      "rows": [
+        "3"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "n > 0 OR false",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE n > 0 OR false",
+      "rows": [
+        "3"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "true OR (1 / 0 = 0)",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE true OR (1 / 0 = 0)",
+      "rows": [
+        null,
+        "0",
+        "3"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "(1 / 0 = 0) OR true",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE (1 / 0 = 0) OR true",
+      "sqlstate": "22012"
+    },
+    {
+      "kind": "predicate",
+      "expression": "false AND missing IS NULL",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE false AND missing IS NULL",
+      "sqlstate": "42703"
+    },
+    {
+      "kind": "predicate",
+      "expression": "NOT NULL::boolean",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE NOT NULL::boolean",
+      "rows": [],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "NOT false",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE NOT false",
+      "rows": [
+        null,
+        "0",
+        "3"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "predicate",
+      "expression": "NOT true",
+      "sql": "CREATE INDEX probe_idx ON index_probe (n) WHERE NOT true",
+      "rows": [],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "replace(s, 'A', 'x')",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((replace(s, 'A', 'x')))",
+      "rows": [
+        null,
+        "",
+        "xLPHx"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "md5(s)",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((md5(s)))",
+      "rows": [
+        null,
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "002101f8725e5c78d9f30d87f3fa4c87"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "md5(replace(s, 'A', 'x'))",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((md5(replace(s, 'A', 'x'))))",
+      "rows": [
+        null,
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "e6692fe2a788437578d0375d59283510"
+      ],
+      "sqlstate": null
+    },
+    {
+      "kind": "key",
+      "expression": "replace(s, lower(s), upper(s))",
+      "sql": "CREATE INDEX probe_idx ON index_probe ((replace(s, lower(s), upper(s))))",
+      "rows": [
+        null,
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
+    }
+  ]
+}

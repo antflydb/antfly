@@ -52,10 +52,41 @@ fn recipe(table: anytype) Digest {
         hash.update(&length);
         hash.update(bytes);
     }
+    if (textReadIndex(table)) |name| {
+        hash.update("antfly/native-query-text-generation/v1");
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, name.len, .little);
+        hash.update(&encoded);
+        hash.update(name);
+    }
     var digest: Digest = undefined;
     hash.final(&digest);
     return digest;
 }
+fn textReadIndex(table: anytype) ?[]const u8 {
+    return if (@hasField(@TypeOf(table), "full_text_read_index")) table.full_text_read_index else null;
+}
+
+test "schema validation publication retained query recipes bind exact primary text selection" {
+    const a = std.testing.allocator;
+    var table: @import("antfly_local_sources").common_topology_records.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{\"version\":3}", .indexes_json = "{\"body\":{\"type\":\"full_text\"},\"title\":{\"type\":\"full_text\"}}" };
+    const legacy = recipe(table);
+    table.full_text_read_index = "body";
+    const body = recipe(table);
+    table.full_text_read_index = "title";
+    const title = recipe(table);
+    try std.testing.expect(!std.mem.eql(u8, &legacy, &body));
+    try std.testing.expect(!std.mem.eql(u8, &body, &title));
+    const value: @import("antfly_local_sources").storage_db_native_query_cut_contract.Recipe = .{ .schema_json = table.schema_json, .read_schema_json = "", .indexes_json = table.indexes_json, .full_text_read_index = table.full_text_read_index };
+    const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(@TypeOf(value), a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("title", decoded.value.full_text_read_index.?);
+    const borrowed = .{ .schema_json = table.schema_json, .read_schema_json = "", .indexes_json = table.indexes_json };
+    try std.testing.expectEqualSlices(u8, &legacy, &recipe(borrowed));
+}
+
 pub fn save(a: A, store: *stores.ArtifactStore, identity: Digest, io: std.Io, table: anytype, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
     return saveWithRetention(a, store, identity, io, table, now, @import("lake_retained_cut.zig").ttl_ms, cancellation);
 }
@@ -90,7 +121,7 @@ pub fn saveWithCover(a: A, store: *stores.ArtifactStore, identity: Digest, io: s
     const bytes = try std.json.Stringify.valueAlloc(a, descriptor, .{});
     defer a.free(bytes);
     if (bytes.len > 4 * 1024 * 1024) return error.QueryCandidateBudgetExceeded;
-    const validation: Request = .{ .id = descriptor.id, .table_id = table.table_id, .expires_ms = descriptor.expires_ms, .cover = physical_cover, .recipe = .{ .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json } };
+    const validation: Request = .{ .id = descriptor.id, .table_id = table.table_id, .expires_ms = descriptor.expires_ms, .cover = physical_cover, .recipe = .{ .full_text_read_index = textReadIndex(table), .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json } };
     try validation.validate(now);
     const scope = try stores.UploadScope.forPublication(domain(table.table_id, identity), descriptor.expires_ms, io);
     var metadata = try store.putScoped(scope, bytes, cancellation);
@@ -114,7 +145,7 @@ pub fn load(a: A, store: *stores.ArtifactStore, identity: Digest, token: []const
     // Legacy capabilities omitted the original routing identity. They cannot
     // safely be resumed once topology may have changed; expire them explicitly.
     if ((descriptor.version != 2 and descriptor.version != 3) or descriptor.cover.len == 0) return error.CatalogGenerationChanged;
-    const request: Request = .{ .id = descriptor.id, .table_id = descriptor.table_id, .expires_ms = descriptor.expires_ms, .cover = descriptor.cover, .recipe = .{ .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json } };
+    const request: Request = .{ .id = descriptor.id, .table_id = descriptor.table_id, .expires_ms = descriptor.expires_ms, .cover = descriptor.cover, .recipe = .{ .full_text_read_index = textReadIndex(table), .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json } };
     try request.validate(now);
     return descriptor;
 }

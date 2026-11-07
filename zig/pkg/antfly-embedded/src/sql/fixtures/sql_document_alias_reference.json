@@ -1,0 +1,732 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL over declared updatable JSONB aliases",
+  "entries": [
+    {
+      "id": "sql-0917",
+      "sql": "INSERT INTO docs (_id, metadata_plan) VALUES ('doc:a', 'pro')",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "plan": {
+                      "type": "keyword",
+                      "x-antfly-column-name": "metadata_plan"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "seeds": [],
+      "affected": 1,
+      "rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "metadata": {
+                "plan": "pro"
+              }
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "aliases": {
+        "columns": [
+          "_id",
+          "metadata_plan"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "doc:a",
+            "pro"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "null_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "metadata": {}
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "metadata": {}
+            }
+          ],
+          [
+            "doc:cold",
+            {
+              "metadata": {
+                "plan": "cold"
+              }
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-1082",
+      "sql": "UPDATE docs SET metadata_plan = 'pro' WHERE _id = 'doc:a'",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "plan": {
+                      "type": "keyword",
+                      "x-antfly-column-name": "metadata_plan"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Alpha",
+            "metadata": {
+              "plan": "free"
+            },
+            "metadata_plan": "decoy",
+            "unknown": {
+              "retained": [
+                1,
+                2
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Beta",
+            "metadata": {
+              "plan": "pro"
+            },
+            "unknown": "keep"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Gamma",
+            "metadata": {},
+            "unknown": null
+          }
+        }
+      ],
+      "affected": 1,
+      "rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "Alpha",
+              "unknown": {
+                "retained": [
+                  1,
+                  2
+                ]
+              },
+              "metadata": {
+                "plan": "pro"
+              },
+              "metadata_plan": "decoy"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "title": "Beta",
+              "unknown": "keep",
+              "metadata": {
+                "plan": "pro"
+              }
+            }
+          ],
+          [
+            "doc:c",
+            {
+              "title": "Gamma",
+              "unknown": null,
+              "metadata": {}
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "aliases": {
+        "columns": [
+          "_id",
+          "metadata_plan"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "doc:a",
+            "pro"
+          ],
+          [
+            "doc:b",
+            "pro"
+          ],
+          [
+            "doc:c",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "null_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "Alpha",
+              "unknown": {
+                "retained": [
+                  1,
+                  2
+                ]
+              },
+              "metadata": {},
+              "metadata_plan": "decoy"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "title": "Beta",
+              "unknown": "keep",
+              "metadata": {
+                "plan": "pro"
+              }
+            }
+          ],
+          [
+            "doc:c",
+            {
+              "title": "Gamma",
+              "unknown": null,
+              "metadata": {}
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "Alpha",
+              "unknown": {
+                "retained": [
+                  1,
+                  2
+                ]
+              },
+              "metadata": {},
+              "metadata_plan": "decoy"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "title": "Beta",
+              "unknown": "keep",
+              "metadata": {
+                "plan": "pro"
+              }
+            }
+          ],
+          [
+            "doc:c",
+            {
+              "title": "Gamma",
+              "unknown": null,
+              "metadata": {}
+            }
+          ],
+          [
+            "doc:cold",
+            {
+              "metadata": {
+                "plan": "cold"
+              }
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-1088",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE metadata_plan = 'pro'",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "plan": {
+                      "type": "keyword",
+                      "x-antfly-column-name": "metadata_plan"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Alpha",
+            "metadata": {
+              "plan": "free"
+            },
+            "metadata_plan": "decoy",
+            "unknown": {
+              "retained": [
+                1,
+                2
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Beta",
+            "metadata": {
+              "plan": "pro"
+            },
+            "unknown": "keep"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Gamma",
+            "metadata": {},
+            "unknown": null
+          }
+        }
+      ],
+      "affected": 1,
+      "rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "Alpha",
+              "unknown": {
+                "retained": [
+                  1,
+                  2
+                ]
+              },
+              "metadata": {
+                "plan": "free"
+              },
+              "metadata_plan": "decoy"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "title": "Launch",
+              "unknown": "keep",
+              "metadata": {
+                "plan": "pro"
+              }
+            }
+          ],
+          [
+            "doc:c",
+            {
+              "title": "Gamma",
+              "unknown": null,
+              "metadata": {}
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "aliases": {
+        "columns": [
+          "_id",
+          "metadata_plan"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "doc:a",
+            "free"
+          ],
+          [
+            "doc:b",
+            "pro"
+          ],
+          [
+            "doc:c",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "null_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "Alpha",
+              "unknown": {
+                "retained": [
+                  1,
+                  2
+                ]
+              },
+              "metadata": {},
+              "metadata_plan": "decoy"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "title": "Launch",
+              "unknown": "keep",
+              "metadata": {
+                "plan": "pro"
+              }
+            }
+          ],
+          [
+            "doc:c",
+            {
+              "title": "Gamma",
+              "unknown": null,
+              "metadata": {}
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "Alpha",
+              "unknown": {
+                "retained": [
+                  1,
+                  2
+                ]
+              },
+              "metadata": {},
+              "metadata_plan": "decoy"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "title": "Launch",
+              "unknown": "keep",
+              "metadata": {
+                "plan": "pro"
+              }
+            }
+          ],
+          [
+            "doc:c",
+            {
+              "title": "Gamma",
+              "unknown": null,
+              "metadata": {}
+            }
+          ],
+          [
+            "doc:cold",
+            {
+              "metadata": {
+                "plan": "cold"
+              }
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    }
+  ]
+}

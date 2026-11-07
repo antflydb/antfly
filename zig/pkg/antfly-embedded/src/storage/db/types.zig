@@ -56,39 +56,11 @@ pub const GeoShapeRelation = enum {
     contains,
 };
 
-pub const SyncLevel = enum {
-    propose,
-    write,
-    full_text,
-    enrichments,
-    full_index,
-};
-
-pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
-    if (std.mem.eql(u8, text, "propose")) return .propose;
-    if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
-    if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "full_index")) return .full_index;
-    return null;
-}
-
-pub fn parsePublicSyncLevelJson(value: std.json.Value) ?SyncLevel {
-    return switch (value) {
-        .string => |text| parsePublicSyncLevelText(text),
-        else => null,
-    };
-}
-
-pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
-    return switch (level) {
-        .propose => "propose",
-        .write => "write",
-        .full_text => "full_text",
-        .enrichments => "enrichments",
-        .full_index => "full_index",
-    };
-}
+const sync_levels = @import("../../common/sync_level.zig");
+pub const SyncLevel = sync_levels.SyncLevel;
+pub const parsePublicSyncLevelText = sync_levels.parsePublicSyncLevelText;
+pub const parsePublicSyncLevelJson = sync_levels.parsePublicSyncLevelJson;
+pub const publicSyncLevelText = sync_levels.publicSyncLevelText;
 
 test "public sync level text accepts full_index and rejects removed aknn alias" {
     try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
@@ -97,11 +69,32 @@ test "public sync level text accepts full_index and rejects removed aknn alias" 
 }
 
 pub const BatchWrite = struct {
+    /// Borrowed from an authenticated internal batch or owned SQL session.
+    /// Public JSON never creates this canonical-domain preparation marker.
+    prepared_domain: ?*const @import("../../schema/domain_handoff.zig").Contract = null,
     key: []const u8,
     value: []const u8,
     /// Top-level JSON-typed fields whose null datum is JSON null, not SQL NULL.
     /// Validated against the pinned relational schema before preparation.
     json_null_fields: []const []const u8 = &.{},
+
+    pub fn json_skip_field(self: @This(), field: []const u8) bool {
+        return std.mem.eql(u8, field, "prepared_domain") and self.prepared_domain == null;
+    }
+
+    /// Integrity encoders serialize the contract data, never its borrowed
+    /// process address. Unprepared writes keep their historical projection.
+    pub fn nativeJsonProjection(self: @This()) struct {
+        key: []const u8,
+        value: []const u8,
+        json_null_fields: []const []const u8,
+        prepared_domain: ?@import("../../schema/domain_handoff.zig").Contract,
+        pub fn nativeJsonSkipField(value: @This(), field: []const u8) bool {
+            return std.mem.eql(u8, field, "prepared_domain") and value.prepared_domain == null;
+        }
+    } {
+        return .{ .key = self.key, .value = self.value, .json_null_fields = self.json_null_fields, .prepared_domain = if (self.prepared_domain) |contract| contract.* else null };
+    }
 };
 
 pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
@@ -297,6 +290,8 @@ pub const MergeReplicationCheckpoint = struct {
 /// replay is deterministic on followers and after restart.
 pub const TransactionMutation = union(enum) {
     begin: struct {
+        sql_locks: ?@import("../pessimistic_lock_transaction.zig").Ref = null,
+        external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
         txn_id: TxnId,
         begin_timestamp: u64,
         created_at_ns: u64,
@@ -310,22 +305,27 @@ pub const TransactionMutation = union(enum) {
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
+        external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
+        external_activation: bool = false,
     },
     resolve: struct {
         txn_id: TxnId,
         status: TxnStatus,
         commit_version: u64,
+        external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
     },
     /// Coordinator-side acknowledgement that one participant has durably
     /// learned the terminal decision. This must be ordered by coordinator
     /// Raft rather than written by a replica-local recovery worker.
     acknowledge: struct {
+        external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
         txn_id: TxnId,
         participant: []const u8,
     },
     /// A bounded coordinator acknowledgement set, replicated atomically after
     /// each member has independently proved terminal resolution.
     acknowledge_many: struct {
+        external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
         txn_id: TxnId,
         participants: []const []const u8,
     },
@@ -339,6 +339,9 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    graph_preparation: ?@import("prepared_graph_effects.zig").Admission = null,
+    /// Private owner-leader checked lock control; never public batch JSON.
+    sql_lock: ?@import("../pessimistic_lock_control.zig").Command = null,
     /// Private ordered curator decision; never accepted from public batch JSON.
     resolver_review: ?@import("resolver_review.zig").Command = null,
     /// Trusted ingress attaches a signed write principal and the admission
@@ -348,6 +351,14 @@ pub const BatchRequest = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    /// Private statement-produced effects and independently signed native
+    /// preparation grant. Public mutation JSON cannot populate these fields.
+    trigger_receipts: []const @import("../../sql/trigger_handoff.zig").Receipt = &.{},
+    trigger_preparation_proof: []const u8 = "",
+    trigger_preparation_group_id: u64 = 0,
+    trigger_preparation_command_digest: ?[32]u8 = null,
+    trigger_preparation_admitted_at_seconds: i64 = 0,
+
     /// Exact metadata read-index snapshot fetched and validated by the owner
     /// leader before proposal. Followers consume these committed bytes locally;
     /// they must never perform metadata IO from deterministic Raft apply.
@@ -408,6 +419,8 @@ pub const BatchRequest = struct {
     relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
+    /// Private ordered owner control. Never admitted from public batch JSON.
+    relational_index_owner_control: ?@import("relational_index_raft_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
@@ -439,6 +452,67 @@ pub const BatchRequest = struct {
     merge_artifacts: []const BatchWrite = &.{},
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
+
+    /// Phase-two activation may use the already admitted external owner only
+    /// when it carries no new effects. Check every field so newly introduced
+    /// mutation channels cannot accidentally inherit this control authority.
+    pub fn externalActivationOwner(self: @This()) ?@import("../transactions.zig").ExternalDecisionOwner {
+        const transaction = self.transaction orelse return null;
+        if (transaction != .prepare or !transaction.prepare.external_activation) return null;
+        const owner = transaction.prepare.external_decision_owner orelse return null;
+        if (!self.hasNoExternalControlEffects()) return null;
+        return owner;
+    }
+
+    pub fn externalDecisionControlOwner(self: @This()) ?@import("../transactions.zig").ExternalDecisionOwner {
+        const transaction = self.transaction orelse return null;
+        const owner = switch (transaction) {
+            .prepare => return self.externalActivationOwner(),
+            .resolve => |value| value.external_decision_owner,
+            .acknowledge => |value| value.external_decision_owner,
+            .acknowledge_many => |value| value.external_decision_owner,
+            else => null,
+        } orelse return null;
+        if (!self.hasNoExternalControlEffects()) return null;
+        return owner;
+    }
+
+    fn hasNoExternalControlEffects(self: @This()) bool {
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "transaction") or
+                std.mem.eql(u8, name, "timestamp_ns") or std.mem.eql(u8, name, "sync_level")) continue;
+            const value = @field(self, name);
+            switch (@typeInfo(@TypeOf(value))) {
+                .optional => if (value != null) return false,
+                .pointer => |info| {
+                    if (comptime info.size != .slice) @compileError("activation must classify new batch field: " ++ name);
+                    if (value.len != 0) return false;
+                },
+                .bool => if (value) return false,
+                .int => if (value != 0) return false,
+                else => @compileError("activation must classify new batch field: " ++ name),
+            }
+        }
+        return true;
+    }
+
+    pub fn requireAtomicIntentShape(self: @This()) !void {
+        if (!self.reject_graph_transform_projections or self.restore_staging_scope != null or self.restore_staging_plan_id != null) return error.InvalidBatchRequest;
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime @hasField(TransactionIntentRequest, name) or std.mem.eql(u8, name, "sync_level") or std.mem.eql(u8, name, "reject_graph_transform_projections")) continue;
+            const value = @field(self, name);
+            switch (@typeInfo(@TypeOf(value))) {
+                .optional => if (value != null) return error.InvalidBatchRequest,
+                .pointer => |info| {
+                    if (comptime info.size != .slice) @compileError("atomic endpoint must classify batch field: " ++ name);
+                    if (value.len != 0) return error.InvalidBatchRequest;
+                },
+                .bool => if (value) return error.InvalidBatchRequest,
+                .int => if (value != 0) return error.InvalidBatchRequest,
+                else => @compileError("atomic endpoint must classify batch field: " ++ name),
+            }
+        }
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -1436,7 +1510,17 @@ pub const Query = union(enum) {
     graph: graph_query_mod.GraphQuery,
 };
 
+/// A scoped integrity proof may authorize full-primary observations directly
+/// or inside a bounded integrity-job batch. Transport still requires explicit
+/// service authentication; native row reads verify the signed owner/purpose.
+pub fn supportsIntegrityReadProof(include_primary_digest: bool, jobs_json: []const u8) bool {
+    return include_primary_digest or jobs_json.len != 0;
+}
+
 pub const LookupOptions = struct {
+    /// Borrowed trusted preparation authority. Routing binds it to the exact
+    /// captured native descriptor; it is never serialized on lookup wires.
+    relation_owner_minter: ?@import("../../common/relation_owner_authority.zig").Minter = null,
     /// Private authoritative metadata assertion. Zero means no active masking;
     /// a nonzero value must match the installed policy before reading data.
     privacy_policy_version: ?[64]u8 = null,
@@ -1449,13 +1533,12 @@ pub const LookupOptions = struct {
     row_policy_database: []const u8 = "",
     /// Private metadata-coordinator probe. Public HTTP lookup parsing must
     /// never populate this field; it exposes no row data.
-    row_policy_receipt: ?struct {
-        generation: u64,
-        phase: @import("../../system_catalog/policies.zig").Publication.Phase,
-    } = null,
+    row_policy_receipt: ?RowPolicyReceipt = null,
     /// Private optimistic observation: captures version and SHA256 of the
     /// exact primary bytes from one snapshot, regardless of JSON projection.
     include_primary_digest: bool = false,
+    /// Internal typed observation only; the outer owner job carries provenance in its bounded body.
+    include_json_null_fields: bool = false,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
     /// Authenticated group-local control read; never accepted by public lookup parsing.
@@ -1466,6 +1549,8 @@ pub const LookupOptions = struct {
     relational_index_status_json: []const u8 = "",
     /// Authenticated private grouped-source control read.
     group_source_query_json: []const u8 = "",
+    /// Authenticated native lock observation, never accepted by public lookup.
+    sql_lock_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
     /// Local FK source-control capability. Never parsed from HTTP or encoded
     /// on the lookup wire; only the authenticated owner receiver sets it.
@@ -1487,6 +1572,13 @@ pub const LookupOptions = struct {
     /// the synchronous lookup call.
     cancellation: ?CancellationToken = null,
 
+    // Native layout fingerprints include field type names. Give this payload
+    // a stable nominal identity across independently compiled owner archives.
+    pub const RowPolicyReceipt = struct {
+        generation: u64,
+        phase: @import("../../system_catalog/policies.zig").Publication.Phase,
+    };
+
     pub fn executionNowNs(self: LookupOptions) u64 {
         const borrow = self.execution_io orelse return @import("antfly_platform").time.monotonicNs();
         var receiver = borrow.receive() catch @panic("incompatible lookup clock ABI");
@@ -1498,9 +1590,12 @@ pub const LookupResult = struct {
     json: []u8,
     version: ?u64 = null,
     expected_content_digest: ?[32]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
 
     pub fn deinit(self: *LookupResult, alloc: Allocator) void {
         alloc.free(self.json);
+        for (self.json_null_fields) |name| alloc.free(name);
+        if (self.json_null_fields.len != 0) alloc.free(self.json_null_fields);
         self.* = undefined;
     }
 };
@@ -1548,6 +1643,7 @@ pub const ColumnarScanStats = struct {
 /// Borrowed typed request for native callers. Encoded only at an archive or
 /// network boundary; fields and JSON operands must outlive the synchronous scan.
 pub const RelationalRowQuery = struct {
+    pub const ExpressionEquality = @import("../relational_index.zig").ExpressionEqualityHint;
     pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
     pub const Condition = struct {
         column: []const u8,
@@ -1555,6 +1651,23 @@ pub const RelationalRowQuery = struct {
         value: ?std.json.Value = null,
         collation: ?[]const u8 = null,
     };
+    /// Exact, unranked SQL predicate. Every owner must understand this field;
+    /// retained-read admission requires an explicit predicate digest from
+    /// every owner before rows. No LIMIT/top-K bound is part of membership.
+    pub const TextFilter = struct {
+        query: []const u8,
+        index: ?[]const u8 = null,
+        config_hash: ?u64 = null,
+        memory_bytes: usize = 32 * 1024 * 1024,
+    };
+    text_filter: ?TextFilter = null,
+    /// Private mutation preparation: exposed RETURNING postimages must pass
+    /// the same owner-side SELECT policy and mandatory filter as a read.
+    /// Ordinary write normalization deliberately does not require visibility.
+    require_normalized_visibility: bool = false,
+    /// Internal normalization context captured by the SQL transaction owner.
+    /// Never replaces read authority, schema fences or the authenticated policy.
+    normalization_transaction_micros: ?i64 = null,
     /// Retained typed readers bound bytes as well as rows. Transported with
     /// the query so every owner uses the same requested page envelope.
     page_bytes: usize = 16 * 1024 * 1024,
@@ -1568,10 +1681,16 @@ pub const RelationalRowQuery = struct {
     lower: ?Bound = null,
     upper: ?Bound = null,
     conditions: []const Condition = &.{},
+    /// Internal access hints, not filters. The caller must retain the logical
+    /// predicate, including when no READY matching index exists. Ignoring a
+    /// hint always leaves a correct primary scan with that residual predicate.
+    expression_equalities: []const ExpressionEquality = &.{},
     schema_version: ?u32 = null,
 };
 
 pub const ScanOptions = struct {
+    /// Trusted local authority capsule; transport serializers never emit it.
+    relation_owner_minter: ?@import("../../common/relation_owner_authority.zig").Minter = null,
     /// Private authoritative metadata assertion. Zero means no active masking;
     /// a nonzero value must match the installed policy before reading data.
     privacy_policy_version: ?[64]u8 = null,
@@ -1784,13 +1903,14 @@ pub const GraphTraversalResult = traversal_mod.TraversalResult;
 pub const GraphPathWeightMode = paths_mod.PathWeightMode;
 pub const GraphPath = paths_mod.Path;
 
-pub const TransactionWrite = struct {
-    key: []const u8,
-    value: []const u8,
-    json_null_fields: []const []const u8 = &.{},
-};
+/// Batch and transaction preparation consume the same borrowed write image.
+/// Sharing the shape prevents private provenance from disappearing in layout
+/// casts when either producer gains another preparation capability.
+pub const TransactionWrite = BatchWrite;
 
 pub const TransactionVersionPredicate = struct {
+    /// Private SQL command provenance; public batch parsers never populate it.
+    row_policy_requirement: @import("../../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     key: []const u8,
     expected_version: u64,
     /// Internal observation guard. TTL timestamps need not change on updates.
@@ -1807,9 +1927,22 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    graph_preparation: ?@import("prepared_graph_effects.zig").Admission = null,
+    /// Leader-materialized time for deterministic new-vote admission.
+    timestamp_ns: u64 = 0,
+    external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
+    external_activation: bool = false,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    /// Private statement-produced effects and independently signed native
+    /// preparation grant. Public mutation JSON cannot populate these fields.
+    trigger_receipts: []const @import("../../sql/trigger_handoff.zig").Receipt = &.{},
+    trigger_preparation_proof: []const u8 = "",
+    trigger_preparation_group_id: u64 = 0,
+    trigger_preparation_command_digest: ?[32]u8 = null,
+    trigger_preparation_admitted_at_seconds: i64 = 0,
+
     range_guards: []const @import("../range_protection.zig").Proof = &.{},
     schema_version: ?u32 = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
@@ -1823,9 +1956,61 @@ pub const TransactionIntentRequest = struct {
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
+    graph_writes: []const GraphEdgeWrite = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
     integrity: []const TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
+
+    /// Borrow the complete prepared contract without allocating or reparsing.
+    /// Every added intent field must have a transport mapping at compile time.
+    /// A stateless, single-owner commit has no transaction decision controls.
+    /// Keep the complete checked intent contract and fail compilation when a
+    /// new field lacks a mapping, exactly as the prepare transport does.
+    pub fn asAtomicBatch(self: @This()) !BatchRequest {
+        if (self.external_decision_owner != null or self.external_activation) return error.InvalidTxnRequest;
+        var batch: BatchRequest = .{};
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation")) continue;
+            if (!@hasField(BatchRequest, name)) @compileError("atomic intent field requires batch transport: " ++ name);
+            @field(batch, name) = @field(self, name);
+        }
+        batch.reject_graph_transform_projections = true;
+        return batch;
+    }
+
+    pub fn fromAtomicBatch(batch: BatchRequest) !@This() {
+        try batch.requireAtomicIntentShape();
+        var request: @This() = .{};
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation")) continue;
+            if (!@hasField(BatchRequest, name)) @compileError("atomic intent field requires batch transport: " ++ name);
+            @field(request, name) = @field(batch, name);
+        }
+        return request;
+    }
+
+    pub fn asBatch(self: @This(), txn_id: TxnId, topology_epoch: u64) BatchRequest {
+        var batch: BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .external_decision_owner = self.external_decision_owner, .external_activation = self.external_activation } } };
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation")) continue;
+            if (!@hasField(BatchRequest, name)) @compileError("transaction intent field requires batch transport: " ++ name);
+            @field(batch, name) = @field(self, name);
+        }
+        return batch;
+    }
+
+    pub fn fromBatch(batch: BatchRequest) !@This() {
+        const transaction = batch.transaction orelse return error.InvalidBatchRequest;
+        if (transaction != .prepare) return error.InvalidBatchRequest;
+        var request: @This() = .{ .external_decision_owner = transaction.prepare.external_decision_owner, .external_activation = transaction.prepare.external_activation };
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation")) continue;
+            if (!@hasField(BatchRequest, name)) @compileError("transaction intent field requires batch transport: " ++ name);
+            @field(request, name) = @field(batch, name);
+        }
+        return request;
+    }
 };
 
 pub const SplitState = struct {
@@ -4455,6 +4640,32 @@ pub const IndexRepairWake = union(enum) {
 };
 
 /// Exact ordered mutation receipt persisted atomically with primary effects.
+/// One borrowed, synchronous native resolution authority. Ordered replay
+/// supplies its own receipt; public commit bodies cannot construct this value.
+pub const ExternalTransactionBegin = struct {
+    sql_locks: ?@import("../pessimistic_lock_transaction.zig").Ref = null,
+    txn_id: TxnId,
+    owner: @import("../transactions.zig").ExternalDecisionOwner,
+    begin_timestamp: u64,
+    created_at_ns: u64,
+    participants: []const []const u8,
+    coordinator: bool,
+    restore_staging_scope: ?[32]u8 = null,
+    ordered_receipt: ?OrderedApplyReceipt = null,
+    admission_timestamp_ns: u64 = 0,
+};
+
+pub const ExternalTransactionResolution = struct {
+    txn_id: TxnId,
+    owner: @import("../transactions.zig").ExternalDecisionOwner,
+    status: TxnStatus,
+    commit_version: u64,
+    sync_level: SyncLevel = .write,
+    visibility_cancellation: CancellationToken = .none,
+    ordered_receipt: ?OrderedApplyReceipt = null,
+    resolved_participant: ?[]const u8 = null,
+};
+
 pub const OrderedApplyReceipt = struct {
     term: u64,
     index: u64,

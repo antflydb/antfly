@@ -863,7 +863,13 @@ test "relational index system source pin prepared crash blocks markers then reop
             defer test_failure = .none;
             try std.testing.expectError(error.InjectedSourcePinFailure, @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(.prepared, (try db.onlineSourceStatus(scope)).snapshot_phase);
-            try std.testing.expectError(error.OnlineSourcePinPending, @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } } }, .{ .term = 1, .index = 3 }));
+            // Exercise a valid transaction command through the production
+            // dispatcher. Preparing an unknown transaction would fail its
+            // read-only lookup before reaching the physical write fence.
+            const participant = try @import("../../api/transaction_contract.zig").participantIdForGroupScoped(alloc, "source", 2, null, null);
+            defer alloc.free(participant);
+            try std.testing.expectError(error.OnlineSourcePinPending, @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyStorageKernelReplicatedBatchAtRaftEntry(alloc, &db, "source", 2, .{ .transaction = .{ .begin = .{ .txn_id = @splat(4), .begin_timestamp = 112, .created_at_ns = 112, .topology_epoch = 1, .participants = &.{participant} } } }, .{ .term = 1, .index = 3 }));
+            try std.testing.expectEqualDeep(db_mod.OrderedApplyReceipt{ .term = 1, .index = 2 }, (try db.orderedApplyReceipt()).?);
             try std.testing.expectError(error.OnlineSourcePinPending, @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{}, .{ .term = 1, .index = 3 }));
             // Even direct transaction metadata cannot bypass the prepared gate.
             {

@@ -830,8 +830,14 @@ const DataApplySnapshotBuilder = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .install_snapshot = installSnapshot,
                 .apply_batch = applyBatch,
+                .requires_apply_delegate = requiresApplyDelegate,
             },
         };
+    }
+
+    fn requiresApplyDelegate(ptr: *anyopaque) bool {
+        const store: *data_apply_client.RaftApplyStore = @ptrCast(@alignCast(ptr));
+        return store.native_source_delegate;
     }
 
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
@@ -900,14 +906,16 @@ const DataApplyPreparedSnapshotSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var file = try self.prepared.materializeFile(alloc);
         errdefer file.deinit(alloc);
-        const artifact = try storage.file_snapshot_artifact.FileSnapshotArtifact.create(
+        const artifact = try storage.file_snapshot_artifact.FileSnapshotArtifact.createWithApplicationManifest(
             alloc,
             std.Options.debug_io,
             file.path,
             file.size,
+            file.application_manifest,
         );
         // The artifact duplicated the path and now owns deletion of the file.
         alloc.free(file.path);
+        alloc.free(file.application_manifest);
         file = undefined;
         return .{ .artifact = artifact };
     }
@@ -2043,6 +2051,22 @@ test "managed host routes metadata and data groups through distinct apply builde
     const data_state = provider.stateForGroup(1001) orelse return error.MissingDataState;
     try std.testing.expect(metadata_state.appliedIndex() > 0);
     try std.testing.expect(data_state.appliedIndex() > 0);
+}
+
+test "managed host default compiled projection preserves its delegate requirement" {
+    // No foreign owner is opened: an unmounted compiled projection must reject
+    // before dereferencing its handle or invoking the ABI at all.
+    var store: data_apply_client.RaftApplyStore = .{ .handle = null, .native_source_delegate = true };
+    const builder = (DataApplySnapshotBuilder{ .store = &store }).builder();
+    try std.testing.expect(builder.requiresApplyDelegate());
+    var machine: state_machine.DataStateMachine = .{
+        .alloc = std.testing.allocator,
+        .applied_sink = @import("state_machine/applied_sink.zig").noopAppliedIndexSink(),
+        .snapshot_builder = builder,
+    };
+    try std.testing.expectError(error.StorageKernelOwnerUnavailable, machine.stateMachine().applyReady(11, null, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = &.{} }}, &.{}));
+    store.native_source_delegate = false;
+    try std.testing.expect(!builder.requiresApplyDelegate());
 }
 
 test "managed host defaults metadata and data apply stores when durable state is enabled" {

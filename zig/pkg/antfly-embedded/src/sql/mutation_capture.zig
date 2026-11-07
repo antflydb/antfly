@@ -20,7 +20,7 @@ const catalog = @import("catalog.zig");
 const describe = @import("describe.zig");
 const relation = @import("relation_binding.zig");
 const Capture = @This();
-const Entry = struct { plan: *const relation.Bound, offset: usize };
+const Entry = struct { plan: *const relation.Bound, offset: usize, binding: describe.BoundStatement };
 alloc: std.mem.Allocator,
 entries: []const Entry,
 read: ?catalog.StatementRead,
@@ -35,6 +35,10 @@ pub fn open(a: std.mem.Allocator, backend: catalog.Backend, bound: describe.Boun
     errdefer a.free(owned);
     var search_arena = std.heap.ArenaAllocator.init(a);
     defer search_arena.deinit();
+    for (owned) |*entry| {
+        const prepared = try @import("relation_access.zig").prepareScans(search_arena.allocator(), a, backend, &entry.binding, parameters);
+        @memcpy(scans.items[entry.offset..][0..prepared.len], prepared);
+    }
     const bound_scans = try @import("relation_runtime.zig").bindSearchScans(search_arena.allocator(), scans.items, parameters);
     const read = if (scans.items.len == 0) null else try (backend.vtable.open_statement orelse return error.SqlStatementSnapshotRequired)(backend.ptr, a, bound_scans);
     errdefer if (read) |value| value.close(value.ptr);
@@ -63,10 +67,17 @@ pub fn cursors(self: *const Capture, plan: *const relation.Bound) ![]const catal
 
 fn collect(a: std.mem.Allocator, bound: describe.BoundStatement, entries: *std.ArrayList(Entry), scans: *std.ArrayList(catalog.StatementScan), depth: usize) anyerror!void {
     if (depth >= 64) return error.SqlProgramLimitExceeded;
+    if (bound.effect_graph) |graph| {
+        for (graph.steps, graph.scope.definitions) |step, definition| {
+            if (!step.mutation and (!step.demanded or definition.inline_read)) continue;
+            try collect(a, step.binding, entries, scans, depth + 1);
+        }
+        try collect(a, graph.root.binding, entries, scans, depth + 1);
+    }
     if (bound.relation) |plan| {
         for (entries.items) |entry| if (entry.plan == plan) return;
         if (entries.items.len >= 64 or plan.scans.len > 64 - scans.items.len) return error.SqlProgramLimitExceeded;
-        try entries.append(a, .{ .plan = plan, .offset = scans.items.len });
+        try entries.append(a, .{ .plan = plan, .offset = scans.items.len, .binding = bound });
         try scans.appendSlice(a, plan.scans);
     }
     if (bound.window) |window| try collect(a, window.input.*, entries, scans, depth + 1);

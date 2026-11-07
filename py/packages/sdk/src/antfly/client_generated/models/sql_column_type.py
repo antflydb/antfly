@@ -4,13 +4,20 @@ from enum import StrEnum
 class SQLColumnType(StrEnum):
     ARRAY = "array"
     BOOLEAN = "boolean"
+    BYTEA = "bytea"
+    DATERANGE = "daterange"
     DATETIME = "datetime"
+    ENUMERATION = "enumeration"
     INTEGER = "integer"
     JSON = "json"
     NUMBER = "number"
+    NUMRANGE = "numrange"
     STRING = "string"
+    TSRANGE = "tsrange"
+    TSTZRANGE = "tstzrange"
     UNKNOWN = "unknown"
     UUID = "uuid"
+    VOID = "void"
 
     def __str__(self) -> str:
         return str(self.value)

@@ -286,7 +286,8 @@ test "relational index system online admission facts are unbound read only and r
     inconsistent.storage_mode = .relational;
     try db.core.store.put(table.key, &inconsistent.encode());
     try std.testing.expectError(error.IntegrityCatalogChanged, Fetch.run(&db, request));
-    try db.core.store.put(table.key, &db.core.table_catalog.encode());
+    const encoded_catalog = try db.core.table_catalog.encodeDurable();
+    try db.core.store.put(table.key, encoded_catalog.slice());
     var invalid = request;
     invalid.scope.consumer_epoch = 1;
     try std.testing.expectError(error.InvalidOnlineSourceCommand, Fetch.run(&db, invalid));
@@ -1059,6 +1060,25 @@ test "relational index system rewrite admission owns complete immutable historic
     }
     var db = try DB.open(alloc, path, options);
     defer db.close();
+    // Schema validation state is deliberately opaque to the history reader.
+    // Its lexical schema_v prefix must not become a phantom layout version.
+    const job = @import("relational_nullability_job.zig");
+    try db.core.store.put(job.key, "retained owner job");
+    try db.core.store.put(job.inputs_key, "retained owner inputs");
+    try db.core.store.put(job.cursor_key, "retained owner cursor");
+    const history = try @import("../schema.zig").loadSchemaHistory(db.core.store, alloc);
+    defer @import("../schema.zig").freeSchemaHistory(alloc, history);
+    try std.testing.expectEqual(@as(usize, 3), history.len);
+    const copied_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copied-history", .{tmp.sub_path});
+    defer alloc.free(copied_path);
+    var copied = try DB.open(alloc, copied_path, options);
+    defer copied.close();
+    try @import("../schema.zig").copySchemas(db.core.store, copied.core.store, alloc);
+    try std.testing.expectError(error.NotFound, copied.core.store.get(alloc, job.key));
+    try std.testing.expectError(error.NotFound, copied.core.store.get(alloc, job.inputs_key));
+    const copied_history = try @import("../schema.zig").loadSchemaHistory(copied.core.store, alloc);
+    defer @import("../schema.zig").freeSchemaHistory(alloc, copied_history);
+    try std.testing.expectEqual(@as(usize, 3), copied_history.len);
     const before = db.core.store.lastReplaySequence(0);
     const json = try executeJson(&db, alloc, request, .none);
     defer alloc.free(json);

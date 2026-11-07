@@ -18,6 +18,7 @@ const data_raft_protocol = @import("../common/data_raft_protocol.zig");
 const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 
 pub const raft_batch_protocol_version = data_raft_protocol.batch_protocol_version;
+pub const raft_batch_index_owner_control_protocol_version = data_raft_protocol.batch_index_owner_control_protocol_version;
 pub const raft_batch_artifact_catalog_protocol_version = data_raft_protocol.batch_artifact_catalog_protocol_version;
 pub const raft_batch_timestamp_protocol_version = data_raft_protocol.batch_timestamp_protocol_version;
 pub const raft_batch_activation_barrier_protocol_version = data_raft_protocol.batch_activation_barrier_protocol_version;
@@ -84,6 +85,21 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "graph batch34 selects protected prepared effects without upgrading ordinary graph deltas" {
+            const types = @import("antfly_local_sources").storage_db_types;
+            var req: types.BatchRequest = .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} };
+            try std.testing.expectEqual(@as(?u16, null), graphTransactionProtocol(req));
+            req.transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 1 } };
+            try std.testing.expectEqual(@as(?u16, 34), graphTransactionProtocol(req));
+            req.graph_writes = &.{};
+            req.transforms = &.{.{ .key = "a", .operations = &.{.{ .op = .push, .path = "_edges.g.R", .value_json = "{\"target\":\"b\"}" }} }};
+            try std.testing.expectEqual(@as(?u16, 34), graphTransactionProtocol(req));
+            req.transforms = &.{};
+            try std.testing.expectEqual(@as(?u16, null), graphTransactionProtocol(req));
+            req.graph_preparation = .{ .metadata_group_id = 1, .incarnation = @splat(1), .source_revision = 1, .table_id = 1, .schema_digest = @splat(2), .indexes = &.{.{ .name = "g", .digest = @splat(3) }} };
+            try std.testing.expectEqual(@as(?u16, 34), graphTransactionProtocol(req));
+        }
+
         test "internal batch forwarding headers are all-or-none and strictly parsed" {
             const valid_headers = [_]http_common.RequestHeader{
                 .{ .name = remaining_ms_header, .value = "425" },
@@ -147,4 +163,82 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+/// Private source retirement has its own decoder boundary; routing a new
+/// source role through the historical SQL-drop floor is insufficient.
+pub fn retirementControlProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
+    const command = req.relational_topology orelse return null;
+    if (command.fence.role == .document_retirement_source or command.document_schema_digest != null)
+        return data_raft_protocol.batch_document_retirement_protocol_version;
+    if (command.sql_drop_control) return data_raft_protocol.batch_sql_drop_control_protocol_version;
+    return null;
+}
+
+/// Only the new prepared/protected lane changes format. Existing ordinary
+/// single-owner graph deltas retain their historical protocol and wire bytes.
+pub fn graphTransactionProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
+    if (@import("antfly_local_sources").system_catalog_policies.requiresSchemaPairDecoder(req.row_policy_install_bundle))
+        return data_raft_protocol.batch_coupled_schema_policy_protocol_version;
+    if (req.graph_preparation != null) return data_raft_protocol.batch_graph_transaction_protocol_version;
+    if (req.transaction == null and req.trigger_receipts.len == 0) return null;
+    if (req.graph_writes.len != 0 or req.graph_deletes.len != 0) return data_raft_protocol.batch_graph_transaction_protocol_version;
+    for (req.transforms) |transform| for (transform.operations) |operation| {
+        if ((@import("antfly_local_sources").storage_db_transform.graphProjectionPath(operation.path) catch return data_raft_protocol.batch_graph_transaction_protocol_version) != null)
+            return data_raft_protocol.batch_graph_transaction_protocol_version;
+    };
+    return null;
+}
+
+pub fn externalTransactionProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
+    if (req.sql_lock != null) return @import("../common/data_raft_protocol.zig").batch_sql_lock_protocol_version;
+    if (req.transaction) |transaction| if (transaction == .begin and transaction.begin.sql_locks != null) return @import("../common/data_raft_protocol.zig").batch_sql_lock_protocol_version;
+    if (req.transaction) |transaction| switch (transaction) {
+        .begin => |begin| if (begin.external_decision_owner != null) {
+            return @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version;
+        },
+        .prepare => |prepare| if (prepare.external_decision_owner != null or prepare.external_activation) {
+            return @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version;
+        },
+        .resolve => |resolve| if (resolve.external_decision_owner != null) {
+            return @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version;
+        },
+        else => {},
+    };
+    return null;
+}
+
+pub fn validateExternalVoteAdmission(req: @import("antfly_local_sources").storage_db_types.BatchRequest, realtime_ns: u64) !void {
+    if (req.transaction) |transaction| {
+        if (transaction == .begin) {
+            if (transaction.begin.external_decision_owner) |owner| try owner.requireFreshVoteAt(@max(1, realtime_ns));
+            return;
+        }
+        if (transaction != .prepare) return;
+        const prepare = transaction.prepare;
+        if (prepare.external_activation) {
+            const owner = prepare.external_decision_owner orelse return error.InvalidExternalDecisionOwner;
+            try owner.validate();
+        } else if (prepare.external_decision_owner) |owner| try owner.requireFreshVoteAt(@max(1, realtime_ns));
+    }
+}
+
+pub fn materializeExternalVoteTimestamp(req: *@import("antfly_local_sources").storage_db_types.BatchRequest, realtime_ns: u64) void {
+    if (req.transaction) |transaction| switch (transaction) {
+        .begin => |begin| if (begin.external_decision_owner != null) {
+            req.timestamp_ns = @max(1, realtime_ns);
+        },
+        .prepare => |prepare| if (prepare.external_decision_owner != null and !prepare.external_activation) {
+            req.timestamp_ns = @max(1, realtime_ns);
+        },
+        else => {},
+    };
+}
+
+test "row-policy coupled schema batch35 precedes historical policy and graph selectors" {
+    const Request = @import("antfly_local_sources").storage_db_types.BatchRequest;
+    const ordinary: Request = .{ .row_policy_install_bundle = "{\"schema_pair\":null}" };
+    try std.testing.expectEqual(@as(?u16, null), graphTransactionProtocol(ordinary));
+    const paired: Request = .{ .row_policy_install_bundle = "{\"schema_pair\":{}}" };
+    try std.testing.expectEqual(@as(?u16, 35), graphTransactionProtocol(paired));
 }

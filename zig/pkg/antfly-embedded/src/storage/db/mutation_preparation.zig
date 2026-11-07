@@ -112,39 +112,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const splitShadowRequiresMaterializedDerivedBatch = S.splitShadowRequiresMaterializedDerivedBatch;
         const storedOrPendingEmbeddingSourceHash = S.storedOrPendingEmbeddingSourceHash;
         const validateDocumentExtractionInlineSourcesSnapshotParsed = S.validateDocumentExtractionInlineSourcesSnapshotParsed;
-        pub fn CoalescedKeyValueRequest(comptime T: type) type {
-            return struct {
-                pub const Entry = struct {
-                    json_null_fields: []const []const u8 = &.{},
-                    key: []const u8,
-                    value: ?[]const u8 = null,
-                    kind: enum { write, delete },
-                    owned_key: bool = false,
-                    owned_value: bool = false,
-                };
-
-                entries: []Entry = &.{},
-                writes: []T = &.{},
-                deletes: [][]const u8 = &.{},
-                graph_writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
-                graph_deletes: std.ArrayListUnmanaged(types.GraphEdgeDelete) = .empty,
-
-                pub fn deinit(self: *@This(), alloc: Allocator) void {
-                    for (self.entries) |entry| {
-                        if (entry.owned_key) alloc.free(@constCast(entry.key));
-                        if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-                    }
-                    if (self.entries.len > 0) alloc.free(self.entries);
-                    if (self.writes.len > 0) alloc.free(self.writes);
-                    if (self.deletes.len > 0) alloc.free(self.deletes);
-                    for (self.graph_writes.items) |*write| deinitOwnedGraphEdgeWrite(alloc, write);
-                    self.graph_writes.deinit(alloc);
-                    for (self.graph_deletes.items) |*delete| deinitOwnedGraphEdgeDelete(alloc, delete);
-                    self.graph_deletes.deinit(alloc);
-                    self.* = .{};
-                }
-            };
-        }
+        pub const CoalescedKeyValueRequest = @import("mutation_coalescing.zig").CoalescedKeyValueRequest;
 
         pub const GeneratedWriteReadSnapshot = struct {
             pub const revisions = @import("../document_mutation_revision.zig");
@@ -166,28 +134,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         };
 
-        pub const TransformReadSnapshot = struct {
-            pub const Entry = struct {
-                key: []const u8,
-                value: ?[]u8,
-                expected_version: u64,
-            };
-
-            entries: []Entry = &.{},
-            positions: std.StringHashMapUnmanaged(usize) = .empty,
-
-            pub fn deinit(self: *@This(), alloc: Allocator) void {
-                for (self.entries) |entry| if (entry.value) |value| alloc.free(value);
-                if (self.entries.len > 0) alloc.free(self.entries);
-                self.positions.deinit(alloc);
-                self.* = .{};
-            }
-
-            pub fn valueFor(self: *const @This(), key: []const u8) ?[]const u8 {
-                const index = self.positions.get(key) orelse return null;
-                return self.entries[index].value;
-            }
-        };
+        pub const TransformReadSnapshot = @import("mutation_coalescing.zig").TransformReadSnapshot;
 
         pub fn captureGeneratedWriteReadSnapshot(self: anytype, alloc: Allocator, writes: []const types.BatchWrite) !GeneratedWriteReadSnapshot {
             const revisions = GeneratedWriteReadSnapshot.revisions;
@@ -229,6 +176,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try request_keys.put(alloc, transform.key, {});
                 try keys.append(alloc, transform.key);
             }
+            var schema_view = S.ownerField(self, "core").*.acquireSchemaView();
+            defer if (schema_view) |*view| view.release();
+            if (schema_view) |view| {
+                var columns: std.ArrayList([]const u8) = .empty;
+                errdefer {
+                    for (columns.items) |name| alloc.free(name);
+                    columns.deinit(alloc);
+                }
+                for (view.tableSchema().relational_columns) |column| if (column.column_type == .json) {
+                    const name = try alloc.dupe(u8, column.name);
+                    errdefer alloc.free(name);
+                    try columns.append(alloc, name);
+                };
+                result.json_columns = try columns.toOwnedSlice(alloc);
+            }
             if (keys.items.len == 0) return result;
 
             // Read values and version timestamps from the same MVCC snapshot. This
@@ -236,12 +198,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // parsing/expansion to proceed without holding the DB-wide apply lock.
             var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
             defer read_txn.abort();
-            var schema_view = S.ownerField(self, "core").*.acquireSchemaView();
-            defer if (schema_view) |*view| view.release();
             const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.items.len);
             var initialized: usize = 0;
             errdefer {
-                for (entries[0..initialized]) |entry| if (entry.value) |value| alloc.free(value);
+                for (entries[0..initialized]) |entry| {
+                    if (entry.value) |value| alloc.free(value);
+                    for (entry.json_null_fields) |name| alloc.free(name);
+                    if (entry.json_null_fields.len != 0) alloc.free(entry.json_null_fields);
+                }
                 alloc.free(entries);
             }
             try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.items.len) orelse
@@ -253,6 +217,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     error.NotFound => null,
                     else => return err,
                 };
+                var json_null_fields: []const []const u8 = &.{};
+                errdefer {
+                    for (json_null_fields) |name| alloc.free(name);
+                    if (json_null_fields.len != 0) alloc.free(json_null_fields);
+                }
                 const value = if (raw) |stored| blk: {
                     if (!internal_keys.isRelationalRowKey(store_key))
                         break :blk try alloc.dupe(u8, stored);
@@ -270,6 +239,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 view.tableSchema().*,
                                 view.physicalLayout(),
                             );
+                        json_null_fields = try row.jsonNullFieldsAlloc(alloc);
                         break :blk try row.reconstructValueAlloc(alloc);
                     };
                     var historical = (try S.ownerField(self, "core").*.acquireSchemaVersionView(version)) orelse
@@ -287,6 +257,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             historical.tableSchema().*,
                             historical.physicalLayout(),
                         );
+                    json_null_fields = try row.jsonNullFieldsAlloc(alloc);
                     break :blk try row.reconstructValueAlloc(alloc);
                 } else null;
                 errdefer if (value) |owned| alloc.free(owned);
@@ -308,6 +279,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .key = key,
                     .value = value,
                     .expected_version = expected_version,
+                    .json_null_fields = json_null_fields,
                 };
                 initialized += 1;
                 result.positions.putAssumeCapacity(key, index);
@@ -316,223 +288,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return result;
         }
 
-        pub fn coalesceKeyValueRequest(
-            self: anytype,
-            alloc: Allocator,
-            comptime T: type,
-            writes: []const T,
-            deletes: []const []const u8,
-            transforms: []const types.DocumentTransform,
-            transform_snapshot: ?*const TransformReadSnapshot,
-        ) !CoalescedKeyValueRequest(T) {
-            // SQL mutations lower to complete replacements. A document transform
-            // cannot retain the provenance of JSON null after reconstructing JSON.
-            if (transforms.len != 0) for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
-            var result = CoalescedKeyValueRequest(T){};
-            var order = std.ArrayListUnmanaged(CoalescedKeyValueRequest(T).Entry).empty;
-            defer order.deinit(alloc);
-            errdefer {
-                // Before toOwnedSlice, the list still owns its full capacity.
-                // Release fields here and let order.deinit free that exact backing
-                // allocation; never pass the shorter items slice to alloc.free.
-                for (order.items) |entry| {
-                    if (entry.owned_key) alloc.free(@constCast(entry.key));
-                    if (entry.owned_value) alloc.free(@constCast(entry.value.?));
+        pub fn coalesceKeyValueRequest(self: anytype, alloc: Allocator, comptime T: type, writes: []const T, deletes: []const []const u8, transforms: []const types.DocumentTransform, snapshot: ?*const TransformReadSnapshot) !CoalescedKeyValueRequest(T) {
+            const Reader = struct {
+                receiver: @TypeOf(self),
+                pub fn isRecoveryExecution(reader: @This()) bool {
+                    return S.isRecoveryExecution(reader.receiver);
                 }
-                result.deinit(alloc);
-            }
-
-            var positions = std.StringHashMapUnmanaged(usize){};
-            defer positions.deinit(alloc);
-
-            for (writes) |write| {
-                const gop = try positions.getOrPut(alloc, write.key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = order.items.len;
-                    try order.append(alloc, .{
-                        .key = write.key,
-                        .value = write.value,
-                        .json_null_fields = write.json_null_fields,
-                        .kind = .write,
-                    });
-                    continue;
+                pub fn get(reader: @This(), a: Allocator, key: []const u8) !?[]u8 {
+                    return reader.receiver.get(a, key);
                 }
-                const entry = &order.items[gop.value_ptr.*];
-                if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-                if (entry.owned_key) alloc.free(@constCast(entry.key));
-                setCoalescedEntryToBorrowedWrite(T, entry, write);
-            }
-
-            for (deletes) |key| {
-                const gop = try positions.getOrPut(alloc, key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = order.items.len;
-                    try order.append(alloc, .{
-                        .key = key,
-                        .kind = .delete,
-                    });
-                    continue;
-                }
-                const entry = &order.items[gop.value_ptr.*];
-                if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-                entry.owned_value = false;
-                resetCoalescedEntryToDelete(T, entry);
-            }
-
-            for (transforms) |transform| {
-                const maybe_index = positions.get(transform.key);
-                const base_json = blk: {
-                    if (maybe_index) |entry_index| {
-                        const entry = order.items[entry_index];
-                        break :blk if (entry.kind == .write) entry.value.? else null;
-                    }
-                    if (transform_snapshot) |read_snapshot| break :blk read_snapshot.valueFor(transform.key);
-                    // Borrowed mutation execution always supplies a pinned read
-                    // set; it has no foreground lookup capability to fall back to.
-                    if (S.isRecoveryExecution(self)) return error.PreparedReadSetChanged;
-                    break :blk try self.get(alloc, transform.key);
-                };
-                defer if (maybe_index == null and transform_snapshot == null) {
-                    if (base_json) |body| alloc.free(body);
-                };
-
-                var document_operations = std.ArrayListUnmanaged(types.TransformOp).empty;
-                defer document_operations.deinit(alloc);
-                var graph_operations = std.ArrayListUnmanaged(struct {
-                    op: types.TransformOpType,
-                    path: transform_mod.GraphProjectionPath,
-                    value_json: []const u8,
-                }).empty;
-                defer graph_operations.deinit(alloc);
-                for (transform.operations) |operation| {
-                    const graph_path = try transform_mod.graphProjectionPath(operation.path);
-                    if (graph_path) |path| {
-                        switch (operation.op) {
-                            .push, .pull, .add_to_set => {},
-                            else => return error.UnsupportedTransformOperation,
-                        }
-                        try graph_operations.append(alloc, .{
-                            .op = operation.op,
-                            .path = path,
-                            .value_json = operation.value_json orelse return error.InvalidArgument,
-                        });
-                    } else {
-                        try document_operations.append(alloc, operation);
-                    }
-                }
-
-                const graph_writes_start = result.graph_writes.items.len;
-                const graph_deletes_start = result.graph_deletes.items.len;
-                for (graph_operations.items) |operation| {
-                    switch (operation.op) {
-                        .push, .add_to_set => try appendGraphTransformWrite(
-                            alloc,
-                            &result.graph_writes,
-                            &result.graph_deletes,
-                            transform.key,
-                            operation.path,
-                            operation.value_json,
-                        ),
-                        .pull => try appendGraphTransformDelete(
-                            alloc,
-                            &result.graph_writes,
-                            &result.graph_deletes,
-                            transform.key,
-                            operation.path,
-                            operation.value_json,
-                        ),
-                        else => unreachable,
-                    }
-                }
-
-                const document_transform: types.DocumentTransform = .{
-                    .key = transform.key,
-                    .operations = document_operations.items,
-                    .upsert = transform.upsert,
-                };
-
-                // A non-upsert transform against an absent (or same-batch deleted)
-                // document is a no-op, but malformed document operations remain
-                // errors independent of state. Graph operands were validated while
-                // constructing their pending deltas above.
-                if (base_json == null and !transform.upsert) {
-                    try transform_mod.validateDocumentTransform(alloc, document_transform);
-                    for (result.graph_writes.items[graph_writes_start..]) |*write| {
-                        deinitOwnedGraphEdgeWrite(alloc, write);
-                    }
-                    result.graph_writes.shrinkRetainingCapacity(graph_writes_start);
-                    for (result.graph_deletes.items[graph_deletes_start..]) |*delete| {
-                        deinitOwnedGraphEdgeDelete(alloc, delete);
-                    }
-                    result.graph_deletes.shrinkRetainingCapacity(graph_deletes_start);
-                    continue;
-                }
-
-                // Even a graph-only transform remains a logical document write:
-                // preserve source version/timestamp and change-journal semantics
-                // while applying the projected edge as a delta. The mapper sees
-                // the unchanged stripped document and therefore does not clear
-                // the graph generation.
-                const resolved = try transform_mod.resolveDocumentTransform(alloc, base_json, document_transform);
-
-                const resolved_document = resolved orelse continue;
-                var resolved_document_owned = true;
-                defer if (resolved_document_owned) alloc.free(resolved_document);
-
-                const gop = try positions.getOrPut(alloc, transform.key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = order.items.len;
-                    const owned_key = try alloc.dupe(u8, transform.key);
-                    errdefer alloc.free(owned_key);
-                    try order.append(alloc, .{
-                        .key = owned_key,
-                        .value = resolved_document,
-                        .kind = .write,
-                        .owned_key = true,
-                        .owned_value = true,
-                    });
-                    resolved_document_owned = false;
-                    continue;
-                }
-
-                const entry = &order.items[gop.value_ptr.*];
-                try setCoalescedEntryToOwnedWrite(T, alloc, entry, transform.key, resolved_document);
-                resolved_document_owned = false;
-            }
-
-            var write_count: usize = 0;
-            var delete_count: usize = 0;
-            for (order.items) |entry| {
-                switch (entry.kind) {
-                    .write => write_count += 1,
-                    .delete => delete_count += 1,
-                }
-            }
-
-            const final_entries = try order.toOwnedSlice(alloc);
-            result.entries = final_entries;
-            if (write_count > 0) result.writes = try alloc.alloc(T, write_count);
-            if (delete_count > 0) result.deletes = try alloc.alloc([]const u8, delete_count);
-
-            var write_index: usize = 0;
-            var delete_index: usize = 0;
-            for (final_entries) |entry| {
-                switch (entry.kind) {
-                    .write => {
-                        result.writes[write_index] = .{
-                            .key = entry.key,
-                            .value = entry.value.?,
-                            .json_null_fields = entry.json_null_fields,
-                        };
-                        write_index += 1;
-                    },
-                    .delete => {
-                        result.deletes[delete_index] = entry.key;
-                        delete_index += 1;
-                    },
-                }
-            }
-            return result;
+            };
+            return @import("mutation_coalescing.zig").coalesceKeyValueRequest(Reader{ .receiver = self }, alloc, T, writes, deletes, transforms, snapshot);
         }
 
         pub fn generatedPrecomputeModeForSyncLevel(sync_level: types.SyncLevel) GeneratedPrecomputeMode {
@@ -659,40 +425,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return (payload_bytes *| 2) +| (operations *| 512);
         }
 
-        pub fn resetCoalescedEntryToDelete(comptime T: type, entry: *CoalescedKeyValueRequest(T).Entry) void {
-            if (entry.owned_value) {
-                // Caller frees previous owned value before switching the entry.
-                entry.owned_value = false;
-            }
-            entry.value = null;
-            entry.kind = .delete;
-        }
+        pub const resetCoalescedEntryToDelete = @import("mutation_coalescing.zig").resetCoalescedEntryToDelete;
 
-        pub fn setCoalescedEntryToBorrowedWrite(comptime T: type, entry: *CoalescedKeyValueRequest(T).Entry, write: T) void {
-            entry.key = write.key;
-            entry.value = write.value;
-            entry.json_null_fields = write.json_null_fields;
-            entry.kind = .write;
-            entry.owned_key = false;
-            entry.owned_value = false;
-        }
+        pub const setCoalescedEntryToBorrowedWrite = @import("mutation_coalescing.zig").setCoalescedEntryToBorrowedWrite;
 
-        pub fn setCoalescedEntryToOwnedWrite(
-            comptime T: type,
-            alloc: Allocator,
-            entry: *CoalescedKeyValueRequest(T).Entry,
-            key: []const u8,
-            value: []u8,
-        ) !void {
-            if (!entry.owned_key) {
-                entry.key = try alloc.dupe(u8, key);
-                entry.owned_key = true;
-            }
-            if (entry.owned_value) alloc.free(@constCast(entry.value.?));
-            entry.value = value;
-            entry.kind = .write;
-            entry.owned_value = true;
-        }
+        pub const setCoalescedEntryToOwnedWrite = @import("mutation_coalescing.zig").setCoalescedEntryToOwnedWrite;
 
         pub fn storedDocumentValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u8) bool {
             if (std.mem.eql(u8, lhs, rhs)) return true;
@@ -2009,9 +1746,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     while (!ctx.failed.load(.acquire)) {
                         const index = ctx.next.fetchAdd(1, .monotonic);
                         if (index >= ctx.writes.len) return;
-                        var prepared = (if (ctx.writes[index].json_null_fields.len != 0)
-                            mapper.PreparedRelationalWrite.initTypedInSharedRegion(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout, ctx.writes[index].json_null_fields, ctx.preserve_logical_values)
-                        else if (ctx.preserve_logical_values)
+                        const preserve = @import("../../schema/domain_handoff.zig").preserveFor(ctx.validator, ctx.writes[index].prepared_domain, ctx.preserve_logical_values) catch |err| {
+                            ctx.fail(err);
+                            return;
+                        };
+                        var prepared = (if (ctx.writes[index].json_null_fields.len != 0 or ctx.writes[index].prepared_domain != null)
+                            mapper.PreparedRelationalWrite.initTypedInSharedRegion(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout, ctx.writes[index].json_null_fields, preserve)
+                        else if (preserve)
                             mapper.PreparedRelationalWrite.initInSharedRegionPreserved(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout)
                         else
                             mapper.PreparedRelationalWrite.initInSharedRegionFromIntent(
@@ -2140,7 +1881,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .alloc = allocator_guard.allocator(),
                 .scratch_child = allocator_guard.allocator(),
                 .writes = writes,
-                .validator = validator,
+                .validator = if (validator) |compiled| (if (!preserve_logical_values and io != null) compiled.forPreparation(try (@import("../../schema/relational_expression.zig").PreparationRuntime{ .io = io.? }).withClock(table_schema.requires_clock_defaults)) else compiled) else null,
                 .table_schema = table_schema,
                 .physical_layout = physical_layout,
                 .db = db,

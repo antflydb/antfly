@@ -1,0 +1,5487 @@
+{
+  "format": 1,
+  "vectors": [
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "1999-12-31 23:59:59.999999",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "1999-12-31 23:59:59.999999",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "1999-12-31 23:59:59.999999",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2025-01-01 01:30:00.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "2025-01-01 01:30:00.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "2025-01-01 01:30:00.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "294276-12-31 23:59:59.999999",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "294276-12-31 23:59:59.999999",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "1999-12-31 23:47:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "1999-12-31 23:45:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "1999-12-31 23:47:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "1999-12-31 23:45:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2025-01-01 01:30:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "2025-01-01 01:17:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "2025-01-01 01:30:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "0002-12-31 23:47:30 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "294276-12-31 23:45:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "294276-12-31 23:47:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "1999-12-31 23:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "1999-12-31 23:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "1999-12-31 23:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "1999-12-31 23:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2025-01-01 01:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "2025-01-01 01:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "2025-01-01 01:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "0002-12-31 23:02:30 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "294276-12-31 23:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "294276-12-31 23:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "1999-12-31 23:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "1999-12-31 23:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "1999-12-31 23:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "1999-12-31 23:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2025-01-01 01:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "2025-01-01 01:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "2025-01-01 01:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "0002-12-31 23:02:30 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "0001-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "294276-12-31 23:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "294276-12-31 23:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "4713-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '2000-01-01 00:00:00',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "4713-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '1999-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "2000-01-01 00:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "4713-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '2025-01-01 01:30:00.123456+01:30',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '0001-01-01 BC',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '0001-01-01 BC',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "4713-01-01 00:00:00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '0001-01-01 BC',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "2000-01-01 00:02:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '294276-12-31 23:59:59.999999',TIMESTAMP 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP 'infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP 'infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP 'infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '-infinity',TIMESTAMP '2000-01-01 00:02:30')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '-infinity',TIMESTAMP '4713-01-01 BC')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMP '-infinity',TIMESTAMP 'infinity')",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "1999-12-31 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "1999-12-31 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "1999-12-31 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "294276-12-31 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "294276-12-31 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 microsecond',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "1999-12-31 23:47:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "1999-12-31 23:45:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "1999-12-31 23:47:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "1999-12-31 23:45:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "2024-12-31 23:47:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "0002-12-31 23:47:30+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "294276-12-31 23:45:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "294276-12-31 23:47:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "1999-12-31 23:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "1999-12-31 23:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "1999-12-31 23:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "1999-12-31 23:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "2024-12-31 23:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "0002-12-31 23:02:30+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "294276-12-31 23:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "294276-12-31 23:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 day -23 hours',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "1999-12-31 23:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "1999-12-31 23:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "1999-12-31 23:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "1999-12-31 23:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "2024-12-31 23:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "2025-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "0002-12-31 23:02:30+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "0001-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "294276-12-31 23:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "294276-12-31 23:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 day 25 hours',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '0',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '-1 microsecond',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "0A000"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL 'infinity',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '2147483647 days',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "4713-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '2000-01-01 00:00:00',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "4713-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '1999-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "2000-01-01 00:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "4713-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '2025-01-01 01:30:00.123456+01:30',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "4713-01-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '0001-01-01 BC',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "2000-01-01 00:02:30+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '294276-12-31 23:59:59.999999',TIMESTAMPTZ 'infinity')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ 'infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ 'infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '2000-01-01 00:02:30')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '-infinity',TIMESTAMPTZ '4713-01-01 BC')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '9223372036854775807 microseconds',TIMESTAMPTZ '-infinity',TIMESTAMPTZ 'infinity')",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin('15 minutes','2000-01-01 00:38:12','2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 00:30:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin('1 day',DATE '2025-01-02',DATE '2025-01-01')",
+      "oid": 1184,
+      "result": "2025-01-02 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin('1 hour',TIMESTAMP '2000-01-01 01:30',TIMESTAMPTZ '2000-01-01')",
+      "oid": 1184,
+      "result": "2000-01-01 01:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(NULL,TIMESTAMP '2000-01-01',TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 month',NULL::timestamp,TIMESTAMP '2000-01-01')",
+      "oid": 1114,
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "date_bin(1,2,3)",
+      "oid": null,
+      "result": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 hour',1,0)",
+      "oid": null,
+      "result": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "date_bin('1 hour','2000-01-01'::text,'2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 hour',TIME '01:00',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 hour',INTERVAL '1 day',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "date_bin()",
+      "oid": null,
+      "result": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "date_bin(INTERVAL '1 hour',TIMESTAMP '2000-01-01')",
+      "oid": null,
+      "result": null,
+      "sqlstate": "42883"
+    },
+    {
+      "expression": "(DATE '1969-12-31')::date",
+      "oid": 1082,
+      "result": "1969-12-31",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '1969-12-31')::timestamp",
+      "oid": 1114,
+      "result": "1969-12-31 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '1969-12-31')::timestamptz",
+      "oid": 1184,
+      "result": "1969-12-31 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '2000-01-01')::date",
+      "oid": 1082,
+      "result": "2000-01-01",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '2000-01-01')::timestamp",
+      "oid": 1114,
+      "result": "2000-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '2000-01-01')::timestamptz",
+      "oid": 1184,
+      "result": "2000-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE 'infinity')::date",
+      "oid": 1082,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE 'infinity')::timestamp",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE 'infinity')::timestamptz",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '-infinity')::date",
+      "oid": 1082,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '-infinity')::timestamp",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '-infinity')::timestamptz",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '5874897-12-31')::date",
+      "oid": 1082,
+      "result": "5874897-12-31",
+      "sqlstate": null
+    },
+    {
+      "expression": "(DATE '5874897-12-31')::timestamp",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "(DATE '5874897-12-31')::timestamptz",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "(TIMESTAMP '1999-12-31 23:59:59.999999')::date",
+      "oid": 1082,
+      "result": "1999-12-31",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMP '1999-12-31 23:59:59.999999')::timestamp",
+      "oid": 1114,
+      "result": "1999-12-31 23:59:59.999999",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMP '1999-12-31 23:59:59.999999')::timestamptz",
+      "oid": 1184,
+      "result": "1999-12-31 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMPTZ '1999-12-31 23:59:59.999999+00')::date",
+      "oid": 1082,
+      "result": "1999-12-31",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMPTZ '1999-12-31 23:59:59.999999+00')::timestamp",
+      "oid": 1114,
+      "result": "1999-12-31 23:59:59.999999",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMPTZ '1999-12-31 23:59:59.999999+00')::timestamptz",
+      "oid": 1184,
+      "result": "1999-12-31 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMP '-infinity')::date",
+      "oid": 1082,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMP '-infinity')::timestamp",
+      "oid": 1114,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMP '-infinity')::timestamptz",
+      "oid": 1184,
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMPTZ 'infinity')::date",
+      "oid": 1082,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMPTZ 'infinity')::timestamp",
+      "oid": 1114,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(TIMESTAMPTZ 'infinity')::timestamptz",
+      "oid": 1184,
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "(NULL::date)::date",
+      "oid": 1082,
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "(NULL::date)::timestamp",
+      "oid": 1114,
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "(NULL::date)::timestamptz",
+      "oid": 1184,
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "(NULL::timestamp)::date",
+      "oid": 1082,
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "(NULL::timestamp)::timestamp",
+      "oid": 1114,
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "(NULL::timestamp)::timestamptz",
+      "oid": 1184,
+      "result": null,
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '01:00'",
+      "oid": 1083,
+      "result": "01:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMETZ '01:00+01:30'",
+      "oid": 1266,
+      "result": "01:00:00+01:30",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 01:30+01:30'",
+      "oid": 1114,
+      "result": "2024-01-01 01:30:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 01:30+01:30'",
+      "oid": 1184,
+      "result": "2024-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '23:59:59.0000005'",
+      "oid": 1083,
+      "result": "23:59:59",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 23:59:59.0000005'",
+      "oid": 1114,
+      "result": "2024-01-01 23:59:59",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 23:59:59.0000005'",
+      "oid": 1184,
+      "result": "2024-01-01 23:59:59+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '1969-12-31 23:59:59.0000005'",
+      "oid": 1114,
+      "result": "1969-12-31 23:59:59",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '1969-12-31 23:59:59.0000005'",
+      "oid": 1184,
+      "result": "1969-12-31 23:59:59+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '23:59:59.0000015'",
+      "oid": 1083,
+      "result": "23:59:59.000002",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 23:59:59.0000015'",
+      "oid": 1114,
+      "result": "2024-01-01 23:59:59.000002",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 23:59:59.0000015'",
+      "oid": 1184,
+      "result": "2024-01-01 23:59:59.000002+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '1969-12-31 23:59:59.0000015'",
+      "oid": 1114,
+      "result": "1969-12-31 23:59:59.000002",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '1969-12-31 23:59:59.0000015'",
+      "oid": 1184,
+      "result": "1969-12-31 23:59:59.000002+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '23:59:59.0000025'",
+      "oid": 1083,
+      "result": "23:59:59.000002",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 23:59:59.0000025'",
+      "oid": 1114,
+      "result": "2024-01-01 23:59:59.000002",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 23:59:59.0000025'",
+      "oid": 1184,
+      "result": "2024-01-01 23:59:59.000002+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '1969-12-31 23:59:59.0000025'",
+      "oid": 1114,
+      "result": "1969-12-31 23:59:59.000002",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '1969-12-31 23:59:59.0000025'",
+      "oid": 1184,
+      "result": "1969-12-31 23:59:59.000002+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '23:59:59.0000035'",
+      "oid": 1083,
+      "result": "23:59:59.000004",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 23:59:59.0000035'",
+      "oid": 1114,
+      "result": "2024-01-01 23:59:59.000004",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 23:59:59.0000035'",
+      "oid": 1184,
+      "result": "2024-01-01 23:59:59.000004+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '1969-12-31 23:59:59.0000035'",
+      "oid": 1114,
+      "result": "1969-12-31 23:59:59.000004",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '1969-12-31 23:59:59.0000035'",
+      "oid": 1184,
+      "result": "1969-12-31 23:59:59.000004+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '23:59:59.1234565'",
+      "oid": 1083,
+      "result": "23:59:59.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 23:59:59.1234565'",
+      "oid": 1114,
+      "result": "2024-01-01 23:59:59.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 23:59:59.1234565'",
+      "oid": 1184,
+      "result": "2024-01-01 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '1969-12-31 23:59:59.1234565'",
+      "oid": 1114,
+      "result": "1969-12-31 23:59:59.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '1969-12-31 23:59:59.1234565'",
+      "oid": 1184,
+      "result": "1969-12-31 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '23:59:59.1234555'",
+      "oid": 1083,
+      "result": "23:59:59.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 23:59:59.1234555'",
+      "oid": 1114,
+      "result": "2024-01-01 23:59:59.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 23:59:59.1234555'",
+      "oid": 1184,
+      "result": "2024-01-01 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '1969-12-31 23:59:59.1234555'",
+      "oid": 1114,
+      "result": "1969-12-31 23:59:59.123456",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '1969-12-31 23:59:59.1234555'",
+      "oid": 1184,
+      "result": "1969-12-31 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '23:59:59.9999995'",
+      "oid": 1083,
+      "result": "24:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 23:59:59.9999995'",
+      "oid": 1114,
+      "result": "2024-01-02 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 23:59:59.9999995'",
+      "oid": 1184,
+      "result": "2024-01-02 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '1969-12-31 23:59:59.9999995'",
+      "oid": 1114,
+      "result": "1970-01-01 00:00:00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '1969-12-31 23:59:59.9999995'",
+      "oid": 1184,
+      "result": "1970-01-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIME '23:59:59.123456789'",
+      "oid": 1083,
+      "result": "23:59:59.123457",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '2024-01-01 23:59:59.123456789'",
+      "oid": 1114,
+      "result": "2024-01-01 23:59:59.123457",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '2024-01-01 23:59:59.123456789'",
+      "oid": 1184,
+      "result": "2024-01-01 23:59:59.123457+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '1969-12-31 23:59:59.123456789'",
+      "oid": 1114,
+      "result": "1969-12-31 23:59:59.123457",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMPTZ '1969-12-31 23:59:59.123456789'",
+      "oid": 1184,
+      "result": "1969-12-31 23:59:59.123457+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "TIMESTAMP '294276-12-31 23:59:59.9999995'",
+      "oid": null,
+      "result": null,
+      "sqlstate": "22008"
+    }
+  ],
+  "transaction_dates": [
+    {
+      "timestamp": "2000-01-01",
+      "result": "2000-01-01"
+    },
+    {
+      "timestamp": "1999-12-31 23:59:59.999999+00",
+      "result": "1999-12-31"
+    },
+    {
+      "timestamp": "2024-02-29 23:59:59.999999+00",
+      "result": "2024-02-29"
+    },
+    {
+      "timestamp": "0001-01-01 BC",
+      "result": "0001-01-01 BC"
+    }
+  ],
+  "entries": [
+    {
+      "id": "sql-0179",
+      "sql": "SELECT CURRENT_DATE AS planned_day_ns FROM usage_records WHERE id = $1",
+      "parameters": [
+        "u1"
+      ],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,amount NUMERIC,created_at TIMESTAMPTZ,updated_at_ns TIMESTAMPTZ)",
+      "seed": "INSERT INTO usage_records(id,amount,created_at,updated_at_ns) VALUES ('u1',5,TIMESTAMPTZ '2024-02-01 12:00:00+00',TIMESTAMPTZ '2024-01-31 23:59:59.123456+00'),('u2',8,TIMESTAMPTZ '2024-02-02 12:00:00+00',NULL)",
+      "read": "SELECT id,amount,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "output": {
+        "columns": [
+          "planned_day_ns"
+        ],
+        "column_oids": [
+          1082
+        ],
+        "rows": [
+          [
+            "$transaction_date"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "final": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 0,
+      "cold": [
+        {
+          "sql": "SELECT TIMESTAMP '2024-01-01 23:59:59.9999995' AS local_rounded,TIMESTAMPTZ '2024-01-01 23:59:59.9999995+00' AS utc_rounded,TIME '23:59:59.9999995' AS day_end,date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '1969-12-31 23:59:59.999999999+00',TIMESTAMPTZ '2000-01-01') AS bucket",
+          "output": {
+            "columns": [
+              "local_rounded",
+              "utc_rounded",
+              "day_end",
+              "bucket"
+            ],
+            "column_oids": [
+              1114,
+              1184,
+              1083,
+              1184
+            ],
+            "rows": [
+              [
+                "2024-01-02 00:00:00",
+                "2024-01-02 00:00:00+00",
+                "24:00:00",
+                "1970-01-01 00:00:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-01-31 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "UPDATE usage_records SET updated_at_ns=date_bin(INTERVAL '15 minutes',updated_at_ns,TIMESTAMPTZ '2000-01-01') WHERE id='u1' RETURNING id,updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "2024-01-31 23:45:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-01-31 23:45:00+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,amount) VALUES('u1',10) ON CONFLICT(id) DO UPDATE SET updated_at_ns=TIMESTAMPTZ '2024-01-31 23:59:59.123456+00' + INTERVAL '1 month 1 day' RETURNING id,updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "2024-03-01 23:59:59.123456+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-03-01 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "SELECT id,date_bin(INTERVAL '7 minutes',created_at,TIMESTAMPTZ '2000-01-01') AS bucket FROM usage_records WHERE date_bin(INTERVAL '1 hour',created_at,TIMESTAMPTZ '2000-01-01') >= TIMESTAMPTZ '2024-02-01' ORDER BY bucket DESC,id",
+          "output": {
+            "columns": [
+              "id",
+              "bucket"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u2",
+                "2024-02-02 11:59:00+00"
+              ],
+              [
+                "u1",
+                "2024-02-01 11:57:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-03-01 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0264",
+      "sql": "SELECT date_bin(3600000000000, amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(86400000000000, amount, 0) = $1 ORDER BY date_bin(60000000000, amount, 0) ASC LIMIT 5",
+      "parameters": [
+        86400000000000
+      ],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,amount NUMERIC,created_at TIMESTAMPTZ,updated_at_ns TIMESTAMPTZ)",
+      "seed": "INSERT INTO usage_records(id,amount,created_at,updated_at_ns) VALUES ('u1',5,TIMESTAMPTZ '2024-02-01 12:00:00+00',TIMESTAMPTZ '2024-01-31 23:59:59.123456+00'),('u2',8,TIMESTAMPTZ '2024-02-02 12:00:00+00',NULL)",
+      "read": "SELECT id,amount,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "output": null,
+      "final": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "sqlstate": "42883",
+      "affected": 0,
+      "cold": []
+    },
+    {
+      "id": "sql-0265",
+      "sql": "SELECT date_bin(INTERVAL '1 hour', amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(INTERVAL '1 day', amount, 0) = $1 ORDER BY date_bin(INTERVAL '1 minute', amount, 0) ASC LIMIT 5",
+      "parameters": [
+        86400000000000
+      ],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,amount NUMERIC,created_at TIMESTAMPTZ,updated_at_ns TIMESTAMPTZ)",
+      "seed": "INSERT INTO usage_records(id,amount,created_at,updated_at_ns) VALUES ('u1',5,TIMESTAMPTZ '2024-02-01 12:00:00+00',TIMESTAMPTZ '2024-01-31 23:59:59.123456+00'),('u2',8,TIMESTAMPTZ '2024-02-02 12:00:00+00',NULL)",
+      "read": "SELECT id,amount,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "output": null,
+      "final": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "sqlstate": "42883",
+      "affected": 0,
+      "cold": []
+    },
+    {
+      "id": "sql-0266",
+      "sql": "SELECT date_bin(INTERVAL '1 hour', TIMESTAMPTZ '2025-01-01T01:30:00+01:30', TIMESTAMPTZ '2025-01-01T00:00:00Z') AS planned_bucket FROM usage_records WHERE id = $1",
+      "parameters": [
+        "u1"
+      ],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,amount NUMERIC,created_at TIMESTAMPTZ,updated_at_ns TIMESTAMPTZ)",
+      "seed": "INSERT INTO usage_records(id,amount,created_at,updated_at_ns) VALUES ('u1',5,TIMESTAMPTZ '2024-02-01 12:00:00+00',TIMESTAMPTZ '2024-01-31 23:59:59.123456+00'),('u2',8,TIMESTAMPTZ '2024-02-02 12:00:00+00',NULL)",
+      "read": "SELECT id,amount,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "output": {
+        "columns": [
+          "planned_bucket"
+        ],
+        "column_oids": [
+          1184
+        ],
+        "rows": [
+          [
+            "2025-01-01 00:00:00+00"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "final": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 0,
+      "cold": [
+        {
+          "sql": "SELECT TIMESTAMP '2024-01-01 23:59:59.9999995' AS local_rounded,TIMESTAMPTZ '2024-01-01 23:59:59.9999995+00' AS utc_rounded,TIME '23:59:59.9999995' AS day_end,date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '1969-12-31 23:59:59.999999999+00',TIMESTAMPTZ '2000-01-01') AS bucket",
+          "output": {
+            "columns": [
+              "local_rounded",
+              "utc_rounded",
+              "day_end",
+              "bucket"
+            ],
+            "column_oids": [
+              1114,
+              1184,
+              1083,
+              1184
+            ],
+            "rows": [
+              [
+                "2024-01-02 00:00:00",
+                "2024-01-02 00:00:00+00",
+                "24:00:00",
+                "1970-01-01 00:00:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-01-31 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "UPDATE usage_records SET updated_at_ns=date_bin(INTERVAL '15 minutes',updated_at_ns,TIMESTAMPTZ '2000-01-01') WHERE id='u1' RETURNING id,updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "2024-01-31 23:45:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-01-31 23:45:00+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,amount) VALUES('u1',10) ON CONFLICT(id) DO UPDATE SET updated_at_ns=TIMESTAMPTZ '2024-01-31 23:59:59.123456+00' + INTERVAL '1 month 1 day' RETURNING id,updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "2024-03-01 23:59:59.123456+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-03-01 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "SELECT id,date_bin(INTERVAL '7 minutes',created_at,TIMESTAMPTZ '2000-01-01') AS bucket FROM usage_records WHERE date_bin(INTERVAL '1 hour',created_at,TIMESTAMPTZ '2000-01-01') >= TIMESTAMPTZ '2024-02-01' ORDER BY bucket DESC,id",
+          "output": {
+            "columns": [
+              "id",
+              "bucket"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u2",
+                "2024-02-02 11:59:00+00"
+              ],
+              [
+                "u1",
+                "2024-02-01 11:57:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-03-01 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1467",
+      "sql": "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = CURRENT_DATE RETURNING id, updated_at_ns",
+      "parameters": [],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,amount NUMERIC,created_at TIMESTAMPTZ,updated_at_ns TIMESTAMPTZ)",
+      "seed": "INSERT INTO usage_records(id,amount,created_at,updated_at_ns) VALUES ('u1',5,TIMESTAMPTZ '2024-02-01 12:00:00+00',TIMESTAMPTZ '2024-01-31 23:59:59.123456+00'),('u2',8,TIMESTAMPTZ '2024-02-02 12:00:00+00',NULL)",
+      "read": "SELECT id,amount,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "output": {
+        "columns": [
+          "id",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "$transaction_midnight"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "final": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "$transaction_midnight"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1,
+      "cold": [
+        {
+          "sql": "SELECT TIMESTAMP '2024-01-01 23:59:59.9999995' AS local_rounded,TIMESTAMPTZ '2024-01-01 23:59:59.9999995+00' AS utc_rounded,TIME '23:59:59.9999995' AS day_end,date_bin(INTERVAL '15 minutes',TIMESTAMPTZ '1969-12-31 23:59:59.999999999+00',TIMESTAMPTZ '2000-01-01') AS bucket",
+          "output": {
+            "columns": [
+              "local_rounded",
+              "utc_rounded",
+              "day_end",
+              "bucket"
+            ],
+            "column_oids": [
+              1114,
+              1184,
+              1083,
+              1184
+            ],
+            "rows": [
+              [
+                "2024-01-02 00:00:00",
+                "2024-01-02 00:00:00+00",
+                "24:00:00",
+                "1970-01-01 00:00:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "$transaction_midnight"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "UPDATE usage_records SET updated_at_ns=date_bin(INTERVAL '15 minutes',updated_at_ns,TIMESTAMPTZ '2000-01-01') WHERE id='u1' RETURNING id,updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "$transaction_midnight"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "$transaction_midnight"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "INSERT INTO usage_records(id,amount) VALUES('u1',10) ON CONFLICT(id) DO UPDATE SET updated_at_ns=TIMESTAMPTZ '2024-01-31 23:59:59.123456+00' + INTERVAL '1 month 1 day' RETURNING id,updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "2024-03-01 23:59:59.123456+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-03-01 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        },
+        {
+          "sql": "SELECT id,date_bin(INTERVAL '7 minutes',created_at,TIMESTAMPTZ '2000-01-01') AS bucket FROM usage_records WHERE date_bin(INTERVAL '1 hour',created_at,TIMESTAMPTZ '2000-01-01') >= TIMESTAMPTZ '2024-02-01' ORDER BY bucket DESC,id",
+          "output": {
+            "columns": [
+              "id",
+              "bucket"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u2",
+                "2024-02-02 11:59:00+00"
+              ],
+              [
+                "u1",
+                "2024-02-01 11:57:00+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-03-01 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1477",
+      "sql": "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = updated_at_ns + INTERVAL '1 month 1 day' RETURNING id, updated_at_ns",
+      "parameters": [],
+      "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,amount NUMERIC,created_at TIMESTAMPTZ,updated_at_ns TIMESTAMPTZ)",
+      "seed": "INSERT INTO usage_records(id,amount,created_at,updated_at_ns) VALUES ('u1',5,TIMESTAMPTZ '2024-02-01 12:00:00+00',TIMESTAMPTZ '2024-01-31 23:59:59.123456+00'),('u2',8,TIMESTAMPTZ '2024-02-02 12:00:00+00',NULL)",
+      "read": "SELECT id,amount,created_at,updated_at_ns FROM usage_records ORDER BY id",
+      "before": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "output": null,
+      "final": {
+        "columns": [
+          "id",
+          "amount",
+          "created_at",
+          "updated_at_ns"
+        ],
+        "column_oids": [
+          25,
+          1700,
+          1184,
+          1184
+        ],
+        "rows": [
+          [
+            "u1",
+            "5",
+            "2024-02-01 12:00:00+00",
+            "2024-01-31 23:59:59.123456+00"
+          ],
+          [
+            "u2",
+            "8",
+            "2024-02-02 12:00:00+00",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            true
+          ]
+        ]
+      },
+      "sqlstate": "42702",
+      "affected": 0,
+      "cold": [
+        {
+          "sql": "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = usage_records.updated_at_ns + INTERVAL '1 month 1 day' RETURNING id, updated_at_ns",
+          "output": {
+            "columns": [
+              "id",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "2024-03-01 23:59:59.123456+00"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ]
+            ]
+          },
+          "final": {
+            "columns": [
+              "id",
+              "amount",
+              "created_at",
+              "updated_at_ns"
+            ],
+            "column_oids": [
+              25,
+              1700,
+              1184,
+              1184
+            ],
+            "rows": [
+              [
+                "u1",
+                "5",
+                "2024-02-01 12:00:00+00",
+                "2024-03-01 23:59:59.123456+00"
+              ],
+              [
+                "u2",
+                "8",
+                "2024-02-02 12:00:00+00",
+                null
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                true
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

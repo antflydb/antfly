@@ -53,7 +53,99 @@ pub const RelationSchemaMutation = struct {
     }
 };
 
+/// Declarative private trigger operation. Metadata derives attachment IDs and
+/// generations from its own predecessor; ingress cannot submit those counters.
+pub const RelationTriggerMutation = struct {
+    guard: domain.RelationMutationGuard,
+    operation: union(enum) {
+        create: struct {
+            name: []const u8,
+            timing: @FieldType(@import("antfly_local_sources").sql_catalog.triggers.Entry, "timing"),
+            events: @FieldType(@import("antfly_local_sources").sql_catalog.triggers.Entry, "events"),
+            level: @FieldType(@import("antfly_local_sources").sql_catalog.triggers.Entry, "level"),
+            function: @import("antfly_local_sources").sql_catalog.routines.records.RoutineReference,
+            arguments: []const []const u8 = &.{},
+            update_columns: []const []const u8 = &.{},
+            predicate: ?[]const u8 = null,
+            replace: bool = false,
+        },
+        drop: struct { name: []const u8, if_exists: bool = false },
+    },
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        const triggers = @import("antfly_local_sources").sql_catalog.triggers;
+        switch (self.operation) {
+            .create => |value| {
+                try (triggers.Declaration{ .name = value.name, .timing = value.timing, .events = value.events, .level = value.level, .function = value.function, .arguments = value.arguments, .predicate = value.predicate }).bind(1, 1).validate();
+                if (value.update_columns.len > 256 or (value.update_columns.len != 0 and !value.events.update)) return error.InvalidSqlTriggerDefinition;
+                for (value.update_columns, 0..) |name, i| {
+                    if (name.len == 0 or name.len > 256 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSqlTriggerDefinition;
+                    for (value.update_columns[0..i]) |prior| if (std.mem.eql(u8, prior, name)) return error.DuplicateSqlColumn;
+                }
+            },
+            .drop => |value| if (value.name.len == 0 or value.name.len > 256 or !std.unicode.utf8ValidateSlice(value.name) or std.mem.indexOfScalar(u8, value.name, 0) != null) return error.InvalidSqlTriggerDefinition,
+        }
+    }
+};
+
+/// Presentation-only intent. Metadata reads and preserves the complete current
+/// record; ingress can neither fabricate a table nor replace unrelated fields.
+pub const RelationDescriptionMutation = struct {
+    guard: domain.RelationMutationGuard,
+    description: []const u8,
+    column: ?[]const u8 = null,
+    object: ?domain.object_annotations.Key = null,
+
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        if (self.object) |key| {
+            if (self.column != null) return error.InvalidCatalogMutation;
+            try (domain.ObjectAnnotationRead{ .guard = self.guard, .key = key }).validate();
+            try domain.object_annotations.validateDescription(self.description);
+            return;
+        }
+        if (self.guard.object_renames.len != 0) return error.InvalidCatalogMutation;
+        if (self.column) |name| try (@import("antfly_local_sources").system_catalog_column_identities.Description{ .name = name, .value = self.description }).validate();
+        if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null) return error.InvalidCatalogMutation;
+        if (self.description.len > 1024 * 1024) return error.CatalogCommandTooLarge;
+        if (!std.unicode.utf8ValidateSlice(self.description) or std.mem.indexOfScalar(u8, self.description, 0) != null) return error.InvalidCatalogMutation;
+    }
+};
+
+/// Private bounded discovery for a native transaction visibility cut. Rows,
+/// index payloads and policy definitions never cross this metadata boundary.
+pub const SqlSnapshotCohortRequest = struct {
+    database: []const u8,
+    owner: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Owner = null,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.owner) |owner| return writer.write(.{ .database = self.database, .owner = owner });
+        return writer.write(.{ .database = self.database });
+    }
+};
+
+pub const SqlSnapshotCohort = struct {
+    pub const max_tables: usize = 256;
+    pub const max_encoded_bytes: usize = 2 * 1024 * 1024;
+    revision: u64,
+    tables: []const struct {
+        id: u64,
+        table: []const u8,
+        schema_version: u32,
+        external: bool,
+        sql_persistence: ?@import("antfly_local_sources").common_topology_records.RelationPersistence.Descriptor = null,
+        pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            return std.mem.eql(u8, field, "sql_persistence") and self.sql_persistence == null;
+        }
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.sql_persistence) |value| return writer.write(.{ .id = self.id, .table = self.table, .schema_version = self.schema_version, .external = self.external, .sql_persistence = value });
+            return writer.write(.{ .id = self.id, .table = self.table, .schema_version = self.schema_version, .external = self.external });
+        }
+    },
+};
+
 pub const Call = union(enum) {
+    sql_snapshot_cohort: SqlSnapshotCohortRequest,
     resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
     lake_index_lifecycle_work: ?u64,
@@ -73,6 +165,20 @@ pub const Call = union(enum) {
     policy_definition_mutate: @import("antfly_local_sources").system_catalog_policies.Command,
     /// Private coordinator-only transition. Never accepted from public SQL.
     policy_publication_mutate: @import("antfly_local_sources").system_catalog_policies.PublicationCommand,
+    scope_retirement_prepare: domain.scope_retirement.Prepare,
+    scope_retirement_work: u64,
+    sql_relation_boot_read: @import("../metadata/sql_relation_boots.zig").Query,
+    sql_relation_lifetime_page: @import("../metadata/sql_relation_lifetimes.zig").PageRequest,
+    sql_relation_boot_submit: []const u8,
+    scope_retirement_manifest: @import("../metadata/scope_retirement_ledger.zig").Lookup,
+    scope_retirement_submit: @import("../metadata/scope_retirement_wire.zig").Request,
+    scope_retirement_observation: @import("../metadata/scope_retirement_wire.zig").Query,
+    table_retirement_prepare: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
+    table_retirement_submit: []const u8,
+    table_retirement_receipt: @import("../metadata/table_retirement_receipt.zig").Request,
+    table_retirement_queue: u64,
+    table_retirement_effects: @import("../metadata/table_retirement_ledger.zig").Lookup,
+    table_retirement_owner_work: @import("../metadata/table_retirement_ledger.zig").Lookup,
     fk_generation_publication_begin: @import("../metadata/fk_generation_publication.zig").Plan,
     fk_generation_publication_mutate: @import("../metadata/fk_generation_publication.zig").Command,
     sql_completion_ready: void,
@@ -83,7 +189,25 @@ pub const Call = union(enum) {
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_status: @import("../metadata/relational_index_publication.zig").StatusRequest,
+    relational_index_prepare: @import("../metadata/relational_index_publication.zig").PrepareRequest,
+    relational_index_begin: @import("../metadata/relational_index_publication.zig").BeginRequest,
+    relational_index_admission_status: @import("../metadata/relational_index_publication.zig").AdmissionRequest,
+    relational_index_owner_decision: @import("../metadata/relational_index_publication.zig").OwnerRequest,
+    relational_index_owner_ack: @import("../metadata/relational_index_publication.zig").Ack,
+    relational_index_owner_ack_status: @import("../metadata/relational_index_publication.zig").Ack,
+    relational_index_publish_decide: @import("../metadata/relational_index_publication.zig").DecidePublish,
+    relational_index_publish_status: @import("../metadata/relational_index_publication.zig").DecidePublish,
+    relational_index_cancel: @import("../metadata/relational_index_publication.zig").CancelDecision,
+    relational_index_cancel_status: @import("../metadata/relational_index_publication.zig").CancelDecision,
+    relational_index_source_accept: @import("../metadata/relational_index_delivery_journal.zig").Request,
+    relational_index_source_accept_status: @import("../metadata/relational_index_delivery_journal.zig").Query,
+    relational_index_source_complete: @import("../metadata/relational_index_delivery_journal.zig").CompletionRequest,
+    query_population_job: @import("../metadata/query_population_job.zig").Request,
+    query_population_prepare: @import("../metadata/relation_create.zig").Request,
     fk_initial_create_prepare: @import("../metadata/fk_generation_publication.zig").InitialCreatePrepareRequest,
+    constraint_name_prepare: domain.ConstraintNamePrepareRequest,
+    constraint_name_check: domain.ConstraintNameCheck,
     fk_initial_child_decision: @import("../metadata/fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_begin: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan,
     fk_initial_create_mutate: @import("../metadata/fk_generation_publication.zig").InitialCommand,
@@ -105,8 +229,45 @@ pub const Call = union(enum) {
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,
+    sql_view_mutate: @import("views.zig").Request,
+    sql_prepared_read: @import("prepared_transactions.zig").Read,
+    sql_lock_read: @import("lock_authority.zig").Query,
+    sql_lock_mutate: @import("lock_authority.zig").Request,
+    sql_lock_outcome: @import("lock_authority.zig").Request,
+    sql_prepared_mutate: @import("prepared_transactions.zig").Mutation,
+    sql_prepared_outcome: @import("prepared_transactions.zig").Mutation,
+    sql_authorization_read: @import("authorization.zig").Read,
+    sql_authorization_mutate: @import("authorization.zig").Mutation,
+    sql_authorization_outcome: @import("authorization.zig").Observation,
+    sql_index_annotations: domain.object_annotations.IndexDescriptionsRead,
+    sql_type_snapshot: @import("named_types.zig").SnapshotRequest,
+    sql_type_bindings: @import("named_types.zig").BindingsRequest,
+    sql_type_mutate: @import("named_types.zig").Mutation,
+    sql_type_outcome: @import("named_types.zig").OutcomeRequest,
+    sql_cast_snapshot: @import("casts.zig").SnapshotRequest,
+    sql_cast_mutate: @import("casts.zig").Mutation,
+    sql_cast_outcome: @import("casts.zig").OutcomeRequest,
+    sql_routine_snapshot: @import("routines.zig").SnapshotRequest,
+    sql_catalog_prepare: @import("catalog_mutations.zig").Preparation,
+    sql_catalog_mutate: @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand,
+    sql_catalog_outcome: @import("catalog_mutations.zig").Observation,
+    sql_native_index_prepare: @import("native_indexes.zig").Preparation,
+    sql_native_index_mutate: @import("native_indexes.zig").Mutation,
+    sql_native_index_outcome: @import("native_indexes.zig").OutcomeRequest,
+    sql_routine_mutate: @import("routines.zig").Mutation,
+    sql_routine_outcome: @import("routines.zig").OutcomeRequest,
+    /// Private body-bound operations, never public SQL-supplied admissions.
+    sql_sequence_admission_head: void,
+    sql_column_sequence_handoffs: @import("../metadata/column_sequence_handoff.zig").Request,
+    sql_sequence_prepare: void,
+    sql_sequence_snapshot: @import("sequence_catalog.zig").SnapshotRequest,
+    sql_sequence_mutate: @import("sequence_catalog.zig").Mutation,
+    sql_sequence_outcome: @import("sequence_catalog.zig").Mutation,
+    sql_sequence_counter_mutate: @import("sequence_catalog.zig").CounterRequest,
+    sql_sequence_counter_outcome: @import("sequence_catalog.zig").CounterRequest,
     relation_replace: RelationReplacement,
     relation_schema_mutate: RelationSchemaMutation,
+    relation_description_mutate: RelationDescriptionMutation,
     query_definition: []const u8,
     /// Current physical definition, including runtime progress. This private
     /// point read is deliberately independent of semantic catalog caches.
@@ -120,10 +281,103 @@ pub const Call = union(enum) {
     write_validation: []const u8,
     write_validation_revision: void,
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
+    schema_validation_owner_read: @import("../metadata/schema_validation_read.zig").OwnerReadRequest,
+    schema_validation_discover: @import("../metadata/schema_validation_read.zig").DiscoveryRequest,
+    schema_validation_work: @import("../metadata/schema_validation_work.zig").Query,
+    schema_validation_prepare: @import("../metadata/schema_validation_admission.zig").Request,
+    schema_validation_receipt_read: @import("../metadata/schema_validation_receipt.zig").Request,
+    schema_validation_status: @import("../metadata/schema_validation_admission.zig").StatusRequest,
+    /// Private binary transport only. The JSON catalog route rejects this tag.
+    schema_validation_submit: []const u8,
+
+    sql_graph_preparation_read: @import("graph_preparation.zig").Source,
+    sql_graph_preparation_admit: @import("graph_preparation.zig").Mutation,
+    sql_graph_preparation_outcome: @import("graph_preparation.zig").Observation,
+    sql_trigger_snapshot: @import("trigger_snapshot.zig").Request,
+
+    /// Bind before serialization, so the existing service signature and exact
+    /// native request digest cover the command owner. Unjournaled mutations
+    /// remain closed to scoped execution until they provide the same contract.
+    pub fn withCommandFence(self: @This(), fence: ?*const @import("command_fence.zig").Fence) !@This() {
+        return self.commandFence(fence, true);
+    }
+    /// Producers must bind before computing compact recovery digests. Never
+    /// silently change an already prepared identity at the dispatch boundary.
+    pub fn requireCommandFence(self: @This(), fence: ?*const @import("command_fence.zig").Fence) !@This() {
+        return self.commandFence(fence, false);
+    }
+    fn commandFence(self: @This(), fence: ?*const @import("command_fence.zig").Fence, comptime bind: bool) !@This() {
+        // Observations retain the original statement identity. A later SQL
+        // command may observe an earlier result; rebinding would corrupt its
+        // digest or incorrectly require the earlier executor to remain alive.
+        if (!self.isMutation()) return self;
+        const value = (fence orelse return self).*;
+        try value.validate();
+        var result = self;
+        switch (result) {
+            // These operations have their own independently joined native
+            // scope/decision identity. Membership activation and durable completion
+            // reference acknowledgements are service work, not new SQL effects.
+            .query_population_job, .sql_sequence_prepare, .sql_completion_reference_mutate, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome => return result,
+            // Reader-floor admission is independent control work. It must not
+            // acquire the caller's statement effect identity at serialization.
+            .sql_graph_preparation_admit => return error.Forbidden,
+            .sql_catalog_mutate => |*request| {
+                try @import("catalog_mutations.zig").validate(request.*);
+                // Prepared commands already have an exact digest. Binding at
+                // dispatch would silently change their recovery identity.
+                const old = request.sql_catalog_admission.?.request.command_fence orelse return error.InvalidCatalogMutation;
+                if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
+                return result;
+            },
+            .setting_mutate => |*request| {
+                switch (request.*) {
+                    inline .role_default, .database_default => |*change| {
+                        if (change.command_fence) |old| {
+                            if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
+                        } else if (!bind) return error.InvalidCatalogMutation;
+                        change.command_fence = value;
+                        return result;
+                    },
+                    .put, .drop => return error.TableTopologyProtocolUpgradeRequired,
+                }
+            },
+            .sql_sequence_counter_mutate, .sql_sequence_counter_outcome => |*request| {
+                if (request.request.command_fence) |old| {
+                    if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
+                } else if (!bind) return error.InvalidCatalogMutation;
+                request.request.command_fence = value;
+                return result;
+            },
+            inline else => |*request| {
+                const T = @TypeOf(request.*);
+                if (comptime @typeInfo(T) == .@"struct") {
+                    if (comptime @hasField(T, "admission")) {
+                        if (comptime @TypeOf(request.admission) == @import("sequence_outcomes.zig").Admission) {
+                            if (request.admission.command_fence) |old| {
+                                if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
+                            } else if (!bind) return error.InvalidCatalogMutation;
+                            request.admission.command_fence = value;
+                            return result;
+                        }
+                    }
+                }
+            },
+        }
+        if (self.isMutation()) return error.TableTopologyProtocolUpgradeRequired;
+        return result;
+    }
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate, .native_memory_create => true,
+            .sql_graph_preparation_read, .sql_graph_preparation_admit, .sql_graph_preparation_outcome => true,
+            .sql_relation_boot_read, .sql_relation_lifetime_page, .sql_relation_boot_submit => true,
+            .resolve_many => |request| request.sql_principal != null,
+            .sql_snapshot_cohort => |request| request.owner != null,
+            .mutate => |request| request.mutation.action == .comment or request.mutation.sql_owner != null or request.mutation.sql_temporary_owner != null,
+            .query_population_job, .query_population_prepare, .schema_validation_prepare, .schema_validation_status, .scope_retirement_prepare, .scope_retirement_submit, .scope_retirement_observation, .scope_retirement_work, .scope_retirement_manifest, .table_retirement_prepare, .table_retirement_submit, .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => true,
+            .schema_validation_submit => |bytes| @import("../metadata/schema_validation_ledger.zig").requiresAdmissionAuthority(bytes),
+            .sql_index_annotations, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_catalog_prepare, .sql_catalog_mutate, .sql_catalog_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_trigger_snapshot, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -135,12 +389,26 @@ pub const Call = union(enum) {
     /// internal service, but ordinary table reads need no setting authority.
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
+            .sql_graph_preparation_read, .sql_graph_preparation_outcome => true,
+            .sql_snapshot_cohort => |request| request.owner != null,
+            .sql_relation_boot_read, .sql_relation_lifetime_page => true,
             .lake_index_lifecycle_read,
             .lake_index_lifecycle_work,
             .setting_snapshot,
             .policy_snapshot,
             .policy_install_snapshot,
             .policy_publication_work,
+            .scope_retirement_prepare,
+            .scope_retirement_work,
+            .scope_retirement_manifest,
+            .scope_retirement_observation,
+            .scope_retirement_submit,
+            .table_retirement_prepare,
+            .table_retirement_submit,
+            .table_retirement_receipt,
+            .table_retirement_queue,
+            .table_retirement_effects,
+            .table_retirement_owner_work,
             .sql_completion_ready,
             .sql_completion_reference,
             .fk_publication_completion,
@@ -148,7 +416,25 @@ pub const Call = union(enum) {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
+            .relational_index_admission_status,
+            .relational_index_owner_decision,
+            .schema_validation_owner_read,
+            .schema_validation_discover,
+            .schema_validation_work,
+            .schema_validation_receipt_read,
+            .schema_validation_submit,
+            .relational_index_owner_ack,
+            .relational_index_owner_ack_status,
+            .relational_index_publish_decide,
+            .relational_index_publish_status,
+            .relational_index_cancel,
+            .relational_index_cancel_status,
+            .relational_index_source_accept,
+            .relational_index_source_complete,
+            .relational_index_source_accept_status,
             .fk_initial_create_prepare,
+            .query_population_job,
+            .query_population_prepare,
             .fk_initial_child_decision,
             .fk_initial_create_status,
             .fk_generation_table_locked,
@@ -162,16 +448,185 @@ pub const Call = union(enum) {
     /// Calls whose native owners report the first possible durable effect.
     pub fn tracksSQLSubmission(self: @This()) bool {
         return switch (self) {
-            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
+            .sql_graph_preparation_admit => true,
+            .query_population_job => true,
+            .policy_definition_mutate, .policy_publication_begin, .policy_publication_mutate => true,
+            .mutate, .sql_catalog_mutate, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .fk_initial_create_begin, .fk_generation_publication_begin, .schema_validation_submit, .table_retirement_submit, .scope_retirement_submit => true,
             else => false,
         };
     }
 
     pub fn isMutation(self: @This()) bool {
-        return self == .mutate or self == .fk_initial_retirement_ack or
-            (self != .store_root_enrollment_status and self.requiresAdministrativeGrant());
+        if (self == .sql_graph_preparation_read or self == .sql_graph_preparation_outcome) return false;
+        if (self == .sql_graph_preparation_admit) return true;
+        // The owner narrows visibility and requires a body-bound read grant;
+        // capturing a cohort never mutates the catalog or its topology.
+        if (self == .sql_snapshot_cohort) return false;
+        if (self == .sql_relation_boot_read or self == .sql_relation_lifetime_page) return false;
+        if (self == .query_population_job) return self.query_population_job.isMutation();
+        if (self == .query_population_prepare) return false;
+        return self == .schema_validation_submit or self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_publish_decide or self == .relational_index_cancel or self == .relational_index_source_accept or self == .relational_index_source_complete or
+            (self != .sql_catalog_prepare and self != .sql_catalog_outcome and self != .sql_native_index_prepare and self != .sql_native_index_outcome and self != .resolve_many and self != .sql_index_annotations and self != .sql_lock_read and self != .sql_lock_outcome and self != .sql_prepared_read and self != .sql_prepared_outcome and self != .sql_authorization_read and self != .sql_authorization_outcome and self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_trigger_snapshot and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .scope_retirement_prepare and self != .scope_retirement_observation and self != .scope_retirement_work and self != .scope_retirement_manifest and self != .table_retirement_prepare and self != .table_retirement_receipt and self != .table_retirement_queue and self != .table_retirement_effects and self != .table_retirement_owner_work and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
+    }
+
+    pub fn isRelationalIndexOwnerCall(self: @This()) bool {
+        return self == .relational_index_status or self == .relational_index_prepare or self == .relational_index_begin or self == .relational_index_admission_status or self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status or self == .relational_index_publish_decide or self == .relational_index_publish_status or self == .relational_index_cancel or self == .relational_index_cancel_status or self == .relational_index_source_accept or self == .relational_index_source_accept_status or self == .relational_index_source_complete;
+    }
+
+    pub fn responseContentType(self: @This()) []const u8 {
+        return if (self == .schema_validation_owner_read) self.schema_validation_owner_read.contentType() else "application/json";
+    }
+
+    pub fn schemaValidationLookup(self: @This()) ?@import("../metadata/schema_validation_read.zig").Lookup {
+        return switch (self) {
+            .schema_validation_owner_read => |request| request.lookup,
+            .schema_validation_receipt_read => |request| request.lookup,
+            .schema_validation_status => |request| request.lookup,
+            else => null,
+        };
+    }
+
+    pub fn isSchemaValidationCall(self: @This()) bool {
+        // Database retirement discovery crosses the same authenticated owner
+        // boundary as the retirement journal; ordinary lock reads do not.
+        if (self == .sql_lock_read and (self.sql_lock_read.database_work != null or self.sql_lock_read.abandoned_private != null)) return true;
+        if (self == .scope_retirement_prepare or self == .scope_retirement_submit or self == .scope_retirement_observation or self == .scope_retirement_work or self == .scope_retirement_manifest) return true;
+        return self == .table_retirement_submit or self == .table_retirement_receipt or self == .table_retirement_queue or self == .table_retirement_effects or self == .table_retirement_owner_work or self == .schema_validation_prepare or self == .schema_validation_submit or self == .schema_validation_discover or self == .schema_validation_work or (self == .sql_sequence_snapshot and self.sql_sequence_snapshot.prepare_retirement) or self.schemaValidationLookup() != null;
     }
 };
+
+test "system catalog schema validation administrative observations use the read transport without weakening authority" {
+    // Only the tag is examined: request validation/authorization remains in
+    // the actual transport and service. Preparing a cut may activate readers,
+    // but neither this call nor a status read submits a schema mutation.
+    const prepare: Call = .{ .schema_validation_prepare = undefined };
+    const status: Call = .{ .schema_validation_status = undefined };
+    for ([_]Call{ prepare, status }) |call| {
+        try std.testing.expect(call.requiresAdministrativeGrant());
+        try std.testing.expect(call.isSchemaValidationCall());
+        try std.testing.expect(!call.isMutation());
+    }
+    const ordinary: Call = .{ .sql_sequence_snapshot = .{ .targets = &.{.{ .table = "counter" }} } };
+    var retirement = ordinary;
+    retirement.sql_sequence_snapshot.prepare_retirement = true;
+    try std.testing.expect(!ordinary.isSchemaValidationCall());
+    try std.testing.expect(retirement.isSchemaValidationCall());
+    try std.testing.expect(retirement.requiresAdministrativeGrant());
+    try std.testing.expect(!retirement.isMutation());
+    // Both staged lifecycle writers report their native first-effect witness;
+    // read-only framing/preflight failures must remain definite nonadmission.
+    for ([_]Call{ .{ .schema_validation_submit = "" }, .{ .table_retirement_submit = "" } }) |submit| {
+        try std.testing.expect(submit.isMutation());
+        try std.testing.expect(submit.tracksSQLSubmission());
+    }
+}
+
+test "sequence catalog calls bind administrative bodies and keep status reads nonmutating" {
+    const a = std.testing.allocator;
+    const sequence = @import("sequence_catalog.zig");
+    const request: sequence.Mutation = .{ .admission = .{ .nonce = @splat(1), .head = 0 }, .target = .{ .table = "counter" }, .namespace_id = 2, .incarnation = @splat(7), .operation = .{ .create = .{ .options = .{} } } };
+    const counter: sequence.CounterRequest = .{ .target = request.target, .namespace_id = 2, .sequence_id = 41, .incarnation = request.incarnation, .request = .{ .expected = .{ .generation = 1, .revision = 1, .last_value = 1, .is_called = false }, .request_id = @splat(1), .operation = .reserve } };
+    for ([_]Call{ .sql_sequence_prepare, .{ .sql_sequence_snapshot = .{ .targets = &.{request.target} } }, .{ .sql_sequence_admission_head = {} }, .{ .sql_sequence_mutate = request }, .{ .sql_sequence_outcome = request }, .{ .sql_sequence_counter_mutate = counter }, .{ .sql_sequence_counter_outcome = counter } }) |call| {
+        try std.testing.expect(call.requiresAdministrativeGrant());
+        try std.testing.expectEqual(call == .sql_sequence_mutate or call == .sql_sequence_prepare or call == .sql_sequence_counter_mutate, call.isMutation());
+        const bytes = try std.json.Stringify.valueAlloc(a, call, .{});
+        defer a.free(bytes);
+        var decoded = try std.json.parseFromSlice(Call, a, bytes, .{});
+        defer decoded.deinit();
+        try std.testing.expectEqual(std.meta.activeTag(call), std.meta.activeTag(decoded.value));
+        if (decoded.value == .sql_sequence_mutate) try decoded.value.sql_sequence_mutate.validate();
+        if (decoded.value == .sql_sequence_outcome) try decoded.value.sql_sequence_outcome.validate();
+        if (decoded.value == .sql_sequence_snapshot) try decoded.value.sql_sequence_snapshot.validate();
+        if (decoded.value == .sql_sequence_counter_mutate) try decoded.value.sql_sequence_counter_mutate.validate();
+        if (decoded.value == .sql_sequence_counter_outcome) try decoded.value.sql_sequence_counter_outcome.validate();
+    }
+}
+
+test "SQL COMMENT table descriptions are bounded administrative identity guarded mutations" {
+    const a = std.testing.allocator;
+    const request: RelationDescriptionMutation = .{
+        .guard = .{ .target = .{ .name = "items" }, .logical_table = "items", .owner = .{ .table_id = 17, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(2) },
+        .description = "a 'quoted' Ω",
+    };
+    const command: Call = .{ .relation_description_mutate = request };
+    try std.testing.expect(command.requiresAdministrativeGrant());
+    try std.testing.expect(command.isMutation());
+    const encoded = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(encoded);
+    var decoded = try std.json.parseFromSlice(Call, a, encoded, .{});
+    defer decoded.deinit();
+    try decoded.value.relation_description_mutate.validate();
+    try std.testing.expectEqualStrings(request.description, decoded.value.relation_description_mutate.description);
+    var invalid = request;
+    invalid.description = "bad\x00text";
+    try std.testing.expectError(error.InvalidCatalogMutation, invalid.validate());
+    invalid.description = "\xff";
+    try std.testing.expectError(error.InvalidCatalogMutation, invalid.validate());
+    invalid = request;
+    invalid.guard.owner.kind = .index;
+    try std.testing.expectError(error.InvalidCatalogMutation, invalid.validate());
+    const oversized = try a.alloc(u8, 1024 * 1024 + 1);
+    defer a.free(oversized);
+    invalid = request;
+    invalid.description = oversized;
+    try std.testing.expectError(error.CatalogCommandTooLarge, invalid.validate());
+}
+
+test "relational index publication ACK calls require body bound authority and distinguish mutations from status" {
+    const abi = @import("antfly_runtime_abi");
+    const VTable = struct { submit: *const fn (*const anyerror) anyerror!u64 };
+    const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+    const Callbacks = struct {
+        fn submit(err: *const anyerror) anyerror!u64 {
+            return err.*;
+        }
+        fn foreign(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return Boundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    for ([_]anyerror{ error.IndexOwnerReceiptChanged, error.InvalidIndexOwnerReceipt, error.MetadataMutationOutcomeUnknown }) |err| {
+        try std.testing.expectError(err, Boundary.call("submit", &Callbacks.foreign, &Callbacks.submit, .{&err}));
+    }
+    const admission: Call = .{ .relational_index_admission_status = undefined };
+    const beginning: Call = .{ .relational_index_begin = undefined };
+    const preparation: Call = .{ .relational_index_prepare = undefined };
+    const scoped_status: Call = .{ .relational_index_status = undefined };
+    try std.testing.expect(!scoped_status.isMutation());
+    try std.testing.expect(scoped_status.requiresAdministrativeGrant());
+    try std.testing.expect(scoped_status.isRelationalIndexOwnerCall());
+    try std.testing.expect(!preparation.isMutation());
+    try std.testing.expect(preparation.requiresAdministrativeGrant());
+    try std.testing.expect(preparation.isRelationalIndexOwnerCall());
+    try std.testing.expect(beginning.isMutation());
+    try std.testing.expect(beginning.requiresAdministrativeGrant());
+    try std.testing.expect(beginning.isRelationalIndexOwnerCall());
+    try std.testing.expect(!admission.isMutation());
+    try std.testing.expect(admission.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(admission.isRelationalIndexOwnerCall());
+    const ack: Call = .{ .relational_index_owner_ack = undefined };
+    const status: Call = .{ .relational_index_owner_ack_status = undefined };
+    const accept: Call = .{ .relational_index_source_accept = undefined };
+    const accepted: Call = .{ .relational_index_source_accept_status = undefined };
+    const completed: Call = .{ .relational_index_source_complete = undefined };
+    const decide: Call = .{ .relational_index_publish_decide = undefined };
+    const decided: Call = .{ .relational_index_publish_status = undefined };
+    const cancel: Call = .{ .relational_index_cancel = undefined };
+    const canceled: Call = .{ .relational_index_cancel_status = undefined };
+    try std.testing.expect(cancel.isMutation());
+    try std.testing.expect(!canceled.isMutation());
+    for ([_]Call{ ack, status, accept, accepted, completed, decide, decided, cancel, canceled }) |call| {
+        try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+        try std.testing.expect(!call.requiresAdministrativeGrant());
+        try std.testing.expect(call.isRelationalIndexOwnerCall());
+    }
+    try std.testing.expect(ack.isMutation());
+    try std.testing.expect(!status.isMutation());
+    try std.testing.expect(accept.isMutation());
+    try std.testing.expect(completed.isMutation());
+    try std.testing.expect(!accepted.isMutation());
+    try std.testing.expect(decide.isMutation());
+    try std.testing.expect(!decided.isMutation());
+}
 
 test "system catalog policy publication status is a service-only read, not a setting grant" {
     const status: Call = .{ .policy_publication_status = 7 };
@@ -183,6 +638,65 @@ test "system catalog policy publication status is a service-only read, not a set
     try std.testing.expect((Call{ .setting_snapshot = undefined }).requiresSettingAuthorityReadGrant());
     try std.testing.expect((Call{ .fk_generation_publication_status = undefined }).requiresSettingAuthorityReadGrant());
     try std.testing.expect((Call{ .policy_publication_begin = undefined }).requiresAdministrativeGrant());
+}
+
+test "system catalog schema validation reads bind projection and never serialize authority" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "SVBI\x01\x00\x00\x00", "owner-command" }, [_]bool{ true, false }) |command, admin| {
+        const submission: Call = .{ .schema_validation_submit = command };
+        try std.testing.expect(submission.isMutation());
+        try std.testing.expect(submission.isSchemaValidationCall());
+        try std.testing.expectEqual(admin, submission.requiresAdministrativeGrant());
+        try std.testing.expect(submission.requiresSettingAuthorityReadGrant());
+        try std.testing.expect(!submission.isRelationalIndexOwnerCall());
+    }
+    var call: Call = .{ .schema_validation_owner_read = .{ .lookup = .{ .group = 21, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) }, .ordinal = 0 } };
+    try call.schema_validation_owner_read.validate();
+    try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!call.requiresAdministrativeGrant());
+    try std.testing.expect(!call.isMutation());
+    try std.testing.expect(!call.isRelationalIndexOwnerCall());
+    try std.testing.expectEqualStrings("application/json", call.responseContentType());
+    call.schema_validation_owner_read.projection = .inputs;
+    try std.testing.expectEqualStrings("application/octet-stream", call.responseContentType());
+    const receipt: Call = .{ .schema_validation_receipt_read = .{ .lookup = call.schema_validation_owner_read.lookup, .expected = .admission } };
+    try std.testing.expect(receipt.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!receipt.requiresAdministrativeGrant());
+    try std.testing.expect(!receipt.isMutation());
+    try std.testing.expect(!receipt.isRelationalIndexOwnerCall());
+    try std.testing.expectEqualStrings("application/json", receipt.responseContentType());
+    try std.testing.expectEqualDeep(call.schemaValidationLookup(), receipt.schemaValidationLookup());
+    const bytes = try std.json.Stringify.valueAlloc(a, call, .{});
+    defer a.free(bytes);
+    var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer raw.deinit();
+    try raw.value.object.getPtr("schema_validation_owner_read").?.object.put(raw.arena.allocator(), "schema_validation_authority", .{ .bool = true });
+    const injected = try std.json.Stringify.valueAlloc(a, raw.value, .{});
+    defer a.free(injected);
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Call, a, injected, .{}));
+    const receipt_bytes = try std.json.Stringify.valueAlloc(a, receipt, .{});
+    defer a.free(receipt_bytes);
+    var receipt_raw = try std.json.parseFromSlice(std.json.Value, a, receipt_bytes, .{});
+    defer receipt_raw.deinit();
+    try receipt_raw.value.object.getPtr("schema_validation_receipt_read").?.object.put(receipt_raw.arena.allocator(), "schema_validation_authority", .{ .bool = true });
+    const injected_receipt = try std.json.Stringify.valueAlloc(a, receipt_raw.value, .{});
+    defer a.free(injected_receipt);
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Call, a, injected_receipt, .{}));
+    call.schema_validation_owner_read.action = .install;
+    try std.testing.expectError(error.InvalidGenerationPublication, call.schema_validation_owner_read.validate());
+    call.schema_validation_owner_read.action = .begin;
+    call.schema_validation_owner_read.ordinal = 4096;
+    try std.testing.expectError(error.InvalidGenerationPublication, call.schema_validation_owner_read.validate());
+}
+
+test "system catalog relational index owner decision requires a body bound read grant and cannot mutate" {
+    const call: Call = .{ .relational_index_owner_decision = .{ .table_id = 1, .group_id = 2, .id = @splat(3), .operation = .fence } };
+    try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!call.requiresAdministrativeGrant());
+    try std.testing.expect(!call.isMutation());
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Call, std.testing.allocator,
+        \\{"relational_index_owner_decision":{"table_id":1,"group_id":2,"id":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"operation":"fence","index_publication_authority":true}}
+    , .{}));
 }
 
 test "store-root enrollment status is an admin-bound read, not a mutation" {
@@ -209,6 +723,11 @@ test "native lake lifecycle calls bind private read and mutation grants" {
 }
 
 test "system catalog relation replacement requires a body-bound administrative mutation grant" {
+    for ([_]Call{ .{ .constraint_name_prepare = undefined }, .{ .constraint_name_check = undefined } }) |prepare| {
+        try std.testing.expect(prepare.requiresAdministrativeGrant());
+        try std.testing.expect(!prepare.requiresSettingAuthorityReadGrant());
+        try std.testing.expect(!prepare.isMutation());
+    }
     const call: Call = .{ .relation_replace = undefined };
     try std.testing.expect(call.requiresAdministrativeGrant());
     try std.testing.expect(call.isMutation());
@@ -248,6 +767,111 @@ test "system catalog relation replacement wire retains exact owner and rejects i
     try std.testing.expectError(error.InvalidCatalogMutation, request.validate());
 }
 
+test "system catalog resource comments require body bound admin forwarding for NULL removal" {
+    const remove: Call = .{ .mutate = .{ .mutation = .{ .action = .comment, .kind = .namespace, .name = "public", .description = null } } };
+    try std.testing.expect(remove.requiresAdministrativeGrant());
+    const ordinary: Call = .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "appdb" } } };
+    try std.testing.expect(!ordinary.requiresAdministrativeGrant());
+}
+
+test "SQL authorization catalog transport binds principal reads and mutations to administrative grants" {
+    const testing = std.testing;
+    const calls = [_]Call{
+        .{ .sql_authorization_read = .{} },
+        .{ .sql_authorization_mutate = undefined },
+        .{ .sql_authorization_outcome = undefined },
+    };
+    for (calls, [_]bool{ false, true, false }) |call, mutates| {
+        try testing.expect(call.requiresAdministrativeGrant());
+        try testing.expectEqual(mutates, call.isMutation());
+    }
+    const owned_table: Call = .{ .mutate = .{ .mutation = .{ .kind = .table, .action = .create, .name = "rows", .sql_owner = .bootstrap } } };
+    try testing.expect(owned_table.requiresAdministrativeGrant());
+    try testing.expect(owned_table.isMutation());
+}
+
+test "distributed txn prepared registry calls bind administrative authority and classify observations" {
+    const calls = [_]Call{
+        .{ .sql_prepared_read = .{ .gid = "" } },
+        .{ .sql_prepared_read = .{ .receipt = @splat(1) } },
+        .{ .sql_prepared_mutate = undefined },
+        .{ .sql_prepared_outcome = undefined },
+    };
+    for (calls, [_]bool{ false, false, true, false }) |call, mutates| {
+        try std.testing.expect(call.requiresAdministrativeGrant());
+        try std.testing.expectEqual(mutates, call.isMutation());
+    }
+}
+
+test "catalog object index annotation reads require body bound administrative transport without mutation authority" {
+    const a = std.testing.allocator;
+    const read: Call = .{ .sql_index_annotations = .{ .table_id = 7, .name = "status_idx" } };
+    try std.testing.expect(read.requiresAdministrativeGrant());
+    try std.testing.expect(!read.isMutation());
+    try read.sql_index_annotations.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, read, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(Call, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("status_idx", parsed.value.sql_index_annotations.name.?);
+    try std.testing.expectError(error.InvalidCatalogMutation, (domain.object_annotations.IndexDescriptionsRead{ .table_id = 0 }).validate());
+}
+
+test "table retirement manifest preparation is a body-bound administrative read without mutation authority" {
+    const call: Call = .{ .table_retirement_prepare = undefined };
+    try std.testing.expect(call.requiresAdministrativeGrant());
+    try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!call.isMutation());
+    try std.testing.expect(!call.isRelationalIndexOwnerCall());
+}
+
+test "SQL command fence binds forwarded identities and rejects substitution and unjournaled mutations" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!(Call{ .sql_lock_read = undefined }).isMutation());
+    try std.testing.expect(!(Call{ .sql_lock_outcome = undefined }).isMutation());
+    try std.testing.expect((Call{ .sql_lock_mutate = undefined }).isMutation());
+    const fence: @import("command_fence.zig").Fence = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .principal = @splat(5), .database = 1, .standalone = false };
+    const call: Call = .{ .sql_sequence_mutate = .{ .admission = .{ .nonce = @splat(6), .head = 0 }, .incarnation = @splat(1), .target = .{ .table = "s" }, .namespace_id = 2, .operation = .{ .create = .{ .options = .{} } } } };
+    try std.testing.expectError(error.InvalidCatalogMutation, call.requireCommandFence(&fence));
+    const bound = try call.withCommandFence(&fence);
+    try std.testing.expectEqualDeep(bound, try bound.requireCommandFence(&fence));
+    const bytes = try std.json.Stringify.valueAlloc(a, bound, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(Call, a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(fence, decoded.value.sql_sequence_mutate.admission.command_fence.?);
+    try std.testing.expectEqualDeep(bound, try decoded.value.withCommandFence(&fence));
+    var foreign = fence;
+    foreign.command.executor = @splat(9);
+    const observation: Call = .{ .sql_sequence_outcome = bound.sql_sequence_mutate };
+    try std.testing.expectEqualDeep(observation, try observation.requireCommandFence(&foreign));
+    try std.testing.expectEqualDeep(observation, try observation.withCommandFence(&foreign));
+    try std.testing.expectError(error.InvalidCatalogMutation, bound.withCommandFence(&foreign));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, (Call{ .relation_schema_mutate = .{ .guard = undefined, .schema_json = "{}" } }).withCommandFence(&fence));
+    inline for (.{
+        Call{ .setting_mutate = .{ .database_default = .{ .name = "timezone", .database = "app", .value = .{ .string = "UTC" } } } },
+        Call{ .setting_mutate = .{ .role_default = .{ .name = "app.mode", .principal = "alice", .database = "", .value = .{ .string = "ready" } } } },
+    }) |scoped| {
+        try std.testing.expectError(error.InvalidCatalogMutation, scoped.requireCommandFence(&fence));
+        const owned = try scoped.withCommandFence(&fence);
+        try std.testing.expectEqualDeep(owned, try owned.requireCommandFence(&fence));
+        try std.testing.expectError(error.InvalidCatalogMutation, owned.withCommandFence(&foreign));
+        const scoped_json = try std.json.Stringify.valueAlloc(a, owned, .{});
+        defer a.free(scoped_json);
+        var scoped_decoded = try std.json.parseFromSlice(Call, a, scoped_json, .{});
+        defer scoped_decoded.deinit();
+        try std.testing.expectEqualDeep(owned, try scoped_decoded.value.requireCommandFence(&fence));
+    }
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, (Call{ .setting_mutate = .{ .drop = "app.mode" } }).withCommandFence(&fence));
+    try std.testing.expectEqualDeep(call, try call.withCommandFence(null));
+    const old = call.sql_sequence_mutate.admission;
+    const encoded = try std.json.Stringify.valueAlloc(a, old, .{});
+    defer a.free(encoded);
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .nonce = old.nonce, .head = old.head }, .{});
+    defer a.free(legacy);
+    try std.testing.expectEqualStrings(legacy, encoded);
+}
+
 test "SQL pgwire native completion mutations require administrative grant and mutation forwarding" {
     const write: Call = .{ .sql_completion_reference_mutate = undefined };
     try std.testing.expect(write.requiresAdministrativeGrant());
@@ -256,6 +880,98 @@ test "SQL pgwire native completion mutations require administrative grant and mu
     const read: Call = .{ .sql_completion_reference = @splat(1) };
     try std.testing.expect(read.requiresSettingAuthorityReadGrant());
     try std.testing.expect(!read.isMutation());
+}
+
+test "SQL command fence catalog preparation cannot silently rebind a prepared native command" {
+    const C = @import("catalog_mutations.zig");
+    const fence: @import("command_fence.zig").Fence = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .database = 1, .principal = @splat(5), .standalone = false };
+    var command: @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand = .{ .expected_revision = 1, .mutation = .{ .kind = .namespace, .action = .create, .name = "scoped" }, .sql_catalog_admission = .{ .request = .{ .nonce = @splat(6), .head = 0 }, .incarnation = @splat(1) } };
+    try std.testing.expectError(error.InvalidCatalogMutation, (Call{ .sql_catalog_mutate = command }).withCommandFence(&fence));
+    command.sql_catalog_admission.?.request.command_fence = fence;
+    const call: Call = .{ .sql_catalog_mutate = command };
+    try std.testing.expect(call.isMutation());
+    try std.testing.expect(call.tracksSQLSubmission());
+    try std.testing.expect(call.requiresAdministrativeGrant());
+    try std.testing.expectEqualDeep(call, try call.requireCommandFence(&fence));
+    var replacement = fence;
+    replacement.command.executor = @splat(7);
+    try std.testing.expectError(error.InvalidCatalogMutation, call.withCommandFence(&replacement));
+    const reads = [_]Call{ .{ .sql_catalog_prepare = .{ .request = .{ .mutation = command.mutation }, .nonce = @splat(6), .command_fence = fence } }, .{ .sql_catalog_outcome = try C.observation(std.testing.allocator, command) } };
+    for (reads) |read| {
+        try std.testing.expect(read.requiresAdministrativeGrant());
+        try std.testing.expect(!read.isMutation());
+        try std.testing.expectEqualDeep(read, try read.requireCommandFence(&replacement));
+    }
+}
+
+test "SQL scope retirement capture requires owner sensitive authority and cannot mutate" {
+    const call: Call = .{ .scope_retirement_prepare = undefined };
+    try std.testing.expect(call.requiresAdministrativeGrant());
+    try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(call.isSchemaValidationCall());
+    try std.testing.expect(!call.isMutation());
+    try std.testing.expect(!call.tracksSQLSubmission());
+}
+
+test "SQL scope retirement database source reads preserve transport authority" {
+    var ordinary: Call = .{ .sql_lock_read = .{
+        .incarnation = @splat(1),
+        .standalone = false,
+        .actor = .{ .session_user = .bootstrap, .credential = "" },
+        .database = 0,
+        .discovery = "tenant_ops",
+    } };
+    try ordinary.sql_lock_read.validate();
+    try std.testing.expect(!ordinary.isSchemaValidationCall());
+    try std.testing.expect(ordinary.requiresAdministrativeGrant());
+    try std.testing.expect(!ordinary.isMutation());
+
+    ordinary.sql_lock_read.discovery = null;
+    ordinary.sql_lock_read.database = 7;
+    ordinary.sql_lock_read.database_work = .{ .wrap = true };
+    try ordinary.sql_lock_read.validate();
+    try std.testing.expect(ordinary.isSchemaValidationCall());
+    try std.testing.expect(ordinary.requiresAdministrativeGrant());
+    try std.testing.expect(!ordinary.isMutation());
+    try std.testing.expect(!ordinary.tracksSQLSubmission());
+
+    // Body classification cannot authorize a caller to impersonate the worker.
+    ordinary.sql_lock_read.actor.current_role = .{ .kind = .role, .instance = @splat(2) };
+    try std.testing.expectError(error.Forbidden, ordinary.sql_lock_read.validate());
+}
+
+test "SQL snapshot cohort owner requires body bound authority and keeps ordinary wire unchanged for SQL relation lifetime" {
+    const a = std.testing.allocator;
+    const ordinary: Call = .{ .sql_snapshot_cohort = .{ .database = "default" } };
+    try std.testing.expect(!ordinary.requiresAdministrativeGrant());
+    try std.testing.expect(!ordinary.isMutation());
+    try std.testing.expect(!ordinary.tracksSQLSubmission());
+    try std.testing.expect(!ordinary.requiresSettingAuthorityReadGrant());
+    const bytes = try std.json.Stringify.valueAlloc(a, ordinary.sql_snapshot_cohort, .{});
+    defer a.free(bytes);
+    const Legacy = struct { database: []const u8 };
+    var legacy = try std.json.parseFromSlice(Legacy, a, bytes, .{});
+    defer legacy.deinit();
+    try std.testing.expectEqualStrings("default", legacy.value.database);
+    const scoped: Call = .{ .sql_snapshot_cohort = .{ .database = "default", .owner = .{ .issuer_node_id = 1, .connection_id = @splat(1), .wire_epoch = @splat(2), .execution_instance = @splat(3), .connection_generation = 1, .principal_digest = @splat(4) } } };
+    try std.testing.expect(scoped.requiresAdministrativeGrant());
+    try std.testing.expect(scoped.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!scoped.isMutation());
+    try std.testing.expect(!scoped.tracksSQLSubmission());
+}
+
+test "graph preparation calls separate readonly vote authority from independent admission submission" {
+    const graph = @import("graph_preparation.zig");
+    const source: graph.Source = .{ .table_id = 7, .epoch = .{ .incarnation = @splat(1), .revision = 2 }, .schema_digest = @splat(2), .indexes = &.{.{ .name = "g", .digest = @splat(3) }} };
+    const mutation: graph.Mutation = .{ .source = source, .admission = .{ .nonce = @splat(4), .head = 0 } };
+    const calls = [_]Call{ .{ .sql_graph_preparation_read = source }, .{ .sql_graph_preparation_admit = mutation }, .{ .sql_graph_preparation_outcome = try graph.observation(std.testing.allocator, mutation) } };
+    for (calls, 0..) |call, ordinal| {
+        const writes = ordinal == 1;
+        try std.testing.expect(call.requiresAdministrativeGrant());
+        try std.testing.expectEqual(writes, call.isMutation());
+        try std.testing.expectEqual(writes, call.tracksSQLSubmission());
+        try std.testing.expectEqual(!writes, call.requiresSettingAuthorityReadGrant());
+    }
 }
 
 test "privacy table record transport is a service read without mutation authority" {

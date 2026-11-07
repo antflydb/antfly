@@ -57,6 +57,10 @@ pub const Program = struct {
         return .{ .version = wire.version, .instructions = wire.instructions, .root = wire.root, .output = wire.output, .parameters = wire.parameters, .parameter_values = wire.parameter_values };
     }
     pub fn fromBound(a: A, bound: *const scalar.Program, parameters: []const std.json.Value) !Program {
+        // Wire Type carries only named-type witnesses, not their executable
+        // catalog-authorized directories. This worker has no named-type binder.
+        for (bound.instructions) |instruction| if (!wireTypeSupported(instruction.type)) return error.SqlDistributedJoinUnsupported;
+        if (!wireTypeSupported(bound.output_type)) return error.SqlDistributedJoinUnsupported;
         var result: Program = .{ .instructions = bound.instructions, .root = bound.root, .output = bound.output_type, .parameters = parameters };
         if (bound.invocation) |invocation| if (invocation.frame) |frame| {
             const values = try a.alloc(Parameter, frame.values.len);
@@ -70,12 +74,24 @@ pub const Program = struct {
                 if (!values[slot].sql_null) continue;
                 const datum = frame.values[slot];
                 if (datum.sql_null) continue;
+                try datum.validateTemporal();
+                if (datum.missing) return error.SqlDistributedJoinUnsupported;
                 values[slot] = .{ .value = datum.value };
                 if (datum.numeric) |number| {
                     var context: Numeric.Context = .{ .alloc = a };
                     values[slot] = .{ .value = .{ .string = try Numeric.format(&context, number.*) }, .text = true };
                 } else if (datum.array) |array| {
                     values[slot].value = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(a, array.*, .{});
+                } else if (datum.temporal()) |temporal| {
+                    var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
+                    values[slot] = .{ .value = .{ .string = try a.dupe(u8, try @import("antfly_local_sources").sql_temporal_text.format(temporal.*, &text)) }, .text = true };
+                } else if (datum.range()) |range| {
+                    var context: Numeric.Context = .{ .alloc = a };
+                    values[slot] = .{ .value = .{ .string = try @import("antfly_local_sources").sql_range_value.formatLeaky(&context, range.*) }, .text = true };
+                } else if (datum.bytes()) |bytes| {
+                    values[slot] = .{ .value = .{ .string = try scalar.Bytea.formatAlloc(a, bytes, (@import("antfly_local_sources").sql_parameter_frame.Limits{}).bytes) }, .text = true };
+                } else if (datum.extension_kind != .none or datum.extension != null) {
+                    return error.SqlDistributedJoinUnsupported;
                 } else if (datum.value == .float and !std.math.isFinite(datum.value.float)) {
                     values[slot] = .{ .value = .{ .string = if (std.math.isNan(datum.value.float)) "NaN" else if (datum.value.float < 0) "-Infinity" else "Infinity" }, .text = true };
                 }
@@ -91,6 +107,8 @@ pub const Program = struct {
     pub fn validate(self: Program, width: usize) !void {
         if ((self.version != 1 and self.version != 2) or self.instructions.len == 0 or self.instructions.len > 4096 or self.root >= self.instructions.len or self.parameterCount() > 256 or (self.parameter_values != null and (self.version != 2 or self.parameters.len != 0))) return error.InvalidSqlDistributedPlan;
         scalar.validateTypedInstructions(self.instructions, self.root, self.output) catch return error.InvalidSqlDistributedPlan;
+        for (self.instructions) |instruction| if (!wireTypeSupported(instruction.type)) return error.SqlDistributedJoinUnsupported;
+        if (!wireTypeSupported(self.output)) return error.SqlDistributedJoinUnsupported;
         for (self.instructions, 0..) |instruction, index| switch (instruction.operation) {
             .literal => {},
             .column => |ordinal| if (ordinal >= width) return error.InvalidSqlDistributedPlan,
@@ -123,6 +141,10 @@ pub const Program = struct {
         return task.matches(.left, cells);
     }
 };
+
+fn wireTypeSupported(descriptor: scalar.Type) bool {
+    return descriptor.kind != .enumeration and descriptor.enum_view == null and descriptor.enum_reference == null and descriptor.domain_binding == null;
+}
 
 const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const Batch = @import("antfly_local_sources").sql_execution_batch.Batch;
@@ -274,8 +296,9 @@ pub const Prepared = struct {
         // All scalar and native vector/grace consumers borrow this same frame.
         for (owner.descriptors) |*descriptor| {
             if (descriptor.kind == null) descriptor.* = .{ .kind = .string };
-            try scalar.validateParameterType(descriptor.*);
-            if (descriptor.kind != .datetime and descriptor.element_type == null) descriptor.element_type = try scalar.parameterElementType(descriptor.*);
+            // Share the invocation descriptor boundary: ranges and bytea are
+            // native scalar types, not SQL-array element descriptors.
+            descriptor.* = try scalar.normalizeParameterType(descriptor.*);
         }
         owner.frame = try local.sql_parameter_frame.Frame.prepare(self.a, owner.descriptors, inputs, .{ .bytes = bytes, .wire_bytes = @min(bytes, 1024 * 1024) });
         owner.phase = .prepared;
@@ -757,6 +780,12 @@ test "distributed SQL typed parameter frames preserve exact numbers arrays JSON 
         .{ .sql = "$1 = 0.1::real", .types = &.{.{ .kind = .number, .element_type = .float32 }}, .values = &.{.{ .string = "0.1" }} },
         .{ .sql = "$1 = 'Infinity'::double precision", .types = &.{.{ .kind = .number, .element_type = .float64 }}, .values = &.{.{ .string = "Infinity" }} },
         .{ .sql = "$2 = 7", .types = &.{ .{ .kind = .array, .element_type = .int64 }, .{ .kind = .integer, .element_type = .int64 } }, .values = &.{ .{ .string = "{1,2}" }, .{ .integer = 7 } } },
+        .{ .sql = "$1 = '2024-02-29'::date", .types = &.{.{ .kind = .datetime, .temporal_kind = .date }}, .values = &.{.{ .string = "2024-02-29" }} },
+        .{ .sql = "$1 = '2024-02-29 12:34:56.123456'::timestamp", .types = &.{.{ .kind = .datetime, .temporal_kind = .timestamp }}, .values = &.{.{ .string = "2024-02-29 12:34:56.123456" }} },
+        .{ .sql = "$1 = '2024-02-29 12:34:56.123456+05:30'::timestamptz", .types = &.{.{ .kind = .datetime, .temporal_kind = .timestamp_tz }}, .values = &.{.{ .string = "2024-02-29 12:34:56.123456+05:30" }} },
+        .{ .sql = "$1 = '[1.25,9.75)'::numrange", .types = &.{.{ .kind = .numrange }}, .values = &.{.{ .string = "[1.25,9.75)" }} },
+        .{ .sql = "$1 = '[2024-02-29,2024-03-02)'::daterange", .types = &.{.{ .kind = .daterange }}, .values = &.{.{ .string = "[2024-02-29,2024-03-02)" }} },
+        .{ .sql = "$1 = '\\x00ff80'::bytea", .types = &.{.{ .kind = .bytea }}, .values = &.{.{ .string = "\\x00ff80" }} },
     };
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -785,9 +814,23 @@ test "distributed SQL typed parameter frames preserve exact numbers arrays JSON 
         var task = try Task.init(a, .{}, 16 * 1024 * 1024, restored, null, null);
         defer task.deinit();
         const frame = &task.left.?.program.invocation.?.frame.?;
+        // Decoding must preserve native range/bytea descriptors instead of
+        // inventing an array element kind for their textual wire payload.
+        if (local.sql_range_value.kindFromType(case.types[0].kind.?) != null or case.types[0].kind == .bytea) {
+            try std.testing.expectEqual(case.types[0].kind, frame.descriptors[0].kind);
+            try std.testing.expect(frame.descriptors[0].element_type == null);
+        }
         const original_work = frame.work;
         for (0..100) |_| try std.testing.expect(try task.matches(.left, &.{}));
         try std.testing.expectEqual(original_work, frame.work);
+        if (case.types[0].kind != .json) {
+            bound.invocation = null;
+            const unframed = try Program.fromBound(sa, &bound, case.values);
+            const unframed_wire = try std.json.Stringify.valueAlloc(sa, unframed, .{});
+            const unframed_restored = try std.json.parseFromSliceLeaky(Program, sa, unframed_wire, .{});
+            try unframed_restored.validate(0);
+            try std.testing.expect(try unframed_restored.matches(a, &.{}));
+        }
     }
     // Legacy V1 plans retain typed ingress and lossless literal decoding.
     var legacy_arena = std.heap.ArenaAllocator.init(a);
@@ -854,4 +897,55 @@ test "distributed SQL scalar admission rejects malformed calls before cache prep
         const instructions = [_]scalar.Instruction{ .{ .type = .{ .kind = .integer }, .operation = .{ .literal = .{ .integer = 1 } } }, call };
         try std.testing.expectError(error.InvalidSqlProgram, scalar.Program.fromTypedInstructions(std.testing.allocator, &instructions, 1, call.type, .{}));
     }
+}
+
+test "distributed SQL named parameter witnesses decline before export while unused typed slots stay undemanded" {
+    const local = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var definition = try scalar.EnumTypes.Owned.create(a, &.{ "warm", "cold" });
+    defer definition.deinit();
+    const record: scalar.EnumTypes.Record = .{ .identity = try scalar.EnumTypes.Identity.init(7, 2, 1, @splat(1)), .definition = definition.definition, .owner = .auth_disabled };
+    var view = try scalar.EnumValues.View.init(a, record);
+    defer view.deinit(a);
+    const types = [_]scalar.Type{.{ .kind = .enumeration, .enum_view = &view }};
+    var compiled = try local.sql_compiler.compileScalar(a, "$1 = $1", .{});
+    defer compiled.deinit();
+    var bound = try scalar.bindTyped(a, compiled.expression, &.{}, &types, .{});
+    defer bound.deinit();
+    const owner = try local.sql_parameter_binding.Invocation.initLeaky(sa, 1);
+    @memcpy(owner.descriptors, &types);
+    try owner.prepareJson(a, &.{.{ .string = "warm" }}, .{});
+    defer owner.deinitFrame();
+    bound.invocation = owner;
+    try std.testing.expect((try bound.evaluate(sa, &.{}, &.{}, .{})).value.bool);
+    try std.testing.expectError(error.SqlDistributedJoinUnsupported, Program.fromBound(sa, &bound, &.{}));
+    const original = owner.frame.?.values[0].enumeration().?;
+    const enum_wire = try std.json.Stringify.valueAlloc(sa, types[0], .{});
+    const witnessed = try std.json.parseFromSliceLeaky(scalar.Type, sa, enum_wire, .{});
+    try std.testing.expect(witnessed.enum_reference != null and witnessed.enum_view == null);
+    // A serialized identity alone cannot reconstruct the authorized label/order
+    // directory. Local fallback retains the original immutable atom instead.
+    try std.testing.expectError(error.InvalidSqlParameters, scalar.validateParameterType(witnessed));
+    try std.testing.expectEqualStrings("warm", original.text);
+    bound.invocation = null;
+    try std.testing.expectError(error.SqlDistributedJoinUnsupported, Program.fromBound(sa, &bound, &.{.{ .string = "warm" }}));
+
+    const sparse_types = [_]scalar.Type{ types[0], .{ .kind = .integer, .element_type = .int64 } };
+    var sparse_compiled = try local.sql_compiler.compileScalar(a, "$2 = 7", .{});
+    defer sparse_compiled.deinit();
+    var sparse = try scalar.bindTyped(a, sparse_compiled.expression, &.{}, &sparse_types, .{});
+    defer sparse.deinit();
+    const sparse_owner = try local.sql_parameter_binding.Invocation.initLeaky(sa, 2);
+    @memcpy(sparse_owner.descriptors, &sparse_types);
+    try sparse_owner.prepareJson(a, &.{ .{ .string = "warm" }, .{ .integer = 7 } }, .{});
+    defer sparse_owner.deinitFrame();
+    sparse.invocation = sparse_owner;
+    const ir = try Program.fromBound(sa, &sparse, &.{});
+    try std.testing.expect(ir.parameter_values.?[0].sql_null);
+    const wire = try std.json.Stringify.valueAlloc(sa, ir, .{});
+    const restored = try std.json.parseFromSliceLeaky(Program, sa, wire, .{});
+    try std.testing.expect(try restored.matches(a, &.{}));
 }

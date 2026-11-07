@@ -179,6 +179,7 @@ pub const Grouped = struct {
                 try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), entry.row.row.values[0] }, .ordinal = ordinal });
             }
             if (state.kind == .pattern_set and state.patterns.?.has_null) try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
+            if (state.collection) |collection| if (collection.has_null) try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
         };
     }
     pub fn appendPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
@@ -434,7 +435,7 @@ pub const Grouped = struct {
     }
     fn reduceNativeBlock(self: *Grouped, block: *spill.Sequential.OwnedBlock, ordinal_base: u64) !usize {
         if (self.fallback != null or block.count() < 2 or block.count() > 256 or block.width() != self.specs.len + 1) return 0;
-        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) return 0;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.kind == .array_agg) return 0;
         const partial_state = (try block.cell(0, 0)).value == .bool and (try block.cell(0, 0)).value.bool;
         for (0..block.count()) |row| {
             const marker = try block.cell(row, 0);
@@ -675,13 +676,17 @@ pub const Grouped = struct {
                             try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .values = &.{.{}}, .ordinal = distinct_ordinal });
                             distinct_ordinal += 1;
                         };
+                        if (incoming.collection) |collection| if (collection.has_null) {
+                            try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .values = &.{.{}}, .ordinal = distinct_ordinal });
+                            distinct_ordinal += 1;
+                        };
                     } else try @import("aggregate_partial.zig").merge(state, incoming);
                 }
             } else {
                 if (row.values.len != states.len + 1) return error.InvalidSqlSpill;
                 for (states, row.values[1..], self.specs, 0..) |*state, input, spec, slot| {
                     if (spec.distinct) {
-                        if (!input.sql_null or spec.kind == .pattern_set) {
+                        if (!input.sql_null or spec.kind == .pattern_set or spec.kind == .array_agg) {
                             try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), input }, .values = &.{input}, .ordinal = distinct_ordinal });
                             distinct_ordinal += 1;
                         }
@@ -720,7 +725,7 @@ pub const Grouped = struct {
         for (keys, output_keys) |key, *copy| copy.* = try operators.cloneDatum(out, key);
         const aggregates = if (exact) try @import("aggregate_partial.zig").encode(out, states) else try out.alloc(Datum, states.len);
         if (!exact) for (states, @constCast(aggregates), pattern_sets) |*state, *copy, set| {
-            copy.* = if (set) |patterns| .{ .patterns = &patterns.interface, .sql_null = false } else try operators.cloneDatum(out, try state.finish());
+            copy.* = if (set) |patterns| Datum.fromParts(.null, false, &patterns.interface) else if (state.kind == .array_agg or operators.Aggregate.integerNumericOutput(state.kind, state.input_type, state.input_element)) try state.finishOutput(out) else try operators.cloneDatum(out, try state.finish());
         };
         self.output_count += 1;
         return .{ .keys = output_keys, .aggregates = aggregates, .ordinal = ordinal };

@@ -21,7 +21,6 @@ const local_transaction_contract = @import("antfly_local_sources").api_local_tra
 const local_write = @import("antfly_local_sources").storage_local_write;
 const validateTableBatchAgainstLocalSchema = local_write.validateTableBatchAgainstLocalSchema;
 const runTestBeforeBatchExecutionHook = @import("antfly_local_sources").api_local_write_test_hooks.runTestBeforeBatchExecutionHook;
-const batchWritesAsTransactionWrites = local_write.batchWritesAsTransactionWrites;
 
 pub fn applyStorageKernelReplicatedBatch(
     alloc: std.mem.Allocator,
@@ -68,7 +67,15 @@ pub fn applyReplicatedTransactionMutationInternal(
     visibility_cancellation: db_mod.types.CancellationToken,
     raft_entry: ?db_mod.OrderedApplyReceipt,
 ) !void {
+    try @import("antfly_local_sources").sql_catalog.trigger_native_admission.requireOwnerGroup(req, group_id);
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    // These new private controls belong to native-local owners. Never drop
+    // a real Raft receipt by routing them through a replica-local helper.
+    if (raft_entry != null) switch (mutation) {
+        .acknowledge => |ack| if (ack.external_decision_owner != null) return error.InvalidBatchRequest,
+        .acknowledge_many => |ack| if (ack.external_decision_owner != null) return error.InvalidBatchRequest,
+        else => {},
+    };
     try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
@@ -92,7 +99,21 @@ pub fn applyReplicatedTransactionMutationInternal(
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
-            if (raft_entry) |entry|
+            if (begin.external_decision_owner) |owner| {
+                if (!begin.retain_terminal) return error.InvalidBatchRequest;
+                _ = try db.beginExternalTransaction(.{
+                    .txn_id = begin.txn_id,
+                    .owner = owner,
+                    .sql_locks = begin.sql_locks,
+                    .begin_timestamp = begin.begin_timestamp,
+                    .created_at_ns = begin.created_at_ns,
+                    .participants = durable_participants,
+                    .coordinator = coordinator,
+                    .restore_staging_scope = req.restore_staging_scope,
+                    .ordered_receipt = raft_entry,
+                    .admission_timestamp_ns = req.timestamp_ns,
+                });
+            } else if (raft_entry) |entry|
                 _ = try db.beginReplicatedTransactionScoped(
                     begin.txn_id,
                     begin.begin_timestamp,
@@ -115,24 +136,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 );
         },
         .prepare => |prepare| {
-            const intents: db_mod.types.TransactionIntentRequest = .{
-                .writes = batchWritesAsTransactionWrites(req.writes),
-                .deletes = req.deletes,
-                .transforms = req.transforms,
-                .predicates = req.predicates,
-                .integrity = req.integrity,
-                .integrity_commands = req.integrity_commands,
-                .range_guards = req.range_guards,
-                .relational_activation = req.relational_activation,
-                .relational_retirement = req.relational_retirement,
-                .relational_index_maintenance = req.relational_index_maintenance,
-                .schema_version = req.schema_version,
-                .relational_schema_version = req.relational_schema_version,
-                .relational_integrity_generation_set = req.relational_integrity_generation_set,
-                .restore_staging_scope = req.restore_staging_scope,
-                .restore_staging_plan_id = req.restore_staging_plan_id,
-                .relational_repair = req.relational_repair,
-            };
+            const intents = try db_mod.types.TransactionIntentRequest.fromBatch(req);
             if (raft_entry) |entry|
                 try db.writeReplicatedTransactionAtOrderedReceipt(prepare.txn_id, intents, entry)
             else
@@ -150,7 +154,9 @@ pub fn applyReplicatedTransactionMutationInternal(
                     transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,
                 };
-                try db.resolveReplicatedTransactionAtOrderedReceipt(
+                if (resolve.external_decision_owner) |owner| {
+                    try db.resolveExternalTransaction(.{ .txn_id = resolve.txn_id, .owner = owner, .status = resolve.status, .commit_version = resolve.commit_version, .sync_level = req.sync_level, .visibility_cancellation = visibility_cancellation, .ordered_receipt = entry, .resolved_participant = if (defer_coordinator_ack) null else local_participant });
+                } else try db.resolveReplicatedTransactionAtOrderedReceipt(
                     resolve.txn_id,
                     resolve.status,
                     resolve.commit_version,
@@ -160,7 +166,15 @@ pub fn applyReplicatedTransactionMutationInternal(
                     if (defer_coordinator_ack) null else local_participant,
                 );
             } else {
-                try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
+                if (resolve.external_decision_owner) |owner| {
+                    // Publish the native participant ACK with its decision.
+                    // An abort before BEGIN has no roster yet: the existing
+                    // abort-fence writer creates its exact local membership.
+                    const defer_coordinator_ack = resolve.status == .committed and
+                        try db.transactionRetainsCoordinatorAcknowledgement(resolve.txn_id);
+                    try db.resolveExternalTransaction(.{ .txn_id = resolve.txn_id, .owner = owner, .status = resolve.status, .commit_version = resolve.commit_version, .sync_level = req.sync_level, .visibility_cancellation = visibility_cancellation, .resolved_participant = if (defer_coordinator_ack) null else local_participant });
+                    return;
+                } else try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
                     resolve.txn_id,
                     resolve.status,
                     resolve.commit_version,
@@ -179,21 +193,25 @@ pub fn applyReplicatedTransactionMutationInternal(
                 }
             }
         },
-        .acknowledge => |ack| (if (raft_entry) |entry|
+        .acknowledge => |ack| (if (ack.external_decision_owner) |owner|
+            db.markExternalTransactionParticipantsResolved(ack.txn_id, &.{ack.participant}, owner)
+        else if (raft_entry) |entry|
             db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(ack.txn_id, ack.participant, entry)
         else
             db.markTransactionParticipantResolved(ack.txn_id, ack.participant)) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft
             // commands. Once cleanup wins, a late acknowledgement is a safe
             // no-op and must not recreate coordinator sidecar metadata.
-            transactions_mod.TxnError.TxnNotFound => {},
+            transactions_mod.TxnError.TxnNotFound => if (ack.external_decision_owner != null) return error.CommitDecisionUnknown,
             else => return err,
         },
-        .acknowledge_many => |ack| (if (raft_entry) |entry|
+        .acknowledge_many => |ack| (if (ack.external_decision_owner) |owner|
+            db.markExternalTransactionParticipantsResolved(ack.txn_id, ack.participants, owner)
+        else if (raft_entry) |entry|
             db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(ack.txn_id, ack.participants, entry)
         else
             db.markTransactionParticipantsResolved(ack.txn_id, ack.participants)) catch |err| switch (err) {
-            transactions_mod.TxnError.TxnNotFound => {},
+            transactions_mod.TxnError.TxnNotFound => if (ack.external_decision_owner != null) return error.CommitDecisionUnknown,
             else => return err,
         },
         .cleanup => |cleanup| {

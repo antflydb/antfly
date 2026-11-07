@@ -276,6 +276,29 @@ pub fn attachReplicatedRestoreStore(
     return .ok;
 }
 
+pub fn authorizeSqlLock(context: *const CallContext) callconv(.c) abi.Status {
+    const Input = @import("sql_data_locks.zig").AuthorizationInput;
+    const Output = @import("antfly_local_sources").storage_pessimistic_lock_control.Command;
+    if (validateCall(Input, Output, context)) |failure| return failure;
+    output(Output, context).* = serverState(context).server.authorizeSqlLock(input(Input, context).*) catch |err| return fail(err);
+    return .ok;
+}
+
+pub fn queryPopulationJob(context: *const CallContext) callconv(.c) abi.Status {
+    const Input = @import("../metadata/query_population_job.zig").Input;
+    if (validateCall(Input, []u8, context)) |failure| return failure;
+    const value = input(Input, context).*;
+    output([]u8, context).* = serverState(context).server.executeQueryPopulationJob(value.alloc, value.context, value.request) catch |err| return fail(err);
+    return .ok;
+}
+
+pub fn drainSqlConnections(context: *const CallContext) callconv(.c) abi.Status {
+    const Deadline = @import("../common/runtime_lifecycle.zig").ShutdownDeadline;
+    if (validateCall(Deadline, void, context)) |failure| return failure;
+    serverState(context).server.drainSqlConnections(input(Deadline, context).*) catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn resumeRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.resumeRestoreJobsOnce() catch |err| return fail(err);
@@ -557,6 +580,9 @@ const function_table: abi.FunctionTable = .{
     .set_ha_executor = &setHotStandbyExecutor,
     .attach_runtime_restore_store = &attachRuntimeRestoreStore,
     .attach_replicated_restore_store = &attachReplicatedRestoreStore,
+    .query_population_job = &queryPopulationJob,
+    .authorize_sql_lock = &authorizeSqlLock,
+    .drain_sql_connections = &drainSqlConnections,
     .resume_restore_jobs = &resumeRestoreJobs,
     .poll_restore_jobs = &pollRestoreJobs,
     .prepare_restore_leadership = &prepareRestoreLeadership,
@@ -1206,4 +1232,89 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         handle = null;
         try Probe.run(std.testing.io);
     }
+}
+
+test "API kernel combined privacy profile rejects34 and mismatched types before borrowed inputs" {
+    var allocator = std.testing.allocator;
+    const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    var context: CreateContext = .{
+        .abi_version = 35,
+        .owner_alloc = &owner_alloc,
+        // A rejected profile/contract must never dereference these inputs.
+        .cfg = @ptrFromInt(1),
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .source = @ptrFromInt(1),
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = @ptrFromInt(1),
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = @ptrFromInt(1),
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = 34;
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = 33;
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = 32;
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = 31;
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&context)));
+    context.abi_version = abi.abi_version;
+    inline for (.{ "cfg_contract", "source_contract", "table_reads_contract", "table_writes_contract" }) |field| {
+        const retained = @field(context, field);
+        @field(context, field).layout_id ^= 1;
+        try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(create(&context)));
+        try std.testing.expect(handle == null and request_alloc == null);
+        @field(context, field) = retained;
+    }
+}
+
+test "API kernel SQL shutdown validates deadline authority before handle access and forwards the exact lifecycle" {
+    const old: CreateContext = .{
+        .abi_version = 33,
+        .owner_alloc = @ptrFromInt(0x1000),
+        .cfg = @ptrFromInt(0x1000),
+        .cfg_contract = .of(void),
+        .source = @ptrFromInt(0x1000),
+        .source_contract = .of(void),
+        .table_reads = @ptrFromInt(0x1000),
+        .table_reads_contract = .of(void),
+        .table_writes = @ptrFromInt(0x1000),
+        .table_writes_contract = .of(void),
+        .out_handle = @ptrFromInt(0x1000),
+        .out_request_alloc = @ptrFromInt(0x1000),
+    };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(create(&old)));
+
+    const Deadline = @import("../common/runtime_lifecycle.zig").ShutdownDeadline;
+    var deadline = Deadline.afterMilliseconds(1000);
+    var invalid: CallContext = .{ .abi_version = abi.abi_version - 1, .handle = @ptrFromInt(1), .input = &deadline, .input_contract = .of(Deadline) };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(function_table.drain_sql_connections(&invalid)));
+    invalid.abi_version = abi.abi_version;
+    invalid.input_contract = .of(u64);
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(function_table.drain_sql_connections(&invalid)));
+    invalid.input_contract = .of(Deadline);
+    invalid.input = null;
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(function_table.drain_sql_connections(&invalid)));
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+            return error.TestUnexpectedStatusRead;
+        }
+    };
+    var token: u8 = 0;
+    var state: ServerState = .{
+        .owner_alloc = std.testing.allocator,
+        .server = server_mod.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &token, .vtable = &.{ .status = Stub.status } }, null, null),
+        .request_alloc_abi = undefined,
+    };
+    defer state.server.deinit();
+    try std.testing.expect(!state.server.sql_command_upkeep_closing.load(.acquire));
+    const valid: CallContext = .{ .abi_version = abi.abi_version, .handle = &state, .input = &deadline, .input_contract = .of(Deadline) };
+    try std.testing.expect(function_table.drain_sql_connections(&valid).isOk());
+    try std.testing.expect(state.server.sql_command_upkeep_closing.load(.acquire));
+    try std.testing.expect(function_table.drain_sql_connections(&valid).isOk());
 }

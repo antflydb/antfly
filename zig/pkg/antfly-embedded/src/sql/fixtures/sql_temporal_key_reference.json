@@ -1,0 +1,815 @@
+{
+  "format": 1,
+  "zone": "UTC",
+  "ddl_id": "sql-0685",
+  "tables": [
+    {
+      "name": "price_intervals",
+      "create": "CREATE TABLE price_intervals (sku text NOT NULL, valid_at numrange NOT NULL, price numeric, PRIMARY KEY (sku, valid_at WITHOUT OVERLAPS));",
+      "seed": "",
+      "read": "SELECT * FROM price_intervals ORDER BY sku",
+      "final": {
+        "columns": [
+          "sku",
+          "valid_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3906,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:a",
+            "[1,10)",
+            "12.5"
+          ],
+          [
+            "sku:b",
+            "[-5,15)",
+            "9"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "products",
+      "create": "CREATE TABLE products (\n  product_id int NOT NULL,\n  product_name text NOT NULL,\n  price numeric,\n  valid_at daterange NOT NULL,\n  PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS)\n);",
+      "seed": "",
+      "read": "SELECT * FROM products ORDER BY product_id",
+      "final": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            1,
+            "widget",
+            "19.5",
+            "[2025-01-01,2025-07-01)"
+          ],
+          [
+            2,
+            "gadget",
+            "24.5",
+            "[2026-01-01,)"
+          ],
+          [
+            3,
+            "legacy",
+            "21.5",
+            "(,2026-01-01)"
+          ],
+          [
+            4,
+            "constructor",
+            "26.5",
+            "[2025-02-01,2025-03-01)"
+          ],
+          [
+            6,
+            "inclusive",
+            "28.5",
+            "[2025-01-01,2025-02-02)"
+          ],
+          [
+            7,
+            "literal-inclusive",
+            "29.5",
+            "[2025-01-01,2025-02-02)"
+          ],
+          [
+            8,
+            "constructor-lower-exclusive",
+            "30.5",
+            "[2025-01-02,2025-02-02)"
+          ],
+          [
+            9,
+            "literal-lower-exclusive",
+            "31.5",
+            "[2025-01-02,2025-02-02)"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "published_prices",
+      "create": "CREATE TABLE published_prices (sku text NOT NULL, visible_at tstzrange NOT NULL, price numeric, PRIMARY KEY (sku, visible_at WITHOUT OVERLAPS));",
+      "seed": "",
+      "read": "SELECT * FROM published_prices ORDER BY sku",
+      "final": {
+        "columns": [
+          "sku",
+          "visible_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3910,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:a",
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+            "12.5"
+          ],
+          [
+            "sku:b",
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+            "14.5"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "local_prices",
+      "create": "CREATE TABLE local_prices (sku text NOT NULL, local_at tsrange NOT NULL, price numeric, PRIMARY KEY (sku, local_at WITHOUT OVERLAPS));",
+      "seed": "",
+      "read": "SELECT * FROM local_prices ORDER BY sku",
+      "final": {
+        "columns": [
+          "sku",
+          "local_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3908,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:a",
+            "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")",
+            "11.5"
+          ],
+          [
+            "sku:b",
+            "[\"2025-01-03 00:00:00\",\"2025-01-04 00:00:00\")",
+            "13.5"
+          ]
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "id": "sql-1414",
+      "sql": "INSERT INTO price_intervals (sku, valid_at, price) VALUES ('sku:a', '[1,10)'::numrange, 12.5) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "sku",
+          "valid_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3906,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:a",
+            "[1,10)",
+            "12.5"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1415",
+      "sql": "INSERT INTO price_intervals (sku, valid_at, price) VALUES ('sku:b', numrange(-5, 15), 9) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "sku",
+          "valid_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3906,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:b",
+            "[-5,15)",
+            "9"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1416",
+      "sql": "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (1, 'widget', 19.5, '[2025-01-01,2025-07-01)'::daterange) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            1,
+            "widget",
+            "19.5",
+            "[2025-01-01,2025-07-01)"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1417",
+      "sql": "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (4, 'constructor', 26.5, daterange(DATE '2025-02-01', DATE '2025-03-01')) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            4,
+            "constructor",
+            "26.5",
+            "[2025-02-01,2025-03-01)"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1418",
+      "sql": "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (6, 'inclusive', 28.5, daterange('2025-01-01'::date, '2025-02-01'::date, '[]')) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            6,
+            "inclusive",
+            "28.5",
+            "[2025-01-01,2025-02-02)"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1419",
+      "sql": "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (7, 'literal-inclusive', 29.5, '[2025-01-01,2025-02-01]'::daterange) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            7,
+            "literal-inclusive",
+            "29.5",
+            "[2025-01-01,2025-02-02)"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1420",
+      "sql": "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (8, 'constructor-lower-exclusive', 30.5, daterange('2025-01-01'::date, '2025-02-01'::date, '(]')) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            8,
+            "constructor-lower-exclusive",
+            "30.5",
+            "[2025-01-02,2025-02-02)"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1421",
+      "sql": "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (9, 'literal-lower-exclusive', 31.5, '(2025-01-01,2025-02-01]'::daterange) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            9,
+            "literal-lower-exclusive",
+            "31.5",
+            "[2025-01-02,2025-02-02)"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1422",
+      "sql": "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (2, 'gadget', 24.5, '[2026-01-01,)'::daterange) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            2,
+            "gadget",
+            "24.5",
+            "[2026-01-01,)"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1423",
+      "sql": "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (3, 'legacy', 21.5, '(,2026-01-01)'::daterange) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "product_id",
+          "product_name",
+          "price",
+          "valid_at"
+        ],
+        "column_oids": [
+          23,
+          25,
+          1700,
+          3912
+        ],
+        "rows": [
+          [
+            3,
+            "legacy",
+            "21.5",
+            "(,2026-01-01)"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1424",
+      "sql": "INSERT INTO published_prices (sku, visible_at, price) VALUES ('sku:a', '[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)'::tstzrange, 12.5) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "sku",
+          "visible_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3910,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:a",
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+            "12.5"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1425",
+      "sql": "INSERT INTO published_prices (sku, visible_at, price) VALUES ('sku:b', tstzrange('2025-01-01T01:30:00+01:30', '2025-01-02T00:00:00Z'), 14.5) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "sku",
+          "visible_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3910,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:b",
+            "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")",
+            "14.5"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1426",
+      "sql": "INSERT INTO local_prices (sku, local_at, price) VALUES ('sku:a', '[2025-01-01 00:00:00,2025-01-02 00:00:00)'::tsrange, 11.5) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "sku",
+          "local_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3908,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:a",
+            "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")",
+            "11.5"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1427",
+      "sql": "INSERT INTO local_prices (sku, local_at, price) VALUES ('sku:b', tsrange('2025-01-03 00:00:00', '2025-01-04 00:00:00'), 13.5) RETURNING *",
+      "write": true,
+      "output": {
+        "columns": [
+          "sku",
+          "local_at",
+          "price"
+        ],
+        "column_oids": [
+          25,
+          3908,
+          1700
+        ],
+        "rows": [
+          [
+            "sku:b",
+            "[\"2025-01-03 00:00:00\",\"2025-01-04 00:00:00\")",
+            "13.5"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 1
+    },
+    {
+      "id": "sql-1428",
+      "sql": "SELECT lower(valid_at) AS valid_start, upper(valid_at) AS valid_end FROM price_intervals WHERE lower(valid_at) >= 1 AND upper(valid_at) IS NOT NULL ORDER BY upper(valid_at) DESC LIMIT 5",
+      "write": false,
+      "output": {
+        "columns": [
+          "valid_start",
+          "valid_end"
+        ],
+        "column_oids": [
+          1700,
+          1700
+        ],
+        "rows": [
+          [
+            "1",
+            "10"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 0
+    },
+    {
+      "id": "sql-1429",
+      "sql": "SELECT sku FROM price_intervals WHERE valid_at @> 7 ORDER BY sku ASC LIMIT 5",
+      "write": false,
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      },
+      "sqlstate": "42883",
+      "affected": 0
+    },
+    {
+      "id": "sql-1430",
+      "sql": "SELECT sku FROM price_intervals WHERE valid_at && numrange(5, 9) ORDER BY sku ASC LIMIT 5",
+      "write": false,
+      "output": {
+        "columns": [
+          "sku"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "sku:a"
+          ],
+          [
+            "sku:b"
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 0
+    },
+    {
+      "id": "sql-1431",
+      "sql": "SELECT product_id FROM products WHERE valid_at && daterange('2025-02-01'::date, '2025-04-01'::date, '[]') ORDER BY product_id ASC LIMIT 5",
+      "write": false,
+      "output": {
+        "columns": [
+          "product_id"
+        ],
+        "column_oids": [
+          23
+        ],
+        "rows": [
+          [
+            1
+          ],
+          [
+            3
+          ],
+          [
+            4
+          ],
+          [
+            6
+          ],
+          [
+            7
+          ]
+        ]
+      },
+      "sqlstate": null,
+      "affected": 0
+    }
+  ],
+  "rejected": [
+    {
+      "sql": "INSERT INTO price_intervals(sku,valid_at,price) VALUES ('sku:a','[5,9)'::numrange,99)",
+      "sqlstate": "23P01"
+    },
+    {
+      "sql": "INSERT INTO price_intervals(sku,valid_at,price) VALUES ('sku:a','[9,11)'::numrange,99)",
+      "sqlstate": "23P01"
+    },
+    {
+      "sql": "INSERT INTO price_intervals(sku,valid_at,price) VALUES ('sku:a','empty'::numrange,99)",
+      "sqlstate": "23514"
+    },
+    {
+      "sql": "INSERT INTO products(product_id,product_name,valid_at) VALUES (1,'overlap','[2025-02-01,2025-03-01)'::daterange)",
+      "sqlstate": "23P01"
+    },
+    {
+      "sql": "INSERT INTO published_prices(sku,visible_at) VALUES ('sku:a','[2025-01-01 00:00:00+00,2025-01-01 01:00:00+00)'::tstzrange)",
+      "sqlstate": "23P01"
+    },
+    {
+      "sql": "INSERT INTO local_prices(sku,local_at) VALUES ('sku:a','[2025-01-01 01:00:00,2025-01-01 02:00:00)'::tsrange)",
+      "sqlstate": "23P01"
+    }
+  ],
+  "operators": [
+    {
+      "expression": "(numrange(1,10) @> 7)::text",
+      "sql": "SELECT (numrange(1,10) @> 7)::text AS value",
+      "sqlstate": "42883",
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "expression": "(numrange(1,10) @> 7::numeric)::text",
+      "sql": "SELECT (numrange(1,10) @> 7::numeric)::text AS value",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "expression": "(numrange(1,10) @> '7')::text",
+      "sql": "SELECT (numrange(1,10) @> '7')::text AS value",
+      "sqlstate": "22P02",
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "expression": "(numrange(1,10) @> '[2,3)')::text",
+      "sql": "SELECT (numrange(1,10) @> '[2,3)')::text AS value",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "expression": "(numrange(1,10) @> NULL)::text",
+      "sql": "SELECT (numrange(1,10) @> NULL)::text AS value",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "expression": "(daterange('2025-01-01','2025-02-01') @> DATE '2025-01-15')::text",
+      "sql": "SELECT (daterange('2025-01-01','2025-02-01') @> DATE '2025-01-15')::text AS value",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "expression": "(tsrange('2025-01-01','2025-02-01') @> TIMESTAMP '2025-01-15')::text",
+      "sql": "SELECT (tsrange('2025-01-01','2025-02-01') @> TIMESTAMP '2025-01-15')::text AS value",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "expression": "(tstzrange('2025-01-01','2025-02-01') @> TIMESTAMP '2025-01-15')::text",
+      "sql": "SELECT (tstzrange('2025-01-01','2025-02-01') @> TIMESTAMP '2025-01-15')::text AS value",
+      "sqlstate": "42883",
+      "output": {
+        "columns": [],
+        "column_oids": [],
+        "rows": []
+      }
+    },
+    {
+      "expression": "(tstzrange('2025-01-01','2025-02-01') @> TIMESTAMPTZ '2025-01-15 00:00:00+00')::text",
+      "sql": "SELECT (tstzrange('2025-01-01','2025-02-01') @> TIMESTAMPTZ '2025-01-15 00:00:00+00')::text AS value",
+      "sqlstate": null,
+      "output": {
+        "columns": [
+          "value"
+        ],
+        "column_oids": [
+          25
+        ],
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    }
+  ],
+  "adjacent": "INSERT INTO price_intervals(sku,valid_at,price) VALUES ('sku:a','[10,20)'::numrange,17)",
+  "remove_adjacent": "DELETE FROM price_intervals WHERE sku='sku:a' AND valid_at='[10,20)'::numrange"
+}

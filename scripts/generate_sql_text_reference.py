@@ -53,6 +53,7 @@ def main():
             FIXTURE,
             FIXTURE.with_name("sql_scalar_kernel_reference.json"),
             FIXTURE.with_name("sql_json_path_reference.json"),
+            FIXTURE.with_name("sql_json_path_operator_reference.json"),
         )
     ]
     for fixture in fixtures:

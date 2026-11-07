@@ -1,0 +1,4211 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "typed_oids": [
+    2950,
+    25,
+    1700,
+    3802,
+    1009,
+    1184,
+    25
+  ],
+  "clock_checks": [
+    {
+      "statement": "INSERT INTO usage_records(tenant_id,quantity) VALUES('clock-a',0) RETURNING (created_at = now())::text AS clock_matches",
+      "output": {
+        "id": "sql-0669",
+        "columns": [
+          "clock_matches"
+        ],
+        "rows": [
+          [
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ],
+        "column_oids": [
+          25
+        ],
+        "affected": 1
+      }
+    },
+    {
+      "statement": "INSERT INTO usage_records(tenant_id,quantity) VALUES('clock-b',0) RETURNING (created_at = transaction_timestamp())::text AS clock_matches",
+      "output": {
+        "id": "sql-0669",
+        "columns": [
+          "clock_matches"
+        ],
+        "rows": [
+          [
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ],
+        "column_oids": [
+          25
+        ],
+        "affected": 1
+      }
+    },
+    {
+      "statement": "SELECT (count(DISTINCT created_at) = 1 AND bool_and(created_at = now()))::text AS clock_matches FROM usage_records WHERE tenant_id IN ('clock-a','clock-b')",
+      "output": {
+        "id": "sql-0669",
+        "columns": [
+          "clock_matches"
+        ],
+        "rows": [
+          [
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ],
+        "column_oids": [
+          25
+        ],
+        "affected": 0
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "sql-0669",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE tenants(id TEXT PRIMARY KEY)",
+          "table": "tenants"
+        },
+        {
+          "statement": "INSERT INTO tenants(id) VALUES ('tenant-a'),('tenant-b'),('tenant-c'),('ABC'),('abc'),('tenant-v7'),('tenant-after'),('clock-a'),('clock-b')"
+        }
+      ],
+      "read_sql": "SELECT tenant_id,quantity::text AS quantity,metadata::text AS metadata,tags::text AS tags,tenant_key,uuid_extract_version(id)::text AS uuid_version,(uuid_extract_timestamp(id) IS NOT NULL)::text AS uuid_has_timestamp,(created_at IS NOT NULL)::text AS has_created_at FROM usage_records ORDER BY tenant_id",
+      "ddl_sqlstate": null,
+      "verify_primary_identity": true,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(tenant_id,metadata,tags) VALUES('tenant-a','{\"n\":1.2300}'::jsonb,ARRAY['one',NULL,'two'])",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id) VALUES('missing')",
+          "sqlstate": "23503",
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id,quantity) VALUES('tenant-b',-1)",
+          "sqlstate": "23514",
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id,quantity) VALUES('tenant-b',10000000000000000)",
+          "sqlstate": "22003",
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id) VALUES(NULL)",
+          "sqlstate": "23502",
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id,tenant_key) VALUES('tenant-b','forged')",
+          "sqlstate": "428C9",
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id,quantity) VALUES('tenant-b',1.235)",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-b",
+                "1.24",
+                null,
+                null,
+                "tenant-b",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "UPDATE usage_records SET quantity=2.345 WHERE tenant_id='tenant-b'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-b",
+                "2.35",
+                null,
+                null,
+                "tenant-b",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "UPDATE tenants SET id='tenant-z' WHERE id='tenant-a'",
+          "sqlstate": "23503",
+          "reopen": {
+            "sqlstate": null
+          },
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-a",
+                "0.00",
+                "{\"n\": 1.2300}",
+                "{one,NULL,two}",
+                "tenant-a",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-b",
+                "2.35",
+                null,
+                null,
+                "tenant-b",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-a"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "DELETE FROM tenants WHERE id='tenant-a'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-b",
+                "2.35",
+                null,
+                null,
+                "tenant-b",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id='tenant-c' WHERE tenant_id='tenant-b'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-b"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "DELETE FROM tenants WHERE id='tenant-b'",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id,metadata,tags) VALUES('ABC','null'::jsonb,ARRAY[]::text[])",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "ABC",
+                "0.00",
+                "null",
+                "{}",
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id) VALUES('abc')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "ABC",
+                "0.00",
+                "null",
+                "{}",
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "abc",
+                "0.00",
+                null,
+                null,
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id) VALUES('ABC')",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "ABC",
+                "0.00",
+                "null",
+                "{}",
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "abc",
+                "0.00",
+                null,
+                null,
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,quantity) SELECT id,'clock-a',0 FROM usage_records WHERE tenant_id='ABC'",
+          "sqlstate": "23505",
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "ABC",
+                "0.00",
+                "null",
+                "{}",
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "abc",
+                "0.00",
+                null,
+                null,
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,quantity) VALUES(NULL,'clock-b',0)",
+          "sqlstate": "23502",
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "ABC",
+                "0.00",
+                "null",
+                "{}",
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "abc",
+                "0.00",
+                null,
+                null,
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "ALTER TABLE usage_records ALTER COLUMN id SET DEFAULT uuidv7()",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "ABC",
+                "0.00",
+                "null",
+                "{}",
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "abc",
+                "0.00",
+                null,
+                null,
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(tenant_id,tags) VALUES('tenant-v7',ARRAY['v7'])",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "ABC",
+                "0.00",
+                "null",
+                "{}",
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "abc",
+                "0.00",
+                null,
+                null,
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-v7",
+                "0.00",
+                null,
+                "{v7}",
+                "tenant-v7",
+                "7",
+                "true",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        },
+        {
+          "statement": "CREATE TABLE IF NOT EXISTS usage_records (\n  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,\n  tenant_id text COLLATE \"C\" NOT NULL,\n  quantity numeric(18, 2) DEFAULT 0::numeric CHECK (quantity >= 0::numeric),\n  metadata jsonb,\n  tags text[],\n  created_at timestamptz DEFAULT now(),\n  tenant_key text GENERATED ALWAYS AS (lower(tenant_id)) STORED,\n  CONSTRAINT usage_records_tenant_key UNIQUE (tenant_id),\n  CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE CASCADE\n);",
+          "sqlstate": null,
+          "preserve_owner": true,
+          "repeat_on_reopen": true,
+          "after": {
+            "id": "sql-0669",
+            "columns": [
+              "tenant_id",
+              "quantity",
+              "metadata",
+              "tags",
+              "tenant_key",
+              "uuid_version",
+              "uuid_has_timestamp",
+              "has_created_at"
+            ],
+            "rows": [
+              [
+                "ABC",
+                "0.00",
+                "null",
+                "{}",
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "abc",
+                "0.00",
+                null,
+                null,
+                "abc",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-c",
+                "2.35",
+                null,
+                null,
+                "tenant-c",
+                "4",
+                "false",
+                "true"
+              ],
+              [
+                "tenant-v7",
+                "0.00",
+                null,
+                "{v7}",
+                "tenant-v7",
+                "7",
+                "true",
+                "true"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          },
+          "related_after": [
+            {
+              "statement": "SELECT id FROM tenants ORDER BY id",
+              "output": {
+                "id": "sql-0669",
+                "columns": [
+                  "id"
+                ],
+                "rows": [
+                  [
+                    "ABC"
+                  ],
+                  [
+                    "abc"
+                  ],
+                  [
+                    "clock-a"
+                  ],
+                  [
+                    "clock-b"
+                  ],
+                  [
+                    "tenant-after"
+                  ],
+                  [
+                    "tenant-c"
+                  ],
+                  [
+                    "tenant-v7"
+                  ]
+                ],
+                "sql_nulls": [
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ],
+                  [
+                    false
+                  ]
+                ],
+                "column_oids": [
+                  25
+                ],
+                "affected": 0
+              }
+            }
+          ]
+        }
+      ],
+      "after_ddl": {
+        "id": "sql-0669",
+        "columns": [
+          "tenant_id",
+          "quantity",
+          "metadata",
+          "tags",
+          "tenant_key",
+          "uuid_version",
+          "uuid_has_timestamp",
+          "has_created_at"
+        ],
+        "rows": [],
+        "sql_nulls": [],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after_ddl": [
+        {
+          "statement": "SELECT id FROM tenants ORDER BY id",
+          "output": {
+            "id": "sql-0669",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "ABC"
+              ],
+              [
+                "abc"
+              ],
+              [
+                "clock-a"
+              ],
+              [
+                "clock-b"
+              ],
+              [
+                "tenant-a"
+              ],
+              [
+                "tenant-after"
+              ],
+              [
+                "tenant-b"
+              ],
+              [
+                "tenant-c"
+              ],
+              [
+                "tenant-v7"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ]
+    }
+  ],
+  "restart_probes": [
+    {
+      "statement": "INSERT INTO usage_records(tenant_id,quantity) VALUES('tenant-after',3.455)",
+      "sqlstate": null,
+      "after": {
+        "id": "sql-0669",
+        "columns": [
+          "tenant_id",
+          "quantity",
+          "metadata",
+          "tags",
+          "tenant_key",
+          "uuid_version",
+          "uuid_has_timestamp",
+          "has_created_at"
+        ],
+        "rows": [
+          [
+            "ABC",
+            "0.00",
+            "null",
+            "{}",
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "abc",
+            "0.00",
+            null,
+            null,
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-after",
+            "3.46",
+            null,
+            null,
+            "tenant-after",
+            "7",
+            "true",
+            "true"
+          ],
+          [
+            "tenant-c",
+            "2.35",
+            null,
+            null,
+            "tenant-c",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-v7",
+            "0.00",
+            null,
+            "{v7}",
+            "tenant-v7",
+            "7",
+            "true",
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after": [
+        {
+          "statement": "SELECT id FROM tenants ORDER BY id",
+          "output": {
+            "id": "sql-0669",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "ABC"
+              ],
+              [
+                "abc"
+              ],
+              [
+                "clock-a"
+              ],
+              [
+                "clock-b"
+              ],
+              [
+                "tenant-after"
+              ],
+              [
+                "tenant-c"
+              ],
+              [
+                "tenant-v7"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ]
+    },
+    {
+      "statement": "UPDATE usage_records SET metadata='null'::jsonb,tags=ARRAY['cold',NULL] WHERE tenant_id='tenant-after'",
+      "sqlstate": null,
+      "after": {
+        "id": "sql-0669",
+        "columns": [
+          "tenant_id",
+          "quantity",
+          "metadata",
+          "tags",
+          "tenant_key",
+          "uuid_version",
+          "uuid_has_timestamp",
+          "has_created_at"
+        ],
+        "rows": [
+          [
+            "ABC",
+            "0.00",
+            "null",
+            "{}",
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "abc",
+            "0.00",
+            null,
+            null,
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-after",
+            "3.46",
+            "null",
+            "{cold,NULL}",
+            "tenant-after",
+            "7",
+            "true",
+            "true"
+          ],
+          [
+            "tenant-c",
+            "2.35",
+            null,
+            null,
+            "tenant-c",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-v7",
+            "0.00",
+            null,
+            "{v7}",
+            "tenant-v7",
+            "7",
+            "true",
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after": [
+        {
+          "statement": "SELECT id FROM tenants ORDER BY id",
+          "output": {
+            "id": "sql-0669",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "ABC"
+              ],
+              [
+                "abc"
+              ],
+              [
+                "clock-a"
+              ],
+              [
+                "clock-b"
+              ],
+              [
+                "tenant-after"
+              ],
+              [
+                "tenant-c"
+              ],
+              [
+                "tenant-v7"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ]
+    },
+    {
+      "statement": "DELETE FROM tenants WHERE id='tenant-v7'",
+      "sqlstate": null,
+      "after": {
+        "id": "sql-0669",
+        "columns": [
+          "tenant_id",
+          "quantity",
+          "metadata",
+          "tags",
+          "tenant_key",
+          "uuid_version",
+          "uuid_has_timestamp",
+          "has_created_at"
+        ],
+        "rows": [
+          [
+            "ABC",
+            "0.00",
+            "null",
+            "{}",
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "abc",
+            "0.00",
+            null,
+            null,
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-after",
+            "3.46",
+            "null",
+            "{cold,NULL}",
+            "tenant-after",
+            "7",
+            "true",
+            "true"
+          ],
+          [
+            "tenant-c",
+            "2.35",
+            null,
+            null,
+            "tenant-c",
+            "4",
+            "false",
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after": [
+        {
+          "statement": "SELECT id FROM tenants ORDER BY id",
+          "output": {
+            "id": "sql-0669",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "ABC"
+              ],
+              [
+                "abc"
+              ],
+              [
+                "clock-a"
+              ],
+              [
+                "clock-b"
+              ],
+              [
+                "tenant-after"
+              ],
+              [
+                "tenant-c"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ]
+    },
+    {
+      "statement": "UPDATE usage_records SET quantity=-1 WHERE tenant_id='tenant-after'",
+      "sqlstate": "23514",
+      "after": {
+        "id": "sql-0669",
+        "columns": [
+          "tenant_id",
+          "quantity",
+          "metadata",
+          "tags",
+          "tenant_key",
+          "uuid_version",
+          "uuid_has_timestamp",
+          "has_created_at"
+        ],
+        "rows": [
+          [
+            "ABC",
+            "0.00",
+            "null",
+            "{}",
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "abc",
+            "0.00",
+            null,
+            null,
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-after",
+            "3.46",
+            "null",
+            "{cold,NULL}",
+            "tenant-after",
+            "7",
+            "true",
+            "true"
+          ],
+          [
+            "tenant-c",
+            "2.35",
+            null,
+            null,
+            "tenant-c",
+            "4",
+            "false",
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after": [
+        {
+          "statement": "SELECT id FROM tenants ORDER BY id",
+          "output": {
+            "id": "sql-0669",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "ABC"
+              ],
+              [
+                "abc"
+              ],
+              [
+                "clock-a"
+              ],
+              [
+                "clock-b"
+              ],
+              [
+                "tenant-after"
+              ],
+              [
+                "tenant-c"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ]
+    },
+    {
+      "statement": "INSERT INTO usage_records(tenant_id) VALUES('missing')",
+      "sqlstate": "23503",
+      "after": {
+        "id": "sql-0669",
+        "columns": [
+          "tenant_id",
+          "quantity",
+          "metadata",
+          "tags",
+          "tenant_key",
+          "uuid_version",
+          "uuid_has_timestamp",
+          "has_created_at"
+        ],
+        "rows": [
+          [
+            "ABC",
+            "0.00",
+            "null",
+            "{}",
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "abc",
+            "0.00",
+            null,
+            null,
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-after",
+            "3.46",
+            "null",
+            "{cold,NULL}",
+            "tenant-after",
+            "7",
+            "true",
+            "true"
+          ],
+          [
+            "tenant-c",
+            "2.35",
+            null,
+            null,
+            "tenant-c",
+            "4",
+            "false",
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after": [
+        {
+          "statement": "SELECT id FROM tenants ORDER BY id",
+          "output": {
+            "id": "sql-0669",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "ABC"
+              ],
+              [
+                "abc"
+              ],
+              [
+                "clock-a"
+              ],
+              [
+                "clock-b"
+              ],
+              [
+                "tenant-after"
+              ],
+              [
+                "tenant-c"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ]
+    },
+    {
+      "statement": "ALTER TABLE usage_records ALTER COLUMN quantity SET DEFAULT 1 / 0",
+      "sqlstate": null,
+      "after": {
+        "id": "sql-0669",
+        "columns": [
+          "tenant_id",
+          "quantity",
+          "metadata",
+          "tags",
+          "tenant_key",
+          "uuid_version",
+          "uuid_has_timestamp",
+          "has_created_at"
+        ],
+        "rows": [
+          [
+            "ABC",
+            "0.00",
+            "null",
+            "{}",
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "abc",
+            "0.00",
+            null,
+            null,
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-after",
+            "3.46",
+            "null",
+            "{cold,NULL}",
+            "tenant-after",
+            "7",
+            "true",
+            "true"
+          ],
+          [
+            "tenant-c",
+            "2.35",
+            null,
+            null,
+            "tenant-c",
+            "4",
+            "false",
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after": [
+        {
+          "statement": "SELECT id FROM tenants ORDER BY id",
+          "output": {
+            "id": "sql-0669",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "ABC"
+              ],
+              [
+                "abc"
+              ],
+              [
+                "clock-a"
+              ],
+              [
+                "clock-b"
+              ],
+              [
+                "tenant-after"
+              ],
+              [
+                "tenant-c"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ]
+    },
+    {
+      "statement": "INSERT INTO usage_records(tenant_id) VALUES('missing')",
+      "sqlstate": "22012",
+      "after": {
+        "id": "sql-0669",
+        "columns": [
+          "tenant_id",
+          "quantity",
+          "metadata",
+          "tags",
+          "tenant_key",
+          "uuid_version",
+          "uuid_has_timestamp",
+          "has_created_at"
+        ],
+        "rows": [
+          [
+            "ABC",
+            "0.00",
+            "null",
+            "{}",
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "abc",
+            "0.00",
+            null,
+            null,
+            "abc",
+            "4",
+            "false",
+            "true"
+          ],
+          [
+            "tenant-after",
+            "3.46",
+            "null",
+            "{cold,NULL}",
+            "tenant-after",
+            "7",
+            "true",
+            "true"
+          ],
+          [
+            "tenant-c",
+            "2.35",
+            null,
+            null,
+            "tenant-c",
+            "4",
+            "false",
+            "true"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      },
+      "related_after": [
+        {
+          "statement": "SELECT id FROM tenants ORDER BY id",
+          "output": {
+            "id": "sql-0669",
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "ABC"
+              ],
+              [
+                "abc"
+              ],
+              [
+                "clock-a"
+              ],
+              [
+                "clock-b"
+              ],
+              [
+                "tenant-after"
+              ],
+              [
+                "tenant-c"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ],
+              [
+                false
+              ]
+            ],
+            "column_oids": [
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ]
+    }
+  ]
+}

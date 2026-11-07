@@ -714,6 +714,9 @@ pub const Capture = struct {
     key_bytes: usize = 0,
     checked: bool = false,
     pin_checked: bool = false,
+    private_claim_generation: ?integrity.Generation = null,
+    private_claim_inventory_prefix: []const u8 = "",
+    private_claim_context_revoked: bool = false,
     has_state: bool = false,
     enabled: bool = false,
     direct_vectors: bool = false,
@@ -726,6 +729,25 @@ pub const Capture = struct {
     staging: bool = false,
     staged: bool = false,
     poisoned: bool = false,
+    /// Internal kernel classification, supplied only AFTER the private claim
+    /// writer/GC revalidates the durable job, catalogs, fence and registration
+    /// in this transaction. Not an RPC flag or a general capture bypass.
+    pub fn bindPrivateClaims(self: *Capture, generation: integrity.Generation, inventory_prefix: []const u8) !void {
+        if (self.poisoned or self.staged or self.touched_primary or self.control or self.private_claim_context_revoked)
+            return error.RetainedEffectsMixedControl;
+        if (std.mem.allEqual(u8, &generation, 0) or inventory_prefix.len == 0)
+            return error.InvalidPrivateIndexClaimInventory;
+        if (self.private_claim_generation) |current| if (!std.mem.eql(u8, &generation, &current)) return error.RetainedEffectsMixedControl;
+        self.private_claim_generation = generation;
+        self.private_claim_inventory_prefix = inventory_prefix;
+    }
+
+    fn privateClaimMetadata(self: *const Capture, key: []const u8) bool {
+        const generation = self.private_claim_generation orelse return false;
+        const prefix = self.private_claim_inventory_prefix;
+        return key.len >= prefix.len + 16 and std.mem.startsWith(u8, key, prefix) and
+            std.mem.eql(u8, key[prefix.len..][0..16], &generation);
+    }
     pub fn deinit(self: *Capture, alloc: Allocator) void {
         var iter = self.keys.keyIterator();
         while (iter.next()) |key| alloc.free(key.*);
@@ -734,6 +756,13 @@ pub const Capture = struct {
     pub fn touch(self: *Capture, alloc: Allocator, txn: anytype, key: []const u8, primary: bool, cache: ?*std.atomic.Value(u8)) !void {
         if (self.staging) return;
         errdefer self.poisoned = true;
+        // Any non-inventory mutation revokes the private context.
+        // This includes the batch's final source-clock write; no claim may
+        // follow it. Ordinary integrity transactions pay no metadata lookup.
+        if (self.private_claim_generation != null and !integrity.isKey(key) and !self.privateClaimMetadata(key)) {
+            self.private_claim_generation = null;
+            self.private_claim_context_revoked = true;
+        }
         if (std.mem.eql(u8, key, &internal_keys.ordered_document_applied_entry_key)) {
             try @import("source_authority.zig").requireRaftMarkerAllowed(txn);
             self.raft_marker = true;
@@ -765,6 +794,20 @@ pub const Capture = struct {
             self.pin_checked = true;
             if (cache == null or cache.?.load(.acquire) != 1) {
                 if (try namespace(txn)) |current| try @import("source_pin_state.zig").requireNoPrepared(txn, current);
+            }
+        }
+        if ((self.private_claim_generation != null or self.private_claim_context_revoked) and integrity.isKey(key)) {
+            const parsed = try integrity.parseKey(key);
+            if (self.private_claim_context_revoked) return error.RetainedEffectsMixedControl;
+            if (self.private_claim_generation) |generation| {
+                // Unpublished UNIQUE claims are derived state, like private
+                // physical index keys. Their explicit ordered batch/outbox
+                // owns the source cut; ordinary row tails must not capture or
+                // double-advance it. FK companions cannot exist in this scope.
+                if (self.staged or self.poisoned) return error.RetainedEffectsTransactionFailed;
+                if (!std.mem.eql(u8, &generation, &parsed.address.generation)) return error.RetainedEffectsMixedControl;
+                if (parsed.kind != .claim) return error.InvalidPrivateIndexClaimInventory;
+                return;
             }
         }
         const vector = @import("db/online_vector_artifacts.zig").isKey(key);

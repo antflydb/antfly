@@ -59,6 +59,8 @@ pub fn merge(comptime Entry: type, alloc: std.mem.Allocator, input: []const Entr
             prior.mutation.row = entry.mutation.row;
             if (@hasField(Entry, "encoded_row")) prior.encoded_row = entry.encoded_row;
             prior.mutation.json_null_fields = entry.mutation.json_null_fields;
+            if (@hasField(@TypeOf(entry.mutation), "domain_admission")) prior.mutation.domain_admission = entry.mutation.domain_admission;
+            if (@hasField(@TypeOf(entry.mutation), "prepared_domain")) prior.mutation.prepared_domain = entry.mutation.prepared_domain;
             prior.mutation.predicate_only = false;
         }
     }

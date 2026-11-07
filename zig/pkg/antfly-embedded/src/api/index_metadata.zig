@@ -13,14 +13,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Control state stored beside index declarations is opaque to configuration
-//! discovery, authorization and rewriting. Do not descend into evidence: its
-//! user-defined keys can look exactly like live configuration.
-const std = @import("std");
+//! Facade for the shared native index metadata and storage-name contract.
+const shared = @import("../system_catalog/index_metadata.zig");
+pub const isReservedEntry = shared.isReservedEntry;
+pub const isOpaqueEntry = shared.isOpaqueEntry;
+pub const isValidIndexName = shared.isValidIndexName;
 
-pub fn isOpaqueEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_privacy") or std.mem.eql(u8, name, "_resolver_record_store") or std.mem.eql(u8, name, "_resolver_record_owners") or
-        std.mem.eql(u8, name, "_resolver_curation") or
-        std.mem.eql(u8, name, "_resolver_namespaces") or
-        std.mem.eql(u8, name, "_curation_proposals");
+test "privacy index API facade delegates opacity and naming to catalog owner" {
+    const testing = @import("std").testing;
+    inline for (.{ "_privacy", "_resolver_record_store", "_curation_proposals", "indexes", "status_fts" }) |name| {
+        try testing.expectEqual(shared.isOpaqueEntry(name), isOpaqueEntry(name));
+        try testing.expectEqual(shared.isReservedEntry(name), isReservedEntry(name));
+        try testing.expectEqual(shared.isValidIndexName(name), isValidIndexName(name));
+    }
+    try testing.expect(isOpaqueEntry("_privacy"));
 }

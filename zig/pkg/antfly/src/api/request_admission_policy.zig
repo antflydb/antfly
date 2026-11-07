@@ -121,6 +121,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "lookupNamespaceTableDocument", .class = .none },
     .{ .operation_id = "listNamespaceTableIndexes", .class = .none },
     .{ .operation_id = "getNamespaceTableIndex", .class = .none },
+    .{ .operation_id = "getNamespaceTableIndexPublication", .class = .none },
     .{ .operation_id = "createNamespaceTableIndex", .class = .none },
     .{ .operation_id = "dropNamespaceTableIndex", .class = .none },
     .{ .operation_id = "queryNamespaceTable", .class = .query },
@@ -184,6 +185,8 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     // SQL execution selects query/write admission after bounded compilation
     // or prepared-plan lookup; preparation/close do not execute data work.
     .{ .operation_id = "executeSQL", .class = .none },
+    // Observation of a durable catalog receipt performs no SQL execution.
+    .{ .operation_id = "getSQLCatalogOperation", .class = .none },
     .{ .operation_id = "prepareSQL", .class = .none },
     .{ .operation_id = "openSQLConnection", .class = .none },
     .{ .operation_id = "closeSQLConnection", .class = .none },
@@ -234,6 +237,9 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "reprocessDocumentArtifact", .class = .none },
     .{ .operation_id = "listIndexes", .class = .none },
     .{ .operation_id = "getIndex", .class = .none },
+    .{ .operation_id = "getIndexPublication", .class = .none },
+    .{ .operation_id = "getSchemaValidationPublication", .class = .none },
+    .{ .operation_id = "getNamespaceSchemaValidationPublication", .class = .none },
     .{ .operation_id = "createIndex", .class = .none },
     .{ .operation_id = "dropIndex", .class = .none },
     .{ .operation_id = "executeGraphMetricAction", .class = .none },

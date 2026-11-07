@@ -1011,7 +1011,148 @@ pub const Detail = enum(c_int) {
     unknown_privacy_category,
     sql_statement_read_unavailable,
     unsupported_sql_execution,
+    // Append-only SQL additions follow every published main Detail identity.
+    sql_index_already_exists = 891,
+    sql_constraint_already_exists = 892,
+    program_limit_exceeded = 893,
+    catalog_occupancy_not_ready = 894,
+    unsupported_native_index_owner = 895,
+    invalid_private_index_claim_inventory = 896,
+    invalid_private_index_claim_receipt = 897,
+    private_index_owner_job_changed = 898,
+    private_index_publication_canceled = 899,
+    private_index_job_required = 900,
+    private_index_publication_required = 901,
+    invalid_private_index_owner_job = 902,
+    invalid_private_index_inputs = 903,
+    relational_index_catalog_schema_mismatch = 904,
+    invalid_index_publication_candidate = 905,
+    immutable_relational_index_definition_conflict = 906,
+    private_index_cancellation_pending = 907,
+    private_index_cancellation_required = 908,
+    invalid_private_index_cancellation = 909,
+    invalid_private_index_native_receipt = 910,
+    invalid_relational_index_progress = 911,
+    missing_relational_index_definitions = 912,
+    index_owner_receipt_changed = 913,
+    invalid_index_owner_receipt = 914,
+    sql_invalid_power_argument = 915,
+    invalid_schema_reader_requirements = 916,
+    private_index_root_recovery_required = 917,
+    invalid_relational_index_budget = 918,
+    private_index_claim_backlog_full = 919,
+    partial_index_predicate_not_implied = 920,
+    relational_check_violation = 921,
+    row_policy_denied = 922,
+    row_policy_authentication_required = 923,
+    check_constraint_validation_required = 924,
+    foreign_key_match_full_violation = 925,
+    invalid_schema_validation_job = 926,
+    invalid_schema_validation_page_command = 927,
+    invalid_schema_validation_token = 928,
+    schema_validation_canceled = 929,
+    schema_validation_cancellation_required = 930,
+    schema_validation_command_rejected = 931,
+    schema_validation_inputs_required = 932,
+    schema_validation_job_changed = 933,
+    schema_validation_job_required = 934,
+    schema_validation_not_ready = 935,
+    schema_validation_preparation_changed = 936,
+    schema_validation_publication_required = 937,
+    schema_validation_runtime_recovery_required = 938,
+    store_registration_required = 939,
+    catalog_publication_fence_unavailable = 940,
+    undefined_column = 941,
+    foreign_key_validation_required = 942,
+    materialized_view_read_only = 943,
+    raft_apply_writer_unavailable = 944,
+    // Append-only scope lifecycle identities; preserve published callback values.
+    sql_database_in_use = 945,
+    invalid_scope_retirement = 946,
+    scope_retirement_changed = 947,
+    sequence_admission_conflict = 948,
+    invalid_table_retirement_manifest = 949,
+    sql_program_limit_exceeded = 950,
+    snapshot_build_cancelled = 951,
+    catalog_generation_exhausted = 952,
+    invalid_sql_relation_persistence = 961,
+    sql_relation_owner_changed = 962,
+    sql_temporary_relation_not_owned = 963,
+    invalid_sql_temporary_namespace = 964,
+    sql_relation_persistence_foreign_key_mismatch = 965,
+    sql_relation_recovery_incomplete = 966,
+    sql_relation_owner_unavailable = 967,
+    invalid_sql_trigger_definition = 953,
+    invalid_sql_trigger_manifest = 954,
+    sql_trigger_context_required = 955,
+    sql_trigger_returned_no_value = 956,
+    sql_trigger_return_value_required = 957,
+    sql_trigger_declared_arguments = 958,
+    sql_trigger_sql_language = 959,
+    sql_trigger_coordination_required = 960,
+    invalid_generation_transaction = 968,
+    generation_transaction_changed = 969,
+    generation_transaction_decision_required = 970,
+    invalid_prepared_graph_effects = 971,
+    sql_prepared_durability_unavailable = 972,
+    invalid_participant = 973,
 };
+
+test "SQL relation persistence callback failures preserve exact identity and behavior" {
+    const errors = [_]anyerror{ error.InvalidSqlRelationPersistence, error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.InvalidSqlTemporaryNamespace, error.SqlRelationPersistenceForeignKeyMismatch, error.SqlRelationRecoveryIncomplete, error.SqlRelationOwnerUnavailable };
+    const codes = [_]Code{ .invalid_argument, .conflict, .forbidden, .invalid_argument, .invalid_argument, .unavailable, .unavailable };
+    for (errors, codes, 961..) |err, code, detail| {
+        const wire = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(code), wire.code);
+        try std.testing.expectEqual(@as(c_int, @intCast(detail)), wire.detail);
+        try std.testing.expectEqual(err, errorFromStatus(wire));
+    }
+}
+
+test "partial index proof rejection preserves exact callback error identity" {
+    const wire = statusFromError(error.PartialIndexPredicateNotImplied);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
+    try std.testing.expectEqual(error.PartialIndexPredicateNotImplied, errorFromStatus(wire));
+}
+
+test "schema reader requirement validation preserves exact callback error identity" {
+    const wire = statusFromError(error.InvalidSchemaReaderRequirements);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
+    try std.testing.expectEqual(error.InvalidSchemaReaderRequirements, errorFromStatus(wire));
+}
+
+test "native index claim failures preserve typed callback boundary identities" {
+    const cases = .{
+        .{ error.UnsupportedNativeIndexOwner, Code.unsupported },
+        .{ error.InvalidPrivateIndexClaimInventory, Code.invalid_argument },
+        .{ error.InvalidPrivateIndexClaimReceipt, Code.corrupt },
+        .{ error.PrivateIndexOwnerJobChanged, Code.conflict },
+        .{ error.PrivateIndexPublicationCanceled, Code.conflict },
+        .{ error.PrivateIndexJobRequired, Code.retryable },
+        .{ error.PrivateIndexRootRecoveryRequired, Code.retryable },
+        .{ error.InvalidRelationalIndexBudget, Code.invalid_argument },
+        .{ error.PrivateIndexClaimBacklogFull, Code.retryable },
+        .{ error.PrivateIndexPublicationRequired, Code.retryable },
+        .{ error.InvalidPrivateIndexOwnerJob, Code.corrupt },
+        .{ error.InvalidPrivateIndexInputs, Code.corrupt },
+        .{ error.RelationalIndexCatalogSchemaMismatch, Code.conflict },
+        .{ error.InvalidIndexPublicationCandidate, Code.invalid_argument },
+        .{ error.ImmutableRelationalIndexDefinitionConflict, Code.conflict },
+        .{ error.PrivateIndexCancellationPending, Code.retryable },
+        .{ error.PrivateIndexCancellationRequired, Code.retryable },
+        .{ error.InvalidPrivateIndexCancellation, Code.corrupt },
+        .{ error.InvalidPrivateIndexNativeReceipt, Code.corrupt },
+        .{ error.InvalidRelationalIndexProgress, Code.corrupt },
+        .{ error.MissingRelationalIndexDefinitions, Code.corrupt },
+        .{ error.IndexOwnerReceiptChanged, Code.conflict },
+        .{ error.InvalidIndexOwnerReceipt, Code.invalid_argument },
+    };
+    inline for (cases) |entry| {
+        const result = statusFromError(entry[0]);
+        try std.testing.expectEqual(@backingInt(entry[1]), result.code);
+        try std.testing.expectEqual(entry[0], errorFromStatus(result));
+    }
+}
 
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
@@ -1237,6 +1378,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedAudioFormat => status(.unsupported, .model_chunk_unsupported_audio_format),
         error.UnsupportedChunkMediaType => status(.unsupported, .model_chunk_unsupported_chunk_media_type),
         error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
+        error.MaterializedViewReadOnly => status(.forbidden, .materialized_view_read_only),
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
         error.ExternalLakeSchemaUnavailable => status(.unavailable, .external_lake_schema_unavailable),
@@ -1292,6 +1434,21 @@ pub fn statusFromError(err: anyerror) Status {
         error.ArtifactCatalogScopeChanged => status(.conflict, .artifact_catalog_scope_changed),
         error.OnlineMergeArtifactCatalogChanged => status(.conflict, .online_merge_artifact_catalog_changed),
         error.StoreRootEnrollmentChanged => status(.forbidden, .store_root_enrollment_changed),
+        error.InvalidSchemaValidationJob => status(.invalid_argument, .invalid_schema_validation_job),
+        error.InvalidSchemaValidationPageCommand => status(.invalid_argument, .invalid_schema_validation_page_command),
+        error.InvalidSchemaValidationToken => status(.invalid_argument, .invalid_schema_validation_token),
+        error.SchemaValidationCanceled => status(.conflict, .schema_validation_canceled),
+        error.SchemaValidationCancellationRequired => status(.conflict, .schema_validation_cancellation_required),
+        error.SchemaValidationCommandRejected => status(.invalid_argument, .schema_validation_command_rejected),
+        error.SchemaValidationInputsRequired => status(.invalid_argument, .schema_validation_inputs_required),
+        error.SchemaValidationJobChanged => status(.conflict, .schema_validation_job_changed),
+        error.SchemaValidationJobRequired => status(.conflict, .schema_validation_job_required),
+        error.SchemaValidationNotReady => status(.retryable, .schema_validation_not_ready),
+        error.SchemaValidationPreparationChanged => status(.conflict, .schema_validation_preparation_changed),
+        error.SchemaValidationPublicationRequired => status(.unsupported, .schema_validation_publication_required),
+        error.SchemaValidationRuntimeRecoveryRequired => status(.retryable, .schema_validation_runtime_recovery_required),
+        error.StoreRegistrationRequired => status(.unavailable, .store_registration_required),
+        error.CatalogPublicationFenceUnavailable => status(.unavailable, .catalog_publication_fence_unavailable),
         error.InvalidStoreRootEnrollment => status(.invalid_argument, .invalid_store_root_enrollment),
         error.InitialChildRootReceiptChanged => status(.conflict, .initial_child_root_receipt_changed),
         error.InvalidInitialFkRetirementSignature => status(.forbidden, .invalid_initial_fk_retirement_signature),
@@ -1344,13 +1501,22 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.SqlInvalidPowerArgument => status(.invalid_argument, .sql_invalid_power_argument),
+        error.InvalidSchemaReaderRequirements => status(.invalid_argument, .invalid_schema_reader_requirements),
         error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
         error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
+        error.SqlIndexAlreadyExists => status(.already_exists, .sql_index_already_exists),
+        error.SqlConstraintAlreadyExists => status(.already_exists, .sql_constraint_already_exists),
+        error.UndefinedColumn => status(.invalid_argument, .undefined_column),
+        error.ForeignKeyValidationRequired => status(.unsupported, .foreign_key_validation_required),
+        error.ProgramLimitExceeded => status(.invalid_argument, .program_limit_exceeded),
+        error.CatalogOccupancyNotReady => status(.retryable, .catalog_occupancy_not_ready),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
         error.RelationalIndexKeyTooLarge => status(.invalid_argument, .relational_index_key_too_large),
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
         error.InvalidRelationalGeneratedValue => status(.invalid_argument, .invalid_relational_generated_value),
         error.GeneratedColumnRewriteRequired => status(.conflict, .generated_column_rewrite_required),
+        error.CheckConstraintValidationRequired => status(.conflict, .check_constraint_validation_required),
         error.RestoreJobCommitNotApplied => status(.retryable, .restore_job_commit_not_applied),
         error.CoordinatedStandaloneHAMetadataRequired => status(.unsupported, .coordinated_standalone_ha_metadata_required),
         error.StorageBusy => status(.retryable, .storage_busy),
@@ -1475,7 +1641,35 @@ pub fn statusFromError(err: anyerror) Status {
         error.ConstraintRetirementChanged => status(.conflict, .constraint_retirement_changed),
         error.ForeignKeyParentMissing => status(.conflict, .foreign_key_parent_missing),
         error.ForeignKeyReferenced => status(.conflict, .foreign_key_referenced),
+        error.ForeignKeyMatchFullViolation => status(.conflict, .foreign_key_match_full_violation),
         error.UniqueConstraintViolation => status(.conflict, .unique_constraint_violation),
+        error.RelationalCheckViolation => status(.invalid_argument, .relational_check_violation),
+        error.RowPolicyDenied => status(.forbidden, .row_policy_denied),
+        error.RowPolicyAuthenticationRequired => status(.forbidden, .row_policy_authentication_required),
+        error.UnsupportedNativeIndexOwner => status(.unsupported, .unsupported_native_index_owner),
+        error.InvalidPrivateIndexClaimInventory => status(.invalid_argument, .invalid_private_index_claim_inventory),
+        error.InvalidPrivateIndexClaimReceipt => status(.corrupt, .invalid_private_index_claim_receipt),
+        error.PrivateIndexOwnerJobChanged => status(.conflict, .private_index_owner_job_changed),
+        error.PrivateIndexPublicationCanceled => status(.conflict, .private_index_publication_canceled),
+        error.PrivateIndexJobRequired => status(.retryable, .private_index_job_required),
+        error.PrivateIndexRootRecoveryRequired => status(.retryable, .private_index_root_recovery_required),
+        error.InvalidRelationalIndexBudget => status(.invalid_argument, .invalid_relational_index_budget),
+        error.PrivateIndexClaimBacklogFull => status(.retryable, .private_index_claim_backlog_full),
+        error.PrivateIndexPublicationRequired => status(.retryable, .private_index_publication_required),
+        error.InvalidPrivateIndexOwnerJob => status(.corrupt, .invalid_private_index_owner_job),
+        error.InvalidPrivateIndexInputs => status(.corrupt, .invalid_private_index_inputs),
+        error.RelationalIndexCatalogSchemaMismatch => status(.conflict, .relational_index_catalog_schema_mismatch),
+        error.InvalidIndexPublicationCandidate => status(.invalid_argument, .invalid_index_publication_candidate),
+        error.ImmutableRelationalIndexDefinitionConflict => status(.conflict, .immutable_relational_index_definition_conflict),
+        error.PrivateIndexCancellationPending => status(.retryable, .private_index_cancellation_pending),
+        error.PrivateIndexCancellationRequired => status(.retryable, .private_index_cancellation_required),
+        error.InvalidPrivateIndexCancellation => status(.corrupt, .invalid_private_index_cancellation),
+        error.InvalidPrivateIndexNativeReceipt => status(.corrupt, .invalid_private_index_native_receipt),
+        error.InvalidRelationalIndexProgress => status(.corrupt, .invalid_relational_index_progress),
+        error.MissingRelationalIndexDefinitions => status(.corrupt, .missing_relational_index_definitions),
+        error.IndexOwnerReceiptChanged => status(.conflict, .index_owner_receipt_changed),
+        error.PartialIndexPredicateNotImplied => status(.invalid_argument, .partial_index_predicate_not_implied),
+        error.InvalidIndexOwnerReceipt => status(.invalid_argument, .invalid_index_owner_receipt),
         error.PreparedGenerationChanged => status(.conflict, .prepared_generation_changed),
         error.PreparedReadSetChanged => status(.conflict, .prepared_read_set_changed),
         error.ForeignKeyActionMismatch => status(.conflict, .foreign_key_action_mismatch),
@@ -1590,6 +1784,37 @@ pub fn statusFromError(err: anyerror) Status {
         error.CommittedPending => status(.retryable, .committed_pending),
         error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
         error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
+        error.RaftApplyWriterUnavailable => status(.retryable, .raft_apply_writer_unavailable),
+        error.SqlDatabaseInUse => status(.conflict, .sql_database_in_use),
+        error.InvalidSqlRelationPersistence => status(.invalid_argument, .invalid_sql_relation_persistence),
+        error.SqlRelationOwnerChanged => status(.conflict, .sql_relation_owner_changed),
+        error.SqlTemporaryRelationNotOwned => status(.forbidden, .sql_temporary_relation_not_owned),
+        error.InvalidSqlTemporaryNamespace => status(.invalid_argument, .invalid_sql_temporary_namespace),
+        error.SqlRelationPersistenceForeignKeyMismatch => status(.invalid_argument, .sql_relation_persistence_foreign_key_mismatch),
+        error.SqlRelationRecoveryIncomplete => status(.unavailable, .sql_relation_recovery_incomplete),
+        error.SqlRelationOwnerUnavailable => status(.unavailable, .sql_relation_owner_unavailable),
+        error.InvalidScopeRetirement => status(.invalid_argument, .invalid_scope_retirement),
+        error.ScopeRetirementChanged => status(.conflict, .scope_retirement_changed),
+        error.SequenceAdmissionConflict => status(.conflict, .sequence_admission_conflict),
+        error.InvalidTableRetirementManifest => status(.invalid_argument, .invalid_table_retirement_manifest),
+        error.SqlProgramLimitExceeded => status(.invalid_argument, .sql_program_limit_exceeded),
+        error.SnapshotBuildCancelled => status(.cancelled, .snapshot_build_cancelled),
+        error.CatalogGenerationExhausted => status(.invalid_argument, .catalog_generation_exhausted),
+        error.InvalidSqlTriggerDefinition => status(.invalid_argument, .invalid_sql_trigger_definition),
+        error.InvalidSqlTriggerManifest => status(.invalid_argument, .invalid_sql_trigger_manifest),
+        error.SqlTriggerContextRequired => status(.invalid_argument, .sql_trigger_context_required),
+        error.SqlTriggerReturnedNoValue => status(.invalid_argument, .sql_trigger_returned_no_value),
+        error.SqlTriggerReturnValueRequired => status(.invalid_argument, .sql_trigger_return_value_required),
+        error.SqlTriggerDeclaredArguments => status(.invalid_argument, .sql_trigger_declared_arguments),
+        error.SqlTriggerSqlLanguage => status(.invalid_argument, .sql_trigger_sql_language),
+        error.SqlTriggerCoordinationRequired => status(.invalid_argument, .sql_trigger_coordination_required),
+        error.InvalidGenerationTransaction => status(.invalid_argument, .invalid_generation_transaction),
+        error.GenerationTransactionChanged => status(.conflict, .generation_transaction_changed),
+        error.GenerationTransactionDecisionRequired => status(.conflict, .generation_transaction_decision_required),
+        error.InvalidPreparedGraphEffects => status(.invalid_argument, .invalid_prepared_graph_effects),
+        error.SqlPreparedDurabilityUnavailable => status(.invalid_argument, .sql_prepared_durability_unavailable),
+        error.InvalidParticipant => status(.invalid_argument, .invalid_participant),
+
         error.RaftBatchWriteTransportOutcomeUnknown => status(.retryable, .raft_batch_write_transport_outcome_unknown),
         error.HttpConnectionClosing => status(.unavailable, .http_connection_closing),
         error.RaftBatchWritePartialOutcome => status(.retryable, .raft_batch_write_partial_outcome),
@@ -1984,6 +2209,9 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .relational_check_violation => "RelationalCheckViolation",
+        .row_policy_denied => "RowPolicyDenied",
+        .row_policy_authentication_required => "RowPolicyAuthenticationRequired",
         .invalid_document_source => "InvalidDocumentSource",
         .unsupported_document_format => "UnsupportedDocumentFormat",
         .document_source_limit_exceeded => "DocumentSourceLimitExceeded",
@@ -2171,6 +2399,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .source_visitor_failed => "SourceVisitorFailed",
 
         .external_lake_read_only => "ExternalLakeReadOnly",
+        .materialized_view_read_only => "MaterializedViewReadOnly",
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
         .external_lake_schema_unavailable => "ExternalLakeSchemaUnavailable",
@@ -2228,6 +2457,21 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .artifact_catalog_scope_changed => "ArtifactCatalogScopeChanged",
         .online_merge_artifact_catalog_changed => "OnlineMergeArtifactCatalogChanged",
         .store_root_enrollment_changed => "StoreRootEnrollmentChanged",
+        .invalid_schema_validation_job => "InvalidSchemaValidationJob",
+        .invalid_schema_validation_page_command => "InvalidSchemaValidationPageCommand",
+        .invalid_schema_validation_token => "InvalidSchemaValidationToken",
+        .schema_validation_canceled => "SchemaValidationCanceled",
+        .schema_validation_cancellation_required => "SchemaValidationCancellationRequired",
+        .schema_validation_command_rejected => "SchemaValidationCommandRejected",
+        .schema_validation_inputs_required => "SchemaValidationInputsRequired",
+        .schema_validation_job_changed => "SchemaValidationJobChanged",
+        .schema_validation_job_required => "SchemaValidationJobRequired",
+        .schema_validation_not_ready => "SchemaValidationNotReady",
+        .schema_validation_preparation_changed => "SchemaValidationPreparationChanged",
+        .schema_validation_publication_required => "SchemaValidationPublicationRequired",
+        .schema_validation_runtime_recovery_required => "SchemaValidationRuntimeRecoveryRequired",
+        .store_registration_required => "StoreRegistrationRequired",
+        .catalog_publication_fence_unavailable => "CatalogPublicationFenceUnavailable",
         .invalid_store_root_enrollment => "InvalidStoreRootEnrollment",
         .initial_child_root_receipt_changed => "InitialChildRootReceiptChanged",
         .invalid_initial_fk_retirement_signature => "InvalidInitialFkRetirementSignature",
@@ -2280,13 +2524,22 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .sql_invalid_power_argument => "SqlInvalidPowerArgument",
+        .invalid_schema_reader_requirements => "InvalidSchemaReaderRequirements",
         .sql_feature_not_supported => "SqlFeatureNotSupported",
         .catalog_publication_proof_pending => "CatalogPublicationProofPending",
+        .sql_index_already_exists => "SqlIndexAlreadyExists",
+        .sql_constraint_already_exists => "SqlConstraintAlreadyExists",
+        .undefined_column => "UndefinedColumn",
+        .foreign_key_validation_required => "ForeignKeyValidationRequired",
+        .program_limit_exceeded => "ProgramLimitExceeded",
+        .catalog_occupancy_not_ready => "CatalogOccupancyNotReady",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
         .relational_index_key_too_large => "RelationalIndexKeyTooLarge",
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
         .invalid_relational_generated_value => "InvalidRelationalGeneratedValue",
         .generated_column_rewrite_required => "GeneratedColumnRewriteRequired",
+        .check_constraint_validation_required => "CheckConstraintValidationRequired",
         .invalid_retained_effects_admission => "InvalidRetainedEffectsAdmission",
         .retained_effects_fence_mismatch => "RetainedEffectsFenceMismatch",
         .retained_effects_mixed_control => "RetainedEffectsMixedControl",
@@ -2409,7 +2662,32 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .constraint_retirement_changed => "ConstraintRetirementChanged",
         .foreign_key_parent_missing => "ForeignKeyParentMissing",
         .foreign_key_referenced => "ForeignKeyReferenced",
+        .foreign_key_match_full_violation => "ForeignKeyMatchFullViolation",
         .unique_constraint_violation => "UniqueConstraintViolation",
+        .unsupported_native_index_owner => "UnsupportedNativeIndexOwner",
+        .invalid_private_index_claim_inventory => "InvalidPrivateIndexClaimInventory",
+        .invalid_private_index_claim_receipt => "InvalidPrivateIndexClaimReceipt",
+        .private_index_owner_job_changed => "PrivateIndexOwnerJobChanged",
+        .private_index_publication_canceled => "PrivateIndexPublicationCanceled",
+        .private_index_job_required => "PrivateIndexJobRequired",
+        .private_index_root_recovery_required => "PrivateIndexRootRecoveryRequired",
+        .invalid_relational_index_budget => "InvalidRelationalIndexBudget",
+        .private_index_claim_backlog_full => "PrivateIndexClaimBacklogFull",
+        .private_index_publication_required => "PrivateIndexPublicationRequired",
+        .invalid_private_index_owner_job => "InvalidPrivateIndexOwnerJob",
+        .invalid_private_index_inputs => "InvalidPrivateIndexInputs",
+        .relational_index_catalog_schema_mismatch => "RelationalIndexCatalogSchemaMismatch",
+        .invalid_index_publication_candidate => "InvalidIndexPublicationCandidate",
+        .immutable_relational_index_definition_conflict => "ImmutableRelationalIndexDefinitionConflict",
+        .private_index_cancellation_pending => "PrivateIndexCancellationPending",
+        .private_index_cancellation_required => "PrivateIndexCancellationRequired",
+        .invalid_private_index_cancellation => "InvalidPrivateIndexCancellation",
+        .invalid_private_index_native_receipt => "InvalidPrivateIndexNativeReceipt",
+        .invalid_relational_index_progress => "InvalidRelationalIndexProgress",
+        .missing_relational_index_definitions => "MissingRelationalIndexDefinitions",
+        .index_owner_receipt_changed => "IndexOwnerReceiptChanged",
+        .partial_index_predicate_not_implied => "PartialIndexPredicateNotImplied",
+        .invalid_index_owner_receipt => "InvalidIndexOwnerReceipt",
         .prepared_generation_changed => "PreparedGenerationChanged",
         .prepared_read_set_changed => "PreparedReadSetChanged",
         .foreign_key_action_mismatch => "ForeignKeyActionMismatch",
@@ -2631,6 +2909,37 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .commit_visibility_not_satisfied => "CommitVisibilityNotSatisfied",
         .leader_unavailable => "LeaderUnavailable",
         .raft_batch_write_outcome_unknown => "RaftBatchWriteOutcomeUnknown",
+        .raft_apply_writer_unavailable => "RaftApplyWriterUnavailable",
+        .sql_database_in_use => "SqlDatabaseInUse",
+        .invalid_sql_relation_persistence => "InvalidSqlRelationPersistence",
+        .sql_relation_owner_changed => "SqlRelationOwnerChanged",
+        .sql_temporary_relation_not_owned => "SqlTemporaryRelationNotOwned",
+        .invalid_sql_temporary_namespace => "InvalidSqlTemporaryNamespace",
+        .sql_relation_persistence_foreign_key_mismatch => "SqlRelationPersistenceForeignKeyMismatch",
+        .sql_relation_recovery_incomplete => "SqlRelationRecoveryIncomplete",
+        .sql_relation_owner_unavailable => "SqlRelationOwnerUnavailable",
+        .invalid_scope_retirement => "InvalidScopeRetirement",
+        .scope_retirement_changed => "ScopeRetirementChanged",
+        .sequence_admission_conflict => "SequenceAdmissionConflict",
+        .invalid_table_retirement_manifest => "InvalidTableRetirementManifest",
+        .sql_program_limit_exceeded => "SqlProgramLimitExceeded",
+        .snapshot_build_cancelled => "SnapshotBuildCancelled",
+        .catalog_generation_exhausted => "CatalogGenerationExhausted",
+        .invalid_sql_trigger_definition => "InvalidSqlTriggerDefinition",
+        .invalid_sql_trigger_manifest => "InvalidSqlTriggerManifest",
+        .sql_trigger_context_required => "SqlTriggerContextRequired",
+        .sql_trigger_returned_no_value => "SqlTriggerReturnedNoValue",
+        .sql_trigger_return_value_required => "SqlTriggerReturnValueRequired",
+        .sql_trigger_declared_arguments => "SqlTriggerDeclaredArguments",
+        .sql_trigger_sql_language => "SqlTriggerSqlLanguage",
+        .sql_trigger_coordination_required => "SqlTriggerCoordinationRequired",
+        .invalid_generation_transaction => "InvalidGenerationTransaction",
+        .generation_transaction_changed => "GenerationTransactionChanged",
+        .generation_transaction_decision_required => "GenerationTransactionDecisionRequired",
+        .invalid_prepared_graph_effects => "InvalidPreparedGraphEffects",
+        .sql_prepared_durability_unavailable => "SqlPreparedDurabilityUnavailable",
+        .invalid_participant => "InvalidParticipant",
+
         .raft_batch_write_transport_outcome_unknown => "RaftBatchWriteTransportOutcomeUnknown",
         .http_connection_closing => "HttpConnectionClosing",
         .raft_batch_write_partial_outcome => "RaftBatchWritePartialOutcome",
@@ -3100,15 +3409,23 @@ test "catalog publication preparation preserves explicit retry identity across a
     var forged = pending;
     forged.code = @backingInt(Code.corrupt);
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(forged));
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired }) |err| {
+        const encoded = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(encoded));
+        var mismatched = encoded;
+        mismatched.code = @backingInt(Code.corrupt);
+        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(mismatched));
+    }
 }
 
 test "released main Detail identifiers retain their exact names and numeric values" {
-    @setEvalBranchQuota(2000);
+    @setEvalBranchQuota(20_000);
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |reflected_name, field_value| {
-        if (field_value <= 370) {
+        if (field_value <= 781) {
             for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
@@ -3116,8 +3433,8 @@ test "released main Detail identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 371), count);
-    try std_test.testing.expectEqual(@as(u64, 0xa07c5018c0739e78), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 782), count);
+    try std_test.testing.expectEqual(@as(u64, 0xf7de08bbd998f30a), fingerprint);
 }
 
 test "metadata proposal recovery errors preserve identity across runtime archives" {
@@ -3224,6 +3541,35 @@ test "inference worker setup and transport failures retain distinct boundary sem
     }
 }
 
+/// Exact lookup for authenticated textual compatibility transports. Never
+/// construct compilation-local errors from untrusted or arbitrary names.
+pub fn errorFromStableName(name: []const u8) ?anyerror {
+    const lookup = comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        const details = std.meta.tags(Detail);
+        var entries: [details.len]struct { []const u8, anyerror } = undefined;
+        for (details, 0..) |detail, index| {
+            const spelling = detailErrorName(detail);
+            entries[index] = .{ spelling, @field(anyerror, spelling) };
+        }
+        break :blk std.StaticStringMap(anyerror).initComptime(entries);
+    };
+    const err = lookup.get(name) orelse return null;
+    return if (errorHasStableDetail(err)) err else null;
+}
+
+test "native normalization failures retain exact stable identities without accepting arbitrary names" {
+    for ([_]anyerror{ error.RelationalCheckViolation, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired, error.InvalidBatchRequest, error.UniqueConstraintViolation, error.OutOfMemory, error.DeadlineExceeded }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+        try std.testing.expectEqual(err, errorFromStableName(@errorName(err)).?);
+    }
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.RelationalCheckViolation).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.RowPolicyDenied).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.RowPolicyAuthenticationRequired).code);
+    try std.testing.expectEqual(@backingInt(Detail.partial_index_predicate_not_implied) + 1, @backingInt(Detail.relational_check_violation));
+    for ([_][]const u8{ "RelationalCheckViolation\n", "relationalcheckviolation", "PrivateProviderSecret", "RuntimeBoundaryFailure" }) |name| try std.testing.expect(errorFromStableName(name) == null);
+}
+
 test "grouped and constrained producer failures preserve callback identity and behavior" {
     try std.testing.expectEqual(error.GroupedSourceOwnerChanged, errorFromStatus(statusFromError(error.GroupedSourceOwnerChanged)));
     try std.testing.expectEqual(@backingInt(Code.conflict), statusFromError(error.GroupedSourceOwnerChanged).code);
@@ -3317,6 +3663,73 @@ test "grouped and constrained producer failures preserve callback identity and b
     try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedGeneratedExtractionSchema).code);
 }
 
+test "released document reader and inference Detail identifiers retain main wire numbers" {
+    const published = .{
+        .{ Detail.document_storage_not_configured, @as(c_int, 782) },
+        .{ Detail.document_run_busy, @as(c_int, 783) },
+        .{ Detail.document_run_exists, @as(c_int, 784) },
+        .{ Detail.document_run_expired, @as(c_int, 785) },
+        .{ Detail.document_run_lease_lost, @as(c_int, 786) },
+        .{ Detail.document_run_not_found, @as(c_int, 787) },
+        .{ Detail.document_run_retention_active, @as(c_int, 788) },
+        .{ Detail.document_run_terminal, @as(c_int, 789) },
+        .{ Detail.document_run_store_needs_recovery, @as(c_int, 790) },
+        .{ Detail.document_model_revision_mismatch, @as(c_int, 791) },
+        .{ Detail.document_budget_exhausted, @as(c_int, 792) },
+        .{ Detail.document_output_too_large, @as(c_int, 793) },
+        .{ Detail.document_stage_in_flight, @as(c_int, 794) },
+        .{ Detail.invalid_document_checkpoint, @as(c_int, 795) },
+        .{ Detail.too_many_active_jobs, @as(c_int, 796) },
+        .{ Detail.invalid_document_source, @as(c_int, 797) },
+        .{ Detail.unsupported_document_format, @as(c_int, 798) },
+        .{ Detail.document_source_limit_exceeded, @as(c_int, 799) },
+        .{ Detail.document_page_limit_exceeded, @as(c_int, 800) },
+        .{ Detail.document_pixel_limit_exceeded, @as(c_int, 801) },
+        .{ Detail.document_media_type_mismatch, @as(c_int, 802) },
+        .{ Detail.invalid_document_selection, @as(c_int, 803) },
+        .{ Detail.duplicate_document_source, @as(c_int, 804) },
+        .{ Detail.document_unresolved, @as(c_int, 805) },
+        .{ Detail.document_capability_mismatch, @as(c_int, 806) },
+        .{ Detail.unsupported_document_request_field, @as(c_int, 807) },
+        .{ Detail.remote_document_model_denied, @as(c_int, 808) },
+        .{ Detail.cloudflare_credential_missing, @as(c_int, 809) },
+        .{ Detail.invalid_cloudflare_config, @as(c_int, 810) },
+        .{ Detail.unsupported_cloudflare_model, @as(c_int, 811) },
+        .{ Detail.unsupported_cloudflare_schema, @as(c_int, 812) },
+        .{ Detail.cloudflare_authentication_failed, @as(c_int, 813) },
+        .{ Detail.invalid_extractor_response, @as(c_int, 814) },
+        .{ Detail.unsupported_extraction_schema_version, @as(c_int, 815) },
+        .{ Detail.invalid_inference_request, @as(c_int, 816) },
+        .{ Detail.document_artifact_not_found, @as(c_int, 817) },
+        .{ Detail.document_artifact_expired, @as(c_int, 818) },
+        .{ Detail.cloudflare_rate_limited, @as(c_int, 819) },
+        .{ Detail.inference_upstream_rate_limited, @as(c_int, 820) },
+        .{ Detail.inference_capacity_unavailable, @as(c_int, 821) },
+        .{ Detail.inference_transport_unavailable, @as(c_int, 822) },
+        .{ Detail.cloudflare_inference_failed, @as(c_int, 823) },
+        .{ Detail.invalid_cloudflare_response, @as(c_int, 824) },
+        .{ Detail.document_token_limit_exceeded, @as(c_int, 825) },
+        .{ Detail.hierarchy_cursor_stale, @as(c_int, 826) },
+        .{ Detail.read_transient_failure, @as(c_int, 827) },
+        .{ Detail.read_request_failed, @as(c_int, 828) },
+        .{ Detail.invalid_gcs_url, @as(c_int, 829) },
+        .{ Detail.gcs_connection_not_found_or_out_of_scope, @as(c_int, 830) },
+        .{ Detail.ambiguous_gcs_connection, @as(c_int, 831) },
+        .{ Detail.invalid_connection_credentials, @as(c_int, 832) },
+        .{ Detail.pioneer_credential_missing, @as(c_int, 833) },
+        .{ Detail.unsupported_pioneer_schema, @as(c_int, 834) },
+        .{ Detail.unsupported_pioneer_input, @as(c_int, 835) },
+        .{ Detail.standalone_replication_sources_unsupported, @as(c_int, 836) },
+        .{ Detail.ha_catalog_replication_sources_unsupported, @as(c_int, 837) },
+        .{ Detail.embed_admission_refused, @as(c_int, 838) },
+        .{ Detail.read_output_truncated, @as(c_int, 839) },
+        .{ Detail.invalid_document_extraction_config, @as(c_int, 840) },
+        .{ Detail.document_extraction_model_required, @as(c_int, 841) },
+    };
+    inline for (published) |entry| try std.testing.expectEqual(entry[1], @backingInt(entry[0]));
+    try std.testing.expect(@backingInt(Detail.sql_index_already_exists) > 841);
+}
+
 test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 674), @backingInt(Detail.inference_worker_executable_not_configured));
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
@@ -3398,6 +3811,13 @@ test "durable document policy errors retain identity across native runtime bound
     }
 }
 
+test "materialized view mutation rejection retains exact runtime boundary identity" {
+    const result = statusFromError(error.MaterializedViewReadOnly);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), result.code);
+    try std.testing.expectEqual(error.MaterializedViewReadOnly, errorFromStatus(result));
+    try std.testing.expectEqual(error.MaterializedViewReadOnly, errorFromStableName("MaterializedViewReadOnly").?);
+}
+
 test "reader failures preserve retry semantics and GCS failures preserve scope semantics" {
     try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.ReadTransientFailure).code);
     try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.ReadRequestFailed).code);
@@ -3415,6 +3835,62 @@ test "invalid persisted extraction policy retains identity across storage callba
     }
 }
 
+test "native locking callback admission preserves retryable ordered apply identity" {
+    const transported = statusFromError(error.RaftApplyWriterUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
+    try std.testing.expectEqual(error.RaftApplyWriterUnavailable, errorFromStatus(transported));
+    try std.testing.expectEqual(@as(c_int, 944), @backingInt(Detail.raft_apply_writer_unavailable));
+}
+
+test "scope retirement callback descriptors preserve exact lifecycle conflict and limit identities" {
+    const cases = .{
+        .{ error.SqlDatabaseInUse, Code.conflict, Detail.sql_database_in_use },
+        .{ error.InvalidScopeRetirement, Code.invalid_argument, Detail.invalid_scope_retirement },
+        .{ error.ScopeRetirementChanged, Code.conflict, Detail.scope_retirement_changed },
+        .{ error.SequenceAdmissionConflict, Code.conflict, Detail.sequence_admission_conflict },
+        .{ error.InvalidTableRetirementManifest, Code.invalid_argument, Detail.invalid_table_retirement_manifest },
+        .{ error.SqlProgramLimitExceeded, Code.invalid_argument, Detail.sql_program_limit_exceeded },
+        .{ error.SnapshotBuildCancelled, Code.cancelled, Detail.snapshot_build_cancelled },
+        .{ error.CatalogGenerationExhausted, Code.invalid_argument, Detail.catalog_generation_exhausted },
+    };
+    inline for (cases) |entry| {
+        const transported = statusFromError(entry[0]);
+        try std.testing.expectEqual(@backingInt(entry[1]), transported.code);
+        try std.testing.expectEqual(@backingInt(entry[2]), transported.detail);
+        try std.testing.expectEqual(entry[0], errorFromStatus(transported));
+        try std.testing.expectEqual(entry[0], errorFromStableName(@errorName(entry[0])).?);
+        try std.testing.expect(errorHasStableDetail(entry[0]));
+    }
+    // Public enum numbers remain independent from the embedded owner ABI.
+    try std.testing.expectEqual(@as(c_int, 944), @backingInt(Detail.raft_apply_writer_unavailable));
+    try std.testing.expectEqual(@as(c_int, 945), @backingInt(Detail.sql_database_in_use));
+    try std.testing.expectEqual(@as(c_int, 952), @backingInt(Detail.catalog_generation_exhausted));
+    try std.testing.expect(errorFromStableName("SqlDatabaseInUse\n") == null);
+    try std.testing.expect(errorFromStableName("ScopeRetirementChangedPrivate") == null);
+}
+
+test "generation graph and durability errors survive an actual C callback status boundary without retry promotion" {
+    const Callback = *const fn (*anyopaque) callconv(.c) Status;
+    const State = struct {
+        failure: anyerror,
+        fn invoke(raw: *anyopaque) callconv(.c) Status {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            return statusFromError(state.failure);
+        }
+    };
+    const callback: Callback = State.invoke;
+    const failures = [_]anyerror{ error.InvalidGenerationTransaction, error.GenerationTransactionChanged, error.GenerationTransactionDecisionRequired, error.InvalidPreparedGraphEffects, error.SqlPreparedDurabilityUnavailable };
+    const codes = [_]Code{ .invalid_argument, .conflict, .conflict, .invalid_argument, .invalid_argument };
+    for (failures, codes, 968..) |failure, code, detail| {
+        var state: State = .{ .failure = failure };
+        const transported = callback(&state);
+        try std.testing.expectEqual(@backingInt(code), transported.code);
+        try std.testing.expectEqual(@as(c_int, @intCast(detail)), transported.detail);
+        try std.testing.expectEqual(failure, errorFromStatus(transported));
+        try std.testing.expect(transported.code != @backingInt(Code.retryable));
+    }
+}
+
 test "privacy failures retain identity and retry classes across runtime callbacks" {
     for ([_]anyerror{ error.IndexRebuilding, error.SqlStatementReadUnavailable, error.UnsupportedSqlExecution }) |err| {
         try std.testing.expect(errorHasStableDetail(err));
@@ -3426,4 +3902,20 @@ test "privacy failures retain identity and retry classes across runtime callback
     }
     try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.PrivacyStale).code);
     try std.testing.expectEqual(@backingInt(Code.corrupt), statusFromError(error.InvalidPrivacyReceipt).code);
+}
+
+test "external terminal membership failure crosses callbacks without retry promotion" {
+    const Callback = *const fn () callconv(.c) Status;
+    const Producer = struct {
+        fn call() callconv(.c) Status {
+            return statusFromError(error.InvalidParticipant);
+        }
+    };
+    const callback: Callback = Producer.call;
+    const result = callback();
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), result.code);
+    try std.testing.expectEqual(@backingInt(Detail.invalid_participant), result.detail);
+    try std.testing.expectEqual(error.InvalidParticipant, errorFromStatus(result));
+    try std.testing.expectEqual(error.InvalidParticipant, errorFromStableName("InvalidParticipant").?);
+    try std.testing.expect(errorHasStableDetail(error.InvalidParticipant));
 }

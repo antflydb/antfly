@@ -1,0 +1,208 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Exact PostgreSQL callable campaign response comparisons.
+const std = @import("std");
+const fixture = @import("sql_owner_test_fixture.zig");
+const client = @import("sql_owner_test_client.zig");
+const compare = @import("sql_parity_reference.zig");
+const wire = @import("antfly_metadata_openapi").types;
+pub const Output = struct { columns: []const []const u8, column_oids: []const u32, rows: []const []const std.json.Value, sql_nulls: []const []const bool };
+pub const Step = struct { id: ?[]const u8 = null, sql: []const u8, command_tag: ?[]const u8 = null, sqlstate: ?[]const u8 = null, output: ?Output = null, notices: []const struct { code: []const u8, message: []const u8 } };
+pub const Prepared = struct { setup: []const Step, statement: []const u8, before: Output, mutation: Step, after: Output };
+pub const Reference = struct { before: []const Step, cold: []const Step, after: []const Step, prepared: ?Prepared = null };
+pub fn observe(ctx: *fixture.Context, step: Step, reader: bool) !void {
+    var authenticated = ctx.*;
+    authenticated.headers = if (reader) ctx.reader_headers else ctx.admin_headers;
+    var response = try client.execute(&authenticated, step.sql, .write_admission);
+    defer response.deinit(ctx.alloc);
+    if (response.status == 202) {
+        var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer result.deinit();
+        if (result.value.catalog_receipt) |receipt| {
+            try awaitCatalogReceipt(&authenticated, receipt, step.sqlstate);
+            if (step.sqlstate != null) {
+                const actual: []const wire.SQLNotice = result.value.notices orelse &.{};
+                try std.testing.expectEqual(step.notices.len, actual.len);
+                return;
+            }
+            return compareCompletion(ctx, step, response, true);
+        }
+    }
+    return compareResponse(ctx, step, response);
+}
+/// An uncertain/pending DDL is observed through its original durable token.
+/// Never repeat the mutation to make a synchronous PostgreSQL witness fit.
+fn awaitCatalogReceipt(ctx: *fixture.Context, initial: wire.SQLCatalogOperationReceipt, expected_sqlstate: ?[]const u8) !void {
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .recovery_token = initial.recovery_token }, .{});
+    defer ctx.alloc.free(body);
+    const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
+    while (true) {
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/operations/status", .POST, body, 5000);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var receipt = try std.json.parseFromSlice(wire.SQLCatalogOperationReceipt, ctx.alloc, response.body, .{});
+        defer receipt.deinit();
+        try std.testing.expectEqual(initial.kind, receipt.value.kind);
+        try std.testing.expectEqual(initial.operation, receipt.value.operation);
+        try std.testing.expectEqualStrings(initial.database, receipt.value.database);
+        try std.testing.expectEqualStrings(initial.namespace, receipt.value.namespace);
+        try std.testing.expectEqualStrings(initial.name, receipt.value.name);
+        if (receipt.value.state == .committed) {
+            try std.testing.expect(expected_sqlstate == null);
+            try std.testing.expect(receipt.value.catalog_revision != null);
+            return;
+        }
+        if (receipt.value.state == .rejected and expected_sqlstate != null) {
+            const diagnostic = receipt.value.diagnostic orelse return error.MissingSqlDiagnostic;
+            try std.testing.expectEqualStrings(expected_sqlstate.?, diagnostic.code);
+            try std.testing.expect(diagnostic.message.len != 0);
+            return;
+        }
+        if (receipt.value.state != .pending and receipt.value.state != .unknown) {
+            std.debug.print("catalog operation did not commit: {s}\n", .{response.body});
+            return error.CatalogOperationFailed;
+        }
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.CatalogOperationTimeout;
+        try ctx.checkDrivers();
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+}
+
+pub fn compareResponse(ctx: *fixture.Context, step: Step, response: anytype) !void {
+    return compareCompletion(ctx, step, response, false);
+}
+
+fn compareCompletion(ctx: *fixture.Context, step: Step, response: anytype, deferred_catalog: bool) !void {
+    const expected_status: u16 = if (step.sqlstate) |code| (if (std.mem.eql(u8, code, "0A000")) 501 else 400) else if (deferred_catalog) 202 else 200;
+    if (response.status != expected_status) std.debug.print("callable status={d} sql={s} body={s}\n", .{ response.status, step.sql, response.body });
+    const notices: []const wire.SQLNotice = if (step.sqlstate) |code| rejected: {
+        try std.testing.expectEqual(expected_status, response.status);
+        var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(code, diagnostic.value.code);
+        // Compare while the parsed diagnostic owns its strings.
+        const actual = diagnostic.value.notices orelse &.{};
+        try std.testing.expectEqual(step.notices.len, actual.len);
+        for (step.notices, actual) |expected, notice| {
+            try std.testing.expectEqualStrings(expected.code, notice.code);
+            try std.testing.expectEqualStrings(expected.message, notice.message);
+        }
+        break :rejected &.{};
+    } else accepted: {
+        try std.testing.expectEqual(expected_status, response.status);
+        var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer result.deinit();
+        if (step.output) |expected| {
+            try std.testing.expectEqual(expected.columns.len, result.value.columns.len);
+            for (expected.columns, expected.column_oids, result.value.columns) |name, oid, column| {
+                try std.testing.expectEqualStrings(name, column.name);
+                try std.testing.expect(compare.postgresColumnMatches(column, oid));
+            }
+            try std.testing.expectEqual(expected.rows.len, result.value.rows.len);
+            const nulls = result.value.sql_nulls orelse return error.MissingSqlNullBitmap;
+            if (std.mem.startsWith(u8, step.sql, "UPDATE")) {
+                const matched = try ctx.alloc.alloc(bool, result.value.rows.len);
+                defer ctx.alloc.free(matched);
+                @memset(matched, false);
+                for (expected.rows, expected.sql_nulls) |want, flags| {
+                    const selected = for (result.value.rows, nulls, 0..) |actual, actual_flags, ordinal| {
+                        if (!matched[ordinal] and try compare.rowMatchesWithNulls(ctx.alloc, result.value.columns, actual, actual_flags, want, flags)) break ordinal;
+                    } else return error.OperatorReturningMultisetMismatch;
+                    matched[selected] = true;
+                }
+            } else for (expected.rows, expected.sql_nulls, result.value.rows, nulls) |want, flags, actual, actual_flags| {
+                if (!try compare.rowMatchesWithNulls(ctx.alloc, result.value.columns, actual, actual_flags, want, flags)) {
+                    std.debug.print("callable postimage sql={s} expected={f} body={s}\n", .{ step.sql, std.json.fmt(want, .{}), response.body });
+                    return error.OperatorPostimageMismatch;
+                }
+            }
+        } else if (std.mem.startsWith(u8, step.command_tag.?, "INSERT ") or std.mem.startsWith(u8, step.command_tag.?, "UPDATE ") or std.mem.startsWith(u8, step.command_tag.?, "DELETE ")) {
+            const tag = step.command_tag.?;
+            const delimiter = std.mem.lastIndexOfScalar(u8, tag, ' ') orelse return error.InvalidPostgresCommandTag;
+            const count = try std.fmt.parseInt(i64, tag[delimiter + 1 ..], 10);
+            try std.testing.expectEqual(count, result.value.rows_affected);
+            const verb_end = std.mem.indexOfScalar(u8, tag, ' ') orelse return error.InvalidPostgresCommandTag;
+            try std.testing.expectEqualStrings(tag[0..verb_end], result.value.command_tag);
+        } else if (deferred_catalog) {
+            try std.testing.expectEqualStrings("DDL PENDING", result.value.command_tag);
+            const receipt = result.value.catalog_receipt orelse return error.MissingCatalogReceipt;
+            const tag = step.command_tag orelse return error.InvalidPostgresCommandTag;
+            const verb_end = std.mem.indexOfScalar(u8, tag, ' ') orelse return error.InvalidPostgresCommandTag;
+            try std.testing.expect(std.ascii.eqlIgnoreCase(tag[0..verb_end], @tagName(receipt.operation)));
+        } else try std.testing.expectEqualStrings(step.command_tag.?, result.value.command_tag);
+        const actual = result.value.notices orelse &.{};
+        try std.testing.expectEqual(step.notices.len, actual.len);
+        for (step.notices, actual) |expected, notice| {
+            try std.testing.expectEqualStrings(expected.code, notice.code);
+            try std.testing.expectEqualStrings(expected.message, notice.message);
+        }
+        break :accepted &.{};
+    };
+    _ = notices;
+}
+
+/// Public prepared resources own both positive and negative catalog witnesses.
+/// Tests close successful resources explicitly and unwind failures safely.
+pub const PreparedResource = struct {
+    context: *fixture.Context,
+    id: []u8,
+    closed: bool = false,
+    pub fn create(ctx: *fixture.Context, statement: []const u8) !PreparedResource {
+        const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement }, .{});
+        defer ctx.alloc.free(body);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/sql/prepared", .POST, body, 15_000);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("callable prepare status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(struct { prepared_id: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return .{ .context = ctx, .id = try ctx.alloc.dupe(u8, parsed.value.prepared_id) };
+    }
+    pub fn expectResult(self: *PreparedResource, step: Step) !void {
+        const ctx = self.context;
+        const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/prepared/{s}/execute", .{self.id});
+        defer ctx.alloc.free(path);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, path, .POST, "{}", 15_000);
+        defer response.deinit(ctx.alloc);
+        try compareResponse(ctx, step, response);
+    }
+    pub fn expectStale(self: *PreparedResource) !void {
+        const ctx = self.context;
+        const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/prepared/{s}/execute", .{self.id});
+        defer ctx.alloc.free(path);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, path, .POST, "{}", 15_000);
+        defer response.deinit(ctx.alloc);
+        if (response.status == 200) std.debug.print("stale prepared callable executed body={s}\n", .{response.body});
+        try std.testing.expect(response.status != 200);
+        var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("40001", diagnostic.value.code);
+    }
+    pub fn close(self: *PreparedResource) !void {
+        if (self.closed) return;
+        const ctx = self.context;
+        const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/prepared/{s}", .{self.id});
+        defer ctx.alloc.free(path);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, path, .DELETE, null, 15_000);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expect(response.status == 200 or response.status == 204);
+        self.closed = true;
+    }
+    pub fn deinit(self: *PreparedResource) void {
+        if (!self.closed) self.close() catch {};
+        self.context.alloc.free(self.id);
+    }
+};

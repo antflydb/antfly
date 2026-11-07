@@ -47,6 +47,14 @@ func marshalSQLRequest(value any) ([]byte, error) {
 }
 
 func executeSQLRequest(doer HttpRequestDoer, request *http.Request) (*http.Response, error) {
+	return executeSQLRequestBounded(doer, request, sqlMaxResponseBytes)
+}
+
+func executeSQLNotificationRequest(doer HttpRequestDoer, request *http.Request) (*http.Response, error) {
+	return executeSQLRequestBounded(doer, request, 1<<20)
+}
+
+func executeSQLRequestBounded(doer HttpRequestDoer, request *http.Request, maximum int64) (*http.Response, error) {
 	// Editors may replace the encoded body: enforce the cap after every editor.
 	var body []byte
 	if request.Body != nil {
@@ -82,17 +90,18 @@ func executeSQLRequest(doer HttpRequestDoer, request *http.Request) (*http.Respo
 	if response == nil || response.Body == nil {
 		return nil, errors.New("SQL transport returned no response body")
 	}
-	if response.ContentLength > sqlMaxResponseBytes {
+	if response.ContentLength > maximum {
 		_ = response.Body.Close()
-		return nil, errors.New("SQL response exceeds 16 MiB")
+		return nil, sqlResponseLimitError(maximum)
 	}
-	response.Body = &sqlBoundedBody{ReadCloser: response.Body, remaining: sqlMaxResponseBytes}
+	response.Body = &sqlBoundedBody{ReadCloser: response.Body, remaining: maximum, maximum: maximum}
 	return response, nil
 }
 
 type sqlBoundedBody struct {
 	io.ReadCloser
 	remaining int64
+	maximum   int64
 }
 
 func (body *sqlBoundedBody) Read(buffer []byte) (int, error) {
@@ -104,7 +113,7 @@ func (body *sqlBoundedBody) Read(buffer []byte) (int, error) {
 		n, err := body.ReadCloser.Read(extra[:])
 		if n != 0 {
 			_ = body.Close()
-			return 0, errors.New("SQL response exceeds 16 MiB")
+			return 0, sqlResponseLimitError(body.maximum)
 		}
 		return 0, err
 	}
@@ -123,6 +132,21 @@ func readSQLResponseBody(body io.Reader) ([]byte, error) {
 	}
 	if len(value) > sqlMaxResponseBytes {
 		return nil, fmt.Errorf("SQL response exceeds 16 MiB")
+	}
+	return value, nil
+}
+
+func sqlResponseLimitError(maximum int64) error {
+	return fmt.Errorf("SQL response exceeds %d MiB", maximum>>20)
+}
+
+func readSQLNotificationResponseBody(body io.Reader) ([]byte, error) {
+	value, err := io.ReadAll(io.LimitReader(body, (1<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(value) > 1<<20 {
+		return nil, sqlResponseLimitError(1 << 20)
 	}
 	return value, nil
 }

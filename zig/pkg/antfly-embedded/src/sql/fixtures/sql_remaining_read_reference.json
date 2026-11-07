@@ -1,0 +1,1523 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "keyword"
+              },
+              "name": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              },
+              "organization_id": {
+                "type": "keyword"
+              },
+              "email": {
+                "type": "keyword"
+              },
+              "amount": {
+                "type": "integer"
+              },
+              "quantity": {
+                "type": "integer"
+              },
+              "tenant_id": {
+                "type": "keyword"
+              },
+              "customer_id": {
+                "type": "keyword"
+              },
+              "created_at": {
+                "type": "keyword"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "keyword"
+              },
+              "tags": {
+                "type": "sql_array",
+                "x-antfly-sql-type": "text",
+                "nullable": true
+              },
+              "metadata": {
+                "type": "json"
+              },
+              "metric_type": {
+                "type": "keyword",
+                "nullable": true
+              },
+              "scope": {
+                "type": "keyword",
+                "nullable": true
+              },
+              "expires_at": {
+                "type": "keyword",
+                "nullable": true
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "r00",
+        "value": {
+          "id": "w00",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org_0",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 1,
+          "quantity": 1,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot"
+            ],
+            "sql_nulls": [
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-0",
+            "kind": "external",
+            "flags": [
+              "group-0"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": null
+        }
+      },
+      {
+        "key": "r01",
+        "value": {
+          "id": "w01",
+          "name": "Grace",
+          "status": "active",
+          "organization_id": "org_0",
+          "email": "grace@example.test",
+          "amount": 2,
+          "quantity": 2,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-02T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 4,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "cold",
+              "old",
+              "extra",
+              "last"
+            ],
+            "sql_nulls": [
+              false,
+              false,
+              false,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-0",
+            "kind": "external",
+            "flags": [
+              "group-0"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "expires_at": "2026-01-02T00:00:00Z"
+        }
+      },
+      {
+        "key": "r02",
+        "value": {
+          "id": "w02",
+          "name": "Other",
+          "status": "ready",
+          "organization_id": "org_0",
+          "email": "blocked@example.test",
+          "amount": 3,
+          "quantity": 3,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-03T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": null,
+          "metadata": {
+            "source": "source-0",
+            "kind": "internal",
+            "flags": [
+              "group-0"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": "2026-01-03T00:00:00Z"
+        }
+      },
+      {
+        "key": "r03",
+        "value": {
+          "id": "w03",
+          "name": "Ada",
+          "status": "op_ready",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 4,
+          "quantity": 4,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-04T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": -1
+              }
+            ],
+            "values": [
+              "hot",
+              null,
+              "new"
+            ],
+            "sql_nulls": [
+              false,
+              true,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-1",
+            "kind": "external",
+            "flags": [
+              "group-1"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "expires_at": "2026-01-04T00:00:00Z"
+        }
+      },
+      {
+        "key": "r04",
+        "value": {
+          "id": "w04",
+          "name": "Grace",
+          "status": "open",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 5,
+          "quantity": 5,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-05T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 2,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot",
+              "new"
+            ],
+            "sql_nulls": [
+              false,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-0",
+            "kind": "external",
+            "flags": [
+              "group-1"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": null
+        }
+      },
+      {
+        "key": "r05",
+        "value": {
+          "id": "w05",
+          "name": "Other",
+          "status": "active",
+          "organization_id": "org_1",
+          "email": "blocked@example.test",
+          "amount": 6,
+          "quantity": 6,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-06T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "cold"
+            ],
+            "sql_nulls": [
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-1",
+            "kind": "internal",
+            "flags": [
+              "group-1"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "expires_at": "2026-01-06T00:00:00Z"
+        }
+      },
+      {
+        "key": "r06",
+        "value": {
+          "id": "w06",
+          "name": "Ada",
+          "status": "ready",
+          "organization_id": "org_2",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 7,
+          "quantity": 7,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-07T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [],
+            "values": [],
+            "sql_nulls": []
+          },
+          "metadata": {
+            "source": "source-0",
+            "kind": "external",
+            "flags": [
+              "group-2"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": "2026-01-07T00:00:00Z"
+        }
+      },
+      {
+        "key": "r07",
+        "value": {
+          "id": "w07",
+          "name": "Grace",
+          "status": "op_ready",
+          "organization_id": "org_2",
+          "email": "grace@example.test",
+          "amount": 8,
+          "quantity": 8,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-08T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 0
+              }
+            ],
+            "values": [
+              "hot",
+              null,
+              "new"
+            ],
+            "sql_nulls": [
+              false,
+              true,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-1",
+            "kind": "external",
+            "flags": [
+              "group-2"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "expires_at": "2026-01-08T00:00:00Z"
+        }
+      },
+      {
+        "key": "r08",
+        "value": {
+          "id": "w08",
+          "name": "Other",
+          "status": "open",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 9,
+          "quantity": 9,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-09T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 2,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot",
+              "new"
+            ],
+            "sql_nulls": [
+              false,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-2",
+            "kind": "internal",
+            "flags": [
+              "group-2"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": null
+        }
+      },
+      {
+        "key": "r09",
+        "value": {
+          "id": "w09",
+          "name": "Ada",
+          "status": "active",
+          "organization_id": "org_3",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 10,
+          "quantity": 10,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-10T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "cold"
+            ],
+            "sql_nulls": [
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-1",
+            "kind": "external",
+            "flags": [
+              "group-3"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "expires_at": "2026-01-10T00:00:00Z"
+        }
+      },
+      {
+        "key": "r10",
+        "value": {
+          "id": "w10",
+          "name": "Grace",
+          "status": "ready",
+          "organization_id": "org_3",
+          "email": "grace@example.test",
+          "amount": 11,
+          "quantity": 11,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-11T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [],
+            "values": [],
+            "sql_nulls": []
+          },
+          "metadata": {
+            "source": "source-2",
+            "kind": "external",
+            "flags": [
+              "group-3"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": "2026-01-11T00:00:00Z"
+        }
+      },
+      {
+        "key": "r11",
+        "value": {
+          "id": "w11",
+          "name": "Other",
+          "status": "op_ready",
+          "organization_id": "org_3",
+          "email": "blocked@example.test",
+          "amount": 12,
+          "quantity": 12,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-12T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot",
+              null,
+              "new"
+            ],
+            "sql_nulls": [
+              false,
+              true,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-3",
+            "kind": "internal",
+            "flags": [
+              "group-3"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "expires_at": "2026-01-12T00:00:00Z"
+        }
+      },
+      {
+        "key": "r12",
+        "value": {
+          "id": "w12",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org_4",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 13,
+          "quantity": 13,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-13T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 2,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot",
+              "new"
+            ],
+            "sql_nulls": [
+              false,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-2",
+            "kind": "external",
+            "flags": [
+              "group-4"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": null
+        }
+      },
+      {
+        "key": "r13",
+        "value": {
+          "id": "w13",
+          "name": "Grace",
+          "status": "active",
+          "organization_id": "org_4",
+          "email": "grace@example.test",
+          "amount": 14,
+          "quantity": 14,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-14T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "cold"
+            ],
+            "sql_nulls": [
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-3",
+            "kind": "external",
+            "flags": [
+              "group-4"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "expires_at": "2026-01-14T00:00:00Z"
+        }
+      },
+      {
+        "key": "r14",
+        "value": {
+          "id": "w14",
+          "name": "Other",
+          "status": "ready",
+          "organization_id": "org_4",
+          "email": "blocked@example.test",
+          "amount": 15,
+          "quantity": 15,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-15T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": {
+            "dimensions": [],
+            "values": [],
+            "sql_nulls": []
+          },
+          "metadata": {
+            "source": "source-4",
+            "kind": "internal",
+            "flags": [
+              "group-4"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": "2026-01-15T00:00:00Z"
+        }
+      },
+      {
+        "key": "r15",
+        "value": {
+          "id": "w15",
+          "name": "Ada",
+          "status": "op_ready",
+          "organization_id": "org_5",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 16,
+          "quantity": 16,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-16T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot",
+              null,
+              "new"
+            ],
+            "sql_nulls": [
+              false,
+              true,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-3",
+            "kind": "external",
+            "flags": [
+              "group-5"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "expires_at": "2026-01-16T00:00:00Z"
+        }
+      },
+      {
+        "key": "r16",
+        "value": {
+          "id": "w16",
+          "name": "Grace",
+          "status": "open",
+          "organization_id": "org_5",
+          "email": "grace@example.test",
+          "amount": 17,
+          "quantity": 17,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-17T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 2,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot",
+              "new"
+            ],
+            "sql_nulls": [
+              false,
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-4",
+            "kind": "external",
+            "flags": [
+              "group-5"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "write",
+          "expires_at": null
+        }
+      },
+      {
+        "key": "r17",
+        "value": {
+          "id": "w17",
+          "name": "Other",
+          "organization_id": "org_5",
+          "email": "blocked@example.test",
+          "amount": 18,
+          "quantity": 18,
+          "tenant_id": "w02",
+          "customer_id": "w01",
+          "created_at": "2026-02-18T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "cold"
+            ],
+            "sql_nulls": [
+              false
+            ]
+          },
+          "metadata": {
+            "source": "source-5",
+            "kind": "internal",
+            "flags": [
+              "group-5"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          },
+          "metric_type": "tokens",
+          "scope": "read write",
+          "status": "active",
+          "expires_at": "2026-01-18T00:00:00Z"
+        }
+      }
+    ],
+    "exact_numeric": true
+  },
+  "entries": [
+    {
+      "id": "sql-0292",
+      "columns": [
+        "id",
+        "tags_plus",
+        "tags_prefixed",
+        "tags_cat",
+        "tags_clean",
+        "tags_replaced"
+      ],
+      "rows": [
+        [
+          "w00",
+          {
+            "dimensions": [
+              {
+                "length": 2,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot",
+              "fresh"
+            ],
+            "sql_nulls": [
+              false,
+              false
+            ]
+          },
+          {
+            "dimensions": [
+              {
+                "length": 2,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "first",
+              "hot"
+            ],
+            "sql_nulls": [
+              false,
+              false
+            ]
+          },
+          {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot",
+              "tail",
+              "last"
+            ],
+            "sql_nulls": [
+              false,
+              false,
+              false
+            ]
+          },
+          {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot"
+            ],
+            "sql_nulls": [
+              false
+            ]
+          },
+          {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              "hot"
+            ],
+            "sql_nulls": [
+              false
+            ]
+          }
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1009,
+        1009,
+        1009,
+        1009,
+        1009
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0641",
+      "columns": [
+        "organization_id",
+        "id"
+      ],
+      "rows": [
+        [
+          "org_0",
+          "w02"
+        ],
+        [
+          "org_1",
+          "w05"
+        ],
+        [
+          "org_2",
+          "w08"
+        ],
+        [
+          "org_3",
+          "w11"
+        ],
+        [
+          "org_4",
+          "w14"
+        ],
+        [
+          "org_5",
+          "w17"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0642",
+      "columns": [
+        "id",
+        "status_key"
+      ],
+      "rows": [
+        [
+          "w17",
+          "active"
+        ],
+        [
+          "w15",
+          "op_ready"
+        ],
+        [
+          "w16",
+          "open"
+        ],
+        [
+          "w14",
+          "ready"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1231",
+      "columns": [
+        "organization_id",
+        "source_count",
+        "distinct_flags"
+      ],
+      "rows": [
+        [
+          "org_2",
+          3,
+          {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              [
+                "group-2"
+              ]
+            ],
+            "sql_nulls": [
+              false
+            ]
+          }
+        ],
+        [
+          "org_3",
+          3,
+          {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              [
+                "group-3"
+              ]
+            ],
+            "sql_nulls": [
+              false
+            ]
+          }
+        ],
+        [
+          "org_4",
+          3,
+          {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              [
+                "group-4"
+              ]
+            ],
+            "sql_nulls": [
+              false
+            ]
+          }
+        ],
+        [
+          "org_5",
+          3,
+          {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              [
+                "group-5"
+              ]
+            ],
+            "sql_nulls": [
+              false
+            ]
+          }
+        ],
+        [
+          "org_1",
+          2,
+          {
+            "dimensions": [
+              {
+                "length": 1,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              [
+                "group-1"
+              ]
+            ],
+            "sql_nulls": [
+              false
+            ]
+          }
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20,
+        3807
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "org_2",
+              3,
+              {
+                "dimensions": [
+                  {
+                    "length": 1,
+                    "lower_bound": 1
+                  }
+                ],
+                "values": [
+                  [
+                    "group-2"
+                  ]
+                ],
+                "sql_nulls": [
+                  false
+                ]
+              }
+            ],
+            [
+              "org_3",
+              3,
+              {
+                "dimensions": [
+                  {
+                    "length": 1,
+                    "lower_bound": 1
+                  }
+                ],
+                "values": [
+                  [
+                    "group-3"
+                  ]
+                ],
+                "sql_nulls": [
+                  false
+                ]
+              }
+            ],
+            [
+              "org_4",
+              3,
+              {
+                "dimensions": [
+                  {
+                    "length": 1,
+                    "lower_bound": 1
+                  }
+                ],
+                "values": [
+                  [
+                    "group-4"
+                  ]
+                ],
+                "sql_nulls": [
+                  false
+                ]
+              }
+            ],
+            [
+              "org_5",
+              3,
+              {
+                "dimensions": [
+                  {
+                    "length": 1,
+                    "lower_bound": 1
+                  }
+                ],
+                "values": [
+                  [
+                    "group-5"
+                  ]
+                ],
+                "sql_nulls": [
+                  false
+                ]
+              }
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false
+            ],
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "org_1",
+              2,
+              {
+                "dimensions": [
+                  {
+                    "length": 1,
+                    "lower_bound": 1
+                  }
+                ],
+                "values": [
+                  [
+                    "group-1"
+                  ]
+                ],
+                "sql_nulls": [
+                  false
+                ]
+              }
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "org_0",
+              1,
+              {
+                "dimensions": [
+                  {
+                    "length": 1,
+                    "lower_bound": 1
+                  }
+                ],
+                "values": [
+                  [
+                    "group-0"
+                  ]
+                ],
+                "sql_nulls": [
+                  false
+                ]
+              }
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1237",
+      "columns": [
+        "organization_id",
+        "record_count"
+      ],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "empty_contract": {
+        "input_rows": 18,
+        "input_groups": 6,
+        "predicate": "false"
+      }
+    },
+    {
+      "id": "sql-1253",
+      "columns": [
+        "organization_id",
+        "status"
+      ],
+      "rows": [
+        [
+          "org_0",
+          "active"
+        ],
+        [
+          "org_1",
+          "open"
+        ],
+        [
+          "org_1",
+          "op_ready"
+        ],
+        [
+          "org_1",
+          "active"
+        ],
+        [
+          "org_2",
+          "ready"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    }
+  ],
+  "excluded": [],
+  "exact_builtin_types": true,
+  "clock_contracts": [
+    {
+      "id": "sql-0174",
+      "columns": [
+        "planned_at_ns"
+      ],
+      "column_oids": [
+        1184
+      ],
+      "semantics": "transaction_start_microseconds"
+    },
+    {
+      "id": "sql-0175",
+      "columns": [
+        "planned_at_ns"
+      ],
+      "column_oids": [
+        1184
+      ],
+      "semantics": "transaction_start_microseconds"
+    },
+    {
+      "id": "sql-0176",
+      "columns": [
+        "planned_at_ns"
+      ],
+      "column_oids": [
+        1184
+      ],
+      "semantics": "transaction_start_microseconds"
+    }
+  ],
+  "uuid_contract": {
+    "id": "sql-0177",
+    "columns": [
+      "request_id"
+    ],
+    "column_oids": [
+      2950
+    ],
+    "version": 4,
+    "variant": "RFC4122"
+  }
+}

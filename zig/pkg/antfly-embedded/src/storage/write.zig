@@ -324,9 +324,7 @@ fn persistPrivacyExecution(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_jso
 }
 
 pub fn batchWritesAsTransactionWrites(writes: []const db_mod.types.BatchWrite) []const db_mod.types.TransactionWrite {
-    comptime std.debug.assert(@sizeOf(db_mod.types.BatchWrite) == @sizeOf(db_mod.types.TransactionWrite));
-    comptime std.debug.assert(@alignOf(db_mod.types.BatchWrite) == @alignOf(db_mod.types.TransactionWrite));
-    return @ptrCast(writes);
+    return writes;
 }
 
 pub fn corruptEmbeddingArtifactInDb(
@@ -1633,6 +1631,13 @@ pub fn validateTableBatchAgainstLocalSchema(
     // CPU and allocation cost without improving error timing: both paths are
     // synchronous and return InvalidBatchRequest before any durable mutation.
     if (db.usesRelationalStorage()) return;
+    {
+        var view = db.core.acquireSchemaView();
+        defer if (view) |*pinned| pinned.release();
+        // The pinned native document pipeline now validates ordinary schemas
+        // as well as generated expressions, after final transform coalescing.
+        if (view) |pinned| if (pinned.validator() != null) return;
+    }
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;
@@ -1761,6 +1766,21 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     historical_ordered_apply: bool,
 ) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call("writeConfigureStorageKernelOwnerDbAtOpen", .{ alloc, db, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, historical_ordered_apply });
+    const schema_policy = try db.schemaOwnerCatalogPolicy(schema_json, historical_ordered_apply);
+    if (schema_policy != .unprotected) {
+        if (schema_policy == .deferred) return true;
+        const durable = (try loadOwnerCatalogContract(alloc, db)) orelse return true;
+        defer alloc.free(durable);
+        if (!std.mem.eql(u8, durable, indexes_json)) return true;
+        // Restore only the already durable query/producer runtime. No schema,
+        // index reconciliation or desired-contract write is admitted here.
+        if (backend_runtime != null and (if (installed) |state| !state.matches(durable) else true)) {
+            try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, durable, backend_runtime, antfly_provider, null, inference.api_url, inference.api_key, table_name, secret_store, remote_content);
+            try db.resumeEnrichmentRuntimeAfterReconfigure("protected schema owner reopen", "*");
+        }
+        if (installed) |state| state.publish(durable);
+        return false;
+    }
     if (historical_ordered_apply) {
         const stored = try loadOwnerCatalogContract(alloc, db);
         defer if (stored) |value| alloc.free(value);
@@ -1987,6 +2007,10 @@ pub fn reconcileStorageKernelOwnerDb(
     installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
     if (comptime storage_engine.enabled) return storage_engine.call("writeReconcileStorageKernelOwnerDb", .{ alloc, db, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, inference, installed });
+    // A scheduler hint cannot repair or mutate this protected catalog, even
+    // if the visible descriptor happens to equal the newly installed schema.
+    if (try db.schemaOwnerCatalogPolicy("", true) != .unprotected)
+        return .{ .state = .busy };
     if (schema_json.len > 0 and try db.childGenerationSourcePinsSchemaJson(schema_json))
         return .{ .state = .busy };
     if (try db.childGenerationSourceDefersOwnerCatalog())
@@ -2415,7 +2439,7 @@ test "owner configuration preserves the prior excluded source epoch bytes" {
     defer a.free(historical);
     var reopened = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false });
     defer reopened.close();
-    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(a, &reopened, "docs", json, "{}", null, null, null, null, null, false)));
+    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(a, &reopened, "docs", json, "{}", null, null, null, null, .{}, null, false)));
     try std.testing.expect(try reopened.rehydrateSchemaJson(json));
     const encoded = try reopened.core.store.get(a, storage_schema.schema_key);
     defer a.free(encoded);

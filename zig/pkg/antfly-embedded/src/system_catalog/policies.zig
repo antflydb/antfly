@@ -54,7 +54,18 @@ pub const Predicate = struct {
                         .string => .string,
                         .array, .object => .json,
                     };
-                    if (actual != null and instruction.type.kind != actual) return error.InvalidRowPolicyProgram;
+                    // Literal instructions retain their input image; the
+                    // scalar evaluator applies the resolved output domain.
+                    // Exact NUMERIC comparisons legitimately retain an
+                    // integer literal here, and UUID inputs are canonical text.
+                    const numeric_input = actual == .integer and instruction.type.kind == .number;
+                    const uuid_input = actual == .string and instruction.type.kind == .uuid;
+                    if (uuid_input) {
+                        const uuid = @import("../common/uuid.zig");
+                        const canonical = uuid.format(uuid.parse(value.string) catch return error.InvalidRowPolicyProgram);
+                        if (!std.mem.eql(u8, &canonical, value.string)) return error.InvalidRowPolicyProgram;
+                    }
+                    if (actual != null and instruction.type.kind != actual and !numeric_input and !uuid_input) return error.InvalidRowPolicyProgram;
                 },
                 .column => |ordinal| {
                     if (ordinal >= columns.len or instruction.type.kind != columns[ordinal].type) return error.InvalidRowPolicyProgram;
@@ -106,6 +117,7 @@ pub const Predicate = struct {
                             .trim, .ltrim, .rtrim => count == 1 or count == 2,
                             .coalesce, .greatest, .least => count > 0,
                             .concat => true,
+                            .@"$current_user" => count == 0 and instruction.type.kind == .string,
                             else => false,
                         };
                         if (!valid) return error.InvalidRowPolicyProgram;
@@ -154,9 +166,12 @@ pub const Record = struct {
     permissive: bool = true,
     using: ?Predicate = null,
     with_check: ?Predicate = null,
+    /// USING is also the implicit write check unless WITH CHECK was explicit.
+    /// Retain this provenance so ALTER USING cannot keep a stale write gate.
+    check_uses_using: bool = false,
 
     pub fn validateShape(self: @This()) !void {
-        if (self.id == 0 or self.generation == 0 or self.table_id == 0 or self.schema_version == 0 or
+        if (self.id == 0 or self.generation == 0 or self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or
             self.name.len == 0 or self.name.len > 128 or !self.commands.any() or self.roles.len == 0 or self.roles.len > 256)
             return error.InvalidRowPolicyRecord;
         for (self.name) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_') return error.InvalidRowPolicyRecord;
@@ -185,6 +200,9 @@ pub const Command = struct {
     version: u16 = 1,
     expected_revision: u64,
     change: union(enum) { put: Record, drop: struct { id: u64, generation: u64, table_id: u64 } },
+    /// Active-table edits atomically freeze and enqueue their successor epoch.
+    /// Only metadata admission may populate this topology-fenced descriptor.
+    publication: ?Publication = null,
 };
 
 pub const Snapshot = struct {
@@ -237,7 +255,7 @@ pub const OwnerDescriptor = struct {
 
     pub fn digest(self: @This()) ![32]u8 {
         if (self.table_id == 0 or self.group_id == 0 or self.range_id == 0 or
-            self.schema_version == 0 or
+            std.mem.allEqual(u8, &self.schema_digest, 0) or
             self.range_start.len > std.math.maxInt(u32) or self.range_end.len > std.math.maxInt(u32))
             return error.InvalidRowPolicyPublication;
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -286,6 +304,106 @@ test "row-policy owner descriptor digest fences physical range and generation" {
     try std.testing.expect(!std.mem.eql(u8, &baseline, &changed_range_digest));
 }
 
+/// An immutable same-object trigger-only schema successor. Both native
+/// layout identities remain truthful; compatibility does not rewrite history.
+pub const SchemaPair = struct {
+    before_schema_json: []const u8,
+    after_schema_json: []const u8,
+    before_schema_digest: [32]u8,
+    after_schema_digest: [32]u8,
+    before_record_digest: [32]u8,
+    staged_record_digest: [32]u8,
+    after_record_digest: [32]u8,
+    before_policy_generation: u64,
+    before_catalog_epoch: u64,
+
+    pub const Schemas = struct { before: @import("../storage/schema.zig").TableSchema, after: @import("../storage/schema.zig").TableSchema };
+
+    pub fn materialize(self: @This(), a: std.mem.Allocator) !Schemas {
+        if (self.before_schema_json.len == 0 or self.after_schema_json.len == 0 or
+            self.before_schema_json.len > max_install_snapshot_bytes or
+            self.after_schema_json.len > max_install_snapshot_bytes - self.before_schema_json.len or
+            self.before_policy_generation == 0 or self.before_catalog_epoch == 0) return error.InvalidRowPolicyBundle;
+        inline for (.{ self.before_schema_digest, self.after_schema_digest, self.before_record_digest, self.staged_record_digest, self.after_record_digest }) |field_digest| {
+            if (std.mem.allEqual(u8, &field_digest, 0)) return error.InvalidRowPolicyBundle;
+        }
+        const parser = @import("../schema/mod.zig");
+        const native = @import("../storage/schema.zig");
+        var before_public = try parser.parseValidatedTableSchema(a, self.before_schema_json);
+        defer before_public.deinit(a);
+        var after_public = try parser.parseValidatedTableSchema(a, self.after_schema_json);
+        defer after_public.deinit(a);
+        const before = try parser.deriveRuntimeTableSchema(a, before_public);
+        errdefer native.freeSchema(a, before);
+        const after = try parser.deriveRuntimeTableSchema(a, after_public);
+        errdefer native.freeSchema(a, after);
+        if (before.storage_mode != .relational or after.storage_mode != .relational or
+            after.version != try std.math.add(u32, before.version, 1)) return error.RowPolicyCatalogChanged;
+        const before_bytes = try native.serializeSchema(a, before);
+        defer a.free(before_bytes);
+        const after_bytes = try native.serializeSchema(a, after);
+        defer a.free(after_bytes);
+        var before_digest: [32]u8 = undefined;
+        var after_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(before_bytes, &before_digest, .{});
+        std.crypto.hash.Blake3.hash(after_bytes, &after_digest, .{});
+        if (!std.mem.eql(u8, &before_digest, &self.before_schema_digest) or
+            !std.mem.eql(u8, &after_digest, &self.after_schema_digest)) return error.RowPolicyCatalogChanged;
+        var normalized = after;
+        normalized.version = before.version;
+        const normalized_bytes = try native.serializeSchema(a, normalized);
+        defer a.free(normalized_bytes);
+        if (!std.mem.eql(u8, before_bytes, normalized_bytes)) return error.RowPolicyUnsupported;
+        var before_json = try std.json.parseFromSlice(std.json.Value, a, self.before_schema_json, .{ .allocate = .alloc_always });
+        defer before_json.deinit();
+        var after_json = try std.json.parseFromSlice(std.json.Value, a, self.after_schema_json, .{ .allocate = .alloc_always });
+        defer after_json.deinit();
+        if (before_json.value != .object or after_json.value != .object) return error.InvalidRowPolicyBundle;
+        var compared = before_json.value;
+        var candidate = after_json.value;
+        _ = compared.object.swapRemove("version");
+        _ = compared.object.swapRemove("sql_triggers");
+        _ = candidate.object.swapRemove("version");
+        _ = candidate.object.swapRemove("sql_triggers");
+        if (!jsonEqual(compared, candidate)) return error.RowPolicyUnsupported;
+        return .{ .before = before, .after = after };
+    }
+
+    pub fn digest(self: @This(), a: std.mem.Allocator) ![32]u8 {
+        const bytes = try std.json.Stringify.valueAlloc(a, self, .{});
+        defer a.free(bytes);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly:row-policy-schema-pair:v1\x00");
+        hash.update(bytes);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+
+    fn jsonEqual(left: std.json.Value, right: std.json.Value) bool {
+        if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+        return switch (left) {
+            .null => true,
+            .bool => |value| value == right.bool,
+            .integer => |value| value == right.integer,
+            .float => |value| value == right.float,
+            .number_string => |value| std.mem.eql(u8, value, right.number_string),
+            .string => |value| std.mem.eql(u8, value, right.string),
+            .array => |value| block: {
+                if (value.items.len != right.array.items.len) break :block false;
+                for (value.items, right.array.items) |a, b| if (!jsonEqual(a, b)) break :block false;
+                break :block true;
+            },
+            .object => |value| block: {
+                if (value.count() != right.object.count()) break :block false;
+                var entries = value.iterator();
+                while (entries.next()) |entry| if (!jsonEqual(entry.value_ptr.*, right.object.get(entry.key_ptr.*) orelse break :block false)) break :block false;
+                break :block true;
+            },
+        };
+    }
+};
+
 pub const InstallSnapshot = struct {
     table_id: u64,
     schema_version: u32,
@@ -293,14 +411,31 @@ pub const InstallSnapshot = struct {
     policy_generation: u64,
     catalog_epoch: u64,
     phase: Publication.Phase,
+    schema_pair: ?SchemaPair = null,
     records: []const Record,
     settings: []const @import("settings.zig").Record,
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "schema_pair")) or self.schema_pair != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.policy_generation == 0 or
+        if (self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or self.policy_generation == 0 or
             self.catalog_epoch == 0 or self.records.len > 1024 or self.settings.len > 1024)
             return error.InvalidRowPolicyRecord;
-        if (self.phase != .disabled and self.records.len == 0) return error.InvalidRowPolicyRecord;
+        if (self.schema_pair) |pair| {
+            if ((self.phase != .pending_install and self.phase != .serving_install and self.phase != .active) or
+                self.policy_generation <= pair.before_policy_generation or self.catalog_epoch <= pair.before_catalog_epoch or
+                !std.mem.eql(u8, &self.schema_digest, &pair.after_schema_digest)) return error.InvalidRowPolicyRecord;
+        }
+        // An enabled table with no policies is a valid default-deny epoch.
         for (self.records, 0..) |record, i| {
             try record.validateShape();
             if (record.table_id != self.table_id or record.schema_version != self.schema_version or
@@ -316,6 +451,30 @@ pub const InstallSnapshot = struct {
         }
     }
 };
+
+test "empty enabled row-policy installation is default deny for every action" {
+    const alloc = std.testing.allocator;
+    const empty: InstallSnapshot = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(9), .policy_generation = 1, .catalog_epoch = 2, .phase = .pending_install, .records = &.{}, .settings = &.{} };
+    try empty.validateShape();
+    const OwnerFixture = struct {
+        fn settings(_: *anyopaque, _: std.mem.Allocator, scope: @import("settings.zig").Scope) !@import("settings.zig").Snapshot {
+            return .{ .scope = scope, .epoch = 2, .definitions = &.{} };
+        }
+        fn policy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8) !Snapshot {
+            return .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(9), .policy_generation = 1, .catalog_epoch = 2, .principal = "alice", .database = "main", .records = &.{} };
+        }
+    };
+    var dummy: u8 = 0;
+    var settings = try setting_catalog.View.capture(alloc, .{ .ptr = &dummy, .load = OwnerFixture.settings }, .{ .principal = "alice", .database = "main" }, &.{});
+    defer settings.deinit();
+    var view = try View.capture(alloc, .{ .ptr = &dummy, .load = OwnerFixture.policy }, .{ .id = 7, .physical_name = "table:7", .schema_version = 1, .columns = &.{} }, @splat(9), &settings);
+    defer view.deinit();
+    for (std.enums.values(Evaluator.Action)) |action| {
+        var evaluator = try Evaluator.init(alloc, &view, &settings, action);
+        defer evaluator.deinit();
+        try std.testing.expect(!try evaluator.permits(alloc, &.{}));
+    }
+}
 
 /// Metadata-owned distributed publication. ACKs are exact owner-descriptor
 /// identities, not just group IDs: a split, relocation, or generation swap
@@ -347,6 +506,7 @@ pub const Publication = struct {
     /// Digest of schema, migration, and index-capability bytes maintained
     /// transactionally with table upserts. Zero forces full validation.
     schema_record_digest: [32]u8 = @splat(0),
+    schema_pair: ?SchemaPair = null,
     /// A prior active generation remains the read authority while a new
     /// immutable candidate is staged, until metadata promotes it.
     serving_generation: ?u64 = null,
@@ -359,13 +519,30 @@ pub const Publication = struct {
     /// until each one has durably installed disabled and this receipt lands.
     disabled_acknowledged_owners: []const OwnerAck = &.{},
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "schema_pair")) or self.schema_pair != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.generation == 0 or
+        if (self.table_id == 0 or std.mem.allEqual(u8, &self.schema_digest, 0) or self.generation == 0 or
             self.catalog_epoch == 0 or self.required_owners.len == 0 or self.required_owners.len > 4096 or
             self.acknowledged_owners.len > self.required_owners.len or
             self.serving_acknowledged_owners.len > self.required_owners.len or
             self.disabled_acknowledged_owners.len > self.required_owners.len)
             return error.InvalidRowPolicyPublication;
+        if (self.schema_pair) |pair| {
+            if ((self.phase != .pending_install and self.phase != .serving_install and self.phase != .active) or
+                self.generation <= pair.before_policy_generation or self.catalog_epoch <= pair.before_catalog_epoch or
+                !std.mem.eql(u8, &self.schema_digest, &pair.after_schema_digest)) return error.InvalidRowPolicyPublication;
+            if (self.phase != .active and (self.serving_generation != pair.before_policy_generation or self.serving_catalog_epoch != pair.before_catalog_epoch)) return error.InvalidRowPolicyPublication;
+        }
         if (self.serving_generation) |serving| {
             if (serving == 0 or serving >= self.generation or self.serving_catalog_epoch == null or self.serving_catalog_epoch.? == 0 or self.serving_catalog_epoch.? >= self.catalog_epoch or
                 (self.phase != .pending_install and self.phase != .pending_disable and
@@ -440,7 +617,7 @@ pub const PublicationStamp = struct {
     }
 
     pub fn validateShape(self: @This()) !void {
-        if (self.table_id == 0 or self.schema_version == 0 or self.generation == 0 or self.catalog_epoch == 0) return error.InvalidRowPolicyPublication;
+        if (self.table_id == 0 or self.generation == 0 or self.catalog_epoch == 0) return error.InvalidRowPolicyPublication;
         if (self.serving_generation) |serving| {
             if (serving == 0 or serving >= self.generation or self.serving_catalog_epoch == null or self.serving_catalog_epoch.? == 0 or self.serving_catalog_epoch.? >= self.catalog_epoch or
                 (self.phase != .pending_install and self.phase != .pending_disable and self.phase != .serving_install and self.phase != .serving_disable)) return error.InvalidRowPolicyPublication;
@@ -460,6 +637,23 @@ pub const PublicationStamp = struct {
         };
     }
 };
+
+test "row-policy native zero schema epochs retain explicit identity and digest guards" {
+    // Managed native CREATE starts at zero. Schema version is a required
+    // field, not a presence bit; generation/catalog epoch remain nonzero.
+    const predicate: Predicate = .{ .instructions = &.{.{ .type = .{ .kind = .boolean, .nullable = false }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0 };
+    var record: Record = .{ .id = 1, .generation = 1, .table_id = 7, .schema_version = 0, .schema_digest = @splat(2), .name = "visible", .commands = .{ .select = true }, .roles = &.{"PUBLIC"}, .using = predicate };
+    try record.validateShape();
+    const owner: OwnerDescriptor = .{ .table_id = 7, .group_id = 9, .shard_id = 9, .range_id = 9, .schema_version = 0, .schema_digest = @splat(2), .range_start = "", .range_end = "" };
+    const descriptor = try owner.digest();
+    const snapshot: InstallSnapshot = .{ .table_id = 7, .schema_version = 0, .schema_digest = @splat(2), .policy_generation = 1, .catalog_epoch = 2, .phase = .pending_install, .records = &.{record}, .settings = &.{} };
+    try snapshot.validateShape();
+    const publication: Publication = .{ .table_id = 7, .schema_version = 0, .schema_digest = @splat(2), .generation = 1, .catalog_epoch = 2, .phase = .pending_install, .required_owners = &.{.{ .group_id = 9, .descriptor_digest = descriptor }}, .acknowledged_owners = &.{} };
+    try publication.validateShape();
+    try PublicationStamp.fromPublication(publication).validateShape();
+    record.schema_digest = @splat(0);
+    try std.testing.expectError(error.InvalidRowPolicyRecord, record.validateShape());
+}
 
 test "row-policy publication stamp retains prior serving authority only during candidate install" {
     const active: PublicationStamp = .{ .table_id = 7, .schema_version = 1, .generation = 4, .catalog_epoch = 9, .topology_generation = 1, .schema_record_digest = @splat(1), .phase = .active };
@@ -596,6 +790,13 @@ pub const Evaluator = struct {
     /// the metadata policy snapshot itself may never assert them. This keeps
     /// policy definitions and authentication claims under separate authority.
     pub fn initForAuthenticatedRoles(alloc: std.mem.Allocator, view: *const View, settings: *const setting_catalog.View, command: Action, authenticated_roles: []const []const u8) !Evaluator {
+        return initForAuthenticatedPrincipal(alloc, view, settings, command, view.snapshot.principal, authenticated_roles);
+    }
+
+    /// Only owner-verified statement proofs may separate policy selection
+    /// from expression identity. Never rewrite the settings principal to the
+    /// view owner: current_user in USING predicates remains the caller.
+    pub fn initForAuthenticatedPrincipal(alloc: std.mem.Allocator, view: *const View, settings: *const setting_catalog.View, command: Action, policy_principal: []const u8, authenticated_roles: []const []const u8) !Evaluator {
         if (view.snapshot.catalog_epoch > settings.epoch or
             !std.mem.eql(u8, view.snapshot.principal, settings.scope.principal) or
             !std.mem.eql(u8, view.snapshot.database, settings.scope.database) or
@@ -614,7 +815,7 @@ pub const Evaluator = struct {
                 .update_old, .update_new => record.commands.update,
                 .delete => record.commands.delete,
             };
-            if (!applies or !roleMatches(record.roles, view.snapshot.principal, authenticated_roles)) continue;
+            if (!applies or !roleMatches(record.roles, policy_principal, authenticated_roles)) continue;
             const predicate: *const Predicate = switch (command) {
                 .insert, .update_new => if (record.with_check) |*program| program else return error.InvalidRowPolicyRecord,
                 .select, .delete, .update_old => if (record.using) |*program| program else return error.InvalidRowPolicyRecord,
@@ -694,6 +895,41 @@ fn evaluatePredicate(predicate: *const Predicate, settings: *const setting_catal
     if (result.sql_null) return false;
     if (result.value != .bool) return error.InvalidRowPolicyProgram;
     return result.value.bool;
+}
+
+test "row policy typed numeric and array predicates preserve native schema domains" {
+    const Fake = struct {
+        fn load(_: *anyopaque, _: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{} };
+        }
+    };
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var settings = try setting_catalog.View.capture(a, .{ .ptr = &marker, .load = Fake.load }, .{ .principal = "caller", .database = "default" }, &.{});
+    defer settings.deinit();
+    const columns = [_]sql_catalog.Column{
+        .{ .name = "id", .path = "id", .type = .integer, .element_type = .int64 },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .numeric },
+        .{ .name = "tags", .path = "tags", .type = .array, .element_type = .text },
+        .{ .name = "u", .path = "u", .type = .uuid, .element_type = .uuid },
+    };
+    var scalar_columns: [columns.len]scalar.Column = undefined;
+    for (columns, &scalar_columns) |column, *out| out.* = .{
+        .name = column.name,
+        .type = column.type,
+        .element_type = column.element_type,
+        .nullable = column.nullable,
+    };
+    for ([_][]const u8{
+        "id=1 AND amount>10 AND tags IS NOT NULL",
+        "u='A0EEBC999C0B4EF8BB6D6BB9BD380A11'",
+    }) |sql| {
+        var parsed = try @import("../sql/compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        var program = try scalar.bindExpectedWithSettings(a, parsed.expression, &scalar_columns, &.{}, .boolean, .{}, &settings);
+        defer program.deinit();
+        try (Predicate{ .instructions = program.instructions, .root = program.root }).validate(&columns, &settings);
+    }
 }
 
 test "row policy capture fences revocation and rejects client-writable setting dependencies" {
@@ -798,9 +1034,61 @@ test "owner policy evaluator combines permissive and restrictive programs with S
     var bob_with_verified_role = try Evaluator.initForAuthenticatedRoles(alloc, &view, &settings, .select, &.{"alice"});
     defer bob_with_verified_role.deinit();
     try std.testing.expect(try bob_with_verified_role.permits(alloc, &.{ scalar.Datum.json(.{ .string = "a" }), scalar.Datum.json(.{ .bool = true }) }));
+    var owner_delegated = try Evaluator.initForAuthenticatedPrincipal(alloc, &view, &settings, .select, "alice", &.{});
+    defer owner_delegated.deinit();
+    try std.testing.expect(try owner_delegated.permits(alloc, &.{ scalar.Datum.json(.{ .string = "a" }), scalar.Datum.json(.{ .bool = true }) }));
+    try std.testing.expectEqualStrings("bob", owner_delegated.settings.scope.principal);
+    try std.testing.expectEqualStrings("bob", view.snapshot.principal);
     view.snapshot.principal = "alice";
     settings.scope.principal = "alice";
     var insert = try Evaluator.init(alloc, &view, &settings, .insert);
     defer insert.deinit();
     try std.testing.expect(!try insert.permits(alloc, &.{ scalar.Datum.json(.{ .string = "a" }), scalar.Datum.json(.{ .bool = true }) }));
+}
+
+/// Bounded feature projection for the opaque owner install snapshot. Malformed
+/// input conservatively requires the new decoder; semantic validation remains
+/// in the normal install path. Row strings are skipped without allocation.
+pub fn requiresSchemaPairDecoder(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    if (bytes.len > 4 * 1024 * 1024) return true;
+    var memory: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
+    defer scanner.deinit();
+    if ((scanner.next() catch return true) != .object_begin) return true;
+    while ((scanner.peekNextTokenType() catch return true) != .object_end) {
+        const key = scanner.nextAllocMax(fixed.allocator(), .alloc_if_needed, 1024) catch return true;
+        const paired = switch (key) {
+            .string => |name| std.mem.eql(u8, name, "schema_pair"),
+            .allocated_string => |name| value: {
+                defer fixed.allocator().free(name);
+                break :value std.mem.eql(u8, name, "schema_pair");
+            },
+            else => return true,
+        };
+        if (paired and (scanner.peekNextTokenType() catch return true) != .null) return true;
+        scanner.skipValue() catch return true;
+    }
+    _ = scanner.next() catch return true;
+    return (scanner.next() catch return true) != .end_of_document;
+}
+
+test "row-policy coupled schema decoder projects captured snapshot before historical selectors" {
+    try std.testing.expect(!requiresSchemaPairDecoder("{}"));
+    try std.testing.expect(!requiresSchemaPairDecoder("{\"schema_pair\":null}"));
+    try std.testing.expect(!requiresSchemaPairDecoder("{\"name\":\"schema_pair\"}"));
+    try std.testing.expect(requiresSchemaPairDecoder("{\"schema_pair\":{}}"));
+    try std.testing.expect(requiresSchemaPairDecoder("{\"schema_p\\u0061ir\":{}}"));
+    try std.testing.expect(requiresSchemaPairDecoder("{"));
+}
+
+test "row-policy coupled schema optional snapshot field preserves historical ordinary bytes" {
+    const a = std.testing.allocator;
+    const snapshot: InstallSnapshot = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .policy_generation = 2, .catalog_epoch = 3, .phase = .pending_install, .records = &.{}, .settings = &.{} };
+    const actual = try std.json.Stringify.valueAlloc(a, snapshot, .{});
+    defer a.free(actual);
+    const old = try std.json.Stringify.valueAlloc(a, .{ .table_id = snapshot.table_id, .schema_version = snapshot.schema_version, .schema_digest = snapshot.schema_digest, .policy_generation = snapshot.policy_generation, .catalog_epoch = snapshot.catalog_epoch, .phase = snapshot.phase, .records = snapshot.records, .settings = snapshot.settings }, .{});
+    defer a.free(old);
+    try std.testing.expectEqualStrings(old, actual);
 }

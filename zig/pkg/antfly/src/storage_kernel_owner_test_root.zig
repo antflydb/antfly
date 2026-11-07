@@ -20,6 +20,7 @@ const owner_tests = @import("storage/kernel_owner_test.zig");
 
 test {
     _ = owner_tests;
+    _ = @import("storage/kernel_owner_trigger_test.zig");
 }
 
 /// Implementation source choices for this compilation root.

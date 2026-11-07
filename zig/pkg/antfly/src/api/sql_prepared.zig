@@ -32,6 +32,26 @@ pub const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
+    kind: enum { table, view, sequence, function, procedure, operator, aggregate, cast, named_type } = .table,
+    /// A prepared cast retains identity independently of namespace spelling.
+    /// Executable enum generations are append-only, so additive generations
+    /// may advance while drop/recreate and catalog replacement remain fenced.
+    named_type: ?struct {
+        lookup: []const u8,
+        incarnation: [16]u8,
+        namespace_id: u64,
+        origin_id: [16]u8,
+    } = null,
+    cast_database_id: ?u64 = null,
+    cast_pair: ?@import("antfly_local_sources").sql_catalog.casts.Pair = null,
+    sequence_incarnation: ?[16]u8 = null,
+    routine_incarnation: ?[16]u8 = null,
+    routine_signature: ?[]const u8 = null,
+    routine_namespace_id: ?u64 = null,
+    /// Original normalized lookup spelling. Dependency-only identity witnesses
+    /// have no spelling and never participate in overload selection.
+    routine_lookup: ?[]const u8 = null,
+    definition_digest: ?[32]u8 = null,
     database: []const u8,
     namespace: []const u8,
     name: []const u8,
@@ -39,22 +59,116 @@ pub const Binding = struct {
     id: u64,
     schema_version: u32,
     revision: u64,
+    /// Binds an immutable native lifetime independently of schema-version reuse.
+    sql_persistence_fingerprint: ?[32]u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            const emit = if (comptime std.mem.eql(u8, name, "sql_persistence_fingerprint")) self.sql_persistence_fingerprint != null else true;
+            if (emit) {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
 
     pub fn from(table: catalog.Table) !Binding {
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
-        return .{ .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision };
+        return .{ .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical_name = table.physical_name, .id = table.id, .schema_version = table.schema_version, .revision = scope.revision, .sql_persistence_fingerprint = if (table.sql_persistence) |descriptor| try descriptor.fingerprint() else null };
     }
 
     pub fn verify(bindings: []const Binding, table: catalog.Table) !void {
         const current = try from(table);
         for (bindings) |entry| {
+            if (entry.kind != .table) continue;
             if (!std.mem.eql(u8, entry.database, current.database) or !std.mem.eql(u8, entry.namespace, current.namespace) or !std.mem.eql(u8, entry.name, current.name)) continue;
-            if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
+            if (entry.id != current.id or entry.schema_version != current.schema_version or entry.revision != current.revision or !std.meta.eql(entry.sql_persistence_fingerprint, current.sql_persistence_fingerprint) or !std.mem.eql(u8, entry.physical_name, current.physical_name)) return error.CatalogGenerationChanged;
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+
+    pub fn fromCast(a: std.mem.Allocator, database: []const u8, snapshot: @import("../system_catalog/casts.zig").Snapshot, pair: @import("antfly_local_sources").sql_catalog.casts.Pair) !Binding {
+        return .{ .kind = .cast, .database = database, .namespace = "", .name = try pair.keyAlloc(a), .physical_name = "", .id = if (snapshot.record) |record| record.id else 0, .schema_version = if (snapshot.record) |record| record.generation else 0, .revision = snapshot.revision, .routine_incarnation = snapshot.incarnation, .cast_database_id = snapshot.database_id orelse return error.DatabaseNotFound, .cast_pair = pair };
+    }
+    pub fn verifyCast(bindings: []const Binding, current: Binding) !void {
+        if (current.kind != .cast or current.cast_pair == null or current.cast_database_id == null or current.cast_database_id == 0 or current.routine_incarnation == null or ((current.id == 0) != (current.schema_version == 0))) return error.InvalidSqlBackendResponse;
+        if (std.mem.allEqual(u8, &current.routine_incarnation.?, 0)) return error.InvalidSqlBackendResponse;
+        current.cast_pair.?.validate() catch return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != .cast or !std.meta.eql(entry.cast_pair, current.cast_pair) or entry.cast_database_id != current.cast_database_id) continue;
+            if (entry.id != current.id or entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation)) return error.CatalogGenerationChanged;
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+
+    pub fn fromRoutine(a: std.mem.Allocator, target: @import("antfly_local_sources").system_catalog_domain.Target, record: @import("antfly_local_sources").sql_catalog.routines.records.Record, incarnation: [16]u8, revision: u64) !Binding {
+        return .{ .kind = std.meta.stringToEnum(@FieldType(Binding, "kind"), @tagName(record.kind)).?, .database = target.database, .namespace = target.namespace, .name = target.table, .physical_name = "", .id = record.id, .schema_version = record.generation, .revision = revision, .routine_incarnation = incarnation, .routine_signature = try record.definition.signatureAlloc(a) };
+    }
+    pub fn verifyRoutine(bindings: []const Binding, current: Binding) !void {
+        if ((current.kind != .function and current.kind != .procedure and current.kind != .operator and current.kind != .aggregate) or current.routine_incarnation == null or current.routine_signature == null or current.routine_namespace_id == null or current.routine_namespace_id == 0) return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != current.kind or entry.id != current.id) continue;
+            if (entry.routine_namespace_id != current.routine_namespace_id or entry.schema_version != current.schema_version or !std.meta.eql(entry.routine_incarnation, current.routine_incarnation) or entry.routine_signature == null or !std.mem.eql(u8, entry.routine_signature.?, current.routine_signature.?)) return error.CatalogGenerationChanged;
+            return;
+        }
+        return error.CatalogGenerationChanged;
+    }
+
+    pub fn fromView(target: @import("antfly_local_sources").system_catalog_domain.Target, id: u64, generation: u32, digest: [32]u8, revision: u64) Binding {
+        return .{
+            .kind = .view,
+            .definition_digest = digest,
+            .database = target.database,
+            .namespace = target.namespace,
+            .name = target.table,
+            .physical_name = "",
+            .id = id,
+            .schema_version = generation,
+            .revision = revision,
+        };
+    }
+    pub fn verifyView(bindings: []const Binding, current: Binding) !void {
+        if (current.kind != .view or current.definition_digest == null) return error.InvalidSqlBackendResponse;
+        for (bindings) |entry| {
+            if (entry.kind != .view or entry.id != current.id) continue;
+            if (entry.schema_version != current.schema_version or entry.definition_digest == null or
+                !std.mem.eql(u8, &entry.definition_digest.?, &current.definition_digest.?)) return error.CatalogGenerationChanged;
+            // Compatible source changes and relation renames do not change a
+            // view definition. Every execution still pins a fresh catalog cut.
             return;
         }
         return error.CatalogGenerationChanged;
     }
 };
+
+test "SQL prepared view manifests preserve identity across source epochs and reject retargeted definitions" {
+    const target: @import("antfly_local_sources").system_catalog_domain.Target = .{ .table = "stored" };
+    const original = Binding.fromView(target, 7, 1, @splat(1), 3);
+    var current = original;
+    current.revision = 9;
+    current.name = "renamed";
+    try Binding.verifyView(&.{original}, current);
+    current.id = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    current = original;
+    current.definition_digest = @splat(2);
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    current = original;
+    current.schema_version = 2;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyView(&.{original}, current));
+    const table: catalog.Table = .{
+        .id = 7,
+        .physical_name = "",
+        .schema_version = 1,
+        .columns = &.{},
+        .scope = .{ .database = target.database, .namespace = target.namespace, .name = target.table, .revision = 3 },
+    };
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verify(&.{original}, table));
+}
 
 pub const Resource = struct {
     id: [32]u8,
@@ -75,6 +189,7 @@ pub const Resource = struct {
     /// The described types depend on the scoped setting definitions, not on
     /// the mutable session values. Execution re-reads values at its own cut.
     setting_epoch: ?u64 = null,
+    lookup_path: ?@import("../pgwire/search_path.zig").Path = null,
     parameter_types: []const ?ast.ColumnType,
     parameter_descriptors: []const @import("antfly_local_sources").sql_scalar.Type = &.{},
     bindings: []const Binding,
@@ -105,10 +220,11 @@ const Directory = struct { resources: []const Entry = &.{} };
 const Action = union(enum) { create: Resource, close: []const u8 };
 
 fn validateParameters(resource: Resource) !void {
+    if (resource.lookup_path) |path| try path.validate();
     if (resource.parameter_types.len != resource.parameter_descriptors.len or resource.parameter_descriptors.len > 1024) return error.InvalidSqlParameters;
     for (resource.parameter_types, resource.parameter_descriptors) |kind, descriptor| {
         if (kind != descriptor.kind) return error.InvalidSqlParameters;
-        try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
+        try @import("antfly_local_sources").sql_scalar.validateParameterDescriptorWire(descriptor);
     }
 }
 
@@ -423,4 +539,19 @@ test "SQL prepared resource survives native store restart and transaction cleanu
     var reopened = try transactions.OpenedSessionStore.open(alloc, directory.path());
     defer reopened.deinit();
     try std.testing.expectError(error.SqlPreparedNotFound, load(reopened.durableStore(), alloc, &resource.id, "alice", 7, 3));
+}
+
+test "SQL prepared routine manifests reject replaced generations signatures and cluster incarnations" {
+    const first: Binding = .{ .kind = .function, .database = "default", .namespace = "public", .name = "f", .physical_name = "", .id = 7, .schema_version = 1, .revision = 2, .routine_signature = "text", .routine_incarnation = @splat(1), .routine_namespace_id = 2 };
+    var current = first;
+    current.revision = 90;
+    try Binding.verifyRoutine(&.{first}, current);
+    current.schema_version = 2;
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
+    current = first;
+    current.routine_signature = "int32";
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
+    current = first;
+    current.routine_incarnation = @splat(2);
+    try std.testing.expectError(error.CatalogGenerationChanged, Binding.verifyRoutine(&.{first}, current));
 }

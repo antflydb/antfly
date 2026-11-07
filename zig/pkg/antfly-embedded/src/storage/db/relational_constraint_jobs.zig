@@ -94,6 +94,8 @@ pub fn status(txn: *docstore.DocStore.Txn, view: registry.SchemaView) !Progress 
     const owner = try jobs.ownership(txn);
     const validator = view.validator() orelse return error.ConstraintNotFound;
     const checks = validator.execution.checks orelse return error.ConstraintNotFound;
+    if (std.mem.allEqual(u8, &checks.validationFingerprint(), 0))
+        return .{ .schema_version = view.version(), .owner = owner, .state = .enforced };
     if (try optional(txn, progress_key)) |raw| {
         const current = try Progress.decode(raw);
         if (current.schema_version == view.version() and std.mem.eql(u8, &current.owner, &owner)) {

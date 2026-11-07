@@ -182,5 +182,38 @@ test "shard adapter archive boundary preserves busy retry and topology read erro
     try std.testing.expectError(error.Canceled, adapter.topologyRead(std.testing.allocator, 17, "rows", request, .fromAtomic(&canceled)));
 }
 
+extern fn schema_preparation_test_provider(*@import("api/schema_validation_preparation.zig").Port, *errors.Status) callconv(.c) void;
+
+test "shard adapter archive boundary schema preparation retains actual admission errors and validates owned responses" {
+    const preparation = @import("api/schema_validation_preparation.zig");
+    var failure: errors.Status = .ok;
+    var port: preparation.Port = undefined;
+    schema_preparation_test_provider(&port, &failure);
+    const request: preparation.Request = .{
+        .group_id = 17,
+        .metadata_incarnation = @splat('a'),
+        .id = @splat(1),
+        .provisional_plan = @splat(2),
+        .transition_id = 3,
+        .namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 },
+        .before_schema = "{}",
+        .after_schema = "{}",
+        .selection = .{ .not_null = &.{"status"} },
+    };
+    try request.validate(17);
+    var distinct = false;
+    inline for (.{ error.CatalogPublicationFenceUnavailable, error.StoreRegistrationRequired, error.StoreRootEnrollmentChanged, error.SchemaValidationJobChanged, error.SchemaValidationRuntimeRecoveryRequired, error.SchemaValidationPreparationChanged, error.SchemaValidationInputsRequired, error.SchemaValidationNotReady, error.InvalidSchemaValidationJob, error.ResourceBudgetExceeded, error.Forbidden, error.Canceled, error.OutOfMemory }) |err| {
+        failure = errors.statusFromError(err);
+        try std.testing.expect(errors.errorHasStableDetail(err));
+        distinct = distinct or shard_adapter_test_error_ordinal(failure) != @intFromError(err);
+        try std.testing.expectError(err, port.prepare(std.testing.allocator, 17, "rows", request, .{ .schema_validation_authority = true }));
+    }
+    // Require independently numbered error sets so a raw Zig callback cannot
+    // accidentally satisfy this regression through matching test ordinals.
+    try std.testing.expect(distinct);
+    failure = .ok;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, port.prepare(std.testing.allocator, 17, "rows", request, .{ .schema_validation_authority = true }));
+}
+
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

@@ -28,8 +28,26 @@ pub const SourceArtifact = struct {
     artifact_sha256: [32]u8,
     native_manifest_size_bytes: u64 = 0,
     native_manifest_sha256: []const u8 = "",
+    /// Optional source public-schema digest for an independent repository
+    /// snapshot. Artifact SHA256 and actual archive namespace are separately
+    /// verified by materialization; this never masquerades as a cohort seal.
+    repository_schema_digest: ?[32]u8 = null,
     cohort_seal: ?@import("antfly_local_sources").storage_db_native_backup_seal_contract.Handle = null,
     rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Binding = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "repository_schema_digest") and self.repository_schema_digest == null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (comptime std.meta.fieldNames(@This())) |field| {
+            if (!self.nativeJsonSkipField(field)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 
     pub fn digest(self: SourceArtifact, alloc: std.mem.Allocator) ![32]u8 {
         const encoded = try std.json.Stringify.valueAlloc(alloc, self, .{});
@@ -42,6 +60,7 @@ pub const SourceArtifact = struct {
 
 pub const ProvisioningProjection = struct {
     pub const InitialFkOwner = struct {
+        catalog_coverage: @import("antfly_local_sources").schema_relational_declarations.CatalogCoverage = .legacy,
         plan_id: [16]u8,
         plan_digest: [32]u8,
         child_table_id: u64,
@@ -51,6 +70,17 @@ pub const ProvisioningProjection = struct {
         schema_digest: [32]u8,
         public_schema_json_digest: [32]u8,
         catalog_digest: [32]u8,
+
+        pub fn jsonStringify(self: InitialFkOwner, writer: anytype) !void {
+            try writer.beginObject();
+            inline for (@typeInfo(InitialFkOwner).@"struct".field_names) |field| {
+                if (!std.mem.eql(u8, field, "catalog_coverage") or self.catalog_coverage != .legacy) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            }
+            try writer.endObject();
+        }
     };
     tables: []records.TableRecord,
     ranges: []records.RangeRecord,

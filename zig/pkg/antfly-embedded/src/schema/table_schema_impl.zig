@@ -17,6 +17,7 @@ const std = @import("std");
 const schema_regex = @import("antfly_regex");
 const geo_mod = @import("../search/geo.zig");
 const storage_schema = @import("../storage/schema.zig");
+const named_layouts = @import("../common/sql_named_type_layout.zig");
 
 // The public vocabulary belongs to OpenAPI. storage/schema.zig separately
 // owns the explicitly tagged durable representation.
@@ -24,7 +25,30 @@ pub const StorageMode = @import("antfly_schema_openapi").TableStorageMode;
 const relational_wire = @import("antfly_schema_openapi");
 const relational_native = @import("../storage/relational_index.zig");
 
+fn validateIndexPredicate(condition: relational_wire.RelationalIndexPredicate) !void {
+    if (condition.constant != null) {
+        if (condition.column != null or condition.op != null or condition.value != .absent or condition.collation != null)
+            return error.InvalidSchemaUpdateRequest;
+    } else {
+        const column = condition.column orelse return error.InvalidSchemaUpdateRequest;
+        if (column.len == 0 or condition.op == null) return error.InvalidSchemaUpdateRequest;
+        if (condition.collation) |collation| if (collation.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn indexPredicate(alloc: std.mem.Allocator, condition: relational_wire.RelationalIndexPredicate) !relational_native.UniquePredicate {
+    try validateIndexPredicate(condition);
+    return .{
+        .constant = condition.constant,
+        .field = condition.column orelse "",
+        .op = TableSchema.nativeEnum(relational_native.RelationalCheckOp, condition.op orelse .eq),
+        .value_json = if (condition.value.valueOrNull()) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+        .collation = condition.collation,
+    };
+}
+
 pub const TableSchema = struct {
+    sql_triggers: ?std.json.Parsed(@import("../system_catalog/triggers.zig").State) = null,
     version: u32 = 0,
     storage_mode: StorageMode = .document,
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
@@ -41,8 +65,10 @@ pub const TableSchema = struct {
     foreign_keys: ?std.json.Parsed([]const relational_wire.RelationalForeignKeyConstraint) = null,
     column_defaults: ?std.json.Parsed(std.json.Value) = null,
     generated_columns: ?std.json.Parsed(std.json.Value) = null,
+    named_types: ?named_layouts.Registry = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
+        if (self.sql_triggers) |*state| state.deinit();
         if (self.external_base_source) |*source| source.deinit(alloc);
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.checks) |*checks| checks.deinit();
@@ -50,6 +76,7 @@ pub const TableSchema = struct {
         if (self.foreign_keys) |*constraints| constraints.deinit();
         if (self.column_defaults) |*expressions| expressions.deinit();
         if (self.generated_columns) |*expressions| expressions.deinit();
+        if (self.named_types) |*registry| registry.deinit();
         alloc.free(self.default_type);
         alloc.free(self.ttl_field);
         for (self.document_schemas) |*document_schema| document_schema.deinit(alloc);
@@ -78,17 +105,14 @@ pub const TableSchema = struct {
             };
             const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
             const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
-            for (conditions, where) |condition, *target| target.* = .{
-                .field = condition.column,
-                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
-                .value_json = if (condition.value.valueOrNull()) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
-                .collation = condition.collation,
-            };
+            for (conditions, where) |condition, *target| target.* = try indexPredicate(alloc, condition);
             definition.* = .{
                 .name = declaration.name,
                 .columns = declaration.columns orelse &.{},
                 .keys = keys,
                 .where = where,
+                .include_columns = declaration.include_columns orelse &.{},
+                .without_overlaps_column = declaration.without_overlaps_column,
                 .nulls_not_distinct = declaration.nulls_not_distinct orelse false,
                 .deferrable = declaration.deferrable orelse false,
                 .timing = nativeEnum(relational_native.ForeignKeyTiming, declaration.timing orelse .immediate),
@@ -102,6 +126,7 @@ pub const TableSchema = struct {
         const declarations = self.foreign_keys orelse return &.{};
         const definitions = try alloc.alloc(relational_native.ForeignKey, declarations.value.len);
         for (declarations.value, definitions) |declaration, *definition| definition.* = .{
+            .not_valid = declaration.not_valid orelse false,
             .name = declaration.name,
             .child_columns = declaration.child_columns,
             .parent_table = declaration.parent_table,
@@ -121,10 +146,21 @@ pub const TableSchema = struct {
         unreachable;
     }
 
+    pub fn coveringConstraintCount(self: TableSchema) usize {
+        var count: usize = 0;
+        if (self.unique_constraints) |constraints| for (constraints.value) |constraint| {
+            const includes: []const []const u8 = constraint.include_columns orelse &.{};
+            if (includes.len != 0) count += 1;
+        };
+        return count;
+    }
+
     pub fn relationalIndexDefinitions(self: TableSchema, alloc: std.mem.Allocator) !?[]const relational_native.RelationalIndexDefinition {
-        const declarations = self.relational_indexes orelse return null;
-        const definitions = try alloc.alloc(relational_native.RelationalIndexDefinition, declarations.value.len);
-        for (declarations.value, definitions) |declaration, *definition| {
+        const declarations = if (self.relational_indexes) |indexes| indexes.value else &.{};
+        const covering = self.coveringConstraintCount();
+        if (self.relational_indexes == null and covering == 0) return null;
+        const definitions = try alloc.alloc(relational_native.RelationalIndexDefinition, declarations.len + covering);
+        for (declarations, definitions[0..declarations.len]) |declaration, *definition| {
             const keys = try alloc.alloc(relational_native.RelationalIndexKey, declaration.keys.len);
             for (declaration.keys, keys) |wire, *key| key.* = .{
                 .column = wire.column orelse "",
@@ -143,14 +179,42 @@ pub const TableSchema = struct {
             };
             const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
             const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
-            for (conditions, where) |condition, *target| target.* = .{
-                .field = condition.column,
-                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
-                .value_json = if (condition.value.valueOrNull()) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
-                .collation = condition.collation,
-            };
+            for (conditions, where) |condition, *target| target.* = try indexPredicate(alloc, condition);
             definition.* = .{ .name = declaration.name, .keys = keys, .include_columns = declaration.include_columns orelse &.{}, .where = where, .owner_kind = .table, .owner_name = relational_native.relational_table_index_owner_name, .access_method = .ordered_tuple };
         }
+        // The constraint is the one catalog owner. Derive its physical access
+        // path from the same immutable declaration instead of publishing an
+        // independently mutable, same-named SQL index. Integrity generations
+        // compare only keys; cover generations also bind payload semantics.
+        var next = declarations.len;
+        if (self.unique_constraints) |constraints| for (constraints.value) |constraint| {
+            const declared_includes = constraint.include_columns orelse &.{};
+            if (declared_includes.len == 0) continue;
+            const columns = constraint.columns orelse return error.InvalidSchemaUpdateRequest;
+            const keys = try alloc.alloc(relational_native.RelationalIndexKey, columns.len);
+            for (columns, keys) |column, *key| key.* = .{ .column = column };
+            // PostgreSQL permits repeated INCLUDE columns, including key
+            // columns. The physical cover needs each source ordinal once.
+            var includes: std.ArrayList([]const u8) = .empty;
+            next_include: for (declared_includes) |column| {
+                for (columns) |key| if (std.mem.eql(u8, key, column)) continue :next_include;
+                for (includes.items) |prior| if (std.mem.eql(u8, prior, column)) continue :next_include;
+                try includes.append(alloc, column);
+            }
+            const conditions: []const relational_wire.RelationalIndexPredicate = constraint.where orelse &.{};
+            const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
+            for (conditions, where) |condition, *target| target.* = try indexPredicate(alloc, condition);
+            definitions[next] = .{
+                .name = constraint.name,
+                .keys = keys,
+                .include_columns = try includes.toOwnedSlice(alloc),
+                .where = where,
+                .owner_kind = .table,
+                .owner_name = relational_native.relational_table_index_owner_name,
+                .access_method = .ordered_tuple,
+            };
+            next += 1;
+        };
         return definitions;
     }
 };
@@ -167,6 +231,7 @@ pub const IndexSortField = struct {
 
 pub const DocumentSchema = struct {
     name: []const u8,
+    has_named_type_fields: bool = false,
     min_properties: ?u64 = null,
     max_properties: ?u64 = null,
     required_fields: [][]const u8 = &.{},
@@ -250,6 +315,18 @@ pub const DocumentSchema = struct {
     }
 };
 
+pub fn hasDocumentExpressions(schema: TableSchema) bool {
+    if (schema.storage_mode != .document) return false;
+    return if (schema.generated_columns) |generated| generated.value.array.items.len != 0 else false;
+}
+
+pub fn documentPropertiesHaveSqlAliases(properties: []const DocumentProperty) bool {
+    for (properties) |property| {
+        if (property.sql_column_name != null or documentPropertiesHaveSqlAliases(property.properties)) return true;
+    }
+    return false;
+}
+
 pub const DocumentProperty = struct {
     name: []const u8,
     root_ref: bool = false,
@@ -260,6 +337,10 @@ pub const DocumentProperty = struct {
     antfly_index: ?bool = null,
     integer_only: bool = false,
     format: ?[]const u8 = null,
+    sql_column_name: ?[]const u8 = null,
+    named_type_id: ?u64 = null,
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    domain_view: ?*const @import("domain_value.zig").View = null,
     sql_type: ?@import("../common/sql_builtin_type.zig").Type = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     allows_null: bool = false,
@@ -320,6 +401,7 @@ pub const DocumentProperty = struct {
         if (self.antfly_types.len > 0) alloc.free(self.antfly_types);
         if (self.antfly_field) |*field| field.deinit(alloc);
         if (self.analyzer) |analyzer| alloc.free(analyzer);
+        if (self.sql_column_name) |name| alloc.free(name);
         if (self.format) |format| alloc.free(format);
         if (self.const_value) |const_value| alloc.free(const_value);
         if (self.numeric_constraints) |plan| plan.deinit();
@@ -475,13 +557,17 @@ const ParsedTypeSpec = struct {
 
 const SchemaContext = struct {
     document_root: std.json.ObjectMap,
+    named_type_seen: ?*bool = null,
     scope_schema: std.json.ObjectMap,
     numeric_domain: bool = false,
+    strict_native_keywords: bool = false,
 
     fn child(self: SchemaContext, object: std.json.ObjectMap) SchemaContext {
         return .{
             .document_root = self.document_root,
+            .named_type_seen = self.named_type_seen,
             .scope_schema = if (object.get("$defs") != null) object else self.scope_schema,
+            .strict_native_keywords = self.strict_native_keywords,
             .numeric_domain = self.numeric_domain or blk: {
                 const kind = object.get("x-antfly-sql-type") orelse break :blk false;
                 const physical = object.get("type") orelse break :blk false;
@@ -497,7 +583,7 @@ const SchemaContext = struct {
 pub const CompiledValidationPlan = struct {
     const PropertyMap = std.StringHashMapUnmanaged(usize);
     const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool, defaulted: bool, is_array: bool, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
-    const Normalization = enum { base, derived, all };
+    const Normalization = enum { base, defaults, derived, all };
     /// Borrowed immutable epoch identity, stable across owner struct moves.
     schema_documents: []const DocumentSchema = &.{},
     schema_version: u32 = 0,
@@ -507,14 +593,20 @@ pub const CompiledValidationPlan = struct {
     properties: std.AutoHashMapUnmanaged(usize, PropertyMap) = .empty,
     patterns: std.StringHashMapUnmanaged(schema_regex.PreparedPattern) = .empty,
     checks: ?*@import("relational_checks.zig").Set = null,
+    historical_checks: bool = false,
     expressions: ?*@import("relational_expression.zig").Set = null,
+    domains: ?@import("domain_row.zig").Plan = null,
+    /// Prepared once per epoch; no per-row schema-width allocation.
+    domain_derived: []const bool = &.{},
+    domain_candidate_generated: []const bool = &.{},
+    domain_admission: ?@import("domain_row.zig").Admission = null,
 
     pub fn init(alloc: std.mem.Allocator, schema: TableSchema) !CompiledValidationPlan {
         var plan: CompiledValidationPlan = .{ .schema_documents = schema.document_schemas, .schema_version = schema.version, .schema_mode = schema.storage_mode };
         errdefer plan.deinit(alloc);
         var sql_columns: std.ArrayList(SqlColumn) = .empty;
         defer sql_columns.deinit(alloc);
-        if (schema.storage_mode == .relational) for (schema.document_schemas) |document| {
+        if (schema.storage_mode == .relational or hasDocumentExpressions(schema)) for (schema.document_schemas) |document| {
             for (document.properties) |property| if (property.sql_type) |kind| {
                 const generated = generated: {
                     if (schema.generated_columns) |columns| for (columns.value.array.items) |entry| {
@@ -533,12 +625,31 @@ pub const CompiledValidationPlan = struct {
             };
         };
         plan.sql_columns = try sql_columns.toOwnedSlice(alloc);
+        const has_domains = blk: {
+            for (schema.document_schemas) |document| for (document.properties) |property| {
+                if (property.domain_view != null) break :blk true;
+            };
+            break :blk false;
+        };
+        if (has_domains) {
+            plan.domains = try @import("mod.zig").prepareDomainRows(alloc, schema);
+            const derived = try alloc.alloc(bool, plan.domains.?.column_count);
+            plan.domain_derived = derived;
+            @memset(derived, false);
+            if (schema.column_defaults) |declarations| for (declarations.value.array.items) |entry|
+                plan.domains.?.excludeDomainDefaults(&.{entry.object.get("column").?.string});
+            if (schema.generated_columns) |declarations| for (declarations.value.array.items) |entry|
+                try plan.domains.?.markGenerated(entry.object.get("column").?.string, derived);
+        }
         for (schema.document_schemas) |document| try plan.addProperty(alloc, makeRootDocumentProperty(document));
-        if (schema.column_defaults != null or schema.generated_columns != null) {
+        if ((schema.storage_mode == .relational or hasDocumentExpressions(schema)) and (schema.column_defaults != null or schema.generated_columns != null)) {
             const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
             errdefer storage_schema.freeSchema(alloc, runtime);
             plan.expressions = try @import("relational_expression.zig").Set.createOwned(alloc, runtime, if (schema.column_defaults) |expressions| expressions.value else .null, if (schema.generated_columns) |expressions| expressions.value else .null);
         }
+        if (plan.domains != null) if (plan.expressions) |expressions| {
+            plan.domain_candidate_generated = try expressions.generatedClosure(alloc, plan.domain_derived);
+        };
         if (schema.checks) |checks| if (checks.value.len != 0) {
             const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
             errdefer storage_schema.freeSchema(alloc, runtime);
@@ -549,6 +660,9 @@ pub const CompiledValidationPlan = struct {
 
     pub fn deinit(self: *CompiledValidationPlan, alloc: std.mem.Allocator) void {
         alloc.free(self.sql_columns);
+        if (self.domains) |*domains| domains.deinit();
+        alloc.free(self.domain_derived);
+        alloc.free(self.domain_candidate_generated);
         if (self.checks) |checks| checks.deinit();
         if (self.expressions) |expressions| expressions.deinit();
         var maps = self.properties.valueIterator();
@@ -573,6 +687,7 @@ pub const CompiledValidationPlan = struct {
         const casts = @import("../sql/builtin_cast.zig");
         for (self.sql_columns) |column| {
             if (selection == .base and column.generated) continue;
+            if (selection == .defaults and (!column.defaulted or column.generated)) continue;
             if (selection == .derived and !column.generated and !column.defaulted) continue;
             try execution.charge(1);
             const cell = root.object.getPtr(column.name) orelse continue;
@@ -581,7 +696,7 @@ pub const CompiledValidationPlan = struct {
                 if (column.kind == .numeric) {
                     // Unconstrained API values are validated, not rewritten.
                     @import("relational_expression.zig").normalizeNumericArrayJson(execution, cell, column.numeric_modifier, preserve or column.numeric_modifier == null) catch |err| switch (err) {
-                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded => return err,
+                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded, error.RelationalExpressionOverflow => return err,
                         else => return error.InvalidBatchRequest,
                     };
                 } else {
@@ -625,7 +740,7 @@ pub const CompiledValidationPlan = struct {
                 .jsonb => {},
                 .numeric => if (column.numeric_modifier) |modifier| {
                     cell.* = @import("relational_expression.zig").normalizeNumericJson(execution, cell.*, modifier, preserve) catch |err| switch (err) {
-                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded => return err,
+                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded, error.RelationalExpressionOverflow => return err,
                         else => return error.InvalidBatchRequest,
                     };
                 },
@@ -752,23 +867,58 @@ const RootRefGuard = struct {
     }
 };
 
+/// Collect physical column type identities before catalog resolution. Readonly
+/// layout assertions are intentionally ignored here; the authority replaces
+/// them from one pinned catalog cut before compiling the complete schema.
+/// Constants, defaults, and JSON payload objects are never searched for refs.
+pub fn namedTypeReferencesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u64 {
+    try validateSchemaValue(value, true);
+    var schema = try parseTableSchemaValueMode(alloc, value, true);
+    defer schema.deinit(alloc);
+    try validateParsedStorageModeSchema(schema);
+    var ids = std.ArrayList(u64).empty;
+    defer ids.deinit(alloc);
+    for (schema.document_schemas) |document| {
+        for (document.properties) |property| if (property.named_type_id) |id| {
+            if (ids.items.len >= named_layouts.max_types) return error.InvalidSchemaUpdateRequest;
+            try ids.append(alloc, id);
+        };
+    }
+    std.mem.sort(u64, ids.items, {}, std.sort.asc(u64));
+    var count: usize = 0;
+    for (ids.items) |id| {
+        if (count == 0 or ids.items[count - 1] != id) {
+            ids.items[count] = id;
+            count += 1;
+        }
+    }
+    ids.items.len = count;
+    return ids.toOwnedSlice(alloc);
+}
+
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    return parseSchemaRequest(alloc, body, false);
+    return parseSchemaRequest(alloc, body, false, true);
 }
 
 /// Creation can carry an unpublished external schema-inference draft. Updates
 /// and stored schemas always require fully bound relational columns.
 pub fn parseCreateSchemaRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    return parseSchemaRequest(alloc, body, true);
+    return parseSchemaRequest(alloc, body, true, true);
 }
-fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inference: bool) ![]u8 {
+/// Trusted stored requests retain inert historical annotations. This is decode,
+/// not permission to admit unknown native options on a new public request.
+pub fn parseStoredCreateSchemaRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return parseSchemaRequest(alloc, body, true, false);
+}
+fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inference: bool, strict_native_keywords: bool) ![]u8 {
     if (body.len == 0) return error.InvalidSchemaUpdateRequest;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
-    try validateSchemaValue(parsed.value);
+    try validateSchemaValue(parsed.value, strict_native_keywords);
     var schema = try parseTableSchemaValue(alloc, parsed.value);
     defer schema.deinit(alloc);
     try validateParsedStorageModeSchema(schema);
+    try validateDocumentSqlAliases(alloc, schema);
     try validateParsedTtlSchema(schema);
     const pending = allow_inference and schema.external_base_source != null and schema.document_schemas.len == 0;
     if (pending) {
@@ -777,6 +927,8 @@ fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inferenc
         try validateParsedRelationalSchema(schema);
         try validateRelationalExpressions(alloc, schema);
     }
+    if (schema.sql_triggers) |state| try @import("table_triggers.zig").canonicalize(parsed.arena.allocator(), &parsed.value, state.value);
+    if (schema.named_types) |registry| try named_layouts.canonicalizeSchemaLeaky(parsed.arena.allocator(), &parsed.value, registry.records);
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -790,23 +942,63 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{ .parse_numbers = false });
     defer parsed.deinit();
-    try validateSchemaValue(parsed.value);
+    try validateSchemaValue(parsed.value, false);
     const schema = try parseTableSchemaValue(alloc, parsed.value);
     errdefer {
         var owned = schema;
         owned.deinit(alloc);
     }
     try validateParsedStorageModeSchema(schema);
+    try validateDocumentSqlAliases(alloc, schema);
     try validateParsedTtlSchema(schema);
     try validateParsedRelationalSchema(schema);
     try validateRelationalExpressions(alloc, schema);
     return schema;
 }
 
+fn validateDocumentSqlAliasPaths(property: *const DocumentProperty, fixed_path: bool) !void {
+    if (property.sql_column_name != null and !fixed_path) return error.InvalidSchemaUpdateRequest;
+    for (property.properties) |*child| try validateDocumentSqlAliasPaths(child, fixed_path);
+    // An array item, pattern match or conditional schema does not name one
+    // immutable object-key path. Never silently discard its alias annotation.
+    const info = @typeInfo(DocumentProperty).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| {
+        if (comptime !std.mem.eql(u8, name, "properties")) {
+            const child = @field(property, name);
+            if (Field == []DocumentProperty) {
+                for (child) |*entry| try validateDocumentSqlAliasPaths(entry, false);
+            } else if (Field == ?*DocumentProperty) {
+                if (child) |entry| try validateDocumentSqlAliasPaths(entry, false);
+            } else if (Field == []const PatternProperty) {
+                for (child) |entry| try validateDocumentSqlAliasPaths(entry.property, false);
+            } else if (Field == []const DependentSchema) {
+                for (child) |entry| try validateDocumentSqlAliasPaths(entry.schema, false);
+            }
+        }
+    }
+}
+
+fn validateDocumentSqlAliases(alloc: std.mem.Allocator, schema: TableSchema) !void {
+    for (schema.document_schemas) |document| {
+        const root = makeRootDocumentProperty(document);
+        try validateDocumentSqlAliasPaths(&root, schema.storage_mode == .document);
+    }
+    if (schema.storage_mode == .document) {
+        for (schema.document_schemas) |document| if (documentPropertiesHaveSqlAliases(document.properties)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            _ = @import("../sql/document_row.zig").deriveColumns(arena.allocator(), schema) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSchemaUpdateRequest;
+            break;
+        };
+    }
+}
+
 fn validateRelationalExpressions(alloc: std.mem.Allocator, schema: TableSchema) !void {
+    if (schema.storage_mode == .document and !hasDocumentExpressions(schema)) return;
     if (schema.column_defaults == null and schema.generated_columns == null and schema.checks == null) return;
     const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
-    errdefer storage_schema.freeSchema(alloc, runtime);
+    var runtime_owned = true;
+    errdefer if (runtime_owned) storage_schema.freeSchema(alloc, runtime);
     if (schema.checks) |definitions| @import("relational_checks.zig").validateDefinitions(alloc, runtime, definitions.value) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidSchemaUpdateRequest,
@@ -819,7 +1011,19 @@ fn validateRelationalExpressions(alloc: std.mem.Allocator, schema: TableSchema) 
         error.OutOfMemory => return err,
         else => return error.InvalidSchemaUpdateRequest,
     };
-    expressions.deinit();
+    runtime_owned = false;
+    defer expressions.deinit();
+    if (hasDocumentExpressions(schema)) {
+        // Dependencies must survive transport extraction so restored values can
+        // be verified from the stored row. Use compiled dependencies, not an
+        // AST walk that would mistake literal JSON payloads for column reads.
+        for (expressions.table.relational_columns, expressions.read_columns) |column, read| {
+            if (!read) continue;
+            for ([_][]const u8{ "_id", "_doc", "_version", "_edges", "_embeddings", "_summaries" }) |name| {
+                if (std.mem.eql(u8, column.name, name)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+    }
 }
 
 pub fn validateJsonSchemaJson(
@@ -1046,7 +1250,7 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
         std.mem.eql(u8, kind, "html") or std.mem.eql(u8, kind, "search_as_you_type") or
         std.mem.eql(u8, kind, "substring") or
         std.mem.eql(u8, kind, "boolean") or std.mem.eql(u8, kind, "integer") or
-        std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "numeric") or sql_array;
+        std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "numeric") or std.mem.eql(u8, kind, "sql_enum") or sql_array;
     if (!physical_scalar) return false;
     if (property.integer_only and !std.mem.eql(u8, kind, "integer")) return false;
     const defaults = DocumentProperty{ .name = "" };
@@ -1055,8 +1259,12 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
             !std.mem.eql(u8, reflected_name, "field_type") and
             // Strict physical validation already checks the pinned scalar or
             // array SQL domain. It must precede this residual validation plan.
+            !std.mem.eql(u8, reflected_name, "sql_column_name") and
             !std.mem.eql(u8, reflected_name, "sql_type") and
             !std.mem.eql(u8, reflected_name, "numeric_modifier") and
+            !std.mem.eql(u8, reflected_name, "named_type_id") and
+            !std.mem.eql(u8, reflected_name, "enum_view") and
+            !std.mem.eql(u8, reflected_name, "domain_view") and
             !std.mem.eql(u8, reflected_name, "integer_only") and
             !std.mem.eql(u8, reflected_name, "allows_null"))
         {
@@ -1105,12 +1313,17 @@ pub fn validateDocumentValueWithPlan(
     physical_fields: []const PhysicalFieldValidation,
     compiled: ?*const CompiledValidationPlan,
 ) !void {
-    if (compiled == null and schema.storage_mode == .relational) {
+    if (compiled == null and (schema.storage_mode == .relational or schema.generated_columns != null)) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
-        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null);
+        return validateDocumentValueWithPlan(alloc, schema, value, physical_fields, &plan);
     }
-    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null);
+    if (hasDocumentExpressions(schema)) {
+        const prepared = try prepareTypedDocumentWithRuntime(alloc, alloc, schema, value, physical_fields, compiled.?, &.{}, true, null);
+        defer prepared.deinit(alloc);
+        return;
+    }
+    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null, null);
 }
 
 /// The only boundary that skips verification owns both expression evaluation
@@ -1123,41 +1336,212 @@ pub fn prepareDocumentValueWithPlan(
     physical_fields: []const PhysicalFieldValidation,
     compiled: *const CompiledValidationPlan,
 ) !void {
+    return prepareDocumentValueWithRuntime(owned_alloc, scratch, schema, value, physical_fields, compiled, null);
+}
+
+pub fn prepareDocumentValueWithRuntime(
+    owned_alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    schema: TableSchema,
+    value: *std.json.Value,
+    physical_fields: []const PhysicalFieldValidation,
+    compiled: *const CompiledValidationPlan,
+    runtime: ?@import("relational_expression.zig").PreparationRuntime,
+) !void {
     try compiled.requireSchema(schema);
+    if (hasDocumentExpressions(schema)) {
+        const prepared = try prepareTypedDocumentWithRuntime(owned_alloc, scratch, schema, value, physical_fields, compiled, &.{}, false, runtime);
+        defer prepared.deinit(owned_alloc);
+        return;
+    }
     const expressions_module = @import("relational_expression.zig");
     var budget: usize = expressions_module.max_allocated_bytes;
     var execution = expressions_module.Execution.init(owned_alloc, &budget);
+    execution.preparation_runtime = runtime;
     try compiled.normalizeSql(&execution, value, false, .base);
     if (compiled.expressions) |expressions| {
         try expressions.applyJsonWithExecution(&execution, value);
         try compiled.normalizeSql(&execution, value, false, .derived);
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution, null);
 }
 
-/// Typed null metadata is schema-checked by the row preparer before entering
-/// this boundary. Pointer identity scopes the exception to the exact root
-/// datums; nested nulls and unrelated SQL NULLs retain ordinary validation.
+/// Compatibility boundary for callers that cannot consume changed metadata.
+/// New row preparers retain the owned result from the typed boundary below.
 pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !void {
+    return prepareTypedDocumentValueWithRuntime(owned_alloc, scratch, schema, value, physical_fields, compiled, json_null_fields, preserve, null);
+}
+
+pub fn prepareTypedDocumentValueWithRuntime(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool, runtime: ?@import("relational_expression.zig").PreparationRuntime) !void {
+    const prepared = try prepareTypedDocumentWithRuntime(owned_alloc, scratch, schema, value, physical_fields, compiled, json_null_fields, preserve, runtime);
+    defer prepared.deinit(owned_alloc);
+    // Legacy representation-only callers cannot silently drop changed datum
+    // semantics. Row preparation consumes the returned authority instead.
+    if (prepared.fields.len != json_null_fields.len) return error.InvalidBatchRequest;
+    for (prepared.fields) |name| {
+        const found = for (json_null_fields) |input| {
+            if (std.mem.eql(u8, name, input)) break true;
+        } else false;
+        if (!found) return error.InvalidBatchRequest;
+    }
+}
+
+/// Owned semantic metadata, never a borrowed snapshot of a retired row owner.
+pub const PreparedJsonNulls = struct {
+    fields: []const []const u8,
+
+    pub fn deinit(self: PreparedJsonNulls, alloc: std.mem.Allocator) void {
+        for (self.fields) |name| alloc.free(name);
+        alloc.free(self.fields);
+    }
+};
+
+pub fn prepareTypedDocumentWithNulls(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !PreparedJsonNulls {
+    return prepareTypedDocumentWithRuntime(owned_alloc, scratch, schema, value, physical_fields, compiled, json_null_fields, preserve, null);
+}
+
+pub fn prepareTypedDocumentWithRuntime(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool, runtime: ?@import("relational_expression.zig").PreparationRuntime) !PreparedJsonNulls {
+    return prepareTypedDocumentPhase(owned_alloc, scratch, schema, value, physical_fields, compiled, json_null_fields, preserve, runtime, .complete);
+}
+
+pub fn prepareTypedDocumentPhase(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool, runtime: ?@import("relational_expression.zig").PreparationRuntime, phase: @import("relational_expression.zig").PreparationPhase) !PreparedJsonNulls {
+    if (preserve and phase != .complete) return error.InvalidBatchRequest;
     try compiled.requireSchema(schema);
     if (value.* != .object) return error.InvalidBatchRequest;
     const expressions_module = @import("relational_expression.zig");
+    const operands = @import("../sql/row_value.zig");
     var budget: usize = expressions_module.max_allocated_bytes;
     var execution = expressions_module.Execution.init(owned_alloc, &budget);
+    execution.preparation_runtime = runtime;
+    execution.domain_admission = compiled.domain_admission orelse if (runtime) |resources| resources.domain_admission else null;
+    var roots: operands.JsonRow = undefined;
+    roots.init(owned_alloc, budget, &execution.numeric);
+    defer roots.deinit();
+    try roots.bindAdmission(&budget);
+    var nulls: operands.JsonNulls = undefined;
+    nulls.init(owned_alloc, budget, &execution.numeric);
+    defer nulls.deinit();
+    try nulls.bindAdmission(&budget);
+    const document_schema = try resolveDocumentSchema(schema, value.object);
+    // Authenticate at this shared boundary, including document-table callers.
+    // Property dispatch reuses the immutable compiled map for wide schemas.
+    for (json_null_fields) |name| {
+        try execution.charge(1 +| name.len);
+        const resolved = document_schema orelse return error.InvalidBatchRequest;
+        const property = compiled.findProperty(resolved.properties, name) orelse return error.InvalidBatchRequest;
+        const json_column = if (schema.storage_mode == .document)
+            @import("../sql/document_row.zig").propertyType(property) == .json
+        else if (property.field_type) |kind|
+            std.mem.eql(u8, kind, "json")
+        else
+            false;
+        if (!json_column) return error.InvalidBatchRequest;
+        const datum = value.object.get(name) orelse return error.InvalidBatchRequest;
+        if (datum != .null) return error.InvalidBatchRequest;
+    }
+    nulls.import(json_null_fields) catch |err| return switch (err) {
+        error.InvalidSqlProgram => error.InvalidBatchRequest,
+        error.SqlProgramLimitExceeded => error.RelationalExpressionBudgetExceeded,
+        else => err,
+    };
+    // A present document JSON null is already a complete datum. Unlike an
+    // AROW cell it needs no transport-side SQL-null marker to authenticate it.
+    if (phase == .complete and hasDocumentExpressions(schema)) {
+        if (compiled.expressions) |program| for (program.table.relational_columns) |column| {
+            if (!column.is_json) continue;
+            if (value.object.get(column.name)) |datum| if (datum == .null and !try nulls.contains(column.name)) try nulls.import(&.{column.name});
+        };
+    }
     if (!preserve) {
-        try compiled.normalizeSql(&execution, value, false, .base);
-        if (compiled.expressions) |expressions| {
-            try expressions.applyJsonWithExecution(&execution, value);
-            try compiled.normalizeSql(&execution, value, false, .derived);
+        if (compiled.domains) |*domains| {
+            const admission = execution.domain_admission orelse @import("domain_row.zig").Admission{ .schema_version = schema.version };
+            // Authenticate before defaults or generated expressions can mutate
+            // the candidate. Sparse witnesses never become public input data.
+            try domains.requireAdmission(admission);
+            if (phase != .selected) {
+                if (compiled.expressions) |expressions| try expressions.requireDefaultInputs(value.*, admission);
+                try domains.prepareJsonDefaultsForAdmission(&execution, value, &nulls, admission);
+            }
+            try compiled.normalizeSql(&execution, value, false, .base);
+            if (phase != .selected) if (compiled.expressions) |expressions| {
+                try expressions.applyTypedJsonPhase(&execution, value, &roots, &nulls, .candidate);
+                try compiled.normalizeSql(&execution, value, false, .defaults);
+            };
+            if (try domains.validateJsonAdmission(&execution, value.*, &roots, &nulls, admission, compiled.domain_derived, .base)) |failure|
+                return switch (failure.violation.kind) {
+                    .not_null => error.SqlNotNullViolation,
+                    .check => error.RelationalCheckViolation,
+                };
+            if (phase == .candidate and compiled.domain_candidate_generated.len != 0) {
+                if (compiled.expressions) |expressions| try expressions.applyTypedJsonGeneratedSelection(&execution, value, &roots, &nulls, compiled.domain_candidate_generated);
+                try compiled.normalizeSql(&execution, value, false, .derived);
+                if (try domains.validateJsonAdmission(&execution, value.*, &roots, &nulls, admission, compiled.domain_derived, .derived)) |failure|
+                    return switch (failure.violation.kind) {
+                        .not_null => error.SqlNotNullViolation,
+                        .check => error.RelationalCheckViolation,
+                    };
+            }
+            if (phase != .candidate) {
+                if (compiled.expressions) |expressions| {
+                    try expressions.applyTypedJsonPhase(&execution, value, &roots, &nulls, .selected);
+                    try compiled.normalizeSql(&execution, value, false, .derived);
+                }
+                if (try domains.validateJsonAdmission(&execution, value.*, &roots, &nulls, admission, compiled.domain_derived, .derived)) |failure|
+                    return switch (failure.violation.kind) {
+                        .not_null => error.SqlNotNullViolation,
+                        .check => error.RelationalCheckViolation,
+                    };
+            }
+        } else {
+            try compiled.normalizeSql(&execution, value, false, .base);
+            if (compiled.expressions) |expressions| {
+                try expressions.applyTypedJsonPhase(&execution, value, &roots, &nulls, phase);
+                if (phase != .candidate) try compiled.normalizeSql(&execution, value, false, .derived);
+            }
         }
     }
-    const pointers = try scratch.alloc(*const std.json.Value, json_null_fields.len);
+    const names = nulls.snapshot() catch |err| return switch (err) {
+        error.SqlProgramLimitExceeded => error.RelationalExpressionBudgetExceeded,
+        else => err,
+    };
+    const pointer_bytes = std.math.mul(usize, names.len, @sizeOf(*const std.json.Value)) catch return execution.limit();
+    if (pointer_bytes > budget) return execution.limit();
+    budget -= pointer_bytes;
+    const pointers = try scratch.alloc(*const std.json.Value, names.len);
     defer scratch.free(pointers);
-    for (json_null_fields, pointers) |name, *pointer| {
+    for (names, pointers) |name, *pointer| {
         pointer.* = value.object.getPtr(name) orelse return error.InvalidBatchRequest;
         if (pointer.*.* != .null) return error.InvalidBatchRequest;
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers, !preserve, &execution);
+    // Typed restore checks the actual null provenance, never repairs it.
+    if (preserve) {
+        // Domain/canonical admission precedes evaluation, just as on ordinary
+        // restore. Verification must not run on unadmitted typed input.
+        try compiled.normalizeSql(&execution, value, true, .all);
+        if (compiled.expressions) |expressions|
+            try expressions.verifyTypedJsonWithExecution(&execution, value.*, names);
+    }
+    if (phase == .selected) if (document_schema) |document| for (document.required_fields) |name| {
+        const property = compiled.findProperty(document.properties, name) orelse return error.InvalidBatchRequest;
+        if (property.allows_null) continue;
+        const cell = value.object.get(name);
+        if (cell == null or (cell.? == .null and !try nulls.contains(name))) return error.SqlNotNullViolation;
+    };
+    if (phase != .candidate) try validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, pointers, true, &execution, &nulls);
+    var output_bytes = std.math.mul(usize, names.len, @sizeOf([]const u8)) catch return execution.limit();
+    for (names) |name| output_bytes = std.math.add(usize, output_bytes, name.len) catch return execution.limit();
+    if (output_bytes > budget) return execution.limit();
+    budget -= output_bytes;
+    const fields = try owned_alloc.alloc([]const u8, names.len);
+    errdefer owned_alloc.free(fields);
+    var copied: usize = 0;
+    errdefer for (fields[0..copied]) |name| owned_alloc.free(name);
+    for (names, fields) |name, *field| {
+        try execution.charge(1 +| name.len);
+        field.* = try owned_alloc.dupe(u8, name);
+        copied += 1;
+    }
+    return .{ .fields = fields };
 }
 
 fn validateDocumentValueInternal(
@@ -1172,6 +1556,10 @@ fn validateDocumentValueInternal(
     // assertion on restore or public validation. Expressions have already run.
     sql_admitted: bool,
     shared_execution: ?*@import("relational_expression.zig").Execution,
+    // Only typed preparation supplies this schema-authenticated owner. Keep
+    // its identity and allowance through CHECKs; pointers alone only authorize
+    // recursive property validation and cannot recreate SQL null provenance.
+    json_null_owner: ?*@import("../sql/row_value.zig").JsonNulls,
 ) !void {
     if (compiled) |plan| try plan.requireSchema(schema);
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
@@ -1278,11 +1666,27 @@ fn validateDocumentValueInternal(
     }
     if (schema.checks) |checks| if (checks.value.len != 0) {
         if (compiled) |plan| {
-            if (try plan.checks.?.firstViolationJsonWithExecution(execution, value.*) != null) return error.RelationalCheckViolation;
+            if (plan.historical_checks) {
+                const failure = if (json_null_owner) |owner|
+                    try plan.checks.?.firstFailureTypedJsonWithExecution(execution, value.*, owner)
+                else
+                    try plan.checks.?.firstFailureJsonWithExecution(execution, value.*);
+                if (failure) |rejection| return rejection.reason;
+                return;
+            }
+            const violation = if (json_null_owner) |owner|
+                try plan.checks.?.firstViolationTypedJsonWithExecution(execution, value.*, owner)
+            else
+                try plan.checks.?.firstViolationJsonWithExecution(execution, value.*);
+            if (violation != null) return error.RelationalCheckViolation;
         } else {
             var plan = try CompiledValidationPlan.init(alloc, schema);
             defer plan.deinit(alloc);
-            if (try plan.checks.?.firstViolationJsonWithExecution(execution, value.*) != null) return error.RelationalCheckViolation;
+            const violation = if (json_null_owner) |owner|
+                try plan.checks.?.firstViolationTypedJsonWithExecution(execution, value.*, owner)
+            else
+                try plan.checks.?.firstViolationJsonWithExecution(execution, value.*);
+            if (violation != null) return error.RelationalCheckViolation;
         }
     };
 }
@@ -1387,12 +1791,13 @@ fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
-fn validateSchemaValue(value: std.json.Value) !void {
+fn validateSchemaValue(value: std.json.Value, strict_native_keywords: bool) !void {
     const root = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
     };
 
+    if (strict_native_keywords and root.contains("sql_triggers")) return error.InvalidSchemaUpdateRequest;
     if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
     if (root.get("storage_mode")) |storage_mode| if (storage_mode != .null) switch (storage_mode) {
         .string => |text| {
@@ -1418,7 +1823,7 @@ fn validateSchemaValue(value: std.json.Value) !void {
         else => return error.InvalidSchemaUpdateRequest,
     };
     if (root.get("enforce_types")) |enforce_types| if (enforce_types != .null and enforce_types != .bool) return error.InvalidSchemaUpdateRequest;
-    if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas);
+    if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas, strict_native_keywords);
     if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
     if (root.get("index_sort")) |index_sort| if (index_sort != .null) try validateIndexSort(index_sort);
 }
@@ -1449,7 +1854,7 @@ fn validateTtlConfig(value: std.json.Value) !void {
     };
 }
 
-fn validateDocumentSchemas(value: std.json.Value) !void {
+fn validateDocumentSchemas(value: std.json.Value, strict_native_keywords: bool) !void {
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -1462,11 +1867,11 @@ fn validateDocumentSchemas(value: std.json.Value) !void {
             else => return error.InvalidSchemaUpdateRequest,
         };
         const schema_value = doc_schema.get("schema") orelse return error.InvalidSchemaUpdateRequest;
-        try validateDocumentSchemaDefinition(schema_value);
+        try validateDocumentSchemaDefinition(schema_value, strict_native_keywords);
     }
 }
 
-fn validateDocumentSchemaDefinition(value: std.json.Value) anyerror!void {
+fn validateDocumentSchemaDefinition(value: std.json.Value, strict_native_keywords: bool) anyerror!void {
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidSchemaUpdateRequest,
@@ -1474,6 +1879,7 @@ fn validateDocumentSchemaDefinition(value: std.json.Value) anyerror!void {
     return validateDocumentSchemaDefinitionWithContext(.{
         .document_root = object,
         .scope_schema = object,
+        .strict_native_keywords = strict_native_keywords,
     }, value);
 }
 
@@ -1494,9 +1900,32 @@ fn validateDocumentSchemaDefinitionWithContext(context: SchemaContext, value: st
     try validateDocumentSchemaKeywords(current_context, object);
 }
 
+fn validateNativeSchemaKeywordPlacement(object: std.json.ObjectMap) !void {
+    const native = comptime std.StaticStringMap(void).initComptime(.{
+        .{ "x-antfly-analyzer", {} },    .{ "x-antfly-dynamic-indexing", {} },
+        .{ "x-antfly-field", {} },       .{ "x-antfly-include-in-all", {} },
+        .{ "x-antfly-index", {} },       .{ "x-antfly-sql-numeric-modifier", {} },
+        .{ "x-antfly-sql-type", {} },    .{ "x-antfly-types", {} },
+        .{ "x-antfly-column-name", {} }, .{ "x-antfly-sql-type-id", {} },
+    });
+    const table_only = comptime std.StaticStringMap(void).initComptime(.{
+        .{ "storage_mode", {} },      .{ "default_type", {} },       .{ "enforce_types", {} },
+        .{ "document_schemas", {} },  .{ "dynamic_templates", {} },  .{ "index_sort", {} },
+        .{ "ttl", {} },               .{ "ttl_field", {} },          .{ "ttl_duration", {} },
+        .{ "ttl_duration_ns", {} },   .{ "relational_indexes", {} }, .{ "unique_constraints", {} },
+        .{ "foreign_keys", {} },      .{ "checks", {} },             .{ "column_defaults", {} },
+        .{ "generated_columns", {} }, .{ "named_types", {} },
+    });
+    for (object.keys()) |key| {
+        if (table_only.has(key) or (std.mem.startsWith(u8, key, "x-antfly-") and !native.has(key)))
+            return error.InvalidSchemaUpdateRequest;
+    }
+}
+
 fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
+    if (context.strict_native_keywords) try validateNativeSchemaKeywordPlacement(object);
     // SQL identities belong to root column properties, never the row object.
-    if (object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")) return error.InvalidSchemaUpdateRequest;
+    if (object.contains("x-antfly-column-name") or object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier") or object.contains("x-antfly-sql-type-id")) return error.InvalidSchemaUpdateRequest;
     if (object.get("type")) |schema_type| {
         if (schema_type != .null) _ = try validateTypeSpecDefinition(schema_type, true);
     }
@@ -1685,6 +2114,7 @@ fn validatePropertySchemaDefinitionWithContext(context: SchemaContext, value: st
 // keyword dispatch frame alive across every child exhausts small LLVM Debug
 // worker stacks even when the JSON/schema depth itself is bounded.
 noinline fn validatePropertyScalarKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
+    if (context.strict_native_keywords) try validateNativeSchemaKeywordPlacement(object);
     if (object.get("type")) |schema_type| {
         if (schema_type != .null) _ = try validateTypeSpecDefinition(schema_type, false);
     }
@@ -2038,6 +2468,7 @@ fn validateTypeArrayDefinition(value: std.json.Array, require_object_only: bool)
 }
 
 fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]const u8 {
+    if (!require_object_only and std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, schema_type_name) != null) return schema_type_name;
     if (require_object_only) {
         if (!std.mem.eql(u8, schema_type_name, "object")) return error.InvalidSchemaUpdateRequest;
         return schema_type_name;
@@ -2061,6 +2492,7 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "embedding") or
         std.mem.eql(u8, schema_type_name, "json") or
         std.mem.eql(u8, schema_type_name, "sql_array") or
+        std.mem.eql(u8, schema_type_name, "sql_enum") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))
     {
@@ -2571,6 +3003,10 @@ pub fn parseTtlDurationNs(raw: []const u8) !u64 {
 }
 
 fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !TableSchema {
+    return parseTableSchemaValueMode(alloc, value, false);
+}
+
+fn parseTableSchemaValueMode(alloc: std.mem.Allocator, value: std.json.Value, unresolved: bool) !TableSchema {
     const root = value.object;
 
     var parsed: TableSchema = .{
@@ -2579,6 +3015,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     };
     errdefer parsed.deinit(alloc);
 
+    if (root.get("sql_triggers")) |state| parsed.sql_triggers = try @import("table_triggers.zig").parseValue(alloc, state);
     if (root.get("version")) |version| {
         if (version != .null) parsed.version = std.math.cast(u32, exactU64JsonNumber(version) orelse return error.InvalidSchemaUpdateRequest) orelse return error.InvalidSchemaUpdateRequest;
     }
@@ -2640,6 +3077,9 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("enforce_types")) |enforce_types| {
         if (enforce_types != .null) parsed.enforce_types = enforce_types.bool;
     }
+    if (!unresolved) if (root.get("named_types")) |layouts| {
+        parsed.named_types = try named_layouts.Registry.parseValue(alloc, layouts);
+    };
     if (root.get("document_schemas")) |document_schemas| {
         if (document_schemas != .null) parsed.document_schemas = try parseDocumentSchemas(alloc, document_schemas);
     }
@@ -2683,6 +3123,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             for (includes) |column| if (column.len == 0 or (try columns.getOrPut(alloc, column)).found_existing) return error.InvalidSchemaUpdateRequest;
             const conditions: []const relational_wire.RelationalIndexPredicate = index.where orelse &.{};
             if (conditions.len > 256) return error.InvalidSchemaUpdateRequest;
+            for (conditions) |condition| try validateIndexPredicate(condition);
         }
     }
     if (root.get("checks")) |checks| {
@@ -2736,6 +3177,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (parsed.external_base_source) |source| {
         if (source.binding.format == .lance or parsed.ttl_duration_ns != 0 or parsed.checks != null or parsed.unique_constraints != null or parsed.foreign_keys != null or parsed.column_defaults != null or parsed.generated_columns != null) return error.InvalidSchemaUpdateRequest;
     }
+    try bindNamedTypesMode(&parsed, unresolved);
     return parsed;
 }
 
@@ -2756,6 +3198,16 @@ fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value
         for (parsed.value[0..i]) |prior| if (std.mem.eql(u8, prior.name, item.name)) return error.InvalidSchemaUpdateRequest;
         const columns = if (T == relational_wire.RelationalUniqueConstraint) item.columns orelse &.{} else item.child_columns;
         if (T == relational_wire.RelationalUniqueConstraint) {
+            const includes = item.include_columns orelse &.{};
+            const conditions = item.where orelse &.{};
+            if (includes.len > 256) return error.InvalidSchemaUpdateRequest;
+            if (includes.len != 0 and (item.columns == null or
+                (item.origin orelse .constraint) != .constraint)) return error.InvalidSchemaUpdateRequest;
+            for (includes) |column| {
+                if (column.len == 0) return error.InvalidSchemaUpdateRequest;
+            }
+            if (conditions.len > 256) return error.InvalidSchemaUpdateRequest;
+            for (conditions) |condition| try validateIndexPredicate(condition);
             if (item.timing == .deferred and !(item.deferrable orelse false)) return error.InvalidSchemaUpdateRequest;
             if ((item.columns != null) == (item.keys != null)) return error.InvalidSchemaUpdateRequest;
             if (item.keys) |keys| {
@@ -2763,6 +3215,7 @@ fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value
             } else try validateConstraintColumns(columns);
         } else try validateConstraintColumns(columns);
         if (T == relational_wire.RelationalForeignKeyConstraint) {
+            if ((item.not_valid orelse false) and item.match == .partial) return error.InvalidSchemaUpdateRequest;
             if (item.parent_table.len == 0 or !std.unicode.utf8ValidateSlice(item.parent_table) or item.parent_columns.len != columns.len)
                 return error.InvalidSchemaUpdateRequest;
             try validateConstraintColumns(item.parent_columns);
@@ -2853,6 +3306,54 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
     }
 }
 
+fn bindNamedProperty(property: *DocumentProperty, registry: ?named_layouts.Registry, root: bool, unresolved: bool) anyerror!void {
+    if (property.named_type_id) |id| {
+        if (!root) return error.InvalidSchemaUpdateRequest;
+        if (!unresolved) {
+            const types = registry orelse return error.InvalidSchemaUpdateRequest;
+            if (types.domainById(id)) |domain| {
+                property.domain_view = domain;
+                property.enum_view = domain.enumeration;
+                const base = domain.column;
+                if (property.sql_type) |declared| {
+                    if (base.sql_element_type == null or declared != base.sql_element_type.?) return error.InvalidSchemaUpdateRequest;
+                } else property.sql_type = base.sql_element_type;
+                if (property.numeric_modifier != null and !@import("../common/sql_builtin_type.zig").NumericModifier.eql(property.numeric_modifier, base.numeric_modifier)) return error.InvalidSchemaUpdateRequest;
+                property.numeric_modifier = base.numeric_modifier;
+                if (@import("mod.zig").runtimeRelationalColumnType(property.*) != base.column_type) return error.InvalidSchemaUpdateRequest;
+            } else {
+                if (property.field_type == null or !std.mem.eql(u8, property.field_type.?, "sql_enum") or property.sql_type != null or property.numeric_modifier != null) return error.InvalidSchemaUpdateRequest;
+                property.enum_view = types.byId(id) orelse return error.InvalidSchemaUpdateRequest;
+            }
+        }
+    }
+    const info = @typeInfo(DocumentProperty).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| {
+        const child = @field(property, name);
+        if (Field == []DocumentProperty) {
+            for (child) |*entry| try bindNamedProperty(entry, registry, false, unresolved);
+        } else if (Field == ?*DocumentProperty) {
+            if (child) |entry| try bindNamedProperty(entry, registry, false, unresolved);
+        } else if (Field == []const PatternProperty) {
+            for (child) |entry| try bindNamedProperty(entry.property, registry, false, unresolved);
+        } else if (Field == []const DependentSchema) {
+            for (child) |entry| try bindNamedProperty(entry.schema, registry, false, unresolved);
+        }
+    }
+}
+fn bindNamedTypesMode(schema: *TableSchema, unresolved: bool) !void {
+    if (schema.storage_mode != .relational and schema.named_types != null and schema.named_types.?.records.len != 0) return error.InvalidSchemaUpdateRequest;
+    for (schema.document_schemas) |document| {
+        if (!document.has_named_type_fields) continue;
+        var root = makeRootDocumentProperty(document);
+        // Only this root's named properties are physical columns. All other
+        // root predicates and nested shapes remain ordinary JSON contracts.
+        root.properties = &.{};
+        try bindNamedProperty(&root, schema.named_types, false, unresolved);
+        for (document.properties) |*property| try bindNamedProperty(property, schema.named_types, schema.storage_mode == .relational, unresolved);
+    }
+}
+
 fn validateParsedStorageModeSchema(schema: TableSchema) !void {
     if (schema.storage_mode == .relational) return;
     for (schema.document_schemas) |document_schema| {
@@ -2862,6 +3363,8 @@ fn validateParsedStorageModeSchema(schema: TableSchema) !void {
 }
 
 fn propertyContainsRelationalOnlySchemaType(property: *const DocumentProperty) bool {
+    if (property.named_type_id != null) return true;
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return true;
     if (property.sql_type != null) return true;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "geopoint") or
@@ -2910,7 +3413,19 @@ fn propertyContainsSqlType(property: *const DocumentProperty) bool {
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) {
-        if (schema.relational_indexes != null or schema.checks != null or schema.unique_constraints != null or schema.foreign_keys != null or schema.column_defaults != null or schema.generated_columns != null) return error.InvalidSchemaUpdateRequest;
+        if (schema.relational_indexes != null or schema.checks != null or schema.unique_constraints != null or schema.foreign_keys != null or schema.column_defaults != null) return error.InvalidSchemaUpdateRequest;
+        if (schema.generated_columns) |generated| if (generated.value.array.items.len != 0) {
+            // A document producer binds one declared root domain, never a
+            // sampled/dynamic field or a per-type ambiguous definition.
+            if (!schema.enforce_types or schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
+            for (generated.value.array.items) |entry| {
+                const target = if (entry == .object) entry.object.get("column") orelse return error.InvalidSchemaUpdateRequest else return error.InvalidSchemaUpdateRequest;
+                if (target != .string) return error.InvalidSchemaUpdateRequest;
+                inline for (.{ "_id", "_doc", "_version", "_type", "_edges", "_embeddings", "_summaries" }) |reserved| {
+                    if (std.mem.eql(u8, target.string, reserved)) return error.InvalidSchemaUpdateRequest;
+                }
+            }
+        };
         return;
     }
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
@@ -2924,9 +3439,25 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
             ((constraint.primary orelse false) or (constraint.deferrable orelse false) or (constraint.timing orelse .immediate) != .immediate)) return error.InvalidSchemaUpdateRequest;
         if ((constraint.columns != null) == (constraint.keys != null)) return error.InvalidSchemaUpdateRequest;
         for (constraint.columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        const includes: []const []const u8 = constraint.include_columns orelse &.{};
+        for (includes) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        if (includes.len != 0) {
+            if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+                if (std.mem.eql(u8, index.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
+            };
+        }
+        if (constraint.without_overlaps_column) |period| {
+            const columns = constraint.columns orelse return error.InvalidSchemaUpdateRequest;
+            if (columns.len == 0 or !std.mem.eql(u8, columns[columns.len - 1], period) or constraint.keys != null or constraint.where != null or
+                (constraint.origin orelse .constraint) == .index) return error.InvalidSchemaUpdateRequest;
+            const property = findDocumentProperty(document_schema.properties, period) orelse return error.InvalidSchemaUpdateRequest;
+            const kind = property.field_type orelse return error.InvalidSchemaUpdateRequest;
+            if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) == null) return error.InvalidSchemaUpdateRequest;
+        }
         if (constraint.primary orelse false) {
             primary_count += 1;
-            if (primary_count > 1 or constraint.columns == null or constraint.columns.?.len == 0 or constraint.keys != null or constraint.where != null or (constraint.deferrable orelse false) or constraint.timing != .immediate)
+            if (primary_count > 1 or constraint.columns == null or constraint.columns.?.len == 0 or
+                constraint.keys != null or constraint.where != null)
                 return error.InvalidSchemaUpdateRequest;
             for (constraint.columns.?) |column| {
                 const property = findDocumentProperty(document_schema.properties, column) orelse return error.InvalidSchemaUpdateRequest;
@@ -2961,7 +3492,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         for (indexes.value) |index| {
             for (index.keys) |key| if (key.column) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
             for (index.include_columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
-            for (index.where orelse &.{}) |condition| if (findDocumentProperty(document_schema.properties, condition.column) == null) return error.InvalidSchemaUpdateRequest;
+            for (index.where orelse &.{}) |condition| if (condition.column) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
         }
     }
     if (schema.default_type.len != 0 and !std.mem.eql(u8, schema.default_type, document_schema.name)) {
@@ -3016,7 +3547,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     }
 }
 
-test "relational primary keys cannot defer enforcement" {
+test "relational primary keys retain deferred enforcement timing" {
     try verifyImmediateConstraintOwners();
 }
 
@@ -3037,7 +3568,21 @@ fn verifyImmediateConstraintOwners() !void {
     }) |constraint| {
         const json = try std.fmt.allocPrint(alloc, "{s}{s}]}}", .{ prefix, constraint });
         defer alloc.free(json);
-        try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc, json));
+        const primary = std.mem.indexOf(u8, constraint, "\"origin\"") == null;
+        const deferred = std.mem.indexOf(u8, constraint, "\"deferrable\":true") != null;
+        if (primary and deferred) {
+            var parsed = try parseSchema(alloc, json);
+            defer parsed.deinit(alloc);
+            const rule = parsed.unique_constraints.?.value[0];
+            try std.testing.expect(rule.primary.?);
+            try std.testing.expect(rule.deferrable.?);
+            const runtime = try @import("mod.zig").deriveRuntimeTableSchema(alloc, parsed);
+            defer storage_schema.freeSchema(alloc, runtime);
+            try std.testing.expect(runtime.requires_deferred_constraints);
+            try std.testing.expectEqual(@as(u32, 32), storage_schema.requiredReaderVersion(runtime));
+        } else {
+            try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(alloc, json));
+        }
     }
 }
 
@@ -3187,7 +3732,7 @@ test "relational declarations validation shares one allowance across NUMERIC con
     defer document.deinit();
     var budget: usize = expressions.max_allocated_bytes;
     var row = expressions.Execution.init(a, &budget);
-    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row);
+    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null);
     const used = 8 * 1024 * 1024 - row.numeric.remaining;
     try std.testing.expect(used > 1);
     try std.testing.expect(budget < expressions.max_allocated_bytes - @sizeOf(@import("numeric_constraints.zig").Execution));
@@ -3196,9 +3741,9 @@ test "relational declarations validation shares one allowance across NUMERIC con
     budget = expressions.max_allocated_bytes;
     row = expressions.Execution.init(a, &budget);
     row.numeric.remaining = used - 1;
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null));
     row.numeric.remaining = 8 * 1024 * 1024;
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null));
 }
 
 test "relational declarations exact NUMERIC preparation lends sticky quotas to recursive constraints" {
@@ -3320,6 +3865,7 @@ fn relationalPhysicalConstraintsAreExactForKind(property: DocumentProperty, inhe
     // validated as JSON but never lowered into physical numeric cells, so their
     // constraints do not need to fit a relational scalar encoding.
     if (documentPropertyUsesJsonEncoding(property) or propertyIsSqlArray(property)) return true;
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return true;
 
     const kind = inherited_kind orelse relationalNumericKind(property);
     if (kind) |numeric_kind| {
@@ -3384,6 +3930,7 @@ fn relationalNumericLiteralIsEncodable(literal: []const u8, kind: RelationalNume
 }
 
 fn isRelationalStorageProperty(property: DocumentProperty) bool {
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return !relationalPropertyContainsRootRef(property);
     // A root reference is context-sensitive: validation resolves it against
     // the enclosing document schema, while the physical column catalog only
     // sees this property. Reject recursive relational shapes until the catalog
@@ -3408,6 +3955,7 @@ fn isRelationalStorageProperty(property: DocumentProperty) bool {
             std.mem.eql(u8, field_type, "embedding") or
             std.mem.eql(u8, field_type, "json") or
             std.mem.eql(u8, field_type, "sql_array") or
+            std.mem.eql(u8, field_type, "sql_enum") or
             std.mem.eql(u8, field_type, "object") or
             std.mem.eql(u8, field_type, "array");
     }
@@ -3454,7 +4002,9 @@ fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]Docu
     var it = object.iterator();
     while (it.next()) |entry| {
         const schema_value = entry.value_ptr.object.get("schema").?;
+        var named_type_seen = false;
         const context: SchemaContext = .{
+            .named_type_seen = &named_type_seen,
             .document_root = schema_value.object,
             .scope_schema = schema_value.object,
         };
@@ -3462,6 +4012,7 @@ fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]Docu
         defer alloc.destroy(property);
         errdefer property.deinit(alloc);
         document_schemas[initialized] = try parseDocumentSchemaFromProperty(alloc, entry.key_ptr.*, property);
+        document_schemas[initialized].has_named_type_fields = named_type_seen;
         initialized += 1;
     }
     return document_schemas;
@@ -3627,6 +4178,9 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     // Scalar parsing owns large Debug temporaries. Finish that work before
     // descending so nested schemas retain only the child traversal frame.
     try @call(.never_inline, parseScalarPropertyKeywords, .{ alloc, context.numeric_domain, object, property });
+    if (property.named_type_id != null) if (context.named_type_seen) |seen| {
+        seen.* = true;
+    };
     property.properties = if (object.get("properties")) |properties_value|
         if (properties_value == .object) try parseDocumentProperties(alloc, context, properties_value.object) else &[_]DocumentProperty{}
     else
@@ -3643,6 +4197,18 @@ fn parseScalarPropertyKeywords(alloc: std.mem.Allocator, numeric_domain: bool, o
         ParsedTypeSpec{};
     property.field_type = type_spec.field_type;
     property.integer_only = type_spec.integer_only;
+    if (object.get("x-antfly-column-name")) |name| {
+        if (name != .string or name.string.len == 0 or name.string.len > 128 or std.mem.indexOfScalar(u8, name.string, 0) != null or
+            std.mem.eql(u8, name.string, "_id") or std.mem.eql(u8, name.string, "_doc") or std.mem.eql(u8, name.string, "_version")) return error.InvalidSchemaUpdateRequest;
+        property.sql_column_name = try alloc.dupe(u8, name.string);
+    }
+    property.named_type_id = if (object.get("x-antfly-sql-type-id")) |value| id: {
+        const number = exactU64JsonNumber(value) orelse return error.InvalidSchemaUpdateRequest;
+        if (number == 0) return error.InvalidSchemaUpdateRequest;
+        break :id number;
+    } else null;
+    const enum_family = if (property.field_type) |physical| std.mem.eql(u8, physical, "sql_enum") else false;
+    if ((enum_family and property.named_type_id == null) or (enum_family and (object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")))) return error.InvalidSchemaUpdateRequest;
     property.sql_type = if (object.get("x-antfly-sql-type")) |value| blk: {
         if (value != .string) return error.InvalidSchemaUpdateRequest;
         const physical = property.field_type orelse return error.InvalidSchemaUpdateRequest;
@@ -5018,6 +5584,14 @@ fn validateDocumentFieldValueWithContext(
     if (!exact_numeric) try validateNumericKeywordsWithContext(context, property, value.*);
 
     const field_type = property.field_type orelse return;
+    if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, field_type)) |kind| {
+        if (value.* != .string) return error.InvalidBatchRequest;
+        var scratch = std.heap.ArenaAllocator.init(context.alloc);
+        defer scratch.deinit();
+        var range_context: @import("../sql/range_value.zig").Context = .{ .alloc = scratch.allocator() };
+        _ = try @import("../sql/range_value.zig").parseLeaky(&range_context, kind, value.string);
+        return;
+    }
 
     if (exact_numeric) {
         if (std.mem.eql(u8, field_type, "number") or std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "integer")) {
@@ -5028,6 +5602,20 @@ fn validateDocumentFieldValueWithContext(
             return;
         }
         return error.InvalidBatchRequest;
+    }
+
+    if (property.enum_view != null) {
+        if (value.* != .string) return error.InvalidBatchRequest;
+        const view = property.enum_view orelse return error.InvalidBatchRequest;
+        if (value.string.len > @import("../system_catalog/named_types.zig").max_label_bytes) return error.InvalidBatchRequest;
+        if (context.preparation_execution) |execution| {
+            var count = view.record.definition.labels.len;
+            var branches: usize = 1;
+            while (count != 0) : (count >>= 1) branches += 1;
+            try execution.charge(branches * (1 + value.string.len));
+        }
+        _ = view.input(value.string) catch return error.InvalidBatchRequest;
+        return;
     }
 
     if (propertyIsSqlArray(property)) {
@@ -6471,7 +7059,7 @@ fn validateRegexPattern(pattern: []const u8) !void {
     _ = try regexMatch(pattern, "");
 }
 
-fn parseTtlTimestampNs(value: std.json.Value) !u64 {
+pub fn parseTtlTimestampNs(value: std.json.Value) !u64 {
     return switch (value) {
         .integer => |integer| blk: {
             if (integer < 0) return error.InvalidBatchRequest;

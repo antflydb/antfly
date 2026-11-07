@@ -37,9 +37,13 @@ fn writeMode(value: anytype, stream: anytype, comptime compact: bool) @TypeOf(st
     if (comptime T == std.json.Value) return stream.write(value);
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
+            if (@hasDecl(T, "nativeJsonStringify")) return value.nativeJsonStringify(stream);
             if (@hasDecl(T, "nativeJsonProjection")) return writeMode(value.nativeJsonProjection(), stream, compact);
             try stream.beginObject();
             inline for (info.field_names) |reflected_name| {
+                if (comptime @hasDecl(T, "nativeJsonSkipFieldComptime")) {
+                    if (comptime T.nativeJsonSkipFieldComptime(reflected_name)) continue;
+                }
                 if (!@hasDecl(T, "nativeJsonSkipField") or !value.nativeJsonSkipField(reflected_name)) {
                     try stream.objectField(reflected_name);
                     try writeMode(@field(value, reflected_name), stream, compact);

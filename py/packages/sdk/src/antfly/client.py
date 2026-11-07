@@ -44,6 +44,11 @@ from antfly.client_generated.models import (
     GraphTraverseQuery,
     IndexMaintenanceRequest,
     IndexMaintenanceResponse,
+    IndexPublicationState,
+    IndexPublicationStatus,
+    IndexPublicationStatusIndexType,
+    SchemaValidationState,
+    SchemaValidationStatus,
     InferenceContextPrepareRequest,
     InferenceContextPrepareResponse,
     InferenceDecideRequest,
@@ -56,10 +61,13 @@ from antfly.client_generated.models import (
     OllamaEmbedderConfig,
     OpenAIEmbedderConfig,
     QueryResponses,
+    SQLCatalogOperationReceipt,
     SQLDiagnostic,
     SQLPreparedExecutionRequest,
     SQLPreparedResponse,
     SQLPrepareRequest,
+    SQLNotificationPage,
+    SQLNotificationPollRequest,
     SQLRequest,
     SQLResponse,
     SyncLevel,
@@ -668,6 +676,48 @@ class IndexOperations:
     def __init__(self, client: "AntflyClient") -> None:
         self._client = client
 
+    def publication(
+        self,
+        table: str,
+        name: str,
+        token: str,
+        *,
+        database: str | None = None,
+        namespace: str | None = None,
+    ) -> IndexPublicationStatus:
+        """Observe the exact retained job without replaying DDL.
+
+        Published is historical completion, not current query readiness.
+        Supply both database and namespace for an explicit catalog scope.
+        """
+        if len(token) != 171 or any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in token):
+            raise ValueError("invalid index publication token")
+        if (database is None) != (namespace is None):
+            raise ValueError("database and namespace must be supplied together")
+        prefix = "/db/v1"
+        if database is not None and namespace is not None:
+            prefix += f"/databases/{quote(database, safe='')}/namespaces/{quote(namespace, safe='')}"
+        result = self._client._request(
+            "GET",
+            f"{prefix}/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}/publication",
+            headers={"X-Antfly-Index-Publication-Token": token},
+            _max_response_bytes=16 << 10,
+            _expected_status=200,
+        )
+        try:
+            status = IndexPublicationStatus.from_dict(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException("invalid index publication response") from exc
+        if (
+            status.publication_token != token
+            or status.index_name != name
+            or status.index_type is not IndexPublicationStatusIndexType.RELATIONAL
+            or not isinstance(status.replication_pending, bool)
+            or (status.replication_pending and status.state is not IndexPublicationState.ADMISSION_UNKNOWN)
+        ):
+            raise AntflyException("index publication response identity or confirmation mismatch")
+        return status
+
     def retry(self, table: str, name: str, request: IndexMaintenanceRequest) -> IndexMaintenanceResponse:
         """Resume failed maintenance using exact status proofs, without automatic retries.
 
@@ -753,12 +803,38 @@ class IndexOperations:
         self._client._request("DELETE", f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}")
 
 
+def _sql_catalog_receipt(body: dict[str, Any]) -> SQLCatalogOperationReceipt:
+    if not isinstance(body, dict):
+        raise ValueError("Invalid SQL catalog receipt")
+    for key in ("database", "namespace", "name", "recovery_token"):
+        if not isinstance(body.get(key), str) or not body[key]:
+            raise ValueError("Invalid SQL catalog receipt identity")
+    if len(body["recovery_token"].encode("utf-8")) > 8192:
+        raise ValueError("Invalid SQL catalog recovery token")
+    for key in ("object_id", "generation", "catalog_revision"):
+        if key in body:
+            value = body[key]
+            if (
+                not isinstance(value, str)
+                or not value.isascii()
+                or not value.isdecimal()
+                or len(value) > 20
+                or str(int(value)) != value
+                or int(value) > (1 << 64) - 1
+            ):
+                raise ValueError("Invalid SQL catalog receipt integer")
+    return SQLCatalogOperationReceipt.from_dict(body)
+
+
 class SQLExecutionError(AntflyException):
     """SQLSTATE diagnostic and optional native transaction reconciliation receipt."""
 
-    def __init__(self, status_code: int, diagnostic: SQLDiagnostic) -> None:
+    def __init__(
+        self, status_code: int, diagnostic: SQLDiagnostic, catalog_receipt: SQLCatalogOperationReceipt | None = None
+    ) -> None:
         self.status_code = status_code
         self.diagnostic = diagnostic
+        self.catalog_receipt = catalog_receipt
         super().__init__(f"SQL execution failed ({diagnostic.code}): {diagnostic.message}")
 
 
@@ -889,8 +965,31 @@ class AntflyClient:
                         msg = text
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
+                    if (path == "/db/v1/sql" or path.startswith("/db/v1/sql/")) and error_body is not None:
+                        receipt_body = error_body.get("catalog_receipt")
+                        if isinstance(receipt_body, dict):
+                            try:
+                                receipt = _sql_catalog_receipt(receipt_body)
+                            except (KeyError, TypeError, ValueError):
+                                receipt = None
+                            if receipt is not None:
+                                diagnostic_body = receipt_body.get("diagnostic")
+                                if (
+                                    not isinstance(diagnostic_body, dict)
+                                    or not isinstance(diagnostic_body.get("code"), str)
+                                    or len(diagnostic_body["code"]) != 5
+                                    or not isinstance(diagnostic_body.get("message"), str)
+                                ):
+                                    diagnostic_body = {
+                                        "code": "40003",
+                                        "message": "SQL catalog outcome is unknown; observe the recovery token without replaying DDL",
+                                    }
+                                diagnostic_body = {**diagnostic_body, "retryable": False}
+                                raise SQLExecutionError(
+                                    response.status_code, SQLDiagnostic.from_dict(diagnostic_body), receipt
+                                )
                     if (
-                        (path == "/db/v1/sql" or path.startswith("/db/v1/sql/prepared"))
+                        (path == "/db/v1/sql" or path.startswith("/db/v1/sql/"))
                         and error_body is not None
                         and isinstance(error_body.get("code"), str)
                         and len(error_body["code"]) == 5
@@ -1345,6 +1444,49 @@ class AntflyClient:
         """
         self._request("DELETE", f"/db/v1/tables/{quote(name, safe='')}")
 
+    def get_schema_validation_publication(
+        self, table: str, token: str, *, database: str | None = None, namespace: str | None = None
+    ) -> SchemaValidationStatus:
+        """Observe an exact schema job without replaying DDL; a token grants no authorization."""
+        if len(token) != 182 or any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in token):
+            raise ValueError("invalid schema validation token")
+        if (database is None) != (namespace is None):
+            raise ValueError("database and namespace must be supplied together")
+        prefix = "/db/v1"
+        if database is not None and namespace is not None:
+            prefix += f"/databases/{quote(database, safe='')}/namespaces/{quote(namespace, safe='')}"
+        result = self._request(
+            "GET",
+            f"{prefix}/tables/{quote(table, safe='')}/schema/publication",
+            headers={"X-Antfly-Schema-Validation-Token": token},
+            _max_response_bytes=16 << 10,
+            _expected_status=200,
+        )
+        try:
+            status = SchemaValidationStatus.from_dict(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException("invalid schema validation response") from exc
+        if (
+            status.schema_validation_token != token
+            or not isinstance(status.state, SchemaValidationState)
+            or type(status.active_schema_version) is not int
+            or status.active_schema_version < 0
+            or status.active_schema_version > 0xFFFFFFFF
+            or (
+                status.state is SchemaValidationState.SUCCEEDED
+                and (
+                    status.phase != "succeeded"
+                    or type(status.owner_count) is not int
+                    or not 1 <= status.owner_count <= 4096
+                    or status.owner_count != status.ready
+                    or status.owner_count != status.installed
+                    or status.owner_count != status.released
+                )
+            )
+        ):
+            raise AntflyException("schema validation response identity or completion mismatch")
+        return status
+
     def execute_sql(self, request: SQLRequest) -> SQLResponse:
         """Execute one bound SQL statement without retrying ambiguous mutations.
 
@@ -1353,9 +1495,84 @@ class AntflyClient:
         """
         return self._sql_result(self._sql_request("POST", "/db/v1/sql", request.to_dict()))
 
+    def poll_sql_notifications(
+        self, connection_id: str, request: SQLNotificationPollRequest | None = None
+    ) -> SQLNotificationPage:
+        """Receive LISTEN events; acknowledge only a completely consumed prior page.
+
+        Lost responses are replayable. This method never executes or retries SQL.
+        Delivery waits until the connection's transaction has ended.
+        """
+        if (
+            not isinstance(connection_id, str)
+            or len(connection_id) != 32
+            or any(char not in "0123456789abcdef" for char in connection_id)
+        ):
+            raise AntflyException("SQL connection ID must be 32 lowercase hexadecimal characters")
+        value = request.to_dict() if request is not None else {}
+        cursor = value.get("acknowledge")
+        if cursor is not None and (
+            not isinstance(cursor, str) or len(cursor) != 20 or any(char not in "0123456789abcdef" for char in cursor)
+        ):
+            raise AntflyException("Invalid SQL notification acknowledgement cursor")
+        limit = value.get("limit", 128)
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise AntflyException("SQL notification limit must be between 1 and 128")
+        body = self._sql_request(
+            "POST", f"/db/v1/sql/connections/{connection_id}/notifications", value, max_response_bytes=1 << 20
+        )
+        events = body.get("notifications")
+        page_cursor = body.get("cursor")
+        if (
+            not isinstance(events, list)
+            or len(events) > limit
+            or type(body.get("pending")) is not bool
+            or (
+                page_cursor is not None
+                and (
+                    not isinstance(page_cursor, str)
+                    or len(page_cursor) != 20
+                    or any(char not in "0123456789abcdef" for char in page_cursor)
+                )
+            )
+            or (events and page_cursor is None)
+        ):
+            raise AntflyException("Invalid SQL notification page")
+        size = 0
+        for event in events:
+            if (
+                not isinstance(event, dict)
+                or not isinstance(event.get("channel"), str)
+                or not isinstance(event.get("payload"), str)
+                or "\0" in event["channel"]
+                or "\0" in event["payload"]
+                or type(event.get("sender_pid")) is not int
+                or not 1 <= event["sender_pid"] <= 2147483647
+            ):
+                raise AntflyException("Invalid SQL notification event")
+            channel_bytes = len(event["channel"].encode("utf-8"))
+            payload_bytes = len(event["payload"].encode("utf-8"))
+            size += channel_bytes + payload_bytes
+            if not 1 <= channel_bytes <= 63 or payload_bytes > 7999 or size > 65536:
+                raise AntflyException("SQL notification page exceeds delivery bounds")
+        return SQLNotificationPage.from_dict(body)
+
     def prepare_sql(self, request: SQLPrepareRequest) -> SQLPreparedResponse:
         """Create an owner-bound durable resource independent of transactions."""
         return SQLPreparedResponse.from_dict(self._sql_request("POST", "/db/v1/sql/prepared", request.to_dict()))
+
+    def get_sql_catalog_operation(self, recovery_token: str) -> SQLCatalogOperationReceipt:
+        """Observe a retained catalog outcome without resubmitting uncertain DDL."""
+        if not isinstance(recovery_token, str) or not 1 <= len(recovery_token.encode("utf-8")) <= 8192:
+            raise AntflyException("SQL recovery token must contain 1..8192 bytes")
+        body = self._sql_request("POST", "/db/v1/sql/operations/status", {"recovery_token": recovery_token})
+        try:
+            receipt = _sql_catalog_receipt(body)
+        except (KeyError, TypeError, ValueError) as error:
+            raise AntflyException("Invalid SQL catalog receipt") from error
+        if receipt.recovery_token != recovery_token:
+            raise AntflyException("SQL catalog receipt does not match recovery token")
+        return receipt
 
     def execute_prepared_sql(self, prepared_id: str, request: SQLPreparedExecutionRequest) -> SQLResponse:
         """Execute with fresh authorization, without replaying ambiguous mutations."""
@@ -1376,7 +1593,13 @@ class AntflyClient:
         )
 
     def _sql_request(
-        self, method: str, path: str, value: dict[str, Any] | None, *, connection_id: str | None = None
+        self,
+        method: str,
+        path: str,
+        value: dict[str, Any] | None,
+        *,
+        connection_id: str | None = None,
+        max_response_bytes: int = 16 << 20,
     ) -> dict[str, Any]:
         from .sql_transport import encode_sql_request
 
@@ -1394,7 +1617,7 @@ class AntflyClient:
             },
             follow_redirects=False,
             _expected_status=200,
-            _max_response_bytes=16 << 20,
+            _max_response_bytes=max_response_bytes,
         )
 
     @staticmethod

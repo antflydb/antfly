@@ -21,9 +21,12 @@ test {
     _ = @import("lateral_test.zig");
     _ = @import("merge_test.zig");
     _ = @import("antfly_local_sources").sql_aggregate_binding;
+    _ = @import("antfly_local_sources").sql_search_cursor;
     _ = @import("antfly_local_sources").sql_compiler;
     _ = @import("antfly_local_sources").sql_schema_ddl;
+    _ = @import("antfly_local_sources").sql_ddl_runtime;
     _ = @import("antfly_local_sources").sql_scalar;
+    _ = @import("antfly_local_sources").sql_document_patch;
     _ = @import("antfly_local_sources").sql_parameter_frame;
     _ = @import("antfly_local_sources").sql_bound_scalars;
     _ = @import("antfly_local_sources").sql_replay_rows;
@@ -46,6 +49,7 @@ test {
     _ = @import("returning_test.zig");
     _ = @import("conflict_test.zig");
     _ = @import("antfly_local_sources").sql_catalog;
+    _ = @import("antfly_local_sources").sql_view_definition;
     _ = @import("antfly_local_sources").sql_document_row;
     _ = @import("antfly_local_sources").sql_read_stream;
     _ = @import("antfly_local_sources").sql_operators;

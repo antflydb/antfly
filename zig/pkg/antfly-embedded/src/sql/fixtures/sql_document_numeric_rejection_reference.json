@@ -1,0 +1,607 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": "guarded-document-field-mutations",
+  "seeds": [
+    {
+      "key": "doc:a",
+      "value": {
+        "title": "Launch",
+        "status": "draft",
+        "category": "release",
+        "amount": 12,
+        "enabled": true,
+        "note": "keep-a",
+        "metadata": {
+          "source": "api",
+          "billing": {
+            "plan": "pro"
+          },
+          "flags": [
+            "rated"
+          ]
+        }
+      }
+    },
+    {
+      "key": "doc:b",
+      "value": {
+        "title": "Other",
+        "status": "ready",
+        "category": "other",
+        "amount": 20,
+        "enabled": false,
+        "note": "keep-b",
+        "metadata": {
+          "source": "internal",
+          "billing": {
+            "plan": "free"
+          },
+          "flags": []
+        }
+      }
+    },
+    {
+      "key": "doc:c",
+      "value": {
+        "title": "Untouched",
+        "status": "closed",
+        "category": "other",
+        "amount": 4,
+        "enabled": false,
+        "note": "keep-c",
+        "metadata": {
+          "source": "manual",
+          "flags": []
+        }
+      }
+    }
+  ],
+  "entries": [
+    {
+      "id": "sql-0970",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "42883",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0971",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "42883",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0972",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "42883",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0973",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "fee": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "fee"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "fee": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "fee"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "sqlstate": "42883",
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": []
+}

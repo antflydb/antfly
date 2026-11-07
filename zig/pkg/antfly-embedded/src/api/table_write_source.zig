@@ -80,6 +80,11 @@ pub const TableWriteSource = struct {
     /// Transaction-ID commits enforce owner-routed range guards atomically
     /// with primary writes, including read-only guard participants.
     supports_sql_range_guards: bool = false,
+    /// Trusted backend capability, never a request hint: row defaults,
+    /// generated values, schema and CHECK validation share the atomic native
+    /// preparation/commit boundary. Ingress must not evaluate volatile defaults
+    /// in a disposable validation copy before invoking that owner.
+    prepares_rows_atomically: bool = false,
 
     pub const VTable = struct {
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
@@ -161,6 +166,10 @@ pub const TableWriteSource = struct {
             action: []const u8,
             cancellation: db_mod.types.CancellationToken,
         ) anyerror!?db_mod.types.GraphMetricStatus = null,
+        sql_maintenance_group: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, []const u8, db_mod.types.CancellationToken) anyerror!?[]u8 = null,
+        sql_maintenance_group_routed: ?*const fn (*anyopaque, std.mem.Allocator, @import("../metadata/catalog_route_contract.zig").CatalogRouteFence, u64, []const u8, []const u8, db_mod.types.CancellationToken) anyerror!?[]u8 = null,
+        sql_maintenance_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, @import("../metadata/catalog_route_contract.zig").CatalogRouteFence, u64, []const u8, []const u8, db_mod.types.CancellationToken) anyerror!?[]u8 = null,
+        sql_maintenance_group_local: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, []const u8) anyerror!?[]u8 = null,
         graph_metric_maintenance_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -292,6 +301,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
         ) anyerror!?void = null,
+        batch_group_local_routed: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence) anyerror!?void = null,
         txn_begin_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -645,6 +655,16 @@ pub const TableWriteSource = struct {
             index_json: ?[]const u8,
             stamp: metadata_api.CatalogMutationStamp,
         ) anyerror!?void = null,
+        /// Structured tail capability; external authority must never fall back
+        /// to an older positional resolver that cannot carry its admission.
+        txn_resolve_group_local_with_request: ?*const fn (
+            *anyopaque,
+            std.mem.Allocator,
+            u64,
+            []const u8,
+            distributed_txn.TxnResolveRequest,
+            db_mod.types.CancellationToken,
+        ) anyerror!?void = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -797,6 +817,24 @@ pub const TableWriteSource = struct {
         const fn_ptr = self.vtable.graph_metric_action_with_cancellation orelse
             return try self.graphMetricAction(alloc, table_name, index_name, metric_name, action);
         return try BoundaryAbi.call("graph_metric_action_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name, metric_name, action, cancellation });
+    }
+
+    pub fn sqlMaintenanceGroup(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const callback = self.vtable.sql_maintenance_group orelse return null;
+        return BoundaryAbi.call("sql_maintenance_group", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, body, cancellation });
+    }
+    pub fn sqlMaintenanceGroupRouted(self: TableWriteSource, alloc: std.mem.Allocator, route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const callback = self.vtable.sql_maintenance_group_routed orelse return error.CatalogRouteFenceUnsupported;
+        return BoundaryAbi.call("sql_maintenance_group_routed", self.boundary_dispatch, callback, .{ self.ptr, alloc, route, group_id, table_name, body, cancellation });
+    }
+    pub fn sqlMaintenanceGroupLocalRouted(self: TableWriteSource, alloc: std.mem.Allocator, route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_mod.types.CancellationToken) !?[]u8 {
+        const callback = self.vtable.sql_maintenance_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
+        return BoundaryAbi.call("sql_maintenance_group_local_routed", self.boundary_dispatch, callback, .{ self.ptr, alloc, route, group_id, table_name, body, cancellation });
+    }
+
+    pub fn sqlMaintenanceGroupLocal(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !?[]u8 {
+        const callback = self.vtable.sql_maintenance_group_local orelse return null;
+        return BoundaryAbi.call("sql_maintenance_group_local", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn graphMetricMaintenanceGroupLocal(
@@ -1026,6 +1064,12 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("batch_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req });
     }
 
+    pub fn batchGroupLocalRouted(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, route: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence) !?void {
+        if (self.vtable.batch_group_local_routed) |apply| return apply(self.ptr, alloc, group_id, table_name, req, route);
+        if (route.route.execution == .native_local) return error.StorageKernelOwnerUnavailable;
+        return self.batchGroupLocal(alloc, group_id, table_name, req);
+    }
+
     pub fn txnBeginGroupLocal(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1066,6 +1110,7 @@ pub const TableWriteSource = struct {
         participants: []const []const u8,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if (context.external_decision_owner != null and self.vtable.txn_begin_group_local_with_pre_decision_context == null) return error.ExternalTransactionDecisionRequired;
         const fn_ptr = self.vtable.txn_begin_group_local_with_pre_decision_context orelse
             return try self.txnBeginGroupLocal(alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
         return try BoundaryAbi.call("txn_begin_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, context });
@@ -1101,6 +1146,15 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.txn_resolve_group_local orelse return null;
         return try BoundaryAbi.call("txn_resolve_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level });
+    }
+
+    pub fn txnResolveGroupLocalWithRequest(self: TableWriteSource, alloc: std.mem.Allocator, group: u64, table: []const u8, req: distributed_txn.TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !?void {
+        try cancellation.check();
+        if (self.vtable.txn_resolve_group_local_with_request) |callback|
+            return try BoundaryAbi.call("txn_resolve_group_local_with_request", self.boundary_dispatch, callback, .{ self.ptr, alloc, group, table, req, cancellation });
+        if (req.external_decision_owner != null) return error.ExternalTransactionDecisionRequired;
+        if (req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.InvalidBatchRequest;
+        return self.txnResolveGroupLocalWithCancellation(alloc, group, table, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation);
     }
 
     pub fn txnResolveGroupLocalWithCancellation(

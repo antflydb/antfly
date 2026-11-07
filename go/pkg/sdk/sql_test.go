@@ -26,6 +26,84 @@ import (
 	"testing"
 )
 
+func TestSQLCatalogRecoveryRetainsUnknownReceiptAndNeverReplays(t *testing.T) {
+	const token = "opaque-retained-operation"
+	const receipt = `{"kind":"sequence","operation":"create","database":"postgres","namespace":"public","name":"counter","state":"unknown","recovery_token":"` + token + `","diagnostic":{"code":"40003","message":"observe only","retryable":false}}`
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+		switch r.URL.Path {
+		case "/db/v1/sql":
+			if calls != 1 {
+				t.Error("replayed DDL")
+			}
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"columns":[],"rows":[],"command_tag":"DDL PENDING","catalog_receipt":`+receipt+`}`)
+		case "/db/v1/sql/operations/status":
+			body, _ := io.ReadAll(r.Body)
+			if string(body) != `{"recovery_token":"`+token+`"}` {
+				t.Errorf("changed recovery handle: %s", body)
+			}
+			_, _ = io.WriteString(w, strings.Replace(receipt, `"state":"unknown"`, `"state":"committed","object_id":"18446744073709551615","generation":"9007199254740993","catalog_revision":"18446744073709551615"`, 1))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := NewAntflyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ExecuteSQL(context.Background(), SQLRequest{Statement: "CREATE SEQUENCE counter"})
+	var diagnostic *SQLExecutionError
+	if !errors.As(err, &diagnostic) || diagnostic.CatalogReceipt == nil || diagnostic.CatalogReceipt.RecoveryToken != token || diagnostic.Diagnostic.Retryable {
+		t.Fatalf("lost recovery receipt: %#v", err)
+	}
+	result, err := client.GetSQLCatalogOperation(context.Background(), diagnostic.CatalogReceipt.RecoveryToken)
+	if err != nil || result.ObjectId != "18446744073709551615" || result.Generation != "9007199254740993" {
+		t.Fatalf("lost committed identity: %#v, %v", result, err)
+	}
+	if _, err := client.GetSQLCatalogOperation(context.Background(), ""); err == nil {
+		t.Fatal("accepted empty token")
+	}
+	if calls != 2 {
+		t.Fatalf("unexpected request count: %d", calls)
+	}
+}
+
+func TestSQLCatalogRecoveryDoesNotRedirectOrRetry(t *testing.T) {
+	for _, status := range []int{307, 403, 503} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.URL.Path != "/db/v1/sql/operations/status" {
+					t.Errorf("redirected recovery: %s", r.URL.Path)
+				}
+				w.Header().Set("Location", "/replayed")
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"code":"40003","message":"observe only","retryable":false}`)
+			}))
+			defer server.Close()
+			client, err := NewAntflyClient(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.GetSQLCatalogOperation(context.Background(), "opaque-retained-operation")
+			var diagnostic *SQLExecutionError
+			if !errors.As(err, &diagnostic) || diagnostic.Diagnostic.Retryable {
+				t.Fatalf("lost nonretryable diagnostic: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("retried/redirected recovery %d times", calls)
+			}
+		})
+	}
+}
+
 func TestPreparedSQLParameterContractsRetainElementIdentity(t *testing.T) {
 	var response SQLPreparedResponse
 	if err := json.Unmarshal([]byte(`{"prepared_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at_ms":123,"owner_node_id":"9007199254740993","parameter_types":["array","integer"],"parameter_descriptors":[{"type":"array","element_type":"int64","nullable":true},{"type":"integer","element_type":"int32","nullable":true}],"columns":[]}`), &response); err != nil {

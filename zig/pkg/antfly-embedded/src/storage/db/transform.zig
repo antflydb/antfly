@@ -926,3 +926,102 @@ test "invalid transform operands are rejected before missing-document no-op reso
         }),
     );
 }
+
+/// The native transform parser is also the authority for UPDATE OF provenance.
+/// SQL document paths keep literal segments, while transform paths use dots.
+pub fn touchesDeclaredPath(a: Allocator, operation: types.TransformOp, path: []const []const u8) !bool {
+    const source = try normalizeJsonPath(operation.path);
+    if (pathsOverlap(source.slice(), path)) return true;
+    if (operation.op == .rename) {
+        const bytes = operation.value_json orelse return error.InvalidArgument;
+        var destination = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer destination.deinit();
+        if (destination.value != .string) return error.InvalidArgument;
+        const target = try normalizeJsonPath(destination.value.string);
+        return pathsOverlap(target.slice(), path);
+    }
+    return false;
+}
+fn pathsOverlap(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+test "transform UPDATE OF uses native nested and rename paths with literal column components" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try touchesDeclaredPath(a, .{ .op = .set, .path = "$.payload.n", .value_json = "1" }, &.{"payload"}));
+    try std.testing.expect(!try touchesDeclaredPath(a, .{ .op = .set, .path = "payload_other.n", .value_json = "1" }, &.{"payload"}));
+    try std.testing.expect(try touchesDeclaredPath(a, .{ .op = .rename, .path = "source", .value_json = "\"payload.n\"" }, &.{"payload"}));
+    try std.testing.expect(!try touchesDeclaredPath(a, .{ .op = .set, .path = "literal.dot", .value_json = "1" }, &.{"literal.dot"}));
+}
+
+/// Reconstruct only the explicit JSON-null cells affected by document ops.
+/// SQL NULL is represented by an absent flag. Declared non-JSON columns never
+/// acquire a JSON-null flag merely because an operand spells the JSON null.
+pub fn resolveJsonNullFields(a: Allocator, before: []const []const u8, json_columns: []const []const u8, transform: types.DocumentTransform, is_insert: bool) ![]const []const u8 {
+    var columns: std.StringHashMapUnmanaged(void) = .empty;
+    defer columns.deinit(a);
+    for (json_columns) |column| try columns.put(a, column, {});
+    var flags: std.StringHashMapUnmanaged(void) = .empty;
+    defer flags.deinit(a);
+    for (before) |field| if (columns.contains(field)) try flags.put(a, field, {});
+    for (transform.operations) |operation| {
+        if (operation.op == .set_on_insert and !is_insert) continue;
+        const path = try normalizeJsonPath(operation.path);
+        if (path.len == 0) continue;
+        const root = path.parts[0];
+        if (operation.op == .rename) {
+            const bytes = operation.value_json orelse return error.InvalidArgument;
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+            defer parsed.deinit();
+            if (parsed.value != .string) return error.InvalidArgument;
+            const destination = try normalizeJsonPath(parsed.value.string);
+            if (destination.len == 0) return error.InvalidArgument;
+            const retained_null = path.len == 1 and flags.contains(root);
+            _ = flags.remove(root);
+            _ = flags.remove(destination.parts[0]);
+            if (retained_null and destination.len == 1 and columns.contains(destination.parts[0])) try flags.put(a, destination.parts[0], {});
+            continue;
+        }
+        _ = flags.remove(root);
+        if (path.len != 1 or !columns.contains(root) or (operation.op != .set and operation.op != .set_on_insert)) continue;
+        const bytes = operation.value_json orelse return error.InvalidArgument;
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        if (parsed.value == .null) try flags.put(a, root, {});
+    }
+    const result = try a.alloc([]const u8, flags.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |field| a.free(field);
+        a.free(result);
+    }
+    var iterator = flags.keyIterator();
+    for (result) |*field| {
+        field.* = try a.dupe(u8, iterator.next().?.*);
+        initialized += 1;
+    }
+    std.mem.sort([]const u8, result, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    return result;
+}
+
+test "shared transform typing preserves SQL NULL and JSON null through nested updates and rename" {
+    const a = std.testing.allocator;
+    const fields = try resolveJsonNullFields(a, &.{"json_before"}, &.{ "json_before", "json_after", "untouched" }, .{ .key = "row", .operations = &.{
+        .{ .op = .rename, .path = "json_before", .value_json = "\"json_after\"" },
+        .{ .op = .set, .path = "integer_col", .value_json = "null" },
+        .{ .op = .set, .path = "untouched", .value_json = "null" },
+        .{ .op = .set, .path = "json_after.n", .value_json = "1" },
+    } }, false);
+    defer {
+        for (fields) |field| a.free(field);
+        a.free(fields);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("untouched", fields[0]);
+}

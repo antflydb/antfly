@@ -57,7 +57,8 @@ fn page(arena: *std.heap.ArenaAllocator, raw: []const u8, next: staging.Progress
 
 /// Point-reads one checksum-verified REF3 frame. A frame may span many bounded
 /// target pages, but its acknowledgement advances only after its last effect.
-/// A retry reconstructs exactly the same values from the immutable program.
+/// The committed row and replay cursor advance atomically. Newly added volatile
+/// defaults are reused from the committed target row during subsequent updates.
 pub fn prepareTail(target: *DB, alloc: Allocator, scope: staging.Scope, source: *DB, programs: *const ProgramSet, max_effects: usize, cancellation: types.CancellationToken) !staging.PreparedPage {
     return prepareTailInternal(target, alloc, scope, source, null, programs, max_effects, cancellation);
 }
@@ -94,6 +95,12 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
     if (next.phase != .importing) return error.RestoreStagingInProgress;
     const previous = next.rewrite orelse return error.InvalidRestoreStagingCommand;
     if (!previous.snapshot_complete or previous.final_cut != null) return error.RestoreStagingInProgress;
+    const preparation: ?@import("../../schema/relational_expression.zig").PreparationRuntime = if (target.backend_runtime.io()) |io| .{ .io = io } else null;
+    // Only volatile backfills need target lookups. A page-local overlay handles
+    // repeated keys in one retained frame without regenerating an earlier ID.
+    var materialized: std.StringHashMapUnmanaged(?[]const u8) = .empty;
+    var target_txn = if (programs.requiresMaterializedDefaults()) try target.core.store.beginReadTxn() else null;
+    defer if (target_txn) |*txn| txn.abort();
     var source_txn = if (source) |db| try db.core.store.beginReadTxn() else null;
     defer if (source_txn) |*txn| txn.abort();
     var namespace: [24]u8 = undefined;
@@ -122,6 +129,7 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
     var deletes: std.ArrayList([]const u8) = .empty;
     var timestamps: std.ArrayList(staging.Timestamp) = .empty;
     var output_bytes: usize = 0;
+    var materialized_bytes: usize = 0;
     var source_effects: u32 = 0;
     while (reader.remaining != 0 and writes.items.len + deletes.items.len < max_effects and source_effects < 1024) {
         try cancellation.check();
@@ -142,16 +150,38 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
         if (effect.value_len) |len| if (len > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
         const transformed: ?LogicalRow = if (try effect.valueAlloc(temporary)) |value| if (programs.document_validator != null)
             .{ .json = try programs.preserveDocument(temporary, value), .timestamp = effect.timestamp }
-        else
-            try programs.transformJson(temporary, value) else null;
+        else logical: {
+            const previous_target = if (materialized.get(effect.key)) |prior| prior else if (target_txn) |*txn|
+                txn.get(effect.key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                }
+            else
+                null;
+            break :logical try programs.transformJsonPrepared(temporary, value, preparation, previous_target);
+        } else null;
         const size = key.len +| if (transformed) |value| value.json.len else @as(usize, 0);
         if (size > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
         if (output_bytes != 0 and output_bytes +| size > 1024 * 1024) {
             reader = before;
             break;
         }
+        const physical_bytes = if (target_txn != null) if (transformed) |value| (value.packed_row orelse return error.InvalidRestoreStagingCommand).len else 0 else 0;
+        if (materialized_bytes +| physical_bytes > 16 * 1024 * 1024) {
+            if (output_bytes == 0) return error.RelationalRowResultTooLarge;
+            reader = before;
+            break;
+        }
+        materialized_bytes += physical_bytes;
         output_bytes += size;
         source_effects += 1;
+        if (target_txn != null) {
+            // The overlay stores encoded target rows, bounded by the same page
+            // row/byte limits, so subsequent effects can bind typed ordinals.
+            const physical_key = try owned.dupe(u8, effect.key);
+            const packed_bytes = if (transformed) |value| try owned.dupe(u8, value.packed_row orelse return error.InvalidRestoreStagingCommand) else null;
+            try materialized.put(owned, physical_key, packed_bytes);
+        }
         const output_key = try owned.dupe(u8, key);
         if (transformed) |value| {
             if (effect.timestamp == 0 or value.timestamp != effect.timestamp) return error.RetainedEffectsCorrupt;

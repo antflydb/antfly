@@ -562,7 +562,7 @@ test "SQL compact ingress preserves codecs shape nulls and isolated ownership" {
         defer original.deinit();
         var wire: std.Io.Writer.Allocating = .init(a);
         defer wire.deinit();
-        try binary.encode(original.value, &wire.writer, .{});
+        try binary.encode(a, original.value, &wire.writer, .{});
         for ([_]bool{ false, true }) |is_binary| {
             var owner = std.heap.ArenaAllocator.init(a);
             defer owner.deinit();
@@ -590,7 +590,7 @@ test "SQL compact ingress rejects truncation and unwinds allocation failures" {
             const value = (try @import("array_text.zig").decodeLeaky(arena.allocator(), .text, "[-1:1]={\"é\\\"x\",NULL,\"retained\"}", .{ .compact = true })).value;
             var wire: std.Io.Writer.Allocating = .init(a);
             defer wire.deinit();
-            @import("array_binary.zig").encode(value, &wire.writer, .{}) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+            @import("array_binary.zig").encode(a, value, &wire.writer, .{}) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
             const copied = (try @import("array_binary.zig").decodeLeaky(arena.allocator(), .text, wire.written(), .{ .compact = true })).value;
             var work: arrays.Budget = .{};
             try std.testing.expectEqual(std.math.Order.eq, try value.compare(copied, &work));
@@ -644,12 +644,12 @@ test "SQL compact validation proof preserves quota work cancellation and binary 
         defer fast.deinit();
         var slow: std.Io.Writer.Allocating = .init(a);
         defer slow.deinit();
-        try binary.encode(value, &fast.writer, .{});
-        try binary.encode(fallback, &slow.writer, .{});
+        try binary.encode(std.testing.allocator, value, &fast.writer, .{});
+        try binary.encode(std.testing.allocator, fallback, &slow.writer, .{});
         try std.testing.expectEqualSlices(u8, slow.written(), fast.written());
         try std.testing.expectEqual(proof.binary_wire_bytes, fast.written().len);
         var denied_output: std.Io.Writer = .fixed(&.{});
-        try std.testing.expectError(error.SqlProgramLimitExceeded, binary.encode(value, &denied_output, .{ .wire_bytes = proof.binary_wire_bytes - 1 }));
+        try std.testing.expectError(error.SqlProgramLimitExceeded, binary.encode(std.testing.allocator, value, &denied_output, .{ .wire_bytes = proof.binary_wire_bytes - 1 }));
         try std.testing.expectEqual(@as(usize, 0), denied_output.end);
         const authenticated = try layout.View.openAuthenticated(case.kind, value.stored.?.bytes, .{});
         try std.testing.expect(authenticated.validation == null);
@@ -750,8 +750,8 @@ test "SQL computed array builder matches canonical storage and binary wire acros
                     defer expected.deinit();
                     var actual: std.Io.Writer.Allocating = .init(a);
                     defer actual.deinit();
-                    try binary.encode(source, &expected.writer, .{});
-                    try binary.encode(value, &actual.writer, .{});
+                    try binary.encode(a, source, &expected.writer, .{});
+                    try binary.encode(a, value, &actual.writer, .{});
                     try std.testing.expectEqualSlices(u8, expected.written(), actual.written());
                 }
             }
@@ -831,7 +831,7 @@ test "SQL computed array builder direct preparation and binary output measuremen
             const peak = counter.peak;
             const encode_start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
             var discard: std.Io.Writer.Discarding = .init(&.{});
-            for (0..20) |_| try @import("array_binary.zig").encode(value, &discard.writer, .{});
+            for (0..20) |_| try @import("array_binary.zig").encode(std.testing.allocator, value, &discard.writer, .{ .values = .{ .work = 16 * 1024 * 1024 } });
             const encode_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - encode_start;
             std.debug.print("SQL_COMPUTED_ARRAY direct={} elements=65536 prepare_ns={} retained={} peak={} encode20_ns={} wire_bytes={}\n", .{ mode == 1, prepare_ns, try value.retainedBytes(), peak, encode_ns, discard.count });
         }
@@ -1034,8 +1034,8 @@ test "SQL native span construction preserves mixed layouts offsets ownership and
                     defer slow_wire.deinit();
                     // Reference text payloads borrow sources; decode the owned oracle.
                     const decoded = try @import("array_storage.zig").borrowLeaky(region, kind, expected, .{});
-                    try @import("array_binary.zig").encode(decoded, &slow_wire.writer, .{});
-                    try @import("array_binary.zig").encode(result, &fast_wire.writer, .{});
+                    try @import("array_binary.zig").encode(a, decoded, &slow_wire.writer, .{});
+                    try @import("array_binary.zig").encode(a, result, &fast_wire.writer, .{});
                     try std.testing.expectEqualSlices(u8, slow_wire.written(), fast_wire.written());
                 }
             }

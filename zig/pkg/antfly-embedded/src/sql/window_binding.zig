@@ -24,7 +24,7 @@ const compiler = @import("compiler.zig");
 const Allocator = std.mem.Allocator;
 pub const Kind = enum { row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, count, sum, avg, min, max, bool_and, bool_or };
 pub const Sort = struct { partition: []const usize, order: []const usize, directions: []const @import("operators.zig").Order };
-pub const Spec = struct { kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, star: bool };
+pub const Spec = struct { input_coercion: ?*const scalar.Program = null, default_coercion: ?*const scalar.Program = null, domain_view: ?*const @import("../schema/domain_value.zig").View = null, kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, enum_view: ?*const @import("../common/sql_enum_value.zig").View = null, integer_numeric_result: bool = false, star: bool };
 pub const Bound = struct {
     input: *const describe.BoundStatement,
     statement: ast.Select,
@@ -105,6 +105,15 @@ fn validatePredicate(predicate: *const ast.Predicate) anyerror!void {
         else => {},
     }
 }
+fn domainCoercion(alloc: Allocator, source: describe.Column, target: *const @import("../schema/domain_value.zig").View, backend: catalog.Backend) !*const scalar.Program {
+    const result = try alloc.create(scalar.Program);
+    const domain = try scalar.domainType(target);
+    const value: ast.Scalar = .{ .column = "$window_value" };
+    const expression: ast.Scalar = .{ .cast = .{ .operand = &value, .type = domain.kind.?, .element_type = domain.element_type, .numeric_modifier = domain.numeric_modifier, .enum_view = domain.enum_view, .domain_view = target } };
+    result.* = try scalar.bindWithSettings(alloc, &expression, &.{.{ .name = "$window_value", .type = source.type, .element_type = source.element_type, .numeric_modifier = source.numeric_modifier, .enum_view = source.enum_view, .domain_view = source.domain_view }}, &.{}, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
+    return result;
+}
+
 const Pending = struct { node: *const ast.Scalar, arguments: []const usize, filter: ?usize, sort: usize };
 const Builder = struct {
     alloc: Allocator,
@@ -242,9 +251,13 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     input_compiled.statement = .{ .select = input_statement };
     const input = try alloc.create(describe.BoundStatement);
     input.* = try describe.bindInternal(alloc, pinned_backend, &input_compiled, inferred);
+    for (builder.sorts.items) |sort| {
+        for (sort.partition) |slot_| if (input.columns[slot_].type == .void) return error.SqlUndefinedFunction;
+        for (sort.order) |slot_| if (input.columns[slot_].type == .void) return error.SqlUndefinedFunction;
+    }
     const parameters = @constCast(input.parameter_types);
     const columns = try alloc.alloc(scalar.Column, input.columns.len + builder.specs.items.len);
-    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column) };
     const specs = try alloc.alloc(Spec, builder.specs.items.len);
     for (builder.specs.items, specs, columns[input.columns.len..], 0..) |pending, *spec, *column, index| {
         const call = pending.node.call;
@@ -259,22 +272,34 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         }
         const first_null = nargs != 0 and call.args[0].* == .literal and call.args[0].literal == .null;
         const default_null = nargs == 3 and call.args[2].* == .literal and call.args[2].literal == .null;
+        const first_unknown = nargs != 0 and call.args[0].* == .literal and (call.args[0].literal == .null or call.args[0].literal == .string);
+        const default_unknown = nargs == 3 and call.args[2].* == .literal and (call.args[2].literal == .null or call.args[2].literal == .string);
+        const first_domain = if (nargs != 0) scalar.domainViewOf(input.columns[pending.arguments[0]]) else null;
+        const default_domain = if (nargs == 3) scalar.domainViewOf(input.columns[pending.arguments[2]]) else null;
         var input_type = if (nargs != 0) input.columns[pending.arguments[0]].type else ast.ColumnType.integer;
+        var input_enum = if (nargs != 0) input.columns[pending.arguments[0]].enum_view else null;
         var input_element = if (nargs != 0) input.columns[pending.arguments[0]].element_type else null;
         if (first_null) input_type = switch (kind) {
+            .ntile => .integer,
             .sum, .avg => .number,
             .bool_and, .bool_or => .boolean,
             .lag, .lead => if (nargs == 3 and !default_null) input.columns[pending.arguments[2]].type else input_type,
             else => input_type,
         };
-        if (first_null and nargs == 3 and !default_null and (kind == .lag or kind == .lead)) input_element = input.columns[pending.arguments[2]].element_type;
+        if (first_null and nargs == 3 and !default_null and (kind == .lag or kind == .lead)) {
+            input_element = input.columns[pending.arguments[2]].element_type;
+            input_enum = input.columns[pending.arguments[2]].enum_view;
+        }
         switch (kind) {
             .sum, .avg => if (input_type != .integer and input_type != .number) return error.SqlTypeMismatch,
             .bool_and, .bool_or => if (input_type != .boolean) return error.SqlTypeMismatch,
-            .ntile => if (input_type != .integer) return error.SqlTypeMismatch,
+            .ntile => {
+                if (input_type != .integer) return error.SqlTypeMismatch;
+                if (!first_null and input_element != .int16 and input_element != .int32) return error.UndefinedSqlFunction;
+            },
             .lag, .lead, .nth_value => {
                 if (nargs > 1 and input.columns[pending.arguments[1]].type != .integer) return error.SqlTypeMismatch;
-                if (nargs == 3 and !default_null) {
+                if (nargs == 3 and !default_null and !(first_domain != null and default_unknown)) {
                     const default_type = input.columns[pending.arguments[2]].type;
                     if ((input_type == .integer or input_type == .number) and (default_type == .integer or default_type == .number)) {
                         const left = input_element orelse (if (input_type == .integer) @import("array_value.zig").ElementType.int64 else .float64);
@@ -282,6 +307,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                         input_element = try @import("builtin_cast.zig").commonNumeric(left, right);
                         if (default_type == .number) input_type = .number;
                     } else if (default_type != input_type) return error.SqlTypeMismatch;
+                    if (input_type == .enumeration) {
+                        const common = try scalar.comparisonDomain(.{ .kind = input_type, .enum_view = input_enum }, scalar.columnType(input.columns[pending.arguments[2]]));
+                        input_enum = common.enum_view;
+                    }
                     const default_element = input.columns[pending.arguments[2]].element_type;
                     if (input_type == .array) {
                         const left = input_element orelse return error.SqlTypeMismatch;
@@ -293,25 +322,35 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
             else => {},
         }
         if (call.filter != null and @backingInt(kind) < @backingInt(Kind.count)) return error.UnsupportedSqlShape;
-        const result_type: ast.ColumnType = switch (kind) {
+        if (input_type == .void) switch (kind) {
+            .min, .max, .sum, .avg, .bool_and, .bool_or => return error.SqlUndefinedFunction,
+            else => {},
+        };
+        const sum_type = @import("operators.zig").Aggregate.sumType(.{ .kind = input_type, .element_type = input_element });
+        const average_type = @import("operators.zig").Aggregate.averageType(.{ .kind = input_type, .element_type = input_element });
+        const integer_numeric_result = input_type == .integer and (kind == .avg or (kind == .sum and sum_type.element_type == .numeric));
+        const result_type: ast.ColumnType = if (integer_numeric_result) .number else switch (kind) {
             .row_number, .rank, .dense_rank, .ntile, .count => .integer,
             .avg, .percent_rank, .cume_dist => .number,
             .bool_and, .bool_or => .boolean,
             else => input_type,
         };
-        const result_element = switch (kind) {
-            .row_number, .rank, .dense_rank, .ntile, .count => @import("array_value.zig").ElementType.int64,
-            .avg => if (input_element == .numeric) @import("array_value.zig").ElementType.numeric else .float64,
+        const result_element = if (integer_numeric_result) @import("array_value.zig").ElementType.numeric else switch (kind) {
+            .row_number, .rank, .dense_rank, .count => @import("array_value.zig").ElementType.int64,
+            .ntile => @import("array_value.zig").ElementType.int32,
+            .avg => average_type.element_type,
             .percent_rank, .cume_dist => @import("array_value.zig").ElementType.float64,
             .bool_and, .bool_or => @import("array_value.zig").ElementType.boolean,
-            .sum => if (result_type == .integer) @import("array_value.zig").ElementType.int64 else input_element,
+            .sum => sum_type.element_type,
             else => input_element,
         };
         if (pending.filter) |filter| if (input.columns[filter].type != .boolean) return error.SqlTypeMismatch;
         if (call.window.?.frame) |frame| if (frame.mode == .groups and call.window.?.order.len == 0) return error.InvalidSqlSyntax;
         if (call.window.?.frame) |frame| if (frame.mode == .range and (frame.start == .preceding or frame.start == .following or frame.end == .preceding or frame.end == .following)) {
             const sort = builder.sorts.items[pending.sort];
-            if (sort.order.len != 1) return error.UnsupportedSqlShape;
+            // Validate after named-window expansion. This is an invalid
+            // window definition, not a missing execution capability.
+            if (sort.order.len != 1) return error.SqlWindowingError;
             const order_type = input.columns[sort.order[0]].type;
             if (order_type != .integer and order_type != .number) return error.SqlTypeMismatch;
         };
@@ -328,8 +367,24 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                 } else slot.* = .integer;
             };
         };
-        spec.* = .{ .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .star = call.star };
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type, .element_type = result_element };
+        const result_domain = switch (kind) {
+            .first_value, .last_value, .nth_value => scalar.domainViewOf(input.columns[pending.arguments[0]]),
+            .lag, .lead => domain: {
+                const source_domain = scalar.domainViewOf(input.columns[pending.arguments[0]]);
+                if (nargs < 3 or default_unknown) break :domain source_domain;
+                if (first_unknown) break :domain default_domain;
+                if (scalar.sameDomain(source_domain, default_domain)) break :domain source_domain;
+                break :domain null;
+            },
+            else => null,
+        };
+        // LAG/LEAD evaluate only the selected value/default. Fresh unknown
+        // inputs cross a real domain cast at that demand point; checking the
+        // entire input projection would reject an unused NOT NULL default.
+        const input_coercion = if (result_domain != null and !scalar.sameDomain(first_domain, result_domain)) try domainCoercion(alloc, input.columns[pending.arguments[0]], result_domain.?, backend) else null;
+        const default_coercion = if ((kind == .lag or kind == .lead) and nargs == 3 and result_domain != null and !scalar.sameDomain(default_domain, result_domain)) try domainCoercion(alloc, input.columns[pending.arguments[2]], result_domain.?, backend) else null;
+        spec.* = .{ .input_coercion = input_coercion, .default_coercion = default_coercion, .domain_view = result_domain, .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .enum_view = if (result_type == .enumeration) input_enum else null, .integer_numeric_result = integer_numeric_result, .star = call.star };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type, .element_type = result_element, .enum_view = spec.enum_view, .domain_view = scalar.domainViewOf(spec) };
     }
     const output_programs = try alloc.alloc(scalar.Program, outputs.len);
     const names = try alloc.alloc([]const u8, outputs.len);
@@ -346,6 +401,9 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         };
     }
     const order_programs = try alloc.alloc(scalar.Program, orders.len);
-    for (orders, order_programs) |node_, *program| program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
+    for (orders, order_programs) |node_, *program| {
+        program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
+        if (program.output_type.kind == .void) return error.SqlUndefinedFunction;
+    }
     return .{ .input = input, .statement = input_statement, .specs = specs, .sorts = builder.sorts.items, .outputs = output_programs, .orders = order_programs, .order_outputs = order_outputs, .names = names };
 }

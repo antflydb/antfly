@@ -1337,10 +1337,23 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     }
 
     const create_started_ns = platform.time.monotonicNs();
-    var create = try sql(alloc, transport, &headers, base, if (snapshot_probe)
+    var create_context: @import("sql_owner_test_fixture.zig").Context = .{
+        .alloc = alloc,
+        .io = io,
+        .metadata = &metadata,
+        .data = &data,
+        .transport = transport,
+        .headers = &headers,
+        .admin_headers = &headers,
+        .reader_headers = &headers,
+        .metadata_uri = metadata_uri,
+        .base = base,
+        .progress = .{ &meta_raft, &meta_control, &data_raft, &data_control },
+    };
+    var create = try @import("sql_owner_test_client.zig").execute(&create_context, if (snapshot_probe)
         "CREATE TABLE usage_records (id TEXT PRIMARY KEY, status TEXT, organization_id TEXT)"
     else
-        "CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent_id BIGINT)");
+        "CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent_id BIGINT)", .write_admission);
     defer create.deinit(alloc);
     if (std.c.getenv("ANTFLY_TEST_WORK_PROFILE")) |value| {
         if (platform.env.truthy(std.mem.span(value))) std.debug.print("SELF_FK_CREATE status={d} elapsed_ms={d} transport_budget_ms={d}\n", .{
@@ -1351,6 +1364,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     }
     // Placement may still be converging after the catalog commit, even for
     // one owner. awaitTable below is the public readiness barrier.
+    if (create.status != 200 and create.status != 202) std.debug.print("self-FK CREATE failed status={d} body={s}\n", .{ create.status, create.body });
     try std.testing.expect(create.status == 200 or create.status == 202);
     const table_id = if (snapshot_probe)
         try awaitTableNamed(alloc, io, transport, &headers, base, "usage_records")

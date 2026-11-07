@@ -17,6 +17,54 @@ const std = @import("std");
 const table_manager = @import("table_manager.zig");
 
 const status_heartbeat_refresh_ms: u64 = 30 * std.time.ms_per_s;
+
+test "store observer schema reader capabilities bind to process incarnation and survive owned admission" {
+    const alloc = std.testing.allocator;
+    const prior: table_manager.StoreRecord = .{ .store_id = 1, .node_id = 2, .reporter_incarnation = 7, .status_generation = 1 };
+    const report: table_manager.StoreStatusReport = .{ .store_id = 1, .reporter_incarnation = 7, .status_generation = 2, .schema_reader = table_manager.SchemaReaderCapabilities.current };
+    const accepted = (try admitObservation(alloc, prior, report, true)).?;
+    defer table_manager.freeStore(alloc, accepted);
+    try std.testing.expectEqualDeep(table_manager.SchemaReaderCapabilities.current, accepted.schema_reader);
+    const clone = try table_manager.cloneStore(alloc, accepted);
+    defer table_manager.freeStore(alloc, clone);
+    try std.testing.expectEqualDeep(accepted.schema_reader, clone.schema_reader);
+    var stale = report;
+    stale.reporter_incarnation = 6;
+    try std.testing.expect((try admitObservation(alloc, accepted, stale, true)) == null);
+    stale = report;
+    stale.status_generation = 1;
+    try std.testing.expect((try admitObservation(alloc, accepted, stale, true)) == null);
+    var downgraded = report;
+    downgraded.schema_reader = .{};
+    try std.testing.expect(!reportsDurablyEqual(report, downgraded));
+    const changed = (try admitObservation(alloc, accepted, downgraded, true)).?;
+    defer table_manager.freeStore(alloc, changed);
+    try std.testing.expect(!changed.schema_reader.known());
+    // Recording a downgrade is not permission to use it for placement.
+    var invalid = report;
+    invalid.schema_reader.encoding_ceiling = 0;
+    try std.testing.expectError(error.InvalidStoreReporterFence, admitObservation(alloc, accepted, invalid, true));
+}
+
+test "store observer schema reader JSON omits unknown legacy capability and preserves independent ceilings" {
+    const alloc = std.testing.allocator;
+    const legacy: table_manager.StoreStatusReport = .{ .store_id = 1 };
+    const legacy_json = try std.json.Stringify.valueAlloc(alloc, legacy, .{});
+    defer alloc.free(legacy_json);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_json, "schema_reader") == null);
+    var report = legacy;
+    report.reporter_incarnation = 7;
+    report.schema_reader = .{ .semantic_ceiling = 30, .encoding_ceiling = 31 };
+    const json = try std.json.Stringify.valueAlloc(alloc, report, .{});
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(table_manager.StoreStatusReport, alloc, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(report.schema_reader, parsed.value.schema_reader);
+    const record: table_manager.StoreRecord = .{ .store_id = 1, .node_id = 2 };
+    const record_json = try std.json.Stringify.valueAlloc(alloc, record, .{});
+    defer alloc.free(record_json);
+    try std.testing.expect(std.mem.indexOf(u8, record_json, "schema_reader") == null);
+}
 const runtime_status_heartbeat_refresh_ns: u64 = 30 * std.time.ns_per_s;
 
 pub const StoreObservation = table_manager.StoreStatusReport;
@@ -45,6 +93,7 @@ pub fn applyObservation(
         updated.artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
         updated.dense_native_storage_protocol_version = observation.dense_native_storage_protocol_version;
         updated.relational_topology_protocol_version = observation.relational_topology_protocol_version;
+        updated.schema_reader = observation.schema_reader;
     }
     updated.live = observation.live;
     updated.health_class = observation.health_class;
@@ -285,6 +334,7 @@ fn observationChangesRecordWithLookup(
     include_repair_status: bool,
     retained_prior: *?RepairLookup,
 ) !bool {
+    if (!observation.schema_reader.validForReporter(observation.reporter_incarnation)) return error.InvalidStoreReporterFence;
     if (existing.reporter_incarnation != 0 and (observation.reporter_incarnation != existing.reporter_incarnation or observation.status_generation < existing.status_generation)) return false;
     const same_runtime = existing.runtime_statuses.ptr == observation.runtime_statuses.ptr and existing.runtime_statuses.len == observation.runtime_statuses.len;
     const repair_checks = !same_runtime and (hasRepairFacts(existing.runtime_statuses) or hasRepairFacts(observation.runtime_statuses));
@@ -327,6 +377,7 @@ fn observationChangesRecordWithLookup(
         existing.artifact_sources_protocol_version != observation.artifact_sources_protocol_version or
         existing.dense_native_storage_protocol_version != observation.dense_native_storage_protocol_version or
         existing.relational_topology_protocol_version != observation.relational_topology_protocol_version or
+        !std.meta.eql(existing.schema_reader, observation.schema_reader) or
         existing.capacity_bytes != observation.capacity_bytes or
         existing.available_bytes != observation.available_bytes or
         existing.lease_pressure != observation.lease_pressure or
@@ -516,6 +567,7 @@ pub fn reportsDurablyEqual(
         lhs.artifact_sources_protocol_version == rhs.artifact_sources_protocol_version and
         lhs.dense_native_storage_protocol_version == rhs.dense_native_storage_protocol_version and
         lhs.relational_topology_protocol_version == rhs.relational_topology_protocol_version and
+        std.meta.eql(lhs.schema_reader, rhs.schema_reader) and
         lhs.live == rhs.live and
         std.mem.eql(u8, lhs.health_class, rhs.health_class) and
         lhs.capacity_bytes == rhs.capacity_bytes and
@@ -527,6 +579,26 @@ pub fn reportsDurablyEqual(
         lhs.backfill_progress_millis == rhs.backfill_progress_millis and
         groupStatusesEqual(lhs.group_statuses, rhs.group_statuses) and
         runtimeStatusesEqual(lhs.runtime_statuses, rhs.runtime_statuses, true);
+}
+
+test "store observer durable projection includes schema epochs and source authority cuts" {
+    const a = std.testing.allocator;
+    const before: table_manager.RuntimeGroupStatusReport = .{ .schema_epoch = 1 };
+    var after = before;
+    try std.testing.expect(runtimeStatusEqual(before, after, true));
+    after.schema_epoch = 2;
+    try std.testing.expect(!runtimeStatusEqual(before, after, true));
+    after = before;
+    after.source_authority = .{ .kind = .native, .namespace = @splat(1), .sequence = 7 };
+    try std.testing.expect(!runtimeStatusEqual(before, after, true));
+    var cloned = try table_manager.cloneRuntimeGroupStatusReport(a, after);
+    defer table_manager.freeRuntimeGroupStatusReport(a, cloned);
+    try std.testing.expect(runtimeStatusEqual(after, cloned, true));
+    cloned.source_authority.?.sequence += 1;
+    try std.testing.expect(!runtimeStatusEqual(after, cloned, true));
+    var changed = after;
+    changed.source_authority.?.kind = .raft;
+    try std.testing.expect(!runtimeStatusEqual(after, changed, true));
 }
 
 pub fn runtimeStatusEqual(
@@ -547,6 +619,8 @@ pub fn runtimeStatusEqual(
         lhs.status_generation != rhs.status_generation or
         lhs.target_observation_revision != rhs.target_observation_revision or
         lhs.target_observation_complete != rhs.target_observation_complete or
+        lhs.schema_epoch != rhs.schema_epoch or
+        !std.meta.eql(lhs.source_authority, rhs.source_authority) or
         lhs.doc_count != rhs.doc_count or
         lhs.disk_bytes != rhs.disk_bytes or
         lhs.disk_bytes_known != rhs.disk_bytes_known or

@@ -55,7 +55,7 @@ pub fn column(name: []const u8, property: Json) !catalog.Column {
     } else null;
     const format = property.object.get("format") orelse .null;
     if (format != .null and format != .string) return error.InvalidSqlBackendResponse;
-    const kind: ast.ColumnType = if (std.mem.eql(u8, wire, "sql_array")) .array else if (std.mem.eql(u8, wire, "keyword") or std.mem.eql(u8, wire, "string") or std.mem.eql(u8, wire, "text") or std.mem.eql(u8, wire, "html") or std.mem.eql(u8, wire, "link"))
+    const kind: ast.ColumnType = if (std.mem.eql(u8, wire, "sql_enum")) .enumeration else if (std.mem.eql(u8, wire, "sql_array")) .array else if (std.mem.eql(u8, wire, "keyword") or std.mem.eql(u8, wire, "string") or std.mem.eql(u8, wire, "text") or std.mem.eql(u8, wire, "html") or std.mem.eql(u8, wire, "link"))
         (if (identity == .uuid or (format == .string and std.mem.eql(u8, format.string, "uuid"))) .uuid else .string)
     else if (std.mem.eql(u8, wire, "numeric") or std.mem.eql(u8, wire, "number")) .number else if (std.mem.eql(u8, wire, "object") or std.mem.eql(u8, wire, "array") or std.mem.eql(u8, wire, "json")) .json else std.meta.stringToEnum(ast.ColumnType, wire) orelse return error.UnsupportedSqlShape;
     if (kind == .array and identity == null) return error.InvalidSqlBackendResponse;

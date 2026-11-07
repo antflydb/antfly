@@ -73,6 +73,7 @@ pub const CurrentView = struct {
         view: *CurrentView,
         inner: @import("../docstore.zig").DocStore.Txn.CursorAdapter,
         upper_bound: ?[]const u8 = null,
+        lower_bound: ?[]const u8 = null,
         const Entry = @import("../backend_erased.zig").Entry;
         pub fn close(self: *Cursor) void {
             self.inner.close();
@@ -80,12 +81,14 @@ pub const CurrentView = struct {
         }
         fn checked(self: *Cursor, entry: ?Entry) !?Entry {
             if (entry) |item| {
+                if (self.lower_bound) |lower| if (std.mem.order(u8, item.key, lower) == .lt) return null;
                 if (self.upper_bound) |upper| if (std.mem.order(u8, item.key, upper) != .lt) return null;
                 try self.view.checkRead(item.key);
             }
             return entry;
         }
         pub fn first(self: *Cursor) !?Entry {
+            if (self.lower_bound) |lower| return self.checked(try self.inner.seekAtOrAfter(lower));
             return self.checked(try self.inner.first());
         }
         pub fn last(self: *Cursor) !?Entry {
@@ -98,10 +101,14 @@ pub const CurrentView = struct {
             return self.checked(try self.inner.prev());
         }
         pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !?Entry {
-            return self.checked(try self.inner.seekAtOrAfter(key));
+            const start = if (self.lower_bound) |lower| if (std.mem.order(u8, key, lower) == .lt) lower else key else key;
+            return self.checked(try self.inner.seekAtOrAfter(start));
         }
         pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !?Entry {
             return self.checked(try self.inner.seekAtOrBefore(key));
+        }
+        pub fn setLowerBound(self: *Cursor, lower: ?[]const u8) void {
+            self.lower_bound = lower;
         }
         pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
             self.upper_bound = upper;
@@ -124,16 +131,47 @@ pub const parseKey = @import("relational_integrity_contract.zig").parseKey;
 
 pub const routingKey = @import("relational_integrity_contract.zig").routingKey;
 pub const validateTransferRecord = @import("relational_integrity_contract.zig").validateTransferRecord;
+pub const TransferView = @import("relational_index_private_claims.zig").TransferView;
+
 pub fn validateTransferredCompanions(txn: anytype, key: []const u8, value: []const u8) !void {
-    const address = try validateTransferRecord(key, value);
+    // Capture before metadata/companion reads invalidate borrowed store bytes.
+    _ = try validateTransferRecord(key, value);
     const parsed = try parseKey(key);
+    const value_digest = hash(value);
+    try validateOrdinaryTransferredCompanions(std.heap.page_allocator, txn, key, value, parsed);
+    const view = try TransferView.init(txn);
+    try view.validateCompanion(txn, parsed, value_digest);
+}
+
+pub fn validateTransferredCompanionsWithView(txn: anytype, key: []const u8, value: []const u8, view: TransferView) !void {
+    return validateTransferredCompanionsWithScratch(std.heap.page_allocator, txn, key, value, view);
+}
+
+pub fn validateTransferredCompanionsWithScratch(alloc: Allocator, txn: anytype, key: []const u8, value: []const u8, view: TransferView) !void {
+    _ = try validateTransferRecord(key, value);
+    const parsed = try parseKey(key);
+    const value_digest = if (view.isPrivate(parsed.address.generation)) hash(value) else @as(Digest, @splat(0));
+    try validateOrdinaryTransferredCompanions(alloc, txn, key, value, parsed);
+    try view.validateCompanion(txn, parsed, value_digest);
+}
+
+fn validateOrdinaryTransferredCompanions(alloc: Allocator, txn: anytype, key: []const u8, value: []const u8, parsed: ParsedKey) !void {
+    if (parsed.kind == .interval) return @import("temporal_integrity.zig").validateTransferred(alloc, txn, key, value);
+    if (parsed.kind == .interval_guard) return error.InvalidIntegrityRecord;
+    const address = parsed.address;
+    // A point read for the claim may reuse the buffer containing a job passed
+    // by the caller. Copy its fixed identity before that read.
+    const transferred_job = if (parsed.kind == .job) (try Job.decode(key, value)).action_id else null;
     const claim_key = address.claimKey();
-    const claim_raw = if (parsed.kind == .claim) value else try optional(txn, &claim_key) orelse return error.IntegrityMissingCompanion;
+    const historical = parsed.kind == .reference and (try Reference.decode(key, value)).historical_unvalidated;
+    const claim_raw = if (parsed.kind == .claim) value else try optional(txn, &claim_key) orelse {
+        if (historical) return;
+        return error.IntegrityMissingCompanion;
+    };
     const claim = try Claim.decode(&claim_key, claim_raw);
     if (claim.state == .draining) {
-        const job_raw = if (parsed.kind == .job) value else try optional(txn, &address.jobKey()) orelse return error.IntegrityMissingCompanion;
-        const job = try Job.decode(&address.jobKey(), job_raw);
-        if (!std.mem.eql(u8, &job.action_id, &claim.action_id)) return error.ForeignKeyActionMismatch;
+        const job_action = transferred_job orelse (try Job.decode(&address.jobKey(), try optional(txn, &address.jobKey()) orelse return error.IntegrityMissingCompanion)).action_id;
+        if (!std.mem.eql(u8, &job_action, &claim.action_id)) return error.ForeignKeyActionMismatch;
     } else if (parsed.kind == .job) return error.InvalidIntegrityRecord;
 }
 
@@ -176,8 +214,15 @@ const Builder = struct {
     retained_bytes: usize,
     operations: std.ArrayList(Operation) = .empty,
     positions: std.StringHashMapUnmanaged(usize) = .empty,
+    reference_coverage_checked: bool = false,
 
-    fn current(self: *Builder, txn: anytype, key: []const u8) !?[]const u8 {
+    fn requireReferenceCoverage(self: *Builder, txn: anytype) !void {
+        if (self.reference_coverage_checked) return;
+        try @import("relational_integrity_generation_admission.zig").requireReferenceCoverageAcknowledged(txn);
+        self.reference_coverage_checked = true;
+    }
+
+    pub fn current(self: *Builder, txn: anytype, key: []const u8) !?[]const u8 {
         if (self.positions.get(key)) |position| {
             const op = self.operations.items[position];
             return if (op.kind == .guard) op.expected_value else op.value;
@@ -192,7 +237,7 @@ const Builder = struct {
         if (self.retained_bytes > max_preparation_bytes) return error.TransactionTooLarge;
     }
 
-    fn add(self: *Builder, txn: anytype, address: Address, key_bytes: []const u8, kind: @FieldType(Operation, "kind"), value: ?[]const u8) !void {
+    pub fn add(self: *Builder, txn: anytype, address: Address, key_bytes: []const u8, kind: @FieldType(Operation, "kind"), value: ?[]const u8) !void {
         if (self.positions.get(key_bytes)) |position| {
             if (kind == .guard) return;
             if (value) |bytes| try self.charge(bytes.len);
@@ -234,169 +279,205 @@ fn requireOwner(claim: Claim, table: []const u8, key: []const u8) !void {
 pub const Job = @import("relational_integrity_contract.zig").Job;
 
 pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effects {
-    const admission_bytes = try validateCommandAdmission(commands);
+    return prepareBatches(alloc, txn, &.{commands});
+}
+
+/// Session probes fold statement deltas in their original order against one
+/// immutable physical read. Releases precede establishes within each statement,
+/// while a later statement can delete an interval inserted by an earlier one.
+/// The resulting effects are observations, never a durable commit permission.
+pub fn prepareBatches(alloc: Allocator, txn: anytype, batches: []const []const Command) !Effects {
+    var admission_bytes: usize = 0;
+    var count: usize = 0;
+    for (batches) |commands| {
+        if (commands.len > max_commands -| count) return error.TransactionTooLarge;
+        count += commands.len;
+        const bytes = try validateCommandAdmission(commands);
+        if (bytes > max_preparation_bytes -| admission_bytes) return error.TransactionTooLarge;
+        admission_bytes += bytes;
+    }
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
     var builder: Builder = .{ .alloc = owned, .retained_bytes = admission_bytes };
-    // Detaches first make RESTRICT independent of caller row ordering. They
-    // may not create a nonexistent parent; creation/attachment remain ordered.
-    for (commands) |command| if (command.operation == .detach or command.operation == .repair_detach) {
-        const claim_key = command.address.claimKey();
-        const raw = try builder.current(txn, &claim_key);
-        if (raw) |bytes| {
-            _ = try Claim.decode(&claim_key, bytes);
-        } else if (command.operation == .detach) return error.ForeignKeyParentMissing;
-        try builder.add(txn, command.address, &claim_key, .guard, null);
-        const reference = if (command.operation == .detach) command.operation.detach else command.operation.repair_detach;
-        const reference_key = try reference.key(command.address);
-        if (try builder.current(txn, &reference_key)) |old| _ = try Reference.decode(&reference_key, old);
-        try builder.add(txn, command.address, &reference_key, .delete, null);
-    };
-    // Row input order must not decide whether same-transaction parents exist.
-    // Release old unique owners before establishing new owners, but only
-    // after all explicit reference detaches have entered the final overlay.
-    for (0..5) |phase| {
-        for (commands) |command| {
-            const command_phase: usize = switch (command.operation) {
-                .detach, .repair_detach => continue,
-                .compare_claim, .check_owner => 0,
-                .release, .repair_release => 1,
-                .establish => 2,
-                .attach => 3,
-                else => 4,
-            };
-            if (command_phase != phase) continue;
-            const address = command.address;
-            const claim_key = address.claimKey();
-            switch (command.operation) {
-                .detach, .repair_detach => {},
-                .compare_claim => |expected| {
-                    const observed = try builder.current(txn, &claim_key);
-                    const encoded = if (expected) |claim| try claim.encode(owned, address) else null;
-                    if (!optionalEqual(observed, encoded)) return error.PreparedReadSetChanged;
-                    try builder.add(txn, address, &claim_key, .guard, null);
-                },
-                .check_owner => |owner| {
-                    const claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
-                    try requireOwner(claim, owner.parent_table, owner.parent_key);
-                    if (claim.state != .live) return error.ForeignKeyActionInProgress;
-                    try builder.add(txn, address, &claim_key, .guard, null);
-                },
-                .establish => |claim| {
-                    if (claim.state != .live) return error.InvalidIntegrityCommand;
-                    if (try builder.current(txn, &claim_key)) |raw| {
-                        const old = try Claim.decode(&claim_key, raw);
-                        try requireOwner(old, claim.parent_table, claim.parent_key);
-                        if (!std.mem.eql(u8, old.tuple, claim.tuple)) return error.IntegrityAddressMismatch;
-                        if (old.state != .live) return error.ForeignKeyActionInProgress;
+    for (batches) |commands| {
+        // Detaches first make RESTRICT independent of caller row ordering. They
+        // may not create a nonexistent parent; creation/attachment remain ordered.
+        for (commands) |command| if (command.operation == .detach or command.operation == .repair_detach) {
+            const claim_key = command.address.claimKey();
+            const raw = try builder.current(txn, &claim_key);
+            if (raw) |bytes| {
+                _ = try Claim.decode(&claim_key, bytes);
+            } else if (command.operation == .detach) return error.ForeignKeyParentMissing;
+            try builder.add(txn, command.address, &claim_key, .guard, null);
+            const reference = if (command.operation == .detach) command.operation.detach else command.operation.repair_detach;
+            const reference_key = try reference.key(command.address);
+            if (try builder.current(txn, &reference_key)) |old| _ = try Reference.decode(&reference_key, old);
+            try builder.add(txn, command.address, &reference_key, .delete, null);
+        };
+        // Row input order must not decide whether same-transaction parents exist.
+        // Release old unique owners before establishing new owners, but only
+        // after all explicit reference detaches have entered the final overlay.
+        for (0..5) |phase| {
+            for (commands) |command| {
+                const command_phase: usize = switch (command.operation) {
+                    .detach, .repair_detach => continue,
+                    .compare_claim, .check_owner, .check_interval => 0,
+                    .release, .repair_release, .release_interval => 1,
+                    .establish, .establish_interval => 2,
+                    .attach, .attach_historical => 3,
+                    else => 4,
+                };
+                if (command_phase != phase) continue;
+                const address = command.address;
+                const claim_key = address.claimKey();
+                switch (command.operation) {
+                    .detach, .repair_detach => {},
+                    .establish_interval, .release_interval, .check_interval => try @import("temporal_integrity.zig").prepareCommand(&builder, txn, command),
+                    .compare_claim => |expected| {
+                        const observed = try builder.current(txn, &claim_key);
+                        const encoded = if (expected) |claim| try claim.encode(owned, address) else null;
+                        if (!optionalEqual(observed, encoded)) return error.PreparedReadSetChanged;
                         try builder.add(txn, address, &claim_key, .guard, null);
-                        continue;
-                    }
-                    try builder.add(txn, address, &claim_key, .put, try claim.encode(owned, address));
-                },
-                .attach => |reference| {
-                    if (try generation_retirement.isRetired(txn, reference)) return error.GenerationRetired;
-                    const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
-                    const claim = try Claim.decode(&claim_key, raw);
-                    if (claim.state != .live) return error.ForeignKeyActionInProgress;
-                    try builder.add(txn, address, &claim_key, .guard, null);
-                    const reference_key = try reference.key(address);
-                    const encoded_reference = try reference.encode(owned, address);
-                    if (try builder.current(txn, &reference_key)) |old| {
-                        _ = try Reference.decode(&reference_key, old);
-                        if (std.mem.eql(u8, old, encoded_reference)) {
-                            try builder.add(txn, address, &reference_key, .guard, null);
+                    },
+                    .check_owner => |owner| {
+                        const claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
+                        try requireOwner(claim, owner.parent_table, owner.parent_key);
+                        if (claim.state != .live) return error.ForeignKeyActionInProgress;
+                        try builder.add(txn, address, &claim_key, .guard, null);
+                    },
+                    .establish => |claim| {
+                        if (claim.state != .live) return error.InvalidIntegrityCommand;
+                        if (try builder.current(txn, &claim_key)) |raw| {
+                            const old = try Claim.decode(&claim_key, raw);
+                            try requireOwner(old, claim.parent_table, claim.parent_key);
+                            if (!std.mem.eql(u8, old.tuple, claim.tuple)) return error.IntegrityAddressMismatch;
+                            if (old.state != .live) return error.ForeignKeyActionInProgress;
+                            try builder.add(txn, address, &claim_key, .guard, null);
                             continue;
                         }
-                        return error.IntegrityAddressMismatch;
-                    }
-                    try builder.add(txn, address, &reference_key, .put, encoded_reference);
-                },
-                .release, .repair_release => |owner| {
-                    const raw = try builder.current(txn, &claim_key) orelse {
-                        if (command.operation != .repair_release) return error.ForeignKeyParentMissing;
-                        try builder.add(txn, address, &claim_key, .guard, null);
-                        continue;
-                    };
-                    const claim = try Claim.decode(&claim_key, raw);
-                    if (command.operation == .repair_release and
-                        (!std.mem.eql(u8, claim.parent_table, owner.parent_table) or !std.mem.eql(u8, claim.parent_key, owner.parent_key)))
-                    {
-                        // Partial activation may have assigned this duplicate's
-                        // tuple to another row. Repair must preserve that owner.
-                        try builder.add(txn, address, &claim_key, .guard, null);
-                        continue;
-                    }
-                    try requireOwner(claim, owner.parent_table, owner.parent_key);
-                    if (claim.state != .live) return error.ForeignKeyActionInProgress;
-                    try builder.requireEmpty(txn, address);
-                    try builder.add(txn, address, &claim_key, .delete, null);
-                },
-                .start_action => |action| {
-                    const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
-                    var claim = try Claim.decode(&claim_key, raw);
-                    try requireOwner(claim, action.parent_table, action.parent_key);
-                    if (action.action == .restrict or std.mem.allEqual(u8, &action.action_id, 0)) return error.InvalidIntegrityCommand;
-                    if (action.parent_version == 0 or (action.action == .parent_delete and action.parent_value != null) or (action.action == .parent_update and action.parent_value == null)) return error.InvalidIntegrityCommand;
-                    if (claim.state == .draining) {
-                        if (!std.mem.eql(u8, &claim.action_id, &action.action_id) or claim.action != action.action or !optionalEqual(claim.target_tuple, action.target_tuple)) return error.ForeignKeyActionInProgress;
-                        const job = try Job.decode(&address.jobKey(), try builder.current(txn, &address.jobKey()) orelse return error.InvalidIntegrityRecord);
-                        if (job.parent_version != action.parent_version or job.parent_schema_version != action.parent_schema_version or !optionalEqual(job.parent_value, action.parent_value)) return error.ForeignKeyActionMismatch;
-                        try builder.add(txn, address, &claim_key, .guard, null);
-                        continue;
-                    }
-                    claim.state = .draining;
-                    claim.action = action.action;
-                    claim.action_id = action.action_id;
-                    claim.target_tuple = action.target_tuple;
-                    try builder.add(txn, address, &claim_key, .put, try claim.encode(owned, address));
-                    try builder.add(txn, address, &address.jobKey(), .put, try (Job{ .action_id = action.action_id, .parent_version = action.parent_version, .parent_schema_version = action.parent_schema_version, .parent_value = action.parent_value }).encode(owned, address));
-                },
-                .finish_action => |action_id| {
-                    const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
-                    const claim = try Claim.decode(&claim_key, raw);
-                    if (claim.state != .draining or !std.mem.eql(u8, &claim.action_id, &action_id)) return error.ForeignKeyActionMismatch;
-                    const job = try Job.decode(&address.jobKey(), try builder.current(txn, &address.jobKey()) orelse return error.InvalidIntegrityRecord);
-                    if (job.phase != .applying or !std.mem.eql(u8, &job.action_id, &action_id)) return error.ForeignKeyActionNotValidated;
-                    try builder.requireEmpty(txn, address);
-                    try builder.add(txn, address, &claim_key, .delete, null);
-                    try builder.add(txn, address, &address.jobKey(), .delete, null);
-                },
-                .advance_validation => |advance| {
-                    const claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
-                    var job = try Job.decode(&address.jobKey(), try builder.current(txn, &address.jobKey()) orelse return error.InvalidIntegrityRecord);
-                    if (claim.state != .draining or job.phase != .validating or !std.mem.eql(u8, &claim.action_id, &advance.action_id) or !std.mem.eql(u8, &job.action_id, &advance.action_id)) return error.ForeignKeyActionMismatch;
-                    if (!std.mem.eql(u8, job.cursor, advance.expected_cursor) or job.rows_validated != advance.expected_rows) return error.InvalidIntegrityContinuation;
-                    if (!advance.complete and advance.failure == null and std.mem.order(u8, advance.cursor, job.cursor) != .gt) return error.InvalidIntegrityContinuation;
-                    job.cursor = if (advance.complete and advance.failure == null) "" else advance.cursor;
-                    job.rows_validated = std.math.add(u64, job.rows_validated, advance.rows) catch return error.InvalidIntegrityRecord;
-                    job.phase = if (advance.failure != null) .failed else if (advance.complete) .applying else .validating;
-                    job.failure = advance.failure orelse "";
-                    try builder.add(txn, address, &claim_key, .guard, null);
-                    try builder.add(txn, address, &address.jobKey(), .put, try job.encode(owned, address));
-                },
-                .retry_action, .cancel_action => |action_id| {
-                    var claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
-                    const job = try Job.decode(&address.jobKey(), try builder.current(txn, &address.jobKey()) orelse return error.InvalidIntegrityRecord);
-                    if (claim.state != .draining or !std.mem.eql(u8, &claim.action_id, &action_id) or !std.mem.eql(u8, &job.action_id, &action_id) or job.phase == .applying) return error.ForeignKeyActionMismatch;
-                    if (command.operation == .retry_action) {
-                        if (job.phase != .failed) return error.ForeignKeyActionMismatch;
-                        try builder.add(txn, address, &claim_key, .guard, null);
-                        try builder.add(txn, address, &address.jobKey(), .put, try (Job{ .action_id = action_id, .parent_version = job.parent_version, .parent_schema_version = job.parent_schema_version, .parent_value = job.parent_value }).encode(owned, address));
-                    } else {
-                        claim.state = .live;
-                        claim.action = .restrict;
-                        claim.action_id = @splat(0);
-                        claim.target_tuple = null;
                         try builder.add(txn, address, &claim_key, .put, try claim.encode(owned, address));
+                    },
+                    .attach, .attach_historical => |reference| {
+                        if (try generation_retirement.isRetired(txn, reference)) return error.GenerationRetired;
+                        if (try builder.current(txn, &claim_key)) |raw| {
+                            const claim = try Claim.decode(&claim_key, raw);
+                            if (claim.state != .live) return error.ForeignKeyActionInProgress;
+                        } else if (command.operation == .attach) return error.ForeignKeyParentMissing;
+                        try builder.add(txn, address, &claim_key, .guard, null);
+                        const reference_key = try reference.key(address);
+                        if (command.operation == .attach and reference.historical_unvalidated) return error.InvalidIntegrityCommand;
+                        var stored = reference;
+                        stored.historical_unvalidated = command.operation == .attach_historical;
+                        const encoded_reference = try stored.encode(owned, address);
+                        if (try builder.current(txn, &reference_key)) |old| {
+                            const prior = try Reference.decode(&reference_key, old);
+                            if (command.operation == .attach_historical and !prior.historical_unvalidated) {
+                                // Existing ordinary writes prove stronger coverage.
+                                // A later backfill never downgrades that proof.
+                                try builder.add(txn, address, &reference_key, .guard, null);
+                                continue;
+                            }
+                            if (command.operation == .attach and prior.historical_unvalidated) {
+                                try builder.add(txn, address, &reference_key, .put, encoded_reference);
+                                continue;
+                            }
+                            if (std.mem.eql(u8, old, encoded_reference)) {
+                                try builder.add(txn, address, &reference_key, .guard, null);
+                                continue;
+                            }
+                            return error.IntegrityAddressMismatch;
+                        }
+                        try builder.add(txn, address, &reference_key, .put, encoded_reference);
+                    },
+                    .release, .repair_release => |owner| {
+                        const raw = try builder.current(txn, &claim_key) orelse {
+                            if (command.operation != .repair_release) return error.ForeignKeyParentMissing;
+                            try builder.add(txn, address, &claim_key, .guard, null);
+                            continue;
+                        };
+                        const claim = try Claim.decode(&claim_key, raw);
+                        if (command.operation == .repair_release and
+                            (!std.mem.eql(u8, claim.parent_table, owner.parent_table) or !std.mem.eql(u8, claim.parent_key, owner.parent_key)))
+                        {
+                            // Partial activation may have assigned this duplicate's
+                            // tuple to another row. Repair must preserve that owner.
+                            try builder.add(txn, address, &claim_key, .guard, null);
+                            continue;
+                        }
+                        try requireOwner(claim, owner.parent_table, owner.parent_key);
+                        if (claim.state != .live) return error.ForeignKeyActionInProgress;
+                        try builder.requireReferenceCoverage(txn);
+                        try builder.requireEmpty(txn, address);
+                        try builder.add(txn, address, &claim_key, .delete, null);
+                    },
+                    .start_action => |action| {
+                        const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
+                        var claim = try Claim.decode(&claim_key, raw);
+                        try requireOwner(claim, action.parent_table, action.parent_key);
+                        if (action.action == .restrict or std.mem.allEqual(u8, &action.action_id, 0)) return error.InvalidIntegrityCommand;
+                        if (action.parent_version == 0 or (action.action == .parent_delete and action.parent_value != null) or (action.action == .parent_update and action.parent_value == null)) return error.InvalidIntegrityCommand;
+                        if (claim.state == .draining) {
+                            if (!std.mem.eql(u8, &claim.action_id, &action.action_id) or claim.action != action.action or !optionalEqual(claim.target_tuple, action.target_tuple)) return error.ForeignKeyActionInProgress;
+                            const job = try Job.decode(&address.jobKey(), try builder.current(txn, &address.jobKey()) orelse return error.InvalidIntegrityRecord);
+                            if (job.parent_version != action.parent_version or job.parent_schema_version != action.parent_schema_version or !optionalEqual(job.parent_value, action.parent_value)) return error.ForeignKeyActionMismatch;
+                            try builder.add(txn, address, &claim_key, .guard, null);
+                            continue;
+                        }
+                        try builder.requireReferenceCoverage(txn);
+                        claim.state = .draining;
+                        claim.action = action.action;
+                        claim.action_id = action.action_id;
+                        claim.target_tuple = action.target_tuple;
+                        try builder.add(txn, address, &claim_key, .put, try claim.encode(owned, address));
+                        try builder.add(txn, address, &address.jobKey(), .put, try (Job{ .action_id = action.action_id, .parent_version = action.parent_version, .parent_schema_version = action.parent_schema_version, .parent_value = action.parent_value }).encode(owned, address));
+                    },
+                    .finish_action => |action_id| {
+                        const raw = try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing;
+                        const claim = try Claim.decode(&claim_key, raw);
+                        if (claim.state != .draining or !std.mem.eql(u8, &claim.action_id, &action_id)) return error.ForeignKeyActionMismatch;
+                        const job = try Job.decode(&address.jobKey(), try builder.current(txn, &address.jobKey()) orelse return error.InvalidIntegrityRecord);
+                        if (job.phase != .applying or !std.mem.eql(u8, &job.action_id, &action_id)) return error.ForeignKeyActionNotValidated;
+                        try builder.requireEmpty(txn, address);
+                        try builder.add(txn, address, &claim_key, .delete, null);
                         try builder.add(txn, address, &address.jobKey(), .delete, null);
-                    }
-                },
+                    },
+                    .advance_validation => |advance| {
+                        const claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
+                        var job = try Job.decode(&address.jobKey(), try builder.current(txn, &address.jobKey()) orelse return error.InvalidIntegrityRecord);
+                        if (claim.state != .draining or job.phase != .validating or !std.mem.eql(u8, &claim.action_id, &advance.action_id) or !std.mem.eql(u8, &job.action_id, &advance.action_id)) return error.ForeignKeyActionMismatch;
+                        if (!std.mem.eql(u8, job.cursor, advance.expected_cursor) or job.rows_validated != advance.expected_rows) return error.InvalidIntegrityContinuation;
+                        if (!advance.complete and advance.failure == null and std.mem.order(u8, advance.cursor, job.cursor) != .gt) return error.InvalidIntegrityContinuation;
+                        job.cursor = if (advance.complete and advance.failure == null) "" else advance.cursor;
+                        job.rows_validated = std.math.add(u64, job.rows_validated, advance.rows) catch return error.InvalidIntegrityRecord;
+                        job.phase = if (advance.failure != null) .failed else if (advance.complete) .applying else .validating;
+                        job.failure = advance.failure orelse "";
+                        try builder.add(txn, address, &claim_key, .guard, null);
+                        try builder.add(txn, address, &address.jobKey(), .put, try job.encode(owned, address));
+                    },
+                    .retry_action, .cancel_action => |action_id| {
+                        var claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
+                        const job = try Job.decode(&address.jobKey(), try builder.current(txn, &address.jobKey()) orelse return error.InvalidIntegrityRecord);
+                        if (claim.state != .draining or !std.mem.eql(u8, &claim.action_id, &action_id) or !std.mem.eql(u8, &job.action_id, &action_id) or job.phase == .applying) return error.ForeignKeyActionMismatch;
+                        if (command.operation == .retry_action) {
+                            if (job.phase != .failed) return error.ForeignKeyActionMismatch;
+                            try builder.add(txn, address, &claim_key, .guard, null);
+                            try builder.add(txn, address, &address.jobKey(), .put, try (Job{ .action_id = action_id, .parent_version = job.parent_version, .parent_schema_version = job.parent_schema_version, .parent_value = job.parent_value }).encode(owned, address));
+                        } else {
+                            claim.state = .live;
+                            claim.action = .restrict;
+                            claim.action_id = @splat(0);
+                            claim.target_tuple = null;
+                            try builder.add(txn, address, &claim_key, .put, try claim.encode(owned, address));
+                            try builder.add(txn, address, &address.jobKey(), .delete, null);
+                        }
+                    },
+                }
             }
         }
     }
     const operations = try builder.operations.toOwnedSlice(owned);
+    try @import("temporal_integrity.zig").validateEffects(owned, txn, operations, &builder.positions);
     return .{ .arena = arena, .operations = operations };
 }
 
@@ -478,14 +559,19 @@ pub fn validatePreparedEffects(alloc: Allocator, txn: anytype, operations: []con
         entry.value_ptr.* = index;
         if (!optionalEqual(try optional(txn, op.key), op.expected_value)) return error.VersionConflict;
     }
+    try @import("temporal_integrity.zig").validateEffects(alloc, txn, operations, &overlay);
+    var reference_coverage_checked = false;
     for (operations) |op| {
         const parsed = try parseKey(op.key);
         const claim_key = parsed.address.claimKey();
         switch (parsed.kind) {
+            .interval, .interval_guard => {}, // Validated with the final ordered overlay above.
             .reference => {
                 if (op.kind == .put and try generation_retirement.isRetired(txn, try Reference.decode(op.key, op.value.?))) return error.GenerationRetired;
                 const claim_op = operations[overlay.get(&claim_key) orelse return error.IntegrityClaimGuardRequired];
                 const current_claim = if (claim_op.kind == .put) claim_op.value else claim_op.expected_value;
+                const historical = if (op.kind == .put) (try Reference.decode(op.key, op.value.?)).historical_unvalidated else if (op.expected_value) |raw| (try Reference.decode(op.key, raw)).historical_unvalidated else false;
+                if (current_claim == null and claim_op.kind == .guard and historical) continue;
                 const claim = try Claim.decode(&claim_key, current_claim orelse return error.ForeignKeyParentMissing);
                 if (op.kind == .put and (claim_op.kind == .delete or claim.state != .live)) return error.ForeignKeyActionInProgress;
             },
@@ -494,6 +580,18 @@ pub fn validatePreparedEffects(alloc: Allocator, txn: anytype, operations: []con
                 const old: ?Claim = if (op.expected_value) |bytes| try Claim.decode(op.key, bytes) else null;
                 const next: ?Claim = if (op.value) |bytes| try Claim.decode(op.key, bytes) else null;
                 if (old) |before| {
+                    // Existing draining jobs precede the barrier. Their exact
+                    // action/job proofs below must still permit completion or
+                    // cancellation; no new attachment can enter a draining claim.
+                    if (before.state == .live and (next == null or next.?.state != before.state or
+                        !std.mem.eql(u8, next.?.parent_table, before.parent_table) or
+                        !std.mem.eql(u8, next.?.parent_key, before.parent_key)))
+                    {
+                        if (!reference_coverage_checked) {
+                            try @import("relational_integrity_generation_admission.zig").requireReferenceCoverageAcknowledged(txn);
+                            reference_coverage_checked = true;
+                        }
+                    }
                     if (next) |after| {
                         if (!std.mem.eql(u8, after.parent_table, before.parent_table) or !std.mem.eql(u8, after.parent_key, before.parent_key)) {
                             if (before.state != .live or after.state != .live) return error.UniqueConstraintViolation;
@@ -642,6 +740,47 @@ pub fn actionPageWithBudget(alloc: Allocator, io: ?std.Io, txn: anytype, address
     return .{ .arena = arena, .claim = claim, .job = job, .next_cursor = next_cursor, .references = reference_items, .complete = complete };
 }
 
+test "relational integrity transfer validates borrowed action jobs before companion reads" {
+    const alloc = std.testing.allocator;
+    const address = try Address.init(@splat(1), "tuple");
+    const claim: Claim = .{ .tuple = "tuple", .parent_table = "parent", .parent_key = "p", .schema_version = 1, .state = .draining, .action = .parent_delete, .action_id = @splat(2) };
+    const claim_bytes = try claim.encode(alloc, address);
+    defer alloc.free(claim_bytes);
+    var job: Job = .{ .action_id = @splat(2), .parent_version = 1, .parent_schema_version = 1 };
+    const job_bytes = try job.encode(alloc, address);
+    defer alloc.free(job_bytes);
+    const Borrowed = struct {
+        address: Address,
+        claim: []const u8,
+        job: []const u8,
+        scratch: [2048]u8 = undefined,
+        fail_reads: bool = false,
+
+        pub fn openCursor(_: *@This()) anyerror!CurrentView.Cursor {
+            // This borrowed-action fixture has no interval namespace. A scan
+            // would indicate that an ordinary companion validation regressed.
+            return error.UnexpectedCursor;
+        }
+
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (self.fail_reads) return error.BackendReadFailed;
+            const raw = if (std.mem.eql(u8, key, &self.address.claimKey())) self.claim else if (std.mem.eql(u8, key, &self.address.jobKey())) self.job else return error.NotFound;
+            @memcpy(self.scratch[0..raw.len], raw);
+            return self.scratch[0..raw.len];
+        }
+    };
+    var txn: Borrowed = .{ .address = address, .claim = claim_bytes, .job = job_bytes };
+    try validateTransferredCompanions(&txn, &address.jobKey(), try txn.get(&address.jobKey()));
+    try validateTransferredCompanionsWithView(&txn, &address.jobKey(), try txn.get(&address.jobKey()), .{});
+    job.action_id = @splat(3);
+    const foreign = try job.encode(alloc, address);
+    defer alloc.free(foreign);
+    txn.job = foreign;
+    try std.testing.expectError(error.ForeignKeyActionMismatch, validateTransferredCompanions(&txn, &address.jobKey(), try txn.get(&address.jobKey())));
+    txn.fail_reads = true;
+    try std.testing.expectError(error.BackendReadFailed, validateTransferredCompanions(&txn, &address.jobKey(), job_bytes));
+}
+
 test "relational integrity keys are generation bound explicitly routed and checksummed" {
     const alloc = std.testing.allocator;
     const address = try Address.init(@splat(1), "typed composite tuple");
@@ -671,6 +810,12 @@ test "relational integrity preparation cleans up every allocation failure and bo
                 pub fn close(_: *@This()) void {}
                 pub fn setUpperBound(_: *@This(), _: ?[]const u8) void {}
                 pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+                    return null;
+                }
+                pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
+                    return null;
+                }
+                pub fn prev(_: *@This()) !?Entry {
                     return null;
                 }
                 pub fn next(_: *@This()) !?Entry {
@@ -731,6 +876,12 @@ test "relational index system integrity compare claim fences absence and exact o
             pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
                 return null;
             }
+            pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
+                return null;
+            }
+            pub fn prev(_: *@This()) !?Entry {
+                return null;
+            }
             pub fn next(_: *@This()) !?Entry {
                 return null;
             }
@@ -773,6 +924,284 @@ fn testCommands(store: *@import("../docstore.zig").DocStore, manager: *transacti
     try manager.initTransaction(id, 1);
     try testPrepareEffects(store, manager, id, effects.operations);
     if (commit) try manager.resolveIntents(id, .committed, 2);
+}
+
+test "SQL range temporal claims fence concurrent gaps batch replacements abort and restart" {
+    const a = std.testing.allocator;
+    const temporal = @import("temporal_integrity_contract.zig");
+    const ranges = @import("../../sql/range_value.zig");
+    const Store = @import("../docstore.zig").DocStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var owner = std.heap.ArenaAllocator.init(a);
+    defer owner.deinit();
+    var context: ranges.Context = .{ .alloc = owner.allocator() };
+    const address = try Address.init(@splat(13), "same-product");
+    const inputs = [_][]const u8{ "[1,10)", "[5,9)", "[10,20)", "[0,20)" };
+    var claims: [inputs.len]temporal.Claim = undefined;
+    for (inputs, &claims, 0..) |input, *claim, i| claim.* = .{
+        .tuple = "same-product",
+        .parent_table = "products",
+        .parent_key = try std.fmt.allocPrint(owner.allocator(), "row:{d}", .{i}),
+        .schema_version = 1,
+        .period = .{ .kind = .numrange, .bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, .numrange, input)) },
+    };
+    {
+        var backend = try @import("../lsm_backend.zig").Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try Store.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        var empty = try CurrentView.init(&store);
+        defer empty.deinit();
+        var first = try prepare(a, &empty, &.{.{ .address = address, .operation = .{ .establish_interval = claims[0] } }});
+        defer first.deinit();
+        var stale = try prepare(a, &empty, &.{.{ .address = address, .operation = .{ .establish_interval = claims[1] } }});
+        defer stale.deinit();
+        try manager.initTransaction(@splat(11), 1);
+        try manager.initTransaction(@splat(12), 1);
+        try testPrepareEffects(&store, &manager, @splat(11), first.operations);
+        try std.testing.expectError(error.IntentConflict, testPrepareEffects(&store, &manager, @splat(12), stale.operations));
+        try manager.resolveIntents(@splat(11), .committed, 2);
+        // Constant/absent gap fences are safe only because participant prepare
+        // repeats the adjacency proof after a prior transaction commits.
+        try std.testing.expectError(error.TemporalOverlapViolation, testPrepareEffects(&store, &manager, @splat(12), stale.operations));
+        try testCommands(&store, &manager, @splat(13), &.{.{ .address = address, .operation = .{ .establish_interval = claims[2] } }}, true);
+        var read = try CurrentView.init(&store);
+        defer read.deinit();
+        try std.testing.expectError(error.TemporalOverlapViolation, prepare(a, &read, &.{.{ .address = address, .operation = .{ .establish_interval = claims[3] } }}));
+        try std.testing.expectError(error.NotFound, read.get(&temporal.guardKey(address)));
+        var oversized = claims[0];
+        const huge_owner = try owner.allocator().alloc(u8, max_record_bytes);
+        @memset(huge_owner, 'x');
+        oversized.parent_key = huge_owner;
+        // Exercise the physical-record limit independently of the more
+        // conservative batch-envelope admission budget. It remains a definite
+        // index-size failure rather than an unknown mutation outcome.
+        var record_builder: Builder = .{ .alloc = owner.allocator(), .retained_bytes = 0 };
+        try std.testing.expectError(error.RelationalIndexKeyTooLarge, @import("temporal_integrity.zig").prepareCommand(&record_builder, &read, .{ .address = address, .operation = .{ .establish_interval = oversized } }));
+        var replacement = try prepare(a, &read, &.{
+            .{ .address = address, .operation = .{ .establish_interval = claims[3] } },
+            .{ .address = address, .operation = .{ .release_interval = .{ .claim = claims[0] } } },
+            .{ .address = address, .operation = .{ .release_interval = .{ .claim = claims[2] } } },
+        });
+        defer replacement.deinit();
+        try manager.initTransaction(@splat(14), 1);
+        try testPrepareEffects(&store, &manager, @splat(14), replacement.operations);
+        try manager.resolveIntents(@splat(14), .aborted, 2);
+        try manager.initTransaction(@splat(15), 1);
+        try testPrepareEffects(&store, &manager, @splat(15), replacement.operations);
+        // Leave these durable prepared intents unresolved across reopen.
+    }
+    {
+        var backend = try @import("../lsm_backend.zig").Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try Store.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.resolveIntents(@splat(15), .committed, 3);
+        var read = try CurrentView.init(&store);
+        defer read.deinit();
+        const key = try claims[3].keyAlloc(owner.allocator(), address);
+        try std.testing.expectEqualStrings(claims[3].parent_key, (try temporal.Claim.decode(key, try read.get(key))).parent_key);
+        for ([_]usize{ 0, 2 }) |index| try std.testing.expectError(error.NotFound, read.get(try claims[index].keyAlloc(owner.allocator(), address)));
+        try std.testing.expectError(error.NotFound, read.get(&temporal.guardKey(address)));
+        try std.testing.expectError(error.TemporalOverlapViolation, prepare(a, &read, &.{.{ .address = address, .operation = .{ .establish_interval = claims[1] } }}));
+    }
+}
+
+test "SQL range temporal claims retain statement order and verify transferred neighbors" {
+    const a = std.testing.allocator;
+    const temporal = @import("temporal_integrity_contract.zig");
+    const ranges = @import("../../sql/range_value.zig");
+    const Store = @import("../docstore.zig").DocStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var backend = try @import("../lsm_backend.zig").Backend.open(a, path, .{});
+    defer backend.close();
+    var store = try Store.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var manager = try transactions.TxnManager.init(a, &store);
+    defer manager.deinit();
+    var owner = std.heap.ArenaAllocator.init(a);
+    defer owner.deinit();
+    const scratch = owner.allocator();
+    var context: ranges.Context = .{ .alloc = scratch };
+    const address = try Address.init(@splat(31), "product");
+    var first: temporal.Claim = .{ .tuple = "product", .parent_table = "products", .parent_key = "a", .schema_version = 1, .period = .{ .kind = .numrange, .bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, .numrange, "[1,10)")) } };
+    var replacement = first;
+    replacement.parent_key = "b";
+    const insert = [_]Command{.{ .address = address, .operation = .{ .establish_interval = first } }};
+    const remove = [_]Command{.{ .address = address, .operation = .{ .release_interval = .{ .claim = first } } }};
+    const reinsert = [_]Command{.{ .address = address, .operation = .{ .establish_interval = replacement } }};
+    {
+        var read = try CurrentView.init(&store);
+        defer read.deinit();
+        var effects = try prepareBatches(a, &read, &.{ &insert, &remove, &reinsert });
+        defer effects.deinit();
+        try manager.initTransaction(@splat(31), 1);
+        try testPrepareEffects(&store, &manager, @splat(31), effects.operations);
+        try manager.resolveIntents(@splat(31), .committed, 2);
+    }
+    {
+        var read = try CurrentView.init(&store);
+        defer read.deinit();
+        try std.testing.expectError(error.NotFound, read.get(try first.keyAlloc(scratch, address)));
+        const key = try replacement.keyAlloc(scratch, address);
+        try validateTransferredCompanionsWithScratch(a, &read, key, try read.get(key), .{});
+        // Checksummed imported claims still need a destination adjacency proof.
+        first.parent_key = "forged-overlap";
+        const bad_key = try first.keyAlloc(scratch, address);
+        const bad_value = try first.encode(scratch, address);
+        try std.testing.expectError(error.TemporalOverlapViolation, validateTransferredCompanionsWithScratch(a, &read, bad_key, bad_value, .{}));
+        try std.testing.expectError(error.TemporalOverlapViolation, prepareBatches(a, &read, &.{&insert}));
+        try std.testing.expectError(error.NotFound, read.get(&temporal.guardKey(address)));
+    }
+}
+
+test "SQL range temporal claims exclude unrelated predecessor intents from gap proofs" {
+    const a = std.testing.allocator;
+    const temporal = @import("temporal_integrity_contract.zig");
+    const ranges = @import("../../sql/range_value.zig");
+    const Store = @import("../docstore.zig").DocStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var backend = try @import("../lsm_backend.zig").Backend.open(a, path, .{});
+    defer backend.close();
+    var store = try Store.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var manager = try transactions.TxnManager.init(a, &store);
+    defer manager.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var context: ranges.Context = .{ .alloc = arena.allocator() };
+    var tuples = [_][]const u8{ "group-a", "group-b" };
+    var addresses = [_]Address{ try Address.init(@splat(47), tuples[0]), try Address.init(@splat(47), tuples[1]) };
+    if (std.mem.order(u8, &addresses[0].routing, &addresses[1].routing) == .gt) {
+        std.mem.swap(Address, &addresses[0], &addresses[1]);
+        std.mem.swap([]const u8, &tuples[0], &tuples[1]);
+    }
+    const period: ranges.Encoded = .{ .kind = .numrange, .bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, .numrange, "[1,10)")) };
+    const left: temporal.Claim = .{ .tuple = tuples[0], .parent_table = "products", .parent_key = "left", .schema_version = 0, .period = period };
+    const right: temporal.Claim = .{ .tuple = tuples[1], .parent_table = "products", .parent_key = "right", .schema_version = 0, .period = period };
+    try testCommands(&store, &manager, @splat(47), &.{.{ .address = addresses[0], .operation = .{ .establish_interval = left } }}, true);
+    try testCommands(&store, &manager, @splat(48), &.{.{ .address = addresses[0], .operation = .{ .release_interval = .{ .claim = left } } }}, false);
+    var read = try CurrentView.initForTransaction(&store, a, @splat(49));
+    defer read.deinit();
+    const left_key = try left.keyAlloc(arena.allocator(), addresses[0]);
+    try std.testing.expectError(error.IntentConflict, read.get(left_key));
+    var effects = try prepare(a, &read, &.{.{ .address = addresses[1], .operation = .{ .establish_interval = right } }});
+    defer effects.deinit();
+    try manager.initTransaction(@splat(49), 1);
+    try testPrepareEffects(&store, &manager, @splat(49), effects.operations);
+    try manager.resolveIntents(@splat(49), .committed, 2);
+    try manager.resolveIntents(@splat(48), .aborted, 2);
+}
+
+test "SQL range temporal claims replace long chains with bounded ordered storage work" {
+    const a = std.testing.allocator;
+    const temporal = @import("temporal_integrity_contract.zig");
+    const ranges = @import("../../sql/range_value.zig");
+    const Store = @import("../docstore.zig").DocStore;
+    const Counts = struct { seeks: usize = 0, steps: usize = 0 };
+    const Observed = struct {
+        inner: *CurrentView,
+        counts: *Counts,
+        const Entry = @import("../backend_erased.zig").Entry;
+        const Cursor = struct {
+            inner: CurrentView.Cursor,
+            counts: *Counts,
+            pub fn close(self: *@This()) void {
+                self.inner.close();
+            }
+            pub fn setLowerBound(self: *@This(), lower: ?[]const u8) void {
+                self.inner.setLowerBound(lower);
+            }
+            pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
+                self.inner.setUpperBound(upper);
+            }
+            pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?Entry {
+                self.counts.seeks += 1;
+                return self.inner.seekAtOrAfter(key);
+            }
+            pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?Entry {
+                self.counts.seeks += 1;
+                return self.inner.seekAtOrBefore(key);
+            }
+            pub fn next(self: *@This()) !?Entry {
+                self.counts.steps += 1;
+                return self.inner.next();
+            }
+            pub fn prev(self: *@This()) !?Entry {
+                self.counts.steps += 1;
+                return self.inner.prev();
+            }
+        };
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.inner.get(key);
+        }
+        pub fn openCursor(self: *@This()) !Cursor {
+            return .{ .inner = try self.inner.openCursor(), .counts = self.counts };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var backend = try @import("../lsm_backend.zig").Backend.open(a, path, .{});
+    defer backend.close();
+    var store = try Store.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var manager = try transactions.TxnManager.init(a, &store);
+    defer manager.deinit();
+    var owner = std.heap.ArenaAllocator.init(a);
+    defer owner.deinit();
+    const scratch = owner.allocator();
+    var context: ranges.Context = .{ .alloc = scratch, .remaining = 128 * 1024 * 1024 };
+    const address = try Address.init(@splat(21), "one-product");
+    const count = 512;
+    const claims = try scratch.alloc(temporal.Claim, count);
+    const seed = try scratch.alloc(Command, count);
+    const replacement = try scratch.alloc(Command, count * 2);
+    for (claims, seed, 0..) |*claim, *command, i| {
+        const input = try std.fmt.allocPrint(scratch, "[{d},{d})", .{ i * 2, i * 2 + 1 });
+        claim.* = .{ .tuple = "one-product", .parent_table = "products", .parent_key = try std.fmt.allocPrint(scratch, "row:{d}", .{i}), .schema_version = 1, .period = .{ .kind = .numrange, .bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, .numrange, input)) } };
+        command.* = .{ .address = address, .operation = .{ .establish_interval = claim.* } };
+        replacement[i * 2] = .{ .address = address, .operation = .{ .release_interval = .{ .claim = claim.* } } };
+        var next = claim.*;
+        const changed = try std.fmt.allocPrint(scratch, "[{d},{d}.5)", .{ i * 2, i * 2 + 1 });
+        next.period.bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, .numrange, changed));
+        replacement[i * 2 + 1] = .{ .address = address, .operation = .{ .establish_interval = next } };
+    }
+    try testCommands(&store, &manager, @splat(21), seed, true);
+    var read = try CurrentView.init(&store);
+    defer read.deinit();
+    var counts: Counts = .{};
+    var observed: Observed = .{ .inner = &read, .counts = &counts };
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    var effects = try prepare(a, &observed, replacement);
+    defer effects.deinit();
+    try std.testing.expectEqual(@as(usize, count + 1), effects.operations.len);
+    try std.testing.expect(counts.seeks < count * 6);
+    try std.testing.expect(counts.steps < count * 6);
+    std.debug.print("TEMPORAL_CLAIM_REPLACE rows={d} seeks={d} cursor_steps={d} elapsed_ns={d}\n", .{ count, counts.seeks, counts.steps, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+    // A shared read guard is not a gap fence, and a staged point guard must
+    // not make its still-live interval disappear from a neighbor search.
+    var collision = claims[1];
+    collision.parent_key = "guard-collision";
+    collision.period.bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, .numrange, "[2.5,3.5)"));
+    try std.testing.expectError(error.TemporalOverlapViolation, prepare(a, &read, &.{
+        .{ .address = address, .operation = .{ .check_interval = claims[1] } },
+        .{ .address = address, .operation = .{ .establish_interval = collision } },
+    }));
 }
 
 test "relational integrity shared parent guards and fenced bounded action recovery" {
@@ -1043,4 +1472,171 @@ test "relational integrity transaction reads preserve shared guards and isolate 
         try std.testing.expectEqual(@as(usize, 1), effects.operations.len);
         try std.testing.expectEqual(.delete, effects.operations[0].kind);
     }
+}
+
+test "relational integrity NOT VALID orphan coverage survives cold reopen and guards later parent deletion" {
+    const a = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    const lsm = @import("../lsm_backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/historical", .{tmp.sub_path});
+    defer a.free(path);
+    const address = try Address.init(@splat(1), "orphan");
+    const reference: Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "fk", .constraint_generation = @splat(2) };
+    const claim: Claim = .{ .tuple = "orphan", .parent_table = "parent", .parent_key = "p", .schema_version = 1 };
+    for (0..2) |epoch| {
+        var backend = try lsm.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (epoch == 0) {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            try std.testing.expectError(error.ForeignKeyParentMissing, prepare(a, &read, &.{.{ .address = address, .operation = .{ .attach = reference } }}));
+            try testCommands(&store, &manager, @splat(1), &.{.{ .address = address, .operation = .{ .attach_historical = reference } }}, true);
+            continue;
+        }
+        {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            const reference_key = try reference.key(address);
+            const raw = try read.get(&reference_key);
+            try std.testing.expect((try Reference.decode(&reference_key, raw)).historical_unvalidated);
+            try validateTransferredCompanions(&read, &reference_key, raw);
+            try std.testing.expectError(error.ForeignKeyParentMissing, prepare(a, &read, &.{.{ .address = address, .operation = .{ .attach = reference } }}));
+        }
+        try testCommands(&store, &manager, @splat(2), &.{.{ .address = address, .operation = .{ .establish = claim } }}, true);
+        {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            try std.testing.expectError(error.ForeignKeyReferenced, prepare(a, &read, &.{.{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } }}));
+        }
+        // New-write coverage upgrades a historical witness. Replayed backfill
+        // never downgrades it or allocates an extra reference record.
+        try testCommands(&store, &manager, @splat(3), &.{.{ .address = address, .operation = .{ .attach = reference } }}, true);
+        try testCommands(&store, &manager, @splat(4), &.{.{ .address = address, .operation = .{ .attach_historical = reference } }}, true);
+        {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            const reference_key = try reference.key(address);
+            try std.testing.expect(!(try Reference.decode(&reference_key, try read.get(&reference_key))).historical_unvalidated);
+        }
+        try testCommands(&store, &manager, @splat(5), &.{ .{ .address = address, .operation = .{ .repair_detach = reference } }, .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } } }, true);
+    }
+}
+
+test "relational integrity NOT VALID parent coverage barrier survives restart and rejects raced destructive effects" {
+    const a = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    const lsm = @import("../lsm_backend.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/coverage", .{tmp.sub_path});
+    defer a.free(path);
+    const address = try Address.init(@splat(1), "parent");
+    const claim: Claim = .{ .tuple = "parent", .parent_table = "parent", .parent_key = "p", .schema_version = 1 };
+    const fence: topology.Fence = .{ .role = .child_generation_parent, .transition_id = 11, .attempt = 1, .peer_group_id = 21, .owner_group_id = 31, .namespace = .{ .table_id = 41, .shard_id = 31, .range_id = 31 }, .catalog_digest = @splat(4) };
+    const transitions: []const admission.Transition = &.{.{ .child_table_id = 51, .child_table_name = "child", .constraint_name = "fk", .expected_generation = null, .next_generation = @splat(8), .plan_id = @splat(2), .decision_digest = @splat(3) }};
+    const digest = try admission.completionReceipt(fence, transitions);
+    const release: Command = .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "p" } } };
+    for (0..2) |epoch| {
+        var backend = try lsm.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (epoch == 0) {
+            try testCommands(&store, &manager, @splat(1), &.{.{ .address = address, .operation = .{ .establish = claim } }}, true);
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            var prepared = try prepare(a, &read, &.{release});
+            defer prepared.deinit();
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            for (transitions) |transition| {
+                try admission.stageTransition(a, &txn, transition);
+                try admission.activateTransition(a, &txn, transition);
+            }
+            try admission.stageCompletion(&txn, fence, transitions, 1, 2);
+            const encoded_fence = try fence.encode();
+            try txn.put(topology.receipt_key, &encoded_fence);
+            try admission.stageReferenceCoveragePending(&txn, digest);
+            try admission.stageAcknowledgement(&txn, fence, transitions, 1, 3);
+            // Early admission ACK does not certify historical coverage.
+            try std.testing.expectError(error.ConstraintActivationInProgress, admission.requireReferenceCoverageAcknowledged(&txn));
+            try std.testing.expectError(error.ConstraintActivationInProgress, validatePreparedEffects(a, &txn, prepared.operations));
+            try txn.commit();
+            continue;
+        }
+        {
+            var read = try CurrentView.init(&store);
+            defer read.deinit();
+            try std.testing.expectError(error.ConstraintActivationInProgress, prepare(a, &read, &.{release}));
+        }
+        // New parent tuples and child backfill remain admitted while deletes wait.
+        const other_address = try Address.init(@splat(1), "new");
+        try testCommands(&store, &manager, @splat(4), &.{.{ .address = other_address, .operation = .{ .establish = .{ .tuple = "new", .parent_table = "parent", .parent_key = "new", .schema_version = 1 } } }}, true);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try std.testing.expectError(error.GenerationAdmissionChanged, admission.stageReferenceCoveragePending(&txn, @splat(99)));
+            var wrong = transitions[0];
+            wrong.next_generation = @splat(99);
+            try std.testing.expectError(error.GenerationAdmissionChanged, admission.stageReferenceCoverageAcknowledgement(&txn, fence, &.{wrong}, 1, 5));
+            try std.testing.expectError(error.ConstraintActivationInProgress, admission.requireReferenceCoverageAcknowledged(&txn));
+            try admission.stageReferenceCoverageAcknowledgement(&txn, fence, transitions, 1, 5);
+            try admission.requireReferenceCoverageAcknowledged(&txn);
+            // Exact lost-reply replay is harmless and retains the early receipt.
+            try admission.stageReferenceCoverageAcknowledgement(&txn, fence, transitions, 1, 5);
+            try txn.commit();
+        }
+        try testCommands(&store, &manager, @splat(5), &.{release}, true);
+    }
+}
+
+test "relational integrity NOT VALID coverage permits proven existing action recovery but fences new actions" {
+    const a = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    const lsm = @import("../lsm_backend.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/actions", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try lsm.Backend.open(a, path, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var manager = try transactions.TxnManager.init(a, &store);
+    defer manager.deinit();
+    const finish = try Address.init(@splat(1), "finish");
+    const cancel = try Address.init(@splat(1), "cancel");
+    try testCommands(&store, &manager, @splat(1), &.{
+        .{ .address = finish, .operation = .{ .establish = .{ .tuple = "finish", .parent_table = "parent", .parent_key = "finish", .schema_version = 1 } } },
+        .{ .address = cancel, .operation = .{ .establish = .{ .tuple = "cancel", .parent_table = "parent", .parent_key = "cancel", .schema_version = 1 } } },
+    }, true);
+    const begin_finish: Command = .{ .address = finish, .operation = .{ .start_action = .{ .parent_table = "parent", .parent_key = "finish", .action_id = @splat(2), .action = .parent_delete, .parent_version = 1, .parent_schema_version = 1 } } };
+    const begin_cancel: Command = .{ .address = cancel, .operation = .{ .start_action = .{ .parent_table = "parent", .parent_key = "cancel", .action_id = @splat(3), .action = .parent_delete, .parent_version = 1, .parent_schema_version = 1 } } };
+    try testCommands(&store, &manager, @splat(2), &.{ begin_finish, begin_cancel }, true);
+    try store.put(admission.pending_reference_coverage_key, &@as([32]u8, @splat(4)));
+    // A lost begin reply does not become a new action after admission closes.
+    try testCommands(&store, &manager, @splat(3), &.{begin_finish}, true);
+    try testCommands(&store, &manager, @splat(4), &.{.{ .address = cancel, .operation = .{ .cancel_action = @splat(3) } }}, true);
+    {
+        var read = try CurrentView.init(&store);
+        defer read.deinit();
+        try std.testing.expectError(error.ConstraintActivationInProgress, prepare(a, &read, &.{begin_cancel}));
+        try std.testing.expectError(error.ForeignKeyActionNotValidated, prepare(a, &read, &.{.{ .address = finish, .operation = .{ .finish_action = @splat(2) } }}));
+    }
+    try testCommands(&store, &manager, @splat(5), &.{.{ .address = finish, .operation = .{ .advance_validation = .{ .action_id = @splat(2), .expected_cursor = "", .expected_rows = 0, .cursor = "", .rows = 0, .complete = true } } }}, true);
+    try testCommands(&store, &manager, @splat(6), &.{.{ .address = finish, .operation = .{ .finish_action = @splat(2) } }}, true);
+    var read = try CurrentView.init(&store);
+    defer read.deinit();
+    try std.testing.expectError(error.ConstraintActivationInProgress, admission.requireReferenceCoverageAcknowledged(&read));
 }

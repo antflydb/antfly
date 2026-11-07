@@ -55,6 +55,7 @@ pub const TokenKind = enum {
     regex_not_match,
     regex_not_imatch,
     semicolon,
+    custom_operator,
 };
 
 pub const TokenKeyword = enum {

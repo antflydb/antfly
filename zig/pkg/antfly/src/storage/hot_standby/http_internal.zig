@@ -117,7 +117,7 @@ pub const Server = struct {
                 if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
                 return try textResponse(response_alloc, 404, "not found");
             },
-            .put, .delete => {
+            .put, .delete, .patch => {
                 if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
                 return try textResponse(response_alloc, 404, "not found");
             },
@@ -231,6 +231,7 @@ fn requestFromLegacy(req: http_common.HttpRequest) http_operation.Request {
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
+            .PATCH => .patch,
         },
         .target = req.uri,
         .authorization = req.authorization orelse req.header("authorization"),
@@ -542,18 +543,22 @@ test "storage.hot_standby internal http adapter returns method errors for genera
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, null);
 
+    var checked: usize = 0;
     for (internal_api.openapi.server.routes) |route| {
         if (!std.mem.startsWith(u8, route.path, "/standby/replication/")) continue;
+        checked += 1;
 
         const path = try generatedRoutePathAlloc(alloc, route.path);
         defer alloc.free(path);
 
         const method = generatedRouteUnsupportedMethod(route.method) orelse return error.TestExpectedUnsupportedMethod;
-        var response = try server.handle(.{ .method = method, .uri = path });
-        defer response.deinit(alloc);
-
-        try std.testing.expectEqual(@as(u16, 405), response.status);
+        for ([_]http_common.Method{ method, .PATCH }) |unsupported| {
+            var response = try server.handle(.{ .method = unsupported, .uri = path });
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 405), response.status);
+        }
     }
+    try std.testing.expect(checked > 0);
 }
 
 test "storage.hot_standby internal http adapter serves replication pull and status update" {

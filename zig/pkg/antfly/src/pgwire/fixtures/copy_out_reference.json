@@ -1,0 +1,76 @@
+{
+  "rows": [
+    [
+      "u1",
+      "hello"
+    ],
+    [
+      "u2",
+      "a,\t\"b\nc\\d"
+    ],
+    [
+      "u3",
+      ""
+    ],
+    [
+      "u4",
+      null
+    ],
+    [
+      "u5",
+      "\\."
+    ],
+    [
+      "u6",
+      "\\N"
+    ]
+  ],
+  "profiles": [
+    {
+      "options": {},
+      "sql": "COPY usage_records(id,status) TO STDOUT (FORMAT text)",
+      "hex": "75310968656c6c6f0a753209612c5c7422625c6e635c5c640a7533090a7534095c4e0a7535095c5c2e0a7536095c5c4e0a"
+    },
+    {
+      "options": {
+        "format": "csv"
+      },
+      "sql": "COPY usage_records(id,status) TO STDOUT (FORMAT csv)",
+      "hex": "75312c68656c6c6f0a75322c22612c092222620a635c64220a75332c22220a75342c0a75352c5c2e0a75362c5c4e0a"
+    },
+    {
+      "options": {
+        "format": "csv",
+        "force_quote_all": true
+      },
+      "sql": "COPY usage_records(id,status) TO STDOUT (FORMAT csv, FORCE_QUOTE *)",
+      "hex": "227531222c2268656c6c6f220a227532222c22612c092222620a635c64220a227533222c22220a227534222c0a227535222c225c2e220a227536222c225c4e220a"
+    },
+    {
+      "options": {
+        "format": "csv",
+        "header": true,
+        "null_string": "nil",
+        "delimiter": 124,
+        "quote": 126,
+        "escape": 33
+      },
+      "sql": "COPY usage_records(id,status) TO STDOUT (FORMAT csv, HEADER, NULL 'nil', DELIMITER '|', QUOTE '~', ESCAPE '!')",
+      "hex": "69647c7374617475730a75317c68656c6c6f0a75327c7e612c0922620a635c647e0a75337c0a75347c6e696c0a75357c5c2e0a75367c5c4e0a"
+    },
+    {
+      "options": {
+        "header": true
+      },
+      "sql": "COPY usage_records(id,status) TO STDOUT (FORMAT text, HEADER)",
+      "hex": "6964097374617475730a75310968656c6c6f0a753209612c5c7422625c6e635c5c640a7533090a7534095c4e0a7535095c5c2e0a7536095c5c4e0a"
+    },
+    {
+      "options": {
+        "format": "binary"
+      },
+      "sql": "COPY usage_records(id,status) TO STDOUT (FORMAT binary)",
+      "hex": "5047434f50590aff0d0a00000000000000000000020000000275310000000568656c6c6f000200000002753200000009612c0922620a635c640002000000027533000000000002000000027534ffffffff0002000000027535000000025c2e0002000000027536000000025c4effff"
+    }
+  ]
+}

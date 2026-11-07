@@ -19,7 +19,23 @@
 
 const std = @import("std");
 
+pub const RelationPersistence = @import("relation_persistence.zig");
+pub const RelationPersistenceCodec = @import("relation_persistence_codec.zig");
+
 pub const TableRecord = struct {
+    /// Server-bound local row lifetime; never accepted as public table input.
+    sql_persistence: ?RelationPersistence.Descriptor = null,
+    /// Physical backing rows belong to this logical materialized-view identity.
+    /// Public mutations must address the view lifecycle, never this storage name.
+    sql_materialized_view_id: ?u64 = null,
+    /// Explicit SQL namespace names over otherwise table-local native indexes.
+    sql_native_indexes_json: []const u8 = "",
+    /// Server-derived requirements of the published definition and retained
+    /// layouts. This internal fact is not a client capability or owner ACK.
+    schema_reader_requirements: ?@import("schema_readers.zig").ReaderRequirements = null,
+    /// Physical primary text generation, independent of logical schema epochs.
+    /// Set only by an index-preserving publication, never public schema input.
+    full_text_read_index: ?[]const u8 = null,
     /// Internal metadata lifecycle intent; never accepted as public schema.
     relational_retirement_json: []const u8 = "",
     /// Native, CAS-published generations over authorized external lake sources.
@@ -43,11 +59,18 @@ pub const TableRecord = struct {
     desired_replica_count: u16 = 3,
     min_ranges: u32 = 1,
 
+    pub fn validateSchemaReaderRequirements(self: TableRecord) !void {
+        if (self.schema_reader_requirements) |requirements|
+            if (!requirements.valid()) return error.InvalidSchemaReaderRequirements;
+    }
+
     pub fn jsonStringify(self: TableRecord, jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(TableRecord).@"struct".field_names) |field_name| {
+            const reader_field = comptime std.mem.eql(u8, field_name, "schema_reader_requirements");
+            const text_field = comptime std.mem.eql(u8, field_name, "full_text_read_index");
             const object_field = comptime std.mem.eql(u8, field_name, "object_storage_generation") or std.mem.eql(u8, field_name, "object_storage_identity");
-            if ((!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
+            if ((!std.mem.eql(u8, field_name, "sql_persistence") or self.sql_persistence != null) and (!std.mem.eql(u8, field_name, "sql_native_indexes_json") or self.sql_native_indexes_json.len != 0) and (!std.mem.eql(u8, field_name, "sql_materialized_view_id") or self.sql_materialized_view_id != null) and (!reader_field or self.schema_reader_requirements != null) and (!text_field or self.full_text_read_index != null) and (!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
                 try jw.objectField(field_name);
                 try jw.write(@field(self, field_name));
             }
@@ -58,7 +81,7 @@ pub const TableRecord = struct {
     /// Default legacy tables retain their exact durable record bytes. Storage
     /// ownership or an admitted migration requires the versioned extension.
     pub fn requiresStorageMetadataExtension(self: TableRecord) bool {
-        return self.storage.engine != .local or self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
+        return self.sql_persistence != null or self.sql_materialized_view_id != null or self.full_text_read_index != null or self.schema_reader_requirements != null or self.storage.engine != .local or self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
     }
 
     pub fn migrationState(self: *const TableRecord) TableMigrationState {

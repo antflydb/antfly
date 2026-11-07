@@ -249,6 +249,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const ensureDurableReplicationStartupBarrier = commit.ensureDurableReplicationStartupBarrier;
         pub const failIfIdentityOrdinalExhaustedForNewUpserts = commit.failIfIdentityOrdinalExhaustedForNewUpserts;
         pub const finalizePendingRowPolicyReceiptLocked = commit.finalizePendingRowPolicyReceiptLocked;
+        pub const finalizePendingRowPolicySchemaPairLocked = commit.finalizePendingRowPolicySchemaPairLocked;
         pub const flushDurableReplicationOutboxes = commit.flushDurableReplicationOutboxes;
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
@@ -825,6 +826,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
+            pub const finalizePendingRowPolicySchemaPairLocked = Implementation.finalizePendingRowPolicySchemaPairLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
@@ -982,6 +984,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
+            pub const finalizePendingRowPolicySchemaPairLocked = Implementation.finalizePendingRowPolicySchemaPairLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
@@ -1016,7 +1019,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub fn scheduleDurableReplicationOutboxRecovery(_: *@This()) void {}
 
             pub fn resolveTransaction(self: *@This(), txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
-                try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .propose, .none, null, null);
+                try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .propose, .none, null, null, null);
             }
 
             pub fn waitForResolvedTransactionSyncWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: types.CancellationToken) !void {

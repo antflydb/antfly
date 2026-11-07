@@ -22,6 +22,7 @@ const arrays = @import("array_value.zig");
 const casts = @import("builtin_cast.zig");
 const operators = @import("operators.zig");
 const MemoryBudget = @import("memory_budget.zig");
+const wire_output = @import("array_output.zig");
 const A = std.mem.Allocator;
 const Json = std.json.Value;
 pub const Options = struct {
@@ -86,29 +87,56 @@ const View = struct {
 
 /// All validation/admission precedes destination writes. Counting and emission
 /// share one view, avoiding per-element JSON serialization/parse allocations.
-fn encodedSize(value: arrays.Value, options: Options) !usize {
+const PreparedOutput = struct {
+    size: usize,
+    work: arrays.Budget,
+};
+
+fn prepareOutput(value: arrays.Value, options: Options) !PreparedOutput {
+    if (options.context) |context| try context.charge(0);
     var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
     const canonical = try value.validateWithBudget(options.values, &work);
     if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
+    const size = try countJson(View{ .value = value }, &work, options.wire_bytes);
+    return .{ .size = size, .work = work };
+}
+
+fn countJson(value: anytype, work: *arrays.Budget, wire_bytes: usize) !usize {
     var size: std.Io.Writer.Discarding = .init(&.{});
-    try std.json.Stringify.value(View{ .value = value }, .{}, &size.writer);
-    if (size.count > options.wire_bytes or size.count > work.remaining / 2) return options.limit();
-    try work.consume(@as(usize, @intCast(size.count)) * 2);
-    return std.math.cast(usize, size.count) orelse options.limit();
+    var counting: arrays.Budget = .{ .remaining = @min(work.remaining, wire_bytes), .shared = work.shared };
+    const before = counting.remaining;
+    var writer: wire_output.Writer = undefined;
+    writer.init(&size.writer, &counting);
+    std.json.Stringify.value(value, .{}, &writer.writer) catch |err| return writer.failure orelse err;
+    writer.writer.flush() catch |err| return writer.failure orelse err;
+    work.remaining -= before - counting.remaining;
+    return @intCast(size.count);
+}
+
+fn emitOutput(value: arrays.Value, target: *std.Io.Writer, emission: *wire_output.Emission) !void {
+    var writer: wire_output.Writer = undefined;
+    writer.init(target, &emission.work);
+    std.json.Stringify.value(View{ .value = value }, .{}, &writer.writer) catch |err| return writer.failure orelse err;
+    writer.writer.flush() catch |err| return writer.failure orelse err;
 }
 
 pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
-    _ = try encodedSize(value, options);
-    try std.json.Stringify.value(View{ .value = value }, .{}, writer);
+    var prepared = try prepareOutput(value, options);
+    var emission: wire_output.Emission = undefined;
+    try emission.init(&prepared.work, prepared.size);
+    try emitOutput(value, writer, &emission);
 }
 
 /// Exact one-allocation output for owners which need retained bytes. Unlike a
 /// growing writer, allocation failures retain their allocator error identity.
 pub fn encodeAlloc(a: A, value: arrays.Value, options: Options) ![]u8 {
-    const bytes = try a.alloc(u8, try encodedSize(value, options));
+    var prepared = try prepareOutput(value, options);
+    var emission: wire_output.Emission = undefined;
+    try emission.init(&prepared.work, prepared.size);
+    const bytes = try a.alloc(u8, prepared.size);
     errdefer a.free(bytes);
     var writer: std.Io.Writer = .fixed(bytes);
-    std.json.Stringify.value(View{ .value = value }, .{}, &writer) catch unreachable;
+    try emitOutput(value, &writer, &emission);
     std.debug.assert(writer.end == bytes.len);
     return bytes;
 }
@@ -117,10 +145,13 @@ pub fn encodeAlloc(a: A, value: arrays.Value, options: Options) ![]u8 {
 /// stringify/parse round trip. The caller owns a bounded region and discards
 /// it on failure; all retained payloads and managed-array allocators are owned.
 pub fn toJsonLeaky(a: A, value: arrays.Value, options: Options) !Json {
-    _ = try encodedSize(value, options);
-    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    var prepared = try prepareOutput(value, options);
+    const work = &prepared.work;
+    var copying: wire_output.Emission = undefined;
+    try copying.init(work, prepared.size);
     const axes = try a.alloc(Json, value.dimensions.len);
     for (value.dimensions, axes) |dimension, *axis| {
+        try copying.work.consume(1);
         var object: std.json.ObjectMap = .empty;
         try object.put(a, "length", .{ .integer = dimension.length });
         try object.put(a, "lower_bound", .{ .integer = dimension.lower });
@@ -130,6 +161,7 @@ pub fn toJsonLeaky(a: A, value: arrays.Value, options: Options) !Json {
     const nulls = try a.alloc(Json, value.cardinality());
     for (0..value.cardinality(), values, nulls) |array_cell_0, *out, *flag| {
         const cell = value.flatCell(array_cell_0);
+        try copying.work.consume(1);
         flag.* = .{ .bool = cell.sql_null };
         out.* = if (cell.sql_null) .null else switch (value.element_type) {
             .numeric => numeric: {
@@ -138,11 +170,17 @@ pub fn toJsonLeaky(a: A, value: arrays.Value, options: Options) !Json {
                 ctx.max_output_bytes = @min(ctx.max_output_bytes, options.wire_bytes);
                 break :numeric .{ .string = try @import("numeric_value.zig").format(&ctx, cell.numeric.?.*) };
             },
-            .int16, .int32, .int64 => .{ .string = try std.fmt.allocPrint(a, "{d}", .{cell.value.integer}) },
+            .int16, .int32, .int64 => integer: {
+                var buffer: [20]u8 = undefined;
+                const bytes = std.fmt.bufPrint(&buffer, "{d}", .{cell.value.integer}) catch unreachable;
+                try copying.work.consume(bytes.len);
+                break :integer .{ .string = try a.dupe(u8, bytes) };
+            },
             .float32, .float64 => if (std.math.isFinite(cell.value.float)) cell.value else .{ .string = if (std.math.isNan(cell.value.float)) "NaN" else if (cell.value.float < 0) "-Infinity" else "Infinity" },
-            else => (try operators.cloneDatum(a, cell)).value,
+            else => (try (@import("row_value.zig").Json{ .value = cell.value }).cloneLeaky(a, &copying.work)).value,
         };
     }
+    try copying.work.consume(1);
     var envelope: std.json.ObjectMap = .empty;
     try envelope.put(a, "dimensions", .{ .array = std.json.Array.fromOwnedSlice(a, axes) });
     try envelope.put(a, "values", .{ .array = std.json.Array.fromOwnedSlice(a, values) });
@@ -235,6 +273,7 @@ pub fn decodeBorrowed(a: A, kind: arrays.ElementType, input: Json, options: Opti
 /// Prepare assignment values without modifying the caller's parsed envelope.
 /// NUMERIC limbs and modifiers share one bounded, unpublished owner.
 pub fn decodeBorrowedWithModifier(a: A, kind: arrays.ElementType, input: Json, modifier: ?@import("numeric_value.zig").TypeModifier, options: Options) !Borrowed {
+    if (options.context) |context| try context.charge(0);
     if (modifier) |constraint| {
         if (kind != .numeric) return error.SqlTypeMismatch;
         try constraint.validate();
@@ -297,6 +336,7 @@ pub fn inspectNumericEnvelope(input: Json, options: Options) !Inspection {
 }
 
 fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection {
+    if (options.context) |context| try context.charge(0);
     if (input != .object or input.object.count() != 3) return error.InvalidSqlArrayShape;
     const axes = try arrayField(input.object, "dimensions");
     const values = try arrayField(input.object, "values");
@@ -340,34 +380,40 @@ fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection 
         bytes = std.math.add(usize, bytes, try operators.datumBytes(cell)) catch return options.limit();
         if (bytes > options.values.bytes) return options.limit();
     }
-    var wire_size: std.Io.Writer.Discarding = .init(&.{});
-    try std.json.Stringify.value(input, .{}, &wire_size.writer);
-    if (wire_size.count > options.wire_bytes or wire_size.count > work.remaining / 2) return options.limit();
-    try work.consume(@as(usize, @intCast(wire_size.count)) * 2);
+    const wire_size = try countJson(input, &work, options.wire_bytes);
+    try work.consume(wire_size); // Prepaid materialization, never a new owner.
     return .{
         .dimensions = dimensions,
         .rank = axes.len,
         .values = values,
         .nulls = nulls,
-        .admission = .{ .work = options.values.work - work.remaining, .wire_bytes = @intCast(wire_size.count) },
+        .admission = .{ .work = options.values.work - work.remaining, .wire_bytes = wire_size },
         .prepared_footprint = if (kind == .numeric) null else bytes,
     };
 }
 
 fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, input: Json, modifier: ?@import("numeric_value.zig").TypeModifier, options: Options) !Decoded {
     const inspected = try inspect(kind, input, options);
+    var copying: wire_output.Emission = undefined;
+    copying.initPrepaid(options.context, inspected.admission.wire_bytes);
     const cells = try a.alloc(arrays.Element, inspected.values.len);
     errdefer if (!own_payloads) a.free(cells);
     var work: arrays.Budget = .{ .remaining = options.values.work - inspected.admission.work, .shared = options.context };
     for (inspected.values, inspected.nulls, cells) |raw, flag, *cell| {
+        try copying.work.consume(1);
         if (kind == .numeric) {
             if (!own_payloads) return error.UnsupportedSqlShape;
             cell.* = if (flag.bool) .{} else try @import("scalar.zig").numericTextWithModifierLeaky(a, raw.string, modifier, &work);
             continue;
         }
         const decoded = try readElement(kind, raw, flag.bool);
-        cell.* = if (own_payloads) try operators.cloneDatum(a, decoded) else decoded;
+        cell.* = if (own_payloads and !decoded.sql_null) arrays.Element.fromParts(
+            (try (@import("row_value.zig").Json{ .value = decoded.value }).cloneLeaky(a, &copying.work)).value,
+            false,
+            null,
+        ) else decoded;
     }
+    try copying.work.consume(inspected.rank);
     const owned_dimensions = try a.dupe(arrays.Dimension, inspected.dimensions[0..inspected.rank]);
     var value: arrays.Value = .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells, .prepared_footprint = inspected.prepared_footprint };
     if (kind == .numeric) value = try arrays.Value.initWithBudget(kind, value.dimensions, value.elements, options.values, &work);
@@ -380,6 +426,7 @@ pub fn decode(backing: A, kind: arrays.ElementType, input: Json, options: Option
 }
 
 fn decodeOwned(backing: A, kind: arrays.ElementType, input: Json, modifier: ?@import("numeric_value.zig").TypeModifier, options: Options) !arrays.Owned {
+    if (options.context) |context| try context.charge(0);
     const budget = try backing.create(MemoryBudget);
     errdefer backing.destroy(budget);
     budget.* = .{ .backing = backing, .limit = options.values.bytes };
@@ -740,16 +787,11 @@ test "SQL array envelope matches PostgreSQL binary values without losing bounds 
         try std.testing.expectEqual(measured.wire_bytes, shared.wire_bytes);
         var binary = std.Io.Writer.Allocating.init(a);
         defer binary.deinit();
-        try @import("array_binary.zig").encode(decoded.value, &binary.writer, .{});
+        try @import("array_binary.zig").encode(a, decoded.value, &binary.writer, .{});
         const expected = try a.alloc(u8, entry.binary.len / 2);
         defer a.free(expected);
         _ = try std.fmt.hexToBytes(expected, entry.binary);
-        if (entry.element_type == .jsonb) {
-            var pg = try @import("array_binary.zig").decode(a, .jsonb, expected, .{});
-            defer pg.deinit();
-            var work: arrays.Budget = .{};
-            try std.testing.expectEqual(std.math.Order.eq, try pg.value.compare(decoded.value, &work));
-        } else try std.testing.expectEqualSlices(u8, expected, binary.written());
+        try std.testing.expectEqualSlices(u8, expected, binary.written());
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const materialized = try toJsonLeaky(arena.allocator(), original.value, .{});
@@ -966,6 +1008,107 @@ test "SQL array envelope streaming benchmark retains no per-cell serialization b
     const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
     for (0..16) |_| try encode(value, &writer.writer, .{});
     std.debug.print("SQL array envelope stream: cells={} bytes={} elapsed_ns={} encode_allocations=0\n", .{ count * 16, writer.count, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+}
+
+test "SQL array envelope output preserves exact shared admission cancellation and allocation faults" {
+    const a = std.testing.allocator;
+    const Context = @import("numeric_value.zig").Context;
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = 0,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    const Operation = struct {
+        fn run(alloc: A, value: arrays.Value, input: Json, mode: u8, options: Options) !void {
+            switch (mode) {
+                0 => {
+                    var target: std.Io.Writer.Discarding = .init(&.{});
+                    try encode(value, &target.writer, options);
+                },
+                1 => {
+                    const bytes = try encodeAlloc(alloc, value, options);
+                    alloc.free(bytes);
+                },
+                2 => _ = try toJsonLeaky(alloc, value, options),
+                3 => _ = try decodeLeakyMeasured(alloc, value.element_type, input, options),
+                4 => {
+                    var borrowed = try decodeBorrowed(alloc, value.element_type, input, options);
+                    borrowed.deinit();
+                },
+                else => unreachable,
+            }
+        }
+        fn faults(backing: A, value: arrays.Value, input: Json, mode: u8) !void {
+            var region: std.heap.ArenaAllocator = .init(backing);
+            defer region.deinit();
+            var context: Context = .{ .alloc = region.allocator() };
+            run(region.allocator(), value, input, mode, .{ .context = &context }) catch |err| {
+                if (err == error.OutOfMemory) try std.testing.expect(context.failure == null);
+                return err;
+            };
+        }
+    };
+    const wide: [2048]u8 = @splat('x');
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(a);
+    try object.put(a, "scale", .{ .number_string = "1.20" });
+    try object.put(a, &wide, .{ .string = &wide });
+    var nested = std.json.Array.init(a);
+    defer nested.deinit();
+    try nested.append(.{ .object = object });
+    try nested.append(.null);
+    const jsonb = try arrays.Value.init(.jsonb, &.{.{ .length = 3, .lower = -4 }}, &.{ arrays.Element.json(.{ .array = nested }), .{}, arrays.Element.json(.null) }, .{});
+    var numeric = try @import("array_text.zig").decode(a, .numeric, "{1.20,NULL,-9007199254740993.2500}", .{});
+    defer numeric.deinit();
+    const integers = try arrays.Value.init(.int64, &.{.{ .length = 3 }}, &.{ arrays.Element.json(.{ .integer = 1 }), .{}, arrays.Element.json(.{ .integer = -9007199254740993 }) }, .{});
+    for ([_]arrays.Value{ jsonb, numeric.value, integers }) |value| {
+        var input_region: std.heap.ArenaAllocator = .init(a);
+        defer input_region.deinit();
+        const input = try toJsonLeaky(input_region.allocator(), value, .{});
+        for ([_]u8{ 0, 1, 2, 3, 4 }) |mode| {
+            var region: std.heap.ArenaAllocator = .init(a);
+            defer region.deinit();
+            var observed: Control = .{};
+            var parent: Context = .{ .alloc = region.allocator(), .checkpoint = Control.check, .ptr = &observed };
+            var child: Context = .{ .alloc = region.allocator(), .parent = &parent };
+            try Operation.run(region.allocator(), value, input, mode, .{ .context = &child });
+            const cost = 8 * 1024 * 1024 - parent.remaining;
+            try std.testing.expectEqual(parent.remaining, child.remaining);
+            var exact: Context = .{ .alloc = region.allocator(), .remaining = cost };
+            try Operation.run(region.allocator(), value, input, mode, .{ .context = &exact, .values = .{ .work = @intCast(cost) } });
+            try std.testing.expectEqual(@as(u64, 0), exact.remaining);
+            var short: Context = .{ .alloc = region.allocator(), .remaining = cost - 1 };
+            try std.testing.expectError(error.SqlProgramLimitExceeded, Operation.run(region.allocator(), value, input, mode, .{ .context = &short }));
+            const left = short.remaining;
+            try std.testing.expectError(error.SqlProgramLimitExceeded, Operation.run(.failing, value, input, mode, .{ .context = &short }));
+            const malformed: arrays.Value = .{ .element_type = value.element_type, .dimensions = &.{.{ .length = 2 }}, .elements = &.{} };
+            try std.testing.expectError(error.SqlProgramLimitExceeded, Operation.run(.failing, malformed, .null, mode, .{ .context = &short }));
+            try std.testing.expectEqual(left, short.remaining);
+            for (1..observed.polls + 1) |cut| {
+                var canceled_region: std.heap.ArenaAllocator = .init(a);
+                defer canceled_region.deinit();
+                var control: Control = .{ .fail_at = cut };
+                var canceled: Context = .{ .alloc = canceled_region.allocator(), .checkpoint = Control.check, .ptr = &control };
+                try std.testing.expectError(error.QueryCanceled, Operation.run(canceled_region.allocator(), value, input, mode, .{ .context = &canceled }));
+                const remaining = canceled.remaining;
+                try std.testing.expectError(error.QueryCanceled, Operation.run(.failing, value, input, mode, .{ .context = &canceled }));
+                try std.testing.expectError(error.QueryCanceled, Operation.run(.failing, malformed, .null, mode, .{ .context = &canceled }));
+                try std.testing.expectEqual(remaining, canceled.remaining);
+            }
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Operation.faults, .{ value, input, mode });
+            if (mode == 0) {
+                var bytes: [8192]u8 = undefined;
+                var target: std.Io.Writer = .fixed(&bytes);
+                var quota: Context = .{ .alloc = .failing, .remaining = cost - 1 };
+                try std.testing.expectError(error.SqlProgramLimitExceeded, encode(value, &target, .{ .context = &quota }));
+                try std.testing.expectEqual(@as(usize, 0), target.end);
+            }
+        }
+    }
 }
 
 test "SQL array parsed admission benchmark retains no cell vectors at maximum cardinality" {

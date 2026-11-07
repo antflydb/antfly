@@ -36,6 +36,16 @@ pub const Config = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     resolver_ctx: ?*anyopaque = null,
     resolve_participant_fn: ?ResolveParticipantFn = null,
+    /// External votes require the exact durable admission on every delivery.
+    /// Missing support retains recovery debt rather than dropping authority.
+    resolve_external_participant_fn: ?*const fn (
+        *anyopaque,
+        transactions_mod.TxnId,
+        []const u8,
+        transactions_mod.TxnStatus,
+        u64,
+        transactions_mod.ExternalDecisionOwner,
+    ) anyerror!void = null,
     /// Replicated DBs route all transaction metadata changes through their
     /// coordinator Raft group. Standalone stores keep the direct local path.
     replicated_metadata: bool = false,

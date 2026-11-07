@@ -19,6 +19,9 @@ const callbacks = @import("../runtime_callback_abi.zig");
 const types = @import("db/types.zig");
 
 pub const View = struct {
+    /// Acknowledgement of an exact unranked text selection. Missing proof is
+    /// never permission to run a primary scan for a requested text predicate.
+    text_filter_digest: ?[32]u8 = null,
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,

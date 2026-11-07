@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.algebraic_index_stats import AlgebraicIndexStats
     from ..models.created_algebraic_index import CreatedAlgebraicIndex
@@ -16,6 +18,7 @@ if TYPE_CHECKING:
     from ..models.embeddings_index_stats import EmbeddingsIndexStats
     from ..models.full_text_index_stats import FullTextIndexStats
     from ..models.graph_index_stats import GraphIndexStats
+    from ..models.index_publication_status import IndexPublicationStatus
     from ..models.index_status_shard_status import IndexStatusShardStatus
     from ..models.relational_index_stats import RelationalIndexStats
 
@@ -32,6 +35,9 @@ class IndexStatus:
             CreatedRelationalIndex): Discriminated normalized configuration returned after an index is created.
         status (AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats |
             RelationalIndexStats): Statistics for an index
+        publication (IndexPublicationStatus | Unset): Exact observation of an online relational-index publication job,
+            not a query-readiness certificate. Published means this retained job completed; later schema/index changes may
+            supersede its artifacts. An absent or unmirrored job is admission_unknown, never permission to replay DDL.
     """
 
     shard_status: IndexStatusShardStatus
@@ -43,6 +49,7 @@ class IndexStatus:
         | CreatedRelationalIndex
     )
     status: AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats | RelationalIndexStats
+    publication: IndexPublicationStatus | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,6 +88,10 @@ class IndexStatus:
         else:
             status = self.status.to_dict()
 
+        publication: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.publication, Unset):
+            publication = self.publication.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -90,6 +101,8 @@ class IndexStatus:
                 "status": status,
             }
         )
+        if publication is not UNSET:
+            field_dict["publication"] = publication
 
         return field_dict
 
@@ -104,6 +117,7 @@ class IndexStatus:
         from ..models.embeddings_index_stats import EmbeddingsIndexStats
         from ..models.full_text_index_stats import FullTextIndexStats
         from ..models.graph_index_stats import GraphIndexStats
+        from ..models.index_publication_status import IndexPublicationStatus
         from ..models.index_status_shard_status import IndexStatusShardStatus
         from ..models.relational_index_stats import RelationalIndexStats
 
@@ -202,10 +216,18 @@ class IndexStatus:
 
         status = _parse_status(d.pop("status"))
 
+        _publication = d.pop("publication", UNSET)
+        publication: IndexPublicationStatus | Unset
+        if isinstance(_publication, Unset):
+            publication = UNSET
+        else:
+            publication = IndexPublicationStatus.from_dict(_publication)
+
         index_status = cls(
             shard_status=shard_status,
             config=config,
             status=status,
+            publication=publication,
         )
 
         index_status.additional_properties = d

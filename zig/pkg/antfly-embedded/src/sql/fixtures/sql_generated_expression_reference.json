@@ -1,0 +1,409 @@
+{
+  "format": 1,
+  "oracle_major": 18,
+  "timezone": "UTC",
+  "reference": "PostgreSQL generated expression planning and complete stored-row results",
+  "inputs": [
+    {
+      "s": null,
+      "n": null
+    },
+    {
+      "s": "",
+      "n": 0
+    },
+    {
+      "s": "ALPHA",
+      "n": 3
+    }
+  ],
+  "entries": [
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (concat(s, 'x')) STORED)",
+      "type": "text",
+      "expression": "concat(s, 'x')",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (concat_ws('-', s, 'x')) STORED)",
+      "type": "text",
+      "expression": "concat_ws('-', s, 'x')",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g timestamptz GENERATED ALWAYS AS (now()) STORED)",
+      "type": "timestamptz",
+      "expression": "now()",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g timestamptz GENERATED ALWAYS AS (transaction_timestamp()) STORED)",
+      "type": "timestamptz",
+      "expression": "transaction_timestamp()",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g timestamptz GENERATED ALWAYS AS (CURRENT_TIMESTAMP(6)) STORED)",
+      "type": "timestamptz",
+      "expression": "CURRENT_TIMESTAMP(6)",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g timestamptz GENERATED ALWAYS AS (s::timestamptz) STORED)",
+      "type": "timestamptz",
+      "expression": "s::timestamptz",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (t::text) STORED)",
+      "type": "text",
+      "expression": "t::text",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g jsonb GENERATED ALWAYS AS (to_jsonb(s)) STORED)",
+      "type": "jsonb",
+      "expression": "to_jsonb(s)",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g jsonb GENERATED ALWAYS AS (jsonb_build_object('s', s)) STORED)",
+      "type": "jsonb",
+      "expression": "jsonb_build_object('s', s)",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (CASE WHEN false THEN concat(s, 'x') ELSE 'ok' END) STORED)",
+      "type": "text",
+      "expression": "CASE WHEN false THEN concat(s, 'x') ELSE 'ok' END",
+      "rows": [
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (coalesce('ok', concat(s, 'x'))) STORED)",
+      "type": "text",
+      "expression": "coalesce('ok', concat(s, 'x'))",
+      "rows": [
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (coalesce(NULL::text, 'ok', concat(s, 'x'))) STORED)",
+      "type": "text",
+      "expression": "coalesce(NULL::text, 'ok', concat(s, 'x'))",
+      "rows": [
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (coalesce(s, 'ok', concat(s, 'x'))) STORED)",
+      "type": "text",
+      "expression": "coalesce(s, 'ok', concat(s, 'x'))",
+      "rows": [
+        "ok",
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (CASE WHEN s IS NULL THEN 'ok' WHEN true THEN 'yes' ELSE concat(s, 'x') END) STORED)",
+      "type": "text",
+      "expression": "CASE WHEN s IS NULL THEN 'ok' WHEN true THEN 'yes' ELSE concat(s, 'x') END",
+      "rows": [
+        "ok",
+        "yes",
+        "yes"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (s IS NULL OR concat(s, 'x') IS NULL OR true) STORED)",
+      "type": "boolean",
+      "expression": "s IS NULL OR concat(s, 'x') IS NULL OR true",
+      "rows": [
+        "true",
+        "true",
+        "true"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (s IS NULL AND concat(s, 'x') IS NULL AND false) STORED)",
+      "type": "boolean",
+      "expression": "s IS NULL AND concat(s, 'x') IS NULL AND false",
+      "rows": [
+        "false",
+        "false",
+        "false"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (true OR (1 / 0 = 0)) STORED)",
+      "type": "boolean",
+      "expression": "true OR (1 / 0 = 0)",
+      "rows": [
+        "true",
+        "true",
+        "true"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (false AND (1 / 0 = 0)) STORED)",
+      "type": "boolean",
+      "expression": "false AND (1 / 0 = 0)",
+      "rows": [
+        "false",
+        "false",
+        "false"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS ((1 / 0 = 0) OR true) STORED)",
+      "type": "boolean",
+      "expression": "(1 / 0 = 0) OR true",
+      "sqlstate": "22012"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS ((1 / 0 = 0) AND false) STORED)",
+      "type": "boolean",
+      "expression": "(1 / 0 = 0) AND false",
+      "sqlstate": "22012"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g int GENERATED ALWAYS AS (1 / 0) STORED)",
+      "type": "int",
+      "expression": "1 / 0",
+      "sqlstate": "22012"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g int GENERATED ALWAYS AS (CASE WHEN s IS NULL THEN 1 ELSE 1 / 0 END) STORED)",
+      "type": "int",
+      "expression": "CASE WHEN s IS NULL THEN 1 ELSE 1 / 0 END",
+      "sqlstate": "22012"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g int GENERATED ALWAYS AS (CASE WHEN false THEN 1 / 0 ELSE 1 END) STORED)",
+      "type": "int",
+      "expression": "CASE WHEN false THEN 1 / 0 ELSE 1 END",
+      "rows": [
+        "1",
+        "1",
+        "1"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g int GENERATED ALWAYS AS (coalesce(1, 1 / 0)) STORED)",
+      "type": "int",
+      "expression": "coalesce(1, 1 / 0)",
+      "rows": [
+        "1",
+        "1",
+        "1"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (CASE WHEN false THEN missing ELSE 'ok' END) STORED)",
+      "type": "text",
+      "expression": "CASE WHEN false THEN missing ELSE 'ok' END",
+      "sqlstate": "42703"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (CASE WHEN false THEN g ELSE 'ok' END) STORED)",
+      "type": "text",
+      "expression": "CASE WHEN false THEN g ELSE 'ok' END",
+      "sqlstate": "42P17"
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (lower(s)) STORED)",
+      "type": "text",
+      "expression": "lower(s)",
+      "rows": [
+        null,
+        "",
+        "alpha"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (s || '-x') STORED)",
+      "type": "text",
+      "expression": "s || '-x'",
+      "rows": [
+        null,
+        "-x",
+        "ALPHA-x"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g int GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 7 ELSE n + 2 END) STORED)",
+      "type": "int",
+      "expression": "CASE WHEN n IS NULL THEN 7 ELSE n + 2 END",
+      "rows": [
+        "7",
+        "2",
+        "5"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g int GENERATED ALWAYS AS (coalesce(n, 7, 1 / 0)) STORED)",
+      "type": "int",
+      "expression": "coalesce(n, 7, 1 / 0)",
+      "rows": [
+        "7",
+        "0",
+        "3"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (n IS NULL OR false) STORED)",
+      "type": "boolean",
+      "expression": "n IS NULL OR false",
+      "rows": [
+        "true",
+        "false",
+        "false"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (n IS NOT NULL AND true) STORED)",
+      "type": "boolean",
+      "expression": "n IS NOT NULL AND true",
+      "rows": [
+        "false",
+        "true",
+        "true"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (NULL::boolean OR n IS NULL) STORED)",
+      "type": "boolean",
+      "expression": "NULL::boolean OR n IS NULL",
+      "rows": [
+        "true",
+        null,
+        null
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (NULL::boolean AND n IS NULL) STORED)",
+      "type": "boolean",
+      "expression": "NULL::boolean AND n IS NULL",
+      "rows": [
+        null,
+        "false",
+        "false"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (replace(s, 'A', 'x')) STORED)",
+      "type": "text",
+      "expression": "replace(s, 'A', 'x')",
+      "rows": [
+        null,
+        "",
+        "xLPHx"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (md5(s)) STORED)",
+      "type": "text",
+      "expression": "md5(s)",
+      "rows": [
+        null,
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "002101f8725e5c78d9f30d87f3fa4c87"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (md5(replace(s, 'A', 'x'))) STORED)",
+      "type": "text",
+      "expression": "md5(replace(s, 'A', 'x'))",
+      "rows": [
+        null,
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "e6692fe2a788437578d0375d59283510"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (replace(s, lower(s), upper(s))) STORED)",
+      "type": "text",
+      "expression": "replace(s, lower(s), upper(s))",
+      "rows": [
+        null,
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (replace(s, '', 'x')) STORED)",
+      "type": "text",
+      "expression": "replace(s, '', 'x')",
+      "rows": [
+        null,
+        "",
+        "ALPHA"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (replace(s, 'A', '')) STORED)",
+      "type": "text",
+      "expression": "replace(s, 'A', '')",
+      "rows": [
+        null,
+        "",
+        "LPH"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g text GENERATED ALWAYS AS (coalesce(md5(s), 'missing')) STORED)",
+      "type": "text",
+      "expression": "coalesce(md5(s), 'missing')",
+      "rows": [
+        "missing",
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "002101f8725e5c78d9f30d87f3fa4c87"
+      ],
+      "sqlstate": null
+    },
+    {
+      "sql": "CREATE TABLE generated_probe (s text, n int, t timestamptz, g boolean GENERATED ALWAYS AS (md5(s) IS NULL) STORED)",
+      "type": "boolean",
+      "expression": "md5(s) IS NULL",
+      "rows": [
+        "true",
+        "false",
+        "false"
+      ],
+      "sqlstate": null
+    }
+  ]
+}

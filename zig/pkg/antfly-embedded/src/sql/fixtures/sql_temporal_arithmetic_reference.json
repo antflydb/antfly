@@ -1,0 +1,962 @@
+{
+  "format": 1,
+  "zone": "UTC",
+  "vectors": [
+    {
+      "expression": "v + INTERVAL '1 month'",
+      "timestamp": "0002b34571f08000",
+      "result": "2024-02-29 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month'",
+      "timestamp": "0002b34571f08000",
+      "result": "2023-12-31 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month 1 day'",
+      "timestamp": "0002b34571f08000",
+      "result": "2024-03-01 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month 1 day'",
+      "timestamp": "0002b34571f08000",
+      "result": "2023-12-30 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "0002b34571f08000",
+      "result": "2024-01-02 22:57:56.123452+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "0002b34571f08000",
+      "result": "2024-02-28 01:02:02.12346+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 hour 30 minutes'",
+      "timestamp": "0002b34571f08000",
+      "result": "2024-02-01 01:29:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 hour 30 minutes'",
+      "timestamp": "0002b34571f08000",
+      "result": "2024-01-31 22:29:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '7 days'",
+      "timestamp": "0002b34571f08000",
+      "result": "2024-02-07 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '7 days'",
+      "timestamp": "0002b34571f08000",
+      "result": "2024-01-24 23:59:59.123456+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 months'",
+      "timestamp": "0002b34571f08000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 months'",
+      "timestamp": "0002b34571f08000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "0002b34571f08000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "0002b34571f08000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "0002b34571f08000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "0002b34571f08000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 days'",
+      "timestamp": "0002b34571f08000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 days'",
+      "timestamp": "0002b34571f08000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL 'infinity'",
+      "timestamp": "0002b34571f08000",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL 'infinity'",
+      "timestamp": "0002b34571f08000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-infinity'",
+      "timestamp": "0002b34571f08000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-infinity'",
+      "timestamp": "0002b34571f08000",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month'",
+      "timestamp": "00029682c812a000",
+      "result": "2023-02-28 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month'",
+      "timestamp": "00029682c812a000",
+      "result": "2022-12-31 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month 1 day'",
+      "timestamp": "00029682c812a000",
+      "result": "2023-03-01 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month 1 day'",
+      "timestamp": "00029682c812a000",
+      "result": "2022-12-30 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "00029682c812a000",
+      "result": "2023-01-01 22:57:56.999996+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "00029682c812a000",
+      "result": "2023-02-26 01:02:03.000004+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 hour 30 minutes'",
+      "timestamp": "00029682c812a000",
+      "result": "2023-01-31 01:30:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 hour 30 minutes'",
+      "timestamp": "00029682c812a000",
+      "result": "2023-01-30 22:30:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '7 days'",
+      "timestamp": "00029682c812a000",
+      "result": "2023-02-07 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '7 days'",
+      "timestamp": "00029682c812a000",
+      "result": "2023-01-24 00:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 months'",
+      "timestamp": "00029682c812a000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 months'",
+      "timestamp": "00029682c812a000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "00029682c812a000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "00029682c812a000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "00029682c812a000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "00029682c812a000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 days'",
+      "timestamp": "00029682c812a000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 days'",
+      "timestamp": "00029682c812a000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL 'infinity'",
+      "timestamp": "00029682c812a000",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL 'infinity'",
+      "timestamp": "00029682c812a000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-infinity'",
+      "timestamp": "00029682c812a000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-infinity'",
+      "timestamp": "00029682c812a000",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-03-29 12:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-01-29 12:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month 1 day'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-03-30 12:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month 1 day'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-01-28 12:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-01-31 10:57:56.999996+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-03-27 13:02:03.000004+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 hour 30 minutes'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-02-29 13:30:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 hour 30 minutes'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-02-29 10:30:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '7 days'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-03-07 12:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '7 days'",
+      "timestamp": "000004acef8ed000",
+      "result": "2000-02-22 12:00:00+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 months'",
+      "timestamp": "000004acef8ed000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 months'",
+      "timestamp": "000004acef8ed000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "000004acef8ed000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "000004acef8ed000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "000004acef8ed000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "000004acef8ed000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 days'",
+      "timestamp": "000004acef8ed000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 days'",
+      "timestamp": "000004acef8ed000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL 'infinity'",
+      "timestamp": "000004acef8ed000",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL 'infinity'",
+      "timestamp": "000004acef8ed000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-infinity'",
+      "timestamp": "000004acef8ed000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-infinity'",
+      "timestamp": "000004acef8ed000",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1970-01-31 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1969-11-30 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month 1 day'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1970-02-01 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month 1 day'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1969-11-29 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1969-12-02 22:57:56.999995+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1970-01-30 01:02:03.000003+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 hour 30 minutes'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1970-01-01 01:29:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 hour 30 minutes'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1969-12-31 22:29:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '7 days'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1970-01-07 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '7 days'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "1969-12-24 23:59:59.999999+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 months'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 months'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "294247-01-10 04:00:54.775806+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 days'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 days'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL 'infinity'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL 'infinity'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-infinity'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-infinity'",
+      "timestamp": "fffca2fec4c81fff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0001-02-29 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0002-12-31 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month 1 day'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0001-03-01 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month 1 day'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0002-12-30 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0001-01-01 22:57:56.999996+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0001-02-27 01:02:03.000004+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 hour 30 minutes'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0001-01-31 01:30:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 hour 30 minutes'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0001-01-30 22:30:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '7 days'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0001-02-07 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '7 days'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "0001-01-24 00:00:00+00 BC",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 months'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 months'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "292277-02-08 04:00:54.775807+00",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 days'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 days'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL 'infinity'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL 'infinity'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-infinity'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-infinity'",
+      "timestamp": "ff1fc8989aee6000",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month 1 day'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month 1 day'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 hour 30 minutes'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 hour 30 minutes'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '7 days'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '7 days'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 months'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 months'",
+      "timestamp": "7fffffffffffffff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "7fffffffffffffff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 days'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 days'",
+      "timestamp": "7fffffffffffffff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL 'infinity'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL 'infinity'",
+      "timestamp": "7fffffffffffffff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-infinity'",
+      "timestamp": "7fffffffffffffff",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL '-infinity'",
+      "timestamp": "7fffffffffffffff",
+      "result": "infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 month 1 day'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 month 1 day'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-1 month 2 days -01:02:03.000004'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '1 hour 30 minutes'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '1 hour 30 minutes'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '7 days'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '7 days'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 months'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 months'",
+      "timestamp": "8000000000000000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '9223372036854775807 microseconds'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-9223372036854775808 microseconds'",
+      "timestamp": "8000000000000000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL '-2147483648 days'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-2147483648 days'",
+      "timestamp": "8000000000000000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v + INTERVAL 'infinity'",
+      "timestamp": "8000000000000000",
+      "result": null,
+      "sqlstate": "22008"
+    },
+    {
+      "expression": "v - INTERVAL 'infinity'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v + INTERVAL '-infinity'",
+      "timestamp": "8000000000000000",
+      "result": "-infinity",
+      "sqlstate": null
+    },
+    {
+      "expression": "v - INTERVAL '-infinity'",
+      "timestamp": "8000000000000000",
+      "result": null,
+      "sqlstate": "22008"
+    }
+  ],
+  "cases": [
+    {
+      "id": "sql-0593",
+      "sql": "SELECT created_at + INTERVAL '1 month' AS next_cycle FROM usage_records WHERE id = $1",
+      "columns": [
+        "next_cycle"
+      ],
+      "column_oids": [
+        1184
+      ],
+      "rows": [
+        [
+          "2024-02-29T23:59:59.123456+00:00"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0594",
+      "sql": "SELECT created_at + INTERVAL '1 month 1 day' AS next_cycle_plus_day FROM usage_records WHERE id = $1",
+      "columns": [
+        "next_cycle_plus_day"
+      ],
+      "column_oids": [
+        1184
+      ],
+      "rows": [
+        [
+          "2024-03-01T23:59:59.123456+00:00"
+        ]
+      ]
+    }
+  ]
+}

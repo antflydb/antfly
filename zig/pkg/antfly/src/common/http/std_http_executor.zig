@@ -175,6 +175,10 @@ pub const StdHttpExecutor = struct {
     pub fn executor(self: *StdHttpExecutor) common.RequestExecutor {
         return .{
             .ptr = self,
+            // The executor owns this stable client/Io capsule. Remote
+            // retained reads need its secure randomness and clock; dropping
+            // the borrow makes every capture fail before sending a request.
+            .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.client.io),
             .vtable = &.{
                 .execute = execute,
                 .execute_stream = executeStream,
@@ -301,6 +305,7 @@ pub const StdHttpExecutor = struct {
             .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
+            .PATCH => .PATCH,
         };
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         var response = try client.requestToWriter(method, req.uri, .{
@@ -343,6 +348,7 @@ pub const StdHttpExecutor = struct {
             .POST => std.http.Method.POST,
             .PUT => std.http.Method.PUT,
             .DELETE => std.http.Method.DELETE,
+            .PATCH => std.http.Method.PATCH,
         };
         var extra_headers = std.ArrayListUnmanaged(std.http.Header).empty;
         defer extra_headers.deinit(alloc);
@@ -452,6 +458,7 @@ pub const StdHttpExecutor = struct {
             .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
+            .PATCH => .PATCH,
         };
         // The resolved client owns URI parsing, connection establishment,
         // transmission, and response receipt behind one opaque call. Local
@@ -712,6 +719,7 @@ pub const StdHttpExecutor = struct {
             .POST => std.http.Method.POST,
             .PUT => std.http.Method.PUT,
             .DELETE => std.http.Method.DELETE,
+            .PATCH => std.http.Method.PATCH,
         };
 
         var extra_headers = std.ArrayListUnmanaged(std.http.Header).empty;
@@ -1058,6 +1066,18 @@ test "std http executor rejects truncated response without replaying a delivered
         try std.testing.expectEqual(common.RequestDeliveryTracker.State.may_have_been_sent, delivery.load());
         try std.testing.expectEqual(@as(usize, 0), executor.client.connection_pool.free_len);
     };
+}
+
+test "std http executor exports request Io for retained read connection admission" {
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+    const source = executor.executor();
+    const clock = source.clock_io orelse return error.MissingRequestIo;
+    var receiver = try clock.receive();
+    var nonce: [16]u8 = undefined;
+    try receiver.io().randomSecure(&nonce);
+    try std.testing.expect(!std.mem.allEqual(u8, &nonce, 0));
+    try std.testing.expect(source.monotonicNs() != 0);
 }
 
 test "std http executor module compiles" {

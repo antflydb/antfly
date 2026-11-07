@@ -20,10 +20,21 @@
 /// mutation inputs. Never write parameter values into the immutable plan.
 pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan, parameters: []const std.json.Value) ![]const catalog.StatementScan {
     const has_search = for (input_scans) |scan| {
-        if (scan.request.search != null) break true;
+        if (scan.request.graph != null or scan.request.search != null or scan.request.text_predicate != null) break true;
     } else false;
     return if (has_search) bound: {
         const bound_scans = try a.dupe(catalog.StatementScan, input_scans);
+        for (bound_scans) |*scan| if (scan.request.graph) |original| {
+            const graph = try a.create(@import("ast.zig").Graph);
+            graph.* = original.*;
+            if (graph.start == .parameter) {
+                if (graph.start.parameter == 0 or graph.start.parameter > parameters.len) return error.InvalidSqlParameters;
+                const value = parameters[graph.start.parameter - 1];
+                if (value != .string) return error.InvalidSqlParameters;
+                graph.start = .{ .string = value.string };
+            }
+            scan.request.graph = graph;
+        };
         for (bound_scans) |*scan| if (scan.request.search) |original| {
             const search = try a.create(catalog.Scan.Search);
             search.* = original.*;
@@ -38,6 +49,24 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
                 if (number < 1 or number > 10000) return error.InvalidSqlParameters;
                 search.limit = @intCast(number);
             }
+        };
+        for (bound_scans) |*scan| if (scan.request.text_predicate) |original| {
+            const selection = try a.create(catalog.Scan.TextPredicate);
+            selection.* = original.*;
+            var text: std.Io.Writer.Allocating = .init(a);
+            defer text.deinit();
+            for (original.expressions, 0..) |value, i| {
+                const input = if (value == .parameter) blk: {
+                    if (value.parameter == 0 or value.parameter > parameters.len) return error.InvalidSqlParameters;
+                    break :blk parameters[value.parameter - 1];
+                } else try describe.bindLiteral(a, value, .string);
+                if (input != .string or input.string.len == 0 or input.string.len > 64 * 1024) return error.InvalidSqlParameters;
+                if (i != 0) try text.writer.writeAll(" AND ");
+                try text.writer.print("({s})", .{input.string});
+                if (text.written().len > 64 * 1024) return error.SqlProgramLimitExceeded;
+            }
+            selection.query = try a.dupe(u8, text.written());
+            scan.request.text_predicate = selection;
         };
         break :bound bound_scans;
     } else input_scans;
@@ -59,6 +88,7 @@ fn dependsOn(node: *const binding.Node, id: usize) bool {
         .recursive_ref => |reference| reference == id,
         .materialized_ref => |source| dependsOn(source, id),
         .query => |query| dependsOn(query.source, id),
+        .unnest => |function| dependsOn(function.source, id),
         .join => |join| dependsOn(join.left, id) or dependsOn(join.right, id),
         .apply => |apply| dependsOn(apply.left, id) or dependsOn(apply.right, id),
         .set => |set| dependsOn(set.left, id) or dependsOn(set.right, id),
@@ -74,6 +104,7 @@ fn outerMask(node: *const binding.Node) u32 {
         .outer_ref => |id| @as(u32, 1) << @intCast(id),
         .materialized_ref => |source| outerMask(source),
         .query => |query| outerMask(query.source),
+        .unnest => |function| outerMask(function.source),
         .join => |join| outerMask(join.left) | outerMask(join.right),
         .apply => |apply| (outerMask(apply.left) | outerMask(apply.right)) & ~(@as(u32, 1) << @intCast(apply.id)),
         .set => |set| outerMask(set.left) | outerMask(set.right),
@@ -248,6 +279,54 @@ test "SQL typed array rows survive scalar join and grouped relation adapters" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL DISTINCT boundaries preserve typed outputs nulls priority and post deduplication pagination" {
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]bool{ false, true }) |with_io| {
+        var fixture: SetTestBackend = .{};
+        var backend = fixture.backend();
+        backend.execution_io = if (with_io) std.testing.io else null;
+        for ([_]Case{
+            .{ .sql = "SELECT DISTINCT x FROM (VALUES(2),(1),(2),(NULL),(NULL)) q(x) ORDER BY x NULLS LAST", .expected = "[[\"1\"],[\"2\"],[null]]" },
+            .{ .sql = "SELECT DISTINCT x FROM (VALUES(2),(1),(2)) q(x) ORDER BY x DESC LIMIT 1 OFFSET 1", .expected = "[[\"1\"]]" },
+            .{ .sql = "SELECT DISTINCT x FROM (VALUES(2),(1),(2)) q(x) ORDER BY q.x", .expected = "[[\"1\"],[\"2\"]]" },
+            .{ .sql = "SELECT DISTINCT lower(t) FROM (VALUES('B'),('A'),('a')) q(t) ORDER BY lower(q.t)", .expected = "[[\"a\"],[\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT lower(t) FROM (VALUES('B'),('A'),('a')) q(t) ORDER BY pg_catalog.lower(q.t)", .expected = "[[\"a\"],[\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT * FROM (VALUES(2),(1),(2)) q(x) ORDER BY 1", .expected = "[[\"1\"],[\"2\"]]" },
+            .{ .sql = "SELECT DISTINCT * FROM (VALUES(2),(1),(2)) q(x) ORDER BY q.x", .expected = "[[\"1\"],[\"2\"]]" },
+            .{ .sql = "SELECT count(*) FROM (SELECT DISTINCT x FROM (VALUES(2),(1),(2)) q(x)) d", .expected = "[[\"2\"]]" },
+            .{ .sql = "SELECT DISTINCT count(*) AS n FROM (VALUES(1),(2),(3)) q(x) GROUP BY x ORDER BY n", .expected = "[[\"1\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (g) g,v FROM (VALUES(1,2),(1,3),(2,4)) q(g,v) ORDER BY g,v DESC", .expected = "[[\"1\",\"3\"],[\"2\",\"4\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (g) g,v FROM (VALUES(1,2),(1,3),(2,4)) q(g,v) ORDER BY q.g,v DESC", .expected = "[[\"1\",\"3\"],[\"2\",\"4\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (g) * FROM (VALUES(1,2),(1,3),(2,4)) q(g,v) ORDER BY g,v DESC LIMIT 1 OFFSET 1", .expected = "[[\"2\",\"4\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (lower(t)) id,lower(t) AS k FROM (VALUES(1,'A',1),(2,'a',2),(3,'B',3)) q(id,t,at) ORDER BY lower(t),at DESC", .expected = "[[\"2\",\"a\"],[\"3\",\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (k) id,lower(t) AS k FROM (VALUES(1,'A',1),(2,'a',2),(3,'B',3)) q(id,t,at) ORDER BY k,at DESC", .expected = "[[\"2\",\"a\"],[\"3\",\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (2) id,lower(t) AS k FROM (VALUES(1,'A',1),(2,'a',2),(3,'B',3)) q(id,t,at) ORDER BY 2,at DESC", .expected = "[[\"2\",\"a\"],[\"3\",\"b\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (k) 2 AS k FROM (VALUES(1),(2)) q(x)", .expected = "[[\"2\"]]" },
+            .{ .sql = "SELECT DISTINCT ON (g) 10/v AS late FROM (VALUES(1,0),(1,1)) q(g,v) ORDER BY g,v DESC", .expected = "[[\"10\"]]" },
+        }) |case| {
+            errdefer std.debug.print("DISTINCT query failed: {s}\n", .{case.sql});
+            var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+            defer compiled.deinit();
+            var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+            defer std.testing.allocator.free(encoded);
+            try std.testing.expectEqualStrings(case.expected, encoded);
+        }
+        for ([_][]const u8{
+            "SELECT DISTINCT x FROM (VALUES(1,2)) q(x,y) ORDER BY y",
+            "SELECT DISTINCT ON (x) x FROM (VALUES(1,2)) q(x,y) ORDER BY y,x",
+            "SELECT DISTINCT ON (0) x FROM (VALUES(1)) q(x)",
+            "SELECT DISTINCT ON (-1) x FROM (VALUES(1)) q(x)",
+            "SELECT DISTINCT ON (1.0) x FROM (VALUES(1)) q(x)",
+        }, [_]anyerror{ error.SqlDistinctOrderMismatch, error.SqlDistinctOnOrderMismatch, error.SqlDistinctOrderMismatch, error.SqlDistinctOrderMismatch, error.InvalidSqlSyntax }) |sql, expected| {
+            var compiled = try @import("compiler.zig").compile(std.testing.allocator, sql, .{});
+            defer compiled.deinit();
+            try std.testing.expectError(expected, @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+        }
+    }
 }
 
 test "SQL internal array query boundaries preserve values in memory and spill execution" {
@@ -628,7 +707,6 @@ test "SQL set inference respects pairwise and derived type boundaries" {
         "(SELECT $1 AS x LIMIT 1) UNION SELECT 1",
         "SELECT COALESCE($1::bigint, NULL) AS x UNION SELECT 1",
         "SELECT NULL::bigint AS x UNION SELECT NULL UNION SELECT $1 UNION SELECT 1",
-        "SELECT CASE WHEN TRUE THEN SUM($1::bigint) ELSE 0 END AS x UNION SELECT 1",
         "WITH n AS (SELECT NULL::bigint AS x) SELECT COALESCE(n.x,$1) AS x FROM n UNION SELECT 1",
     }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
@@ -637,6 +715,12 @@ test "SQL set inference respects pairwise and derived type boundaries" {
         defer result.deinit();
         try std.testing.expectEqual(@import("ast.zig").ColumnType.integer, result.output.columns[0].type);
     }
+    var numeric_query = try compiler.compile(std.testing.allocator, "SELECT CASE WHEN TRUE THEN SUM($1::bigint) ELSE 0 END AS x UNION SELECT 1", .{});
+    defer numeric_query.deinit();
+    var numeric_result = try runtime.execute(std.testing.allocator, backend.backend(), &numeric_query, &.{.{ .integer = 1 }}, .{});
+    defer numeric_result.deinit();
+    try std.testing.expectEqual(@import("ast.zig").ColumnType.number, numeric_result.output.columns[0].type);
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), numeric_result.output.columns[0].element_type);
     var predicate_query = try compiler.compile(std.testing.allocator, "SELECT $1 AS x WHERE $1=1 UNION ALL SELECT 1.5", .{});
     defer predicate_query.deinit();
     var predicate_result = try runtime.execute(std.testing.allocator, backend.backend(), &predicate_query, &.{.{ .integer = 1 }}, .{});
@@ -690,7 +774,8 @@ test "SQL set admission rejects incompatible shapes and enforces the shared memo
     }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        const expected = if (std.mem.eql(u8, sql, "SELECT 1 UNION SELECT 1, 2")) error.SqlSetColumnCountMismatch else error.SqlSetTypeMismatch;
+        try std.testing.expectError(expected, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
     }
     for ([_][]const u8{
         "SELECT ARRAY[1]::int4[] UNION SELECT ARRAY[TRUE]::boolean[]",
@@ -713,17 +798,63 @@ fn Engine(comptime Context: type) type {
         context: Context,
         cursors: []const catalog.Cursor,
         visited: usize = 0,
+        expanded_rows: usize = 0,
         work: usize = 0,
         cache_arena: std.heap.ArenaAllocator,
+        ordered_effects: ?@import("statement_effects.zig").Effects = null,
         planning_budget: @import("memory_budget.zig") = undefined,
         planning_arena: ?std.heap.ArenaAllocator = null,
         static_rows: std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = .empty,
         static_hashes: std.AutoHashMapUnmanaged(*const binding.Node, *operators.HashJoin) = .empty,
         static_memberships: std.AutoHashMapUnmanaged(*const binding.Node, *operators.TupleMembership) = .empty,
-        recursions: [32]?*Worklist = @splat(null),
+        recursions: [32]?*Recursion = @splat(null),
         recursion_scopes: [32]?usize = @splat(null),
         outer_values: [32]?[]const Datum = @splat(null),
         outer_replays: [32]std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = @splat(.empty),
+
+        const Recursion = struct {
+            node: *const binding.Node,
+            worklist: Worklist,
+            scratch: std.heap.ArenaAllocator,
+            iterator: ?*Iterator = null,
+            phase: enum { seed, step } = .seed,
+            advancing: bool = false,
+            failure: ?anyerror = null,
+
+            fn stop(self: *Recursion) void {
+                const iterator = self.iterator;
+                self.iterator = null;
+                if (iterator) |owned| owned.deinit();
+            }
+
+            fn advance(self: *Recursion, engine: *Self, index: usize) anyerror!void {
+                const plan = self.node.operation.recursive;
+                while (index >= self.worklist.rows.items.len and !self.worklist.complete) {
+                    try engine.checkpoint();
+                    if (self.iterator == null) {
+                        self.iterator = if (self.phase == .seed)
+                            try Iterator.create(engine, plan.seed)
+                        else
+                            try Iterator.createRecursive(engine, plan.step, plan.id);
+                        self.iterator.?.markPrefixProducer();
+                    }
+                    if (!self.scratch.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
+                    const a = self.scratch.allocator();
+                    if (try self.iterator.?.nextDemand(a, 1)) |values| {
+                        const normalized = try normalize(a, self.node.columns, values);
+                        try self.worklist.append(engine, normalized, engine.context.limits.scan_rows);
+                        continue;
+                    }
+                    self.stop();
+                    // Freeze each complete delta before opening its recursive
+                    // step. Newly yielded rows cannot feed that same step.
+                    self.worklist.begin = if (self.phase == .seed) 0 else self.worklist.end;
+                    self.worklist.end = self.worklist.rows.items.len;
+                    self.phase = .step;
+                    self.worklist.complete = self.worklist.begin == self.worklist.end;
+                }
+            }
+        };
 
         pub fn checkpoint(self: *Self) !void {
             try self.context.checkpoint();
@@ -732,6 +863,13 @@ fn Engine(comptime Context: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Suspended recursive steps can retain cached replay readers.
+            for (0..self.recursions.len) |id| if (self.recursions[id]) |state| state.stop();
+            // Lazy producers can retain readers of other cached inputs. Join
+            // every producer before destroying any of those shared owners.
+            var producers = self.static_rows.valueIterator();
+            while (producers.next()) |replay| replay.*.closeProducer();
+            for (0..self.outer_replays.len) |id| self.closeOuterProducers(id);
             for (0..self.outer_replays.len) |id| {
                 self.clearOuter(id);
                 self.outer_replays[id].deinit(self.context.alloc);
@@ -750,90 +888,96 @@ fn Engine(comptime Context: type) type {
             }
         }
 
+        fn closeOuterProducers(self: *Self, id: usize) void {
+            var entries = self.outer_replays[id].valueIterator();
+            while (entries.next()) |replay| replay.*.closeProducer();
+        }
+
         fn clearOuter(self: *Self, id: usize) void {
+            // Stop recursive steps first so they release replay readers, but
+            // retain worklist rows until every scoped consumer has closed.
+            for (self.recursion_scopes, 0..) |scope, recursion_id| if (scope == id) {
+                if (self.recursions[recursion_id]) |state| state.stop();
+            };
+            // Scoped materializations can borrow one another. Retire every
+            // producer before freeing any replay or its captured outer values.
+            self.closeOuterProducers(id);
+            for (self.recursion_scopes, 0..) |scope, recursion_id| if (scope == id) self.closeRecursion(recursion_id);
             var entries = self.outer_replays[id].valueIterator();
             while (entries.next()) |replay| replay.*.deinit();
             self.outer_replays[id].clearRetainingCapacity();
-            for (self.recursion_scopes, 0..) |scope, recursion_id| if (scope == id) self.closeRecursion(recursion_id);
             self.outer_values[id] = null;
         }
 
         fn closeRecursion(self: *Self, id: usize) void {
-            if (self.recursions[id]) |worklist| {
-                worklist.deinit();
-                self.context.alloc.destroy(worklist);
+            if (self.recursions[id]) |state| {
+                // Relinquish ownership before nested iterator cleanup can
+                // retire another lexical scope or revisit this slot.
                 self.recursions[id] = null;
                 self.recursion_scopes[id] = null;
+                state.stop();
+                state.worklist.deinit();
+                state.scratch.deinit();
+                self.context.alloc.destroy(state);
             }
         }
 
-        fn staticRows(self: *Self, node: *const binding.Node) anyerror!*Replay {
+        fn prefixRows(self: *Self, node: *const binding.Node) anyerror!*Replay {
             const mask = outerMask(node);
             const outer_id: usize = if (mask != 0) 31 - @clz(mask) else 0;
             const cache = if (mask != 0) &self.outer_replays[outer_id] else &self.static_rows;
             if (cache.get(node)) |rows| return rows;
-            // Reserve room for consuming operators when spill is available;
-            // memory-only backends retain their full statement admission.
             const memory_bytes = if (self.context.spill != null) self.context.limits.retained_bytes / 16 else self.context.limits.retained_bytes;
             const replay = try Replay.create(self.context.alloc, node.columns.len, memory_bytes, self.context.spill);
             errdefer replay.deinit();
             const iterator = try Iterator.createContext(self, node, null, mask != 0);
-            defer iterator.deinit();
-            var scratch = std.heap.ArenaAllocator.init(self.context.alloc);
-            defer scratch.deinit();
-            while (try iterator.next(scratch.allocator())) |values| {
-                if (replay.count >= self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                try replay.append(values);
-                _ = scratch.reset(.free_all);
-            }
-            try replay.finish();
+            iterator.markPrefixProducer();
+            // attachProducer transfers iterator ownership only on success.
+            replay.attachProducer(.{ .ptr = iterator, .pull = prefixPull, .close = prefixClose }, self.context.limits.scan_rows) catch |err| {
+                iterator.deinit();
+                return err;
+            };
             try cache.put(if (mask != 0) self.context.alloc else self.cache_arena.allocator(), node, replay);
             return replay;
         }
+        fn prefixPull(raw: *anyopaque, a: Allocator) anyerror!?[]const Datum {
+            const iterator: *Iterator = @ptrCast(@alignCast(raw));
+            // Projection demand is one row; physical cursors retain their
+            // existing page admission and are never reopened for a reader.
+            return iterator.nextDemand(a, 1);
+        }
+        fn prefixClose(raw: *anyopaque) void {
+            const iterator: *Iterator = @ptrCast(@alignCast(raw));
+            iterator.deinit();
+        }
 
-        fn recursive(self: *Self, node: *const binding.Node) anyerror!*Worklist {
+        fn recursive(self: *Self, node: *const binding.Node, index: usize) anyerror!*Worklist {
             const plan = node.operation.recursive;
-            if (self.recursions[plan.id]) |state| {
-                if (!state.complete) return error.UnsupportedSqlShape;
-                return state;
-            }
-            const state = try self.context.alloc.create(Worklist);
-            state.* = .init(self.context.alloc, plan.all);
-            self.recursions[plan.id] = state;
-            const mask = outerMask(node);
-            self.recursion_scopes[plan.id] = if (mask != 0) 31 - @clz(mask) else null;
-            var scratch = std.heap.ArenaAllocator.init(self.context.alloc);
-            defer scratch.deinit();
-            {
-                const seed = try Iterator.create(self, plan.seed);
-                defer seed.deinit();
-                while (try seed.next(scratch.allocator())) |values| {
-                    const normalized = try normalize(scratch.allocator(), node.columns, values);
-                    try state.append(self, normalized, self.context.limits.scan_rows);
-                    _ = scratch.reset(.free_all);
-                }
-            }
-            state.end = state.rows.items.len;
-            while (state.begin != state.end) {
-                try self.checkpoint();
-                const step = try Iterator.createRecursive(self, plan.step, plan.id);
-                defer step.deinit();
-                while (try step.next(scratch.allocator())) |values| {
-                    const normalized = try normalize(scratch.allocator(), node.columns, values);
-                    try state.append(self, normalized, self.context.limits.scan_rows);
-                    _ = scratch.reset(.free_all);
-                }
-                state.begin = state.end;
-                state.end = state.rows.items.len;
-            }
-            state.complete = true;
-            return state;
+            const state = self.recursions[plan.id] orelse blk: {
+                const created = try self.context.alloc.create(Recursion);
+                created.* = .{ .node = node, .worklist = .init(self.context.alloc, plan.all), .scratch = .init(self.context.alloc) };
+                self.recursions[plan.id] = created;
+                const mask = outerMask(node);
+                self.recursion_scopes[plan.id] = if (mask != 0) 31 - @clz(mask) else null;
+                break :blk created;
+            };
+            if (index < state.worklist.rows.items.len or state.worklist.complete) return &state.worklist;
+            if (state.failure) |err| return err;
+            if (state.advancing) return error.UnsupportedSqlShape;
+            state.advancing = true;
+            defer state.advancing = false;
+            state.advance(self, index) catch |err| {
+                state.failure = err;
+                state.stop();
+                return err;
+            };
+            return &state.worklist;
         }
 
         fn normalize(alloc: Allocator, columns: []const binding.Column, values: []const Datum) ![]const Datum {
             if (columns.len != values.len) return error.SqlTypeMismatch;
             const result = try alloc.alloc(Datum, values.len);
-            for (values, columns, result) |value, column, *out| out.* = try describe.coerceDatum(alloc, value, column.type, column.element_type);
+            for (values, columns, result) |value, column, *out| out.* = try describe.coerceDatumTyped(alloc, value, scalar.columnType(column));
             return result;
         }
 
@@ -909,9 +1053,19 @@ fn Engine(comptime Context: type) type {
             if (cursor.set_dynamic_filter == null) return false;
             return wants(cursor.ptr, columns[0..keys_.len]);
         }
+        fn ordered(self: *Self, node: *const binding.Node) !bool {
+            if (self.ordered_effects == null) self.ordered_effects = .{ .a = self.cache_arena.allocator(), .ordered_only = true };
+            return self.ordered_effects.?.node(node, 0);
+        }
         fn preferLeftBuild(self: *Self, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) !bool {
             const left = join.left;
             const right = join.right;
+            // Keep an ordered producer on the probe side. Eagerly building
+            // it would consume future sequence/default effects before an
+            // enclosing mutation or RETURNING expression can fail.
+            const left_ordered = try self.ordered(left);
+            const right_ordered = try self.ordered(right);
+            if (left_ordered != right_ordered) return right_ordered;
             // A native exact probe avoids opening source pages altogether.
             // Preserve that access path before comparing scan/build sizes;
             // scan-only estimates do not price index seeks or covering payloads.
@@ -947,6 +1101,7 @@ fn Engine(comptime Context: type) type {
             node: *const binding.Node,
             arena: std.heap.ArenaAllocator,
             scratch: std.heap.ArenaAllocator,
+            filter_arena: std.heap.ArenaAllocator,
             projection_arena: std.heap.ArenaAllocator,
             left: ?*Iterator = null,
             right: ?*Iterator = null,
@@ -985,6 +1140,9 @@ fn Engine(comptime Context: type) type {
             query_remaining: usize = 0,
             query_buffer: []const []const Datum = &.{},
             query_buffer_index: usize = 0,
+            unnest_values: ?[]const Datum = null,
+            unnest_index: usize = 0,
+            unnest_count: usize = 0,
             set_entries: std.ArrayList(SetEntry) = .empty,
             set_heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
             set_ready: bool = false,
@@ -997,6 +1155,7 @@ fn Engine(comptime Context: type) type {
             recursive_id: ?usize = null,
             apply_mode: bool = false,
             batch_demand: ?usize = null,
+            prefix_producer: bool = false,
             cached_reader: ?*Replay.Reader = null,
             borrowed_hash: bool = false,
             flipped_join: bool = false,
@@ -1010,6 +1169,12 @@ fn Engine(comptime Context: type) type {
             const QueryPlan = struct { input: QueryMap, outputs: QueryMap, forward: ?QueryMap };
             const SetEntry = struct { values: []const Datum, count: usize, next: ?usize };
 
+            fn markPrefixProducer(self: *Iterator) void {
+                self.prefix_producer = true;
+                if (self.left) |left| left.markPrefixProducer();
+                if (self.right) |right| right.markPrefixProducer();
+            }
+
             fn create(engine: *Self, node: *const binding.Node) anyerror!*Iterator {
                 return createRecursive(engine, node, null);
             }
@@ -1019,34 +1184,45 @@ fn Engine(comptime Context: type) type {
             fn createContext(engine: *Self, node: *const binding.Node, recursive_id: ?usize, apply_mode: bool) anyerror!*Iterator {
                 const alloc = engine.context.alloc;
                 const self = try alloc.create(Iterator);
-                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .projection_arena = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
+                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .filter_arena = .init(alloc), .projection_arena = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
                 errdefer self.deinit();
                 if (engine.context.limits.profile) |profile| self.profile_id = try profile.register(node, engine.context.binding.relation.?.scans);
-                if (recursive_id) |id| if (!dependsOn(node, id)) {
-                    self.cached_reader = try (try engine.staticRows(node)).openReader();
+                if (recursive_id) |id| if (node.replay_policy != .streaming and !dependsOn(node, id)) {
+                    self.cached_reader = try (try engine.prefixRows(node)).openReader();
                     return self;
                 };
-                if (apply_mode and outerMask(node) == 0 and (recursive_id == null or !dependsOn(node, recursive_id.?))) {
-                    self.cached_reader = try (try engine.staticRows(node)).openReader();
+                // Repeatable expansion plans preserve demand through derived
+                // boundaries. Captured and volatile producers retain replay;
+                // restarting those could lose rows or repeat external effects.
+                if (apply_mode and node.replay_policy != .streaming and outerMask(node) == 0 and (recursive_id == null or !dependsOn(node, recursive_id.?))) {
+                    self.cached_reader = try (try engine.prefixRows(node)).openReader();
                     return self;
                 }
                 switch (node.operation) {
-                    .materialized_ref => |source| self.cached_reader = try (try engine.staticRows(source)).openReader(),
+                    .materialized_ref => |source| self.cached_reader = try (try engine.prefixRows(source)).openReader(),
+                    .statement_cte => |slot| {
+                        const execution = engine.context.backend.statement_effect_execution orelse return error.InvalidSqlBackendResponse;
+                        self.cached_reader = try execution.open(execution.ptr, slot.slot);
+                    },
                     .join => |join| {
-                        if (recursive_id == null and !apply_mode and !join.correlation and join.membership == null) {
+                        // An outer-reference attachment is a proven singleton,
+                        // not an estimated small table. Keep it on the right
+                        // for direct streaming concatenation; ordinary recursive
+                        // joins still probe the delta and build invariant data.
+                        const outer_attachment = (join.kind == .inner or join.kind == .cross) and join.membership == null and join.condition == null and join.left_keys.len == 0 and join.right_keys.len == 0 and (join.left.operation == .outer_ref or join.right.operation == .outer_ref);
+                        if (!outer_attachment and recursive_id == null and !apply_mode and !join.correlation and join.membership == null) {
                             if (engine.context.backend.distributed_join) |remote| {
                                 self.remote_join = try remote.open(remote.ptr, alloc, node, engine.context.binding.relation.?.scans, engine.cursors, engine.context.parameters, engine.context.backend.distributed_context);
                                 if (self.remote_join != null) return self;
                             }
                         }
-                        // Always probe the delta and build the invariant side.
-                        // Keep output ordinals in the original SQL FROM order.
-                        self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else try engine.preferLeftBuild(join);
+                        self.flipped_join = if (outer_attachment) join.left.operation == .outer_ref else if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else try engine.preferLeftBuild(join);
                         self.left = try createContext(engine, if (self.flipped_join) join.right else join.left, recursive_id, apply_mode);
                         self.right = try createContext(engine, if (self.flipped_join) join.left else join.right, recursive_id, apply_mode);
                     },
                     .apply => |apply| self.left = try createContext(engine, apply.left, recursive_id, apply_mode),
                     .query => |query| self.left = try createContext(engine, query.source, recursive_id, apply_mode),
+                    .unnest => |function| self.left = try createContext(engine, function.source, recursive_id, apply_mode),
                     .set => |set| {
                         self.left = try createContext(engine, set.left, recursive_id, apply_mode);
                         self.right = try createContext(engine, set.right, recursive_id, apply_mode);
@@ -1064,7 +1240,10 @@ fn Engine(comptime Context: type) type {
                 if (self.page) |page| page.deinit();
                 if (self.left) |left| left.deinit();
                 if (self.right) |right| right.deinit();
-                if (self.node.operation == .apply) self.engine.clearOuter(self.node.operation.apply.id);
+                // An invariant Apply can itself be a replay consumer. Only
+                // the iterator that installed an active outer row owns its
+                // scope; closing a cached consumer must not retire its producer.
+                if (self.node.operation == .apply and self.left_values != null) self.engine.clearOuter(self.node.operation.apply.id);
                 if (self.values_leaf) |leaf| leaf.deinit();
                 if (self.join_view) |view| view.deinit();
                 if (self.partition_join) |join| join.close();
@@ -1079,6 +1258,7 @@ fn Engine(comptime Context: type) type {
                 self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
+                self.filter_arena.deinit();
                 self.projection_arena.deinit();
                 self.engine.context.alloc.destroy(self);
             }
@@ -1099,6 +1279,7 @@ fn Engine(comptime Context: type) type {
             fn nextBatchMeasured(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 if (maximum == 0) return .{ .rows = &.{} };
                 try self.engine.checkpoint();
+                if (self.node.row_filter != null) return self.nextRowsBatch(a, maximum, failure);
                 // Cost samples borrow the producer's page. Replay them before
                 // advancing any producer, including a distributed child join.
                 if (self.sampled) |sample| {
@@ -1137,6 +1318,7 @@ fn Engine(comptime Context: type) type {
                     self.join_view = null;
                 }
                 if (self.node.operation == .join and self.node.operation.join.membership == null and
+                    self.right.?.node.operation != .outer_ref and
                     !Adapter.hasPatterns(self.node, 0) and
                     (self.node.operation.join.condition == null or !@import("decision_eval.zig").hasExternal(&self.node.operation.join.condition.?)))
                 {
@@ -1161,7 +1343,7 @@ fn Engine(comptime Context: type) type {
                     for (ordinals, types, self.node.columns, 0..) |*ordinal, *type_, column, index| {
                         const original = if (self.node.operation.join.output_order) |order| order[index] else index;
                         ordinal.* = if (!self.flipped_join) original else if (original < width) self.node.operation.join.right.columns.len + original else original - width;
-                        type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                        type_.* = scalar.columnType(column);
                     }
                     for (selection, 0..) |*index, i| index.* = i;
                     return .{ .mapped = .{ .source = source, .ordinals = ordinals, .types = types, .selection = selection } };
@@ -1177,7 +1359,7 @@ fn Engine(comptime Context: type) type {
                     };
                     if (eligible) return self.nextQueryBatch(a, maximum, query, failure);
                 }
-                if (self.cached_reader == null and self.node.operation == .scan) {
+                if (self.cached_reader == null and !self.prefix_producer and self.node.operation == .scan) {
                     const scan = self.node.operation.scan;
                     const cursor = self.engine.cursors[scan.index];
                     if (cursor.next_columns) |pull| {
@@ -1187,16 +1369,21 @@ fn Engine(comptime Context: type) type {
                         _ = self.arena.reset(.free_all);
                         self.pages += 1;
                         if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+                        try self.engine.context.admitScanPage();
                         const page = try pull(cursor.ptr, self.arena.allocator(), @intCast(maximum));
                         try page.validate();
                         if (page.selection.len > maximum or page.selection.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.SqlProgramLimitExceeded;
+                        try self.engine.context.admitScanRows(page.selection.len);
                         self.engine.visited += page.selection.len;
                         self.eof = page.after == null;
                         const definitions = try a.alloc(scalar.Column, self.node.columns.len);
-                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
                         return .{ .columns = .{ .page = page, .definitions = definitions } };
                     }
                 }
+                return self.nextRowsBatch(a, maximum, failure);
+            }
+            fn nextRowsBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 var rows: std.ArrayList([]const Datum) = .empty;
                 var retained: usize = 0;
                 while (rows.items.len < maximum) {
@@ -1234,7 +1421,7 @@ fn Engine(comptime Context: type) type {
                     for (names, self.node.columns, ordinals, types) |name, column, *ordinal, *type_| {
                         ordinal.* = layout.ordinals.get(name) orelse return error.InvalidSqlBackendResponse;
                         if (ordinal.* >= source.width()) return error.InvalidSqlBackendResponse;
-                        type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                        type_.* = scalar.columnType(column);
                     }
                     const selection = try a.alloc(usize, source.len());
                     for (selection, 0..) |*index, lane| index.* = lane;
@@ -1251,7 +1438,7 @@ fn Engine(comptime Context: type) type {
                     fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) anyerror!Datum {
                         const view: *@This() = @ptrCast(@alignCast(raw));
                         const definition = view.columns[column];
-                        return describe.coerceDatum(alloc, try view.rows[row].cell(view.names[column]), definition.type, definition.element_type);
+                        return describe.coerceDatumTyped(alloc, try view.rows[row].cell(view.names[column]), scalar.columnType(definition));
                     }
                 };
                 const view = try a.create(View);
@@ -1275,6 +1462,19 @@ fn Engine(comptime Context: type) type {
                 return result;
             }
             fn nextMeasured(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
+                const filter = self.node.row_filter orelse return self.nextUnfiltered(alloc);
+                while (true) {
+                    try self.engine.checkpoint();
+                    // Rejected rows must not accumulate in the consumer's
+                    // result/batch arena. Accepted cells borrow this region
+                    // until the next pull, like native source-page cells.
+                    if (!self.filter_arena.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
+                    const scratch = self.filter_arena.allocator();
+                    const values = (try self.nextUnfiltered(scratch)) orelse return null;
+                    if (try filter.matches(filter.ptr, scratch, values)) return values;
+                }
+            }
+            fn nextUnfiltered(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 try self.engine.checkpoint();
                 if (self.sampled) |sample| {
                     if (self.sampled_index < sample.len()) {
@@ -1290,16 +1490,18 @@ fn Engine(comptime Context: type) type {
                 }
                 if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
-                    .materialized_ref => unreachable,
+                    .unnest => |function| self.nextUnnest(alloc, function),
+                    .materialized_ref, .statement_cte => unreachable,
                     .recursive => blk: {
-                        const state = try self.engine.recursive(self.node);
+                        const state = try self.engine.recursive(self.node, self.output_index);
                         if (self.output_index == state.rows.items.len) break :blk null;
                         const values = state.rows.items[self.output_index].values;
                         self.output_index += 1;
                         break :blk values;
                     },
                     .recursive_ref => |id| blk: {
-                        const state = self.engine.recursions[id] orelse return error.InvalidSqlBackendResponse;
+                        const owner = self.engine.recursions[id] orelse return error.InvalidSqlBackendResponse;
+                        const state = &owner.worklist;
                         if (state.begin + self.output_index == state.end) break :blk null;
                         const values = state.rows.items[state.begin + self.output_index].values;
                         self.output_index += 1;
@@ -1339,7 +1541,7 @@ fn Engine(comptime Context: type) type {
                             for (names, self.node.columns, values) |name, column, *out| {
                                 const ordinal = layout.ordinals.get(name) orelse return error.InvalidSqlBackendResponse;
                                 if (ordinal >= row.len) return error.InvalidSqlBackendResponse;
-                                out.* = try operators.cloneDatum(alloc, try describe.coerceDatum(alloc, row[ordinal], column.type, column.element_type));
+                                out.* = try operators.cloneDatum(alloc, try describe.coerceDatumTyped(alloc, row[ordinal], scalar.columnType(column)));
                             }
                             self.output_index += 1;
                             break :blk values;
@@ -1350,7 +1552,7 @@ fn Engine(comptime Context: type) type {
                         const values = try alloc.alloc(Datum, self.node.columns.len);
                         for (names, self.node.columns, values) |name, column, *out| {
                             const cell = try row.cell(name);
-                            out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
+                            out.* = try describe.coerceDatumTyped(alloc, cell, scalar.columnType(column));
                         }
                         break :blk values;
                     },
@@ -1363,7 +1565,8 @@ fn Engine(comptime Context: type) type {
                                 _ = self.arena.reset(.free_all);
                                 self.pages += 1;
                                 if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                                const wanted: u32 = @intCast(@min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
+                                try self.engine.context.admitScanPage();
+                                const wanted: u32 = @intCast(@min(if (self.prefix_producer) std.math.maxInt(usize) else self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
                                 self.column_page = try pull(cursor.ptr, self.arena.allocator(), wanted);
                                 try self.column_page.?.validate();
                                 if (self.column_page.?.selection.len > wanted) return error.InvalidSqlBackendResponse;
@@ -1373,14 +1576,19 @@ fn Engine(comptime Context: type) type {
                             const page = self.column_page.?;
                             const index = self.page_index;
                             self.page_index += 1;
+                            try self.engine.context.admitScanRows(1);
                             self.engine.visited += 1;
                             if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                             const values = try alloc.alloc(Datum, self.node.columns.len);
-                            for (scan.source_columns, self.node.columns, values) |name, column, *out| {
+                            for (scan.source_columns, self.node.columns, values, 0..) |name, column, *out, ordinal| {
+                                if (scan.demanded) |mask| if (!mask[ordinal]) {
+                                    out.* = .{};
+                                    continue;
+                                };
                                 const cell = try page.typedCell(alloc, index, name, column.element_type == .numeric);
                                 // Values borrow the current page until the next pull.
                                 // Retaining operators own typed copies at admission.
-                                out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
+                                out.* = try describe.coerceDatumTyped(alloc, cell, scalar.columnType(column));
                             }
                             break :blk values;
                         }
@@ -1391,7 +1599,8 @@ fn Engine(comptime Context: type) type {
                             _ = self.arena.reset(.free_all);
                             self.pages += 1;
                             if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                            const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
+                            try self.engine.context.admitScanPage();
+                            const wanted = @min(if (self.prefix_producer) std.math.maxInt(usize) else self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
                             self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(wanted));
                             if (self.page.?.rows.len > wanted) return error.InvalidSqlBackendResponse;
                             self.page_index = 0;
@@ -1399,12 +1608,17 @@ fn Engine(comptime Context: type) type {
                         }
                         const row = self.page.?.rows[self.page_index];
                         self.page_index += 1;
+                        try self.engine.context.admitScanRows(1);
                         self.engine.visited += 1;
                         if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                         const values = try alloc.alloc(Datum, self.node.columns.len);
-                        for (scan.source_columns, self.node.columns, values) |name, column, *out| {
+                        for (scan.source_columns, self.node.columns, values, 0..) |name, column, *out, ordinal| {
+                            if (scan.demanded) |mask| if (!mask[ordinal]) {
+                                out.* = .{};
+                                continue;
+                            };
                             const cell = try @import("joined_mutation.zig").cell(alloc, row, name);
-                            out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
+                            out.* = try describe.coerceDatumTyped(alloc, cell, scalar.columnType(column));
                         }
                         break :blk values;
                     },
@@ -1452,6 +1666,43 @@ fn Engine(comptime Context: type) type {
                 defer self.batch_demand = previous;
                 return self.next(alloc);
             }
+            fn nextUnnest(self: *Iterator, alloc: Allocator, function: @FieldType(@FieldType(binding.Node, "operation"), "unnest")) anyerror!?[]const Datum {
+                while (true) {
+                    try self.engine.checkpoint();
+                    if (self.unnest_values == null or self.unnest_index == self.unnest_count) {
+                        self.unnest_values = null;
+                        // Retention can consolidate arena blocks and allocate.
+                        // Clear borrowed cells first and propagate failure,
+                        // including on the final exhaustion pull.
+                        if (!self.arena.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
+                        const input = (try self.left.?.next(self.arena.allocator())) orelse return null;
+                        const values = try self.arena.allocator().alloc(Datum, function.arrays.len);
+                        self.unnest_count = 0;
+                        for (function.arrays, values) |program, *value| {
+                            value.* = try self.engine.context.evaluate(self.arena.allocator(), program, input);
+                            if (value.sql_null) continue;
+                            const array = value.array orelse return error.InvalidSqlBackendResponse;
+                            self.unnest_count = @max(self.unnest_count, array.cardinality());
+                        }
+                        self.unnest_values = values;
+                        self.unnest_index = 0;
+                        if (self.unnest_count == 0) continue;
+                    }
+                    if (self.engine.expanded_rows == self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                    self.engine.expanded_rows += 1;
+                    const row = try alloc.alloc(Datum, self.node.columns.len);
+                    @memset(row, .{});
+                    for (self.unnest_values.?, row[0..function.arrays.len]) |value, *out| {
+                        if (value.sql_null) continue;
+                        const array = value.array orelse return error.InvalidSqlBackendResponse;
+                        if (self.unnest_index < array.cardinality()) out.* = try operators.cloneDatum(alloc, array.flatCell(self.unnest_index));
+                    }
+                    if (function.ordinality) row[row.len - 1] = Datum.fromJson(.{ .integer = @intCast(self.unnest_index + 1) });
+                    self.unnest_index += 1;
+                    return row;
+                }
+            }
+
             fn nextApply(self: *Iterator, alloc: Allocator, apply: @FieldType(@FieldType(binding.Node, "operation"), "apply")) anyerror!?[]const Datum {
                 while (true) {
                     try self.engine.checkpoint();
@@ -1482,16 +1733,17 @@ fn Engine(comptime Context: type) type {
                             }
                         }
                         self.right = try createContext(self.engine, apply.right, self.recursive_id, true);
+                        if (self.prefix_producer) self.right.?.markPrefixProducer();
                     }
                     _ = self.scratch.reset(.free_all);
-                    if (try self.right.?.next(self.scratch.allocator())) |right| {
+                    if (try self.right.?.nextDemand(self.scratch.allocator(), self.batch_demand orelse std.math.maxInt(usize))) |right| {
                         // A second pull may retire borrowed cursor/cache pages.
                         // Own the first row before checking the cardinality
                         // witness, and never expose a prefix of an invalid row.
                         const row = if (apply.single_row) blk: {
                             const owned = try self.scratch.allocator().alloc(Datum, right.len);
                             for (right, owned) |value, *out| out.* = try operators.cloneDatum(self.scratch.allocator(), value);
-                            _ = self.probe_arena.reset(.{ .retain_with_limit = 16 * 1024 });
+                            if (!self.probe_arena.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
                             if (try self.right.?.next(self.probe_arena.allocator()) != null) return error.SqlCardinalityViolation;
                             break :blk owned;
                         } else right;
@@ -1611,7 +1863,7 @@ fn Engine(comptime Context: type) type {
                     const source = try a.create(Batch);
                     source.* = column.*;
                     const types = try a.alloc(scalar.Type, 1);
-                    types[0] = .{ .kind = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier };
+                    types[0] = scalar.columnType(definition);
                     column.* = .{ .mapped = .{ .source = source, .ordinals = &.{0}, .types = types, .selection = identity } };
                     if (definition.type == .json) continue;
                     if (try column.physicalColumn(a, 0) == null and try column.decimalColumnSelected(a, 0, null) == null) {
@@ -1645,14 +1897,14 @@ fn Engine(comptime Context: type) type {
                 const types = try a.alloc(scalar.Type, ordinals.len);
                 for (query.binding.scalars.columns, ordinals, types) |column, *ordinal, *type_| {
                     ordinal.* = source.get(column.name) orelse std.math.maxInt(usize);
-                    type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                    type_.* = scalar.columnType(column);
                 }
                 const projected_ordinals = try a.alloc(usize, query.binding.columns.len);
                 const projected_types = try a.alloc(scalar.Type, projected_ordinals.len);
                 var forward = self.query_fields.?.len == query.binding.columns.len;
                 for (query.binding.columns, projected_ordinals, projected_types, 0..) |column, *ordinal, *type_, index| {
                     ordinal.* = std.math.maxInt(usize);
-                    type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                    type_.* = scalar.columnType(column);
                     const program = if (index < query.binding.scalars.projections.len) query.binding.scalars.projections[index] else null;
                     if (program) |projection| {
                         if (projection.instructions.len != 1 or projection.instructions[projection.root].operation != .column) {
@@ -1676,7 +1928,7 @@ fn Engine(comptime Context: type) type {
                         ordinal.* = std.math.maxInt(usize);
                         continue;
                     }
-                    type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                    type_.* = scalar.columnType(column);
                 }
                 return .{ .input = .{ .ordinals = ordinals, .types = types }, .outputs = .{ .ordinals = projected_ordinals, .types = projected_types }, .forward = if (forward) .{ .ordinals = projected_ordinals, .types = projected_types } else null };
             }
@@ -1823,7 +2075,7 @@ fn Engine(comptime Context: type) type {
                             for (selected.items, vector) |index, *value| value.* = try input.cell(a, index, ordinal);
                             values.* = vector;
                         }
-                        for (@constCast(values.*), output_errors) |*value, *err| value.* = describe.coerceDatum(a, value.*, definition.type, definition.element_type) catch |cause| blk: {
+                        for (@constCast(values.*), output_errors) |*value, *err| value.* = describe.coerceDatumTyped(a, value.*, scalar.columnType(definition)) catch |cause| blk: {
                             if (cause == error.OutOfMemory) return cause;
                             err.* = err.* orelse cause;
                             break :blk .{};
@@ -1877,9 +2129,16 @@ fn Engine(comptime Context: type) type {
                     for (query.source.columns, names) |column, *name| name.* = column.internal;
                     const layout = try catalog.Row.TypedLayout.init(scratch, names);
                     // Each nested stage leaves room for upstream pages, bindings and spill operators.
-                    const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
+                    var ordered_effects = if (context.binding.scalars.predicate) |*program| program.orderedEffects() else false;
+                    for (context.binding.scalars.projections) |optional| if (optional) |*program| {
+                        ordered_effects = ordered_effects or program.orderedEffects();
+                    };
+                    const wanted = @min(if (ordered_effects) @as(usize, 1) else self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
                     while (rows.items.len < wanted) {
-                        const input = (if (context.binding.scalars.predicate == null)
+                        // Pure expansion has no physical I/O to amortize.
+                        // Keep evaluation prefix-bounded even under residual
+                        // filtering; rejected rows continue pulling normally.
+                        const input = (if (context.binding.scalars.predicate == null or query.source.replay_policy == .streaming)
                             try self.left.?.nextDemand(scratch, wanted - rows.items.len)
                         else
                             try self.left.?.next(scratch)) orelse break;
@@ -1924,7 +2183,7 @@ fn Engine(comptime Context: type) type {
 
             fn setValues(self: *Iterator, alloc: Allocator, values: []const Datum) ![]const Datum {
                 const result = try alloc.alloc(Datum, values.len);
-                for (values, result, self.node.columns) |value, *out, column| out.* = try describe.coerceDatum(alloc, value, column.type, column.element_type);
+                for (values, result, self.node.columns) |value, *out, column| out.* = try describe.coerceDatumTyped(alloc, value, scalar.columnType(column));
                 return result;
             }
             fn nextValues(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
@@ -1937,6 +2196,7 @@ fn Engine(comptime Context: type) type {
                             if (source.type != target.type) self.values_leaf_coerce = true;
                         }
                         self.values_leaf = try createContext(self.engine, leaf, self.recursive_id, self.apply_mode);
+                        if (self.prefix_producer) self.values_leaf.?.markPrefixProducer();
                     }
                     if (try self.values_leaf.?.next(alloc)) |values| {
                         if (values.len != self.node.columns.len) return error.InvalidSqlBackendResponse;
@@ -2232,7 +2492,7 @@ fn Engine(comptime Context: type) type {
                     self.membership_index = try operators.TupleMembership.create(self.engine.context.alloc, join.right_keys.len, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .work = self.engine.context.limits.scan_rows *| 64 }, .{ .ptr = self.engine, .call = membershipCheckpoint });
                     while (true) {
                         try self.engine.checkpoint();
-                        _ = self.scratch.reset(.retain_capacity);
+                        if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
                         const a = self.scratch.allocator();
                         const row = try self.right.?.next(a) orelse break;
                         const keys_ = try self.keys(a, join.right_keys, row);
@@ -2250,7 +2510,7 @@ fn Engine(comptime Context: type) type {
                     }
                 }
                 const row = try self.left.?.next(alloc) orelse return null;
-                _ = self.scratch.reset(.retain_capacity);
+                if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
                 const keys_ = try self.keys(self.scratch.allocator(), join.left_keys, row);
                 const null_correlation = for (keys_[0..correlations]) |key| {
                     if (key.sql_null) break true;
@@ -2544,7 +2804,7 @@ fn Engine(comptime Context: type) type {
                             .output_order = join.output_order,
                         };
                         while (true) {
-                            _ = scratch.reset(.retain_capacity);
+                            if (!scratch.reset(.retain_capacity)) return error.OutOfMemory;
                             const a = scratch.allocator();
                             const count = @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.left.?.node.columns.len * @sizeOf(Datum) * 16)));
                             const batch = try self.left.?.nextBatch(a, count, null);
@@ -2568,6 +2828,17 @@ fn Engine(comptime Context: type) type {
                 }
             }
             fn nextJoin(self: *Iterator, alloc: Allocator, join: JoinPlan) anyerror!?[]const Datum {
+                if ((join.kind == .inner or join.kind == .cross) and join.membership == null and join.condition == null and join.left_keys.len == 0 and join.right_keys.len == 0 and self.right.?.node.operation == .outer_ref) {
+                    if (!self.emitted) {
+                        self.left_values = try self.right.?.next(self.arena.allocator());
+                        self.emitted = true;
+                    }
+                    if (self.left_values == null) return null;
+                    const input = (try self.left.?.nextDemand(alloc, self.batch_demand orelse std.math.maxInt(usize))) orelse return null;
+                    const row = try self.combine(alloc, input, self.left_values);
+                    for (@constCast(row)) |*cell| cell.* = try operators.cloneDatum(alloc, cell.*);
+                    return row;
+                }
                 if (join.membership != null) return self.nextMembership(alloc, join);
                 try self.prepareJoin(join);
                 if (self.partition_join != null) return self.nextPartitionJoin(alloc, join);
@@ -2585,7 +2856,7 @@ fn Engine(comptime Context: type) type {
                             // lifetime. Reuse retained pages across output rows;
                             // returned cells still reference the stable probe/build
                             // rows, not this transient candidate allocation.
-                            _ = self.scratch.reset(.retain_capacity);
+                            if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
                             if (self.left_values == null) self.left_values = try self.probe_payload.row(self.probe_arena.allocator(), self.probe_index - 1);
                             const values = try self.combine(self.scratch.allocator(), self.left_values, try match.materializeValues(self.scratch.allocator()));
                             if (join.condition) |program| {
@@ -2624,6 +2895,7 @@ fn Engine(comptime Context: type) type {
 
         const Adapter = struct {
             engine: *Self,
+            ordered_input: bool = false,
             iterator: *Iterator,
             table: catalog.Table,
             ordinal: u64 = 0,
@@ -2631,7 +2903,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+                return .{ .statement_ctes = self.engine.context.backend.statement_ctes, .statement_cte_visibility = self.engine.context.backend.statement_cte_visibility, .statement_effect_execution = self.engine.context.backend.statement_effect_execution, .clock_values = self.engine.context.backend.clock_values, .statement_clock = self.engine.context.backend.statement_clock, .clock_source = self.engine.context.backend.clock_source, .transaction_start = self.engine.context.backend.transaction_start, .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .routine_resolver = self.engine.context.backend.routine_resolver, .sequence_resolver = self.engine.context.backend.sequence_resolver, .sequence_provider = self.engine.context.backend.sequence_provider, .advisory_provider = self.engine.context.backend.advisory_provider, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -2676,6 +2948,7 @@ fn Engine(comptime Context: type) type {
                         if (hasPatterns(arm, depth + 1)) break true;
                     } else false,
                     .materialized_ref => |source| hasPatterns(source, depth + 1),
+                    .unnest => |function| hasPatterns(function.source, depth + 1),
                     .recursive, .recursive_ref => true,
                     else => false,
                 };
@@ -2685,7 +2958,7 @@ fn Engine(comptime Context: type) type {
             fn nextColumns(ptr: *anyopaque, a: Allocator, limit: u32) anyerror!catalog.ColumnPage {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.pending_failure) |err| return err;
-                const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
+                const wanted = @min(if (self.ordered_input) @min(limit, 1) else limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
                 var failure: ?anyerror = null;
                 const batch = try self.iterator.nextBatch(a, wanted, &failure);
                 self.pending_failure = failure;
@@ -2710,7 +2983,7 @@ fn Engine(comptime Context: type) type {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 // Row adapters share the same memory-aware demand ceiling as
                 // typed pages; an aggregate does not need oversized row pages.
-                const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
+                const wanted = @min(if (self.ordered_input) @min(limit, 1) else limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
                 var rows: std.ArrayList(catalog.Row) = .empty;
                 var bytes: usize = 0;
                 var stopped_for_bytes = false;
@@ -2748,6 +3021,9 @@ fn Source(comptime Context: type) type {
         adapter: Engine(Context).Adapter = undefined,
 
         fn create(context: Context) !*Self {
+            return createProjected(context, false, false);
+        }
+        fn createProjected(context: Context, complete_query: bool, force_prefix: bool) !*Self {
             const relation = context.binding.relation orelse return error.InvalidSqlBackendResponse;
             const self = try context.alloc.create(Self);
             self.* = .{ .alloc = context.alloc, .regex_execution = .init(context.alloc, @min(16 * 1024 * 1024, context.limits.retained_bytes)), .engine = .{ .context = context, .cursors = &.{}, .cache_arena = .init(context.alloc) } };
@@ -2755,7 +3031,8 @@ fn Source(comptime Context: type) type {
             if (self.engine.context.backend.regex_execution == null) self.engine.context.backend.regex_execution = &self.regex_execution;
             var search_arena = std.heap.ArenaAllocator.init(context.alloc);
             defer search_arena.deinit();
-            const scans = try bindSearchScans(search_arena.allocator(), relation.scans, context.parameters);
+            const prepared_scans = if (context.statement_capture != null) relation.scans else try @import("relation_access.zig").prepareScans(search_arena.allocator(), context.alloc, context.backend, &context.binding, context.parameters);
+            const scans = try bindSearchScans(search_arena.allocator(), prepared_scans, context.parameters);
             if (scans.len != 0) {
                 if (context.statement_capture) |capture| {
                     self.engine.cursors = try capture.cursors(relation);
@@ -2800,8 +3077,32 @@ fn Source(comptime Context: type) type {
                 _ = self.engine.planning_arena.?.reset(.free_all);
                 break :fallback relation.root;
             };
-            self.iterator = try Engine(Context).Iterator.create(&self.engine, root);
-            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table };
+            var cursor_root = root;
+            if (complete_query) {
+                const a = self.engine.cache_arena.allocator();
+                const columns = try a.alloc(binding.Column, context.binding.columns.len);
+                for (context.binding.columns, columns, 0..) |column, *out, index| out.* = .{
+                    .name = column.name,
+                    .internal = try std.fmt.allocPrint(a, "\x00query_cursor_{d}", .{index}),
+                    .qualifier = "",
+                    .type = column.type,
+                    .temporal_kind = column.temporal_kind,
+                    .element_type = column.element_type,
+                    .numeric_modifier = column.numeric_modifier,
+                    .enum_view = column.enum_view,
+                    .domain_view = column.domain_view,
+                    .nullable = true,
+                    .untyped_null = column.untyped_null,
+                };
+                const projected = try a.create(binding.Node);
+                projected.* = .{ .columns = columns, .operation = .{ .query = .{ .source = root, .statement = relation.statement, .binding = context.binding } } };
+                cursor_root = projected;
+            }
+            self.iterator = try Engine(Context).Iterator.create(&self.engine, cursor_root);
+            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table, .ordered_input = try self.engine.ordered(cursor_root) };
+            // Ordering applies to expression effects, not immutable raw-page
+            // I/O. Keep physical prefetch bounded at its normal batch size.
+            if (force_prefix or self.adapter.ordered_input) self.iterator.?.markPrefixProducer();
             return self;
         }
         fn close(self: *Self) void {
@@ -2825,6 +3126,21 @@ fn Source(comptime Context: type) type {
             self.close();
         }
     };
+}
+
+/// Pull the complete bound SELECT, including projection and blocking operators,
+/// while retaining the original physical capture identity. No synthetic scan
+/// or independently refreshed read is introduced for a mutation producer.
+pub fn openQueryCursor(context: anytype) !catalog.Cursor {
+    const owner = try Source(@TypeOf(context)).createProjected(context, true, false);
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .close = @TypeOf(owner.*).closeCursor };
+}
+
+/// Mutation arms may be ordered even when their input expressions are pure.
+/// Preserve physical page batching independently of logical one-row demand.
+pub fn openMutationCursor(context: anytype) !catalog.Cursor {
+    const owner = try Source(@TypeOf(context)).createProjected(context, true, true);
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .close = @TypeOf(owner.*).closeCursor };
 }
 
 pub fn openCursor(context: anytype) !catalog.Cursor {
@@ -2916,7 +3232,7 @@ test "SQL derived encoded projections preserve lazy errors limits and sparse agg
     const cases = [_]struct { sql: []const u8, expected: []const u8 }{
         .{ .sql = "SELECT v FROM (SELECT 10/x AS v FROM (VALUES(2),(0)) t(x)) d LIMIT 1", .expected = "[[5]]" },
         .{ .sql = "SELECT x,y FROM (SELECT a+1 AS x,b*2 AS y FROM (VALUES(1,3),(2,4),(3,5)) t(a,b)) d WHERE x>2", .expected = "[[3,8],[4,10]]" },
-        .{ .sql = "SELECT SUM(v) FILTER (WHERE v>2),SUM(1/0) FILTER (WHERE false) FROM (SELECT x+1 AS v FROM (VALUES(1),(2),(3)) t(x)) d", .expected = "[[7,null]]" },
+        .{ .sql = "SELECT SUM(v) FILTER (WHERE v>2),SUM(1/(v-v)) FILTER (WHERE false) FROM (SELECT x+1 AS v FROM (VALUES(1),(2),(3)) t(x)) d", .expected = "[[7,null]]" },
     };
     for (cases) |case| {
         var backend: SetTestBackend = .{};
@@ -3812,6 +4128,101 @@ test "native projection refinements benchmark hybrid JSON projections" {
         try std.testing.expectEqual(@as(usize, 0), after.reads);
         try std.testing.expect(after.peak < before.peak);
         std.debug.print("HYBRID_JSON_PROJECTION sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} before_scalar_reads={d} after_scalar_reads={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak, before.reads, after.reads });
+    }
+}
+
+test "SQL text predicate parameter bindings never mutate prepared scan programs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text: catalog.Scan.TextPredicate = .{ .expressions = &.{.{ .parameter = 1 }} };
+    const scan: catalog.StatementScan = .{ .table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{}, .storage_mode = .document }, .request = .{ .fields = &.{}, .limit = 37, .text_predicate = &text } };
+    const first = try bindSearchScans(a, &.{scan}, &.{.{ .string = "body:alpha" }});
+    const second = try bindSearchScans(a, &.{scan}, &.{.{ .string = "body:beta" }});
+    try std.testing.expect(text.query == null);
+    try std.testing.expectEqualStrings("(body:alpha)", first[0].request.text_predicate.?.query.?);
+    try std.testing.expectEqualStrings("(body:beta)", second[0].request.text_predicate.?.query.?);
+    try std.testing.expectError(error.InvalidSqlParameters, bindSearchScans(a, &.{scan}, &.{.{ .integer = 1 }}));
+    try std.testing.expectError(error.InvalidSqlParameters, bindSearchScans(a, &.{scan}, &.{}));
+}
+
+test "SQL user aggregate derived CTE joins retain live reduction outputs" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bindings = @import("routine_bindings.zig");
+    const definitions = @import("routine_definition.zig");
+    const transition = try definitions.prepare(arena.allocator(), .{ .id = 12, .generation = 1, .definition = .{ .arguments = &.{ .{ .type = .{ .scalar = .int64 } }, .{ .type = .{ .scalar = .int64 } } }, .result = .{ .scalar = .int64 }, .body = "SELECT $1+$2", .owner = .auth_disabled } }, null, null);
+    const integer = definitions.runtimeType(.{ .scalar = .int64 });
+    var aggregate: bindings.Aggregate = .{ .id = 13, .generation = 1, .arguments = &.{integer}, .state = integer, .output = integer, .transition = transition, .initial = scalar.Datum.json(.{ .integer = 0 }) };
+    const Callbacks = struct {
+        fn function(_: *anyopaque, _: Allocator, _: []const u8, _: []const bindings.Argument) anyerror!*const bindings.Resolved {
+            return error.UndefinedSqlFunction;
+        }
+        fn resolve(raw: *anyopaque, _: Allocator, _: []const u8, _: []const bindings.Argument) anyerror!?*const bindings.Aggregate {
+            return @ptrCast(@alignCast(raw));
+        }
+    };
+    const queries = [_][]const u8{
+        "SELECT mixed(id::bigint) AS total FROM (VALUES(1),(2),(3)) t(id)",
+        "WITH totals AS (SELECT mixed(id::bigint) AS total FROM (VALUES(1),(2),(3)) t(id)) SELECT total FROM totals",
+        "WITH totals AS (SELECT mixed(id::bigint) AS total FROM (VALUES(1),(2),(3)) t(id)) SELECT total FROM (VALUES(1),(2),(3)) t(id) CROSS JOIN totals ORDER BY id",
+    };
+    for (queries, 0..) |query, index| {
+        var fixture: SetTestBackend = .{};
+        var backend = fixture.backend();
+        backend.routine_resolver = .{ .ptr = &aggregate, .resolve = Callbacks.function, .resolve_aggregate = Callbacks.resolve };
+        var compiled = try @import("compiler.zig").compile(a, query, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        try std.testing.expectEqual(if (index == 2) @as(usize, 3) else 1, result.output.native_rows.?.len);
+        for (result.output.native_rows.?) |row| {
+            if (row[0].sql_null) std.debug.print("aggregate derived query returned NULL: {s}\n", .{query});
+            try std.testing.expect(!row[0].sql_null);
+            try std.testing.expectEqual(@as(i64, 6), row[0].value.integer);
+        }
+    }
+}
+
+test "SQL database cast view boundaries retain builtin programs and restore caller resolution" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bindings = @import("routine_bindings.zig");
+    const function = try @import("routine_definition.zig").prepare(arena.allocator(), .{ .id = 77, .generation = 1, .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .jsonb } }}, .result = .{ .scalar = .text }, .body = "SELECT 'custom'", .owner = .auth_disabled } }, null, null);
+    var view = try @import("compiler.zig").compile(a, "SELECT payload,payload::text AS converted FROM (VALUES('{}'::jsonb)) t(payload)", .{});
+    defer view.deinit();
+    const Fixture = struct {
+        query: *const @import("ast.zig").Select,
+        function: *const bindings.Resolved,
+        calls: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalLookup;
+        }
+        fn read(raw: *anyopaque, _: Allocator, _: @import("ast.zig").Name) !catalog.ReadRelation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .view = .{ .id = 7, .generation = 1, .query = self.query, .columns = &.{ .{ .name = "payload", .path = "payload", .type = .json, .element_type = .jsonb }, .{ .name = "converted", .path = "converted", .type = .string, .element_type = .text } }, .backend = .{ .ptr = self, .binding_scope = 42, .vtable = &.{ .resolve = resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = checkpoint } }, .security_barrier = false } };
+        }
+        fn routine(_: *anyopaque, _: Allocator, _: []const u8, _: []const bindings.Argument) anyerror!*const bindings.Resolved {
+            return error.UnexpectedFunctionLookup;
+        }
+        fn cast(raw: *anyopaque, _: Allocator, source: scalar.Type, target: scalar.Type, _: @import("../system_catalog/casts.zig").Context) anyerror!?*const bindings.Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (source.kind == .json and target.kind == .string) self.function else null;
+        }
+    };
+    for ([_][]const u8{ "SELECT converted FROM v", "SELECT payload::text AS converted FROM v" }, 0..) |sql, index| {
+        var fixture: Fixture = .{ .query = &view.statement.select, .function = function };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .routine_resolver = .{ .ptr = &fixture, .resolve = Fixture.routine, .resolve_cast = Fixture.cast }, .vtable = &.{ .resolve = Fixture.resolve, .resolve_read = Fixture.read, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        try std.testing.expectEqualStrings(if (index == 0) "{}" else "custom", result.output.native_rows.?[0][0].value.string);
+        try std.testing.expect(if (index == 0) fixture.calls == 0 else fixture.calls != 0);
     }
 }
 

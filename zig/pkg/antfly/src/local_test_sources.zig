@@ -31,6 +31,7 @@ pub const raft_transport_http_snapshot = @import("raft/transport/http_snapshot.z
 pub const raft_transport_routes = @import("raft/transport/routes.zig");
 pub const raft_transport_std_http_listener = @import("raft/transport/std_http_listener.zig");
 pub const storage_artifact_publication_dispatch = @import("storage/artifact_publication_dispatch.zig");
+pub const storage_relational_index_raft_apply = @import("storage/relational_index_raft_apply_test.zig");
 pub const storage_hot_standby_db_commit = @import("storage/hot_standby/db_commit.zig");
 pub const storage_hot_standby_effects = @import("storage/hot_standby/effects.zig");
 pub const storage_hot_standby_primary = @import("storage/hot_standby/primary.zig");

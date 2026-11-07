@@ -524,6 +524,14 @@ pub const ExecuteNamespaceTableGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Observe an exact index publication in an explicit namespace
+pub const GetNamespaceTableIndexPublicationPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
 /// Repair an index generation
 pub const RepairNamespaceIndexPathParams = struct {
     database_name: []const u8,
@@ -888,6 +896,13 @@ pub fn parsePatchNamespaceTableSchemaBody(allocator: std.mem.Allocator, body: []
     return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Observe an exact namespaced validation-only schema publication
+pub const GetNamespaceSchemaValidationPublicationPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
 /// Set namespace tablespace
 pub const SetNamespaceTableTablespacePathParams = struct {
     table_name: []const u8,
@@ -1048,6 +1063,21 @@ pub fn parseOpenSQLConnectionBody(allocator: std.mem.Allocator, body: []const u8
 pub const CloseSQLConnectionPathParams = struct {
     connection_id: []const u8,
 };
+
+/// Receive and acknowledge committed SQL notifications
+pub const PollSQLNotificationsPathParams = struct {
+    connection_id: []const u8,
+};
+
+/// Parse the JSON request body for pollSQLNotifications.
+pub fn parsePollSQLNotificationsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLNotificationPollRequest) {
+    return std.json.parseFromSlice(types.SQLNotificationPollRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for getSQLCatalogOperation.
+pub fn parseGetSQLCatalogOperationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLCatalogRecoveryRequest) {
+    return std.json.parseFromSlice(types.SQLCatalogRecoveryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// Parse the JSON request body for prepareSQL.
 pub fn parsePrepareSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLPrepareRequest) {
@@ -1492,6 +1522,12 @@ pub const ExecuteGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Observe an exact index publication
+pub const GetIndexPublicationPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
 /// Repair an index generation
 pub const RepairIndexPathParams = struct {
     table_name: []const u8,
@@ -1922,6 +1958,11 @@ pub fn parsePatchSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std
     return std.json.parseFromSlice(types.TableSchemaPatch, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Observe an exact validation-only schema publication
+pub const GetSchemaValidationPublicationPathParams = struct {
+    table_name: []const u8,
+};
+
 /// Create or resume a table storage migration job
 pub const CreateTableStorageMigrationPathParams = struct {
     table_name: []const u8,
@@ -2133,6 +2174,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication", .operation_id = "getNamespaceTableIndexPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy", .operation_id = "getNamespaceTablePrivacy", .request_body = .none, .streaming_response = false },
@@ -2163,6 +2205,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query", .operation_id = "queryNamespaceRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "updateNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "patchNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema/publication", .operation_id = "getNamespaceSchemaValidationPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "setNamespaceTableTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "clearNamespaceTableTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tablespace", .operation_id = "setNamespaceTablespace", .request_body = .buffered, .streaming_response = false },
@@ -2187,6 +2230,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/connections", .operation_id = "openSQLConnection", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/connections/{connection_id}", .operation_id = "closeSQLConnection", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql/connections/{connection_id}/notifications", .operation_id = "pollSQLNotifications", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql/operations/status", .operation_id = "getSQLCatalogOperation", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/prepared", .operation_id = "prepareSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/prepared/{prepared_id}", .operation_id = "closePreparedSQL", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/prepared/{prepared_id}/execute", .operation_id = "executePreparedSQL", .request_body = .buffered, .streaming_response = false },
@@ -2234,6 +2279,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}/publication", .operation_id = "getIndexPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/lake/catalog", .operation_id = "getLakeCatalog", .request_body = .none, .streaming_response = false },
@@ -2277,6 +2323,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "queryRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/schema/publication", .operation_id = "getSchemaValidationPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/storage/migrations", .operation_id = "createTableStorageMigration", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/storage/migrations/{jobId}", .operation_id = "getTableStorageMigration", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/storage/migrations/{jobId}", .operation_id = "advanceTableStorageMigration", .request_body = .buffered, .streaming_response = false },
@@ -2365,6 +2412,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'createNamespaceTableIndex'");
         if (!@hasDecl(Impl, "dropNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'dropNamespaceTableIndex'");
         if (!@hasDecl(Impl, "executeNamespaceTableGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeNamespaceTableGraphMetricAction'");
+        if (!@hasDecl(Impl, "getNamespaceTableIndexPublication")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTableIndexPublication'");
         if (!@hasDecl(Impl, "repairNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'repairNamespaceIndex'");
         if (!@hasDecl(Impl, "retryNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'retryNamespaceIndex'");
         if (!@hasDecl(Impl, "getNamespaceTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTablePrivacy'");
@@ -2395,6 +2443,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "queryNamespaceRelationalRows")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceRelationalRows'");
         if (!@hasDecl(Impl, "updateNamespaceTableSchema")) @compileError("ServerRouter: Impl missing required method 'updateNamespaceTableSchema'");
         if (!@hasDecl(Impl, "patchNamespaceTableSchema")) @compileError("ServerRouter: Impl missing required method 'patchNamespaceTableSchema'");
+        if (!@hasDecl(Impl, "getNamespaceSchemaValidationPublication")) @compileError("ServerRouter: Impl missing required method 'getNamespaceSchemaValidationPublication'");
         if (!@hasDecl(Impl, "setNamespaceTableTablespace")) @compileError("ServerRouter: Impl missing required method 'setNamespaceTableTablespace'");
         if (!@hasDecl(Impl, "clearNamespaceTableTablespace")) @compileError("ServerRouter: Impl missing required method 'clearNamespaceTableTablespace'");
         if (!@hasDecl(Impl, "setNamespaceTablespace")) @compileError("ServerRouter: Impl missing required method 'setNamespaceTablespace'");
@@ -2419,6 +2468,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "executeSQL")) @compileError("ServerRouter: Impl missing required method 'executeSQL'");
         if (!@hasDecl(Impl, "openSQLConnection")) @compileError("ServerRouter: Impl missing required method 'openSQLConnection'");
         if (!@hasDecl(Impl, "closeSQLConnection")) @compileError("ServerRouter: Impl missing required method 'closeSQLConnection'");
+        if (!@hasDecl(Impl, "pollSQLNotifications")) @compileError("ServerRouter: Impl missing required method 'pollSQLNotifications'");
+        if (!@hasDecl(Impl, "getSQLCatalogOperation")) @compileError("ServerRouter: Impl missing required method 'getSQLCatalogOperation'");
         if (!@hasDecl(Impl, "prepareSQL")) @compileError("ServerRouter: Impl missing required method 'prepareSQL'");
         if (!@hasDecl(Impl, "closePreparedSQL")) @compileError("ServerRouter: Impl missing required method 'closePreparedSQL'");
         if (!@hasDecl(Impl, "executePreparedSQL")) @compileError("ServerRouter: Impl missing required method 'executePreparedSQL'");
@@ -2466,6 +2517,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
         if (!@hasDecl(Impl, "dropIndex")) @compileError("ServerRouter: Impl missing required method 'dropIndex'");
         if (!@hasDecl(Impl, "executeGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeGraphMetricAction'");
+        if (!@hasDecl(Impl, "getIndexPublication")) @compileError("ServerRouter: Impl missing required method 'getIndexPublication'");
         if (!@hasDecl(Impl, "repairIndex")) @compileError("ServerRouter: Impl missing required method 'repairIndex'");
         if (!@hasDecl(Impl, "retryIndex")) @compileError("ServerRouter: Impl missing required method 'retryIndex'");
         if (!@hasDecl(Impl, "getLakeCatalog")) @compileError("ServerRouter: Impl missing required method 'getLakeCatalog'");
@@ -2509,6 +2561,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "queryRelationalRows")) @compileError("ServerRouter: Impl missing required method 'queryRelationalRows'");
         if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
         if (!@hasDecl(Impl, "patchSchema")) @compileError("ServerRouter: Impl missing required method 'patchSchema'");
+        if (!@hasDecl(Impl, "getSchemaValidationPublication")) @compileError("ServerRouter: Impl missing required method 'getSchemaValidationPublication'");
         if (!@hasDecl(Impl, "createTableStorageMigration")) @compileError("ServerRouter: Impl missing required method 'createTableStorageMigration'");
         if (!@hasDecl(Impl, "getTableStorageMigration")) @compileError("ServerRouter: Impl missing required method 'getTableStorageMigration'");
         if (!@hasDecl(Impl, "advanceTableStorageMigration")) @compileError("ServerRouter: Impl missing required method 'advanceTableStorageMigration'");
@@ -2595,6 +2648,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createNamespaceTableIndex));
             try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropNamespaceTableIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeNamespaceTableGraphMetricAction));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/publication", httpx.Handler.bind(self.impl, getNamespaceTableIndexPublication));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/repair", httpx.Handler.bind(self.impl, repairNamespaceIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryNamespaceIndex));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/privacy", httpx.Handler.bind(self.impl, getNamespaceTablePrivacy));
@@ -2625,6 +2679,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rows/query", httpx.Handler.bind(self.impl, queryNamespaceRelationalRows));
             try server.put("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateNamespaceTableSchema));
             try server.patch("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/schema", httpx.Handler.bind(self.impl, patchNamespaceTableSchema));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/schema/publication", httpx.Handler.bind(self.impl, getNamespaceSchemaValidationPublication));
             try server.put("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/tablespace", httpx.Handler.bind(self.impl, setNamespaceTableTablespace));
             try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/tablespace", httpx.Handler.bind(self.impl, clearNamespaceTableTablespace));
             try server.put("/databases/:databaseName/namespaces/:namespaceName/tablespace", httpx.Handler.bind(self.impl, setNamespaceTablespace));
@@ -2649,6 +2704,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/sql", httpx.Handler.bind(self.impl, executeSQL));
             try server.post("/sql/connections", httpx.Handler.bind(self.impl, openSQLConnection));
             try server.delete("/sql/connections/:connection_id", httpx.Handler.bind(self.impl, closeSQLConnection));
+            try server.post("/sql/connections/:connection_id/notifications", httpx.Handler.bind(self.impl, pollSQLNotifications));
+            try server.post("/sql/operations/status", httpx.Handler.bind(self.impl, getSQLCatalogOperation));
             try server.post("/sql/prepared", httpx.Handler.bind(self.impl, prepareSQL));
             try server.delete("/sql/prepared/:prepared_id", httpx.Handler.bind(self.impl, closePreparedSQL));
             try server.post("/sql/prepared/:prepared_id/execute", httpx.Handler.bind(self.impl, executePreparedSQL));
@@ -2696,6 +2753,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
             try server.delete("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropIndex));
             try server.post("/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeGraphMetricAction));
+            try server.get("/tables/:tableName/indexes/:indexName/publication", httpx.Handler.bind(self.impl, getIndexPublication));
             try server.post("/tables/:tableName/indexes/:indexName/repair", httpx.Handler.bind(self.impl, repairIndex));
             try server.post("/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryIndex));
             try server.get("/tables/:tableName/lake/catalog", httpx.Handler.bind(self.impl, getLakeCatalog));
@@ -2739,6 +2797,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/rows/query", httpx.Handler.bind(self.impl, queryRelationalRows));
             try server.put("/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateSchema));
             try server.patch("/tables/:tableName/schema", httpx.Handler.bind(self.impl, patchSchema));
+            try server.get("/tables/:tableName/schema/publication", httpx.Handler.bind(self.impl, getSchemaValidationPublication));
             try server.post("/tables/:tableName/storage/migrations", httpx.Handler.bind(self.impl, createTableStorageMigration));
             try server.get("/tables/:tableName/storage/migrations/:jobId", httpx.Handler.bind(self.impl, getTableStorageMigration));
             try server.post("/tables/:tableName/storage/migrations/:jobId", httpx.Handler.bind(self.impl, advanceTableStorageMigration));
@@ -3234,6 +3293,16 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.executeNamespaceTableGraphMetricAction(ctx, database_name, namespace_name, table_name, index_name, metric_name, action);
         }
 
+        /// Observe an exact index publication in an explicit namespace
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication
+        fn getNamespaceTableIndexPublication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            return impl.getNamespaceTableIndexPublication(ctx, database_name, namespace_name, table_name, index_name);
+        }
+
         /// Repair an index generation
         /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair
         fn repairNamespaceIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -3538,6 +3607,15 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.patchNamespaceTableSchema(ctx, database_name, namespace_name, table_name);
         }
 
+        /// Observe an exact namespaced validation-only schema publication
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema/publication
+        fn getNamespaceSchemaValidationPublication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.getNamespaceSchemaValidationPublication(ctx, database_name, namespace_name, table_name);
+        }
+
         /// Set namespace tablespace
         /// PUT /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace
         fn setNamespaceTableTablespace(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -3707,6 +3785,19 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn closeSQLConnection(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const connection_id = ctx.param("connection_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: connection_id" });
             return impl.closeSQLConnection(ctx, connection_id);
+        }
+
+        /// Receive and acknowledge committed SQL notifications
+        /// POST /sql/connections/{connection_id}/notifications
+        fn pollSQLNotifications(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const connection_id = ctx.param("connection_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: connection_id" });
+            return impl.pollSQLNotifications(ctx, connection_id);
+        }
+
+        /// Observe an exact retained SQL catalog operation
+        /// POST /sql/operations/status
+        fn getSQLCatalogOperation(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.getSQLCatalogOperation(ctx);
         }
 
         /// Create a durable prepared SQL resource
@@ -4091,6 +4182,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.executeGraphMetricAction(ctx, table_name, index_name, metric_name, action);
         }
 
+        /// Observe an exact index publication
+        /// GET /tables/{tableName}/indexes/{indexName}/publication
+        fn getIndexPublication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            return impl.getIndexPublication(ctx, table_name, index_name);
+        }
+
         /// Repair an index generation
         /// POST /tables/{tableName}/indexes/{indexName}/repair
         fn repairIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -4439,6 +4538,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.patchSchema(ctx, table_name, query_params);
         }
 
+        /// Observe an exact validation-only schema publication
+        /// GET /tables/{tableName}/schema/publication
+        fn getSchemaValidationPublication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.getSchemaValidationPublication(ctx, table_name);
+        }
+
         /// Create or resume a table storage migration job
         /// POST /tables/{tableName}/storage/migrations
         fn createTableStorageMigration(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -4645,6 +4751,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn getNamespaceTableIndexPublication(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn repairNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn getNamespaceTablePrivacy(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
@@ -4675,6 +4782,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn queryNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn updateNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn patchNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn getNamespaceSchemaValidationPublication(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn setNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn clearNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn setNamespaceTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
@@ -4699,6 +4807,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn openSQLConnection(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closeSQLConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
+//   fn pollSQLNotifications(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
+//   fn getSQLCatalogOperation(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn prepareSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response
 //   fn executePreparedSQL(self: *Impl, ctx: *httpx.Context, prepared_id: []const u8) !httpx.Response
@@ -4746,6 +4856,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn getIndexPublication(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn getLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
@@ -4789,6 +4900,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: UpdateSchemaParams) !httpx.Response
 //   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: PatchSchemaParams) !httpx.Response
+//   fn getSchemaValidationPublication(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn createTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn advanceTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
