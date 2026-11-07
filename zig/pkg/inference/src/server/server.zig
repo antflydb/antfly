@@ -32643,6 +32643,13 @@ test "direct generate preflight counts video without treating it as audio" {
     try std.testing.expectEqual(@as(usize, 4), preflight.decoded_media_bytes);
 }
 
+test "generation says what to do when no route can decode HEVC" {
+    const failure = generationRequestFailure(error.HevcDecoderUnavailable).?;
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("VIDEO_CODEC_UNAVAILABLE", failure.code);
+    try std.testing.expect(std.mem.indexOf(u8, failure.message, "transcode") != null);
+}
+
 test "generation maps undecodable images to a client error" {
     try std.testing.expectEqual(@as(u16, 400), generationRequestFailure(error.ImageDecodeFailed).?.status);
     try std.testing.expectEqual(@as(u16, 413), generationRequestFailure(error.ImageTooLarge).?.status);
@@ -39642,6 +39649,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .message = "expanded embedding input exceeds the model context limit",
         },
         error.InvalidVideoInput => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported or corrupt video; expected progressive SDR H.264 MP4" },
+        error.HevcDecoderUnavailable => .{ .status = 400, .code = "VIDEO_CODEC_UNAVAILABLE", .message = "this host cannot decode this HEVC video; transcode it to H.264 or AV1, or use a host with hardware HEVC decoding, such as a Mac or an NVIDIA GPU" },
         error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds the 60-second or 256-MiB limit" },
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video embeddings require the Linux CUDA backend with NVDEC" },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server" },
@@ -42594,7 +42602,8 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         error.MalformedAnnexB,
         error.MissingVideoParameterSet,
         => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
-        error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
+        error.HevcDecoderUnavailable => .{ .status = 400, .code = "VIDEO_CODEC_UNAVAILABLE", .message = "this host cannot decode this HEVC video; transcode it to H.264 or AV1, or use a host with hardware HEVC decoding, such as a Mac or an NVIDIA GPU", .retryable = false },
+        error.VideoDurationExceeded, error.VideoInputTooLarge, error.SharedAdmissionExceeded => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server", .retryable = true },
         error.Timeout => .{
             .status = 504,
