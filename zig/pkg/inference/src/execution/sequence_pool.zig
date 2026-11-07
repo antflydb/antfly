@@ -660,7 +660,10 @@ test "resident sequence pooling Metal handles masks empty rows and exact gather 
 
 test "resident sequence pooling CUDA handles masks empty rows and exact gather without activation reads" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    try checkPoolingBackend(.cuda);
+    checkPoolingBackend(.cuda) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
 }
 
 test "sequence pooling explicit cleanup rejects missing current boundary before backend access" {

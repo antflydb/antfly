@@ -5772,11 +5772,14 @@ test "generation budget preserves managed prefill shape and external KV ownershi
     const component = GptGenerationBudgetComponent{ .backend = .native, .kv_dtype = .f32, .config = cfg, .backend_owns_kv = true, .fixed_prefill_shape = true };
     const expected = try component.estimate(200, 8, 200);
     try std.testing.expectEqual(@as(usize, 0), expected.kv_bytes);
-    var roomy = RunBudget.init(.{});
+    const expected_scratch = try std.math.add(usize, expected.scratch_bytes, expected.host_metadata_bytes);
+    try std.testing.expect(expected.host_metadata_bytes > 0);
+    var roomy = RunBudget.init(.{ .scratch_limit_bytes = expected_scratch });
     const admitted = try reserveGptGenerationPrefill(&roomy, &.{component}, 200, 8, 32);
     try std.testing.expectEqual(@as(usize, 200), admitted.max_chunk_rows);
-    try std.testing.expectEqual(expected.scratch_bytes, admitted.max_scratch_bytes);
-    var tight = RunBudget.init(.{ .scratch_limit_bytes = expected.scratch_bytes - 1 });
+    try std.testing.expectEqual(expected_scratch, admitted.max_scratch_bytes);
+    try std.testing.expectEqual(expected_scratch, roomy.scratchTotalBytes());
+    var tight = RunBudget.init(.{ .scratch_limit_bytes = expected_scratch - 1 });
     try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationPrefill(&tight, &.{component}, 200, 8, 32));
     try std.testing.expectEqual(@as(usize, 0), tight.scratchTotalBytes());
 }

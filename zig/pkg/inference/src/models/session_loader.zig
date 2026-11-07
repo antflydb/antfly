@@ -376,6 +376,9 @@ pub fn loadPreferredWithArtifacts(
                     floor,
                     resident_amounts,
                 );
+                // Admitted standalone/component receivers need the SAME actual
+                // Model owner/gate before policy can authorize Native cold work.
+                try loaded.session.installOwnedExecutionGate(allocator);
                 try host.attach_admission_fn(host.context, &loaded.session, backend_runtime, resident_amounts, selected_man);
             }
             // Resident preparation can populate the shared weight cache.
@@ -540,6 +543,7 @@ pub fn loadComponent(
             if (control) |active| try active.check();
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (host.admission_enabled) {
+                try loaded.session.installOwnedExecutionGate(allocator);
                 try host.attach_admission_fn(host.context, &loaded.session, backend_runtime, resident_amounts, source.manifest);
             }
             try bound.finish(&construction_proof);

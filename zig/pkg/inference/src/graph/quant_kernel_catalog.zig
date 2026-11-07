@@ -1717,11 +1717,22 @@ test "catalog resolves exact SM89 Q6_K Q8_1 argmax family shapes" {
         .input_dim = 4096,
         .output_dim = 262_144,
     }, 8, 9)) == null);
+    // Execution eligibility follows the actual portable artifact contract;
+    // its immutable benchmark evidence remains scoped to SM89.
+    const portable = (try resolve(signature, .{
+        .rows = 1,
+        .input_dim = 2560,
+        .output_dim = 262_144,
+    }, 8, 0)) orelse return error.MissingPortableCatalogEntry;
+    try std.testing.expectEqualStrings(resolved.kernel_id, portable.kernel_id);
+    try std.testing.expectEqual(resolved.fingerprint(), portable.fingerprint());
+    try std.testing.expectEqualStrings("sm_89", portable.target.architecture);
+    try std.testing.expect(!portable.production_enabled);
     try std.testing.expect((try resolve(signature, .{
         .rows = 1,
         .input_dim = 2560,
         .output_dim = 262_144,
-    }, 8, 0)) == null);
+    }, 7, 0)) == null);
 
     var f32_signature = signature;
     f32_signature.small_batch_matmul.activation = .f32;

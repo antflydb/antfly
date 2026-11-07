@@ -1014,7 +1014,10 @@ test "decoder graph cache owns tracing allocations and failed traces remain retr
     for ([_]Backend{ .native, .metal, .cuda }) |kind| {
         if (kind == .metal and !build_options.enable_metal) continue;
         if (kind == .cuda and !build_options.enable_cuda) continue;
-        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, kind, null);
+        var context = @import("../backends/compute_context.zig").BackendContext.init(a, kind, null) catch |err| switch (@as(anyerror, err)) {
+            error.CudaUnavailable, error.NoCudaDevices => if (kind == .cuda) continue else return err,
+            else => return err,
+        };
         defer context.deinit(a);
         const cb = context.computeBackend();
         var request = std.heap.FixedBufferAllocator.init(&.{});

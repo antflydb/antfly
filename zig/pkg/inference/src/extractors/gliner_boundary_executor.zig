@@ -1563,8 +1563,17 @@ test "GPU boundary classification windows fit backend-specific reference reserva
     if (receiver.failure) |err| return err;
     try std.testing.expectEqual(receiver.peak, reserved);
     try std.testing.expect(reserved > metal_reserved);
-    var tight = options;
-    tight.device.max_encoder_device_bytes = reserved - 1;
+    // CUDA may reduce a physical window group while preserving every window.
+    var bounded = options;
+    bounded.device.max_encoder_device_bytes = reserved - 1;
+    const replanned = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, bounded);
+    try std.testing.expect(replanned > 0 and replanned <= bounded.device.max_encoder_device_bytes);
+    var serial = options;
+    serial.long_document.window_batch_size = 1;
+    const irreducible = try referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, serial);
+    try std.testing.expect(irreducible > 0 and irreducible < reserved);
+    var tight = serial;
+    tight.device.max_encoder_device_bytes = irreducible - 1;
     try std.testing.expectError(error.ResourceLimitExceeded, referenceEncoderDeviceBytes(.cuda, a, &config, tokenizer.tokenizer(), &request, tight));
 }
 

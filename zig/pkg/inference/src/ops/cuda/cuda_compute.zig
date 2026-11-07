@@ -37056,20 +37056,15 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
 }
 
 test "CUDA row snapshots use stable allocation and fail closed before capture device access" {
-    const Probe = struct {
-        fn dtype(_: *anyopaque, _: CT) anyerror!tensor_mod.DType {
-            return .f32;
-        }
-    };
     var compute: CudaCompute = undefined;
     compute.ctx.observation.store(null, .release);
     compute.ctx.observation_enable_failed.store(false, .release);
     compute.debug_cuda_graph_capture_active = true;
     compute.debug_cuda_graph_capture_disabled = false;
-    var callbacks = vtable;
-    callbacks.tensorDType = Probe.dtype;
-    const backend = ops.ComputeBackend{ .ptr = &compute, .vtable = &callbacks };
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, backend.snapshotRows2D(std.testing.allocator, @ptrFromInt(8), 0, 2, 2));
+    var shape = [_]i64{ 2, 2 };
+    var input = CudaTensor{ .buffer = .{}, .dtype = .f32, .shape = &shape, .elem_count = 4, .owns_shape = false };
+    const backend = ops.ComputeBackend{ .ptr = &compute, .vtable = &vtable };
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, backend.snapshotRows2D(std.testing.allocator, @ptrCast(&input), 0, 2, 2));
     try std.testing.expect(compute.debug_cuda_graph_capture_disabled);
 }
 
@@ -37667,7 +37662,10 @@ test "CUDA assigned RoPE capture retains guarded storage and reads fresh inputs 
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     const K = ops.kernel_descriptor;
-    var context = try @import("../../backends/compute_context.zig").BackendContext.init(a, .cuda, null);
+    var context = @import("../../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer context.deinit(a);
     var cb = context.computeBackend();
     const compute: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -41861,7 +41859,10 @@ test "cuda GLiNER GRU residual modes preserve cancellation-sensitive state on de
 test "cuda specialty FP32 fused attention preserves ragged full geometry and repeat stability" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try CudaCompute.init(a);
+    var compute = CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const batch: usize = 8;
     const heads: usize = 12;
@@ -44013,6 +44014,19 @@ test "CUDA cache root promotion and retained handles unwind every metadata alloc
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
+test "CUDA empty storage custody needs no provider while nonempty and borrowed buffers fail closed" {
+    var owner = CudaStorageRetirement{ .allocator = std.testing.allocator };
+    var context: context_mod.CudaContext = undefined;
+    try owner.adoptBuffers(&context, &.{.{}});
+    try std.testing.expect(owner.provider == null and owner.source_context == null);
+    try std.testing.expectEqual(@as(usize, 0), owner.physical_bytes);
+    try std.testing.expectError(error.InvalidCudaAllocationOwner, owner.adoptBuffers(&context, &.{.{ .borrowed = true }}));
+    try std.testing.expectError(error.CudaStorageOwnerClosed, owner.adoptBuffers(&context, &.{.{ .ptr = 16, .len = 4, .allocation_bytes = 4 }}));
+    try std.testing.expectError(error.CudaStorageOwnerClosed, owner.adoptBuffers(&context, &.{.{ .ptr = 16 }}));
+    try std.testing.expect(owner.provider == null and owner.source_context == null);
+    try std.testing.expectEqual(@as(usize, 0), owner.physical_bytes);
+}
+
 test "CUDA retained cache storage survives actual cache retirement and releases only with its final handle" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -44360,11 +44374,12 @@ const CudaStorageRetirement = struct {
     fn adoptBuffers(self: *CudaStorageRetirement, source: *context_mod.CudaContext, buffers: []const buffer_mod.DeviceBuffer) !void {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        if (self.source_context != source or self.provider == null or self.provider.?.ctx != source.ctx) return error.CudaStorageOwnerClosed;
         var tokens: [3]allocation_ledger.Token = undefined;
         var count: usize = 0;
         var bytes: usize = 0;
+        var empty = true;
         for (buffers) |buffer| {
+            empty = empty and buffer.ptr == 0 and buffer.len == 0 and buffer.allocation_bytes == 0 and buffer.allocation_token == null;
             if (buffer.borrowed) return error.InvalidCudaAllocationOwner;
             bytes = try std.math.add(usize, bytes, buffer.allocation_bytes);
             if (buffer.allocation_token) |token| {
@@ -44372,6 +44387,10 @@ const CudaStorageRetirement = struct {
                 count += 1;
             }
         }
+        // Metadata-only empty tensors have no device custody to transfer and
+        // storageRetirement(0) deliberately creates no CUDA provider.
+        if (empty) return;
+        if (self.source_context != source or self.provider == null or self.provider.?.ctx != source.ctx) return error.CudaStorageOwnerClosed;
         const total = try std.math.add(usize, self.physical_bytes, bytes);
         if (count != 0) try allocation_ledger.process.handoff(tokens[0..count], source.device_allocations.owner_id, self.provider.?.device_allocations.owner_id, @intFromPtr(source.ctx));
         self.physical_bytes = total;

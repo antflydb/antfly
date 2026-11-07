@@ -56172,7 +56172,9 @@ int termite_metal_decode_runtime_scatter_add_axis0_f32_device(
         NSUInteger thread_width = runtime->scatter_add_axis0_f32_pipeline.maxTotalThreadsPerThreadgroup;
         if (thread_width == 0u || thread_width > 256u) thread_width = 256u;
         if (thread_width > dim) thread_width = dim;
-        [encoder setThreadgroupMemoryLength:(thread_width + 1u) * sizeof(uint32_t) atIndex:0];
+        // Metal requires dynamic threadgroup allocations in sixteen-byte units.
+        const NSUInteger scratch_bytes = (((thread_width + 1u) * sizeof(uint32_t)) + 15u) & ~(NSUInteger)15u;
+        [encoder setThreadgroupMemoryLength:scratch_bytes atIndex:0];
         antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(out_rows, (dim + thread_width - 1u) / thread_width, 1), MTLSizeMake(thread_width, 1, 1));
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);

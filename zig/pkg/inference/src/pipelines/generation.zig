@@ -14267,14 +14267,17 @@ test "LightOnOCR3 device vision cancellation retires independent page features o
         var table = @import("../ops/native_compute.zig").vtable_impl;
         table.freeTensor = Probe.free;
         const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
-        var pipeline: NativeGenerationPipeline = undefined;
-        pipeline.cb = cb;
-        pipeline.execution_lock = &mutex;
-        pipeline.execution_gate = if (event_gate) &gate else null;
-        pipeline.execution_phase_waiters = null;
-        pipeline.execution_control = .{ .check_fn = Probe.cancel };
-        pipeline.execution_contention_wait_ns = 100 * std.time.ns_per_us;
-        pipeline.io = std.testing.io;
+        var pipeline = NativeGenerationPipeline{
+            .allocator = std.testing.allocator,
+            .cb = cb,
+            .gpt_config = .{},
+            .tokenizer = undefined,
+            .execution_lock = &mutex,
+            .execution_gate = if (event_gate) &gate else null,
+            .execution_control = .{ .check_fn = Probe.cancel },
+            .execution_contention_wait_ns = 100 * std.time.ns_per_us,
+            .io = std.testing.io,
+        };
         var pages: [2]qwen3vl_projector.ProjectedImages = undefined;
         for (&pages, 0..) |*page, i| page.* = .{
             .allocator = std.testing.allocator,

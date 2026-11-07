@@ -7257,7 +7257,10 @@ test "gemma4 resident vision CUDA parity on hardware" {
     try populateGemma4VisionTestWeights(&weights);
     var reference = native.NativeCompute.init(allocator, &weights, null);
     defer reference.deinit();
-    var compute = try cuda.CudaCompute.init(allocator);
+    var compute = cuda.CudaCompute.init(allocator) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     try checkGemma4VisionResidency(compute.computeBackend(), reference.computeBackend());
 }
@@ -7753,7 +7756,10 @@ test "gemma4 video compact rows survive accumulator reuse on CUDA" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     const cuda = @import("../ops/cuda/cuda_compute.zig");
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };

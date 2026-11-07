@@ -13773,7 +13773,11 @@ test "metal generated attention and RMS opt-ins are fail-closed and execution-co
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "BOOL missing_requested_generated_pipeline"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "missing_requested_generated_pipeline || missing_quant_reduce_pipeline"));
+    // The shared catalogue now owns every required pipeline, including quant reducers.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "missing_requested_generated_pipeline || missing_required_pipeline"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const BOOL missing_required_pipeline = termite_metal_missing_required_pipeline(runtime)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "ANTFLY_METAL_PIPELINE_VALIDATION(ANTFLY_METAL_REQUIRE_PIPELINE)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (Required && runtime->Field == nil) return YES;"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_decode_1x_calls += 1"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_flash_prefill_calls += 1"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_flash_prefill_hd512_calls += 1"));
@@ -14032,7 +14036,10 @@ test "metal paged attention masks value rows without divergent branching" {
     defer std.testing.allocator.free(source);
 
     const masked_accumulation = "value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f)";
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, masked_accumulation));
+    // Both entry points instantiate the one original masked accumulation body.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, masked_accumulation));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "antfly_paged_decode_body<antfly_paged_attention_1x_params, 256u>("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "antfly_paged_decode_body<termite_metal_paged_attention_params, 256u>("));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "if (weight != 0.0f) value += weight"));
 }
 

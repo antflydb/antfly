@@ -1227,21 +1227,25 @@ test "reader capability probe distinguishes unsupported metadata and preserves a
 test "Moondream readers route natively only with native checkpoint artifacts" {
     const allocator = std.testing.allocator;
     const man = manifest_mod.ModelManifest{ .allocator = allocator };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(parent);
+    const model_dir = try std.fs.path.join(allocator, &.{ parent, "moondream2" });
+    defer allocator.free(model_dir);
     // Missing or ONNX-only Moondream directories stay unsupported and fail
     // closed without loading anything.
-    const support = try probeManifest(allocator, "models/readers/vikhyatk/moondream2", man);
+    const support = try probeManifest(allocator, model_dir, man);
     try std.testing.expectEqual(UnsupportedReason.unsupported_moondream_artifacts, support.unsupported);
     var session_manager = backends.SessionManager.init(allocator);
     try std.testing.expectError(
         error.UnsupportedMoondreamArtifacts,
-        LoadedReader.loadFromDirWithControl(allocator, "models/readers/vikhyatk/moondream2", &session_manager, undefined, null),
+        LoadedReader.loadFromDirWithControl(allocator, model_dir, &session_manager, undefined, null),
     );
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    // The missing model's REAL parent exists for the publication lease;
+    // only native checkpoint presence changes across the original route checks.
     try tmp.dir.createDirPath(std.testing.io, "moondream2");
-    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "moondream2" });
-    defer allocator.free(model_dir);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/config.json", .data = "{\"model_type\":\"moondream1\"}" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/decoder_model_merged.onnx", .data = "onnx" });
     try std.testing.expectEqual(UnsupportedReason.unsupported_moondream_artifacts, (try probeManifest(allocator, model_dir, man)).unsupported);

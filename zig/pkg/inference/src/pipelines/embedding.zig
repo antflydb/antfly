@@ -6866,8 +6866,8 @@ fn checkPreparedTextProjectionBoundary(backend_kind: backends.BackendType) !void
         source_counter: ?*std.atomic.Value(u64),
         retired_source_executions: u64 = 0,
         gate: *std.atomic.Mutex,
-        providers: []const *std.atomic.Mutex,
-        source_backend: ops_mod.ComputeBackend,
+        providers: [2]?*std.atomic.Mutex,
+        source_backend: ?ops_mod.ComputeBackend,
         cancel_on_destination: bool,
         cancelled: bool = false,
         live: usize = 0,
@@ -6893,7 +6893,8 @@ fn checkPreparedTextProjectionBoundary(backend_kind: backends.BackendType) !void
         fn observe(self: *@This()) void {
             self.callbacks += 1;
             if (!self.gate.tryLock()) self.failure = error.SourceModelGateDuringSupplier else self.gate.unlock();
-            for (self.providers, 0..) |gate, provider_index| {
+            for (self.providers, 0..) |maybe_gate, provider_index| {
+                const gate = maybe_gate orelse continue;
                 if (!gate.tryLock()) {
                     if (self.failure == null) {
                         std.debug.print("TEXT_STAGE_SUPPLIER_PROVIDER_HELD phase={s} provider={d} source_executions={d} callbacks={d}\n", .{ @tagName(self.callback_phase), provider_index, self.sourceExecutions(), self.callbacks });
@@ -6902,9 +6903,12 @@ fn checkPreparedTextProjectionBoundary(backend_kind: backends.BackendType) !void
                     self.failure = error.SourceOrDestinationProviderDuringSupplier;
                 } else gate.unlock();
             }
-            if (self.source_backend.operationToken() != null) {
+            if (self.source_backend) |backend| if (backend.operationToken() != null) {
                 self.failure = error.SourceOperationDuringSupplier;
-            }
+            };
+        }
+        fn retireProviderMetadata(self: *@This(), index: usize) void {
+            self.providers[index] = null;
         }
         fn reserve(raw: *anyopaque, amounts: memory_admission.AdmissionAmounts) memory_admission.AdmissionResourceError!usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -6952,10 +6956,20 @@ fn checkPreparedTextProjectionBoundary(backend_kind: backends.BackendType) !void
         // Pin the actual provider owners independently of Imported wrappers.
         // These defers run AFTER both session-close defers, including errors.
         const Shared = @import("../backends/compute_context.zig").SharedBackendContext;
+        var live_probe: ?*Probe = null;
         var source_provider: ?*Shared = null;
-        defer if (source_provider) |owner| owner.release();
+        defer if (source_provider) |owner| {
+            // MetalCompute dies before the SharedContext's weight-store refunds.
+            // The Shared gate remains live through those supplier callbacks.
+            if (live_probe) |probe| probe.source_backend = null;
+            owner.release();
+            if (live_probe) |probe| probe.retireProviderMetadata(0);
+        };
         var projection_provider: ?*Shared = null;
-        defer if (projection_provider) |owner| owner.release();
+        defer if (projection_provider) |owner| {
+            owner.release();
+            if (live_probe) |probe| probe.retireProviderMetadata(1);
+        };
         var source_graph = ml.graph.Graph.init(a);
         defer source_graph.deinit();
         var source_builder = ml.graph.Builder.init(&source_graph);
@@ -6993,7 +7007,8 @@ fn checkPreparedTextProjectionBoundary(backend_kind: backends.BackendType) !void
         var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
         source.execution_gate = &gate;
         source.cohort_scheduler = &scheduler;
-        var probe = Probe{ .source_counter = &source_impl.execution_count, .gate = &gate, .providers = &.{ &source_impl.shared_backend_ctx.operations.gate.mutex, &projection_impl.shared_backend_ctx.operations.gate.mutex }, .source_backend = source_impl.cb, .cancel_on_destination = mode == 2 };
+        var probe = Probe{ .source_counter = &source_impl.execution_count, .gate = &gate, .providers = .{ &source_impl.shared_backend_ctx.operations.gate.mutex, &projection_impl.shared_backend_ctx.operations.gate.mutex }, .source_backend = source_impl.cb, .cancel_on_destination = mode == 2 };
+        live_probe = &probe;
         // Imported execution-count storage belongs to the wrapper; backend
         // header is copied by value and its exact context is independently pinned.
         defer probe.retireWrapperMetadata();
@@ -7057,7 +7072,23 @@ fn checkPreparedTextProjectionBoundary(backend_kind: backends.BackendType) !void
         try std.testing.expect(probe.callbacks > 0);
         if (mode != 1) try std.testing.expect(probe.source_funded_at_destination);
         if (probe.failure) |err| return err;
+        // Wrapper retirement must release the source host quota immediately.
+        // Provider-owned physical caches stay charged until their actual owners
+        // die. Keep each borrowed observer through release callbacks, then
+        // detach it immediately after the actual owner has been destroyed.
+        projection_provider.?.release();
+        probe.retireProviderMetadata(1);
+        projection_provider = null;
+        try std.testing.expect(probe.source_backend.?.operationToken() == null);
+        source_provider.?.operations.assertIdle();
+        // BackendContext destroys MetalCompute before retiring its weight store;
+        // only that compute header stops being observable before release.
+        probe.source_backend = null;
+        source_provider.?.release();
+        probe.retireProviderMetadata(0);
+        source_provider = null;
         try std.testing.expectEqual(@as(usize, 0), probe.live);
+        if (probe.failure) |err| return err;
         try std.testing.expectEqualDeep(memory_admission.AdmissionAmounts{}, controller.snapshot());
     }
 }
@@ -8699,10 +8730,10 @@ test "Gemma public text original source task escrow preserves four-row windows c
         var session = switch (kind) {
             .native => try session_factory.createNativeSession(a, model_path),
             .metal => try session_factory.createMetalSession(a, model_path),
-            .cuda => session_factory.createCudaSession(a, model_path) catch |err| switch (err) {
+            .cuda => if (comptime build_options.enable_cuda) session_factory.createCudaSession(a, model_path) catch |err| switch (err) {
                 error.CudaUnavailable, error.NoCudaDevices => continue,
                 else => return err,
-            },
+            } else unreachable,
             else => unreachable,
         };
         var live = true;

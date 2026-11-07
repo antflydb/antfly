@@ -54991,6 +54991,7 @@ test "Metal prepared dense row projections install pair QKV owners and preserve 
 }
 
 test "Metal prepared projection geometry recognizes multirow heads while row-one profile stays bounded" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const a = std.testing.allocator;
     var graph = ml.graph.Graph.init(a);
     defer graph.deinit();
@@ -59317,6 +59318,7 @@ test "Metal ordinary host linear fallback owns complete readable F32 rows withou
 }
 
 test "Metal refuses Native declared multiquery attention before opaque provider or tensor access" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const Shape = @import("ml").graph.Shape;
     const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = 3, .key_rows = 3, .num_heads = 2, .head_dim = 2 } }, .input_count = 3, .input_shapes = .{ Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 3, 4 }) }, .output_shape = Shape.init(.f32, &.{ 3, 4 }) };
     const foreign_context: *anyopaque = @ptrFromInt(16);

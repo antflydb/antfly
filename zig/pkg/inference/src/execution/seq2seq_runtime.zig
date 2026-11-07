@@ -349,6 +349,8 @@ test "incremental seq2seq fuses prefill and cached steps with broadcast branch a
             };
         }
     };
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    defer std.debug.assert(scheduler.head == null and scheduler.tail == null);
     var harness = Harness{ .broker = micro.Broker.init(std.testing.allocator) };
     defer harness.broker.deinit();
     var controller = memory.AdmissionController{};
@@ -357,6 +359,7 @@ test "incremental seq2seq fuses prefill and cached steps with broadcast branch a
     var gate = std.atomic.Mutex.unlocked;
     var session = fake.session();
     session.execution_gate = &gate;
+    session.cohort_scheduler = &scheduler;
     session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false };
     var encoder = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 1, 1, 1, 1 });
     defer encoder.deinit();

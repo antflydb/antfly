@@ -853,7 +853,10 @@ test "clip resident vision CUDA parity on hardware" {
     try populateClipTestWeights(&weights, true);
     var native = native_compute.NativeCompute.init(allocator, &weights, null);
     defer native.deinit();
-    var compute = try cuda.CudaCompute.init(allocator);
+    var compute = cuda.CudaCompute.init(allocator) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     var it = weights.resident_weights.iterator();
     while (it.next()) |entry| {

@@ -6471,10 +6471,11 @@ test "managed direct compute guards construction and cleanup" {
         }
     };
     var probe = Probe{};
-    var vtable: Session.VTable = undefined;
+    var vtable = arch_vtable;
     vtable.backend = Probe.backend;
     vtable.interruption = null;
     const session = Session{ .ptr = &probe, .vtable = &vtable };
+    try std.testing.expect(session.vtable != &arch_vtable);
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.Timeout, getComputeBackendWithControl(session, allocator, .{ .deadline_ns = 0 }));
     try std.testing.expectError(error.ProcessIsolationRequired, getComputeBackendWithControl(session, allocator, .{}));
@@ -6488,7 +6489,8 @@ test "managed direct compute guards construction and cleanup" {
     try std.testing.expectEqual(@as(usize, 1), probe.disarms);
     try std.testing.expect(!probe.armed);
 
-    var compute_vtable: ops.ComputeBackend.VTable = undefined;
+    var compute_vtable = native_mod.vtable_impl;
+    compute_vtable.cold_cleanup_services = null;
     compute_vtable.deinitBackend = Probe.close;
     var managed = ManagedComputeBackend{
         .backend = .{ .ptr = &probe, .vtable = &compute_vtable },

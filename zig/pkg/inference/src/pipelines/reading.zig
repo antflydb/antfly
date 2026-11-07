@@ -3035,7 +3035,10 @@ test "LightOnOCR3 CUDA Florence checked argmax preserves no-repeat policy withou
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const cuda = @import("../ops/cuda/cuda_compute.zig");
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const ids = [_]i64{ 1, 2, 3, 1, 2, 0, 7, 8, 9, 7, 8, 0, 4, 5, 6, 4, 5, 0 };

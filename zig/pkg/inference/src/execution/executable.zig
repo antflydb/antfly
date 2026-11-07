@@ -205,7 +205,10 @@ test "prepared executable reuses CPU Metal and CUDA plans with resident outputs"
             if (comptime !@import("build_options").enable_metal) continue;
             if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
         }
-        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, kind, null);
+        var context = @import("../backends/compute_context.zig").BackendContext.init(a, kind, null) catch |err| switch (@as(anyerror, err)) {
+            error.CudaUnavailable, error.NoCudaDevices => if (kind == .cuda) continue else return err,
+            else => return err,
+        };
         defer context.deinit(a);
         const cb = context.computeBackend();
         var executable = try prepare(a, &program, &cb, .compiled_preferred);
@@ -275,7 +278,10 @@ test "prepared BERT program matches CPU reference on CPU Metal and CUDA" {
             if (comptime !@import("build_options").enable_metal) continue;
             if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
         }
-        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, kind, null);
+        var context = @import("../backends/compute_context.zig").BackendContext.init(a, kind, null) catch |err| switch (@as(anyerror, err)) {
+            error.CudaUnavailable, error.NoCudaDevices => if (kind == .cuda) continue else return err,
+            else => return err,
+        };
         defer context.deinit(a);
         const cb = context.computeBackend();
         var inputs: std.ArrayListUnmanaged(interpreter.RuntimeInput) = .empty;
@@ -670,6 +676,34 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
         var executable = try prepareAnalyzedGraph(a, &program.graph, program.analysis, &cb, .partitioned, .{ .region_costs = if (refine) .{} else null });
         defer executable.deinit();
         const placement = &executable.runtime.plan.?.base;
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        // Native owns both typed axis-one gathers; ReLU and softmax retain
+        // their selected placement. Count the actual prepared dispatch routes.
+        for ([_]@TypeOf(first){ first, host }) |original| {
+            const node = program.id_map[original];
+            const kernel = pool.kernels[node] orelse return error.MissingPreparedGather;
+            try std.testing.expect(kernel.descriptor.operation == .gather);
+            try std.testing.expectEqual(@as(u8, 1), kernel.descriptor.operation.gather.axis);
+            try std.testing.expectEqual(.i32, kernel.descriptor.input_shapes[1].dtype);
+            try std.testing.expectEqual(ops.BackendKind.native, pool.backends[kernel.backend_index].kind());
+            try std.testing.expect(pool.preparedKernelRoute(node) != null);
+        }
+        const activation_kernel = pool.kernels[program.id_map[activation]] orelse return error.MissingPreparedActivation;
+        try std.testing.expect(activation_kernel.descriptor.operation == .unary);
+        try std.testing.expectEqual(ops.kernel_descriptor.Unary.relu, activation_kernel.descriptor.operation.unary);
+        try std.testing.expectEqual(if (refine) ops.BackendKind.native else .metal, pool.backends[activation_kernel.backend_index].kind());
+        const softmax_kernel = pool.kernels[program.id_map[resident]] orelse return error.MissingPreparedSoftmax;
+        try std.testing.expect(softmax_kernel.descriptor.operation == .softmax);
+        try std.testing.expectEqual(ops.BackendKind.metal, pool.backends[softmax_kernel.backend_index].kind());
+        for ([_]@TypeOf(first){ activation, resident }) |original| {
+            try std.testing.expect(pool.preparedKernelRoute(program.id_map[original]) != null);
+        }
+        var prepared_dispatches: u64 = 0;
+        for (pool.kernels, 0..) |kernel, node| if (kernel != null) {
+            try std.testing.expect(pool.preparedKernelRoute(@intCast(node)) != null);
+            prepared_dispatches += 1;
+        };
+        try std.testing.expectEqual(@as(u64, 4), prepared_dispatches);
         try std.testing.expectEqual(if (refine) ops.BackendKind.native else .metal, placement.partitions[placement.node_assignment[program.id_map[activation]]].backend);
         try std.testing.expectError(error.DeviceReadbackForbidden, executable.run(a, .{ .runtime_inputs = &bindings, .output_placement = .producer, .activation_readbacks = .forbidden }));
         for (0..3) |iteration| {
@@ -687,9 +721,7 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
             defer a.free(probabilities);
             for (probabilities, [_]f32{ 0.8807971, 0.11920292, 0.01798621, 0.98201376 }) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
             try std.testing.expectEqual(@as(u64, if (refine) 3 else 5), result.stats.cross_device_transfers);
-            // Both placements now dispatch two shared kernels: CPU ReLU plus Metal
-            // softmax after refinement, or Metal ReLU plus Metal softmax before it.
-            try std.testing.expectEqual(@as(u64, 2), result.stats.assigned_kernel_dispatches);
+            try std.testing.expectEqual(prepared_dispatches, result.stats.assigned_kernel_dispatches);
             try std.testing.expectEqual(@as(u64, if (refine) 24 else 40), result.stats.physical_transfer_bytes);
             try std.testing.expectEqual(@as(u64, if (refine) 32 else 48), result.stats.actual_download_bytes);
             if (iteration != 0) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
@@ -782,7 +814,10 @@ test "prepared CPU RoPE descriptors use invocation attention offsets and retain 
 
 test "prepared CUDA RoPE descriptors use invocation attention offsets and retain earlier outputs" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    try testPreparedRopePositions(.cuda);
+    testPreparedRopePositions(.cuda) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
 }
 
 test "prepared Metal RoPE descriptors use invocation attention offsets and retain earlier outputs" {
@@ -866,7 +901,10 @@ test "equivalent BERT ONNX safetensors GGUF and Q8 snapshots share Metal prepara
 }
 test "equivalent BERT ONNX safetensors GGUF and Q8 snapshots share CUDA preparation" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    try @import("testing/model_formats.zig").run(.cuda);
+    @import("testing/model_formats.zig").run(.cuda) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
 }
 
 test "equivalent stateful decoder ONNX safetensors GGUF and Q8 snapshots share CPU preparation" {
@@ -878,7 +916,10 @@ test "equivalent stateful decoder ONNX safetensors GGUF and Q8 snapshots share M
 }
 test "equivalent stateful decoder ONNX safetensors GGUF and Q8 snapshots share CUDA preparation" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
-    try @import("testing/model_formats.zig").runDecoder(.cuda);
+    @import("testing/model_formats.zig").runDecoder(.cuda) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
 }
 
 test "prepared state matrix bindings stay live without immutable weight packing on Metal" {
@@ -935,7 +976,10 @@ test "prepared physical CUDA replay owns address banks and preserves held output
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     const ml = @import("ml");
-    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null);
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer context.deinit(a);
     const cb = context.computeBackend();
     var graph = ml.graph.Graph.init(a);
@@ -1078,7 +1122,10 @@ test "prepared physical CUDA capture failure falls back before submission and re
             std.testing.allocator.destroy(self);
         }
     };
-    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null);
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer context.deinit(a);
     const original = context.computeBackend();
     var functions = original.vtable.kernels.?.*;

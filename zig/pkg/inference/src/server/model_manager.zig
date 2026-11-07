@@ -14318,6 +14318,11 @@ test "Whisper prompt preparation unwinds every allocation failure" {
 
 fn expectBoundSourceOutput(session: backends.Session, gguf: bool) !void {
     const a = std.testing.allocator;
+    if (session.run_admission != null) {
+        const owner = session.model_lifetime orelse return error.MissingAdmittedModelOwner;
+        try std.testing.expect(session.execution_gate != null);
+        try std.testing.expectEqual(&owner.execution_gate, session.execution_gate.?);
+    }
     if (gguf) {
         var ids = try backends.Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 1, 2 });
         defer ids.deinit();
@@ -14393,6 +14398,66 @@ fn exerciseBoundSourceLoaders(root: []const u8, input: []const u8, gguf: bool) !
         try expectBoundSourceOutput(loaded.session, gguf);
     }
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+}
+
+fn admittedLoaderOwnerScenario(a: std.mem.Allocator, path: []const u8, component: bool, fail_after_attach: bool) !void {
+    const Probe = struct {
+        manager: ModelManager,
+        fail_after_attach: bool,
+        attachments: usize = 0,
+        fn attach(raw: *anyopaque, session: *backends.Session, backend_runtime: backends.BackendRuntime, resident: runtime.tier.memory.AdmissionAmounts, man: ?*const manifest_mod.ModelManifest) !void {
+            const manager: *ModelManager = @ptrCast(@alignCast(raw));
+            const self: *@This() = @fieldParentPtr("manager", manager);
+            const owner = session.model_lifetime orelse return error.MissingAdmittedModelOwner;
+            try std.testing.expect(session.execution_gate != null);
+            try std.testing.expectEqual(&owner.execution_gate, session.execution_gate.?);
+            // Exercise actual cold final-resource allocation before policy and
+            // the failure edge AFTER it attached real admission and a Model pin.
+            try std.testing.expect(owner.prepared_final_resources != null);
+            self.attachments += 1;
+            try SessionLoadHost.attachAdmission(raw, session, backend_runtime, resident, man);
+            if (self.fail_after_attach) return error.InjectedLateModelAdmission;
+        }
+    };
+    var sm = backends.SessionManager.initWithIo(a, std.testing.io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var probe = Probe{ .manager = ModelManager.init(a, sm), .fail_after_attach = fail_after_attach };
+    defer probe.manager.deinit();
+    probe.manager.admission_enabled = true;
+    probe.manager.configureServingPolicy(.{ .allow_unknown = true });
+    var host = SessionLoadHost.services(&probe.manager);
+    host.attach_admission_fn = Probe.attach;
+    var manifest = try manifest_mod.loadFromDir(a, path);
+    defer manifest.deinit();
+    const result = if (component)
+        session_loader.loadComponent(a, host, path, &.{.native}, null, &probe.manager.session_manager, null, .{ .path = path, .publication = try managed_receipt.publicationGeneration(a, std.testing.io, path) }, null)
+    else
+        session_loader.loadPreferred(a, host, &.{.native}, path, manifest, &probe.manager.session_manager, null);
+    if (result) |value| {
+        var loaded = value;
+        loaded.deinit();
+        if (fail_after_attach) return error.ExpectedLateAdmissionFailure;
+    } else |err| {
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, probe.manager.currentAdmissionAmounts());
+        if (err != error.InjectedLateModelAdmission) return err;
+        if (!fail_after_attach) return err;
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.attachments);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, probe.manager.currentAdmissionAmounts());
+}
+
+test "admitted preferred and component loaders publish the actual execution owner and unwind late policy failure" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    for ([_]bool{ false, true }) |component| for ([_]bool{ false, true }) |fail_after_attach| {
+        try platform.allocator.checkAllAllocationFailures(a, admittedLoaderOwnerScenario, .{ path, component, fail_after_attach });
+    };
 }
 
 test "model selection bound GGUF sources preserve format independently of target suffix" {

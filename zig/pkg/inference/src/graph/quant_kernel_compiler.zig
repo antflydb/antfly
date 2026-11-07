@@ -12578,10 +12578,15 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expect(!std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_ENABLE_DECODE_GQA_FLASH"));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_metal_decode_gqa_split_eligible("));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_metal_encode_decode_gqa_split_dispatch("));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "dispatchThreadgroups:MTLSizeMake(params->q_len, params->num_kv_heads, launch->params.split_count)"));
-    // The generic and dedicated OCR stage/reducer pairs share the schedule ABI.
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]]"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]]"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(params->q_len, params->num_kv_heads, launch->params.split_count)"));
+    // One ABI macro supplies each binding to both original entry-point pairs.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "TERMITE_MSL_ABI_PAGED_GQA_SPLIT_STAGE(termite_lightonocr3_gqa_split_stage)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "TERMITE_MSL_ABI_PAGED_GQA_SPLIT_REDUCE(termite_lightonocr3_gqa_split_reduce)"));
+    // Ordinary, dedicated and batched OCR entries all retain the same math body.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_paged_gqa_split_stage_body(q, encoded_key, v_bytes, block_table, partial_o, p, schedule, shmem, tid, lane, sgitg, qi, kv_h, split, hd, split_count);"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_paged_gqa_split_reduce_body(partial_o, output, p, schedule, lane, sgitg, qi, h, hd, split_count);"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]]"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "_Static_assert(sizeof(termite_metal_decode_gqa_split_params) == 16"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "[encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:7]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "[encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:3]"));

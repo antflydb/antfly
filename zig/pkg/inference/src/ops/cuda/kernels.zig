@@ -21814,7 +21814,10 @@ test "CUDA named RoPE arguments reread captured device positions" {
 
 test "CUDA named projection adapters preserve every codec epilogue and output plane" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
-    var ctx = try context_mod.CudaContext.initDefault();
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     var module = try KernelModule.load(&ctx);
     defer module.unload(&ctx);
@@ -22138,7 +22141,10 @@ test "CUDA shared Q4K triple launcher preserves ordinary and tiled native output
 test "CUDA Q8 row column and tensor core tiles cover every output and guard" {
     if (!build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var ctx = try context_mod.CudaContext.initDefault();
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     var module = try KernelModule.load(&ctx);
     defer module.unload(&ctx);
@@ -22477,12 +22483,18 @@ test "CUDA projection launch descriptors preserve native contracts" {
 
 test "CUDA projection device results and graph replay" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
-    try @import("testing/projection_launch.zig").device(KernelModule, KernelModule);
+    @import("testing/projection_launch.zig").device(KernelModule, KernelModule) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
 }
 
 test "CUDA Q4 Q8 row schedules preserve independent dots tails and captured inputs" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
-    var ctx = try context_mod.CudaContext.initDefault();
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     var module = try KernelModule.load(&ctx);
     defer module.unload(&ctx);
@@ -22563,7 +22575,10 @@ test "CUDA Q4 Q8 row schedules preserve independent dots tails and captured inpu
 
 test "CUDA A4B baseline primitives execute on the loaded device without a GPU allowlist" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
-    var ctx = try context_mod.CudaContext.initDefault();
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer ctx.deinit();
     var module = try KernelModule.load(&ctx);
     defer module.unload(&ctx);

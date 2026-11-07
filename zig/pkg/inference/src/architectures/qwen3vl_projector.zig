@@ -3347,7 +3347,10 @@ test "LightOnOCR3 CUDA learned positions preserve host interpolation merge order
     const tensor_mod = @import("../backends/tensor.zig");
     const a = std.testing.allocator;
     for ([_]usize{ 768, 1024 }) |dim| for ([_]bool{ false, true }) |bf16| {
-        var compute = try CudaCompute.init(a);
+        var compute = CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+            error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+            else => return err,
+        };
         defer compute.deinit();
         if (!@import("../ops/cuda/paged_attention_bf16.zig").packetSupported(compute.ctx.info.compute_major, compute.ctx.info.driver_version)) return error.SkipZigTest;
         compute.capability_profile = .lightonocr3;

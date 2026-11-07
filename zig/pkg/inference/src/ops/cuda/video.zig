@@ -969,7 +969,10 @@ pub const Preprocessor = struct {
 test "video CUDA scalar clamps preserve bounds without host transfers" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     var values: [513]f32 = undefined;
@@ -1005,7 +1008,10 @@ test "video CUDA scalar clamps preserve bounds without host transfers" {
 test "video CUDA vision attention matches CPU softmax across frames and long sequences" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     for ([_][3]usize{ .{ 2, 513, 64 }, .{ 1, 33, 128 } }) |size| {
@@ -1066,7 +1072,10 @@ test "video CUDA vision attention matches CPU softmax across frames and long seq
 test "video CUDA weight widening matches all FP16 and BF16 values and uploads compact bytes" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const halves = try a.alloc(u16, 65536);

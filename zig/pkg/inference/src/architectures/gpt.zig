@@ -15107,7 +15107,10 @@ test "LightOnOCR3 CUDA uncached hidden and logits forwards own admitted temporar
     const cuda = @import("../ops/cuda/cuda_compute.zig");
     const Tensor = @import("../backends/tensor.zig").Tensor;
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const Fixture = struct {

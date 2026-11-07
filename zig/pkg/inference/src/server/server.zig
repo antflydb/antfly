@@ -37166,7 +37166,8 @@ test "generation prefill planning excludes serialized waiters and preserves isol
         .position_encoding = .rope,
     };
     const smaller = try runtime.tier.memory.estimateGptGeneration(.cuda, .f16, cfg, 31289, 128, 256);
-    var budget = runtime.tier.memory.RunBudget.init(.{ .scratch_limit_bytes = try std.math.add(usize, smaller.scratch_bytes, smaller.host_metadata_bytes) });
+    const smaller_amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(smaller);
+    var budget = runtime.tier.memory.RunBudget.init(.{ .scratch_limit_bytes = smaller_amounts.scratchTotalBytes() });
     const bounded = try runtime.tier.memory.reserveGptGenerationPrefill(&budget, &.{.{
         .backend = .cuda,
         .kv_dtype = .f16,
@@ -37174,7 +37175,7 @@ test "generation prefill planning excludes serialized waiters and preserves isol
     }}, 31289, 128, ceiling);
     try std.testing.expectEqual(@as(usize, 256), bounded.max_chunk_rows);
     try std.testing.expectEqual(bounded.max_scratch_bytes, budget.scratchTotalBytes());
-    try std.testing.expect(bounded.max_scratch_bytes <= smaller.scratch_bytes);
+    try std.testing.expectEqual(smaller_amounts.scratchTotalBytes(), bounded.max_scratch_bytes);
 }
 
 test "generation batching treats every requested CUDA graph replay mode as serialized" {
@@ -47466,7 +47467,37 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     var model: model_manager_mod.LoadedModel = undefined;
     model.managed_publication = null;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
-    var ctx: Context = undefined;
+    model.native_generate_lock = .unlocked;
+    model.native_reader_execution_lane = .{};
+    model.native_reader_stream = .{};
+    var ctx: Context = .{
+        .allocator = std.testing.allocator,
+        .model = &model,
+        .cfg = .{},
+        .budget = memory.RunBudget.init(limits),
+        .lane = try model.native_reader_execution_lane.acquire(.{}),
+        .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(std.testing.allocator),
+        .manager = runtime.kv.manager.KvManager.init(std.testing.allocator),
+        .vision_broker = executor_microbatch.Broker.init(std.testing.allocator),
+        .prefill_broker = executor_microbatch.Broker.init(std.testing.allocator),
+        .execution_id = 1,
+    };
+    var model_locked = false;
+    var reader_held = true;
+    defer {
+        if (model_locked) model.unlockNativeGeneration();
+        if (reader_held) ctx.lane.release();
+        if (ctx.auxiliary_lease) |*lease| lease.release();
+        ctx.decoder_peak.deinit();
+        ctx.vision_peak.deinit();
+        ctx.vision_host_peak.deinit();
+        ctx.prefill_broker.deinit();
+        ctx.vision_broker.deinit();
+        ctx.manager.deinit();
+        ctx.coordinator.deinit();
+    }
+    try (InferenceExecutionControl{}).lock(model.nativeGenerationMutex());
+    model_locked = true;
     ctx.cb = null;
     ctx.features = .{};
     ctx.cfg = .{};
@@ -47478,7 +47509,6 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     ctx.gate_events = false;
     ctx.decoder_peak = .{};
     ctx.published_decoder_peak = .init(0);
-    defer ctx.decoder_peak.deinit();
     var factory = Context.Factory{ .node = &node, .model = &model, .cfg = .{}, .limits = limits, .physical_rows_limit = 32, .decoder_peak = 64, .control = .{} };
     const page = memory.AdmissionAmounts{ .host_scratch_bytes = 2, .backend_scratch_bytes = 8, .backend_kv_bytes = 4 };
     var first = try ctx.admitPage(&factory, null, 0, page);
@@ -47498,6 +47528,10 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     second.release();
     // An idle but still-owned backend keeps its peak until teardown.
     try std.testing.expectEqual(@as(usize, 64), workspace.borrowed.snapshot().backend_scratch_bytes);
+    model.unlockNativeGeneration();
+    model_locked = false;
+    ctx.lane.release();
+    reader_held = false;
     ctx.decoder_peak.deinit();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
     try std.testing.expectEqual(@as(usize, 80), controller.snapshot().backend_scratch_bytes);
@@ -47621,7 +47655,37 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     var model: model_manager_mod.LoadedModel = undefined;
     model.managed_publication = null;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
-    var ctx: Context = undefined;
+    model.native_generate_lock = .unlocked;
+    model.native_reader_execution_lane = .{};
+    model.native_reader_stream = .{};
+    var ctx: Context = .{
+        .allocator = std.testing.allocator,
+        .model = &model,
+        .cfg = .{},
+        .budget = memory.RunBudget.init(limits),
+        .lane = try model.native_reader_execution_lane.acquire(.{}),
+        .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(std.testing.allocator),
+        .manager = runtime.kv.manager.KvManager.init(std.testing.allocator),
+        .vision_broker = executor_microbatch.Broker.init(std.testing.allocator),
+        .prefill_broker = executor_microbatch.Broker.init(std.testing.allocator),
+        .execution_id = 1,
+    };
+    var model_locked = false;
+    var reader_held = true;
+    defer {
+        if (model_locked) model.unlockNativeGeneration();
+        if (reader_held) ctx.lane.release();
+        if (ctx.auxiliary_lease) |*lease| lease.release();
+        ctx.decoder_peak.deinit();
+        ctx.vision_peak.deinit();
+        ctx.vision_host_peak.deinit();
+        ctx.prefill_broker.deinit();
+        ctx.vision_broker.deinit();
+        ctx.manager.deinit();
+        ctx.coordinator.deinit();
+    }
+    try (InferenceExecutionControl{}).lock(model.nativeGenerationMutex());
+    model_locked = true;
     ctx.cb = null;
     ctx.features = features;
     ctx.cfg = .{};
@@ -47633,7 +47697,6 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     ctx.step_mutex = .unlocked;
     ctx.step_gate = .{};
     ctx.gate_events = false;
-    defer if (ctx.auxiliary_lease) |*lease| lease.release();
     var factory = Context.Factory{ .node = &node, .model = &model, .cfg = .{}, .limits = limits, .physical_rows_limit = 16, .features = features, .control = .{} };
     // Reject the auxiliary host reservation after borrowing backend credit.
     // The failed acquisition must unwind that credit before a later retry.
@@ -47684,6 +47747,10 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     try std.testing.expectEqual(extra.backend_scratch_bytes, workspace.borrowed.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(extra.host_scratch_bytes, controller.snapshot().host_scratch_bytes);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, node.model_manager.acquireGenerationResources(&.{.{ .session = model.session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = extra } }}));
+    model.unlockNativeGeneration();
+    model_locked = false;
+    ctx.lane.release();
+    reader_held = false;
     ctx.auxiliary_lease.?.release();
     ctx.auxiliary_lease = null;
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
@@ -50747,6 +50814,11 @@ test "reader cold bank actual destroy retires failed and adopted hooks under cur
             try self.queue(epoch orelse return error.MissingCurrentEpoch);
             self.hook_retired = true;
         }
+        fn backendKind(_: *anyopaque) @import("../ops/ops.zig").BackendKind {
+            // This custom provider executes only CPU metadata retirement callbacks.
+            // Its distinct table attests no canonical Native or CUDA implementation.
+            return .native;
+        }
         fn cbClose(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!self.hook_retired) self.failure = error.BackendRetiredBeforeStorage;
@@ -50782,6 +50854,7 @@ test "reader cold bank actual destroy retires failed and adopted hooks under cur
         var model: model_manager_mod.LoadedModel = undefined;
         model.native_generate_lock = .unlocked;
         model.native_reader_execution_lane = .{};
+        model.native_reader_stream = .{};
         var sink = try Sink.Ref.create();
         defer sink.release();
         var prep = try sink.enter();
@@ -50798,7 +50871,9 @@ test "reader cold bank actual destroy retires failed and adopted hooks under cur
         const ctx = try a.create(Context);
         ctx.* = .{ .allocator = a, .model = &model, .cfg = .{}, .budget = runtime.tier.memory.RunBudget.init(.{}), .lane = lane, .cleanup_owner = .{ .guard = current, .owned_epoch = try current_epoch.retain() }, .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a), .manager = runtime.kv.manager.KvManager.init(a), .vision_broker = executor_microbatch.Broker.init(a), .prefill_broker = executor_microbatch.Broker.init(a), .execution_id = 1, .kv_bank = Banks.Owned.fromLeaf(Probe, &probe), .bank_adopted = adopted };
         var table: @import("../ops/ops.zig").ComputeBackend.VTable = undefined;
+        table.backendKind = Probe.backendKind;
         table.deinitBackend = Probe.cbClose;
+        table.debugTimingSnapshot = null;
         table.cold_cleanup_services = null; // This custom fixture owns only cbClose.
         if (adopted) {
             ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, .{ .backend = .cuda, .dtype = .f16, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 64, .store_cpu_bytes = false });

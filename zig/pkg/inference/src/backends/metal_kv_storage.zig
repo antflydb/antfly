@@ -2206,9 +2206,16 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
 
 test "Metal KV sequence release removes more bindings than one slot batch" {
     const allocator = std.testing.allocator;
-    var storage: MetalKvStorage = undefined;
-    storage.allocator = allocator;
-    storage.slot_map = .empty;
+    // This slot-map-only fixture owns no device slots; initialize every
+    // optional owner, including the cold-bank retirement path, from defaults.
+    var storage: MetalKvStorage = .{
+        .allocator = allocator,
+        .runtime = undefined, // No binding below owns or touches a device slot.
+        .format = .raw_f32,
+        .num_kv_heads = 1,
+        .head_dim = 1,
+        .page_size_tokens = 1,
+    };
     defer storage.slot_map.deinit(allocator);
 
     const target_sequence: storage_runtime.SequenceId = 7;
