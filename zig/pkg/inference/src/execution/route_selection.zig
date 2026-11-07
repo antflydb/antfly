@@ -661,7 +661,7 @@ fn currentConsumerReadOnlyCase(a: std.mem.Allocator) !void {
     // Only these context-free kind callbacks are queried. No GPU provider,
     // kernel execution, source ownership, or capability is fabricated here.
     try std.testing.expect(&Metadata.foreign_native_table != &@import("../ops/native_compute.zig").vtable_impl);
-    const backends = [_]ops.ComputeBackend{ native, .{ .ptr = @ptrFromInt(16), .vtable = &Metadata.cuda_table }, .{ .ptr = @ptrFromInt(16), .vtable = &Metadata.foreign_native_table } };
+    var backends = [_]ops.ComputeBackend{ native, .{ .ptr = @ptrFromInt(16), .vtable = &Metadata.cuda_table }, .{ .ptr = @ptrFromInt(16), .vtable = &Metadata.foreign_native_table } };
     var graph = ml.graph.Graph.init(a);
     defer graph.deinit();
     var builder = ml.graph.Builder.init(&graph);
