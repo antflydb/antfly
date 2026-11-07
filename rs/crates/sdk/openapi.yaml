@@ -69351,6 +69351,37 @@ components:
       description: A required comparison agreed, disagreed, or could not run because its stage failed
         with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without
         discarding model answers or usage.
+    DecisionRevisionDependency:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - path
+        - identity
+      properties:
+        kind:
+          type: string
+          enum:
+            - model
+            - cascade
+            - unverified
+        path:
+          type: array
+          maxItems: 8
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+        identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        model:
+          type: string
+          minLength: 1
+          maxLength: 2048
+      description: Flat execution dependency relative to the upstream Decisions invocation. Model entries
+        pin generated model revisions; cascade entries pin definitions. Unverified entries mark incomplete
+        historical provenance and cannot authorize receipt reuse.
     DecisionCascadeUpstreamAgreement:
       type: object
       additionalProperties: false
@@ -69413,6 +69444,15 @@ components:
         - decision_method
         - escalated
       properties:
+        upstream_revisions:
+          type: array
+          x-go-type-skip-optional-pointer: false
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/DecisionRevisionDependency'
+          description: Complete bounded upstream execution dependencies. An empty array explicitly records
+            no versioned dependencies. Omission on historical projected proxy stages indicates incomplete
+            provenance.
         upstream_agreement:
           $ref: '#/components/schemas/DecisionCascadeUpstreamAgreement'
         agreement_status:

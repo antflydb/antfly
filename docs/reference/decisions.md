@@ -348,6 +348,17 @@ provide token logprobs. Such stages can appear only last. Resolver probability
 thresholds still apply to the probabilistic stages; a terminal verdict-only
 stage must choose categorically, and its reported 0/1 distribution is not a
 calibrated confidence estimate.
+Stage traces also retain a flat `upstream_revisions` manifest, bounded to 32
+entries and eight stage path levels. It records every successful generated
+model revision and the upstream cascade definitions, including dependencies
+before a typed final answer. An empty manifest explicitly records no versioned
+dependencies; missing provenance on older projected upstream traces cannot
+establish that the upstream was unversioned. Resolver replay requires an
+authoritative verifier for composite routes and preserves stored receipts when
+that verification is unavailable. Stored successful responses are reclassified
+under the current policy without model inference; an upstream veto retracts a
+historical accepted verdict to REVIEW and restores the mention's own endpoint.
+
 Stage traces include `model_revision` when the provider reports an immutable
 revision. Resolver adjudication verifies the definition, escalation decisions,
 stage order, and agreement between the trace and the final answer.

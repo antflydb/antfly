@@ -636,7 +636,7 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
         if (name != .string or !std.mem.eql(u8, name.string, stage.name) or method != .string or !std.mem.eql(u8, method.string, @tagName(stage.method)) or escalated != .bool) return error.InvalidDecisionOutput;
         const has_next = index + 1 < executed.array.items.len;
         if (fields.get("error")) |err| {
-            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous or fields.contains("upstream_agreement")) return error.InvalidDecisionOutput;
+            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous or fields.contains("upstream_agreement") or fields.contains("upstream_revisions")) return error.InvalidDecisionOutput;
             const expected: ?Agreement = if (stage.require_agreement) .{ .status = .unverified } else null;
             try validateAgreement(fields, expected);
             if (expected) |agreement| aggregate = agreement;
@@ -644,6 +644,10 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
         }
         const answers = fields.get("answers") orelse return error.InvalidDecisionOutput;
         if (answers != .array or answers.array.items.len == 0) return error.InvalidDecisionOutput;
+        if (fields.contains("upstream_revisions")) {
+            var dependencies: @import("revisions.zig").Manifest = .{};
+            try dependencies.collect(entry);
+        }
         const upstream = try readUpstreamAgreement(fields, answers);
         const expected: ?Agreement = if (stage.require_agreement)
             (if (blockedAgreement(upstream)) .{ .status = .unverified } else try compareAgreement(previous_answers orelse return error.InvalidDecisionOutput, answers, stage.when.?.question))
@@ -859,7 +863,10 @@ fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?any
         try inBand(next_band.?, response.?.object.get("answers").?)
     else
         false;
+    var dependencies: @import("revisions.zig").Manifest = .{};
+    if (response) |value| try dependencies.collect(value);
     var entry = try trace(a, stage, response, usage, err);
+    if (response != null) try put(a, &entry.object, "upstream_revisions", try dependencies.value(a));
     var reference: ?AgreementRef = null;
     if (upstream) |agreement| {
         var receipt: std.json.ObjectMap = .empty;

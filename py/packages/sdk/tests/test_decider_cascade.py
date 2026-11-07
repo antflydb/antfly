@@ -77,3 +77,20 @@ def test_upstream_agreement_summary_round_trip_preserves_abstention():
             "upstream_agreement": summary,
         }
         assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire
+
+
+def test_upstream_revisions_preserve_empty_presence_and_flat_dependencies():
+    from antfly.client_generated.models import DecisionCascadeStageTrace
+
+    for dependencies in (
+        None,
+        [],
+        [
+            {"kind": "model", "path": ["fast"], "identity": "a" * 64, "model": "gen"},
+            {"kind": "cascade", "path": [], "identity": "b" * 64},
+        ],
+    ):
+        wire = {"name": "proxy", "decision_method": "typed", "escalated": False}
+        if dependencies is not None:
+            wire["upstream_revisions"] = dependencies
+        assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire

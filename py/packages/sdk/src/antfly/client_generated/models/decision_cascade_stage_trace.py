@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
     from ..models.decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
+    from ..models.decision_revision_dependency import DecisionRevisionDependency
     from ..models.decision_usage import DecisionUsage
     from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
     from ..models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
@@ -34,6 +35,9 @@ class DecisionCascadeStageTrace:
         name (str):
         decision_method (DecisionCascadeStageTraceDecisionMethod):
         escalated (bool): Whether this answer fell inside the next stage's band, sending the input on.
+        upstream_revisions (list[DecisionRevisionDependency] | Unset): Complete bounded upstream execution dependencies.
+            An empty array explicitly records no versioned dependencies. Omission on historical projected proxy stages
+            indicates incomplete provenance.
         upstream_agreement (DecisionCascadeUpstreamAgreement | Unset): Bounded agreement summary reported by the stage's
             upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream
             definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first
@@ -60,6 +64,7 @@ class DecisionCascadeStageTrace:
     name: str
     decision_method: DecisionCascadeStageTraceDecisionMethod
     escalated: bool
+    upstream_revisions: list[DecisionRevisionDependency] | Unset = UNSET
     upstream_agreement: DecisionCascadeUpstreamAgreement | Unset = UNSET
     agreement_status: DecisionCascadeAgreementStatus | Unset = UNSET
     agreed: bool | Unset = UNSET
@@ -99,6 +104,13 @@ class DecisionCascadeStageTrace:
         decision_method = self.decision_method.value
 
         escalated = self.escalated
+
+        upstream_revisions: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.upstream_revisions, Unset):
+            upstream_revisions = []
+            for upstream_revisions_item_data in self.upstream_revisions:
+                upstream_revisions_item = upstream_revisions_item_data.to_dict()
+                upstream_revisions.append(upstream_revisions_item)
 
         upstream_agreement: dict[str, Any] | Unset = UNSET
         if not isinstance(self.upstream_agreement, Unset):
@@ -163,6 +175,8 @@ class DecisionCascadeStageTrace:
                 "escalated": escalated,
             }
         )
+        if upstream_revisions is not UNSET:
+            field_dict["upstream_revisions"] = upstream_revisions
         if upstream_agreement is not UNSET:
             field_dict["upstream_agreement"] = upstream_agreement
         if agreement_status is not UNSET:
@@ -190,6 +204,7 @@ class DecisionCascadeStageTrace:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
         from ..models.decision_cascade_upstream_agreement import DecisionCascadeUpstreamAgreement
+        from ..models.decision_revision_dependency import DecisionRevisionDependency
         from ..models.decision_usage import DecisionUsage
         from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
         from ..models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
@@ -207,6 +222,15 @@ class DecisionCascadeStageTrace:
         decision_method = DecisionCascadeStageTraceDecisionMethod(d.pop("decision_method"))
 
         escalated = d.pop("escalated")
+
+        _upstream_revisions = d.pop("upstream_revisions", UNSET)
+        upstream_revisions: list[DecisionRevisionDependency] | Unset = UNSET
+        if _upstream_revisions is not UNSET:
+            upstream_revisions = []
+            for upstream_revisions_item_data in _upstream_revisions:
+                upstream_revisions_item = DecisionRevisionDependency.from_dict(upstream_revisions_item_data)
+
+                upstream_revisions.append(upstream_revisions_item)
 
         _upstream_agreement = d.pop("upstream_agreement", UNSET)
         upstream_agreement: DecisionCascadeUpstreamAgreement | Unset
@@ -356,6 +380,7 @@ class DecisionCascadeStageTrace:
             name=name,
             decision_method=decision_method,
             escalated=escalated,
+            upstream_revisions=upstream_revisions,
             upstream_agreement=upstream_agreement,
             agreement_status=agreement_status,
             agreed=agreed,

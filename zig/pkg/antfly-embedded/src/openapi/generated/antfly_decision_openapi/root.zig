@@ -25,6 +25,7 @@ pub const DecisionInput = types.DecisionInput;
 pub const DecisionLevel = types.DecisionLevel;
 pub const DecisionLevelProbability = types.DecisionLevelProbability;
 pub const DecisionRequest = types.DecisionRequest;
+pub const DecisionRevisionDependency = types.DecisionRevisionDependency;
 pub const DecisionSimilarity = types.DecisionSimilarity;
 pub const DecisionTableSource = types.DecisionTableSource;
 pub const DecisionUsage = types.DecisionUsage;

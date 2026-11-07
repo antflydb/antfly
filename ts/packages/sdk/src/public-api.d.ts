@@ -30800,6 +30800,14 @@ export interface components {
          * @enum {string}
          */
         DecisionCascadeAgreementStatus: "agreed" | "disagreed" | "unverified";
+        /** @description Flat execution dependency relative to the upstream Decisions invocation. Model entries pin generated model revisions; cascade entries pin definitions. Unverified entries mark incomplete historical provenance and cannot authorize receipt reuse. */
+        DecisionRevisionDependency: {
+            /** @enum {string} */
+            kind: "model" | "cascade" | "unverified";
+            path: string[];
+            identity: string;
+            model?: string;
+        };
         /** @description Bounded agreement summary reported by the stage's upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded stage. */
         DecisionCascadeUpstreamAgreement: {
             agreement_status: components["schemas"]["DecisionCascadeAgreementStatus"];
@@ -30820,6 +30828,8 @@ export interface components {
             output_tokens: number;
         };
         DecisionCascadeStageTrace: {
+            /** @description Complete bounded upstream execution dependencies. An empty array explicitly records no versioned dependencies. Omission on historical projected proxy stages indicates incomplete provenance. */
+            upstream_revisions?: components["schemas"]["DecisionRevisionDependency"][];
             upstream_agreement?: components["schemas"]["DecisionCascadeUpstreamAgreement"];
             agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
             /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */

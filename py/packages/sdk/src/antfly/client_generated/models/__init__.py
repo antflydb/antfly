@@ -320,6 +320,8 @@ from .decision_evidence_text_type import DecisionEvidenceTextType
 from .decision_input import DecisionInput
 from .decision_level import DecisionLevel
 from .decision_level_probability import DecisionLevelProbability
+from .decision_revision_dependency import DecisionRevisionDependency
+from .decision_revision_dependency_kind import DecisionRevisionDependencyKind
 from .decision_similarity import DecisionSimilarity
 from .decision_table_source import DecisionTableSource
 from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
@@ -2963,6 +2965,8 @@ __all__ = (
     "DecisionInput",
     "DecisionLevel",
     "DecisionLevelProbability",
+    "DecisionRevisionDependency",
+    "DecisionRevisionDependencyKind",
     "DecisionSimilarity",
     "DecisionTableSource",
     "DecisionTableSourceFilterQuery",

@@ -3229,6 +3229,9 @@ pub const Runtime = struct {
 
     fn proxyDecisionRevisionCapabilities(self: *Runtime, a: Allocator, raw: std.json.Value) !?inference_work.InferenceCapabilities {
         const probe = try @import("antfly_resolver").adjudication.Config.parseRevisionRequest(a, raw);
+        // This native route exposes a single leaf revision. Composite routes
+        // require an authoritative host verifier of the complete dependency set.
+        if (probe.version != 1) return error.CapabilityDiscoveryUnavailable;
         const original = try @import("functions/materialization.zig").parse(a, probe.specification);
         defer original.deinit();
         const cfg = original.value.decider;

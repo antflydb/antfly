@@ -603,6 +603,8 @@ pub const DecisionCascadeAgreementStatus = enum {
 };
 
 pub const DecisionCascadeStageTrace = struct {
+    /// Complete bounded upstream execution dependencies. An empty array explicitly records no versioned dependencies. Omission on historical projected proxy stages indicates incomplete provenance.
+    upstream_revisions: ?[]const DecisionRevisionDependency = null,
     upstream_agreement: ?DecisionCascadeUpstreamAgreement = null,
     agreement_status: ?DecisionCascadeAgreementStatus = null,
     /// Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable.
@@ -626,6 +628,7 @@ pub const DecisionCascadeStageTrace = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "upstream_revisions", "upstream_revisions", true },
         .{ "upstream_agreement", "upstream_agreement", true },
         .{ "agreement_status", "agreement_status", true },
         .{ "agreed", "agreed", true },
@@ -651,6 +654,10 @@ pub const DecisionCascadeStageTrace = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.upstream_revisions) |value| {
+            try jw.objectField("upstream_revisions");
+            try jw.write(value);
+        }
         if (self.upstream_agreement) |value| {
             try jw.objectField("upstream_agreement");
             try jw.write(value);
@@ -1115,6 +1122,45 @@ pub const DecisionRequest = union(enum) {
             .generated_decide_request => |v| try jw.write(v.*),
             .decide_request => |v| try jw.write(v.*),
         }
+    }
+};
+
+/// Flat execution dependency relative to the upstream Decisions invocation. Model entries pin generated model revisions; cascade entries pin definitions. Unverified entries mark incomplete historical provenance and cannot authorize receipt reuse.
+pub const DecisionRevisionDependency = struct {
+    kind: []const u8,
+    path: []const []const u8,
+    identity: []const u8,
+    model: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "path", "path", false },
+        .{ "identity", "identity", false },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("path");
+        try jw.write(self.path);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 

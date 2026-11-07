@@ -2185,6 +2185,8 @@ pub const ResolutionStage = struct {
             var owner = value;
             owner.deinit();
         };
+        var classifier = if (self.adjudicate) |config| try adjudication.Classifier.init(arena, config) else null;
+        defer if (classifier) |*prepared| prepared.deinit();
         const reused = try arena.alloc(?ResolvedEntity, parsed.entities.len);
         var cascade_revisions: adjudication.Config.RevisionCache = .{};
         defer cascade_revisions.deinit(arena);
@@ -2198,6 +2200,16 @@ pub const ResolutionStage = struct {
                 for (prior_resolution.entities) |prior_entity| {
                     if (!std.mem.eql(u8, prior_entity.local_id, entity.local_id)) continue;
                     if (prior_entity.adjudication) |evidence| {
+                        if (evidence.version != 1) continue;
+                        const successful = evidence.status == .accepted or evidence.status == .rejected or evidence.status == .abstained;
+                        if (successful != (evidence.response != null)) return error.InvalidAdjudicationOutput;
+                        if (!successful and model_revision == null and !self.adjudicate.?.tracksResponseRevisions() and
+                            !std.mem.eql(u8, evidence.execution_hash, base_receipt_hash))
+                        {
+                            const method = self.adjudicate.?.decider.object.get("decision_method");
+                            if (method != null and method.? == .string and std.mem.eql(u8, method.?.string, "generated"))
+                                return error.CapabilityDiscoveryUnavailable;
+                        }
                         var expected = receipt_hash;
                         var migrate_revision: ?[32]u8 = null;
                         if (self.adjudicate.?.tracksResponseRevisions()) {
@@ -2210,12 +2222,22 @@ pub const ResolutionStage = struct {
                                     reused[i] = prior_entity;
                                 continue;
                             };
-                            const recorded = self.adjudicate.?.responseRevision(arena, response, null, &cascade_revisions) catch continue;
+                            const recorded = try self.adjudicate.?.responseRevision(arena, response, null, &cascade_revisions);
                             const recorded_hash = if (recorded) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
                             // Changed inputs/policy do not need to discover an
                             // obsolete receipt's model dependencies.
-                            const legacy = recorded != null and std.mem.eql(u8, evidence.execution_hash, base_receipt_hash);
+                            const old_revision = try self.adjudicate.?.legacyResponseRevision(response);
+                            const old_hash = if (old_revision) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
+                            const legacy = recorded != null and (std.mem.eql(u8, evidence.execution_hash, old_hash) or std.mem.eql(u8, evidence.execution_hash, base_receipt_hash));
                             if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash) and !legacy) continue;
+                            if (evidence.version == 1 and (evidence.status == .accepted or evidence.status == .rejected or evidence.status == .abstained)) {
+                                if (try classifier.?.classify(response) == .abstained) {
+                                    // A recorded veto safely retracts an old verdict
+                                    // even while model metadata is unavailable.
+                                    reused[i] = prior_entity;
+                                    continue;
+                                }
+                            }
                             // Receipts with no model revision dependency can
                             // still replay offline, like ordinary typed ones.
                             if (self.adjudicator == null) {
@@ -2243,6 +2265,14 @@ pub const ResolutionStage = struct {
                                 if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash) and !legacy) continue;
                                 if (model_revision == null) return error.CapabilityDiscoveryUnavailable;
                                 if (legacy and std.mem.eql(u8, expected, recorded_hash)) migrate_revision = recorded;
+                            }
+                        }
+                        if (evidence.response == null and (evidence.status == .failed or evidence.status == .budget_exhausted)) {
+                            if (model_revision) |revision| {
+                                var legacy_revision: [32]u8 = undefined;
+                                std.crypto.hash.sha2.Sha256.hash(&std.fmt.bytesToHex(revision, .lower), &legacy_revision, .{});
+                                const legacy_hash = try fingerprintHex(arena, .{ base_receipt_hash, legacy_revision });
+                                if (std.mem.eql(u8, evidence.execution_hash, legacy_hash)) migrate_revision = revision;
                             }
                         }
                         if (migrate_revision) |revision| {
@@ -2413,9 +2443,27 @@ pub const ResolutionStage = struct {
         for (@constCast(resolution.entities), 0..) |*entity, i| {
             if (reused[i]) |receipt| {
                 entity.* = try cloneResolvedEntity(result_arena, receipt);
+                const evidence = &entity.adjudication.?;
+                switch (evidence.status) {
+                    .accepted, .rejected, .abstained => {
+                        const response = evidence.response orelse return error.InvalidAdjudicationOutput;
+                        const status = try classifier.?.classify(response);
+                        if (status != evidence.status) {
+                            // Reinterpret old receipts under the current validation
+                            // rules without spending inference or promoting a verdict.
+                            if (status != .abstained) return error.InvalidAdjudicationOutput;
+                            evidence.status = .abstained;
+                            entity.decision = .review;
+                            entity.doc_ref = .{ .table = try result_arena.dupe(u8, self.resolver.table), .key = try self.resolver.renderKeyAlloc(result_arena, parsed.entities[i]) };
+                            entity.canonical_name = try result_arena.dupe(u8, parsed.entities[i].text);
+                            entity.redirected_from = null;
+                        }
+                    },
+                    .failed, .budget_exhausted => if (evidence.response != null) return error.InvalidAdjudicationOutput,
+                }
             }
         }
-        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &resolution, parsed.entities, lists, reused, base_receipt_hash, model_revision);
+        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &classifier.?, &resolution, parsed.entities, lists, reused, base_receipt_hash, model_revision);
 
         // Apply human-curation overrides: a reviewed mention takes the curator's
         // decision and endpoint (strings copied into the resolution arena so they
@@ -2467,9 +2515,7 @@ pub const ResolutionStage = struct {
         return try resolution.toJson(gpa);
     }
 
-    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, base_execution_hash: []const u8, model_revision: ?[32]u8) !void {
-        var classifier = try adjudication.Classifier.init(a, config);
-        defer classifier.deinit();
+    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, classifier: *const adjudication.Classifier, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, base_execution_hash: []const u8, model_revision: ?[32]u8) !void {
         const specification = classifier.specification_json;
         const execution_hash = if (model_revision) |revision| try fingerprintHex(a, .{ base_execution_hash, revision }) else base_execution_hash;
         const semantic_config = try config.semantic(a);
@@ -4694,7 +4740,12 @@ test "REVIEW upstream Decisions methods preserve abstention through mint and off
             try testing.expectEqual(if (blocked) Decision.review else Decision.match, parsed.entities[0].decision);
             try testing.expectEqual(if (blocked) adjudication.Status.abstained else adjudication.Status.accepted, parsed.entities[0].adjudication.?.status);
             stage.adjudicator = null;
-            _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+            if (!blocked and !absent) {
+                // Metadata-only historical summaries cannot establish an
+                // empty dependency set. Vetoes may still replay safely.
+                try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+                try testing.expectEqualStrings(bytes, (try map.store().get(scratch, "resolution")).?);
+            } else _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
             try testing.expectEqual(@as(usize, 1), fixture.calls);
             if (!absent) {
                 try response.object.getPtr("cascade").?.object.put(scratch, "agreed", .{ .bool = !std.mem.eql(u8, status, "agreed") });
@@ -4813,6 +4864,9 @@ test "REVIEW generated revisions pin direct proxy cascade and explicit receipts 
                 try result.object.put(alloc, key, source.object.get(key).?);
                 try stage.object.put(alloc, key, source.object.get(key).?);
             }
+            var manifest: @import("antfly_decisions").revisions.Manifest = .{};
+            try manifest.collect(source);
+            try stage.object.put(alloc, "upstream_revisions", try manifest.value(alloc));
             try stage.object.put(alloc, "agreement_status", .{ .string = if (veto) "unverified" else "agreed" });
             if (veto) {
                 try stage.object.put(alloc, "upstream_agreement", summary);
@@ -4916,4 +4970,146 @@ test "REVIEW generated revisions pin direct proxy cascade and explicit receipts 
         _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
         try testing.expectEqual(@as(usize, 2), fixture.base.calls);
     }
+}
+
+test "REVIEW receipt replay retracts historical veto verdicts migrates native failures and rejects malformed responses" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        legacy: bool = false,
+        missing: bool = false,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return AdjudicationFixture.execute(&self.base, alloc, request);
+        }
+        fn revision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.missing) return null;
+            const raw: [32]u8 = @splat(0xaa);
+            if (!self.legacy) return raw;
+            var old: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&std.fmt.bytesToHex(raw, .lower), &old, .{});
+            return old;
+        }
+        fn executor(self: *@This()) adjudication.Executor {
+            return .{ .ptr = self, .execute = execute, .model_revision = revision };
+        }
+    };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    for ([_]enum { veto, failure, budget, malformed }{ .veto, .failure, .budget, .malformed }) |mode| {
+        const generated = mode != .veto;
+        const cfg = try adjudication.Config.parse(a, if (generated)
+            \\{"decider":{"decision_method":"generated","generator":{"provider":"antfly","model":"leaf"}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Same?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9},"on_failure":"mint"}
+        else
+            adjudication_test_config);
+        defer cfg.deinit();
+        var fixture = Fixture{};
+        var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+        if (generated) {
+            const answer = &response.object.getPtr("answers").?.array.items[0];
+            try answer.object.put(scratch, "decision_method", .{ .string = "generated" });
+            try answer.object.put(scratch, "raw_structured_answer", .{ .string = "same" });
+            try answer.object.put(scratch, "probability_source", .{ .string = "token_logprobs" });
+            try response.object.put(scratch, "model_revision", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+        }
+        fixture.base.response = try std.json.Stringify.valueAlloc(scratch, response, .{});
+        fixture.legacy = mode == .failure or mode == .budget;
+        if (mode == .failure) fixture.base.fail = error.CapabilityDiscoveryUnavailable;
+        if (mode == .budget) fixture.base.fail = error.Timeout;
+        var map = MapStore{ .alloc = a };
+        defer map.deinit();
+        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+        var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = fixture.executor(), .work_retention = .none };
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        const saved = (try map.store().get(scratch, "resolution")).?;
+        var stored = try std.json.parseFromSliceLeaky(std.json.Value, scratch, saved, .{});
+        const evidence = stored.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
+        switch (mode) {
+            .veto => {
+                // This was a valid accepted receipt before upstream veto
+                // interpretation was introduced. Keep its old binding/status.
+                try response.object.put(scratch, "cascade", try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+                    \\{"agreement_status":"disagreed","agreed":false,"disagreed_questions":["same"]}
+                , .{}));
+                try evidence.object.put(scratch, "response", response);
+                stage.adjudicator = null;
+            },
+            .failure, .budget => {
+                fixture.missing = true;
+                try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+                try testing.expectEqualStrings(saved, (try map.store().get(scratch, "resolution")).?);
+                fixture.missing = false;
+                fixture.legacy = false;
+                fixture.base.fail = null;
+            },
+            .malformed => try evidence.object.put(scratch, "response", .{ .array = std.array_list.Managed(std.json.Value).init(scratch) }),
+        }
+        const edited = try std.json.Stringify.valueAlloc(scratch, stored, .{});
+        try map.store().put("resolution", edited);
+        if (mode == .malformed) {
+            try testing.expectError(error.InvalidAdjudicationOutput, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+            try testing.expectEqualStrings(edited, (try map.store().get(scratch, "resolution")).?);
+        } else {
+            _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+            var parsed = try parseResolution(a, (try map.store().get(scratch, "resolution")).?);
+            defer parsed.deinit();
+            try testing.expectEqual(if (mode == .veto) Decision.review else Decision.new, parsed.entities[0].decision);
+            try testing.expectEqual(if (mode == .veto) adjudication.Status.abstained else if (mode == .budget) adjudication.Status.budget_exhausted else adjudication.Status.failed, parsed.entities[0].adjudication.?.status);
+            try testing.expectEqualStrings("Antfly database", parsed.entities[0].canonical_name);
+            try testing.expectEqualStrings("concept/antfly_database", parsed.entities[0].doc_ref.key);
+        }
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+    }
+}
+
+test "REVIEW composite proxy dependencies verify earlier generated leaves with a typed final" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const config = try adjudication.Config.parse(a, adjudication_test_config);
+    defer config.deinit();
+    const Fixture = struct {
+        calls: usize = 0,
+        changed: bool = false,
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: adjudication.Request) ![]u8 {
+            return error.UnexpectedInferenceDuringDiscovery;
+        }
+        fn revision(ptr: *anyopaque, alloc: std.mem.Allocator, raw: []const u8, _: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const envelope = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+            const request = try adjudication.Config.parseRevisionRequest(alloc, envelope.object.get("decision_revision_probe").?);
+            try testing.expectEqual(@as(u32, 2), request.version);
+            var manifest: @import("antfly_decisions").revisions.Manifest = .{};
+            var flat = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, request.dependencies.?, .{ .emit_null_optional_fields = false }), .{});
+            if (self.changed) try flat.array.items[0].object.put(alloc, "identity", .{ .string = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" });
+            var projection = std.json.Value{ .object = .empty };
+            try projection.object.put(alloc, "upstream_revisions", flat);
+            try manifest.collect(projection);
+            return manifest.digest(false);
+        }
+    };
+    const response = try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+        \\{"model":"typed-final","answers":[{"decision_method":"typed"}],"cascade":{"definition_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stages":[{"name":"fast","decision_method":"generated","model":"gen","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answers":[{"decision_method":"generated"}]},{"name":"strong","decision_method":"typed","upstream_revisions":[],"model":"typed-final","answers":[{"decision_method":"typed"}]}]}}
+    , .{});
+    var fixture = Fixture{};
+    const executor: adjudication.Executor = .{ .ptr = &fixture, .execute = Fixture.execute, .model_revision = Fixture.revision };
+    var cache: adjudication.Config.RevisionCache = .{};
+    defer cache.deinit(scratch);
+    const recorded = (try config.value.responseRevision(scratch, response, null, &cache)).?;
+    for (0..32) |_| try testing.expectEqualSlices(u8, &recorded, &(try config.value.responseRevision(scratch, response, executor, &cache)).?);
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+    fixture.changed = true;
+    var next_batch: adjudication.Config.RevisionCache = .{};
+    defer next_batch.deinit(scratch);
+    const refreshed = (try config.value.responseRevision(scratch, response, executor, &next_batch)).?;
+    try testing.expect(!std.mem.eql(u8, &recorded, &refreshed));
+    try testing.expectEqual(@as(usize, 2), fixture.calls);
 }

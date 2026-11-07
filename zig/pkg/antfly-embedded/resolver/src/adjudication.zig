@@ -146,11 +146,25 @@ pub const Config = struct {
         revision: ?[32]u8 = null,
         failure: ?anyerror = null,
     };
-    pub const RevisionRequest = struct { version: u32 = 1, specification: []const u8, model: []const u8 };
+    pub const RevisionRequest = struct {
+        version: u32 = 1,
+        specification: []const u8,
+        model: []const u8,
+        dependencies: ?[]const @import("antfly_decisions").revisions.Node = null,
+    };
 
     pub fn parseRevisionRequest(a: std.mem.Allocator, raw: std.json.Value) !RevisionRequest {
         const probe = std.json.parseFromValueLeaky(RevisionRequest, a, raw, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidAdjudicationOutput;
-        if (probe.version != 1 or probe.model.len == 0 or probe.model.len > 2048 or !std.unicode.utf8ValidateSlice(probe.model)) return error.InvalidAdjudicationOutput;
+        if ((probe.version != 1 and probe.version != 2) or probe.model.len == 0 or probe.model.len > 2048 or !std.unicode.utf8ValidateSlice(probe.model)) return error.InvalidAdjudicationOutput;
+        if (probe.version == 1 and probe.dependencies != null) return error.InvalidAdjudicationOutput;
+        if (probe.version == 2) {
+            const nodes = probe.dependencies orelse return error.InvalidAdjudicationOutput;
+            if (nodes.len == 0 or nodes.len > @import("antfly_decisions").revisions.max_nodes) return error.InvalidAdjudicationOutput;
+            var manifest: @import("antfly_decisions").revisions.Manifest = .{};
+            var projection = std.json.Value{ .object = .empty };
+            try projection.object.put(a, "upstream_revisions", raw.object.get("dependencies").?);
+            manifest.collect(projection) catch return error.InvalidAdjudicationOutput;
+        }
         return probe;
     }
 
@@ -175,6 +189,7 @@ pub const Config = struct {
     }
 
     pub fn reportedRevision(response: std.json.Value) !?[32]u8 {
+        if (response != .object) return error.InvalidAdjudicationOutput;
         const raw = response.object.get("model_revision") orelse return null;
         if (raw != .string or raw.string.len != 64) return error.InvalidAdjudicationOutput;
         for (raw.string) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidAdjudicationOutput;
@@ -184,12 +199,20 @@ pub const Config = struct {
     }
 
     fn proxyRevision(self: Config, a: std.mem.Allocator, decider: std.json.Value, response: std.json.Value, executor: ?Executor, cache: *RevisionCache, index: usize) !?[32]u8 {
-        const answers = response.object.get("answers") orelse return error.InvalidAdjudicationOutput;
-        if (answers != .array or answers.array.items.len != 1 or answers.array.items[0] != .object) return error.InvalidAdjudicationOutput;
-        const method = answers.array.items[0].object.get("decision_method") orelse return error.InvalidAdjudicationOutput;
-        if (method != .string) return error.InvalidAdjudicationOutput;
-        if (!std.mem.eql(u8, method.string, "generated")) return null;
-        const recorded = try reportedRevision(response) orelse return null;
+        var dependencies: @import("antfly_decisions").revisions.Manifest = .{};
+        dependencies.collect(response) catch return error.InvalidAdjudicationOutput;
+        if (dependencies.len == 0) return null;
+        const scalar = dependencies.len == 1 and dependencies.nodes[0].kind == .model and dependencies.nodes[0].path.len == 0;
+        const recorded: [32]u8 = if (scalar) blk: {
+            var digest: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&digest, dependencies.nodes[0].identity) catch return error.InvalidAdjudicationOutput;
+            break :blk digest;
+        } else dependencies.digest(false);
+        // Incomplete historical projection cannot establish current execution
+        // dependencies. Preserve the stored receipt until explicitly rerun.
+        if (executor != null) for (dependencies.items()) |node| {
+            if (node.kind == .unverified) return error.CapabilityDiscoveryUnavailable;
+        };
         const model = response.object.get("model") orelse return error.InvalidAdjudicationOutput;
         if (model != .string or model.string.len == 0 or model.string.len > 2048 or !std.unicode.utf8ValidateSlice(model.string)) return error.InvalidAdjudicationOutput;
         const current = executor orelse return recorded;
@@ -197,6 +220,8 @@ pub const Config = struct {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(&.{@intCast(index)});
         hash.update(model.string);
+        const selectors = dependencies.digest(true);
+        hash.update(&selectors);
         var key: [32]u8 = undefined;
         hash.final(&key);
         const cached = try cache.proxies.getOrPut(a, key);
@@ -207,9 +232,11 @@ pub const Config = struct {
             // Discovery-only envelope: never used as an inference request or
             // persisted producer configuration. Hosts verify this exact route.
             const probe = try std.json.Stringify.valueAlloc(a, .{ .decision_revision_probe = RevisionRequest{
+                .version = if (scalar) 1 else 2,
                 .specification = try copy.producerSpecification(a),
                 .model = model.string,
-            } }, .{});
+                .dependencies = if (scalar) null else dependencies.items(),
+            } }, .{ .emit_null_optional_fields = false });
             cached.value_ptr.revision = resolve(current.ptr, a, probe, self.revisionTimeout()) catch |err| {
                 cached.value_ptr.failure = err;
                 return err;
@@ -217,6 +244,47 @@ pub const Config = struct {
         }
         if (cached.value_ptr.failure) |err| return err;
         return cached.value_ptr.revision orelse error.CapabilityDiscoveryUnavailable;
+    }
+
+    /// Previous writers pinned only the final generated answer of a proxy.
+    /// Used solely to recognize old bindings, never as proof of completeness.
+    pub fn legacyResponseRevision(self: Config, response: std.json.Value) !?[32]u8 {
+        if (response != .object) return error.InvalidAdjudicationOutput;
+        const stages = self.cascadeStages();
+        if (stages.len == 0) return legacyProxyRevision(response);
+        const trace = response.object.get("cascade") orelse return error.InvalidAdjudicationOutput;
+        if (trace != .object) return error.InvalidAdjudicationOutput;
+        const entries = trace.object.get("stages") orelse return error.InvalidAdjudicationOutput;
+        if (entries != .array or entries.array.items.len > stages.len) return error.InvalidAdjudicationOutput;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var pinned = false;
+        for (entries.array.items, 0..) |entry, i| {
+            if (entry != .object) return error.InvalidAdjudicationOutput;
+            if (!entry.object.contains("answers")) continue;
+            const decider = stages[i].object.get("decider").?;
+            const revision = if (isDecisionProxy(decider)) try legacyProxyRevision(entry) else blk: {
+                const method = decider.object.get("decision_method") orelse continue;
+                if (method != .string or !std.mem.eql(u8, method.string, "generated")) continue;
+                break :blk try reportedRevision(entry);
+            };
+            if (revision) |digest| {
+                hash.update(stages[i].object.get("name").?.string);
+                hash.update(&digest);
+                pinned = true;
+            }
+        }
+        if (!pinned) return null;
+        var out: [32]u8 = undefined;
+        hash.final(&out);
+        return out;
+    }
+    fn legacyProxyRevision(response: std.json.Value) !?[32]u8 {
+        if (response != .object) return error.InvalidAdjudicationOutput;
+        const answers = response.object.get("answers") orelse return error.InvalidAdjudicationOutput;
+        if (answers != .array or answers.array.items.len != 1 or answers.array.items[0] != .object) return error.InvalidAdjudicationOutput;
+        const method = answers.array.items[0].object.get("decision_method") orelse return error.InvalidAdjudicationOutput;
+        if (method != .string) return error.InvalidAdjudicationOutput;
+        return if (std.mem.eql(u8, method.string, "generated")) try reportedRevision(response) else null;
     }
 
     fn revisionTimeout(self: Config) u32 {
@@ -404,7 +472,11 @@ pub const Executor = struct {
     execute: *const fn (*anyopaque, std.mem.Allocator, Request) anyerror![]u8,
     /// Discovery only. Proxy dependencies use a versioned
     /// decision_revision_probe envelope containing the original specification
-    /// and reported model. A verifier must prove the current configured route,
+    /// and reported model. Version 1 returns the raw single-model revision.
+    /// Version 2 includes a bounded flat dependencies array; return the current
+    /// Manifest.digest(false), preserving execution order and checking every
+    /// cascade definition and executed model against the configured route.
+    /// A verifier must prove the current configured route,
     /// not merely that the old resolved leaf still exists. Missing verification
     /// is an availability failure for a recorded dependency.
     model_revision: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32) anyerror!?[32]u8 = null,
