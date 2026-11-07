@@ -596,6 +596,46 @@ func TestMigrateLocalRepointsCatalogAndServesMediaFromBucket(t *testing.T) {
 	require.Equal(t, "hello world", w.body.String())
 }
 
+// TestMigrateLocalAdoptsNamespaceAndRekeysExactlyOnce exercises Part 2's
+// actual promise through the real Runner/Publisher pipeline: a source
+// synced before identity.namespace existed (this fixture's, exactly like a
+// real pre-upgrade deployment) is still on the legacy, location-based key
+// formula, so migrate-local's provider change rekeys it -- but only this
+// once, since migrate-local assigns it a namespace as part of the same PUT.
+// The old row is replaced (not left behind as a duplicate), and the PUT
+// response and IdentityNotice both say a rekey happened.
+func TestMigrateLocalAdoptsNamespaceAndRekeysExactlyOnce(t *testing.T) {
+	opts, _, stateDir, _, _, backend := migrateServiceFixture(t)
+
+	// Establish a baseline row while still on the local connection, exactly
+	// as if this source had been running before this feature existed.
+	pre, err := NewService(ServiceOptions{Profile: opts.Profile, StateDir: stateDir, PublicURL: opts.PublicURL, AdminToken: opts.AdminToken, MediaKey: opts.MediaKey})
+	require.NoError(t, err)
+	require.Equal(t, "completed", startServiceJob(t, pre).State)
+	require.NoError(t, pre.Close())
+
+	backend.mu.Lock()
+	require.Len(t, backend.records, 1)
+	var oldKey string
+	for key := range backend.records {
+		oldKey = key
+	}
+	backend.mu.Unlock()
+	require.NotEmpty(t, oldKey)
+
+	result, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err, "result: %+v", result)
+	require.True(t, result.CatalogRepointed)
+	require.True(t, result.Rekeyed, "this source had no identity.namespace yet")
+	require.Contains(t, result.IdentityNotice(), "assigned")
+
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	require.Len(t, backend.records, 1, "the provider change must update the row, not add a second one")
+	_, oldKeyStillThere := backend.records[oldKey]
+	require.False(t, oldKeyStillThere, "adopting a namespace for the first time is the one unavoidable rekey; the legacy key must be gone")
+}
+
 func newLoopbackMediaRequest(t *testing.T, u *url.URL, etag string) *http.Request {
 	t.Helper()
 	r, err := http.NewRequest(http.MethodGet, u.RequestURI(), nil)

@@ -64,7 +64,6 @@ func migrateLocal(args []string) error {
 			return err
 		}
 	}
-	fmt.Fprintln(os.Stderr, "migrate-local: "+sources.MigrateLocalRekeyNotice)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	result, err := sources.MigrateLocal(ctx, sources.MigrateLocalOptions{
@@ -123,6 +122,9 @@ func printMigrateSummary(r sources.MigrateLocalResult) {
 		} else {
 			fmt.Fprintf(os.Stderr, "migrate-local: already pointed at connection %q bucket %q prefix %q; nothing to repoint\n", r.ToConnection, r.Bucket, r.ToPrefix)
 		}
+	}
+	if notice := r.IdentityNotice(); notice != "" {
+		fmt.Fprintln(os.Stderr, "migrate-local: "+notice)
 	}
 	fmt.Fprintln(os.Stderr, "migrate-local: local copies were left in place. Once search results against the bucket look right, remove them yourself; this tool never deletes local content.")
 }

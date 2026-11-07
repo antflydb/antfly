@@ -30,15 +30,39 @@ import (
 	"time"
 )
 
-// MigrateLocalRekeyNotice is printed before anything is copied (including on
-// a dry run) so the consequence of repointing is visible up front, not just
-// in documentation. Repointing changes the provider-tagged item identity,
-// and the catalog's document ID is derived from that identity, not from the
-// content digest, so every migrated record gets a new ID. Derived data
-// attached to the old row -- OCR text, chunks, embeddings -- does not carry
-// over and must be recomputed against the new one; only the content digest
-// survives unrecomputed.
-const MigrateLocalRekeyNotice = "repointing gives every migrated record a new catalog ID (derived from the provider-tagged item identity, not the content digest); any derived OCR, chunks or embeddings attached to the old row will not carry over and must be recomputed against the new one."
+// IdentityNotice explains what this run did to row identity, for a CLI to
+// print after the run completes (its outcome -- Rekeyed in particular --
+// is only known once the repoint PUT has actually happened). Empty for a
+// dry run or a run that never reached the catalog.
+//
+// Identity (IdentityKey: see sync.go) depends only on identity.namespace and
+// each row's relative key, never on connection or provider, so a provider
+// change by itself never has to re-key anything once a namespace is set.
+// migrate-local assigns one (defaulting to the source's own ID) the first
+// time it repoints a source that does not have one yet; --to-prefix mirrors
+// the local store's own "objects/sha256/<digest>[.ext]" layout, so each
+// object's relative key is the same before and after the copy. Together
+// these mean: a source already carrying a namespace is never rekeyed by
+// this tool, and one that is not pays exactly one rekey, here, to get one.
+//
+// Row identity is not the whole story, though: whether derived data (OCR,
+// chunks, embeddings) also survives depends on the destination table's own
+// document_extraction config declaring checksum_algorithm for this source's
+// rows. migrate-local has no visibility into that table-side config -- it
+// is server/Zig configuration, not anything in a source profile -- and
+// cannot confirm it either way. Without it, a location-based fingerprint still
+// changes (this source's canonical URI and any etag move with the provider
+// change), so Antfly still recomputes derived data for a row whose ID did
+// not change.
+func (r MigrateLocalResult) IdentityNotice() string {
+	if r.DryRun || !r.CatalogRepointed {
+		return ""
+	}
+	if r.Rekeyed {
+		return "this source had no identity.namespace yet (or had one but changed connection/config before having one), so this run assigned it a namespace; every migrated row got a new ID this one time. From here on, as long as a future provider change keeps the same relative key -- as this tool's own copy does, since --to-prefix mirrors the local store's own object layout -- rows will update in place instead."
+	}
+	return "rows were updated in place with the same IDs (this source already had an identity.namespace). Whether derived data -- OCR, chunks, embeddings -- also survived depends on the destination table's document_extraction config declaring checksum_algorithm for this source's rows; migrate-local cannot see that table-side config and cannot confirm it either way. Without it, Antfly still recomputes derived data for a row whose location metadata (URI, etag) changed, even though its ID did not."
+}
 
 // MigrateLocalOptions configures a one-shot move of one local-provider
 // source's content-addressed objects to a bucket, and the subsequent repoint
@@ -150,6 +174,10 @@ type MigrateLocalResult struct {
 	// RunID is the underlying service sync job ID, for cross-referencing
 	// serve's own run history.
 	RunID string
+	// Rekeyed is the repoint PUT's own rekeys signal (see PutSourceMutation):
+	// true only when this source had no identity.namespace before this run.
+	// See IdentityNotice.
+	Rekeyed bool
 }
 
 // MigrateLocal copies a local source's objects to a bucket connection,
@@ -179,8 +207,10 @@ func MigrateLocal(ctx context.Context, opts MigrateLocalOptions) (MigrateLocalRe
 
 // migrateRepointer sends the reconfigured source and resync through some
 // admin surface's run admission, and waits for the resulting job to finish.
+// rekeys is the PUT response's own signal (see PutSourceMutation): true only
+// when the source had no identity.namespace before this call.
 type migrateRepointer interface {
-	repoint(ctx context.Context, sourceID string, updated Source) (SyncJob, error)
+	repoint(ctx context.Context, sourceID string, updated Source) (job SyncJob, rekeys bool, err error)
 }
 
 // migrateLocalRun is the copy-then-maybe-repoint tail shared by both repoint
@@ -219,13 +249,25 @@ func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result Migra
 	}
 	updated := source
 	updated.Connection, updated.Config = opts.ToConnection, destConfig
-	job, err := repointer.repoint(ctx, source.ID, updated)
+	if updated.Identity.Namespace == "" {
+		// Row identity (IdentityKey) depends only on namespace and each
+		// row's relative key, never on connection or provider. A source that
+		// has never had a namespace is still on the legacy, location-based
+		// formula (RecordKey), which the provider change below would
+		// otherwise re-key regardless of anything this tool does. Assigning
+		// one now -- the same default service.go gives a brand new source --
+		// pays that cost exactly once, here, so every later provider change
+		// (including a future migrate-local run) is free.
+		updated.Identity.Namespace = source.ID
+	}
+	job, rekeys, err := repointer.repoint(ctx, source.ID, updated)
 	if err != nil {
 		return result, err
 	}
 	result.CatalogRepointed = true
 	result.ReferencesUpdated = result.Copied + result.Skipped
 	result.RunID = job.ID
+	result.Rekeyed = rekeys
 	return result, nil
 }
 
@@ -373,32 +415,39 @@ func migrateLocalLive(ctx context.Context, opts MigrateLocalOptions, result Migr
 // POSTs "/v1/sync" for just that source, so the resync runs through the
 // ordinary Runner/Publisher/MediaReference pipeline with its usual ownership
 // and publication barriers. It polls the resulting job to completion.
-func (s *Service) repoint(ctx context.Context, sourceID string, updated Source) (SyncJob, error) {
+func (s *Service) repoint(ctx context.Context, sourceID string, updated Source) (SyncJob, bool, error) {
 	out, err := serviceAdminCall(ctx, s, http.MethodPut, "/v1/sources/"+sourceID, updated)
 	if err != nil {
-		return SyncJob{}, err
+		return SyncJob{}, false, err
 	}
 	if out.status != http.StatusOK {
-		return SyncJob{}, fmt.Errorf("repoint source %s: admin PUT failed with HTTP %d", sourceID, out.status)
+		return SyncJob{}, false, fmt.Errorf("repoint source %s: admin PUT failed with HTTP %d", sourceID, out.status)
+	}
+	var putResponse struct {
+		Rekeys bool `json:"rekeys"`
+	}
+	if err := json.Unmarshal(out.body.Bytes(), &putResponse); err != nil {
+		return SyncJob{}, false, err
 	}
 	out, err = serviceAdminCall(ctx, s, http.MethodPost, "/v1/sync", map[string]any{"source_id": sourceID, "restart": true})
 	if err != nil {
-		return SyncJob{}, err
+		return SyncJob{}, false, err
 	}
 	if out.status != http.StatusAccepted {
-		return SyncJob{}, fmt.Errorf("start repoint sync for %s: admin POST failed with HTTP %d", sourceID, out.status)
+		return SyncJob{}, false, fmt.Errorf("start repoint sync for %s: admin POST failed with HTTP %d", sourceID, out.status)
 	}
 	var job SyncJob
 	if err := json.Unmarshal(out.body.Bytes(), &job); err != nil {
-		return SyncJob{}, err
+		return SyncJob{}, false, err
 	}
-	return migrateWaitForJob(ctx, sourceID, job, 20*time.Millisecond, func(ctx context.Context) (int, []byte, error) {
+	job, err = migrateWaitForJob(ctx, sourceID, job, 20*time.Millisecond, func(ctx context.Context) (int, []byte, error) {
 		out, err := serviceAdminCall(ctx, s, http.MethodGet, "/v1/jobs/"+job.ID, nil)
 		if err != nil {
 			return 0, nil, err
 		}
 		return out.status, out.body.Bytes(), nil
 	})
+	return job, putResponse.Rekeys, err
 }
 
 // serviceAdminCall issues one in-process admin request against a Service's
@@ -496,28 +545,35 @@ func (c *liveAdminClient) getProfile(ctx context.Context) (Profile, error) {
 	return profile, nil
 }
 
-func (c *liveAdminClient) repoint(ctx context.Context, sourceID string, updated Source) (SyncJob, error) {
-	status, _, err := c.callSerialized(ctx, http.MethodPut, "/v1/sources/"+sourceID, updated)
+func (c *liveAdminClient) repoint(ctx context.Context, sourceID string, updated Source) (SyncJob, bool, error) {
+	status, putBody, err := c.callSerialized(ctx, http.MethodPut, "/v1/sources/"+sourceID, updated)
 	if err != nil {
-		return SyncJob{}, err
+		return SyncJob{}, false, err
 	}
 	if status != http.StatusOK {
-		return SyncJob{}, fmt.Errorf("repoint source %s on %s: admin PUT failed with HTTP %d", sourceID, c.baseURL, status)
+		return SyncJob{}, false, fmt.Errorf("repoint source %s on %s: admin PUT failed with HTTP %d", sourceID, c.baseURL, status)
+	}
+	var putResponse struct {
+		Rekeys bool `json:"rekeys"`
+	}
+	if err := json.Unmarshal(putBody, &putResponse); err != nil {
+		return SyncJob{}, false, err
 	}
 	status, data, err := c.callSerialized(ctx, http.MethodPost, "/v1/sync", map[string]any{"source_id": sourceID, "restart": true})
 	if err != nil {
-		return SyncJob{}, err
+		return SyncJob{}, false, err
 	}
 	if status != http.StatusAccepted {
-		return SyncJob{}, fmt.Errorf("start repoint sync for %s on %s: admin POST failed with HTTP %d", sourceID, c.baseURL, status)
+		return SyncJob{}, false, fmt.Errorf("start repoint sync for %s on %s: admin POST failed with HTTP %d", sourceID, c.baseURL, status)
 	}
 	var job SyncJob
 	if err := json.Unmarshal(data, &job); err != nil {
-		return SyncJob{}, err
+		return SyncJob{}, false, err
 	}
-	return migrateWaitForJob(ctx, sourceID, job, 300*time.Millisecond, func(ctx context.Context) (int, []byte, error) {
+	job, err = migrateWaitForJob(ctx, sourceID, job, 300*time.Millisecond, func(ctx context.Context) (int, []byte, error) {
 		return c.call(ctx, http.MethodGet, "/v1/jobs/"+job.ID, nil)
 	})
+	return job, putResponse.Rekeys, err
 }
 
 // migrateWaitForJob polls poll at interval until the job it describes
