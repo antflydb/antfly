@@ -17,8 +17,8 @@ public actor AntflyClient {
     inferenceGate = InferenceGate(capacity: maxConcurrentRequests)
     var config = Configuration()
     config.server = server
-    _ = try config.validated()
-    origin = URL(string: server)!
+    config = try config.validated()
+    origin = URL(string: config.server)!
     self.token = token
     let settings = URLSessionConfiguration.ephemeral
     settings.timeoutIntervalForRequest = 120

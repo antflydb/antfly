@@ -93,12 +93,25 @@ public struct Configuration: Codable, Equatable, Sendable {
   }
   public func validated() throws -> Configuration {
     guard version == 1 else { throw DictationError.invalid("Unsupported settings version.") }
-    guard let url = URL(string: server), ["http", "https"].contains(url.scheme), url.host != nil,
-      url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
-      url.path.isEmpty || url.path == "/"
+    let origin = server.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !origin.isEmpty else {
+      throw DictationError.invalid("Enter a server address, such as http://localhost:8080.")
+    }
+    guard let url = URL(string: origin), ["http", "https"].contains(url.scheme),
+      let host = url.host, !host.isEmpty
     else {
       throw DictationError.invalid(
-        "Server must be an HTTP(S) origin without credentials or a path.")
+        "Server address must start with http:// or https:// and include a hostname.")
+    }
+    guard url.user == nil, url.password == nil else {
+      throw DictationError.invalid(
+        "Remove credentials from the server address. Use the Bearer token field for authentication."
+      )
+    }
+    guard url.query == nil, url.fragment == nil, url.path.isEmpty || url.path == "/" else {
+      throw DictationError.invalid(
+        "Use only the server origin, such as http://localhost:8080, without a path, query, or fragment."
+      )
     }
     guard (1...2).contains(concurrentRequests ?? 1) else {
       throw DictationError.invalid("Inference concurrency must be one or two.")
@@ -148,7 +161,9 @@ public struct Configuration: Codable, Equatable, Sendable {
           "Dictionary allows 256 single-line entries of up to 128 bytes.")
       }
     }
-    return self
+    var normalized = self
+    normalized.server = origin
+    return normalized
   }
   public static func decode(_ data: Data) throws -> Configuration {
     guard data.count <= 1_048_576 else {

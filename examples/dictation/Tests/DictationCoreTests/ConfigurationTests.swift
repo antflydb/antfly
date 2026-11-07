@@ -98,3 +98,25 @@ import Testing
   config.presets[0].cleanupModel = "generators/cleanup"
   #expect(throws: DictationError.self) { try config.validated() }
 }
+
+@Test func serverOriginValidationAcceptsLocalhostAndTrimsPastedWhitespace() throws {
+  for address in ["http://localhost:8080", "http://127.0.0.1:8080", "https://example.com/"] {
+    var config = Configuration()
+    config.server = " \n" + address + "\t "
+    #expect(try config.validated().server == address)
+  }
+  for (address, explanation) in [
+    (" ", "Enter a server address"), ("localhost:8080", "must start"),
+    ("http://user:pass@localhost:8080", "Remove credentials"),
+    ("http://localhost:8080/api", "without a path"),
+  ] {
+    var config = Configuration()
+    config.server = address
+    do {
+      _ = try config.validated()
+      Issue.record("Accepted invalid server address")
+    } catch {
+      #expect(error.localizedDescription.contains(explanation))
+    }
+  }
+}
