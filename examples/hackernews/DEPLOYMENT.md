@@ -1,10 +1,11 @@
 # Hacker News: Antfly Cloud deployment and standalone qualification
 
 The intended real deployment is an organization-owned Antfly Cloud instance.
-The standalone renderer below is an optional qualification tool, not the Cloud
-provisioning path. This candidate is not deployed or archive-qualified. Complete the regional
+The standalone renderer below is an optional qualification tool. A private bounded
+sample is deployed on Cloud with rc.10; see the qualification record below.
+Full-archive qualification and public launch remain outstanding. Complete the
 public-API gates in `docs/plans/hackernews-deployment-qualification.md` before
-selecting serving resources or exposing `hn.antfly.io`.
+exposing `hn.antfly.io`.
 
 For the real deployment, merge the required runtime fixes and publish an immutable
 Antfly release containing them. Add that image to Colony's development runtime
@@ -23,6 +24,10 @@ retained Lite state volume. The earlier standalone 20 GiB proposal is optional
 qualification infrastructure and is not attached to the real Cloud instance.
 
 ## Managed Cloud setup
+
+See the [rc.10 managed sample qualification](managed-qualification-20261106.md)
+for the existing-state format barrier and the rehearsed fresh-incarnation cutover.
+Verify source-format compatibility before targeting an existing instance.
 
 Use the runtime in `runtime.json` for the database and the producer library.
 Verify that the managed instance reports the pinned image, accepts the gateway's
@@ -81,6 +86,14 @@ Use a dedicated sample prefix for private qualification. Keep a later full expor
 in a separate frozen prefix; do not mix duplicate sample/full-export rows beneath
 the active Parquet source. Moving that source requires an explicit reviewed
 publication/migration, not silently adding files.
+
+The generated definitions declare data files immutable. Export into fresh names
+and never overwrite or delete a referenced Parquet or Iceberg data object while
+its snapshots remain retained. This permits published-index reads to avoid
+per-file HEAD revalidation; prefix membership and Iceberg metadata pointers can
+still change through their publication protocols. If an external writer can
+overwrite file contents, use the mutable contract and retain its revalidation
+cost. Existing schemas do not gain this declaration by regenerating the plan.
 
 Submit those definitions to `/tables/hn_archive`, `/tables/hn_current` and
 `/sources/hackernews` at the authenticated native tenant API. Both tables explicitly
@@ -196,6 +209,33 @@ health, nonempty distinct results and continuation without repeated rows. They d
 not establish full-archive correctness or performance. Separately qualify expected
 fixture IDs, edits/deletes, backup restore, replacement-pod recovery, credential
 refresh beyond a token lifetime, sustained load and the matched DuckDB comparison.
+
+To measure the first user search without health checks warming the gateway, add
+`--search-first`. It changes probe order; it does not itself stop an instance or
+prove a cold cache. Use `--max-search-seconds 5` for an explicit five-second
+sample latency gate (choose the release criterion before running). Slow searches
+are retained without retrying: functional smoke can pass while the latency gate
+fails with a nonzero exit. These bounded observations are not a percentile test.
+
+Gateway builds from this revision return the numeric
+`Server-Timing: antfly_upstream;dur=...` metric on search responses, including
+upstream failures. The qualification report records `backend_seconds` and
+`outside_backend_seconds` when that metric is valid. The upstream duration
+includes the managed Cloud proxy, network and response read; it is not an engine
+timer. Outside time includes gateway startup/admission, client transport and
+response delivery. Older deployed gateways omit the metric; missing attribution
+must not be interpreted as zero overhead. Correlate with provider request/startup
+logs and engine profiles. Engine `/metrics` refreshes asynchronously every five
+seconds, so adjacent scrapes do not give reliable per-request phase deltas.
+
+For the Cloud Run hosting owner (`colony/infra/showcases/hackernews.go`), configure
+the `/health` startup probe explicitly: `initialDelaySeconds: 0`,
+`periodSeconds: 1`, `timeoutSeconds: 1`, `failureThreshold: 30`. The provider's
+default ten-second period was observed adding roughly ten seconds before a cold
+container could serve its first search. Keep `/health` local; `/ready` performs
+upstream checks and must not gate process startup. This probe configuration does
+not require keeping idle instances alive. Apply through the hosting owner and
+qualify a new revision's first request before claiming the startup issue fixed.
 
 Only after private acceptance enable the HN public invoker, reviewed monitoring
 channels and optional verified domain mapping. Publish the exact DNS records

@@ -608,14 +608,20 @@ test "validated managed receipt cleans up every allocation failure" {
 /// standalone files; callers still fence their own pathname separately.
 pub fn publicationRootAlloc(a: std.mem.Allocator, io: std.Io, model: []const u8) ![]u8 {
     if (!std.mem.endsWith(u8, model, ".gguf")) return a.dupe(u8, model);
-    const canonical = try resolveRegularFilePath(a, io, model);
+    // Requested ancestors own rejection obligations too: a symlink inside a
+    // managed installation cannot borrow a foreign target's publication.
+    const requested = try resolveRequestedFilePath(a, io, model);
+    defer a.free(requested);
+    const canonical = try resolveRegularFilePath(a, io, requested);
     defer a.free(canonical);
-    var ancestor = std.fs.path.dirname(canonical);
-    while (ancestor) |root| : (ancestor = std.fs.path.dirname(root)) {
-        for ([_][]const u8{ complete_filename, in_progress_filename, plan_filename }) |name| {
-            const path = try managedPath(a, root, name);
-            defer a.free(path);
-            if (try pathPresent(std.Io.Dir.cwd(), io, path)) return a.dupe(u8, root);
+    for ([_][]const u8{ requested, canonical }) |path| {
+        var ancestor = std.fs.path.dirname(path);
+        while (ancestor) |root| : (ancestor = std.fs.path.dirname(root)) {
+            for ([_][]const u8{ complete_filename, in_progress_filename, plan_filename }) |name| {
+                const marker = try managedPath(a, root, name);
+                defer a.free(marker);
+                if (try pathPresent(std.Io.Dir.cwd(), io, marker)) return a.dupe(u8, root);
+            }
         }
     }
     return a.dupe(u8, model);

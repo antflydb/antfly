@@ -254,15 +254,19 @@ pub const InferenceExecutionControl = struct {
         };
     }
 
+    /// Fail policy checks before reserving resources, without starting a native
+    /// call monitor while admission may still wait or reclaim other sessions.
+    pub fn validateUninterruptible(self: InferenceExecutionControl, interruption: Interruption) !void {
+        if (interruption == .uninterruptible and self.hard_cancellation == null and self.native_call_policy != .in_process) return error.ProcessIsolationRequired;
+    }
+
     pub fn enterUninterruptible(
         self: InferenceExecutionControl,
         interruption: Interruption,
     ) !UninterruptibleGuard {
+        try self.validateUninterruptible(interruption);
         if (interruption != .uninterruptible) return .{};
-        const boundary = self.hard_cancellation orelse {
-            if (self.native_call_policy == .in_process) return .{};
-            return error.ProcessIsolationRequired;
-        };
+        const boundary = self.hard_cancellation orelse return .{};
         return .{
             .boundary = boundary,
             .token = try boundary.arm(.{
@@ -694,4 +698,33 @@ test "LightOnOCR3 execution lane cleanup survives cancellation of its owning Io 
     cancel_task = null;
     try std.testing.expect(done.load(.acquire));
     try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
+}
+
+test "uninterruptible admission preflight validates without arming a monitor" {
+    const Hooks = struct {
+        arms: usize = 0,
+        disarms: usize = 0,
+        fn arm(raw: *anyopaque, _: MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.arms += 1;
+            return 1;
+        }
+        fn disarm(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.disarms += 1;
+        }
+    };
+    try std.testing.expectError(error.ProcessIsolationRequired, (InferenceExecutionControl{}).validateUninterruptible(.uninterruptible));
+    try (InferenceExecutionControl{}).validateUninterruptible(.cooperative);
+    try (InferenceExecutionControl{ .native_call_policy = .in_process }).validateUninterruptible(.uninterruptible);
+    var hooks = Hooks{};
+    const control = InferenceExecutionControl{ .hard_cancellation = .{ .ptr = &hooks, .arm_fn = Hooks.arm, .disarm_fn = Hooks.disarm } };
+    try control.validateUninterruptible(.uninterruptible);
+    try std.testing.expectEqual(@as(usize, 0), hooks.arms);
+    {
+        var guard = try control.enterUninterruptible(.uninterruptible);
+        defer guard.deinit();
+        try std.testing.expectEqual(@as(usize, 1), hooks.arms);
+    }
+    try std.testing.expectEqual(hooks.arms, hooks.disarms);
 }

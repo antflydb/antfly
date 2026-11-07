@@ -60,6 +60,24 @@ module carries a matching header copy for standalone builds, but the release
 packages and archives also keep `include/antfly.h` available for direct C
 consumers.
 
+The shell installer uses `/usr/local` for root installs and `$HOME/.local` for
+user installs. It places the executable in `bin/antfly`, the native libraries
+and adjusted pkg-config metadata in `lib/antfly`, the C header in
+`include/antfly.h`, and dashboard assets in `share/antfly/antfarm`. All of these
+participate in the same install/rollback transaction. Updating the dashboard
+replaces only its owned `antfarm` directory, preserving sibling runtime versions
+or other data under `share/antfly`.
+
+For a user install, compile a C consumer with:
+
+```sh
+export PKG_CONFIG_PATH="$HOME/.local/lib/antfly/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+cc example.c -o example $(pkg-config --cflags --libs libantfly)
+```
+
+The installed pkg-config file describes this layout; archive metadata retains
+the archive's own prefix-relative `lib` and `include` paths.
+
 ## Release Flow
 
 1. Push a stable or RC Antfly tag, or manually dispatch the `Nightly request`
@@ -130,10 +148,19 @@ consumers.
    Native archives remain available under
    `https://releases.antfly.io/antfly/<version>/` for direct installation.
 
-Stable and RC releases publish the verified CLI packages to npm and PyPI.
-Nightlies build and ledger-verify those same packages, but publish only the R2
-release payload and container image; package registries are not used as
-snapshot storage.
+Registry publication is selected by `scripts/release/channels.json`, not by
+the presence of built packages or a GitHub Release. The current policy publishes
+stable CLI releases to npm and Homebrew, but disables PyPI publication for every
+channel. RC/alpha/beta (`next`) releases publish GitHub prerelease assets,
+versioned object-storage payloads, and container images without publishing to
+npm or PyPI. Nightlies build and ledger-verify the same CLI packages, but publish
+only the object-storage payload and container image. Old npm `next` tags and
+previous PyPI versions therefore do not identify the current prerelease.
+
+The release workflow retains conditional npm/PyPI publishing and verification
+steps for channels that enable them. Changing registry destinations requires a
+reviewed channel-policy change; a successful promotion with those jobs skipped
+is expected when the policy disables them.
 
 Release-object retention is journal-aware. Stable releases are permanent;
 nightlies are retained for 30 days or for the newest 10 snapshots, whichever
@@ -320,12 +347,11 @@ musl, and unknown Linux libc environments use the portable musl archive. Set
 preparing an installation for a different host. In automatic mode it also
 falls back to musl when an older release does not provide a GNU archive.
 
-For published prerelease tags, npm uses the release version directly. Python
+Prerelease npm package artifacts use the release version directly. Python
 wheels use PEP 440 equivalents, for example `v<version>-rc.1` becomes `<version>rc1`.
-Stable npm releases publish with the `latest` dist-tag. Prerelease npm versions
-publish with the `next` dist-tag, so `npm install -g @antfly/cli` stays on the
-latest stable release and `npm install -g @antfly/cli@next` can install RC
-builds. Nightly package artifacts remain in R2 and have no npm dist-tag.
+Registry publication and npm dist-tags follow the channel policy described in
+[Release Flow](#release-flow); a built artifact's version does not imply that
+the package was published.
 
 It creates:
 

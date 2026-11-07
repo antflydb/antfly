@@ -68,6 +68,7 @@ pub const Object = union(enum) {
     name: []u8,
     array: []Object,
     dict: []DictEntry,
+    stream_header: []DictEntry,
     stream: struct {
         header: []DictEntry,
         data_offset: usize,
@@ -102,7 +103,7 @@ pub const Object = union(enum) {
                 }
                 break :blk .{ .array = out };
             },
-            .dict => |entries| blk: {
+            .dict, .stream_header => |entries| blk: {
                 const out = try alloc.alloc(DictEntry, entries.len);
                 var initialized: usize = 0;
                 errdefer {
@@ -117,7 +118,7 @@ pub const Object = union(enum) {
                     initialized += 1;
                     out[i].value = try entry.value.clone(alloc);
                 }
-                break :blk .{ .dict = out };
+                break :blk if (self == .stream_header) .{ .stream_header = out } else .{ .dict = out };
             },
             .stream => |stream_value| blk: {
                 const out = try alloc.alloc(DictEntry, stream_value.header.len);
@@ -154,6 +155,7 @@ pub const Object = union(enum) {
     pub fn get(self: *const Object, key: []const u8) ?*const Object {
         const entries = switch (self.*) {
             .dict => self.dict,
+            .stream_header => self.stream_header,
             .stream => self.stream.header,
             else => return null,
         };
@@ -185,7 +187,7 @@ pub const Object = union(enum) {
                 for (items) |*item| item.deinit(alloc);
                 alloc.free(items);
             },
-            .dict => |entries| {
+            .dict, .stream_header => |entries| {
                 for (entries) |*entry| entry.deinit(alloc);
                 alloc.free(entries);
             },
@@ -229,6 +231,15 @@ pub const Lexeme = Token;
 // Full parsing remains the default for rendering and general object consumers.
 pub const Projection = enum {
     full,
+    text_xobject,
+    xobject_header,
+    color_profile_header,
+    appearance_header,
+    structure_metadata,
+    resource_table,
+    resource_entries,
+    resource_fields,
+    name,
     resources,
     required_resources,
     resource_container,
@@ -239,15 +250,46 @@ pub const Projection = enum {
     integer,
     text,
 
-    const Field = struct { keep: bool, skip: bool = false, child: Projection = .full };
+    const Field = struct { keep: bool, skip: bool = false, view: bool = false, child: Projection = .full };
 
     fn field(self: Projection, key: []const u8) Field {
         return switch (self) {
             .full => .{ .keep = true },
+            .structure_metadata => blk: {
+                // Structure nodes, number trees, and content-container headers
+                // share this resolver. Payload-related dictionaries are never
+                // needed, even when a referenced container is a PDF Form.
+                for ([_][]const u8{ "Type", "ParentTree", "K", "Kids", "Limits", "Nums", "P", "Pg", "S", "Stm", "MCID", "ActualText", "StructParents" }) |name| {
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true, .child = .structure_metadata };
+                }
+                break :blk .{ .keep = false };
+            },
+            // Normal appearances can also be state dictionaries. Preserve their
+            // names/references while leaving unrelated compound fields as views.
+            .appearance_header => if (std.mem.eql(u8, key, "Subtype") or std.mem.eql(u8, key, "BBox") or std.mem.eql(u8, key, "Matrix")) .{ .keep = true } else .{ .keep = true, .view = true },
+            .resource_table, .resource_entries => .{ .keep = true, .view = true },
+            .text_xobject => blk: {
+                if (std.mem.eql(u8, key, "Subtype") or std.mem.eql(u8, key, "Subtype2") or std.mem.eql(u8, key, "Type")) break :blk .{ .keep = true, .child = .name };
+                if (std.mem.eql(u8, key, "StructParent")) break :blk .{ .keep = true, .skip = true };
+                if (std.mem.eql(u8, key, "Length") or std.mem.eql(u8, key, "StructParents")) break :blk .{ .keep = true, .child = .integer };
+                if (std.mem.eql(u8, key, "Resources")) break :blk .{ .keep = true, .child = .resource_fields };
+                for ([_][]const u8{ "BBox", "Matrix", "Group", "Filter", "DecodeParms" }) |name| {
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true };
+                }
+                break :blk .{ .keep = false };
+            },
+            .xobject_header => if (std.mem.eql(u8, key, "Subtype") or std.mem.eql(u8, key, "Subtype2")) .{ .keep = true, .child = .name } else if (std.mem.eql(u8, key, "StructParent")) .{ .keep = true, .skip = true } else .{ .keep = false },
+            .color_profile_header => if (std.mem.eql(u8, key, "N")) .{ .keep = true, .child = .integer } else .{ .keep = std.mem.eql(u8, key, "Alternate") or std.mem.eql(u8, key, "Range") },
+            .resource_fields => blk: {
+                for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace", "Properties" }) |name| {
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true, .view = std.mem.eql(u8, key, "Properties"), .child = .resource_table };
+                }
+                break :blk .{ .keep = false };
+            },
             .resources, .required_resources => blk: {
                 if (std.mem.eql(u8, key, "Properties")) break :blk .{ .keep = true, .skip = self == .required_resources, .child = .property_table };
                 for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace" }) |name| {
-                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true };
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true, .child = .resource_table };
                 }
                 break :blk .{ .keep = false };
             },
@@ -256,7 +298,7 @@ pub const Projection = enum {
             .resource_properties => .{ .keep = std.mem.eql(u8, key, "Properties"), .child = .property_table },
             .property_table => .{ .keep = true, .child = .property },
             .property => if (std.mem.eql(u8, key, "ActualText")) .{ .keep = true, .child = .text } else if (std.mem.eql(u8, key, "MCID")) .{ .keep = true, .child = .integer } else .{ .keep = false },
-            .integer, .text => .{ .keep = false },
+            .integer, .text, .name => .{ .keep = false },
         };
     }
 };
@@ -270,9 +312,14 @@ pub const Scanner = struct {
     max_object_depth: usize = std.math.maxInt(usize),
     object_depth: usize = 0,
     source_ref: ?ObjRef = null,
+    resource_names: ?*const std.StringHashMapUnmanaged(void) = null,
     allow_stream: bool = true,
     control: ?*ScanControl = null,
     last_checked_pos: usize = 0,
+    stream_length_resolver: ?struct {
+        context: *const anyopaque,
+        resolve: *const fn (*const anyopaque, ObjRef, bool) anyerror!?usize,
+    } = null,
 
     fn checkpoint(self: *Scanner) !void {
         try self.checkpointUsing(self.control);
@@ -333,9 +380,10 @@ pub const Scanner = struct {
                 const compound = first == '[' or (first == '<' and self.pos + 1 < self.bytes.len and self.bytes[self.pos + 1] == '<');
                 const string = first == '(' or (first == '<' and !compound);
                 const reject = switch (projection) {
-                    .full => false,
+                    .full, .structure_metadata => false,
                     .integer => compound or string or first == '/',
                     .text => compound or first == '/',
+                    .name => compound or string,
                     else => first == '[' or string or first == '/',
                 };
                 if (reject) {
@@ -373,8 +421,15 @@ pub const Scanner = struct {
                                 if (boxed_initialized) boxed.deinit(self.alloc);
                                 self.alloc.destroy(boxed);
                             }
+                            const prior_source_ref = self.source_ref;
+                            if ((projection == .text_xobject or projection == .resource_table or projection == .resource_entries or projection == .resource_fields) and self.source_ref == null)
+                                self.source_ref = .{ .id = @intCast(value), .gen = @intCast(tok2.integer) };
+                            defer self.source_ref = prior_source_ref;
                             boxed.* = try self.readObjectProjected(projection);
                             boxed_initialized = true;
+                            if (boxed.* == .stream_header) {
+                                return .{ .obj_def = .{ .ptr = .{ .id = @intCast(value), .gen = @intCast(tok2.integer) }, .value = boxed } };
+                            }
 
                             var end_tok = try self.readToken();
                             defer end_tok.deinit(self.alloc);
@@ -407,7 +462,7 @@ pub const Scanner = struct {
             },
             .keyword => |kw| {
                 if (std.mem.eql(u8, kw, "null")) return .null;
-                if (std.mem.eql(u8, kw, "[")) return try self.readArray();
+                if (std.mem.eql(u8, kw, "[")) return try self.readArray(if (projection == .structure_metadata) .structure_metadata else .full);
                 if (std.mem.eql(u8, kw, "<<")) return try self.readDictOrStream(projection);
                 return error.UnexpectedKeyword;
             },
@@ -426,7 +481,7 @@ pub const Scanner = struct {
         tok.deinit(alloc);
     }
 
-    fn readArray(self: *Scanner) anyerror!Object {
+    fn readArray(self: *Scanner, projection: Projection) anyerror!Object {
         var items = std.ArrayList(Object).empty;
         defer items.deinit(self.alloc);
         errdefer {
@@ -439,7 +494,7 @@ pub const Scanner = struct {
             if (tok == .eof) return error.UnexpectedEof;
             if (tok == .keyword and std.mem.eql(u8, tok.keyword, "]")) break;
             try self.unreadOwnedToken(&tok);
-            var item = try self.readObject();
+            var item = try self.readObjectProjected(projection);
             errdefer item.deinit(self.alloc);
             try items.append(self.alloc, item);
             item = .null;
@@ -455,8 +510,146 @@ pub const Scanner = struct {
         return self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], "<<");
     }
 
-    fn readDictOrStream(self: *Scanner, projection: Projection) anyerror!Object {
+    // Common tables keep a tiny reusable index. Large tables retain only their
+    // source span until a collector knows the selected names. In particular,
+    // ignored XObjects and unused tables never allocate an unbounded index.
+    fn readResourceTable(self: *Scanner, bounded: bool) !Object {
+        const table_start = self.pos - 2;
         var entries = std.ArrayList(DictEntry).empty;
+        defer entries.deinit(self.alloc);
+        errdefer for (entries.items) |*entry| entry.deinit(self.alloc);
+        while (true) {
+            try self.skipSpaceAndComments();
+            if (self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], ">>")) {
+                self.pos += 2;
+                return .{ .dict = try entries.toOwnedSlice(self.alloc) };
+            }
+            if (self.peekByte() != '/') return error.UnexpectedDictKey;
+            const key_start = self.pos;
+            try self.skipObject(self.object_depth);
+            const key_end = self.pos;
+            if (bounded and (entries.items.len >= 8 or key_end - key_start > 128)) {
+                try self.skipObject(self.object_depth);
+                while (true) {
+                    try self.skipSpaceAndComments();
+                    if (self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], ">>")) {
+                        self.pos += 2;
+                        break;
+                    }
+                    if (self.peekByte() != '/') return error.UnexpectedDictKey;
+                    try self.skipObject(self.object_depth);
+                    try self.skipObject(self.object_depth);
+                }
+                for (entries.items) |*entry| entry.deinit(self.alloc);
+                entries.clearRetainingCapacity();
+                return .{ .deferred = .{ .reference = self.source_ref.?, .start = self.base_offset + table_start, .end = self.base_offset + self.pos } };
+            }
+            if (!bounded) if (self.resource_names) |names| {
+                var failure: ?anyerror = null;
+                const selected = names.containsAdapted(self.bytes[key_start + 1 .. key_end], ResourceNameContext{ .control = self.control, .failure = &failure });
+                if (failure) |err| return err;
+                if (!selected) {
+                    try self.skipObject(self.object_depth);
+                    continue;
+                }
+            };
+            var key_scanner = Scanner.init(self.alloc, self.bytes[key_start..key_end]);
+            key_scanner.control = self.control;
+            defer key_scanner.deinit();
+            var key = try key_scanner.readObject();
+            defer key.deinit(self.alloc);
+            if (key != .name) return error.UnexpectedDictKey;
+            try self.skipSpaceAndComments();
+            const value_start = self.pos;
+            const first = self.peekByte() orelse return error.UnexpectedEof;
+            try self.skipObject(self.object_depth);
+            var value: Object = if (first == '<' or first == '[' or first == '(' or first == '/')
+                .{ .deferred = .{ .reference = self.source_ref.?, .start = self.base_offset + value_start, .end = self.base_offset + self.pos } }
+            else blk: {
+                // Parse only this scalar, so numeric lookahead cannot allocate
+                // the next (possibly enormous and unselected) dictionary key.
+                var scalar = Scanner.init(self.alloc, self.bytes[value_start..self.pos]);
+                scalar.control = self.control;
+                scalar.max_object_depth = self.max_object_depth;
+                scalar.object_depth = self.object_depth;
+                defer scalar.deinit();
+                break :blk try scalar.readObject();
+            };
+            errdefer value.deinit(self.alloc);
+            try entries.append(self.alloc, .{ .key = key.name, .value = value });
+            key = .null;
+        }
+    }
+
+    // Hash decoded PDF names without allocating unselected keys. The adapted
+    // context has exactly StringHashMap's hash/equality semantics after #xx
+    // decoding, including long names and escaped bytes.
+    const ResourceNameContext = struct {
+        control: ?*ScanControl = null,
+        failure: ?*?anyerror = null,
+        fn spend(self: @This(), work: usize) bool {
+            if (self.control) |control| control.spend(work) catch |err| {
+                self.failure.?.* = err;
+                return false;
+            };
+            return true;
+        }
+        fn next(raw: []const u8, offset: *usize, literal_until: *usize) ?u8 {
+            if (offset.* == raw.len) return null;
+            const byte = raw[offset.*];
+            offset.* += 1;
+            if (byte == '#' and offset.* > literal_until.* and offset.* + 1 < raw.len) {
+                if (unhex(raw[offset.*])) |hi| if (unhex(raw[offset.* + 1])) |lo| {
+                    offset.* += 2;
+                    return hi << 4 | lo;
+                };
+                // Match readName's literal recovery for malformed escapes.
+                literal_until.* = offset.* + 2;
+            }
+            return byte;
+        }
+        pub fn hash(self: @This(), raw: []const u8) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            var offset: usize = 0;
+            var literal_until: usize = 0;
+            var buffer: [64]u8 = undefined;
+            var count: usize = 0;
+            while (next(raw, &offset, &literal_until)) |byte| {
+                buffer[count] = byte;
+                count += 1;
+                if (count == buffer.len) {
+                    if (!self.spend(buffer.len)) return 0;
+                    hasher.update(&buffer);
+                    count = 0;
+                }
+            }
+            if (!self.spend(count)) return 0;
+            hasher.update(buffer[0..count]);
+            return hasher.final();
+        }
+        pub fn eql(self: @This(), raw: []const u8, name: []const u8) bool {
+            var offset: usize = 0;
+            var i: usize = 0;
+            var literal_until: usize = 0;
+            while (next(raw, &offset, &literal_until)) |byte| {
+                if (i % 4096 == 0 and !self.spend(@min(4096, name.len -| i))) return false;
+                if (i == name.len or name[i] != byte) return false;
+                i += 1;
+            }
+            return i == name.len;
+        }
+    };
+
+    fn readDictOrStream(self: *Scanner, projection: Projection) anyerror!Object {
+        if ((projection == .resource_table or projection == .resource_entries) and self.source_ref != null)
+            return self.readResourceTable(projection == .resource_table);
+        var entries = std.ArrayList(DictEntry).empty;
+        var header_only = false;
+        var subtype_seen = false;
+        var secondary_subtype_seen = false;
+        var form = false;
+        var postscript = false;
+        var deferred_form_fields = false;
         defer {
             for (entries.items) |*entry| entry.deinit(self.alloc);
             entries.deinit(self.alloc);
@@ -469,15 +662,47 @@ pub const Scanner = struct {
             if (tok == .keyword and std.mem.eql(u8, tok.keyword, ">>")) break;
             if (tok != .name) return error.UnexpectedDictKey;
 
-            const selected = projection.field(tok.name);
+            const selected = (if (header_only) Projection.xobject_header else projection).field(tok.name);
             if (!selected.keep) {
                 try self.skipObject(self.object_depth);
                 continue;
             }
+            if (projection == .resource_fields) {
+                // The view has at most five fields. Preserve first-key lookup
+                // semantics without retaining repeated attacker-owned entries.
+                var duplicate = false;
+                for (entries.items) |entry| if (std.mem.eql(u8, entry.key, tok.name)) {
+                    duplicate = true;
+                    break;
+                };
+                if (duplicate) {
+                    try self.skipObject(self.object_depth);
+                    continue;
+                }
+            }
             const key = try self.alloc.dupe(u8, tok.name);
             errdefer self.alloc.free(key);
 
-            const value: Object = if (projection == .property_table and self.source_ref != null and self.unread.items.len == 0 and (try self.nextIsDictionary())) blk: {
+            const value: Object = if (selected.view and self.source_ref != null) blk: {
+                try self.skipSpaceAndComments();
+                const first = self.peekByte() orelse return error.UnexpectedEof;
+                if (first != '<' and first != '[' and first != '(' and first != '/')
+                    break :blk try self.readObjectProjected(.full);
+                const start = self.base_offset + self.pos;
+                try self.skipObject(self.object_depth);
+                break :blk .{ .deferred = .{ .reference = self.source_ref.?, .start = start, .end = self.base_offset + self.pos } };
+            } else if (projection == .text_xobject and selected.child == .full and !selected.skip) blk: {
+                // Classification includes an optional late Subtype2 /PS. Defer
+                // allocating Form fields until it is complete, but parse the
+                // common scalar resource references once without a rescan.
+                try self.skipSpaceAndComments();
+                if (self.peekByte()) |first| if (std.ascii.isDigit(first))
+                    break :blk try self.readObjectProjected(selected.child);
+                const start = self.base_offset + self.pos;
+                try self.skipObject(self.object_depth);
+                deferred_form_fields = true;
+                break :blk .{ .deferred = .{ .reference = self.source_ref orelse .{ .id = 0, .gen = 0 }, .start = start, .end = self.base_offset + self.pos } };
+            } else if (projection == .property_table and self.source_ref != null and self.unread.items.len == 0 and (try self.nextIsDictionary())) blk: {
                 try self.skipSpaceAndComments();
                 const start = self.base_offset + self.pos;
                 try self.skipObject(self.object_depth);
@@ -506,8 +731,47 @@ pub const Scanner = struct {
             }
 
             try entries.append(self.alloc, .{ .key = key, .value = value });
+            if (projection == .text_xobject and !subtype_seen and std.mem.eql(u8, key, "Subtype")) {
+                subtype_seen = true;
+                form = std.mem.eql(u8, value.asName() orelse "", "Form");
+                header_only = !form or postscript;
+            }
+            if (projection == .text_xobject and !secondary_subtype_seen and std.mem.eql(u8, key, "Subtype2")) {
+                secondary_subtype_seen = true;
+                postscript = std.mem.eql(u8, value.asName() orelse "", "PS");
+                header_only = postscript or (subtype_seen and !form);
+            }
         }
 
+        // Native extraction consumes only PDF Form payloads. Other subtypes
+        // (including both PostScript encodings) need no validated byte range.
+        header_only = projection == .text_xobject and (!form or postscript);
+        if (header_only) {
+            // Classification keys may occur anywhere. Drop deferred Form
+            // fields; fields after a known ignored subtype were skipped.
+            var kept: usize = 0;
+            for (entries.items) |*entry| {
+                if (Projection.xobject_header.field(entry.key).keep) {
+                    entries.items[kept] = entry.*;
+                    kept += 1;
+                } else entry.deinit(self.alloc);
+            }
+            entries.shrinkRetainingCapacity(kept);
+        } else if (deferred_form_fields) {
+            for (entries.items) |*entry| {
+                if (entry.value != .deferred) continue;
+                const location = entry.value.deferred;
+                var field_scanner = Scanner.initWithOffset(self.alloc, self.bytes[location.start - self.base_offset .. location.end - self.base_offset], location.start);
+                field_scanner.source_ref = self.source_ref;
+                field_scanner.control = self.control;
+                field_scanner.allow_stream = self.allow_stream;
+                field_scanner.max_object_depth = self.max_object_depth;
+                field_scanner.object_depth = self.object_depth;
+                field_scanner.stream_length_resolver = self.stream_length_resolver;
+                defer field_scanner.deinit();
+                entry.value = try field_scanner.readObjectProjected(projection.field(entry.key).child);
+            }
+        }
         const owned = try entries.toOwnedSlice(self.alloc);
         entries = .empty;
         errdefer {
@@ -515,7 +779,7 @@ pub const Scanner = struct {
             self.alloc.free(owned);
         }
 
-        if (!self.allow_stream) return .{ .dict = owned };
+        if (!self.allow_stream or projection == .resource_fields or projection == .resource_table) return .{ .dict = owned };
         var tok = try self.readToken();
         defer tok.deinit(self.alloc);
         if (tok != .keyword or !std.mem.eql(u8, tok.keyword, "stream")) {
@@ -533,19 +797,26 @@ pub const Scanner = struct {
             else => return error.StreamMissingNewline,
         }
 
+        // Header-only views deliberately have no payload range. They cannot
+        // be passed to a stream decoder or mistaken for a validated stream.
+        if (projection == .xobject_header or projection == .color_profile_header or projection == .appearance_header or projection == .structure_metadata or header_only) return .{ .stream_header = owned };
+
         const data_start = self.pos;
         const data_offset = self.base_offset + data_start;
-        const actual_length = if (streamLength(owned)) |direct_length| blk: {
-            if (self.pos + direct_length > self.bytes.len) {
+        const actual_length = if (try self.streamLength(owned)) |direct_length| blk: {
+            if (direct_length > self.bytes.len - self.pos) {
                 return error.UnexpectedEof;
             }
             self.pos += direct_length;
+            // Seeking by a validated length does not scan payload bytes.
+            if (self.control != null) self.last_checked_pos = self.pos;
             break :blk direct_length;
         } else blk: {
-            const data_end = findEndStreamDataEnd(self.bytes, self.pos) orelse {
+            const data_end = (try findEndStreamDataEnd(self.bytes, self.pos, self.control)) orelse {
                 return error.MissingEndStream;
             };
             self.pos = data_end;
+            if (self.control != null) self.last_checked_pos = self.pos;
             break :blk data_end - data_start;
         };
 
@@ -560,6 +831,35 @@ pub const Scanner = struct {
             .data_offset = data_offset,
             .data_length = actual_length,
         } };
+    }
+
+    fn streamLength(self: *Scanner, entries: []DictEntry) !?usize {
+        for (entries) |*entry| {
+            if (!std.mem.eql(u8, entry.key, "Length")) continue;
+            if (entry.value.asInteger()) |length| {
+                if (length < 0) return error.InvalidStreamLength;
+                return std.math.cast(usize, length) orelse error.InvalidStreamLength;
+            }
+            if (entry.value == .obj_ref) if (self.stream_length_resolver) |resolver| {
+                var object_stream = false;
+                for (entries) |field| {
+                    if (std.mem.eql(u8, field.key, "Type") and std.mem.eql(u8, field.value.asName() orelse "", "ObjStm")) {
+                        object_stream = true;
+                        break;
+                    }
+                }
+                const length = try resolver.resolve(resolver.context, entry.value.obj_ref, object_stream);
+                if (length) |resolved| {
+                    if (resolved > self.bytes.len - self.pos) return error.UnexpectedEof;
+                    // Cache the validated scalar in the owned header without
+                    // enlarging every Object or retaining a second map.
+                    entry.value = .{ .integer = std.math.cast(i64, resolved) orelse return error.InvalidStreamLength };
+                }
+                return length;
+            };
+            return null;
+        }
+        return null;
     }
 
     fn readToken(self: *Scanner) anyerror!Token {
@@ -714,18 +1014,24 @@ pub const Scanner = struct {
                 const number = (try numberToken(word)) orelse return error.UnexpectedKeyword;
                 if (number != .integer or number.integer < 0 or number.integer > std.math.maxInt(u32)) return;
                 const end = self.pos;
-                const generation = self.skipWord() catch {
-                    self.pos = end;
-                    return;
+                const generation = self.skipWord() catch |err| switch (err) {
+                    error.UnexpectedEof => {
+                        self.pos = end;
+                        return;
+                    },
+                    else => return err,
                 };
                 const gen = try numberToken(generation);
                 if (gen == null or gen.? != .integer or gen.?.integer < 0 or gen.?.integer > std.math.maxInt(u16)) {
                     self.pos = end;
                     return;
                 }
-                const suffix = self.skipWord() catch {
-                    self.pos = end;
-                    return;
+                const suffix = self.skipWord() catch |err| switch (err) {
+                    error.UnexpectedEof => {
+                        self.pos = end;
+                        return;
+                    },
+                    else => return err,
                 };
                 if (!std.mem.eql(u8, suffix, "R")) self.pos = end;
             },
@@ -965,22 +1271,19 @@ fn numberToken(text: []const u8) !?Token {
     return null;
 }
 
-fn streamLength(entries: []const DictEntry) ?usize {
-    for (entries) |entry| {
-        if (std.mem.eql(u8, entry.key, "Length")) {
-            const len_i = entry.value.asInteger() orelse return null;
-            if (len_i < 0) return null;
-            return @intCast(len_i);
-        }
-    }
-    return null;
-}
-
-fn findEndStreamDataEnd(bytes: []const u8, start: usize) ?usize {
+fn findEndStreamDataEnd(bytes: []const u8, start: usize, control: ?*ScanControl) !?usize {
     var search = start;
     while (search < bytes.len) {
-        const maybe_idx = std.mem.indexOf(u8, bytes[search..], "endstream") orelse return null;
+        // Include marker overlap while bounding each cancellation/work interval.
+        const window_end = if (control != null) search + @min(bytes.len - search, 4096) else bytes.len;
+        const scan_end = window_end + @min(bytes.len - window_end, "endstream".len - 1);
+        const maybe_idx = std.mem.indexOf(u8, bytes[search..scan_end], "endstream") orelse {
+            if (control) |active| try active.spend(window_end - search);
+            search = window_end;
+            continue;
+        };
         const kw_pos = search + maybe_idx;
+        if (control) |active| try active.spend(maybe_idx + "endstream".len);
         if (kw_pos > start and !isSpace(bytes[kw_pos - 1])) {
             search = kw_pos + "endstream".len;
             continue;
@@ -1620,4 +1923,493 @@ test "scanner polls cancellation and bounds work throughout long tokens and skip
         defer scanner.deinit();
         try std.testing.expectError(error.PdfMetadataWorkLimit, scanner.readObjectProjected(.property));
     }
+}
+
+test "scanner numeric lookahead propagates cancellation and work exhaustion" {
+    const a = std.testing.allocator;
+    const padding: [2048]u8 = @splat('X');
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    // Exercise both generation and R-suffix lookahead at every nearby poll
+    // boundary, including the two prefixes that previously swallowed Canceled.
+    for ([_][]const u8{ "0", "0 1 R" }) |number| {
+        for (1980..2020) |len| {
+            const input = try std.fmt.allocPrint(a, "<< /Padding ({s}) /ActualText (Label) /Private {s} >>", .{ padding[0..len], number });
+            defer a.free(input);
+            var probe = Probe{};
+            var control = ScanControl{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+            var scanner = Scanner.init(a, input);
+            scanner.control = &control;
+            defer scanner.deinit();
+            if (scanner.readObjectProjected(.property)) |result| {
+                var object = result;
+                defer object.deinit(a);
+                try std.testing.expect(probe.calls < 2);
+            } else |err| try std.testing.expectEqual(error.Canceled, err);
+        }
+        for (1..128) |limit| {
+            const input = try std.fmt.allocPrint(a, "<< /Private {s} >>", .{number});
+            defer a.free(input);
+            var control = ScanControl{ .remaining_work = limit };
+            var scanner = Scanner.init(a, input);
+            scanner.control = &control;
+            defer scanner.deinit();
+            if (scanner.readObjectProjected(.property)) |result| {
+                var object = result;
+                object.deinit(a);
+            } else |err| try std.testing.expectEqual(error.PdfMetadataWorkLimit, err);
+        }
+    }
+}
+
+test "scanner stream boundary search polls cancellation and bounds work" {
+    const a = std.testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(a);
+    try input.appendSlice(a, "<< /Type /ObjStm /N 1 /First 4 /Length 9 0 R >>\nstream\n");
+    for (0..8192) |_| try input.appendSlice(a, "xendstreamx");
+    try input.appendSlice(a, "\nendstream");
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    var probe = Probe{};
+    var control = ScanControl{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+    var scanner = Scanner.init(a, input.items);
+    scanner.control = &control;
+    defer scanner.deinit();
+    try std.testing.expectError(error.Canceled, scanner.readObject());
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expect(scanner.pos < input.items.len / 2);
+    try std.testing.expect(std.math.maxInt(usize) - control.remaining_work < 16 * 1024);
+    var limited = ScanControl{ .remaining_work = 1024 };
+    var bounded = Scanner.init(a, input.items);
+    bounded.control = &limited;
+    defer bounded.deinit();
+    try std.testing.expectError(error.PdfMetadataWorkLimit, bounded.readObject());
+    try std.testing.expect(bounded.pos < input.items.len / 2);
+}
+
+test "scanner controlled stream searches preserve markers across chunk boundaries" {
+    const a = std.testing.allocator;
+    for (0..9) |offset| {
+        const padding = try a.alloc(u8, 4096 - offset);
+        defer a.free(padding);
+        @memset(padding, 'X');
+        for ([_][]const u8{ "\n", "\r", "\r\n" }) |newline| {
+            const input = try std.fmt.allocPrint(a, "<< /Length 9 0 R >>\nstream\n{s}{s}endstream", .{ padding, newline });
+            defer a.free(input);
+            for ([_]bool{ false, true }) |controlled| {
+                var control = ScanControl{};
+                var scanner = Scanner.init(a, input);
+                scanner.control = if (controlled) &control else null;
+                defer scanner.deinit();
+                var object = try scanner.readObject();
+                defer object.deinit(a);
+                try std.testing.expectEqual(padding.len, object.stream.data_length);
+                try std.testing.expectEqualStrings(padding, input[object.stream.data_offset..][0..object.stream.data_length]);
+            }
+        }
+    }
+    // Unterminated payloads must consume bounded chunks, including a final
+    // partial marker, rather than retrying the same bytes or allocating.
+    for ([_][]const u8{ "", "X", "endstrea", "xendstreamx", " endstreamx", "xendstream " }) |input| {
+        var control = ScanControl{};
+        try std.testing.expectEqual(@as(?usize, null), try findEndStreamDataEnd(input, 0, &control));
+    }
+}
+
+test "scanner resolves indirect lengths before examining payload markers" {
+    const a = std.testing.allocator;
+    const payload = "before\nendstream\nendobj\nafter\r\n";
+    const input = "<< /Length 8 0 R >>\nstream\n" ++ payload ++ "\nendstream";
+    const Resolver = struct {
+        calls: usize = 0,
+        length: usize = payload.len,
+        failure: ?anyerror = null,
+        fn resolve(raw: *const anyopaque, ref: ObjRef, _: bool) anyerror!?usize {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u32, 8), ref.id);
+            if (self.failure) |err| return err;
+            return self.length;
+        }
+    };
+    var resolver = Resolver{};
+    var control = ScanControl{ .remaining_work = 1024 };
+    var scanner = Scanner.init(a, input);
+    scanner.control = &control;
+    scanner.stream_length_resolver = .{ .context = &resolver, .resolve = Resolver.resolve };
+    defer scanner.deinit();
+    var object = try scanner.readObject();
+    defer object.deinit(a);
+    try std.testing.expectEqualStrings(payload, input[object.stream.data_offset..][0..object.stream.data_length]);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(i64, payload.len), object.get("Length").?.integer);
+    for ([_]anyerror{ error.OutOfMemory, error.Canceled, error.PdfMetadataWorkLimit, error.InvalidStreamLength }) |failure| {
+        var failing = Resolver{ .failure = failure };
+        var failed = Scanner.init(a, input);
+        failed.stream_length_resolver = .{ .context = &failing, .resolve = Resolver.resolve };
+        defer failed.deinit();
+        try std.testing.expectError(failure, failed.readObject());
+    }
+    var too_long = Resolver{ .length = std.math.maxInt(usize) };
+    var invalid = Scanner.init(a, input);
+    invalid.stream_length_resolver = .{ .context = &too_long, .resolve = Resolver.resolve };
+    defer invalid.deinit();
+    try std.testing.expectError(error.UnexpectedEof, invalid.readObject());
+}
+
+test "scanner known stream lengths seek without charging payload scan work" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 32 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'X');
+    const input = try std.fmt.allocPrint(a, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ payload.len, payload });
+    defer a.free(input);
+    var control = ScanControl{ .remaining_work = 1024 };
+    var scanner = Scanner.init(a, input);
+    scanner.control = &control;
+    defer scanner.deinit();
+    var object = try scanner.readObject();
+    defer object.deinit(a);
+    try std.testing.expectEqual(payload.len, object.stream.data_length);
+    try std.testing.expect(control.remaining_work > 0);
+    var invalid = Scanner.init(a, "<< /Length -1 >>\nstream\nx\nendstream");
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidStreamLength, invalid.readObject());
+}
+
+test "scanner image header views never inspect payloads or resolve lengths" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 32 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'X');
+    const input = try std.fmt.allocPrint(a, "8 0 obj\n<< /Subtype /Image /Length 99 0 R /StructParent 10 0 R >>\nstream\n{s}", .{payload});
+    defer a.free(input);
+    const Resolver = struct {
+        calls: usize = 0,
+        fn resolve(raw: *const anyopaque, _: ObjRef, _: bool) anyerror!?usize {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return error.InvalidStreamLength;
+        }
+    };
+    var resolver = Resolver{};
+    var control = ScanControl{ .remaining_work = 1024 };
+    var scanner = Scanner.init(a, input);
+    scanner.control = &control;
+    scanner.stream_length_resolver = .{ .context = &resolver, .resolve = Resolver.resolve };
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.xobject_header);
+    defer object.deinit(a);
+    const header = object.obj_def.value;
+    try std.testing.expect(header.* == .stream_header);
+    try std.testing.expectEqualStrings("Image", header.get("Subtype").?.asName().?);
+    try std.testing.expect(header.get("StructParent") != null);
+    try std.testing.expect(header.get("Length") == null);
+    try std.testing.expectEqual(@as(usize, 0), resolver.calls);
+    try std.testing.expect(scanner.pos < input.len / 2);
+}
+
+test "scanner native XObjects classify images without resolving lengths in either dictionary order" {
+    const a = std.testing.allocator;
+    const Resolver = struct {
+        fn resolve(_: *const anyopaque, _: ObjRef, _: bool) anyerror!?usize {
+            return error.InvalidStreamLength;
+        }
+    };
+    for ([_][]const u8{
+        \\8 0 obj << /Subtype /Image /Length 99 0 R /StructParent 10 0 R /Resources << /Private (ignored) >> /Matrix [1 0 0 1 0 0] >>
+        \\stream
+        \\payload without a terminator
+        ,
+        \\8 0 obj << /Length 99 0 R /Resources << /Private (ignored) >> /Matrix [1 0 0 1 0 0] /StructParent 10 0 R /Subtype /Image >>
+        \\stream
+        \\payload without a terminator
+        ,
+    }) |input| {
+        var scanner = Scanner.init(a, input);
+        defer scanner.deinit();
+        scanner.stream_length_resolver = .{ .context = &scanner, .resolve = Resolver.resolve };
+        var object = try scanner.readObjectProjected(.text_xobject);
+        defer object.deinit(a);
+        const image = object.obj_def.value;
+        try std.testing.expect(image.* == .stream_header);
+        try std.testing.expectEqual(@as(usize, 2), image.stream_header.len);
+        try std.testing.expectEqualStrings("Image", image.get("Subtype").?.asName().?);
+        try std.testing.expect(image.get("StructParent") != null);
+        try std.testing.expect(image.get("Length") == null);
+        try std.testing.expect(image.get("Resources") == null);
+    }
+}
+
+fn exerciseNativeFormProjection(a: Allocator, input: []const u8) !void {
+    const payload = "BT (Hello) Tj ET";
+    const Resolver = struct {
+        calls: usize = 0,
+        fn resolve(raw: *const anyopaque, reference: ObjRef, object_stream: bool) anyerror!?usize {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u32, 9), reference.id);
+            try std.testing.expect(!object_stream);
+            return payload.len;
+        }
+    };
+    var resolver = Resolver{};
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    scanner.stream_length_resolver = .{ .context = &resolver, .resolve = Resolver.resolve };
+    var object = try scanner.readObjectProjected(.text_xobject);
+    defer object.deinit(a);
+    const form = object.obj_def.value;
+    try std.testing.expect(form.* == .stream);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqualStrings(payload, input[form.stream.data_offset..][0..form.stream.data_length]);
+    for ([_][]const u8{ "Subtype", "Type", "Length", "StructParents", "StructParent", "Resources", "BBox", "Matrix", "Group", "Filter", "DecodeParms" }) |field|
+        try std.testing.expect(form.get(field) != null);
+    try std.testing.expect(form.get("Private") == null);
+    try std.testing.expectEqual(@as(i64, payload.len), form.get("Length").?.integer);
+    try std.testing.expectEqual(@as(u32, 10), form.get("StructParents").?.obj_ref.id);
+}
+
+test "scanner native Form projection retains extraction fields and resolves length once" {
+    const a = std.testing.allocator;
+    const fields = "/Type /XObject /Length 9 0 R /StructParents 10 0 R /StructParent 11 0 R /Resources << /Font << /F1 5 0 R >> >> /BBox [0 0 10 10] /Matrix [1 0 0 1 0 0] /Group << /S /Transparency /I true /K false >> /Filter [] /DecodeParms null /Private (ignored) ";
+    for ([_][]const u8{
+        "8 0 obj << /Subtype /Form " ++ fields ++ ">>\nstream\nBT (Hello) Tj ET\nendstream\nendobj",
+        "8 0 obj << " ++ fields ++ "/Subtype /Form >>\nstream\nBT (Hello) Tj ET\nendstream\nendobj",
+        "8 0 obj << /Subtype /Form " ++ fields ++ "/Subtype2 /Other >>\nstream\nBT (Hello) Tj ET\nendstream\nendobj",
+        "8 0 obj << /Subtype2 /Other " ++ fields ++ "/Subtype /Form >>\nstream\nBT (Hello) Tj ET\nendstream\nendobj",
+    }) |input| {
+        try exerciseNativeFormProjection(a, input);
+        try std.testing.checkAllAllocationFailures(a, exerciseNativeFormProjection, .{input});
+    }
+}
+
+test "scanner native image fields before Subtype do not materialize" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const input = try std.fmt.allocPrint(a, "8 0 obj << /Resources << /Private ({s}) >> /Filter [/FlateDecode /{s}] /DecodeParms [null << /Private ({s}) >>] /Subtype /Image /Length 99 0 R >>\nstream\nABC", .{ padding, padding, padding });
+    defer a.free(input);
+    var backing: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var scanner = Scanner.init(fixed.allocator(), input);
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.text_xobject);
+    defer object.deinit(fixed.allocator());
+    try std.testing.expect(object.obj_def.value.* == .stream_header);
+    try std.testing.expectEqual(@as(usize, 1), object.obj_def.value.stream_header.len);
+    var control = ScanControl{ .remaining_work = 1024 };
+    var limited = Scanner.init(a, input);
+    defer limited.deinit();
+    limited.control = &control;
+    try std.testing.expectError(error.PdfMetadataWorkLimit, limited.readObjectProjected(.text_xobject));
+}
+
+fn exerciseIgnoredXObjectProjection(a: Allocator, input: []const u8) !void {
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.text_xobject);
+    defer object.deinit(a);
+    try std.testing.expect(object.obj_def.value.* == .stream_header);
+    try std.testing.expect(object.obj_def.value.get("Resources") == null);
+    try std.testing.expect(object.obj_def.value.get("Length") == null);
+    var copy = try object.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expect(copy.obj_def.value.get("StructParent") != null);
+}
+
+test "scanner native ignored XObjects never allocate payload fields in any subtype order" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 64 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const cases = [_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "/Subtype /PS", .after = "" },
+        .{ .before = "", .after = "/Subtype /PS" },
+        .{ .before = "/Subtype /Form", .after = "/Subtype2 /PS" },
+        .{ .before = "/Subtype2 /PS", .after = "/Subtype /Form" },
+        .{ .before = "", .after = "/Subtype /Form /Subtype2 /PS" },
+        .{ .before = "/Subtype /Unknown", .after = "" },
+        .{ .before = "", .after = "" },
+    };
+    for (cases) |case| {
+        const input = try std.fmt.allocPrint(a, "8 0 obj << {s} /Resources << /Private ({s}) >> /Filter [/{s}] /DecodeParms << /Private ({s}) >> /Length 99 0 R {s} /StructParent 10 0 R >>\nstream\nno payload terminator", .{ case.before, padding, padding, padding, case.after });
+        defer a.free(input);
+        var backing: [4096]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&backing);
+        try exerciseIgnoredXObjectProjection(fixed.allocator(), input);
+        var control = ScanControl{ .remaining_work = 1024 };
+        var limited = Scanner.init(a, input);
+        defer limited.deinit();
+        limited.control = &control;
+        try std.testing.expectError(error.PdfMetadataWorkLimit, limited.readObjectProjected(.text_xobject));
+        const Probe = struct {
+            calls: usize = 0,
+            fn cancelled(raw: ?*const anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+                self.calls += 1;
+                return self.calls >= 2;
+            }
+        };
+        var probe = Probe{};
+        var cancellation = ScanControl{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+        var canceled = Scanner.init(a, input);
+        defer canceled.deinit();
+        canceled.control = &cancellation;
+        try std.testing.expectError(error.Canceled, canceled.readObjectProjected(.text_xobject));
+        try std.testing.expectEqual(@as(usize, 2), probe.calls);
+        const small = try std.fmt.allocPrint(a, "8 0 obj << {s} /Resources << /Private (owned) >> /Filter [/Private] /Length 99 0 R {s} /StructParent 10 0 R >>\nstream\nignored", .{ case.before, case.after });
+        defer a.free(small);
+        try std.testing.checkAllAllocationFailures(a, exerciseIgnoredXObjectProjection, .{small});
+    }
+}
+
+fn exerciseFormResourceViews(a: Allocator, input: []const u8) !void {
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.text_xobject);
+    defer object.deinit(a);
+    const resources = object.obj_def.value.get("Resources").?;
+    try std.testing.expect(resources.* == .dict);
+    try std.testing.expect(resources.get("Private") == null);
+    try std.testing.expectEqual(@as(u32, 5), resources.get("Font").?.get("F1").?.obj_ref.id);
+    for ([_][]const u8{"Properties"}) |name| {
+        const field = resources.get(name).?;
+        try std.testing.expect(field.* == .deferred);
+        try std.testing.expectEqual(@as(u32, 8), field.deferred.reference.id);
+        try std.testing.expect(field.deferred.start < field.deferred.end);
+    }
+    var copy = try object.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expectEqual(@as(u32, 5), copy.obj_def.value.get("Resources").?.get("Font").?.get("F1").?.obj_ref.id);
+}
+
+test "scanner native Form resources index only needed fields without rescanning opaque data" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 64 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const input = try std.fmt.allocPrint(a, "8 0 obj << /Subtype /Form /Resources << /Font << /F1 5 0 R >>\n%{s}\n/Private ({s}) /Properties << /Unused << /ActualText ({s}) >> >> >> /Length 1 >>\nstream\nx\nendstream\nendobj", .{ padding, padding, padding });
+    defer a.free(input);
+    var backing: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    try exerciseFormResourceViews(fixed.allocator(), input);
+    var control = ScanControl{ .remaining_work = input.len * 3 };
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    scanner.control = &control;
+    var object = try scanner.readObjectProjected(.text_xobject);
+    defer object.deinit(a);
+    try std.testing.expect(control.remaining_work > 0);
+    const small = "8 0 obj << /Subtype /Form /Resources << /Font << /F1 5 0 R >> /Private (ignored) /Properties << /Tag << /ActualText (Label) >> >> >> /Length 1 >>\nstream\nx\nendstream\nendobj";
+    try std.testing.checkAllAllocationFailures(a, exerciseFormResourceViews, .{small});
+}
+
+test "scanner resource views preserve scalar references and bound repeated keys" {
+    const a = std.testing.allocator;
+    const input = "8 0 obj << /Resources << /Font +5 0 R /Font << /Ignored (duplicate) >> /Properties 6 0 R /XObject null >> /Subtype /Form /Length 1 >>\nstream\nx\nendstream\nendobj";
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.text_xobject);
+    defer object.deinit(a);
+    const resources = object.obj_def.value.get("Resources").?;
+    try std.testing.expectEqual(@as(usize, 3), resources.dict.len);
+    try std.testing.expectEqual(@as(u32, 5), resources.get("Font").?.obj_ref.id);
+    try std.testing.expectEqual(@as(u32, 6), resources.get("Properties").?.obj_ref.id);
+    try std.testing.expect(resources.get("XObject").?.* == .null);
+}
+
+fn exerciseColorProfileHeader(a: Allocator, input: []const u8) !void {
+    const Resolver = struct {
+        fn resolve(_: *const anyopaque, _: ObjRef, _: bool) anyerror!?usize {
+            return error.InvalidStreamLength;
+        }
+    };
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    scanner.stream_length_resolver = .{ .context = &scanner, .resolve = Resolver.resolve };
+    var object = try scanner.readObjectProjected(.color_profile_header);
+    defer object.deinit(a);
+    const header = object.obj_def.value;
+    try std.testing.expect(header.* == .stream_header);
+    try std.testing.expectEqual(@as(i64, 3), header.get("N").?.integer);
+    try std.testing.expectEqualStrings("DeviceRGB", header.get("Alternate").?.asName().?);
+    try std.testing.expectEqual(@as(usize, 6), header.get("Range").?.array.len);
+    try std.testing.expect(header.get("Length") == null);
+    try std.testing.expect(header.get("Metadata") == null);
+    var copy = try header.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expect(copy == .stream_header);
+}
+
+test "scanner color profile headers never resolve lengths or inspect payload boundaries" {
+    const a = std.testing.allocator;
+    const input = "8 0 obj << /Length 99 0 R /N 3 /Alternate /DeviceRGB /Range [0 1 0 1 0 1] /Metadata (ignored) >>\nstream\nno payload terminator";
+    try std.testing.checkAllAllocationFailures(a, exerciseColorProfileHeader, .{input});
+}
+
+fn exerciseSelectedResourceEntries(a: Allocator, input: []const u8) !void {
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(a);
+    try names.put(a, "F1", {});
+    try names.put(a, "Bad#x#41", {});
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    scanner.source_ref = .{ .id = 8, .gen = 0 };
+    scanner.resource_names = &names;
+    var table = try scanner.readObjectProjected(.resource_entries);
+    defer table.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), table.dict.len);
+    try std.testing.expect(table.get("F1").?.* == .deferred);
+    try std.testing.expectEqual(@as(u32, 5), table.get("Bad#x#41").?.obj_ref.id);
+}
+
+test "scanner resource indexes stay bounded across large tables and subtype orders" {
+    const a = std.testing.allocator;
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    for (0..4096) |i| try table.print(a, "/F{d} 5 0 R ", .{i});
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "", .after = "/Subtype /Image" },
+        .{ .before = "/Subtype /Form", .after = "/Subtype2 /PS" },
+        .{ .before = "/Subtype2 /PS", .after = "/Subtype /Form" },
+        .{ .before = "/Subtype /Image", .after = "" },
+    }) |order| {
+        const input = try std.fmt.allocPrint(a, "8 0 obj << {s} /Resources << /Font << {s} >> /XObject << {s} >> /ExtGState << {s} >> /ColorSpace << {s} >> >> {s} /Length 99 0 R >>\nstream\nignored", .{ order.before, table.items, table.items, table.items, table.items, order.after });
+        defer a.free(input);
+        var buffer: [8192]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+        var scanner = Scanner.init(fixed.allocator(), input);
+        defer scanner.deinit();
+        var object = try scanner.readObjectProjected(.text_xobject);
+        defer object.deinit(fixed.allocator());
+        try std.testing.expect(object.obj_def.value.* == .stream_header);
+    }
+}
+
+test "scanner demanded resource tables select decoded names without allocating unused keys" {
+    const a = std.testing.allocator;
+    const huge_key = try a.alloc(u8, 128 * 1024);
+    defer a.free(huge_key);
+    @memset(huge_key, 'X');
+    const input = try std.fmt.allocPrint(a, "<< /Unused 1 /{s} << /Private ({s}) >> /F#31 << /Subtype /Type1 >> /Bad#x#41 5 0 R >>", .{ huge_key, huge_key });
+    defer a.free(input);
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    try exerciseSelectedResourceEntries(fixed.allocator(), input);
+    try std.testing.checkAllAllocationFailures(a, exerciseSelectedResourceEntries, .{"<< /Unused 1 /F#31 << /Subtype /Type1 >> /Bad#x#41 5 0 R >>"});
 }

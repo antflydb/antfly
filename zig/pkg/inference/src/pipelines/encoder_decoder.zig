@@ -296,7 +296,7 @@ pub fn findMergedDecoder(allocator: std.mem.Allocator, model_dir: []const u8) !?
 /// the coalesced cold constructor, not to every cached acquisition.
 pub fn findMergedDecoderWithArtifacts(artifacts: *const @import("../registry/published_artifacts.zig").PublishedArtifacts) !?[]const u8 {
     for ([_][]const u8{ "decoder_model_merged.onnx", "onnx/decoder_model_merged.onnx" }) |relative| {
-        if (try artifacts.resolve(relative)) |path| return path;
+        if (try artifacts.resolveModel(relative)) |path| return path;
     }
     return null;
 }
@@ -352,7 +352,7 @@ fn findPublishedModelFile(a: std.mem.Allocator, artifacts: *@import("../registry
         for (candidates) |name| {
             const relative = if (directory.len == 0) try a.dupe(u8, name) else try std.fs.path.join(a, &.{ directory, name });
             defer a.free(relative);
-            if (try artifacts.resolve(relative)) |path| {
+            if (try artifacts.resolveModel(relative)) |path| {
                 errdefer a.free(path);
                 try artifacts.verifyFile(relative);
                 return path;
@@ -557,4 +557,23 @@ test "findEncoderDecoderPaths falls back to native Florence decoder" {
 
     try std.testing.expect(std.mem.endsWith(u8, paths.encoder, "onnx/vision_encoder.onnx"));
     try std.testing.expectEqualStrings(model_dir, paths.decoder);
+}
+
+test "model selection component discovery preserves ONNX aliases before binding" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/encoder", .data = "data" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/decoder", .data = "data" });
+    try tmp.dir.symLink(io, "blobs/encoder", "encoder_model.onnx", .{});
+    try tmp.dir.symLink(io, "blobs/decoder", "decoder_model.onnx", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const paths = try findEncoderDecoderPaths(a, root);
+    defer a.free(paths.encoder);
+    defer a.free(paths.decoder);
+    try std.testing.expect(std.mem.endsWith(u8, paths.encoder, "/encoder_model.onnx"));
+    try std.testing.expect(std.mem.endsWith(u8, paths.decoder, "/decoder_model.onnx"));
 }

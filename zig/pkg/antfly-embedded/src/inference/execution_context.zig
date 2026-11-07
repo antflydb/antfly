@@ -58,6 +58,67 @@ pub const Progress = execution_control.Progress;
 pub const ProgressSink = execution_control.ProgressSink;
 pub const RequestContext = execution_control.RequestContext;
 
+/// Whether `endpoint` is `default_endpoint`, compared after the `/ai/v1`
+/// normalization every Antfly inference client applies. Empty values never
+/// match. The node default credential is scoped by this comparison against
+/// the effective endpoint a request executes against.
+pub fn isDefaultEndpoint(endpoint: []const u8, default_endpoint: ?[]const u8) bool {
+    const configured = default_endpoint orelse return false;
+    const requested = canonicalEndpoint(endpoint);
+    const node_default = canonicalEndpoint(configured);
+    return requested.len > 0 and node_default.len > 0 and sameEndpoint(requested, node_default);
+}
+
+/// Scheme and host compare case-insensitively (RFC 3986 §6.2.2.1); userinfo,
+/// port, path, query and fragment compare exactly, so a case-distinct route
+/// prefix on a shared gateway never receives the node credential.
+fn sameEndpoint(a: []const u8, b: []const u8) bool {
+    const a_split = splitOrigin(a);
+    const b_split = splitOrigin(b);
+    return std.ascii.eqlIgnoreCase(a_split.scheme, b_split.scheme) and
+        sameAuthority(a_split.authority, b_split.authority) and
+        std.mem.eql(u8, a_split.rest, b_split.rest);
+}
+
+const OriginSplit = struct { scheme: []const u8, authority: []const u8, rest: []const u8 };
+
+fn splitOrigin(url: []const u8) OriginSplit {
+    const sep = std.mem.indexOf(u8, url, "://") orelse return .{ .scheme = "", .authority = "", .rest = url };
+    const after = url[sep + 3 ..];
+    const end = std.mem.indexOfAny(u8, after, "/?#") orelse after.len;
+    return .{ .scheme = url[0..sep], .authority = after[0..end], .rest = after[end..] };
+}
+
+fn sameAuthority(a: []const u8, b: []const u8) bool {
+    // Userinfo is case-sensitive; only fold when neither side carries it.
+    if (std.mem.indexOfScalar(u8, a, '@') != null or std.mem.indexOfScalar(u8, b, '@') != null) {
+        return std.mem.eql(u8, a, b);
+    }
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+/// Mirrors transport normalization: trailing slashes are dropped and exactly
+/// one `/ai/v1` suffix is implied. Interior slashes stay significant, so
+/// `/tenantA//ai/v1` (a distinct request path) never matches `/tenantA/ai/v1`.
+fn canonicalEndpoint(raw: []const u8) []const u8 {
+    const canonical = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \t\r\n"), "/");
+    if (std.mem.endsWith(u8, canonical, "/ai/v1")) return canonical[0 .. canonical.len - "/ai/v1".len];
+    return canonical;
+}
+
+/// Node-level credential paired with `ExecutionEnvironment.default_endpoint`.
+/// `reference` is normally an unresolved `${secret:...}` reference; it is
+/// resolved per request so stored-secret rotation reaches running workers and
+/// no resolved token is retained by a durable provider owner.
+pub const DefaultCredential = struct {
+    reference: []const u8,
+    /// Borrowed process resolver (for example the node secret store). It must
+    /// outlive every environment that carries this credential.
+    resolver: ?*anyopaque = null,
+    /// Returns an owned token, or null when the reference resolves to nothing.
+    resolve: *const fn (resolver: ?*anyopaque, alloc: std.mem.Allocator, reference: []const u8) anyerror!?[]u8,
+};
+
 /// Durable, task-neutral execution environment. Provider owners may retain
 /// this value; each invocation derives a short-lived `RequestContext` from it.
 pub const ExecutionEnvironment = struct {
@@ -82,6 +143,8 @@ pub const ExecutionEnvironment = struct {
     /// retain it beyond their durable provider owner. Standalone invocations
     /// may create a call-scoped compatibility client when it is absent.
     http_client: ?*httpx.Client = null,
+    /// Credential for `default_endpoint` only; see `defaultAuthorizationAlloc`.
+    default_credential: ?DefaultCredential = null,
 
     pub fn resolveAntflyEndpoint(
         self: ExecutionEnvironment,
@@ -96,6 +159,23 @@ pub const ExecutionEnvironment = struct {
             if (std.mem.trim(u8, endpoint, " \t\r\n").len > 0) return endpoint;
         }
         return null;
+    }
+
+    /// Owned `Authorization` value for a request whose effective endpoint is
+    /// `default_endpoint` (inherited, or named explicitly). Null otherwise, so
+    /// a third-party per-model URL is never sent the node credential.
+    pub fn defaultAuthorizationAlloc(
+        self: ExecutionEnvironment,
+        alloc: std.mem.Allocator,
+        resolved_endpoint: ?[]const u8,
+    ) !?[]u8 {
+        const resolved = resolved_endpoint orelse return null;
+        if (!isDefaultEndpoint(resolved, self.default_endpoint)) return null;
+        const credential = self.default_credential orelse return null;
+        const token = (try credential.resolve(credential.resolver, alloc, credential.reference)) orelse return null;
+        defer alloc.free(token);
+        if (token.len == 0) return null;
+        return try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
     }
 
     pub fn waitContext(self: ExecutionEnvironment) remote_capabilities.WaitContext {
@@ -156,6 +236,49 @@ test "execution context gives explicit and linked routes precedence" {
         context.resolveAntflyEndpoint(null, false).?,
     );
     try std.testing.expect((Context{ .default_endpoint = " \t" }).resolveAntflyEndpoint(null, false) == null);
+}
+
+test "default credential authorizes only the default endpoint" {
+    const Resolver = struct {
+        fn resolve(_: ?*anyopaque, alloc: std.mem.Allocator, reference: []const u8) anyerror!?[]u8 {
+            try std.testing.expectEqualStrings("${secret:node.key}", reference);
+            return try alloc.dupe(u8, "node-token");
+        }
+    };
+    const alloc = std.testing.allocator;
+    const context = Context{
+        .default_endpoint = "http://shared/ai/v1",
+        .default_credential = .{ .reference = "${secret:node.key}", .resolve = Resolver.resolve },
+    };
+    const authorization = (try context.defaultAuthorizationAlloc(alloc, "http://shared/ai/v1")).?;
+    defer alloc.free(authorization);
+    try std.testing.expectEqualStrings("Bearer node-token", authorization);
+    // Naming the default endpoint explicitly is still the default endpoint.
+    const explicit = (try context.defaultAuthorizationAlloc(alloc, "http://shared/")).?;
+    defer alloc.free(explicit);
+    try std.testing.expectEqualStrings("Bearer node-token", explicit);
+    // Another (possibly third-party) endpoint never receives it.
+    try std.testing.expect(try context.defaultAuthorizationAlloc(alloc, "http://third-party/ai/v1") == null);
+    // Linked/in-process execution has no remote endpoint.
+    try std.testing.expect(try context.defaultAuthorizationAlloc(alloc, null) == null);
+    try std.testing.expect(try (Context{ .default_endpoint = "http://shared" }).defaultAuthorizationAlloc(alloc, "http://shared") == null);
+}
+
+test "default endpoint match folds only scheme and host case" {
+    const default_url = "https://Gateway.example/tenantA/ai/v1";
+    try std.testing.expect(isDefaultEndpoint("HTTPS://gateway.EXAMPLE/tenantA/ai/v1", default_url));
+    try std.testing.expect(isDefaultEndpoint("https://gateway.example/tenantA/", default_url));
+    // Route prefixes are case-sensitive: a different tenant route must not match.
+    try std.testing.expect(!isDefaultEndpoint("https://gateway.example/tenanta/ai/v1", default_url));
+    try std.testing.expect(!isDefaultEndpoint("https://gateway.example/TENANTA/ai/v1", default_url));
+    // Ports and userinfo are not folded away.
+    try std.testing.expect(!isDefaultEndpoint("https://gateway.example:8443/tenantA/ai/v1", default_url));
+    try std.testing.expect(!isDefaultEndpoint("https://User@gateway.example/x", "https://user@gateway.example/x"));
+    try std.testing.expect(isDefaultEndpoint("https://user@gateway.example/x", "https://user@gateway.example/x"));
+    // Interior slashes are a distinct request path, not a spelling of the default.
+    try std.testing.expect(!isDefaultEndpoint("https://gateway.example/tenantA//ai/v1", default_url));
+    try std.testing.expect(!isDefaultEndpoint("https://gateway.example//ai/v1", "https://gateway.example"));
+    try std.testing.expect(isDefaultEndpoint("https://gateway.example/ai/v1/", "https://gateway.example/"));
 }
 
 test "routing context appends trusted table header" {

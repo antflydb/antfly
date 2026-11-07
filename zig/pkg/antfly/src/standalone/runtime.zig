@@ -5431,6 +5431,7 @@ pub fn runFromIterator(
         });
         try storage_kernel_context.configureRemoteContent(remote_content);
         try storage_kernel_context.configureSecrets(&secret_store);
+        if (loaded_config) |*cfg| try storage_kernel_context.configureInferenceDefaults(cfg.inference.api_url, cfg.inference.api_key);
         const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, if (loaded_config) |*cfg| cfg else null, .standalone, data_dir);
         defer alloc.free(retained_setup);
         try storage_kernel_context.configureNativeQueries(retained_setup);
@@ -5701,7 +5702,13 @@ pub fn runFromIterator(
     // Attach before opening any context-backed auth/system stores. Those
     // handles intentionally retain the storage context for their lifetime;
     // attaching afterward is rejected as a live-owner configuration mutation.
-    if (comptime control_only_storage_sources)
+    //
+    // With an explicit inference.api_url, skip the in-process provider (same
+    // isolation as the API server; see `embedded_inference_enabled`) so
+    // storage-owned chunkers and asset producers use the configured endpoint
+    // and its default credential, not the disabled embedded runtime, which
+    // would answer ModelNotFound or run the model in-process.
+    if (comptime control_only_storage_sources) if (embedded_inference_enabled)
         try storage_kernel_context.attachInferenceProvider(antfly_node);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.initWithOptions(

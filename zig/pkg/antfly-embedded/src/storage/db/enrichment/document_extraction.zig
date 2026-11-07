@@ -2611,7 +2611,7 @@ fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: 
     return try alloc.dupe(u8, current.string);
 }
 
-pub const native_text_extraction_identity = "native-text-v7";
+pub const native_text_extraction_identity = "native-text-v8";
 
 /// True for exactly 64 ASCII hex digits (either case). SHA-256 is the only
 /// declared algorithm today.
