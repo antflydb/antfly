@@ -976,7 +976,12 @@ pub const FsStore = struct {
             _ = std.fmt.hexToBytes(&scope.attempt, entry.name) catch continue;
             scope.validate() catch continue;
             if (scope.fencingToken() < floor or scope.fencingToken() >= cutoff) continue;
-            _ = try self.reclaimEmptyScopedAttempt(io, scope, cancellation);
+            _ = self.reclaimEmptyScopedAttempt(io, scope, cancellation) catch |err| switch (err) {
+                // This API only retires empty namespaces. Journal visitors
+                // handle resumable temporary discovery on their next turn.
+                error.ArtifactEnumerationPaused => continue,
+                else => return err,
+            };
         }
     }
 
@@ -2008,4 +2013,28 @@ test "external lake filesystem journal migrates unidentified legacy continuation
     defer a.free(legacy);
     try store.visitScopedUploads(scope.domain, .{ .ptr = &visitor, .visit = Visitor.visit, .checkpoint = Visitor.checkpoint, .continuation = legacy, .cleanup_staging = true, .reclaim_retired_inventory = true, .fencing_cutoff = 2, .max_entries = 8 }, .none);
     try std.testing.expectEqual(@as(usize, 2), visitor.count);
+}
+
+test "external lake filesystem journal generic retirement preserves nonempty legacy attempts" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "journal-generic-legacy");
+    defer cleanupTmp(path);
+    var backend = try FsStore.init(a, std.mem.span(path));
+    defer backend.deinit();
+    var store = backend.artifactStore();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(59), 1, std.testing.io);
+    var value = try store.putScoped(scope, "legacy pending", .none);
+    defer value.deinit(a);
+    const payload = try pathForArtifactIdAlloc(a, backend.root_dir, value.artifact_id);
+    defer a.free(payload);
+    const temporary = try std.fmt.allocPrint(a, "{s}.tmp-00000000000000000000000000000001", .{payload});
+    defer a.free(temporary);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = temporary, .data = "legacy pending" });
+    try store.delete(value.artifact_id);
+    try store.reclaimRetiredScopedInventory(scope.domain, 0, 2, .none);
+    try std.Io.Dir.cwd().access(std.testing.io, temporary, .{});
+    try store.cleanupRetiredScopedTemporaries(scope.domain, 2, .none);
+    try store.reclaimRetiredScopedInventory(scope.domain, 0, 2, .none);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, std.fs.path.dirname(payload).?, .{}));
 }
