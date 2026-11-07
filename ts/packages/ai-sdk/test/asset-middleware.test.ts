@@ -1,4 +1,4 @@
-import type { LanguageModelV4, LanguageModelV4CallOptions } from "@ai-sdk/provider";
+import type { LanguageModelV4, LanguageModelV4CallOptions, ProviderV4 } from "@ai-sdk/provider";
 import { AntflyClient } from "@antfly/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AssetFetchError, createAssetMiddleware } from "../src/asset/middleware.js";
@@ -380,4 +380,128 @@ it.each([
     expect(part.data.type).toBe("reference");
     expect(upload.mock.calls[0][0].mediaType).toBe(resource.mime_type);
   } else expect(part.data).toEqual({ type: "data", data: videoBytes });
+});
+
+it("inlines assets when the supplied provider has no optional files API", async () => {
+  stubCatalogAndMediaFetch();
+  const provider: ProviderV4 = {
+    specificationVersion: "v4",
+    languageModel: vi.fn(),
+    embeddingModel: vi.fn(),
+    imageModel: vi.fn(),
+  };
+  const middleware = createAssetMiddleware({
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    authorize: () => true,
+    allowVendorUpload: true,
+    files: provider,
+  });
+  const result = await middleware.transformParams?.({
+    type: "generate",
+    params: paramsWithReferencePart(),
+    model: fakeModel("external"),
+  });
+  expect(result?.prompt[0]).toMatchObject({
+    content: [{ type: "text" }, { type: "file", data: { type: "data", data: videoBytes } }],
+  });
+  expect(JSON.stringify(result)).not.toContain(resource.uri);
+});
+
+it("resolves provider files lazily on cache misses and preserves the factory receiver", async () => {
+  const fetch = stubCatalogAndMediaFetch();
+  const uploadFile = vi
+    .fn()
+    .mockResolvedValue({ providerReference: { vendor: "file-1" }, warnings: [] });
+  const api = { specificationVersion: "v4" as const, provider: "vendor", uploadFile };
+  const provider = {
+    specificationVersion: "v4" as const,
+    languageModel: vi.fn(),
+    embeddingModel: vi.fn(),
+    imageModel: vi.fn(),
+    files: vi.fn(function (this: ProviderV4) {
+      expect(this).toBe(provider);
+      return api;
+    }),
+  } satisfies ProviderV4;
+  const authorize = vi.fn(() => true);
+  const middleware = createAssetMiddleware({
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    authorize,
+    allowVendorUpload: true,
+    files: provider,
+  });
+  expect(provider.files).not.toHaveBeenCalled();
+  for (let call = 0; call < 2; call++) {
+    await middleware.transformParams?.({
+      type: "generate",
+      params: paramsWithReferencePart(),
+      model: fakeModel("vendor"),
+    });
+  }
+  expect(authorize).toHaveBeenCalledTimes(2);
+  expect(provider.files).toHaveBeenCalledOnce();
+  expect(uploadFile).toHaveBeenCalledOnce();
+  expect(fetch.mock.calls.filter(([input]) => input === resource.uri)).toHaveLength(1);
+});
+
+it.each([
+  "factory",
+  "upload",
+] as const)("preserves genuine %s failures without an inline fallback", async (phase) => {
+  const fetch = stubCatalogAndMediaFetch();
+  const failure = new Error("vendor operation failed");
+  const uploadFile = vi.fn().mockRejectedValue(failure);
+  const provider: ProviderV4 = {
+    specificationVersion: "v4",
+    languageModel: vi.fn(),
+    embeddingModel: vi.fn(),
+    imageModel: vi.fn(),
+    files() {
+      if (phase === "factory") throw failure;
+      return { specificationVersion: "v4", provider: "vendor", uploadFile };
+    },
+  };
+  const middleware = createAssetMiddleware({
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    authorize: () => true,
+    allowVendorUpload: true,
+    files: provider,
+  });
+  await expect(
+    middleware.transformParams?.({
+      type: "generate",
+      params: paramsWithReferencePart(),
+      model: fakeModel("vendor"),
+    })
+  ).rejects.toBe(failure);
+  expect(fetch.mock.calls.filter(([input]) => input === resource.uri)).toHaveLength(
+    phase === "factory" ? 0 : 1
+  );
+});
+
+it("does not resolve vendor file capabilities before asset authorization", async () => {
+  const fetch = stubCatalogAndMediaFetch();
+  const files = vi.fn();
+  const provider: ProviderV4 = {
+    specificationVersion: "v4",
+    languageModel: vi.fn(),
+    embeddingModel: vi.fn(),
+    imageModel: vi.fn(),
+    files,
+  };
+  const middleware = createAssetMiddleware({
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    authorize: () => false,
+    allowVendorUpload: true,
+    files: provider,
+  });
+  await expect(
+    middleware.transformParams?.({
+      type: "generate",
+      params: paramsWithReferencePart(),
+      model: fakeModel("vendor"),
+    })
+  ).rejects.toThrow(/denied/);
+  expect(files).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
 });
