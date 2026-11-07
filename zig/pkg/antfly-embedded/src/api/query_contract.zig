@@ -5857,22 +5857,22 @@ fn toOpenApiAggregationResult(
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
         defer parsed.deinit();
         switch (parsed.value) {
-            .float => |value| out.value = @floatCast(value),
+            .float => |value| out.value = value,
             .integer => |value| out.value = @floatFromInt(value),
             .object => |object| {
-                if (object.get("value")) |value| out.value = try jsonValueToF32(value);
+                if (object.get("value")) |value| out.value = try jsonValueToF64(value);
                 if (object.get("approximate")) |value| {
                     if (value == .bool) out.approximate = value.bool;
                 }
-                if (object.get("relative_error")) |value| out.relative_error = try jsonValueToF32(value);
+                if (object.get("relative_error")) |value| out.relative_error = try jsonValueToF64(value);
                 if (object.get("count")) |value| out.count = try jsonValueToI64(value);
-                if (object.get("min")) |value| out.min = try jsonValueToF32(value);
-                if (object.get("max")) |value| out.max = try jsonValueToF32(value);
-                if (object.get("sum")) |value| out.sum = try jsonValueToF32(value);
-                if (object.get("sum_squares")) |value| out.sum_of_squares = try jsonValueToF32(value);
-                if (object.get("avg")) |value| out.avg = try jsonValueToF32(value);
-                if (object.get("variance")) |value| out.variance = try jsonValueToF32(value);
-                if (object.get("std_dev")) |value| out.std_deviation = try jsonValueToF32(value);
+                if (object.get("min")) |value| out.min = try jsonValueToF64(value);
+                if (object.get("max")) |value| out.max = try jsonValueToF64(value);
+                if (object.get("sum")) |value| out.sum = try jsonValueToF64(value);
+                if (object.get("sum_squares")) |value| out.sum_of_squares = try jsonValueToF64(value);
+                if (object.get("avg")) |value| out.avg = try jsonValueToF64(value);
+                if (object.get("variance")) |value| out.variance = try jsonValueToF64(value);
+                if (object.get("std_dev")) |value| out.std_deviation = try jsonValueToF64(value);
             },
             else => {},
         }
@@ -5962,6 +5962,15 @@ fn jsonValueToBucketKeyAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![
 }
 
 fn jsonValueToF32(value: std.json.Value) !?f32 {
+    return switch (value) {
+        .null => null,
+        .integer => @floatFromInt(value.integer),
+        .float => @floatCast(value.float),
+        else => error.InvalidQueryRequest,
+    };
+}
+
+fn jsonValueToF64(value: std.json.Value) !?f64 {
     return switch (value) {
         .null => null,
         .integer => @floatFromInt(value.integer),
@@ -20953,4 +20962,16 @@ test "time series public query preserves duration origin and bounded extent" {
     try std.testing.expectEqualStrings("1970-01-01T00:02:00Z", requests[0].bucket_origin);
     try std.testing.expectEqualStrings("2026-11-06T12:00:00Z", requests[0].date_bounds_start);
     try std.testing.expectEqual(@as(usize, 1), requests[0].aggregations.len);
+}
+
+test "time series JSON aggregation keeps SQL float64 measurement precision" {
+    const a = std.testing.allocator;
+    const result = try toOpenApiAggregationResult(a, null, .{
+        .name = "average",
+        .field = "temperature",
+        .type = "avg",
+        .value_json = "{\"count\":1,\"sum\":23.123456789,\"avg\":23.123456789}",
+    });
+    try std.testing.expectEqual(@as(f64, 23.123456789), result.avg.?);
+    try std.testing.expectEqual(@as(f64, 23.123456789), result.sum.?);
 }

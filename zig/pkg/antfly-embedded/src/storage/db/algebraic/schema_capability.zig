@@ -1043,8 +1043,12 @@ fn scalarType(property: anytype) ?[]const u8 {
     // sorting rather than requiring a redundant JSON Schema format annotation.
     if (property.antfly_field) |mapping| {
         if (mapping.field_type) |kind| {
-            if (std.mem.eql(u8, kind, "date") or std.mem.eql(u8, kind, "datetime")) return "datetime";
+            if (std.mem.eql(u8, kind, "date") or std.mem.eql(u8, kind, "datetime") or std.mem.eql(u8, kind, "timestamp")) return "datetime";
         }
+    }
+    if (property.antfly_types.len == 1) {
+        const kind = property.antfly_types[0];
+        if (std.mem.eql(u8, kind, "date") or std.mem.eql(u8, kind, "datetime") or std.mem.eql(u8, kind, "timestamp")) return "datetime";
     }
     const field_type = property.field_type orelse {
         if (property.const_value != null or property.enum_values.len > 0) return "string";

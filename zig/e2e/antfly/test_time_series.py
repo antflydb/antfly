@@ -109,7 +109,7 @@ def test_time_series_fixed_buckets_and_algebraic_corrections(stateful_api, shard
                 "c": {
                     "observed_at": "2026-11-06T12:10:00Z",
                     "device_id": "sensor",
-                    "temperature": 30,
+                    "temperature": 30.123456789,
                 },
             },
             sync_level="full_index",
@@ -202,3 +202,85 @@ def test_time_series_fixed_buckets_and_algebraic_corrections(stateful_api, shard
         },
     )
     assert len(sql["rows"]) == 2, sql
+    assert (
+        float(sql["rows"][1][1])
+        == corrected[2]["sub_aggregations"]["average"]["avg"]
+        == 30.123456789
+    )
+
+
+def test_time_series_ttl_removes_exact_aggregate_contributions(stateful_api):
+    from helpers import wait_until
+
+    api = stateful_api
+    name = f"series_ttl_{time.time_ns()}"
+    schema = _schema()
+    schema["ttl"] = {"field": "expiry_reference", "duration": "1s"}
+    schema["document_schemas"]["reading"]["schema"]["properties"][
+        "expiry_reference"
+    ] = {
+        "type": "string",
+        "format": "date-time",
+        "x-antfly-field": {"type": "date"},
+    }
+    config = {
+        "num_shards": 1,
+        "schema": schema,
+        "indexes": {
+            "series_aggregates": {
+                "type": "algebraic",
+                "derive_from_schema": True,
+                "aggregates": [
+                    {
+                        "name": "rows",
+                        "op": "count",
+                        "time": "observed_at",
+                        "bucket": "5m",
+                    },
+                    {
+                        "name": "average",
+                        "op": "avg",
+                        "measure": "temperature",
+                        "time": "observed_at",
+                        "bucket": "5m",
+                    },
+                ],
+            }
+        },
+    }
+    finish_create_table(api, name, api._request("POST", f"/tables/{name}", config))
+    documents = {
+        "a": {
+            "observed_at": "2026-11-06T12:01:00Z",
+            "device_id": "sensor",
+            "temperature": 10,
+            "expiry_reference": "2400-01-01T00:00:00Z",
+        },
+        "b": {
+            "observed_at": "2026-11-06T12:02:00Z",
+            "device_id": "sensor",
+            "temperature": 20,
+            "expiry_reference": "2400-01-01T00:00:00Z",
+        },
+    }
+    api.batch_write(name, inserts=documents, sync_level="full_index")
+
+    def response(query):
+        payload = api.query_table(name, query)
+        return payload.get("responses", [payload])[0]
+
+    assert response(_query())["aggregations"]["points"]["buckets"][0]["doc_count"] == 2
+    documents["a"]["expiry_reference"] = "2000-01-01T00:00:00Z"
+    api.batch_write(name, inserts={"a": documents["a"]}, sync_level="full_index")
+    assert wait_until(
+        lambda: (
+            not response({"full_text_search": {"ids": ["a"]}, "limit": 1})["hits"][
+                "hits"
+            ]
+        ),
+        timeout_s=65,
+        interval_s=0.5,
+    )
+    buckets = response(_query())["aggregations"]["points"]["buckets"]
+    assert buckets[0]["doc_count"] == 1, buckets
+    assert buckets[0]["sub_aggregations"]["average"]["avg"] == 20, buckets

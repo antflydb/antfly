@@ -65,7 +65,10 @@ be prevented. Helpers do not automatically replay ambiguous writes. Split large
 imports into bounded batches and preserve the IDs and exact payload for retries.
 `client.writeSeries(table, timestamp, readings, { batchSize: 500 })` consumes an
 iterable or async iterable in sequential bounded batches. It stops on error;
-earlier batches remain committed.
+earlier batches remain committed. The result reports pending and repair-required
+batch counts, and an optional `onBatch` callback receives each full commit outcome.
+A `SeriesImportError` exposes acknowledged progress and pending IDs; reconcile
+that batch before retrying it.
 
 ## Query bucketed measurements
 
@@ -145,7 +148,9 @@ ORDER BY device_id, bucket;
 ```
 
 `date_bin` shares exact fixed-duration arithmetic with JSON histograms, including
-origins and offset normalization. Use `date_trunc('day', observed_at)` for UTC
+origins and offset normalization. JSON metric responses retain 64-bit floating-point
+precision, matching SQL floating measurements. Exact decimal SQL values retain
+their separate numeric type semantics. Use `date_trunc('day', observed_at)` for UTC
 calendar grouping. SQL emits populated groups; bounded empty generation is a JSON
 presentation option. `seriesSQL(options)` produces parameterized SQL with quoted
 identifiers. SQL expressions outside the materialization planner's proven shapes

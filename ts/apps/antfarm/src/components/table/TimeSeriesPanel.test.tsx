@@ -67,4 +67,18 @@ describe("time series explorer", () => {
     expect(screen.getByText(/Calendar interval must be/)).toBeTruthy();
     expect(api.series).not.toHaveBeenCalled();
   });
+  it("sends explicit alignment and zero-fill choices", async () => {
+    render(<TimeSeriesPanel tableName="readings" />);
+    fireEvent.change(screen.getByLabelText("Fixed alignment origin (optional RFC3339)"), {
+      target: { value: "1970-01-01T00:02:00Z" },
+    });
+    fireEvent.click(screen.getByLabelText("Fill missing measurements with zero"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    });
+    expect(api.series).toHaveBeenCalledWith(
+      expect.objectContaining({ bucket: { every: "5m", origin: "1970-01-01T00:02:00Z" }, fill: 0 }),
+      expect.anything()
+    );
+  });
 });

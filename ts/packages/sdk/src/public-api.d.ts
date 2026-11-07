@@ -10126,51 +10126,51 @@ export interface components {
         };
         AggregationResult: {
             /**
-             * Format: float
+             * Format: double
              * @description Single value for metric aggregations (sum, avg, min, max, count, cardinality)
              */
             value?: number;
             /** @description For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations. */
             approximate?: boolean;
             /**
-             * Format: float
+             * Format: double
              * @description For an approximate cardinality value, the relative standard error of the estimate. Present only when approximate is true.
              */
             relative_error?: number;
             /** @description Document count for stats aggregations */
             count?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Minimum value for stats aggregations
              */
             min?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Maximum value for stats aggregations
              */
             max?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Sum for stats aggregations
              */
             sum?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Sum of squares for stats aggregations
              */
             sum_of_squares?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Average for stats aggregations
              */
             avg?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Standard deviation for stats aggregations
              */
             std_deviation?: number;
             /**
-             * Format: float
+             * Format: double
              * @description Variance for stats aggregations
              */
             variance?: number;

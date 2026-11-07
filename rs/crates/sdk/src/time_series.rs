@@ -71,4 +71,10 @@ mod tests {
             "2026-11-06T00:00:00.000000001Z"
         );
     }
+    #[test]
+    fn measurement_responses_preserve_float64_precision() {
+        let result: crate::types::AggregationResult =
+            serde_json::from_value(json!({"avg":23.123456789})).unwrap();
+        assert_eq!(f64::from(result.avg.unwrap()), 23.123456789_f64);
+    }
 }

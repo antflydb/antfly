@@ -5212,7 +5212,7 @@ components:
       properties:
         value:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Single value for metric aggregations (sum, avg, min, max, count, cardinality)
@@ -5225,7 +5225,7 @@ components:
             (false). Absent for non-cardinality aggregations.
         relative_error:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: >-
@@ -5237,43 +5237,43 @@ components:
           description: Document count for stats aggregations
         min:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Minimum value for stats aggregations
         max:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Maximum value for stats aggregations
         sum:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Sum for stats aggregations
         sum_of_squares:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Sum of squares for stats aggregations
         avg:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Average for stats aggregations
         std_deviation:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Standard deviation for stats aggregations
         variance:
           type: number
-          format: float
+          format: double
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Variance for stats aggregations
