@@ -11292,7 +11292,7 @@ const SharedPdfWindowScheduler = struct {
             var borrowed = try cache.lookup(source_url, if (config.credentials.len > 0) config.credentials else null) orelse return false;
             defer borrowed.deinit();
             const downloaded = borrowed.entry().content;
-            try document_extraction_mod.verifyChecksumDigestHex(config, &borrowed.entry().content_sha256);
+            try document_extraction_mod.verifyChecksumDigest(config, &borrowed.entry().content_sha256);
             break :blk try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config.native_text, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
         };
         defer alloc.free(fingerprint);
@@ -12170,6 +12170,7 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
     for ([_][]const u8{
         "{\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
         "{\"etag\":\"revision-one\",\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
+        "{\"checksum_algorithm\":\"sha256\",\"checksum\":\"56b9baa75f3d45f8295e3c60a9d07ec62a3c01ecd7f2b2bb71b725d714c0feea\",\"ocr\":{\"reader\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}",
     }) |config_json| {
         const producer_json = try std.fmt.allocPrint(alloc, "{{\"type\":\"document_extraction\",\"config\":{s}}}", .{config_json});
         defer alloc.free(producer_json);
@@ -17584,9 +17585,7 @@ fn processDocumentExtractionAsset(
     // embedded, or otherwise referenced. A wrong digest must fail loudly
     // here, not keep stale output alive under a digest that no longer
     // matches what is actually at the source.
-    var content_digest_hex: [64]u8 = undefined;
-    document_extraction_mod.hexBytesBuf(&prepared_source.content_sha256, &content_digest_hex);
-    document_extraction_mod.verifyChecksumDigestHex(config, &content_digest_hex) catch |raw_err| {
+    document_extraction_mod.verifyChecksumDigest(config, &prepared_source.content_sha256) catch |raw_err| {
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,

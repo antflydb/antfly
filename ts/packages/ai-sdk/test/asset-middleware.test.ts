@@ -55,7 +55,8 @@ function stubCatalogAndMediaFetch(): ReturnType<typeof vi.fn> {
       });
     }
     if (url === resource.uri) {
-      expect(init?.headers).toMatchObject({ "If-Match": resource.version });
+      expect(new Headers(init?.headers).get("if-match")).toBe(resource.version);
+      expect(new Headers(init?.headers).get("accept-encoding")).toBe("identity");
       return new Response(videoBytes);
     }
     throw new Error(`Unexpected fetch: ${url}`);

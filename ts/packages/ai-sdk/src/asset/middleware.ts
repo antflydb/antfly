@@ -11,6 +11,15 @@ import { type LanguageModelMiddleware, uploadFile, wrapLanguageModel } from "ai"
 import { abortable, combinedSignal } from "../abort.js";
 import { type CatalogResource, resolveAuthorizedAsset } from "./catalog.js";
 import { type AuthorizeAsset, antflyAssetReferenceFrom } from "./reference.js";
+import {
+  AssetByteLimitError,
+  AssetFetchError,
+  discardSourceBody,
+  fetchSourceResponse,
+  readSourceBytes,
+} from "./transport.js";
+
+export { AssetByteLimitError, AssetFetchError } from "./transport.js";
 
 export interface AssetUploadCacheEntry {
   reference: Record<string, string>;
@@ -118,21 +127,12 @@ export interface AssetMiddlewareOptions {
   fetch?: typeof fetch;
   /** Abort signal for the server-side fetch of the asset's bytes. */
   abortSignal?: AbortSignal;
-}
-
-/** Thrown when fetching an asset's pinned bytes fails. Never includes the capability URL. */
-export class AssetFetchError extends Error {
-  constructor(
-    readonly status: number,
-    readonly reason: "version-mismatch" | "fetch-failed"
-  ) {
-    super(
-      reason === "version-mismatch"
-        ? "Asset fetch failed: the pinned version no longer matches (If-Match failed)."
-        : `Asset fetch failed with HTTP ${status}.`
-    );
-    this.name = "AssetFetchError";
-  }
+  /** Largest pinned asset accepted for byte transfer. Default 256 MiB. */
+  maxAssetBytes?: number;
+  /** Sum of declared sizes across resolved file parts, including repeated parts. Default 256 MiB. */
+  maxTotalAssetBytes?: number;
+  /** Concurrent file rewrites (authorization, lookup, transfer/upload). Default 4. */
+  maxConcurrentAssetFetches?: number;
 }
 
 async function fetchResourceBytes(
@@ -144,19 +144,19 @@ async function fetchResourceBytes(
   // media URLs as secrets in logs and errors too"); it is used exactly
   // once, here, server-side, and must never appear in a thrown message,
   // a prompt, or a tool result.
-  const response = await fetchFn(resource.uri, {
+  const response = await fetchSourceResponse(fetchFn, resource.uri, {
     headers: { "If-Match": resource.version },
     signal,
   });
   if (response.status === 412 || response.status === 409) {
-    await response.body?.cancel();
+    await discardSourceBody(response.body, signal);
     throw new AssetFetchError(response.status, "version-mismatch");
   }
   if (!response.ok) {
-    await response.body?.cancel();
+    await discardSourceBody(response.body, signal);
     throw new AssetFetchError(response.status, "fetch-failed");
   }
-  return new Uint8Array(await response.arrayBuffer());
+  return readSourceBytes(response, resource.length, signal);
 }
 
 /**
@@ -178,10 +178,39 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
   const fetchFn = options.fetch ?? globalThis.fetch;
   const cache = options.cache ?? createInMemoryAssetUploadCache();
 
+  const positiveInteger = (value: number | undefined, fallback: number, name: string) => {
+    const limit = value ?? fallback;
+    if (!Number.isSafeInteger(limit) || limit < 1)
+      throw new RangeError(`${name} must be a positive safe integer`);
+    return limit;
+  };
+  const maxAssetBytes = positiveInteger(options.maxAssetBytes, 256 * 1024 * 1024, "maxAssetBytes");
+  const maxTotalAssetBytes = positiveInteger(
+    options.maxTotalAssetBytes,
+    256 * 1024 * 1024,
+    "maxTotalAssetBytes"
+  );
+  const concurrency = positiveInteger(
+    options.maxConcurrentAssetFetches,
+    4,
+    "maxConcurrentAssetFetches"
+  );
+  type RequestAssets = { total: number; bytes: Map<string, Promise<Uint8Array>> };
+  function admit(resource: CatalogResource, assets: RequestAssets): void {
+    if (!Number.isSafeInteger(resource.length) || resource.length < 0)
+      throw new AssetFetchError(0, "invalid-length");
+    if (resource.length > maxAssetBytes) throw new AssetByteLimitError("asset", maxAssetBytes);
+    // Subtraction avoids overflow, and repeated inline parts still expand the provider's request.
+    if (resource.length > maxTotalAssetBytes - assets.total)
+      throw new AssetByteLimitError("request", maxTotalAssetBytes);
+    assets.total += resource.length;
+  }
+
   async function rewriteFilePart(
     part: LanguageModelV4FilePart,
     provider: string,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    assets: RequestAssets
   ): Promise<LanguageModelV4FilePart> {
     if (part.data.type !== "reference") return part;
     const reference = antflyAssetReferenceFrom(part.data.reference);
@@ -193,6 +222,7 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
       signal
     );
 
+    admit(resource, assets);
     if (options.allowVendorUpload && options.files) {
       // A representation ETag is scoped to one asset, not globally to bytes.
       // Only source metadata supplies the separately verified content digest.
@@ -239,36 +269,54 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
       };
     }
 
-    const bytes = await fetchResourceBytes(resource, fetchFn, signal);
+    // Authorization still runs for every occurrence. Only immutable, pinned bytes
+    // are shared, and only within this request (never across users or requests).
+    const key = JSON.stringify([resource.uri, resource.version, resource.length]);
+    let pending = assets.bytes.get(key);
+    if (!pending) {
+      pending = fetchResourceBytes(resource, fetchFn, signal);
+      assets.bytes.set(key, pending);
+    }
+    const bytes = await pending;
     return { ...part, mediaType: resource.mime_type, data: { type: "data", data: bytes } };
-  }
-
-  async function rewriteMessage(
-    message: LanguageModelV4Message,
-    provider: string,
-    signal: AbortSignal | undefined
-  ): Promise<LanguageModelV4Message> {
-    if (message.role !== "user" && message.role !== "assistant") return message;
-    const content = await Promise.all(
-      message.content.map((part) =>
-        part.type === "file" ? rewriteFilePart(part, provider, signal) : part
-      )
-    );
-    return { ...message, content } as LanguageModelV4Message;
   }
 
   return {
     specificationVersion: "v4",
     transformParams: async ({ params, model }) => {
       if (model.provider === "antfly") return params;
-      const signal = combinedSignal(options.abortSignal, params.abortSignal);
-      const prompt = await abortable(
-        Promise.all(
-          params.prompt.map((message) => rewriteMessage(message, model.provider, signal))
-        ),
-        signal
-      );
-      return { ...params, prompt };
+      const cancellation = new AbortController();
+      const signal = combinedSignal(options.abortSignal, params.abortSignal, cancellation.signal);
+      const assets: RequestAssets = { total: 0, bytes: new Map() };
+      const jobs: (() => Promise<void>)[] = [];
+      const prompt = params.prompt.map((message) => {
+        if (message.role !== "user" && message.role !== "assistant") return message;
+        const content = [...message.content];
+        for (const [index, part] of content.entries()) {
+          if (part.type === "file")
+            jobs.push(async () => {
+              content[index] = await rewriteFilePart(part, model.provider, signal, assets);
+            });
+        }
+        return { ...message, content } as LanguageModelV4Message;
+      });
+      let next = 0;
+      const worker = async () => {
+        while (next < jobs.length) {
+          signal?.throwIfAborted();
+          await jobs[next++]();
+        }
+      };
+      try {
+        await abortable(
+          Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker)),
+          signal
+        );
+        return { ...params, prompt };
+      } catch (error) {
+        cancellation.abort(error);
+        throw error;
+      }
     },
   };
 }

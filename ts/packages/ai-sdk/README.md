@@ -79,7 +79,7 @@ const result = await generateText({
   `client`): the reference resolves natively into the typed `source` content
   part sent to the Antfly gateway. The gateway fetches and inlines the pinned
   bytes server-side before calling the model.
-- **To an external model**: wrap it with `withAssetMiddleware(model, { client })`
+- **To an external model**: wrap it with `withAssetMiddleware(model, { client, authorize })`
   (or `createAssetMiddleware` + `wrapLanguageModel`). It fetches the asset
   with `If-Match` and inlines it by default. The resolved catalog MIME type
   accompanies both inline bytes and vendor file references, overriding the
@@ -93,6 +93,19 @@ const result = await generateText({
   Scope any explicitly shared cache to a single vendor account. Without a
   verified `metadata.sha256`, caching stays scoped to the asset, URI, version
   and MIME type; a strong ETag alone is not a global content identity.
+  Inline byte transfers are deduplicated within each request after authorization.
+  `maxConcurrentAssetFetches` bounds file work across the full history (default 4).
+  `maxAssetBytes` and `maxTotalAssetBytes` default to 256 MiB each; the latter
+  counts every resolved file part, including repeated references and cached vendor
+  references. Repeated inline parts still expand the eventual provider request.
+  These limits apply to Antfly references, and may be configured per middleware.
+  Transfers require an exact, nonnegative pinned byte length, reject conflicting
+  HTTP lengths, and stop reading as soon as a body exceeds its pinned size.
+  Oversized assets throw `AssetByteLimitError`; failed or inconsistent transfers
+  throw `AssetFetchError`. Fetch, body-read, and cancellation errors are sanitized
+  without retaining transport messages or causes; caller abort reasons are preserved.
+  The display helper uses the same error boundary while streaming with backpressure.
+
 - **Uploading a new asset**: `uploadFile({ client, sources, sourceId,
   localRoot, table, data, mimeType })` writes the bytes under a registered
   source's local content-addressed store and triggers a per-source sync run,

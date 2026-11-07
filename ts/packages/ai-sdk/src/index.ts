@@ -23,6 +23,7 @@ export {
   retryDelayMs,
 } from "./asset/errors.js";
 export {
+  AssetByteLimitError,
   AssetFetchError,
   type AssetMiddlewareOptions,
   type AssetUploadCache,

@@ -6632,9 +6632,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (config.checksum_algorithm != null and config.checksum.len > 0) {
                 var content_digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
-                var content_digest_hex: [64]u8 = undefined;
-                document_extraction_mod.hexBytesBuf(&content_digest, &content_digest_hex);
-                document_extraction_mod.verifyChecksumDigestHex(config, &content_digest_hex) catch |raw_err| {
+                document_extraction_mod.verifyChecksumDigest(config, &content_digest) catch |raw_err| {
                     try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", artifact_writes);
                     return;
                 };

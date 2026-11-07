@@ -105,3 +105,18 @@ it.each([
   });
   expect(match).not.toHaveProperty("return");
 });
+
+it("preserves valid graph names that coincide with Object prototype properties", async () => {
+  const query = vi.fn().mockResolvedValue({ responses: [{ graph_results: {} }] });
+  const tools = createGraphTool({ client: { tables: { query } } as never, table: "docs" });
+  const operations = JSON.parse(
+    '{"__proto__":{"traverse":{"start":{"keys":["a"]}}},"constructor":{"traverse":{"start":{"keys":["b"]}}}}'
+  );
+  await tools.antfly_graph_query.execute?.({ operations }, toolOptions());
+  const sent = JSON.parse(JSON.stringify(query.mock.calls[0][1]));
+  expect(Object.keys(sent.graph_queries)).toEqual(["__proto__", "constructor"]);
+  const operation = Object.getOwnPropertyDescriptor(sent.graph_queries, "__proto__")?.value;
+  expect(operation.index).toBe("graph");
+  expect(operation.traverse.max_depth).toBe(6);
+  expect(Object.getPrototypeOf(operations)).toBe(Object.prototype);
+});

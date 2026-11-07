@@ -2737,6 +2737,14 @@ pub fn metadataFingerprintLegacyAlloc(
 /// keep stale output alive: the caller must fail extraction, not fall back
 /// to location-based identity, on this error. A no-op when
 /// `checksum_algorithm` is unset or no digest resolved for this row.
+/// Verifies a fetched SHA-256 value with a typed raw-byte boundary.
+pub fn verifyChecksumDigest(config: Config, digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8) !void {
+    if (config.checksum_algorithm == null or config.checksum.len == 0) return;
+    var digest_hex: [64]u8 = undefined;
+    hexBytesBuf(digest, &digest_hex);
+    try verifyChecksumDigestHex(config, &digest_hex);
+}
+
 pub fn verifyChecksumDigestHex(config: Config, digest_hex: []const u8) !void {
     const algorithm = config.checksum_algorithm orelse return;
     if (config.checksum.len == 0) return;
@@ -5862,6 +5870,8 @@ test "document extraction checksum verification matches, mismatches and no-ops" 
     alloc.free(@constCast(declared.checksum));
     declared.checksum = try alloc.dupe(u8, &digest_c);
     try verifyChecksumDigestHex(declared, &digest_c);
+    try verifyChecksumDigest(declared, &(@as([32]u8, @splat(0xcc))));
+    try std.testing.expectError(error.DocumentChecksumMismatch, verifyChecksumDigest(declared, &(@as([32]u8, @splat(0xdd)))));
     const digest_d = testRepeatedHexDigest('d');
     try std.testing.expectError(error.DocumentChecksumMismatch, verifyChecksumDigestHex(declared, &digest_d));
     // Case-insensitive match against an uppercase downloaded digest.
@@ -5871,12 +5881,14 @@ test "document extraction checksum verification matches, mismatches and no-ops" 
     var no_algorithm = try parseConfig(alloc, "{}");
     defer no_algorithm.deinit(alloc);
     try verifyChecksumDigestHex(no_algorithm, "anything-at-all");
+    try verifyChecksumDigest(no_algorithm, &(@as([32]u8, @splat(0))));
 
     var no_digest = try parseConfig(alloc,
         \\{"checksum_algorithm":"sha256","content_type":"text/plain"}
     );
     defer no_digest.deinit(alloc);
     try verifyChecksumDigestHex(no_digest, "anything-at-all");
+    try verifyChecksumDigest(no_digest, &(@as([32]u8, @splat(0))));
 }
 
 test "document extraction route matching normalizes content type parameters" {

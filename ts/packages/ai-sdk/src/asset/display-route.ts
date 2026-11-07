@@ -2,6 +2,7 @@ import type { AntflyClient } from "@antfly/sdk";
 import { abortable } from "../abort.js";
 import { AssetNotFoundError, resolveCatalogResource } from "./catalog.js";
 import { type AntflyAssetReference, decodeAssetReference } from "./reference.js";
+import { discardSourceBody, fetchSourceResponse } from "./transport.js";
 
 /**
  * A browser-display route helper for the pattern settled on antfly#1491: a
@@ -108,17 +109,35 @@ export function createAssetDisplayHandler(
     }
     // `resource.uri` is the capability URL; it is read here, server-side,
     // and in no other field of this response.
-    const upstream = await fetchFn(resource.uri, {
+    const upstream = await fetchSourceResponse(fetchFn, resource.uri, {
       method: request.method,
       headers: upstreamHeaders,
       signal: request.signal,
     });
 
+    if (!upstream.ok && upstream.status !== 304) {
+      // Upstream diagnostics may repeat their request URL. Preserve the status,
+      // but never expose an error body containing the bearer capability.
+      await discardSourceBody(upstream.body, request.signal);
+      const headers = new Headers({
+        "cache-control": "private, no-store",
+        "content-type": "text/plain; charset=utf-8",
+        "x-content-type-options": "nosniff",
+      });
+      const range = upstream.headers.get("content-range");
+      if (upstream.status === 416 && range && /^bytes \*\/\d+$/.test(range))
+        headers.set("content-range", range);
+      return new Response(request.method === "HEAD" ? null : "Asset fetch failed", {
+        status: upstream.status,
+        headers,
+      });
+    }
+
     // Fetch implementations may decompress automatically while retaining encoded
     // lengths/ranges. Refuse an upstream that ignores identity negotiation.
     const encoding = upstream.headers.get("content-encoding")?.trim().toLowerCase();
     if (encoding && encoding !== "identity") {
-      await upstream.body?.cancel();
+      await discardSourceBody(upstream.body, request.signal);
       return new Response(request.method === "HEAD" ? null : "Unsupported upstream encoding", {
         status: 502,
         headers: { "cache-control": "private, no-store" },
@@ -138,7 +157,7 @@ export function createAssetDisplayHandler(
     headers.set("cache-control", "private, no-store");
     headers.set("x-content-type-options", "nosniff");
 
-    if (request.method === "HEAD") await upstream.body?.cancel();
+    if (request.method === "HEAD") await discardSourceBody(upstream.body, request.signal);
     return new Response(request.method === "HEAD" ? null : upstream.body, {
       status: upstream.status,
       headers,

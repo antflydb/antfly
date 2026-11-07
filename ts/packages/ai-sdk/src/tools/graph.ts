@@ -44,7 +44,7 @@ export function createGraphTool(options: AntflyGraphToolOptions): Record<string,
     if (!entries.length || entries.length > 8) {
       throw new Error("Expected 1 to 8 named graph operations.");
     }
-    const copy: Record<string, GraphOperation> = {};
+    const copy: Record<string, GraphOperation> = Object.create(null);
     for (const [name, raw] of entries) {
       const op: GraphOperation = { ...raw };
       const kinds = OPERATION_KINDS.filter((k) => k in op);

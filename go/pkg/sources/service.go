@@ -811,14 +811,9 @@ func (s *Service) prepareNamespaceAdoption(ctx context.Context, id, namespace st
 // CURRENT rows, not against the change about to take effect.
 //
 // Local identity is derived directly from configuration, even for an empty or
-// missing store: an empty listing does not prove that no catalog rows exist.
-// Other connectors use a best-effort preview: unable to verify -- no such connection, a connector that
-// cannot be opened, an enumeration failure, a panic from a connector this
-// has not been exercised against, or items that disagree on their prefix --
-// is treated as "no" (report a re-key rather than risk a false claim of
-// safety). For those connectors, an empty inventory (nothing published under the existing
-// connection/config yet) has nothing to re-key regardless of which
-// namespace is adopted, so that alone is verified "yes".
+// missing store. Other connectors use a best-effort preview. Unavailable,
+// empty, or inconsistent inventories cannot prove that persisted catalog keys
+// match the proposed namespace; report a possible re-key in those cases.
 func (s *Service) namespaceReproducesExistingKeys(ctx context.Context, id string, existing Source, connection Connection, namespace string) (matches bool) {
 	defer func() {
 		if recover() != nil {
@@ -840,9 +835,6 @@ func (s *Service) namespaceReproducesExistingKeys(ctx context.Context, id string
 	inventory, err := connector.Enumerate(ctx, Request{SourceNamespace: "job/" + id, Config: existing.Config, Mode: ImportModeSource, Preview: true})
 	if err != nil {
 		return false
-	}
-	if len(inventory.Objects) == 0 {
-		return true
 	}
 	legacy, err := LegacyNamespace(id, inventory.Objects)
 	if err != nil {
