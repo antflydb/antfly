@@ -27,6 +27,8 @@ import hashlib
 import json
 import math
 import os
+import platform
+import csv
 import re
 import resource
 import sys
@@ -174,31 +176,132 @@ def compare_reference(actual, expected, max_error=1e-4):
     }
 
 
+def vm_counter_order():
+    if sys.platform == "darwin":
+        return ["pageouts", "swapins", "swapouts"]
+    if sys.platform.startswith("linux"):
+        return ["pswpin", "pswpout"]
+    raise ValueError("unsupported paging observation platform")
+
+
 def vm_counters():
-    raw = subprocess.check_output(["vm_stat"], text=True)
+    darwin = sys.platform == "darwin"
+    raw = subprocess.check_output(["vm_stat"], text=True, timeout=5) if darwin else Path("/proc/vmstat").read_text()
+    keys = ("Pageouts", "Swapins", "Swapouts") if darwin else tuple(vm_counter_order())
     values = []
-    for key in ("Pageouts", "Swapins", "Swapouts"):
-        match = re.search(r"^" + key + r":\s+(\d+)", raw, re.MULTILINE)
+    for key in keys:
+        match = re.search(r"^" + key + (r":\s+(\d+)" if darwin else r"\s+(\d+)$"), raw, re.MULTILINE)
         if not match:
             raise ValueError("missing VM counter " + key)
         values.append(int(match[1]))
     return values
 
 
-def conditions():
-    return {
-        "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "hardware": subprocess.check_output(
-            ["sysctl", "hw.model", "hw.memsize", "hw.ncpu", "machdep.cpu.brand_string"],
-            text=True,
-        ),
-        "swap": subprocess.check_output(["sysctl", "vm.swapusage"], text=True),
-        "vm_stat": subprocess.check_output(["vm_stat"], text=True),
-        "threads": {
-            key: os.environ.get(key)
-            for key in ("VECLIB_MAXIMUM_THREADS", "OMP_NUM_THREADS")
-        },
-    }
+def cuda_identity():
+    """Observe the sole actual GPU without guessing multi-device ordinal mapping."""
+    try:
+        raw = subprocess.check_output([
+            "nvidia-smi", "--query-gpu=uuid,name,driver_version,pci.bus_id,memory.total",
+            "--format=csv,noheader,nounits",
+        ], text=True, timeout=10)
+        rows = list(csv.reader(raw.splitlines(), skipinitialspace=True))
+        if len(rows) != 1 or len(rows[0]) != 5 or any(not x.strip() for x in rows[0]):
+            raise ValueError("sole GPU identity required; multi-device selection is unattested")
+        uuid, name, driver, pci, memory = [x.strip() for x in rows[0]]
+        if not uuid.startswith("GPU-"):
+            raise ValueError("invalid GPU identity")
+        if memory in ("N/A", "[N/A]"):
+            memory_mib, memory_status = None, "unavailable"
+        elif memory.isdigit() and int(memory) > 0:
+            memory_mib, memory_status = int(memory), "observed"
+        else:
+            raise ValueError("invalid GPU memory observation")
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible not in (None, "0", uuid):
+            raise ValueError("visible CUDA ordinal cannot be attested")
+        return dict(status="observed", kind="cuda", uuid=uuid, name=name,
+                    driver_version=driver, pci_bus_id=pci, memory_mib=memory_mib,
+                    memory_capacity_status=memory_status, query_output=raw,
+                    visibility={k: os.environ.get(k) for k in
+                                ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")})
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return dict(status="unavailable", kind="cuda", reason=str(error))
+
+
+def metal_identity():
+    try:
+        raw = subprocess.check_output(["system_profiler", "SPDisplaysDataType", "-json"], text=True, timeout=10)
+        rows = json.loads(raw)["SPDisplaysDataType"]
+        if len(rows) != 1 or not rows[0].get("sppci_model"):
+            raise ValueError("sole Metal GPU identity required")
+        keys = ("sppci_model", "spdisplays_vendor", "spdisplays_device-id", "spdisplays_metal")
+        return dict(status="observed", kind="metal", device={k: rows[0].get(k) for k in keys})
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+        return dict(status="unavailable", kind="metal", reason=str(error))
+
+
+THREAD_ENVIRONMENT_KEYS = (
+    "VECLIB_MAXIMUM_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS", "ANTFLY_INFERENCE_CPU_THREADS", "ANTFLY_INFERENCE_BLAS",
+)
+
+
+def conditions(backend=None):
+    threads = {key: os.environ.get(key) for key in THREAD_ENVIRONMENT_KEYS}
+    identity = dict(platform=sys.platform, node=platform.node(), machine=platform.machine(),
+                    release=platform.release(), cpu_count=os.cpu_count())
+    result = dict(utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), threads=threads,
+                  host_identity=identity)
+    budget = dict(environment=threads, cpu_count=os.cpu_count())
+    if sys.platform == "darwin":
+        result.update(
+            hardware=subprocess.check_output(["sysctl", "hw.model", "hw.memsize", "hw.ncpu", "machdep.cpu.brand_string"], text=True, timeout=5),
+            swap=subprocess.check_output(["sysctl", "vm.swapusage"], text=True, timeout=5),
+            vm_stat=subprocess.check_output(["vm_stat"], text=True, timeout=5),
+        )
+        budget["affinity"] = "not exposed by Darwin process API"
+        budget["cgroup_cpu_max"] = "not applicable on Darwin"
+    elif sys.platform.startswith("linux"):
+        result["vmstat"] = Path("/proc/vmstat").read_text()
+        result["meminfo"] = Path("/proc/meminfo").read_text()
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+        result["hardware"] = sorted(set(line.strip() for line in cpuinfo.splitlines()
+            if line.split(":", 1)[0].strip() in ("model name", "Hardware", "CPU implementer", "CPU part")))
+        if not result["hardware"]:
+            raise ValueError("Linux CPU hardware identity unavailable")
+        fields = {}
+        for key in ("MemTotal", "SwapTotal", "SwapFree"):
+            match = re.search(r"^" + key + r":\s+(\d+) kB$", result["meminfo"], re.MULTILINE)
+            if not match:
+                raise ValueError("missing Linux memory observation " + key)
+            fields[key] = int(match[1]) * 1024
+        result["swap"] = {"total_bytes": fields["SwapTotal"], "free_bytes": fields["SwapFree"]}
+        identity["memory_bytes"] = fields["MemTotal"]
+        identity["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        budget["affinity"] = sorted(os.sched_getaffinity(0))
+        # Unified hierarchy membership is process-specific; don't substitute the
+        # host root's quota for a nested container's actual cgroup.
+        groups = Path("/proc/self/cgroup").read_text().splitlines()
+        group = next((line[3:] for line in groups if line.startswith("0::")), None)
+        budget["cgroup_cpu_max"] = None
+        if group is not None and ".." not in Path(group).parts:
+            quota = Path("/sys/fs/cgroup") / group.lstrip("/") / "cpu.max"
+            ancestry = list(reversed(quota.parent.parents)) + [quota.parent]
+            observations = []
+            for directory in ancestry:
+                if directory == Path("/sys/fs/cgroup") or Path("/sys/fs/cgroup") in directory.parents:
+                    entry = directory / "cpu.max"
+                    if entry.is_file():
+                        observations.append({"path": str(entry), "value": entry.read_text().strip()})
+            if observations:
+                budget["cgroup_cpu_max"] = observations
+    else:
+        raise ValueError("unsupported host observation platform")
+    result["thread_budget"] = budget
+    result["device_identity"] = (cuda_identity() if backend in ("cuda", "torch-cuda") else
+                                 metal_identity() if backend in ("metal", "mps") else
+                                 {"status": "observed", "kind": "cpu"})
+    return result
 
 
 def prepare(model, artifacts, output):
@@ -968,7 +1071,7 @@ def main():
                 )
             )
         },
-        "vm_counter_order": ["pageouts", "swapins", "swapouts"],
+        "vm_counter_order": vm_counter_order(),
         "backend": args.backend,
         "tool_sha256": reference.sha256(Path(__file__)),
         "reference_tool_sha256": reference.sha256(Path(reference.__file__)),
@@ -985,7 +1088,7 @@ def main():
         if args.backend in ("native", "metal", "cuda")
         else "encoder, pooling and output transfer; excludes input preprocessing and HTTP",
         "cases": {},
-        "before": conditions(),
+        "before": conditions(args.backend),
     }
     try:
         if args.backend in ("native", "metal", "cuda"):
@@ -1002,7 +1105,7 @@ def main():
             result["reference_result_sha256"] = reference.sha256(args.reference)
         result["status"] = "pass"
     finally:
-        result["after"] = conditions()
+        result["after"] = conditions(args.backend)
         if result["status"] != "pass":
             result["status"] = "failed"
         publish(args.output, result)

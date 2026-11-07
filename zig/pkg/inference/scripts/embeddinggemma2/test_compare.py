@@ -267,5 +267,84 @@ class PrecisionTests(unittest.TestCase):
                 compare.execution_precision(backend, "bfloat16")
 
 
+
+class PlatformObservationContracts(unittest.TestCase):
+    def test_linux_swap_counters_have_two_real_fields(self):
+        with mock.patch.object(compare.sys, "platform", "linux"), mock.patch.object(
+            compare.Path, "read_text", return_value="pswpin 7\npswpout 11\npgpgout 99\n"
+        ), mock.patch.object(compare.subprocess, "check_output") as commands:
+            self.assertEqual(compare.vm_counter_order(), ["pswpin", "pswpout"])
+            self.assertEqual(compare.vm_counters(), [7, 11])
+            commands.assert_not_called()
+        with mock.patch.object(compare.sys, "platform", "linux"), mock.patch.object(
+            compare.Path, "read_text", return_value="pswpin 7\n"
+        ), self.assertRaises(ValueError):
+            compare.vm_counters()
+
+    def test_darwin_counter_order_and_commands_are_preserved(self):
+        with mock.patch.object(compare.sys, "platform", "darwin"), mock.patch.object(
+            compare.subprocess, "check_output", return_value="Pageouts: 2.\nSwapins: 3.\nSwapouts: 4.\n"
+        ) as command:
+            self.assertEqual(compare.vm_counter_order(), ["pageouts", "swapins", "swapouts"])
+            self.assertEqual(compare.vm_counters(), [2, 3, 4])
+            self.assertEqual(command.call_args.args[0], ["vm_stat"])
+
+    def test_linux_conditions_observe_host_swap_affinity_and_nested_quota(self):
+        files = {
+            "/proc/vmstat": "pswpin 7\npswpout 11\n",
+            "/proc/meminfo": "MemTotal: 1000 kB\nSwapTotal: 200 kB\nSwapFree: 150 kB\n",
+            "/proc/cpuinfo": "processor : 0\nmodel name : fixture CPU\n",
+            "/proc/sys/kernel/random/boot_id": "fixture-boot",
+            "/proc/self/cgroup": "0::/fixture\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000",
+            "/sys/fs/cgroup/fixture/cpu.max": "200000 100000",
+        }
+        with mock.patch.object(compare.sys, "platform", "linux"), mock.patch.object(
+            compare.Path, "read_text", autospec=True, side_effect=lambda path: files[str(path)]
+        ), mock.patch.object(compare.Path, "is_file", autospec=True, side_effect=lambda path: str(path) in files), mock.patch.object(
+            compare.os, "sched_getaffinity", create=True, return_value={1, 3}
+        ), mock.patch.object(compare.subprocess, "check_output") as commands:
+            result = compare.conditions("native")
+        commands.assert_not_called()
+        self.assertEqual(result["swap"], {"total_bytes": 200 * 1024, "free_bytes": 150 * 1024})
+        self.assertEqual(result["host_identity"]["boot_id"], "fixture-boot")
+        self.assertEqual(result["thread_budget"]["affinity"], [1, 3])
+        self.assertEqual(len(result["thread_budget"]["cgroup_cpu_max"]), 2)
+        self.assertEqual(result["device_identity"], {"status": "observed", "kind": "cpu"})
+
+    def test_cuda_requires_observed_sole_device_driver_and_visibility(self):
+        row = "GPU-fixture, Example GPU, 580.1, 0000:01:00.0, 1000\n"
+        with mock.patch.dict(compare.os.environ, {}, clear=True), mock.patch.object(
+            compare.subprocess, "check_output", return_value=row
+        ) as command:
+            result = compare.cuda_identity()
+            self.assertEqual(result["status"], "observed")
+            self.assertEqual(result["driver_version"], "580.1")
+            self.assertEqual(command.call_args.kwargs["timeout"], 10)
+        for missing in ("N/A", "[N/A]"):
+            with mock.patch.dict(compare.os.environ, {}, clear=True), mock.patch.object(
+                compare.subprocess, "check_output", return_value=row.replace("1000", missing)
+            ):
+                observed = compare.cuda_identity()
+                self.assertEqual(observed["status"], "observed")
+                self.assertIsNone(observed["memory_mib"])
+                self.assertEqual(observed["memory_capacity_status"], "unavailable")
+                self.assertIn(missing, observed["query_output"])
+        for output in ("", row + row, "GPU-fixture, name, , pci, N/A\n", row.replace("1000", "unknown"), row.replace("1000", "0")):
+            with mock.patch.object(compare.subprocess, "check_output", return_value=output):
+                self.assertEqual(compare.cuda_identity()["status"], "unavailable")
+        with mock.patch.object(compare.subprocess, "check_output", side_effect=FileNotFoundError()):
+            self.assertEqual(compare.cuda_identity()["status"], "unavailable")
+        with mock.patch.dict(compare.os.environ, {"CUDA_VISIBLE_DEVICES": "1"}), mock.patch.object(
+            compare.subprocess, "check_output", return_value=row
+        ):
+            self.assertEqual(compare.cuda_identity()["status"], "unavailable")
+
+    def test_metal_requires_actual_single_gpu_inventory(self):
+        with mock.patch.object(compare.subprocess, "check_output", return_value='{"SPDisplaysDataType":[{"sppci_model":"Apple fixture","spdisplays_metal":"supported"}]}'):
+            self.assertEqual(compare.metal_identity()["status"], "observed")
+        with mock.patch.object(compare.subprocess, "check_output", return_value='{"SPDisplaysDataType":[]}'):
+            self.assertEqual(compare.metal_identity()["status"], "unavailable")
+
 if __name__ == "__main__":
     unittest.main()

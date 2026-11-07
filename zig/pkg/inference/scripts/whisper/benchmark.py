@@ -30,6 +30,8 @@ import os
 import random
 import re
 import statistics
+import sys
+import urllib.error
 import time
 import urllib.request
 import uuid
@@ -104,10 +106,207 @@ def multipart(audio, language, timestamps):
     return bytes(body), "multipart/form-data; boundary=" + boundary
 
 
-def main():
+def extract_antfly_text(result):
+    """One submitted audio item must finish successfully, including silence."""
+    if not isinstance(result, dict) or result.get("error") is not None:
+        raise ValueError("Antfly response contains an error or is not an object")
+    data = result.get("data")
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        raise ValueError("Antfly response must contain exactly one audio result")
+    item = data[0]
+    if item.get("error") is not None or item.get("status") != "complete":
+        raise ValueError("Antfly audio recognition did not complete without error")
+    if not isinstance(item.get("text"), str):
+        raise ValueError("Antfly complete result is missing transcript text")
+    return item["text"]
+
+
+def post_record(url, body, content_type):
+    """Keep the exact response bytes, including HTTP/JSON failures."""
+    started = time.perf_counter()
+    raw = None
+    status = None
+    result = None
+    error = None
+    try:
+        request = urllib.request.Request(
+            url, data=body, headers={"Content-Type": content_type}
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=300)
+        except urllib.error.HTTPError as failure:
+            with failure:
+                status = failure.code
+                raw = failure.read()
+            raise RuntimeError(f"HTTP {status}") from failure
+        with response:
+            status = response.status
+            raw = response.read()
+        if not 200 <= status < 300:
+            raise RuntimeError(f"HTTP {status}")
+        def reject_constant(value):
+            raise ValueError("nonfinite JSON constant: " + value)
+        result = json.loads(raw, parse_constant=reject_constant)
+    except Exception as failure:
+        error = {"type": type(failure).__name__, "message": str(failure)}
+    return {
+        "seconds": time.perf_counter() - started,
+        "http_status": status,
+        "response_bytes_base64": base64.b64encode(raw).decode() if raw is not None else None,
+        "response": result,
+        "error": error,
+    }
+
+
+def antfly_baseline(args, body, audio, audio_seconds, reference):
+    # Share ONLY the existing deterministic statistics. Process/model/backend
+    # identity remains the enclosing campaign's responsibility.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from paired_benchmark import balanced_pair_order, distribution, paired_log_ratio_ci
+
+    results = {"antfly": [], "baseline_antfly": []}
+    endpoints = {
+        "antfly": args.antfly_url,
+        "baseline_antfly": args.baseline_antfly_url,
+    }
+    report = {
+        "schema": "antfly.whisper.baseline_comparison.v1",
+        "scope": "Warm complete HTTP recognition; excludes model/process loading. No backend, hardware, precision or live model attestation inferred.",
+        "model": args.model,
+        "audio_sha256": hashlib.sha256(audio).hexdigest(),
+        "audio_seconds": audio_seconds,
+        "language": args.language,
+        "timestamps": args.timestamps,
+        "decoding": "Identical JSON request; greedy first pass and server default temperature fallback. Outer campaign must attest both server policies.",
+        "request_sha256": hashlib.sha256(body).hexdigest(),
+        "endpoints": endpoints,
+        "reference": reference,
+        "quality_scope": "Transcript WER only; raw timestamp fields are retained, not timestamp accuracy qualification.",
+        "maximum_wer": args.max_wer,
+        "quality_policy": "Both arms meet reference WER cap; candidate WER is no worse in every pair including warmup.",
+        "warmup": args.warmup,
+        "trials": args.trials,
+        "require_faster": args.require_faster,
+        "regression_limits": {"median_ratio_max": 1.05, "p95_ratio_max": 1.10},
+        "client_cpu_affinity": sorted(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else None,
+        "measurements": results,
+        "complete": False,
+        "aborted": None,
+        "baseline_candidate_speedup_ci": None,
+        "candidate_baseline_latency_ratio": None,
+        "quality_passed": False,
+        "regression_passed": False,
+        "faster_passed": False,
+        "performance_passed": False,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    def save():
+        args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+
+    save()
+    aborted = False
+    for pair in range(args.warmup + args.trials):
+        phase = "warmup" if pair < args.warmup else "measurement"
+        for target in balanced_pair_order(pair + 1, "antfly", "baseline_antfly"):
+            # Persist even an interrupted pending attempt; completed error
+            # responses remain literal failures and are never replaced/retried.
+            row = {"pair": pair + 1, "phase": phase, "state": "pending"}
+            results[target].append(row)
+            save()
+            row.update(post_record(endpoints[target], body, "application/json"))
+            row["state"] = "failed"
+            if row["error"] is None:
+                try:
+                    row["text"] = extract_antfly_text(row["response"])
+                    row["wer"] = wer(reference, row["text"])
+                    if not math.isfinite(row["seconds"]) or row["seconds"] <= 0:
+                        raise ValueError("nonpositive or nonfinite HTTP duration")
+                    row["state"] = "complete"
+                except (ValueError, TypeError, KeyError) as failure:
+                    row["error"] = {"type": type(failure).__name__, "message": str(failure)}
+            save()
+            if row["error"] is not None:
+                report["aborted"] = {
+                    "target": target,
+                    "pair": pair + 1,
+                    "error": row["error"],
+                }
+                aborted = True
+                break
+        if aborted:
+            break
+    report["complete"] = all(
+        len(rows) == args.warmup + args.trials
+        and all(row["state"] == "complete" for row in rows)
+        for rows in results.values()
+    )
+    measured = {
+        target: [
+            row for row in rows
+            if row["phase"] == "measurement" and row["state"] == "complete"
+        ]
+        for target, rows in results.items()
+    }
+    summary = {}
+    for target, rows in measured.items():
+        if rows:
+            stats = distribution(row["seconds"] for row in rows)
+            summary[target] = {
+                "samples": len(rows),
+                "median_seconds": stats["median"],
+                "p95_seconds": stats["p95"],
+                "max_wer": max(row["wer"] for row in rows),
+                "real_time_factor": stats["median"] / audio_seconds,
+            }
+    report["summary"] = summary
+    if report["complete"]:
+        candidate, baseline = summary["antfly"], summary["baseline_antfly"]
+        quality_ok = all(
+            row["wer"] <= args.max_wer for rows in results.values() for row in rows
+        )
+        quality_ok = quality_ok and all(
+            a["wer"] <= b["wer"]
+            for a, b in zip(results["antfly"], results["baseline_antfly"])
+        )
+        report["quality_passed"] = quality_ok
+        ratios = {
+            "median": candidate["median_seconds"] / baseline["median_seconds"],
+            "p95": candidate["p95_seconds"] / baseline["p95_seconds"],
+        }
+        report["candidate_baseline_latency_ratio"] = ratios
+        report["regression_passed"] = (
+            quality_ok and ratios["median"] <= 1.05 and ratios["p95"] <= 1.10
+        )
+        interval = paired_log_ratio_ci([
+            (b["seconds"], a["seconds"])
+            for a, b in zip(measured["antfly"], measured["baseline_antfly"])
+        ])
+        report["baseline_candidate_speedup_ci"] = interval
+        report["faster_passed"] = quality_ok and interval["lower_95"] > 1
+        report["performance_passed"] = report["regression_passed"] and (
+            not args.require_faster or report["faster_passed"]
+        )
+    save()
+    print(json.dumps({
+        key: report[key]
+        for key in (
+            "complete", "summary", "quality_passed", "regression_passed",
+            "faster_passed", "performance_passed",
+        )
+    }, indent=2))
+    return 0 if report["performance_passed"] else 1
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--antfly-url", default="http://127.0.0.1:18081/ai/v1/read")
-    parser.add_argument("--whisper-url", default="http://127.0.0.1:18082/inference")
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument("--whisper-url")
+    comparison.add_argument("--baseline-antfly-url")
+    parser.add_argument("--require-faster", action="store_true", help="Also require paired speedup CI lower bound > 1 in Antfly baseline mode")
     parser.add_argument("--model", default="openai/whisper-small")
     parser.add_argument("--audio", required=True, type=Path)
     parser.add_argument("--reference", required=True, type=Path)
@@ -117,9 +316,13 @@ def main():
     parser.add_argument("--timestamps", action="store_true")
     parser.add_argument("--max-wer", type=float, default=0.10)
     parser.add_argument("--output", required=True, type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.trials < 3 or args.warmup < 1:
         parser.error("at least three measured trials and one warmup are required")
+    if args.require_faster and not args.baseline_antfly_url:
+        parser.error("--require-faster requires --baseline-antfly-url")
+    if args.baseline_antfly_url and (not math.isfinite(args.max_wer) or args.max_wer < 0):
+        parser.error("--max-wer must be finite and nonnegative")
     audio = args.audio.read_bytes()
     with wave.open(str(args.audio)) as wav:
         seconds = wav.getnframes() / wav.getframerate()
@@ -131,6 +334,11 @@ def main():
             "audio_options": {"language": args.language, "timestamps": args.timestamps},
         }
     ).encode()
+    if args.baseline_antfly_url:
+        if seconds <= 0:
+            parser.error("audio must have a positive duration")
+        return antfly_baseline(args, antfly, audio, seconds, reference)
+    args.whisper_url = args.whisper_url or "http://127.0.0.1:18082/inference"
     whisper, whisper_type = multipart(audio, args.language, args.timestamps)
     requests = {
         "antfly": (args.antfly_url, antfly, "application/json"),
