@@ -4676,7 +4676,7 @@ pub fn formatCudaPrefillProfileLine(buf: []u8, stats: CudaRuntimeStats) []const 
     if (comptime build_options.enable_cuda) {
         return std.fmt.bufPrint(
             buf,
-            "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} f16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d} rope={d} kv_write={d} elementwise={d} embedding={d}",
+            "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} f16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d} rope={d} kv_write={d} elementwise={d} embedding={d} bf16_projection={d} ffn_block={d} recurrent_core={d} collection_failures={d}",
             .{
                 stats.prefill_profile_events,
                 stats.prefill_profile_q4_linear_us,
@@ -4695,6 +4695,10 @@ pub fn formatCudaPrefillProfileLine(buf: []u8, stats: CudaRuntimeStats) []const 
                 stats.prefill_profile_kv_write_us,
                 stats.prefill_profile_elementwise_us,
                 stats.prefill_profile_embedding_us,
+                stats.prefill_profile_bf16_projection_us,
+                stats.prefill_profile_ffn_block_us,
+                stats.prefill_profile_recurrent_core_us,
+                stats.profile_collection_failures,
             },
         ) catch buf[0..0];
     }
@@ -4729,7 +4733,7 @@ pub fn formatCudaDecodeProfileLine(buf: []u8, stats: CudaRuntimeStats) []const u
     if (comptime build_options.enable_cuda) {
         return std.fmt.bufPrint(
             buf,
-            "cuda_decode_profile_us: events={d} qkv={d} gqa_attention={d} attention_output={d} attention_norm_residual={d} ffn_gate_up={d} ffn_gated_down={d} ffn_post_norm={d} lm_head_argmax={d} graph_replay={d}",
+            "cuda_decode_profile_us: events={d} qkv={d} gqa_attention={d} attention_output={d} attention_norm_residual={d} ffn_gate_up={d} ffn_gated_down={d} ffn_post_norm={d} lm_head_argmax={d} graph_replay={d} bf16_projection={d} ffn_block={d} recurrent_core={d} collection_failures={d}",
             .{
                 stats.decode_profile_events,
                 stats.decode_profile_qkv_us,
@@ -4741,6 +4745,10 @@ pub fn formatCudaDecodeProfileLine(buf: []u8, stats: CudaRuntimeStats) []const u
                 stats.decode_profile_ffn_post_norm_us,
                 stats.decode_profile_lm_head_argmax_us,
                 stats.decode_profile_graph_replay_us,
+                stats.decode_profile_bf16_projection_us,
+                stats.decode_profile_ffn_block_us,
+                stats.decode_profile_recurrent_core_us,
+                stats.profile_collection_failures,
             },
         ) catch buf[0..0];
     }
@@ -20550,4 +20558,29 @@ test "actual managed Native audio BF16 getter Stage unwinds every allocation fai
     };
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.cached, .{});
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.denied, .{});
+}
+
+test "CUDA operation profile formatting retains all role counters without truncation" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var stats: CudaRuntimeStats = .{};
+    const info = @typeInfo(CudaRuntimeStats).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        switch (@typeInfo(T)) {
+            .int => @field(stats, name) = std.math.maxInt(T),
+            else => {},
+        }
+    }
+    var buffer: [768]u8 = undefined;
+    const decode = formatCudaDecodeProfileLine(&buffer, stats);
+    try std.testing.expect(decode.len != 0);
+    try std.testing.expect(std.mem.indexOf(u8, decode, "bf16_projection=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decode, "ffn_block=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decode, "recurrent_core=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decode, "collection_failures=") != null);
+    const prefill = formatCudaPrefillProfileLine(&buffer, stats);
+    try std.testing.expect(prefill.len != 0);
+    try std.testing.expect(std.mem.indexOf(u8, prefill, "bf16_projection=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefill, "ffn_block=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefill, "recurrent_core=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefill, "collection_failures=") != null);
 }

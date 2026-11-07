@@ -1603,6 +1603,9 @@ pub const RuntimeStats = struct {
     gated_down_fallbacks: usize = 0,
     /// Cumulative collection failures, including automatic mid-request drains.
     profile_collection_failures: usize = 0,
+    decode_profile_bf16_projection_us: u64 = 0,
+    decode_profile_ffn_block_us: u64 = 0,
+    decode_profile_recurrent_core_us: u64 = 0,
     decode_profile_events: usize = 0,
     decode_profile_qkv_us: u64 = 0,
     decode_profile_gqa_attention_us: u64 = 0,
@@ -1613,6 +1616,9 @@ pub const RuntimeStats = struct {
     decode_profile_ffn_post_norm_us: u64 = 0,
     decode_profile_lm_head_argmax_us: u64 = 0,
     decode_profile_graph_replay_us: u64 = 0,
+    prefill_profile_bf16_projection_us: u64 = 0,
+    prefill_profile_ffn_block_us: u64 = 0,
+    prefill_profile_recurrent_core_us: u64 = 0,
     prefill_profile_events: usize = 0,
     prefill_profile_q4_linear_us: u64 = 0,
     prefill_profile_q4_qkv_us: u64 = 0,
@@ -4433,6 +4439,8 @@ pub const CudaCompute = struct {
         var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, hidden), 4));
         errdefer releaseDeviceBuffer(self, &output);
         errdefer self.ctx.synchronize() catch {};
+        var operation_profile = beginOperationProfile(self, .attention_output, .bf16_projection, rows);
+        defer if (operation_profile) |*scope| scope.end();
         try self.cublaslt.?.matmulBf16WeightResidualF32Out(&self.ctx, output, staged, weight.buffer, residual.buffer, cublasLtWorkspace(self), rows, in_dim, hidden);
         self.stats.bf16_cublaslt_linear_calls += 1;
         self.lighton_projection_residual_calls += 1;
@@ -4474,6 +4482,8 @@ pub const CudaCompute = struct {
             if (weight.dtype != .bf16 or weight.quant_type != null or weight.strict_resident_training) return null;
             try ensureCount(weight, try checkedMul(hidden, intermediate));
         }
+        var operation_profile = beginOperationProfile(self, .ffn_block, .ffn_block, rows);
+        defer if (operation_profile) |*scope| scope.end();
         if (self.lighton_bf16_projection_outputs or (self.lighton_bf16_prefill_ffn and rows >= 256)) {
             const output = try lightOnCompactBf16FfnBlock(self, request, input, norm, weights);
             if (self.lighton_bf16_prefill_ffn and rows >= 256) self.lighton_bf16_prefill_ffn_calls += 1;
@@ -5504,6 +5514,8 @@ pub const CudaCompute = struct {
         const core = (try allocUninitF32ShapeOp(self, &shape)).?;
         defer cb.free(core);
         state.failed = true;
+        var operation_profile = beginOperationProfile(self, .recurrent_core, .recurrent_core, n);
+        defer if (operation_profile) |*scope| scope.end();
         try self.lighton_recurrent.run(&self.ctx, .{
             tensorFromCt(request.mixed).buffer.ptr, state.weights[0].ptr,
             state.history[0].ptr,                   state.history[1].ptr,
@@ -14684,6 +14696,8 @@ fn lightOnFfnBf16Down(self: *CudaCompute, sources: LightOnActivationSources, dow
     var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, hidden), 4));
     errdefer releaseDeviceBuffer(self, &output);
     errdefer self.ctx.synchronize() catch {};
+    var operation_profile = beginOperationProfile(self, .ffn_gated_down, .bf16_projection, rows);
+    defer if (operation_profile) |*scope| scope.end();
     switch (sources) {
         .joined => |joined| try self.lighton_activation.runJoined(&self.ctx, .{ activated.ptr, joined.ptr }, @intCast(rows), @intCast(intermediate)),
         .separate => |inputs| try self.lighton_activation.runSeparate(&self.ctx, .{ activated.ptr, inputs.gate.ptr, inputs.up.ptr }, @intCast(count)),
@@ -14868,6 +14882,8 @@ fn prepareBf16Projection(self: *CudaCompute, dst: buffer_mod.DeviceBuffer, input
 fn runCublasLtBf16Matmul(self: *CudaCompute, dst: buffer_mod.DeviceBuffer, input_bf16: buffer_mod.DeviceBuffer, weight_bf16: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) !bool {
     var projection = try prepareBf16Projection(self, dst, input_bf16, weight_bf16, workspace, rows, in_dim, out_dim, false) orelse return error.CublasLtUnsupported;
     defer projection.deinit();
+    var operation_profile = beginOperationProfile(self, .bf16_projection, .bf16_projection, rows);
+    defer if (operation_profile) |*scope| scope.end();
     try projection.submit(self);
     return true;
 }
@@ -14935,6 +14951,8 @@ fn tryCublasLtBf16Linear(
     };
     defer plan_0.deinit();
     errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    var operation_profile = beginOperationProfile(self, .bf16_projection, .bf16_projection, rows);
+    defer if (operation_profile) |*scope| scope.end();
     try convertBf16ActivationForCublasLt(self, input, activation, rows);
     try plan_0.submit(self);
     if (physical_rows != rows) self.stats.bf16_bucketed_linear_calls += 1;
@@ -15000,6 +15018,8 @@ fn tryCublasLtBf16LinearPair(
     var plan_1 = try prepareBf16Projection(self, dst_b, activation.buffer, weight_b, workspace, physical_rows, in_dim, out_dim, false) orelse return false;
     defer plan_1.deinit();
     errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    var operation_profile = beginOperationProfile(self, .bf16_projection, .bf16_projection, rows);
+    defer if (operation_profile) |*scope| scope.end();
     try convertBf16ActivationForCublasLt(self, input, activation, rows);
     try plan_0.submit(self);
     try plan_1.submit(self);
@@ -15207,6 +15227,8 @@ fn tryCublasLtBf16Qkv(
     var plan_2 = try prepareBf16Projection(self, dst_v, activation.buffer, weight_v, workspace, physical_rows, in_dim, kv_out_dim, false) orelse return false;
     defer plan_2.deinit();
     errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    var operation_profile = beginOperationProfile(self, .bf16_projection, .bf16_projection, rows);
+    defer if (operation_profile) |*scope| scope.end();
     try convertBf16ActivationForCublasLt(self, input, activation, rows);
     try plan_0.submit(self);
     try plan_1.submit(self);
@@ -15510,6 +15532,9 @@ pub fn cudaPrefillOpProfileEnabled() bool {
 }
 
 const CudaDecodeProfileCategory = enum {
+    bf16_projection,
+    ffn_block,
+    recurrent_core,
     qkv,
     gqa_attention,
     attention_output,
@@ -15522,6 +15547,9 @@ const CudaDecodeProfileCategory = enum {
 };
 
 const CudaPrefillProfileCategory = enum {
+    bf16_projection,
+    ffn_block,
+    recurrent_core,
     q4_linear,
     q4_qkv,
     q4_pair,
@@ -15612,22 +15640,30 @@ fn recycleProfileSlot(self: *CudaCompute, slot: u32) void {
 /// scope, so it stays correct even where the existing code nests scopes (e.g.
 /// the `.staging` scope opened inside a `.bf16_linear` GEMM).
 fn acquireProfileSlot(self: *CudaCompute) ?u32 {
-    ensureProfilePoolAllocated(self) catch return null;
+    ensureProfilePoolAllocated(self) catch {
+        self.stats.profile_collection_failures +|= 1;
+        return null;
+    };
     if (self.profile_pool.free_count == 0) {
         // Pool exhausted mid-request: drain in place with a single sync to
         // recycle every completed pair, then continue.
         drainCudaProfile(self);
-        if (self.profile_pool.free_count == 0) return null;
+        if (self.profile_pool.free_count == 0) {
+            self.stats.profile_collection_failures +|= 1;
+            return null;
+        }
     }
     self.profile_pool.free_count -= 1;
     const slot = self.profile_pool.free_stack[self.profile_pool.free_count];
     if (self.profile_pool.pairs[slot].start == null) {
         self.profile_pool.pairs[slot] = self.ctx.createProfileEventPair() catch {
+            self.stats.profile_collection_failures +|= 1;
             self.profile_pool.free_count += 1; // return the untouched slot
             return null;
         };
     }
     self.ctx.recordProfileStart(self.profile_pool.pairs[slot]) catch {
+        self.stats.profile_collection_failures +|= 1;
         self.profile_pool.free_count += 1;
         return null;
     };
@@ -15637,6 +15673,7 @@ fn acquireProfileSlot(self: *CudaCompute) ?u32 {
 /// Record a slot's end event (async, no sync) and buffer it for the next drain.
 fn finishProfileSlot(self: *CudaCompute, slot: u32, kind: CudaProfilePendingKind) void {
     self.ctx.recordProfileEnd(self.profile_pool.pairs[slot]) catch {
+        self.stats.profile_collection_failures +|= 1;
         // End could not be recorded; recycle without counting a garbage interval.
         recycleProfileSlot(self, slot);
         return;
@@ -15729,9 +15766,30 @@ fn beginPrefillProfile(self: *CudaCompute, category: ?CudaPrefillProfileCategory
     return .{ .compute = self, .category = resolved_category, .slot = slot };
 }
 
+// Operation intervals can nest (for example a projection inside an FFN).
+// They classify actual dispatched work; their sums are not disjoint GPU time.
+const CudaOperationProfileScope = union(enum) {
+    decode: CudaDecodeProfileScope,
+    prefill: CudaPrefillProfileScope,
+    fn end(self: *CudaOperationProfileScope) void {
+        switch (self.*) {
+            inline else => |*scope| scope.end(),
+        }
+    }
+};
+fn beginOperationProfile(self: *CudaCompute, comptime decode: CudaDecodeProfileCategory, comptime prefill: CudaPrefillProfileCategory, rows: usize) ?CudaOperationProfileScope {
+    if (rows == 1) {
+        if (beginDecodeProfile(self, decode, rows)) |scope| return .{ .decode = scope };
+    } else if (beginPrefillProfile(self, prefill, rows)) |scope| return .{ .prefill = scope };
+    return null;
+}
+
 fn noteDecodeProfileUs(self: *CudaCompute, category: CudaDecodeProfileCategory, elapsed_us: u64) void {
     self.stats.decode_profile_events += 1;
     switch (category) {
+        .bf16_projection => self.stats.decode_profile_bf16_projection_us += elapsed_us,
+        .ffn_block => self.stats.decode_profile_ffn_block_us += elapsed_us,
+        .recurrent_core => self.stats.decode_profile_recurrent_core_us += elapsed_us,
         .qkv => self.stats.decode_profile_qkv_us += elapsed_us,
         .gqa_attention => self.stats.decode_profile_gqa_attention_us += elapsed_us,
         .attention_output => self.stats.decode_profile_attention_output_us += elapsed_us,
@@ -15747,6 +15805,9 @@ fn noteDecodeProfileUs(self: *CudaCompute, category: CudaDecodeProfileCategory, 
 fn notePrefillProfileUs(self: *CudaCompute, category: CudaPrefillProfileCategory, elapsed_us: u64) void {
     self.stats.prefill_profile_events += 1;
     switch (category) {
+        .bf16_projection => self.stats.prefill_profile_bf16_projection_us += elapsed_us,
+        .ffn_block => self.stats.prefill_profile_ffn_block_us += elapsed_us,
+        .recurrent_core => self.stats.prefill_profile_recurrent_core_us += elapsed_us,
         .q4_linear => self.stats.prefill_profile_q4_linear_us += elapsed_us,
         .q4_qkv => self.stats.prefill_profile_q4_qkv_us += elapsed_us,
         .q4_pair => self.stats.prefill_profile_q4_pair_us += elapsed_us,
@@ -55041,6 +55102,13 @@ test "CUDA profile snapshot refuses copied tables and missing live cleanup befor
 test "CUDA profile failures remain visible after a later successful collection" {
     const Mock = struct {
         var fail_read = true;
+        var fail_record = true;
+        fn create(_: *driver_mod.CUevent, _: c_uint) callconv(.c) driver_mod.CUresult {
+            return 1; // metadata creation failure, no actual CUDA allocation
+        }
+        fn record(_: driver_mod.CUevent, _: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            return if (fail_record) 1 else driver_mod.CUDA_SUCCESS;
+        }
         fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
             return driver_mod.CUDA_SUCCESS;
         }
@@ -55084,7 +55152,7 @@ test "CUDA profile failures remain visible after a later successful collection" 
     compute.ctx.driver.fns.cuGetErrorString = Mock.text;
     compute.profile_pool.pending_count = 1;
     compute.profile_pool.free_count = 0;
-    @import("../../test_error_logs.zig").expectErrorLogs(1);
+    @import("../../test_error_logs.zig").expectErrorLogs(4);
     Mock.fail_read = true;
     drainCudaProfile(&compute);
     try std.testing.expectEqual(@as(usize, 2), compute.stats.profile_collection_failures);
@@ -55103,4 +55171,42 @@ test "CUDA profile failures remain visible after a later successful collection" 
     try std.testing.expectEqual(@as(u64, 1000), compute.stats.decode_profile_qkv_us);
     try std.testing.expectEqual(@as(usize, 0), compute.profile_pool.pending_count);
     try std.testing.expectEqual(@as(usize, 1), compute.profile_pool.free_count);
+
+    // Creation/start/end failures also make the interval unavailable, without
+    // discarding the original slot ownership or numerical error policy.
+    compute.ctx.driver.fns.cuEventCreate = Mock.create;
+    compute.ctx.driver.fns.cuEventRecord = Mock.record;
+    try std.testing.expect(acquireProfileSlot(&compute) == null);
+    try std.testing.expectEqual(@as(usize, 3), compute.stats.profile_collection_failures);
+    pairs[0] = .{ .start = @ptrFromInt(16), .end = @ptrFromInt(32) };
+    Mock.fail_record = true;
+    try std.testing.expect(acquireProfileSlot(&compute) == null);
+    try std.testing.expectEqual(@as(usize, 4), compute.stats.profile_collection_failures);
+    Mock.fail_record = false;
+    const actual_slot = acquireProfileSlot(&compute) orelse return error.ExpectedProfileSlot;
+    try std.testing.expectEqual(@as(usize, 0), compute.profile_pool.free_count);
+    Mock.fail_record = true;
+    finishProfileSlot(&compute, actual_slot, .{ .decode = .qkv });
+    try std.testing.expectEqual(@as(usize, 5), compute.stats.profile_collection_failures);
+    try std.testing.expectEqual(@as(usize, 0), compute.profile_pool.pending_count);
+    try std.testing.expectEqual(@as(usize, 1), compute.profile_pool.free_count);
+}
+
+test "CUDA operation profile categories preserve literal decode and prefill mapping" {
+    var compute: CudaCompute = undefined;
+    compute.stats = .{};
+    noteDecodeProfileUs(&compute, .bf16_projection, 11);
+    noteDecodeProfileUs(&compute, .ffn_block, 13);
+    noteDecodeProfileUs(&compute, .recurrent_core, 17);
+    notePrefillProfileUs(&compute, .bf16_projection, 19);
+    notePrefillProfileUs(&compute, .ffn_block, 23);
+    notePrefillProfileUs(&compute, .recurrent_core, 29);
+    try std.testing.expectEqual(@as(u64, 11), compute.stats.decode_profile_bf16_projection_us);
+    try std.testing.expectEqual(@as(u64, 13), compute.stats.decode_profile_ffn_block_us);
+    try std.testing.expectEqual(@as(u64, 17), compute.stats.decode_profile_recurrent_core_us);
+    try std.testing.expectEqual(@as(u64, 19), compute.stats.prefill_profile_bf16_projection_us);
+    try std.testing.expectEqual(@as(u64, 23), compute.stats.prefill_profile_ffn_block_us);
+    try std.testing.expectEqual(@as(u64, 29), compute.stats.prefill_profile_recurrent_core_us);
+    try std.testing.expectEqual(@as(usize, 3), compute.stats.decode_profile_events);
+    try std.testing.expectEqual(@as(usize, 3), compute.stats.prefill_profile_events);
 }
