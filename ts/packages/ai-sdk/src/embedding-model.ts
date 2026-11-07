@@ -33,6 +33,7 @@ export class AntflyEmbeddingModel implements EmbeddingModelV4 {
     const response = await this.inference.embed(this.modelId, options.values, {
       dimensions: options.dimensions,
       signal: options.abortSignal,
+      headers: options.headers,
     });
     if (response.errors?.length) {
       throw new Error(

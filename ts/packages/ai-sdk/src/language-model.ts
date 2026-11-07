@@ -80,7 +80,10 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     const warnings: SharedV4Warning[] = [];
     const request = await abortable(this.buildRequest(options, warnings), options.abortSignal);
-    const response = await this.inference.generate(request, { signal: options.abortSignal });
+    const response = await this.inference.generate(request, {
+      signal: options.abortSignal,
+      headers: options.headers,
+    });
     return {
       content: toContent(response),
       finishReason: toFinishReason(response.choices[0]?.finish_reason),
@@ -102,7 +105,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
       this.buildRequest({ ...options, abortSignal: signal }, warnings),
       signal
     );
-    const parts = this.streamParts(request, warnings, signal);
+    const parts = this.streamParts(request, warnings, signal, options.headers);
     let cancelled = false;
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
@@ -170,7 +173,8 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
   private async *streamParts(
     request: Omit<GenerateRequest, "stream">,
     warnings: SharedV4Warning[],
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    headers: LanguageModelV4CallOptions["headers"]
   ): AsyncGenerator<LanguageModelV4StreamPart> {
     yield { type: "stream-start", warnings };
     let sentResponseMetadata = false;
@@ -185,7 +189,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     let finishReason: LanguageModelV4FinishReason = { unified: "other", raw: undefined };
     let usage: LanguageModelV4Usage = toUsage(undefined);
     try {
-      for await (const chunk of this.inference.generateStream(request, { signal })) {
+      for await (const chunk of this.inference.generateStream(request, { signal, headers })) {
         if (!sentResponseMetadata) {
           yield {
             type: "response-metadata",

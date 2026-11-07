@@ -406,7 +406,7 @@ describe("InferenceClient with mock fetch", () => {
       expect(await lastFetchJSONBody()).toMatchObject({ model: "gemma", stream: true });
       const [, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
       expect(init?.signal).toBe(controller.signal);
-      expect((init?.headers as Record<string, string>).Accept).toBe("text/event-stream");
+      expect(new Headers(init?.headers).get("Accept")).toBe("text/event-stream");
     });
 
     it("fails closed when a server does not attest a managed generation policy", async () => {
@@ -1124,8 +1124,8 @@ describe("InferenceClient with mock fetch", () => {
       expect(url).toBe("http://localhost:8080/ai/v1/embed");
       expect(options?.method).toBe("POST");
       expect(options?.headers).toBeDefined();
-      const headers = options?.headers as Record<string, string>;
-      expect(headers.Accept).toBe(NUMERIC_RESPONSE_ACCEPT);
+      const headers = new Headers(options?.headers);
+      expect(headers.get("Accept")).toBe(NUMERIC_RESPONSE_ACCEPT);
     });
 
     it.each([
@@ -1707,4 +1707,37 @@ describe("InferenceClient with mock fetch", () => {
       }
     });
   });
+});
+
+it("isolates concurrent per-call headers and keeps numeric response negotiation", async () => {
+  const captured: Headers[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      captured.push(request.headers);
+      return Response.json({ object: "list", model: "m", data: [{ index: 0, embedding: [1, 2] }] });
+    })
+  );
+  const inference = new InferenceClient({
+    baseUrl: "http://embed.test",
+    headers: { Authorization: "Bearer configured", "X-Keep": "default" },
+  });
+  try {
+    await Promise.all([
+      inference.embed("m", ["a"], { headers: { authorization: "Bearer a", "X-Keep": undefined } }),
+      inference.embed("m", ["b"], { headers: { AUTHORIZATION: "Bearer b" } }),
+      inference.embedDense("m", ["c"], { headers: { Accept: "application/xml" } }),
+    ]);
+    expect(captured.map((h) => h.get("Authorization"))).toEqual([
+      "Bearer a",
+      "Bearer b",
+      "Bearer configured",
+    ]);
+    expect(captured[0].get("X-Keep")).toBe("default");
+    expect(captured[2].get("Accept")).toBe(NUMERIC_RESPONSE_ACCEPT);
+    expect(captured[0].get("Accept")).toBe("application/json");
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

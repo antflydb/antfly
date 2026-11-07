@@ -32745,11 +32745,13 @@ fn processSparseEmbedding(
     defer if (input) |*token| token.deinit();
     const revision = try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name);
     // Only protocol 17 can carry an execution identity or an output guard.
-    if (input) |*token| if (token.effect_protocol >= 17) {
+    if (input) |*token| {
         var read = try runtime.store.beginProbe();
         defer read.abort();
+        // A resolved revision cannot silently fall back to an unbound receipt
+        // on an older catalog. Admission upgrades base sparse indexes to 17.
         try token.bindExecution(&read, revision);
-    };
+    }
     if (input) |*token| if (try producerInputAccepted(runtime, token)) return;
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
@@ -39192,7 +39194,8 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
     try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same\",\"uri\":\"file:///a\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = index });
     var catalog = try db.artifactInventoryCommand(alloc);
     defer catalog.catalogs.deinit(alloc);
-    catalog.binding.effect_protocol = 17;
+    // Exercise admission's actual protocol selection for dense AND sparse.
+    try std.testing.expectEqual(@as(u16, 17), catalog.binding.effect_protocol);
     index += 1;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = index });
     var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };

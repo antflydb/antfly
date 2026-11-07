@@ -1521,3 +1521,70 @@ func TestNewUploadFreshInventoryAfterFailedSync(t *testing.T) {
 	defer backend.mu.Unlock()
 	require.Len(t, backend.records, 2)
 }
+
+func TestMigrateLocalDotPrefixPreservesPublishedRows(t *testing.T) {
+	opts, _, stateDir, _, _, backend := migrateServiceFixture(t)
+	service, err := NewService(ServiceOptions{Profile: opts.Profile, StateDir: stateDir, PublicURL: opts.PublicURL, AdminToken: opts.AdminToken, MediaKey: opts.MediaKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := serviceAdminCall(t.Context(), service, http.MethodPost, "/v1/sync", map[string]any{"source_id": testSourceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var job SyncJob
+	if err := json.Unmarshal(out.body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	if state := waitServiceJob(t, service, job.ID).State; state != "completed" {
+		t.Fatalf("initial sync: %s", state)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	before := len(backend.records)
+	backend.mu.Unlock()
+	if before != 1 {
+		t.Fatalf("initial rows: %d", before)
+	}
+	opts.ToPrefix = "."
+	result, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err)
+	require.Empty(t, result.ToPrefix)
+	// Either spelling of the root must match the same durable retry lineage.
+	opts.ToPrefix = ""
+	retry, err := MigrateLocal(t.Context(), opts)
+	require.NoError(t, err)
+	require.True(t, retry.CatalogRepointed)
+	require.Equal(t, 1, retry.Skipped)
+	backend.mu.Lock()
+	after := len(backend.records)
+	backend.mu.Unlock()
+	if after != before {
+		t.Errorf("successful migration deleted catalog rows: before=%d after=%d repointed=%v", before, after, result.CatalogRepointed)
+	}
+}
+
+func TestMigrationDestinationPrefixMatchesCopyKeys(t *testing.T) {
+	for _, prefix := range []string{"", ".", "assets", "nested/assets"} {
+		for _, provider := range []string{ProviderS3, ProviderGCS} {
+			t.Run(provider+"/"+prefix, func(t *testing.T) {
+				config, err := migrateDestinationConfig(provider, "bucket", prefix)
+				require.NoError(t, err)
+				var selected struct {
+					Prefix string `json:"prefix"`
+				}
+				require.NoError(t, json.Unmarshal(config, &selected))
+				filename := strings.Repeat("a", 64) + ".txt"
+				key, err := migrateDestinationKey(prefix, filename)
+				require.NoError(t, err)
+				require.Equal(t, selected.Prefix+localObjectDir+"/"+filename, key)
+			})
+		}
+	}
+	for _, prefix := range []string{"../outside", "/absolute", "a/../b", "a/"} {
+		_, err := migrateDestinationConfig(ProviderS3, "bucket", prefix)
+		require.Error(t, err)
+	}
+}

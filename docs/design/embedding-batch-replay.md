@@ -35,9 +35,9 @@ Ordered generated text vectors bind their receipt input to the resolved model
 revision. A revision change replaces the old generated result only if the
 physical output still matches the pre-inference observation. Duplicate work for
 the same revision retains its canonical accepted output, and explicit authored
-vectors remain authoritative. Catalog effect protocol 17 and Raft batch protocol
-26 gate the new execution identity; older publication/proof bytes retain their
-existing digests and decoders.
+vectors remain authoritative. Base dense and sparse indexes both select catalog
+effect protocol 17; Raft batch protocol 26 gates the new execution identity. Older
+publication/proof bytes retain their existing digests and decoders.
 
 Grouped multimodal requests preserve ordered parts as one logical input across
 native and remote execution. Remote multipart requests use

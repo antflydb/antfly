@@ -40,6 +40,7 @@ export class AntflyRerankingModel implements RerankingModelV4 {
       options.documents.values,
       {
         signal: options.abortSignal,
+        headers: options.headers,
       }
     );
     const ranking = response.data

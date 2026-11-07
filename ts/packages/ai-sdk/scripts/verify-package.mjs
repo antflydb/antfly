@@ -5,7 +5,10 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const registrySDK = process.argv.includes("--registry-sdk");
-const registrySDKVersion = process.env.ANTFLY_SDK_VERSION ?? "0.2.2";
+const sdkManifest = JSON.parse(
+  readFileSync(new URL("../../sdk/package.json", import.meta.url), "utf8")
+);
+const registrySDKVersion = process.env.ANTFLY_SDK_VERSION ?? sdkManifest.version;
 const packedNames = registrySDK ? ["ai-sdk"] : ["sdk", "ai-sdk"];
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
 const manifest = JSON.parse(readFileSync(resolve(root, "ts/packages/ai-sdk/package.json"), "utf8"));
@@ -44,6 +47,12 @@ for (const name of packedNames)
     resolve(root, `ts/packages/${name}`)
   );
 
+const packedManifest = JSON.parse(
+  run("tar", ["-xOf", resolve(artifacts, "ai-sdk.tgz"), "package/package.json"])
+);
+if (packedManifest.dependencies["@antfly/sdk"] !== `^${sdkManifest.version}`)
+  throw new Error("Packed SDK dependency floor differs from the tested minimum");
+
 const entries = run("tar", ["-tzf", resolve(artifacts, "ai-sdk.tgz")])
   .trim()
   .split("\n");
@@ -65,12 +74,18 @@ run("npm", [
 ]);
 
 for (const [extension, statement] of [
-  ["mjs", "import * as integration from '@antfly/ai-sdk';"],
-  ["cjs", "const integration = require('@antfly/ai-sdk');"],
+  [
+    "mjs",
+    "import * as integration from '@antfly/ai-sdk'; import * as sdk from '@antfly/sdk'; import { StandaloneSourcesClient } from '@antfly/sdk/sources';",
+  ],
+  [
+    "cjs",
+    "const integration = require('@antfly/ai-sdk'); const sdk = require('@antfly/sdk'); const { StandaloneSourcesClient } = require('@antfly/sdk/sources');",
+  ],
 ]) {
   writeFileSync(
     resolve(consumer, `exports.${extension}`),
-    `${statement}\nfor (const key of ['createAntfly','createMemoryTools','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
+    `${statement}\nfor(const name of ['AntflyHTTPError','AntflyResponseError','AntflyClient']) if(typeof sdk[name] !== 'function') throw new Error('SDK foundation missing: '+name);\nif(typeof StandaloneSourcesClient !== 'function') throw new Error('SDK sources subpath missing');\nfor (const key of ['createAntfly','createMemoryTools','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
   );
   run("node", [`exports.${extension}`]);
 }
@@ -143,10 +158,12 @@ writeFileSync(
 run("pnpm", ["install", "--ignore-scripts", "--no-frozen-lockfile"], isolated);
 const isolatedContract = `import type { LanguageModel, EmbeddingModel } from 'ai';
 import { createAntfly, createSearchTool, uploadFile } from '@antfly/ai-sdk';
+import { StandaloneSourcesClient } from '@antfly/sdk/sources';
 const provider = createAntfly({baseUrl:'http://localhost:8080'});
 const language: LanguageModel = provider.languageModel('model');
 const embedding: EmbeddingModel = provider.embeddingModel('model');
 void language; void embedding; void uploadFile;
+void new StandaloneSourcesClient({baseUrl:'http://localhost:8082',token:'test-token'});
 void createSearchTool({client:provider.client,table:'docs'});
 `;
 for (const extension of ["mts", "cts"]) {

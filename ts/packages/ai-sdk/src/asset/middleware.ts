@@ -234,12 +234,13 @@ export function createAssetMiddleware(options: AssetMiddlewareOptions): Language
       );
       return {
         ...part,
+        mediaType: resource.mime_type,
         data: { type: "reference", reference: { ...part.data.reference, ...entry.reference } },
       };
     }
 
     const bytes = await fetchResourceBytes(resource, fetchFn, signal);
-    return { ...part, data: { type: "data", data: bytes } };
+    return { ...part, mediaType: resource.mime_type, data: { type: "data", data: bytes } };
   }
 
   async function rewriteMessage(

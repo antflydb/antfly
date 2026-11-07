@@ -196,6 +196,10 @@ type MigrateLocalResult struct {
 // anything in the local store. See MigrateLocalOptions for the two repoint
 // modes (a live Server, or an in-process StateDir).
 func MigrateLocal(ctx context.Context, opts MigrateLocalOptions) (MigrateLocalResult, error) {
+	// Keep root aliases canonical in cutover receipts and retry comparisons too.
+	if opts.ToPrefix == "." {
+		opts.ToPrefix = ""
+	}
 	result := MigrateLocalResult{DryRun: opts.DryRun, SourceID: opts.SourceID, FromConnection: opts.FromConnection, ToConnection: opts.ToConnection, Bucket: opts.ToBucket, ToPrefix: opts.ToPrefix}
 	if opts.SourceID == "" || opts.FromConnection == "" || opts.ToConnection == "" || opts.ToBucket == "" {
 		return result, fmt.Errorf("%w: source, from-connection, to-connection and to-bucket are required", ErrInvalidInput)
@@ -366,9 +370,13 @@ func migrateDestinationConfig(provider, bucket, prefix string) (json.RawMessage,
 	// Bucket prefixes are literal byte prefixes. A directory boundary keeps the
 	// exact suffix identical to LocalConnector's relative key, including any
 	// meaningful leading slash in a bucket object name.
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
+	dir, err := localStoreDir(prefix)
+	if err != nil {
+		return nil, err
 	}
+	// Copy keys use this same normalized directory. In particular, "."
+	// names the store root and must not become the literal bucket prefix "./".
+	prefix = strings.TrimSuffix(dir, localObjectDir)
 	switch provider {
 	case ProviderS3:
 		return json.Marshal(S3Config{Bucket: bucket, Prefix: prefix})

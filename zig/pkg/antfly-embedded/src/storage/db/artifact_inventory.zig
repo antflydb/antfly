@@ -55,7 +55,7 @@ pub const Catalogs = struct {
     /// Select capabilities from this immutable definition cut, independently
     /// of the database's monotonic reader floor. Resolver/producer receipts
     /// need protocol 15; grouped producer ownership needs protocol 16.
-    /// Base dense vectors need protocol 17; scoped chunk vectors need protocol 18.
+    /// Base dense and sparse vectors need protocol 17; scoped chunk vectors need protocol 18.
     pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
         const enrichments = @import("catalog/enrichment_catalog.zig");
         const producers = if (self.enrichments.len != 0)
@@ -76,7 +76,7 @@ pub const Catalogs = struct {
             defer @import("types.zig").freeIndexConfigs(alloc, configs);
             for (configs) |cfg| {
                 if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) return 18;
-                if (cfg.kind == .dense_vector and try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
+                if (try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
             }
         }
         if (self.resolvers.len != 0) {

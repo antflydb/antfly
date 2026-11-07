@@ -1,7 +1,7 @@
 # @antfly/ai-sdk
 
 Antfly provider, tools, chat history persistence and the asset flow for the
-Vercel AI SDK (`ai` >=7.0.162 <8, `zod` >=4.1.8 <5). Requires Node 24+.
+Vercel AI SDK (`ai` >=7.0.162 <8, `zod` >=4.1.8 <5). Requires Node 24+ and `@antfly/sdk` >=0.2.3 <0.3 (including its `/sources` export).
 
 ```ts
 import { createAntfly, createMemoryTools, createSearchTool, createSqlTool } from "@antfly/ai-sdk";
@@ -28,6 +28,10 @@ const result = await generateText({
 `NoSuchModelError` -- Antfly has no image generation model, and `ProviderV4`
 requires the method to exist. It also exposes `.client` (`AntflyClient`) and
 `.inference` (`InferenceClient`) for building tools and history below.
+
+Per-call HTTP `headers` are forwarded for generation, streaming, embedding and
+reranking. Defined values override configured headers case-insensitively without
+changing other requests. The transport owns `Accept` to match its response decoder.
 
 Known limitations, documented rather than silently handled: `stopSequences`
 and `seed` have no server-side equivalent and are reported as call warnings;
@@ -77,7 +81,9 @@ const result = await generateText({
   bytes server-side before calling the model.
 - **To an external model**: wrap it with `withAssetMiddleware(model, { client })`
   (or `createAssetMiddleware` + `wrapLanguageModel`). It fetches the asset
-  with `If-Match` and inlines it by default. Set `allowVendorUpload: true`
+  with `If-Match` and inlines it by default. The resolved catalog MIME type
+  accompanies both inline bytes and vendor file references, overriding the
+  caller-supplied label. Set `allowVendorUpload: true`
   and `files: <that provider's files API>` to upload once per provider and
   cache by verified content digest and MIME type instead -- off by default, because revoking
   access in Antfly does not remove a vendor's own copy. Concurrent references
@@ -179,3 +185,8 @@ explicit memory tools.
 From `ts/`: `pnpm --filter @antfly/ai-sdk build`, `pnpm --filter @antfly/ai-sdk test`.
 `pnpm --filter @antfly/ai-sdk typecheck` also compile-checks the provider and
 each model against the installed `@ai-sdk/provider` types.
+
+The registry release gate checks the exact minimum SDK version and runs the same
+strict ESM/CommonJS and non-hoisted consumers as package CI, with library checks
+enabled. Publish SDK 0.2.3 before tagging the AI SDK integration; the gate refuses
+publication while that SDK release is unavailable.

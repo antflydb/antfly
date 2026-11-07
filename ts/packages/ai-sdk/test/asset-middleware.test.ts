@@ -343,3 +343,40 @@ it("aborts an abandoned upload and clears cancelled or failed flights for retry"
   await invoke();
   expect(uploadFile).toHaveBeenCalledTimes(3);
 });
+
+it.each([
+  false,
+  true,
+])("uses catalog MIME for resolved bytes and vendor references (upload=%s)", async (allowVendorUpload) => {
+  stubCatalogAndMediaFetch();
+  const upload = vi
+    .fn()
+    .mockResolvedValue({ providerReference: { openai: "file-video" }, warnings: [] });
+  const middleware = createAssetMiddleware({
+    authorize: () => true,
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    allowVendorUpload,
+    files: { specificationVersion: "v4", provider: "openai", uploadFile: upload },
+  });
+  const params = paramsWithReferencePart();
+  const message = params.prompt[0];
+  if (message.role !== "user") throw new Error("Expected user message");
+  const file = message.content[1];
+  if (file.type !== "file") throw new Error("Expected file");
+  file.mediaType = "image/png";
+  const result = await middleware.transformParams?.({
+    type: "generate",
+    params,
+    model: fakeModel("openai"),
+  });
+  const transformed = result?.prompt[0];
+  if (transformed?.role !== "user") throw new Error("Expected user message");
+  const part = transformed.content[1];
+  if (part.type !== "file") throw new Error("Expected file");
+  expect(part.mediaType).toBe(resource.mime_type);
+  expect(file.mediaType).toBe("image/png");
+  if (allowVendorUpload) {
+    expect(part.data.type).toBe("reference");
+    expect(upload.mock.calls[0][0].mediaType).toBe(resource.mime_type);
+  } else expect(part.data).toEqual({ type: "data", data: videoBytes });
+});

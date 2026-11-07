@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -436,4 +437,111 @@ func TestCredentialFactoryRejectsAmbiguousReferences(t *testing.T) {
 	require.Error(t, err)
 	_, err = factory(t.Context(), Connection{Provider: ProviderS3, SecretRefs: map[string]string{"unknown": "key"}})
 	require.Error(t, err)
+}
+
+type blockingNamespaceConnector struct {
+	Connector
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (c *blockingNamespaceConnector) Enumerate(ctx context.Context, r Request) (Inventory, error) {
+	c.once.Do(func() { close(c.entered) })
+	select {
+	case <-c.release:
+		return Inventory{}, nil
+	case <-ctx.Done():
+		return Inventory{}, ctx.Err()
+	}
+}
+
+func TestServiceNamespaceVerificationDoesNotBlockAndFencesConcurrentEdits(t *testing.T) {
+	for _, change := range []string{"none", "source", "connection", "remove"} {
+		t.Run(change, func(t *testing.T) {
+			service, _, _ := serviceFixture(t)
+			original := service.factory
+			entered, release := make(chan struct{}), make(chan struct{})
+			service.factory = func(ctx context.Context, connection Connection) (Connector, error) {
+				connector, err := original(ctx, connection)
+				if err != nil {
+					return nil, err
+				}
+				return &blockingNamespaceConnector{Connector: connector, entered: entered, release: release}, nil
+			}
+			source := service.profile.Sources[0]
+			source.Identity.Namespace = "adopted"
+			putDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() { putDone <- serviceCall(service, "PUT", "/v1/sources/"+source.ID, source) }()
+			<-entered
+			released := false
+			defer func() {
+				if !released {
+					close(release)
+					<-putDone
+				}
+			}()
+			readDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() { readDone <- serviceCall(service, "GET", "/v1/profile", nil) }()
+			select {
+			case read := <-readDone:
+				require.Equal(t, 200, read.Code)
+			case <-time.After(time.Second):
+				t.Fatal("profile read blocked behind provider enumeration")
+			}
+			switch change {
+			case "source":
+				updated := source
+				updated.Identity = Identity{}
+				updated.Alias = "concurrently edited"
+				require.Equal(t, 200, serviceCall(service, "PUT", "/v1/sources/"+source.ID, updated).Code)
+			case "connection":
+				require.Equal(t, 200, serviceCall(service, "DELETE", "/v1/connections/"+source.Connection, nil).Code)
+			case "remove":
+				require.Equal(t, 200, serviceCall(service, "DELETE", "/v1/sources/"+source.ID, nil).Code)
+			}
+			close(release)
+			released = true
+			result := <-putDone
+			if change == "none" {
+				require.Equal(t, 200, result.Code, result.Body.String())
+				require.Equal(t, "adopted", service.profile.Sources[0].Identity.Namespace)
+			} else {
+				require.Equal(t, 412, result.Code, result.Body.String())
+				if change == "remove" {
+					require.Empty(t, service.profile.Sources)
+					return
+				}
+				require.Empty(t, service.profile.Sources[0].Identity.Namespace)
+				if change == "source" {
+					require.Equal(t, "concurrently edited", service.profile.Sources[0].Alias)
+				}
+			}
+		})
+	}
+}
+
+func TestServiceNamespaceVerificationSkipsProviderDuringSync(t *testing.T) {
+	service, _, _ := serviceFixture(t)
+	original := service.factory
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	service.factory = func(ctx context.Context, connection Connection) (Connector, error) {
+		connector, err := original(ctx, connection)
+		if err != nil {
+			return nil, err
+		}
+		return &blockingNamespaceConnector{Connector: connector, entered: entered, release: release}, nil
+	}
+	source := service.profile.Sources[0]
+	require.Equal(t, 202, serviceCall(service, "POST", "/v1/sync", map[string]any{"source_id": source.ID}).Code)
+	<-entered
+	source.Identity.Namespace = "adopted"
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- serviceCall(service, "PUT", "/v1/sources/"+source.ID, source) }()
+	select {
+	case response := <-done:
+		require.Equal(t, 409, response.Code)
+	case <-time.After(time.Second):
+		t.Fatal("namespace preflight competed with an active sync")
+	}
 }

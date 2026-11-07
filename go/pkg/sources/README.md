@@ -493,6 +493,11 @@ and rejects concurrent acquisition, identity or transfer-connection changes. Bot
 and sync admission use an atomic `If-Match` precondition, together with
 configuration digests for both transfer connections; a conflicting edit
 fails cutover without overwriting it. Copied objects remain available for retry.
+Destination copy keys and source selection use the same canonical prefix; `.`
+names the bucket root, just like an empty prefix. Namespace adoption checks provider
+identity outside the service mutex with a bounded deadline. Concurrent source,
+connection or credential changes invalidate that check before the source is written.
+
 Live migration requires companion precondition protocol version 2. Cutover
 atomically persists a migration receipt alongside the source. Every retry must
 match the original local root, prefix, destination connection, bucket, prefix,
