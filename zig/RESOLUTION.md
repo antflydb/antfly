@@ -339,7 +339,11 @@ the previous committed verdict is preserved and the refresh fails. Explicit
 reported dependency changes.
 Probability thresholds apply to the probabilistic stages; a terminal
 verdict-only stage must provide a categorical 0/1 distribution. Catalogs with a cascade policy
-require reader epoch 30.
+require reader epoch 30; policies with an enabled `require_agreement` guard
+require epoch 31. Agreement is recomputed from validated stage answers before
+thresholds apply. Disagreed or unverified comparisons commit an abstained
+receipt and remain REVIEW even with `on_failure: mint`. These receipts replay
+without fresh inference until their normal policy or dependency invalidation.
 
 **Description inputs.** Extraction mentions may supply `description` and a numeric
 `description_embedding`; candidate document fields supply the corresponding text
@@ -3223,4 +3227,5 @@ compiled trace validator once per resolution batch. Classifying each response
 validates every executed stage without allocating or rebuilding the plan;
 revision-dependent specification hashes are reused within the batch. Both
 cascade adjudication and cascade decision enrichments fence readers below
-epoch 30, including grouped enrichment producers.
+epoch 30, including grouped enrichment producers. Enabling an agreement guard
+raises that fence to epoch 31; absent or explicit-false guards retain epoch 30.

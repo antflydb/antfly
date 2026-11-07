@@ -298,6 +298,7 @@ from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
 from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
 from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
+from .decision_cascade_agreement_status import DecisionCascadeAgreementStatus
 from .decision_cascade_stage_trace import DecisionCascadeStageTrace
 from .decision_cascade_stage_trace_decision_method import DecisionCascadeStageTraceDecisionMethod
 from .decision_cascade_stage_trace_provenance import DecisionCascadeStageTraceProvenance
@@ -2939,6 +2940,7 @@ __all__ = (
     "DeciderConfigEmbeddingOptionsTaskType",
     "DeciderConfigProvider",
     "DecisionBatchItem",
+    "DecisionCascadeAgreementStatus",
     "DecisionCascadeStageTrace",
     "DecisionCascadeStageTraceDecisionMethod",
     "DecisionCascadeStageTraceProvenance",

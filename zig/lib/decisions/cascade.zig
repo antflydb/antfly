@@ -58,6 +58,7 @@ pub const Stage = struct {
     method: Method,
     when: ?Band = null,
     on_failure: OnFailure = .fail,
+    require_agreement: bool = false,
 };
 
 pub const Budget = struct {
@@ -129,18 +130,22 @@ pub fn compile(a: A, value: V) !Definition {
     const stages = try a.alloc(Stage, raw_stages.array.items.len);
     for (raw_stages.array.items, stages, 0..) |raw, *stage, i| {
         const fields = try object(raw);
-        try keys(fields, &.{ "name", "decider", "when", "on_failure" });
+        try keys(fields, &.{ "name", "decider", "when", "on_failure", "require_agreement" });
         const name = try text(fields.get("name") orelse return error.InvalidDecisionCascade);
         if (!validStageName(name)) return error.InvalidDecisionCascade;
         for (stages[0..i]) |other| if (std.mem.eql(u8, other.name, name)) return error.InvalidDecisionCascade;
         const decider = fields.get("decider") orelse return error.InvalidDecisionCascade;
         stage.* = .{ .name = name, .decider = decider, .method = try methodOf(decider) };
         if (fields.get("on_failure")) |policy| stage.on_failure = std.meta.stringToEnum(OnFailure, try text(policy)) orelse return error.InvalidDecisionCascade;
+        if (fields.get("require_agreement")) |required| {
+            if (required != .bool) return error.InvalidDecisionCascade;
+            stage.require_agreement = required.bool;
+        }
         if (i == 0) {
             // The first stage answers every item and has nothing to fall back to.
             // Explicit fail is equivalent to omission, including defaults
             // emitted by generated SDKs. Only keep_previous needs a prior answer.
-            if (fields.contains("when") or stage.on_failure != .fail) return error.InvalidDecisionCascade;
+            if (fields.contains("when") or stage.on_failure != .fail or stage.require_agreement) return error.InvalidDecisionCascade;
             continue;
         }
         const when = try object(fields.get("when") orelse return error.InvalidDecisionCascade);
@@ -195,6 +200,11 @@ fn identity(a: A, definition: *const Definition) ![64]u8 {
         try s.write(stage.name);
         try s.objectField("decider");
         try writeCanonical(&s, stage.decider);
+        // Preserve identities of definitions that do not enable the gate.
+        if (stage.require_agreement) {
+            try s.objectField("require_agreement");
+            try s.write(true);
+        }
         try s.objectField("on_failure");
         try s.write(@tagName(stage.on_failure));
         if (stage.when) |when| {
@@ -265,6 +275,140 @@ fn writeCanonical(s: *std.json.Stringify, value: V) !void {
         },
         else => try s.write(value),
     }
+}
+
+pub const AgreementStatus = enum { agreed, disagreed, unverified };
+const agreement_fields = [_][]const u8{ "agreement_status", "agreed", "disagreed_questions" };
+pub const Agreement = struct {
+    status: AgreementStatus = .agreed,
+    questions: [64][]const u8 = undefined,
+    count: usize = 0,
+};
+
+/// Reader fencing inspects an already validated, frozen definition.
+pub fn requiresAgreement(value: V) bool {
+    if (value != .object) return false;
+    const stages = value.object.get("stages") orelse return false;
+    if (stages != .array) return false;
+    for (stages.array.items) |stage| {
+        if (stage != .object) continue;
+        const required = stage.object.get("require_agreement") orelse continue;
+        if (required == .bool and required.bool) return true;
+    }
+    return false;
+}
+
+const NamedAnswer = struct { name: []const u8, value: V };
+fn orderedAnswers(answers: V, storage: *[64]NamedAnswer) ![]NamedAnswer {
+    if (answers != .array or answers.array.items.len == 0 or answers.array.items.len > storage.len) return error.InvalidDecisionOutput;
+    const entries = storage[0..answers.array.items.len];
+    for (answers.array.items, entries) |answer, *entry| {
+        if (answer != .object) return error.InvalidDecisionOutput;
+        const name = answer.object.get("name") orelse return error.InvalidDecisionOutput;
+        if (name != .string or name.string.len == 0) return error.InvalidDecisionOutput;
+        entry.* = .{ .name = name.string, .value = answer };
+    }
+    std.mem.sort(NamedAnswer, entries, {}, struct {
+        fn less(_: void, lhs: NamedAnswer, rhs: NamedAnswer) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.less);
+    for (entries[1..], entries[0 .. entries.len - 1]) |entry, previous| if (std.mem.eql(u8, entry.name, previous.name)) return error.InvalidDecisionOutput;
+    return entries;
+}
+fn sameVote(lhs: V, rhs: V) !bool {
+    const ltype = lhs.object.get("type") orelse return error.InvalidDecisionOutput;
+    const rtype = rhs.object.get("type") orelse return error.InvalidDecisionOutput;
+    if (ltype != .string or rtype != .string or !std.mem.eql(u8, ltype.string, rtype.string)) return error.InvalidDecisionOutput;
+    if (std.mem.eql(u8, ltype.string, "choice")) {
+        const l = lhs.object.get("choice") orelse return error.InvalidDecisionOutput;
+        const r = rhs.object.get("choice") orelse return error.InvalidDecisionOutput;
+        if (l != .string or r != .string) return error.InvalidDecisionOutput;
+        return std.mem.eql(u8, l.string, r.string);
+    }
+    if (!std.mem.eql(u8, ltype.string, "predicate")) return error.InvalidDecisionOutput;
+    const l = try number(lhs.object.get("probability") orelse return error.InvalidDecisionOutput);
+    const r = try number(rhs.object.get("probability") orelse return error.InvalidDecisionOutput);
+    if (!std.math.isFinite(l) or !std.math.isFinite(r) or l < 0 or l > 1 or r < 0 or r > 1) return error.InvalidDecisionOutput;
+    return l != 0.5 and r != 0.5 and (l > 0.5) == (r > 0.5);
+}
+
+/// Bounded stack scratch; no per-result plan, prompt parsing or allocation.
+pub fn compareAgreement(previous: V, current: V, scope: ?[]const u8) !Agreement {
+    var left: [64]NamedAnswer = undefined;
+    var right: [64]NamedAnswer = undefined;
+    const lhs = try orderedAnswers(previous, &left);
+    const rhs = try orderedAnswers(current, &right);
+    if (lhs.len != rhs.len) return error.InvalidDecisionOutput;
+    var result = Agreement{};
+    var selected = scope == null;
+    for (lhs, rhs) |l, r| {
+        if (!std.mem.eql(u8, l.name, r.name)) return error.InvalidDecisionOutput;
+        if (scope) |name| if (!std.mem.eql(u8, name, l.name)) continue;
+        selected = true;
+        if (!try sameVote(l.value, r.value)) {
+            result.status = .disagreed;
+            result.questions[result.count] = r.name;
+            result.count += 1;
+        }
+    }
+    if (!selected) return error.InvalidDecisionOutput;
+    return result;
+}
+fn writeAgreement(a: A, fields: *std.json.ObjectMap, agreement: Agreement) !void {
+    try put(a, fields, "agreement_status", .{ .string = @tagName(agreement.status) });
+    if (agreement.status != .unverified) try put(a, fields, "agreed", .{ .bool = agreement.status == .agreed });
+    if (agreement.status == .disagreed) {
+        var names = std.json.Array.init(a);
+        for (agreement.questions[0..agreement.count]) |name| try names.append(.{ .string = name });
+        try put(a, fields, "disagreed_questions", .{ .array = names });
+    }
+}
+fn validateAgreement(fields: std.json.ObjectMap, expected: ?Agreement) !void {
+    if (expected) |agreement| {
+        const status = fields.get("agreement_status") orelse return error.InvalidDecisionOutput;
+        if (status != .string or !std.mem.eql(u8, status.string, @tagName(agreement.status))) return error.InvalidDecisionOutput;
+        if (agreement.status == .unverified) {
+            if (fields.contains("agreed")) return error.InvalidDecisionOutput;
+        } else {
+            const agreed = fields.get("agreed") orelse return error.InvalidDecisionOutput;
+            if (agreed != .bool or agreed.bool != (agreement.status == .agreed)) return error.InvalidDecisionOutput;
+        }
+        if (agreement.status == .disagreed) {
+            const names = fields.get("disagreed_questions") orelse return error.InvalidDecisionOutput;
+            if (names != .array or names.array.items.len != agreement.count) return error.InvalidDecisionOutput;
+            for (names.array.items, agreement.questions[0..agreement.count]) |name, actual| {
+                if (name != .string or !std.mem.eql(u8, name.string, actual)) return error.InvalidDecisionOutput;
+            }
+        } else if (fields.contains("disagreed_questions")) return error.InvalidDecisionOutput;
+    } else for (agreement_fields) |field| if (fields.contains(field)) return error.InvalidDecisionOutput;
+}
+
+/// Shared scalar/predicate consumer gate. Full trace validation additionally
+/// recomputes the state from the frozen definition and the actual answers.
+pub fn agreementBlocked(response: V) !bool {
+    if (response != .object) return error.InvalidDecisionOutput;
+    const raw = response.object.get("cascade") orelse return false;
+    if (raw != .object) return error.InvalidDecisionOutput;
+    const status = raw.object.get("agreement_status") orelse {
+        try validateAgreement(raw.object, null);
+        return false;
+    };
+    if (status != .string) return error.InvalidDecisionOutput;
+    const parsed = std.meta.stringToEnum(AgreementStatus, status.string) orelse return error.InvalidDecisionOutput;
+    var expected = Agreement{ .status = parsed };
+    if (parsed == .disagreed) {
+        const names = raw.object.get("disagreed_questions") orelse return error.InvalidDecisionOutput;
+        if (names != .array or names.array.items.len == 0 or names.array.items.len > expected.questions.len) return error.InvalidDecisionOutput;
+        for (names.array.items, 0..) |name, i| {
+            if (name != .string or name.string.len == 0) return error.InvalidDecisionOutput;
+            if (i > 0 and !std.mem.lessThan(u8, expected.questions[i - 1], name.string)) return error.InvalidDecisionOutput;
+            expected.questions[i] = name.string;
+        }
+        expected.count = names.array.items.len;
+    }
+    try validateAgreement(raw.object, expected);
+    return parsed != .agreed;
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +510,8 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
     const answered = cascade.get("answered_by") orelse return error.InvalidDecisionOutput;
     if (executed != .array or executed.array.items.len == 0 or executed.array.items.len > definition.stages.len or answered != .string) return error.InvalidDecisionOutput;
     var last: ?usize = null;
+    var previous_answers: ?V = null;
+    var aggregate: ?Agreement = null;
     for (executed.array.items, 0..) |entry, index| {
         const fields = try object(entry);
         const stage = definition.stages[index];
@@ -376,14 +522,23 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
         const has_next = index + 1 < executed.array.items.len;
         if (fields.get("error")) |err| {
             if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous) return error.InvalidDecisionOutput;
+            const expected: ?Agreement = if (stage.require_agreement) .{ .status = .unverified } else null;
+            try validateAgreement(fields, expected);
+            if (expected) |agreement| aggregate = agreement;
             continue;
         }
         const answers = fields.get("answers") orelse return error.InvalidDecisionOutput;
         if (answers != .array or answers.array.items.len == 0) return error.InvalidDecisionOutput;
-        const should_escalate = if (index + 1 < definition.stages.len) try inBand(definition.stages[index + 1].when.?, answers) else false;
+        const expected: ?Agreement = if (stage.require_agreement) try compareAgreement(previous_answers orelse return error.InvalidDecisionOutput, answers, stage.when.?.question) else null;
+        try validateAgreement(fields, expected);
+        if (expected) |agreement| aggregate = agreement;
+        const blocked = if (aggregate) |agreement| agreement.status != .agreed else false;
+        const should_escalate = !blocked and if (index + 1 < definition.stages.len) try inBand(definition.stages[index + 1].when.?, answers) else false;
         if (escalated.bool != should_escalate or has_next != should_escalate) return error.InvalidDecisionOutput;
         last = index;
+        previous_answers = answers;
     }
+    try validateAgreement(cascade, aggregate);
     const index = last orelse return error.InvalidDecisionOutput;
     const final = executed.array.items[index].object;
     if (!std.mem.eql(u8, answered.string, definition.stages[index].name) or
@@ -452,6 +607,7 @@ const Row = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     estimated_usage: bool = false,
+    agreement: ?usize = null,
     stages: std.array_list.Managed(V),
 };
 
@@ -511,7 +667,7 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
             if (isFatal(err)) return err;
             for (active.items) |index| {
                 const row = &rows[index];
-                try row.stages.append(try trace(a, stage, null, null, err));
+                _ = try appendTrace(a, row, stage, null, null, err);
                 if (stage_index == 0 or stage.on_failure == .fail) {
                     row.response = null;
                     row.failure = err;
@@ -534,15 +690,15 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
             };
             if (value) |response| {
                 if (response != .object or response.object.get("answers") == null) return error.InvalidDecisionOutput;
-                try row.stages.append(try trace(a, stage, response, usage, null));
+                const blocked = try appendTrace(a, row, stage, response, usage, null);
                 row.response = response;
                 row.failure = null;
-                try still.append(index);
+                if (!blocked) try still.append(index);
                 continue;
             }
             const err = failure orelse error.InvalidDecisionOutput;
             if (isFatal(err)) return err;
-            try row.stages.append(try trace(a, stage, null, usage, err));
+            _ = try appendTrace(a, row, stage, null, usage, err);
             // keep_previous retains the previous answer; the item stops here.
             if (stage_index > 0 and stage.on_failure == .keep_previous) continue;
             row.response = null;
@@ -564,6 +720,19 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
         value.* = try assemble(a, definition, name, row, final);
     }
     return out;
+}
+
+fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?anyerror) !bool {
+    var entry = try trace(a, stage, response, usage, err);
+    var blocked = false;
+    if (stage.require_agreement) {
+        const agreement = if (response) |current| try compareAgreement(row.response.?.object.get("answers").?, current.object.get("answers").?, stage.when.?.question) else Agreement{ .status = .unverified };
+        try writeAgreement(a, &entry.object, agreement);
+        row.agreement = row.stages.items.len;
+        blocked = agreement.status != .agreed;
+    }
+    try row.stages.append(entry);
+    return blocked;
 }
 
 fn trace(a: A, stage: Stage, response: ?V, usage: ?V, err: ?anyerror) !V {
@@ -602,6 +771,9 @@ fn assemble(a: A, definition: *const Definition, name: []const u8, row: *Row, fi
     };
     try put(a, &cascade, "answered_by", .{ .string = answered });
     try put(a, &cascade, "stages", .{ .array = row.stages });
+    if (row.agreement) |index| for (agreement_fields) |field| {
+        if (row.stages.items[index].object.get(field)) |value| try put(a, &cascade, field, value);
+    };
     try put(a, &root, "cascade", .{ .object = cascade });
     return .{ .object = root };
 }
@@ -953,4 +1125,106 @@ test "decision cascade accepts SDK defaults and canonicalizes explicit first-sta
     try std.testing.expectEqualSlices(u8, &explicit.sha256, &omitted.sha256);
     try first.object.put(a, "on_failure", .{ .string = "keep_previous" });
     try std.testing.expectError(error.InvalidDecisionCascade, compile(a, body));
+}
+
+test "decision cascade agreement configuration preserves disabled identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try compileJson(a, example);
+    const raw = try std.json.parseFromSliceLeaky(V, a, example, .{});
+    const stages = raw.object.getPtr("stages").?.array.items;
+    for (stages) |*stage| try stage.object.put(a, "require_agreement", .{ .bool = false });
+    const disabled = try compile(a, raw);
+    try std.testing.expectEqualSlices(u8, &base.sha256, &disabled.sha256);
+    try stages[0].object.put(a, "require_agreement", .{ .bool = true });
+    try std.testing.expectError(error.InvalidDecisionCascade, compile(a, raw));
+    try stages[0].object.put(a, "require_agreement", .{ .bool = false });
+    try stages[1].object.put(a, "require_agreement", .{ .string = "true" });
+    try std.testing.expectError(error.InvalidDecisionCascade, compile(a, raw));
+    try stages[1].object.put(a, "require_agreement", .{ .bool = true });
+    const enabled = try compile(a, raw);
+    try std.testing.expect(!std.mem.eql(u8, &base.sha256, &enabled.sha256));
+    try std.testing.expect(requiresAgreement(raw));
+}
+
+test "decision cascade agreement compares scoped choices and predicate ties without allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lhs = try std.json.parseFromSliceLeaky(V, a,
+        \\[{"name":"a","type":"choice","choice":"same"},{"name":"b","type":"predicate","probability":0.9}]
+    , .{});
+    const rhs = try std.json.parseFromSliceLeaky(V, a,
+        \\[{"name":"b","type":"predicate","probability":0.1},{"name":"a","type":"choice","choice":"same"}]
+    , .{});
+    try std.testing.expectEqual(AgreementStatus.agreed, (try compareAgreement(lhs, rhs, "a")).status);
+    const disagreement = try compareAgreement(lhs, rhs, null);
+    try std.testing.expectEqual(AgreementStatus.disagreed, disagreement.status);
+    try std.testing.expectEqual(@as(usize, 1), disagreement.count);
+    try std.testing.expectEqualStrings("b", disagreement.questions[0]);
+    try rhs.array.items[0].object.put(a, "probability", .{ .float = 0.5 });
+    try std.testing.expectEqual(AgreementStatus.disagreed, (try compareAgreement(rhs, rhs, "b")).status);
+    try rhs.array.items[0].object.put(a, "probability", .{ .float = 0.99 });
+    try std.testing.expectEqual(AgreementStatus.agreed, (try compareAgreement(lhs, rhs, null)).status);
+    try std.testing.expectError(error.InvalidDecisionOutput, compareAgreement(lhs, rhs, "missing"));
+    rhs.array.items[0] = rhs.array.items[1];
+    try std.testing.expectError(error.InvalidDecisionOutput, compareAgreement(lhs, rhs, null));
+}
+
+test "decision cascade agreement gates batches stops later stages and verifies the trace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definition = try compileJson(a,
+        \\{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"decision_method":"generated","generator":{"model":"strong"}},"require_agreement":true,"when":{"choice":"same","probability_between":[0.3,1.0]}},{"name":"never","decider":{"model":"never"},"when":{"probability_between":[0,1]}}]}
+    );
+    var fake = Fake{ .fast = &.{ 0.99, 0.6, 0.1 }, .strong_same = 0.2 };
+    const result = try execute(a, &definition, "c", 3, .{ .ptr = &fake, .run = Fake.run });
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    for (result.values, 0..) |value, index| {
+        const response = value.?;
+        _ = try validateTrace(&definition, response);
+        const trace_value = response.object.get("cascade").?.object;
+        if (index == 2) {
+            try std.testing.expect(!trace_value.contains("agreement_status"));
+            try std.testing.expect(!try agreementBlocked(response));
+        } else {
+            try std.testing.expect(try agreementBlocked(response));
+            try std.testing.expectEqualStrings("disagreed", trace_value.get("agreement_status").?.string);
+            try std.testing.expectEqual(@as(usize, 2), trace_value.get("stages").?.array.items.len);
+            try std.testing.expectEqual(@as(i64, 20), response.object.get("usage").?.object.get("input_tokens").?.integer);
+        }
+    }
+    var forged = result.values[0].?;
+    try forged.object.getPtr("cascade").?.object.put(a, "agreed", .{ .bool = true });
+    try std.testing.expectError(error.InvalidDecisionOutput, validateTrace(&definition, forged));
+    _ = forged.object.getPtr("cascade").?.object.swapRemove("agreement_status");
+    try std.testing.expectError(error.InvalidDecisionOutput, validateTrace(&definition, forged));
+}
+
+test "decision cascade guarded keep_previous is unverified not an agreeing vote" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = try std.json.parseFromSliceLeaky(V, a, example, .{});
+    const strong = &raw.object.getPtr("stages").?.array.items[1];
+    try strong.object.put(a, "require_agreement", .{ .bool = true });
+    try strong.object.put(a, "on_failure", .{ .string = "keep_previous" });
+    const definition = try compile(a, raw);
+    for ([_]bool{ false, true }) |whole_stage| {
+        var fake = Fake{ .fast = &.{0.6}, .strong_fails = whole_stage, .strong_item_failure = if (whole_stage) null else 0 };
+        const result = try execute(a, &definition, "c", 1, .{ .ptr = &fake, .run = Fake.run });
+        const response = result.values[0].?;
+        _ = try validateTrace(&definition, response);
+        try std.testing.expect(try agreementBlocked(response));
+        const fields = response.object.get("cascade").?.object;
+        try std.testing.expectEqualStrings("unverified", fields.get("agreement_status").?.string);
+        try std.testing.expect(!fields.contains("agreed"));
+    }
+    var agreeing = Fake{ .fast = &.{0.6}, .strong_same = 0.9 };
+    const result = try execute(a, &definition, "c", 1, .{ .ptr = &agreeing, .run = Fake.run });
+    _ = try validateTrace(&definition, result.values[0].?);
+    try std.testing.expect(!try agreementBlocked(result.values[0].?));
+    try std.testing.expect(result.values[0].?.object.get("cascade").?.object.get("agreed").?.bool);
 }

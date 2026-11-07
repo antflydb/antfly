@@ -18332,6 +18332,11 @@ export interface components {
                 probability_between: number[];
             };
             /**
+             * @description Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
+             * @default false
+             */
+            require_agreement?: boolean;
+            /**
              * @description Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
              * @default fail
              * @enum {string}
@@ -30793,6 +30798,11 @@ export interface components {
             };
         };
         InferenceDecideAnswer: components["schemas"]["GeneratedChoiceAnswer"] | components["schemas"]["GeneratedMultiChoiceAnswer"] | components["schemas"]["GeneratedPredicateAnswer"] | components["schemas"]["GeneratedScoreAnswer"] | components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
+        /**
+         * @description A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous. Disagreed and unverified outcomes abstain without discarding model answers or usage.
+         * @enum {string}
+         */
+        DecisionCascadeAgreementStatus: "agreed" | "disagreed" | "unverified";
         DecisionUsage: {
             /** @description True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured. */
             estimated?: boolean;
@@ -30802,6 +30812,11 @@ export interface components {
             output_tokens: number;
         };
         DecisionCascadeStageTrace: {
+            agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
+            agreed?: boolean;
+            /** @description Sorted question names that disagreed. Present only when agreement_status is disagreed. */
+            disagreed_questions?: string[];
             name: string;
             /** @enum {string} */
             decision_method: "typed" | "generated";
@@ -30822,6 +30837,11 @@ export interface components {
         };
         /** @description Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages. */
         DecisionCascadeTrace: {
+            agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
+            agreed?: boolean;
+            /** @description Sorted question names that disagreed. Present only when agreement_status is disagreed. */
+            disagreed_questions?: string[];
             /** @description The configured cascade name. */
             decider: string;
             /** @description Identity of the cascade definition, excluding credentials. Any change to stages, bands, failure policy or budget changes it. */

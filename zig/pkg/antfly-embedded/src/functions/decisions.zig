@@ -475,6 +475,7 @@ pub fn questionsFor(a: std.mem.Allocator, function: Function, args: []const Json
 }
 pub fn selectResult(function: Function, response: Json) !Json {
     if (function == .ai_decide) return response;
+    if (try cascade_contract.agreementBlocked(response)) return .null;
     const answers = (try object(response)).get("answers") orelse return error.InvalidDecisionOutput;
     if (answers != .array) return error.InvalidDecisionOutput;
     for (answers.array.items) |entry| {
@@ -1038,4 +1039,22 @@ test "decision provider embeddinggemma2 validates multi choice configured margin
     try put(a, answer, "status", .{ .string = "selected" });
     _ = answer.object.swapRemove("abstention_reason");
     _ = try normalizeResponseWithConfig(a, questions, response, cfg);
+}
+
+test "decision scalar functions abstain while ai_decide preserves guarded raw evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        \\{"agreement_status":"disagreed","agreed":false,"disagreed_questions":["answer"]}
+        ,
+        \\{"agreement_status":"unverified"}
+    }) |metadata| {
+        var response = try std.json.parseFromSliceLeaky(Json, a,
+            \\{"model":"raw","answers":[{"name":"answer","choice":"yes","score":5,"probability":0.99}]}
+        , .{});
+        try response.object.put(a, "cascade", try std.json.parseFromSliceLeaky(Json, a, metadata, .{}));
+        for ([_]Function{ .ai_choice, .ai_score, .ai_probability }) |function| try std.testing.expect((try selectResult(function, response)) == .null);
+        try std.testing.expectEqualStrings("raw", (try selectResult(.ai_decide, response)).object.get("model").?.string);
+    }
 }

@@ -727,6 +727,8 @@ pub const DeciderCascadeStage = struct {
     decider: DeciderConfig,
     /// Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer.
     when: ?std.json.Value = null,
+    /// Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
+    require_agreement: ?bool = null,
     /// Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
     on_failure: ?[]const u8 = null,
 
@@ -735,6 +737,7 @@ pub const DeciderCascadeStage = struct {
         .{ "name", "name", false },
         .{ "decider", "decider", false },
         .{ "when", "when", true },
+        .{ "require_agreement", "require_agreement", true },
         .{ "on_failure", "on_failure", true },
     };
 
@@ -754,6 +757,10 @@ pub const DeciderCascadeStage = struct {
         try jw.write(self.decider);
         if (self.when) |value| {
             try jw.objectField("when");
+            try jw.write(value);
+        }
+        if (self.require_agreement) |value| {
+            try jw.objectField("require_agreement");
             try jw.write(value);
         }
         if (self.on_failure) |value| {

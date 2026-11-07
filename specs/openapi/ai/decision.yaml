@@ -846,12 +846,29 @@ components:
             $ref: '#/components/schemas/DecideAnswer'
         cascade:
           $ref: '#/components/schemas/DecisionCascadeTrace'
+    DecisionCascadeAgreementStatus:
+      type: string
+      enum: [agreed, disagreed, unverified]
+      description: A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous. Disagreed and unverified outcomes abstain without discarding model answers or usage.
     DecisionCascadeTrace:
       type: object
       additionalProperties: false
       required: [decider, definition_sha256, answered_by, stages]
       description: Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages.
       properties:
+        agreement_status:
+          $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
+        agreed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable.
+        disagreed_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: {type: string, minLength: 1}
+          description: Sorted question names that disagreed. Present only when agreement_status is disagreed.
         decider:
           type: string
           description: The configured cascade name.
@@ -873,6 +890,19 @@ components:
       additionalProperties: false
       required: [name, decision_method, escalated]
       properties:
+        agreement_status:
+          $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
+        agreed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable.
+        disagreed_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: {type: string, minLength: 1}
+          description: Sorted question names that disagreed. Present only when agreement_status is disagreed.
         name:
           type: string
         decision_method:

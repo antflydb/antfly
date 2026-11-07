@@ -30,4 +30,25 @@ def test_constructed_cascade_defaults_match_server_fixture_and_round_trip():
     wire = config.to_dict()
     assert wire == json.loads(fixture.read_text())
     assert wire["cascade"]["stages"][0]["on_failure"] == "fail"
+    assert wire["cascade"]["stages"][0]["require_agreement"] is False
     assert DeciderConfig.from_dict(wire).to_dict() == wire
+    wire["cascade"]["stages"][1]["require_agreement"] = True
+    assert DeciderConfig.from_dict(wire).to_dict() == wire
+
+
+def test_cascade_agreement_trace_preserves_false_and_unverified_presence():
+    from antfly.client_generated.models import DecisionCascadeTrace
+
+    for state in ("agreed", "disagreed", "unverified"):
+        wire = {
+            "decider": "c",
+            "definition_sha256": "a" * 64,
+            "answered_by": "strong",
+            "stages": [],
+            "agreement_status": state,
+        }
+        if state != "unverified":
+            wire["agreed"] = state == "agreed"
+        if state == "disagreed":
+            wire["disagreed_questions"] = ["same"]
+        assert DecisionCascadeTrace.from_dict(wire).to_dict() == wire

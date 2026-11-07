@@ -16,6 +16,11 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Cascade agreement guards** — later decider stages can require matching votes
+  before acceptance. Disagreed or unverified checks abstain, preserve raw evidence
+  and usage, and remain REVIEW during resolver replay. Enabled guards fence older
+  readers with epoch 31.
+
 - **Decider cascades** — a named decider can run a cheap stage on every input
   and escalate only inputs whose answer probability falls inside a configured
   band to a stronger stage (`decision_method: cascade`). Cascades work in

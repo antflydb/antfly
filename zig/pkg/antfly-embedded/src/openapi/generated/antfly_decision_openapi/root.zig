@@ -10,6 +10,7 @@ pub const DecideQuestion = types.DecideQuestion;
 pub const DecideRequest = types.DecideRequest;
 pub const DecideResponse = types.DecideResponse;
 pub const DecisionBatchItem = types.DecisionBatchItem;
+pub const DecisionCascadeAgreementStatus = types.DecisionCascadeAgreementStatus;
 pub const DecisionCascadeStageTrace = types.DecisionCascadeStageTrace;
 pub const DecisionCascadeTrace = types.DecisionCascadeTrace;
 pub const DecisionChoice = types.DecisionChoice;

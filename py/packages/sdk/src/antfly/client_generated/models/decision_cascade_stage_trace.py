@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.decision_cascade_agreement_status import DecisionCascadeAgreementStatus
 from ..models.decision_cascade_stage_trace_decision_method import DecisionCascadeStageTraceDecisionMethod
 from ..types import UNSET, Unset
 
@@ -32,6 +33,13 @@ class DecisionCascadeStageTrace:
         name (str):
         decision_method (DecisionCascadeStageTraceDecisionMethod):
         escalated (bool): Whether this answer fell inside the next stage's band, sending the input on.
+        agreement_status (DecisionCascadeAgreementStatus | Unset): A required comparison agreed, disagreed, or could not
+            run because its stage failed with keep_previous. Disagreed and unverified outcomes abstain without discarding
+            model answers or usage.
+        agreed (bool | Unset): Derived comparison result. Present only for agreed or disagreed checks; absent when no
+            check ran or verification was unavailable.
+        disagreed_questions (list[str] | Unset): Sorted question names that disagreed. Present only when
+            agreement_status is disagreed.
         model (str | Unset):
         model_revision (str | Unset): Immutable model revision reported by this stage, when available.
         answers (list[EmbeddingChoiceAnswer | EmbeddingMultiChoiceAnswer | GeneratedChoiceAnswer |
@@ -47,6 +55,9 @@ class DecisionCascadeStageTrace:
     name: str
     decision_method: DecisionCascadeStageTraceDecisionMethod
     escalated: bool
+    agreement_status: DecisionCascadeAgreementStatus | Unset = UNSET
+    agreed: bool | Unset = UNSET
+    disagreed_questions: list[str] | Unset = UNSET
     model: str | Unset = UNSET
     model_revision: str | Unset = UNSET
     answers: (
@@ -82,6 +93,16 @@ class DecisionCascadeStageTrace:
         decision_method = self.decision_method.value
 
         escalated = self.escalated
+
+        agreement_status: str | Unset = UNSET
+        if not isinstance(self.agreement_status, Unset):
+            agreement_status = self.agreement_status.value
+
+        agreed = self.agreed
+
+        disagreed_questions: list[str] | Unset = UNSET
+        if not isinstance(self.disagreed_questions, Unset):
+            disagreed_questions = self.disagreed_questions
 
         model = self.model
 
@@ -132,6 +153,12 @@ class DecisionCascadeStageTrace:
                 "escalated": escalated,
             }
         )
+        if agreement_status is not UNSET:
+            field_dict["agreement_status"] = agreement_status
+        if agreed is not UNSET:
+            field_dict["agreed"] = agreed
+        if disagreed_questions is not UNSET:
+            field_dict["disagreed_questions"] = disagreed_questions
         if model is not UNSET:
             field_dict["model"] = model
         if model_revision is not UNSET:
@@ -167,6 +194,17 @@ class DecisionCascadeStageTrace:
         decision_method = DecisionCascadeStageTraceDecisionMethod(d.pop("decision_method"))
 
         escalated = d.pop("escalated")
+
+        _agreement_status = d.pop("agreement_status", UNSET)
+        agreement_status: DecisionCascadeAgreementStatus | Unset
+        if isinstance(_agreement_status, Unset):
+            agreement_status = UNSET
+        else:
+            agreement_status = DecisionCascadeAgreementStatus(_agreement_status)
+
+        agreed = d.pop("agreed", UNSET)
+
+        disagreed_questions = cast(list[str], d.pop("disagreed_questions", UNSET))
 
         model = d.pop("model", UNSET)
 
@@ -298,6 +336,9 @@ class DecisionCascadeStageTrace:
             name=name,
             decision_method=decision_method,
             escalated=escalated,
+            agreement_status=agreement_status,
+            agreed=agreed,
+            disagreed_questions=disagreed_questions,
             model=model,
             model_revision=model_revision,
             answers=answers,

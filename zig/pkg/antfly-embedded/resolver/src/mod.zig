@@ -1897,7 +1897,7 @@ test "REVIEW adjudication abstains rejects bounds work and propagates cancellati
     const config = try adjudication.Config.parse(a, adjudication_test_config);
     defer config.deinit();
     var fixture: AdjudicationFixture = .{ .response =
-        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","probabilities":[{"value":"same","probability":0.4},{"value":"different","probability":0.6}]}]}
+        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"different","probabilities":[{"value":"same","probability":0.4},{"value":"different","probability":0.6}]}]}
     };
     var map: MapStore = .{ .alloc = a };
     defer map.deinit();
@@ -1912,7 +1912,7 @@ test "REVIEW adjudication abstains rejects bounds work and propagates cancellati
     try testing.expectEqual(adjudication.Status.abstained, result.entities[0].adjudication.?.status);
     try testing.expectEqual(adjudication.Status.budget_exhausted, result.entities[1].adjudication.?.status);
     fixture.response =
-        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","probabilities":[{"value":"same","probability":0.02},{"value":"different","probability":0.98}]}]}
+        \\{"model":"fixture","answers":[{"name":"same","type":"choice","decision_method":"typed","choice":"different","probabilities":[{"value":"same","probability":0.02},{"value":"different","probability":0.98}]}]}
     ;
     const rejected = (try stage.computeAlloc(a, map.store(), fixture.provider(), "source")).?;
     defer a.free(rejected);
@@ -4399,7 +4399,13 @@ test "REVIEW adjudication prepared cascade classification allocates no per-resul
     const prompt = try a.alloc(u8, 60000);
     @memset(prompt, 'x');
     try config.decider.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[1].object.getPtr("decider").?.object.put(a, "instructions", .{ .string = prompt });
+    try config.decider.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[1].object.put(a, "require_agreement", .{ .bool = true });
     const response = try std.json.parseFromSliceLeaky(std.json.Value, a, try adjudicationCascadeResponse(a, config), .{});
+    const cascade_trace = response.object.getPtr("cascade").?;
+    for ([_]*std.json.ObjectMap{ &cascade_trace.object, &cascade_trace.object.getPtr("stages").?.array.items[1].object }) |fields| {
+        try fields.put(a, "agreement_status", .{ .string = "agreed" });
+        try fields.put(a, "agreed", .{ .bool = true });
+    }
     const AllocationFailure = struct {
         fn run(alloc: std.mem.Allocator, policy: adjudication.Config, value: std.json.Value) !void {
             var prepared = try adjudication.Classifier.init(alloc, policy);
@@ -4465,4 +4471,75 @@ test "REVIEW adjudication failed cascade receipts survive recovery until explici
         defer refreshed.deinit();
         try testing.expectEqual(Decision.match, refreshed.entities[0].decision);
     };
+}
+
+test "REVIEW guarded adjudication abstains durably even when operational failure permits mint" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    for ([_]bool{ false, true }) |failed| {
+        const raw = try std.mem.replaceOwned(u8, scratch, adjudication_cascade_config, "\"when\":", "\"require_agreement\":true,\"on_failure\":\"keep_previous\",\"when\":");
+        var cfg_value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{});
+        try cfg_value.object.put(scratch, "on_failure", .{ .string = "mint" });
+        const config = try adjudication.Config.parse(a, try std.json.Stringify.valueAlloc(scratch, cfg_value, .{}));
+        defer config.deinit();
+        var response = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try adjudicationCascadeResponse(scratch, config.value), .{});
+        const trace = response.object.getPtr("cascade").?;
+        const entries = trace.object.getPtr("stages").?.array.items;
+        const first = entries[0].object.get("answers").?.array.items[0];
+        if (failed) {
+            _ = entries[1].object.swapRemove("answers");
+            try entries[1].object.put(scratch, "error", .{ .string = "ProviderUnavailable" });
+            try response.object.put(scratch, "answers", entries[0].object.get("answers").?);
+            try response.object.put(scratch, "model", entries[0].object.get("model").?);
+            try trace.object.put(scratch, "answered_by", .{ .string = "fast" });
+        } else {
+            // Prior stage votes different; final strong answer is confidently same.
+            var changed = first;
+            try changed.object.put(scratch, "choice", .{ .string = "different" });
+            entries[0].object.getPtr("answers").?.array.items[0] = changed;
+            const distribution = changed.object.get("probabilities").?.array.items;
+            try distribution[0].object.put(scratch, "probability", .{ .float = 0.4 });
+            try distribution[1].object.put(scratch, "probability", .{ .float = 0.6 });
+        }
+        for ([_]*std.json.ObjectMap{ &trace.object, &entries[1].object }) |fields| {
+            try fields.put(scratch, "agreement_status", .{ .string = if (failed) "unverified" else "disagreed" });
+            if (!failed) {
+                try fields.put(scratch, "agreed", .{ .bool = false });
+                try fields.put(scratch, "disagreed_questions", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "[\"same\"]", .{}));
+            }
+        }
+        try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(scratch, config.value, response));
+        var resolver = try Resolver.parse(a,
+            \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+        );
+        defer resolver.deinit();
+        var fixture: AdjudicationFixture = .{ .response = try std.json.Stringify.valueAlloc(scratch, response, .{}) };
+        var map: MapStore = .{ .alloc = a };
+        defer map.deinit();
+        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+        var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+        try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+        const bytes = (try map.store().get(a, "resolution")).?;
+        defer a.free(bytes);
+        var parsed = try parseResolution(a, bytes);
+        defer parsed.deinit();
+        try testing.expectEqual(Decision.review, parsed.entities[0].decision);
+        try testing.expectEqual(adjudication.Status.abstained, parsed.entities[0].adjudication.?.status);
+        stage.adjudicator = null;
+        _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 1), fixture.calls);
+        // Abstention does not make contradictory votes or malformed distributions valid.
+        var altered = entries[0].object.get("answers").?.array.items[0];
+        const original_choice = altered.object.get("choice").?;
+        try altered.object.put(scratch, "choice", .{ .string = if (failed) "different" else "same" });
+        entries[0].object.getPtr("answers").?.array.items[0] = altered;
+        if (failed) response.object.getPtr("answers").?.array.items[0] = altered;
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+        try altered.object.put(scratch, "choice", original_choice);
+        // Neither a missing aggregate gate nor a contradictory flag is authoritative.
+        _ = trace.object.swapRemove("agreement_status");
+        try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(scratch, config.value, response));
+    }
 }

@@ -262,6 +262,45 @@ resolver `adjudicate` policy or decision enrichment.
   the request before any stage runs. Native model discovery runs only when a
   stage is reached, under its deadline and failure policy.
 
+Set `require_agreement: true` on a later stage to require its vote to match
+that of the preceding stage before accepting the result:
+
+```yaml
+- name: strong
+  decider:
+    decision_method: generated
+    generator: {provider: openai, model: your-strong-model}
+  when: {question: same, choice: same, probability_between: [0.3, 1.0]}
+  require_agreement: true
+```
+
+This band sends **every positive candidate**, including confident positives,
+for confirmation. A narrower uncertainty band leaves confident earlier answers
+unchecked. `when.choice` selects the probability used for escalation; agreement
+compares selected choice strings. Predicate votes must be strictly on the same
+side of 0.5; a tie at 0.5 does not agree. `when.question` scopes the comparison
+to that question; without it, all questions must agree.
+
+Disagreement stops that input immediately. Later stages cannot override the
+veto, and other inputs continue independently. Raw final answers and accumulated
+usage remain available through `ai_decide` and the Decisions API; SQL
+`ai_choice`, `ai_score`, and `ai_probability` return NULL. Predicate convenience
+clients return `DecisionAbstained`. Resolver adjudication remains REVIEW even
+with `on_failure: mint`, because disagreement is an abstention rather than an
+operational failure.
+
+Guarded stage traces and the aggregate trace contain `agreement_status`:
+`agreed`, `disagreed`, or `unverified`. The derived `agreed` boolean appears for
+completed comparisons, and sorted `disagreed_questions` appears only for
+disagreement. A guarded stage failing with `keep_previous` retains the earlier
+answer but reports `unverified` and abstains. No agreement fields appear when
+no guard ran. A successful check remains recorded if a later unguarded stage
+runs; guard every later stage whose answer must also be confirmed.
+
+Agreement records matching votes; it does not establish model independence or
+calibrated confidence. Use suitable independent evidence and evaluate the
+resulting policy on representative data.
+
 Responses carry a `cascade` trace per input (top-level for single input, on each
 batch row otherwise):
 

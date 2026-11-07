@@ -397,6 +397,10 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
     }
     const probabilities = answer.object.get("probabilities") orelse return error.InvalidAdjudicationOutput;
     if (probabilities != .array or probabilities.array.items.len != config.question.choices.len) return error.InvalidAdjudicationOutput;
+    const selected = answer.object.get("choice") orelse return error.InvalidAdjudicationOutput;
+    if (selected != .string) return error.InvalidAdjudicationOutput;
+    var selected_probability: ?f64 = null;
+    var maximum: f64 = 0;
     var accepted: f64 = 0;
     var rejected: f64 = 0;
     var total: f64 = 0;
@@ -418,6 +422,8 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
             if (!std.math.isFinite(probability) or probability < 0 or probability > 1) return error.InvalidAdjudicationOutput;
             if (verdict_only and probability != 0 and probability != 1) return error.InvalidAdjudicationOutput;
             total += probability;
+            maximum = @max(maximum, probability);
+            if (std.mem.eql(u8, selected.string, choice.value)) selected_probability = probability;
             if (std.mem.eql(u8, choice.value, config.accept.choice)) accepted = probability;
             if (config.reject) |reject| if (std.mem.eql(u8, choice.value, reject.choice)) {
                 rejected = probability;
@@ -425,7 +431,8 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
         }
         if (!found) return error.InvalidAdjudicationOutput;
     }
-    if (@abs(total - 1) > 0.001) return error.InvalidAdjudicationOutput;
+    if (@abs(total - 1) > 0.001 or (selected_probability orelse return error.InvalidAdjudicationOutput) != maximum) return error.InvalidAdjudicationOutput;
+    if (definition != null and try @import("antfly_decisions").cascade.agreementBlocked(response)) return .abstained;
     if (accepted >= config.accept.min_probability and accepted > 0.5) return .accepted;
     if (config.reject) |reject| if (rejected >= reject.min_probability and rejected > 0.5) return .rejected;
     return .abstained;

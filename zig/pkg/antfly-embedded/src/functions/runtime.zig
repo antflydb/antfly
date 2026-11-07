@@ -3051,13 +3051,17 @@ test "decision provider cascade enrichment fences legacy readers including group
     ;
     const validation = @import("../storage/db/enrichment/config_validation.zig");
     const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
-    var cfg = @import("../storage/db/catalog/enrichment_catalog.zig").EnrichmentConfig{ .name = "cascade", .kind = .asset, .source_field = "text", .producer_json = producer };
-    try std.testing.expectEqual(catalog.decider_cascade_reader_version, try validation.requiredReaderVersion(a, cfg));
-    cfg.group_source_json = "{}";
-    try std.testing.expectEqual(catalog.decider_cascade_reader_version, try validation.requiredReaderVersion(a, cfg));
-    cfg.group_source_json = "";
-    cfg.prior_context_json = "{}";
-    try std.testing.expectEqual(catalog.decider_cascade_reader_version, try validation.requiredReaderVersion(a, cfg));
+    for ([_]bool{ false, true }) |guard| {
+        const configured = try std.mem.replaceOwned(u8, a, producer, "\"when\":", if (guard) "\"require_agreement\":true,\"when\":" else "\"require_agreement\":false,\"when\":");
+        const required = if (guard) catalog.cascade_agreement_reader_version else catalog.decider_cascade_reader_version;
+        var cfg = @import("../storage/db/catalog/enrichment_catalog.zig").EnrichmentConfig{ .name = "cascade", .kind = .asset, .source_field = "text", .producer_json = configured };
+        try std.testing.expectEqual(required, try validation.requiredReaderVersion(a, cfg));
+        cfg.group_source_json = "{}";
+        try std.testing.expectEqual(required, try validation.requiredReaderVersion(a, cfg));
+        cfg.group_source_json = "";
+        cfg.prior_context_json = "{}";
+        try std.testing.expectEqual(required, try validation.requiredReaderVersion(a, cfg));
+    }
 }
 
 test "decision provider cascade enrichment publication and reopen preserve reader fence" {
@@ -3068,30 +3072,35 @@ test "decision provider cascade enrichment publication and reopen preserve reade
     const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
     const indexes = @import("../storage/db/catalog/index_manager.zig");
     const docstore = @import("../storage/docstore.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
-    defer a.free(path);
-    {
-        var store = try docstore.DocStore.open(a, path, .{});
-        defer store.close();
-        var manager = try indexes.IndexManager.init(a, path);
-        defer manager.deinit();
-        try manager.addEnrichment(&store, .{ .name = "cascade", .kind = .asset, .field = "text", .content_type = "application/json", .producer_json = producer });
-        try std.testing.expectEqual(catalog.decider_cascade_reader_version, manager.minimum_reader_version.load(.acquire));
-    }
-    {
-        var store = try docstore.DocStore.open(a, path, .{});
-        defer store.close();
-        var read = try store.beginReadTxn();
-        defer read.abort();
-        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, catalog.decider_cascade_reader_version - 1));
-        try std.testing.expectEqual(catalog.decider_cascade_reader_version, try catalog.readMinimumReaderVersion(&read, catalog.supported_reader_version));
-        var manager = try indexes.IndexManager.init(a, path);
-        defer manager.deinit();
-        try manager.load(&store);
-        try std.testing.expect(manager.getEnrichment(.asset, "cascade") != null);
-        try std.testing.expectEqual(catalog.decider_cascade_reader_version, manager.minimum_reader_version.load(.acquire));
+    for ([_]?bool{ null, false, true }) |guard| {
+        const configured = if (guard) |enabled| try std.mem.replaceOwned(u8, a, producer, "\"when\":", if (enabled) "\"require_agreement\":true,\"when\":" else "\"require_agreement\":false,\"when\":") else try a.dupe(u8, producer);
+        defer a.free(configured);
+        const required = if (guard orelse false) catalog.cascade_agreement_reader_version else catalog.decider_cascade_reader_version;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+        defer a.free(path);
+        {
+            var store = try docstore.DocStore.open(a, path, .{});
+            defer store.close();
+            var manager = try indexes.IndexManager.init(a, path);
+            defer manager.deinit();
+            try manager.addEnrichment(&store, .{ .name = "cascade", .kind = .asset, .field = "text", .content_type = "application/json", .producer_json = configured });
+            try std.testing.expectEqual(required, manager.minimum_reader_version.load(.acquire));
+        }
+        {
+            var store = try docstore.DocStore.open(a, path, .{});
+            defer store.close();
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, required - 1));
+            try std.testing.expectEqual(required, try catalog.readMinimumReaderVersion(&read, catalog.supported_reader_version));
+            var manager = try indexes.IndexManager.init(a, path);
+            defer manager.deinit();
+            try manager.load(&store);
+            try std.testing.expect(manager.getEnrichment(.asset, "cascade") != null);
+            try std.testing.expectEqual(required, manager.minimum_reader_version.load(.acquire));
+        }
     }
 }
 
@@ -3377,4 +3386,52 @@ test "decision functions generated budget checkpoints preserve fatal execution c
             try std.testing.expectEqual(@as(usize, 0), stopped.calls);
         }
     };
+}
+
+test "decision provider guarded cascade batches retain raw agreement and veto evidence" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = try registry_mod.Registry.parseFromSlice(a,
+        \\{"deciders":{"c":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"antfly","model":"fast"}},{"name":"strong","decider":{"provider":"antfly","model":"strong"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}}}}
+    );
+    defer registry.deinit();
+    const Fake = struct {
+        fn decide(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?managed.RequestContext) ![]u8 {
+            const parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            const fields = parsed.value.object;
+            const model = fields.get("model").?.string;
+            const text = fields.get("input").?.string;
+            const p: f64 = if (std.mem.eql(u8, text, "skip")) 0.1 else if (std.mem.eql(u8, model, "fast")) 0.99 else if (std.mem.eql(u8, text, "agree")) 0.95 else 0.02;
+            return std.fmt.allocPrint(alloc,
+                \\{{"model":"{s}","answers":[{{"name":"same","type":"choice","decision_method":"typed","choice":"{s}","probabilities":[{{"value":"same","probability":{d}}},{{"value":"different","probability":{d}}}]}}],"usage":{{"input_tokens":5,"output_tokens":0}}}}
+            , .{ model, if (p > 0.5) "same" else "different", p, 1 - p });
+        }
+    };
+    var token: u8 = 0;
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = std.testing.io, .antfly_provider = .{ .ptr = &token, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const values = try runtime.provider().evaluateBatch(scratch, &.{
+        .{ .decider = "c", .questions = questions, .input = .{ .text = "agree" } },
+        .{ .decider = "c", .questions = questions, .input = .{ .text = "veto" } },
+        .{ .decider = "c", .questions = questions, .input = .{ .text = "skip" } },
+    });
+    for (values, 0..) |value, i| {
+        const trace = value.object.get("cascade").?.object;
+        if (i == 2) {
+            try std.testing.expect(!trace.contains("agreed"));
+        } else {
+            try std.testing.expectEqual(i == 0, trace.get("agreed").?.bool);
+            try std.testing.expectEqualStrings(if (i == 0) "agreed" else "disagreed", trace.get("agreement_status").?.string);
+        }
+        try std.testing.expectEqual(@as(i64, if (i == 2) 5 else 10), value.object.get("usage").?.object.get("input_tokens").?.integer);
+    }
+    try std.testing.expectEqualStrings("different", values[1].object.get("answers").?.array.items[0].object.get("choice").?.string);
 }

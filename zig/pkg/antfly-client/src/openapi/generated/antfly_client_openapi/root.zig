@@ -198,6 +198,7 @@ pub const DeciderCascade = types.DeciderCascade;
 pub const DeciderCascadeStage = types.DeciderCascadeStage;
 pub const DeciderConfig = types.DeciderConfig;
 pub const DecisionBatchItem = types.DecisionBatchItem;
+pub const DecisionCascadeAgreementStatus = types.DecisionCascadeAgreementStatus;
 pub const DecisionCascadeStageTrace = types.DecisionCascadeStageTrace;
 pub const DecisionCascadeTrace = types.DecisionCascadeTrace;
 pub const DecisionChoice = types.DecisionChoice;

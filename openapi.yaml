@@ -42634,6 +42634,12 @@ components:
                 maximum: 1
               description: Lower and upper bound, lower strictly below upper. The previous stage must
                 not be verdict_only.
+        require_agreement:
+          type: boolean
+          default: false
+          description: Require this stage to agree with the preceding stage on the band question, or every
+            question when unscoped. True is allowed only after the first stage. Disagreement stops this
+            input and abstains; a keep_previous failure leaves agreement unverified and also abstains.
         on_failure:
           type: string
           enum:
@@ -69335,6 +69341,15 @@ components:
         - $ref: '#/components/schemas/TrainedPredicateAnswer'
         - $ref: '#/components/schemas/EmbeddingChoiceAnswer'
         - $ref: '#/components/schemas/EmbeddingMultiChoiceAnswer'
+    DecisionCascadeAgreementStatus:
+      type: string
+      enum:
+        - agreed
+        - disagreed
+        - unverified
+      description: A required comparison agreed, disagreed, or could not run because its stage failed
+        with keep_previous. Disagreed and unverified outcomes abstain without discarding model answers
+        or usage.
     DecisionUsage:
       type: object
       additionalProperties: false
@@ -69363,6 +69378,22 @@ components:
         - decision_method
         - escalated
       properties:
+        agreement_status:
+          $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
+        agreed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Derived comparison result. Present only for agreed or disagreed checks; absent
+            when no check ran or verification was unavailable.
+        disagreed_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Sorted question names that disagreed. Present only when agreement_status is disagreed.
         name:
           type: string
         decision_method:
@@ -69406,6 +69437,22 @@ components:
         in order. The top-level model and answers come from the answering stage, and usage is the sum
         over these stages.
       properties:
+        agreement_status:
+          $ref: '#/components/schemas/DecisionCascadeAgreementStatus'
+        agreed:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: Derived comparison result. Present only for agreed or disagreed checks; absent
+            when no check ran or verification was unavailable.
+        disagreed_questions:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Sorted question names that disagreed. Present only when agreement_status is disagreed.
         decider:
           type: string
           description: The configured cascade name.
