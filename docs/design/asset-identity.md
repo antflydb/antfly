@@ -335,22 +335,36 @@ side effect.
 
 A generic field-scoped skip check for *every* producer kind — so that a
 provider change never retriggers anything beyond document_extraction's own
-decision — is also out of scope. Document extraction's own skip decision
-(fixed here) and chunk-sourced embedding's skip decision
-(`modelChunkEmbeddingSourceHash`, already content-scoped, unaffected) both
-correctly ignore a pure relocation already. A narrower producer-dispatch
-path does not: a dense or sparse embedding producer configured to read a
-field directly off the raw document row (bypassing `document_extraction`
-and chunking entirely) gates on a whole-row content digest
-(`capturePrimarySource` in `artifact_publication.zig`) before it ever
-reaches the content-scoped fallback (`shouldSkipEmbeddingArtifact`), and
-that whole-row digest changes whenever *any* field changes, including
-`source.uri`. That gate is shared by many producer kinds beyond embedding,
-for correctness properties beyond simple caching (it is also how a producer
-notices its row changed underneath it at all), so narrowing it is a
-separate change with its own review, not a small adjustment to make here
-silently. It does not affect the document-extraction pipeline this design's
-proof exercises, which chunks before embedding.
+decision — is also out of scope. How embedding producers react to a relocation
+depends on whether ordered authority is active for the write.
+
+**Without ordered authority** (standalone runs with `enable_data_raft = false`;
+ordinary Raft is believed to behave the same, from reading the code),
+`input` is null and the content-scoped `shouldSkipEmbeddingArtifact` runs, so
+text embedding producers don't call the embedder for a pure relocation. That
+covers both chunk-sourced producers and producers reading a field directly off
+the row. Templates that resolve to multimodal parts are the exception:
+`processDenseTemplateParts` records a null `source_hash`, so they re-embed every
+time their row is reprocessed, relocated or not.
+
+**With ordered authority** (protocol-gated and not advertised, see
+[Ordered artifact publication](ordered-artifacts.md)), the content-scoped skip
+is bypassed. A producer captures a source whose digest covers the whole row
+(`capture` in `artifact_producer_input.zig` for direct fields,
+`capturePrimarySource` for chunk vectors), and an acceptance miss goes to the
+embedder. Any row change, including `source.uri`, re-embeds both kinds of
+producer. This has not been measured, because the mode can't be enabled today.
+
+The whole-row digest should stay: exact input binding is what proofs, receipts,
+closure and merge rely on, and narrowing it would need a protocol change. The
+intended fix is to carry the output forward. On an acceptance miss where the
+stored `source_hash` equals the fresh hash, skip the embedder and republish the
+existing vector under the new source, failing closed for a null hash, a
+reprocess generation, a revision or dimension mismatch, an undecodable vector,
+privacy-scoped input, or a protocol below 17. That fix isn't implemented.
+
+`document_extraction` under ordered authority has not been traced, so this
+design's relocation guarantee is only established for the mode the proof ran in.
 
 ## Verification
 
