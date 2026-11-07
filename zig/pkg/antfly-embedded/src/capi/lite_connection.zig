@@ -1108,6 +1108,7 @@ const PathGate = struct {
     path: []u8,
     mutex: QueuedMutex = .{},
     sql_preparation: @import("sql.zig").PreparationAdmission = .{},
+    document_publications: @import("publication_queue.zig").Queue = .{},
     references: usize = 1,
     owners: std.ArrayList(*Owner) = .empty,
     lease_stats: native.PathLeaseStats = .{},

@@ -2737,7 +2737,7 @@ fn beginOutcomeReceipts(lock_handle: *Handle) @import("outcome_receipts.zig").Sc
     const receipts = @import("outcome_receipts.zig");
     // Directory handles may hold an unpublished durable WAL record until they
     // reopen; Lite connections flag and reconcile an uncertain runtime.
-    lock_handle.outcome_writer.pending_until_close = lock_handle.lite_connection == null;
+    lock_handle.outcome_writer.setPendingUntilClose(lock_handle.lite_connection == null);
     return receipts.begin(&lock_handle.outcome_writer);
 }
 
@@ -3164,6 +3164,12 @@ pub fn openLiteHandleAllocWithSharedInference(
             .io = borrowed_io,
         });
     errdefer if (!handle_owns_resources) backend.deinit();
+    if (!create and resolved.externally_locked and liteOpenModeCanWrite(resolved.open_mode) and backend.native_docstore.?.file.recovery_tail_pending) {
+        // This constructs a fresh root under the caller's path lease, before
+        // any DB/read runtime exists. Raw nested file adapters do not get this
+        // authority; uncertain owners must close and reopen before reaching it.
+        if (!try backend.native_docstore.?.file.recoverUncommittedTail()) return error.FileBusy;
+    }
     if (resolved.allocator_verification_owner) |verified| {
         if (!resolved.externally_locked) return error.InvalidArgument;
         try backend.native_docstore.?.file.inheritAllocatorVerification(verified);
@@ -5093,13 +5099,22 @@ fn prepareOwnedBatchAttempt(handle_ptr: ?*anyopaque, prepared: *?@import("../sto
 }
 
 fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prepare_attempt: ?*const fn (*anyopaque, *PreparationBudget) anyerror!void, apply: *const fn (*anyopaque, *Handle, *bool) anyerror!void) capi.ErrorCode {
+    return executeBatchWithReplayPreparationBudget(ptr, request, prepare_attempt, apply, null, true);
+}
+
+fn executeBatchWithReplayPreparationBudget(ptr: ?*anyopaque, request: *anyopaque, prepare_attempt: ?*const fn (*anyopaque, *PreparationBudget) anyerror!void, apply: *const fn (*anyopaque, *Handle, *bool) anyerror!void, shared_budget: ?*PreparationBudget, comptime retry_replay_capacity: bool) capi.ErrorCode {
     const alloc = std.heap.c_allocator;
     var entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
     var entry_owned = true;
     defer if (entry_owned) entry.release();
     const timeout_ms = if (entry.lock_handle.lite_connection) |connection| connection.options.busy_timeout_ms else 0;
     const io = handleLockIo();
-    var deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    const initial_budget: i96 = if (shared_budget) |budget| budget.remaining_ns else @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var deadline = std.Io.Clock.awake.now(io).nanoseconds + initial_budget;
+    defer if (shared_budget) |budget| {
+        const remaining = @min(initial_budget, @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds));
+        budget.charge(@intCast(initial_budget - remaining));
+    };
     var backoff: i96 = std.time.ns_per_ms;
     var wait_path: ?[]u8 = null;
     defer if (wait_path) |path| alloc.free(path);
@@ -5107,11 +5122,12 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
         if (prepare_attempt) |prepare| {
             const started = std.Io.Clock.awake.now(io).nanoseconds;
             var budget: PreparationBudget = .{ .remaining_ns = std.math.cast(u64, @max(0, deadline - started)) orelse std.math.maxInt(u64) };
-            prepare(request, &budget) catch |err| return capi.mapErrorContext(err, "batch owned preparation");
+            const result = prepare(request, &budget);
             // Parsing, proof, mapping and IO are active request work. Actual
             // nested gate/lease waits consume this same overall call budget.
             const elapsed = @max(0, std.Io.Clock.awake.now(io).nanoseconds - started);
             deadline += @max(0, elapsed - @as(i96, budget.waited_ns));
+            result catch |err| return capi.mapErrorContext(err, "batch owned preparation");
         }
 
         // Admission consumes the entry on every outcome. Before that handoff,
@@ -5120,6 +5136,7 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
         const guard = enterWithAdmissionBudget(entry, ptr, .write, .mutation, false, @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds)) orelse return capi.mapError(error.InvalidArgument);
         var held = true;
         defer if (held) guard.leave();
+        deadline = std.Io.Clock.awake.now(io).nanoseconds + (guard.admission_budget_ns orelse 0);
         if (guard.entry_error) |code| {
             var detail: [1024]u8 = undefined;
             const message = std.fmt.bufPrint(&detail, "batch writer admission: {s}", .{std.mem.span(capi.lastErrorDetail())}) catch "batch writer admission refused";
@@ -5131,11 +5148,19 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
         const body_started = std.Io.Clock.awake.now(io).nanoseconds;
         var primary_committed = false;
         apply(request, guard.handle, &primary_committed) catch |err| {
+            // The body is active work. Split pre-commit cohort refusals retain
+            // the same measured waiting budget instead of charging their CPU
+            // preparation or restoring a fresh per-request timeout.
+            deadline = std.Io.Clock.awake.now(io).nanoseconds + (guard.admission_budget_ns orelse 0);
             if (primary_committed) return batchFailureCode(err, true);
             if (err == error.CommitVisibilityNotSatisfied)
                 return capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch");
+            // A cohort larger than current replay capacity may never fit,
+            // even though its individual members can. Split a known pre-commit
+            // refusal before spending every origin's timeout on that group.
+            if (!retry_replay_capacity and err == error.LiteReplayBacklogExceeded) return capi.mapErrorContext(err, "cohort replay capacity refused before commit");
             const owned_stale = err == error.OwnedPreparationStale and prepare_attempt != null;
-            if (err != error.LiteReplayBacklogExceeded and !owned_stale) return capi.mapErrorContext(err, "batch before primary commit");
+            if (err != error.LiteReplayBacklogExceeded and !owned_stale) return capi.mapErrorContext(err, if (antfly.capi_dependencies.sql_errors.isUnknownOutcome(err)) "batch primary publication outcome unknown" else "batch before primary commit");
             if (timeout_ms == 0) return capi.mapErrorContext(if (owned_stale) error.FileBusy else err, if (owned_stale) "batch prepared source changed before commit" else "batch replay admission");
             // Busy timeout bounds admission/capacity waits, not active batch
             // preparation. A late, pre-commit quota refusal must still give
@@ -5170,8 +5195,182 @@ fn executeBatchWithReplayPreparation(ptr: ?*anyopaque, request: *anyopaque, prep
             backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
             continue;
         };
+        deadline = std.Io.Clock.awake.now(io).nanoseconds + (guard.admission_budget_ns orelse 0);
         return .ok;
     }
+}
+
+const OwnedQueuedBatch = struct {
+    handle_ptr: ?*anyopaque,
+    request: db_mod.types.BatchRequest,
+};
+
+fn executeSingleOwnedBatch(handle_ptr: ?*anyopaque, batch: db_mod.types.BatchRequest, marker: ?@import("outcome_receipts.zig").Marker, budget: ?*PreparationBudget, writer: ?*@import("outcome_receipts.zig").Writer) capi.ErrorCode {
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    var prepared: ?Prepared = null;
+    defer if (prepared) |*plan| plan.deinit();
+    const Request = struct {
+        handle_ptr: ?*anyopaque,
+        request: db_mod.types.BatchRequest,
+        prepared: *?Prepared,
+        marker: ?@import("outcome_receipts.zig").Marker,
+        writer: ?*@import("outcome_receipts.zig").Writer,
+        fn prepare(raw: *anyopaque, shared: *PreparationBudget) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try prepareOwnedBatchAttempt(self.handle_ptr, self.prepared, self.request, shared);
+        }
+        fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const plan = if (self.prepared.*) |*value| value else null;
+            if (self.marker) |assigned| {
+                if (!self.writer.?.accepts(assigned)) return error.OutcomeReconciliationRequired;
+                return handle.database().batchTrackedWithPreparedDocuments(self.request, primary_committed, assigned, plan);
+            }
+            return trackedBatchWithPreparedDocuments(handle.database(), self.request, primary_committed, handle.selected_table_name, plan);
+        }
+    };
+    var request: Request = .{ .handle_ptr = handle_ptr, .request = batch, .prepared = &prepared, .marker = marker, .writer = writer };
+    return executeBatchWithReplayPreparationBudget(handle_ptr, &request, Request.prepare, Request.apply, budget, true);
+}
+
+fn finishQueuedPublication(jobs: []const *@import("publication_queue.zig").Job, code: capi.ErrorCode) void {
+    const message = std.mem.span(capi.lastErrorDetail());
+    for (jobs) |job| {
+        job.resolution_marker = job.marker;
+        if (code == .outcome_unknown) {
+            for (jobs) |peer| if (std.mem.eql(u8, &peer.marker.writer, &job.marker.writer) and peer.marker.sequence > job.resolution_marker.sequence) {
+                job.resolution_marker = peer.marker;
+            };
+            // Fence on the leader, before another group can publish. Each
+            // origin installs its own TLS receipt only after waking.
+            job.writer.fenceUnknown(job.resolution_marker);
+        }
+        job.complete(code, message);
+    }
+}
+
+fn processSinglePublication(job: *@import("publication_queue.zig").Job) void {
+    if (job.bounded and job.budget.remaining_ns == 0) {
+        job.complete(.busy, "native publication queue deadline expired; no mutation applied");
+        return;
+    }
+    const origin: *OwnedQueuedBatch = @ptrCast(@alignCast(job.context));
+    const code = executeSingleOwnedBatch(origin.handle_ptr, origin.request, job.marker, &job.budget, job.writer);
+    finishQueuedPublication(&.{job}, code);
+}
+
+fn processPublicationsIndividually(jobs: []const *@import("publication_queue.zig").Job) void {
+    const io = handleLockIo();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    for (jobs) |job| {
+        // Once a cohort splits, earlier individual calls are queue waiting
+        // for later origins. Their CPU and IO cannot renew another deadline.
+        job.budget.chargeElapsed(io, started);
+        processSinglePublication(job);
+    }
+}
+
+fn processQueuedPublications(selected: []const *@import("publication_queue.zig").Job) void {
+    const queue = @import("publication_queue.zig");
+    const cohort_mod = @import("../storage/db/publication_cohort.zig");
+    var jobs: [cohort_mod.maximum_requests]*queue.Job = undefined;
+    var requests: [cohort_mod.maximum_requests]db_mod.types.BatchRequest = undefined;
+    var markers: [cohort_mod.maximum_requests]@import("outcome_receipts.zig").Marker = undefined;
+    var count: usize = 0;
+    for (selected) |job| {
+        if (job.bounded and job.budget.remaining_ns == 0) {
+            job.complete(.busy, "native publication queue deadline expired; no mutation applied");
+            continue;
+        }
+        if (!job.writer.accepts(job.marker)) {
+            job.complete(.stalled, "native publication owner requires outcome reconciliation; this queued mutation did not apply");
+            continue;
+        }
+        const origin: *OwnedQueuedBatch = @ptrCast(@alignCast(job.context));
+        jobs[count] = job;
+        requests[count] = origin.request;
+        markers[count] = job.marker;
+        count += 1;
+    }
+    if (count == 0) return;
+    if (count == 1) return processSinglePublication(jobs[0]);
+    var cohort = cohort_mod.Group.init(std.heap.c_allocator, requests[0..count]) catch {
+        // Conflicting keys and unsupported controls retain ordinary request
+        // boundaries. A permanent refusal cannot poison unrelated callers.
+        processPublicationsIndividually(jobs[0..count]);
+        return;
+    };
+    defer cohort.deinit();
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    var prepared: ?Prepared = null;
+    defer if (prepared) |*plan| plan.deinit();
+    const Request = struct {
+        jobs: []const *queue.Job,
+        handle_ptr: ?*anyopaque,
+        cohort: *const cohort_mod.Group,
+        markers: []const @import("outcome_receipts.zig").Marker,
+        prepared: *?Prepared,
+        committed: bool = false,
+        fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try prepareOwnedBatchAttempt(self.handle_ptr, self.prepared, self.cohort.request, budget);
+        }
+        fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            defer self.committed = primary_committed.*;
+            for (self.jobs) |job| if (!job.writer.accepts(job.marker)) return error.OutcomeReconciliationRequired;
+            try handle.database().batchTrackedWithPreparedCohort(self.cohort, primary_committed, self.markers, if (self.prepared.*) |*plan| plan else null);
+        }
+    };
+    const first: *OwnedQueuedBatch = @ptrCast(@alignCast(jobs[0].context));
+    var request: Request = .{ .jobs = jobs[0..count], .handle_ptr = first.handle_ptr, .cohort = &cohort, .markers = markers[0..count], .prepared = &prepared };
+    var budget: PreparationBudget = .{ .remaining_ns = std.math.maxInt(u64) };
+    for (jobs[0..count]) |job| budget.remaining_ns = @min(budget.remaining_ns, job.budget.remaining_ns);
+    const code = executeBatchWithReplayPreparationBudget(first.handle_ptr, &request, Request.prepare, Request.apply, &budget, false);
+    for (jobs[0..count]) |job| job.budget.charge(budget.waited_ns);
+    if (code != .ok and code != .outcome_unknown and code != .stalled and !request.committed) {
+        // No primary decision occurred. Release all joint candidates before
+        // bounded individual admission, retaining each origin's remaining budget.
+        if (prepared) |*plan| plan.deinit();
+        prepared = null;
+        processPublicationsIndividually(jobs[0..count]);
+        return;
+    }
+    finishQueuedPublication(jobs[0..count], code);
+}
+
+fn executeOwnedDocumentBatch(handle_ptr: ?*anyopaque, request: db_mod.types.BatchRequest) capi.ErrorCode {
+    const entry = HandleEntry.capture(handle_ptr) orelse return capi.mapError(error.InvalidArgument);
+    defer entry.release();
+    const connection = entry.lock_handle.lite_connection orelse return executeSingleOwnedBatch(handle_ptr, request, null, null, null);
+    if (connection.options.profile != .native) return executeSingleOwnedBatch(handle_ptr, request, null, null, null);
+    const weight = @import("../storage/db/publication_cohort.zig").Group.measure(request) catch return executeSingleOwnedBatch(handle_ptr, request, null, null, null);
+    const receipts = @import("outcome_receipts.zig");
+    receipts.clearLast();
+    const receipt_scope = receipts.begin(&entry.lock_handle.outcome_writer);
+    defer receipt_scope.end();
+    var origin: OwnedQueuedBatch = .{ .handle_ptr = handle_ptr, .request = request };
+    const table_name = if (entry.handle.selected_table_name) |name| (if (std.mem.eql(u8, name, "default")) null else @as(?[]const u8, name)) else null;
+    var job: @import("publication_queue.zig").Job = .{
+        .context = &origin,
+        .scope = connection.owner,
+        .table_name = table_name,
+        .table_id = entry.handle.selected_table_id,
+        .timestamp_ns = request.timestamp_ns,
+        .sync_level = @backingInt(request.sync_level),
+        .bytes = weight.bytes,
+        .operations = weight.operations,
+        .writer = &entry.lock_handle.outcome_writer,
+        .budget = .{ .remaining_ns = std.math.cast(u64, @as(u128, connection.options.busy_timeout_ms) * std.time.ns_per_ms) orelse std.math.maxInt(u64) },
+        .bounded = connection.options.busy_timeout_ms != 0,
+    };
+    connection.gate.document_publications.submit(handleLockIo(), &job, processQueuedPublications);
+    if (job.code == .outcome_unknown) job.writer.retire(job.resolution_marker, if (table_name) |name| .{ .name = name, .id = job.table_id } else null);
+    if (job.code == .ok) {
+        capi.clearLastError();
+        return .ok;
+    }
+    return capi.recordError(job.code, job.detail[0..job.detail_len]);
 }
 
 pub fn antfly_db_batch(
@@ -5190,24 +5389,7 @@ pub fn antfly_db_batch(
     const a = std.heap.c_allocator;
     var owned = StructBatchRequest.parse(a, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
     defer owned.deinit();
-    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
-    var prepared: ?Prepared = null;
-    defer if (prepared) |*plan| plan.deinit();
-    const Request = struct {
-        owned: *StructBatchRequest,
-        prepared: *?Prepared,
-        handle_ptr: ?*anyopaque,
-        fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
-            const request: *@This() = @ptrCast(@alignCast(raw));
-            try prepareOwnedBatchAttempt(request.handle_ptr, request.prepared, request.owned.req, budget);
-        }
-        fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
-            const request: *@This() = @ptrCast(@alignCast(raw));
-            try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, if (request.prepared.*) |*plan| plan else null);
-        }
-    };
-    var request: Request = .{ .owned = &owned, .prepared = &prepared, .handle_ptr = handle_ptr };
-    return executeBatchWithReplayPreparation(handle_ptr, &request, Request.prepare, Request.apply);
+    return executeOwnedDocumentBatch(handle_ptr, owned.req);
 }
 
 var test_batch_response_allocator: if (builtin.is_test) ?Allocator else void = if (builtin.is_test) null else {};
@@ -5251,24 +5433,7 @@ pub fn antfly_db_batch_json(
     var response: ?[]u8 = batch_api.encodeBatchResponse(response_allocator, owned.result()) catch |err|
         return capi.mapErrorContext(err, "batch response allocation failed before mutation; no write applied");
     defer if (response) |buffer| response_allocator.free(buffer);
-    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
-    var prepared: ?Prepared = null;
-    defer if (prepared) |*plan| plan.deinit();
-    const Request = struct {
-        owned: *@TypeOf(owned),
-        prepared: *?Prepared,
-        handle_ptr: ?*anyopaque,
-        fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
-            const request: *@This() = @ptrCast(@alignCast(raw));
-            try prepareOwnedBatchAttempt(request.handle_ptr, request.prepared, request.owned.req, budget);
-        }
-        fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
-            const request: *@This() = @ptrCast(@alignCast(raw));
-            try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, if (request.prepared.*) |*plan| plan else null);
-        }
-    };
-    var request: Request = .{ .owned = &owned, .prepared = &prepared, .handle_ptr = handle_ptr };
-    const code = executeBatchWithReplayPreparation(handle_ptr, &request, Request.prepare, Request.apply);
+    const code = executeOwnedDocumentBatch(handle_ptr, owned.req);
     if (code != .ok) return code;
     out_buf.* = .{ .ptr = response.?.ptr, .len = response.?.len };
     response = null;
@@ -12093,6 +12258,231 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     try std.testing.expectEqual(t.Lifecycle.superseded, record.lifecycle);
     const detail = try std.json.parseFromSliceLeaky(t.SupersessionProposalDetail, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_proposal, .{}, "", "pair"), .{});
     try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
+}
+
+test "capi native publication cohort queues before admission and shares one indexed checkpoint" {
+    try testQueuedNativePublication(.clean);
+}
+
+test "capi native publication cohort isolates a permanently invalid member before commit" {
+    try testQueuedNativePublication(.invalid_member);
+}
+
+test "capi native publication cohort unknown outcome fences all shared writer receipts" {
+    try testQueuedNativePublication(.unknown);
+}
+
+fn testQueuedNativePublication(case: enum { clean, invalid_member, unknown }) !void {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = handleLockIo();
+    var directory = try TestDirectory.init("queued-native-cohort");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    const wrapper = try @import("lite_connection.zig").open(path, .{ .profile = .native, .busy_timeout_ms = 5000 }, true);
+    const id = try publishHandle(wrapper);
+    var closed = false;
+    defer if (!closed) antfly_db_close(id);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const queue = &connection.gate.document_publications;
+    const Probe = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        second_entered: std.Io.Event = .unset,
+        second_release: std.Io.Event = .unset,
+        third_was_fenced: bool = false,
+        groups: usize = 0,
+        second_group_size: usize = 0,
+        fault: bool = false,
+        connection: *@import("lite_connection.zig").Connection,
+        fn armFault(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Invoked under the actual writer admission, after any serving
+            // replacement. No borrowed runtime/file survives queue waiting.
+            const current = self.connection.owner.current orelse return error.TestMissingCurrentOwner;
+            current.owned_lite_backend.?.native_docstore.?.file.test_fail_checkpoint_publication = error.WriteFailed;
+        }
+        fn selected(raw: *anyopaque, jobs: []const *@import("publication_queue.zig").Job) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.groups += 1;
+            if (self.groups == 1) {
+                self.entered.set(handleLockIo());
+                self.release.waitUncancelable(handleLockIo());
+            } else if (self.groups == 2) {
+                self.second_group_size = jobs.len;
+                if (self.fault) {
+                    self.second_entered.set(handleLockIo());
+                    self.second_release.waitUncancelable(handleLockIo());
+                    @import("../storage/db/mutation_commit.zig").test_before_primary_commit = .{ .ptr = self, .run = armFault };
+                }
+            } else if (self.groups == 3) {
+                self.third_was_fenced = jobs.len == 1 and !jobs[0].writer.accepts(jobs[0].marker);
+            }
+        }
+    };
+    var probe: Probe = .{ .fault = case == .unknown, .connection = connection };
+    defer @import("../storage/db/mutation_commit.zig").test_before_primary_commit = null;
+    queue.test_before_process = .{ .ptr = &probe, .notify = Probe.selected };
+    var hook_attached = true;
+    defer if (hook_attached) {
+        queue.test_before_process = null;
+    };
+    const Worker = struct {
+        id: *anyopaque,
+        ordinal: usize,
+        code: capi.ErrorCode = .internal,
+        invalid: bool = false,
+        receipt: ?@import("outcome_receipts.zig").Marker = null,
+        fn run(self: *@This()) void {
+            var bytes: [256]u8 = undefined;
+            const request = std.fmt.bufPrint(&bytes, "{{\"inserts\":{{\"document-{d}\":{{\"body\":\"cohort unicode résumé 日本語\"}}}},\"sync_level\":\"write\"}}", .{self.ordinal}) catch unreachable;
+            var output: capi.Buffer = .{};
+            defer antfly_buffer_free(&output);
+            if (self.invalid) {
+                const write = capi.WriteIntent{ .key = .fromSlice("document-2"), .value = .fromSlice("malformed JSON") };
+                self.code = antfly_db_batch(self.id, &.{write}, 1, null, 0, 0, 0);
+            } else self.code = antfly_db_batch_json(self.id, .fromSlice(request), &output);
+            if (@import("outcome_receipts.zig").lastReceipt()) |receipt| self.receipt = receipt.marker;
+            if (self.code != .ok) std.debug.print("queued cohort worker={d} code={t} detail={s}\n", .{ self.ordinal, self.code, std.mem.span(capi.lastErrorDetail()) });
+        }
+    };
+    const file = blk: {
+        const guard = enterHandle(id, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        break :blk &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+    };
+    // The owner is stopped and these calls cannot publish before the probe
+    // releases the first selected request. The mutable file is read only while
+    // that test fence is held, or after every caller has joined.
+    const before = file.activeCheckpoint().commit_sequence;
+    const syncs = file.test_durability_syncs.load(.monotonic);
+    const worker_count: usize = if (case == .unknown) 10 else 9;
+    var all_workers: [10]Worker = undefined;
+    const workers = all_workers[0..worker_count];
+    var threads: [10]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        probe.release.set(io);
+        probe.second_release.set(io);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (workers, 0..) |*worker, ordinal| worker.* = .{ .id = id, .ordinal = ordinal, .invalid = case == .invalid_member and ordinal == 2 };
+    threads[0] = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Worker.run, .{&workers[0]});
+    spawned = 1;
+    try probe.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    // No writer gate is held by the paused publication queue.
+    {
+        const guard = enterHandle(id, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+    }
+    for (1..9) |ordinal| {
+        threads[ordinal] = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Worker.run, .{&workers[ordinal]});
+        spawned += 1;
+    }
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
+    while (true) {
+        queue.mutex.lockUncancelable(io);
+        const pending = queue.pending;
+        queue.mutex.unlock(io);
+        if (pending == 8) break;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.TestQueueEnrollmentTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    probe.release.set(io);
+    if (case == .unknown) {
+        try probe.second_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        // This origin enrolled under the old writer identity after the second
+        // cohort was selected. The leader must fence it before waking origins.
+        threads[9] = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Worker.run, .{&workers[9]});
+        spawned += 1;
+        const until = std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
+        while (true) {
+            queue.mutex.lockUncancelable(io);
+            const pending = queue.pending;
+            queue.mutex.unlock(io);
+            if (pending == 1) break;
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until) return error.TestQueueEnrollmentTimeout;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        probe.second_release.set(io);
+    }
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+    for (workers) |worker| try std.testing.expectEqual(
+        if (case == .unknown and worker.ordinal == 9) capi.ErrorCode.stalled else if (case == .unknown and worker.ordinal != 0) capi.ErrorCode.outcome_unknown else if (worker.invalid) capi.ErrorCode.invalid_argument else capi.ErrorCode.ok,
+        worker.code,
+    );
+    try std.testing.expectEqual(@as(usize, if (case == .unknown) 3 else 2), probe.groups);
+    try std.testing.expectEqual(@as(usize, 8), probe.second_group_size);
+    if (case == .unknown) {
+        try std.testing.expect(probe.third_was_fenced);
+        try std.testing.expect(workers[9].receipt == null);
+        const receipt = workers[1].receipt orelse return error.TestMissingCohortReceipt;
+        try std.testing.expectEqual(@as(u64, 9), receipt.sequence);
+        for (workers[1..9]) |worker| {
+            const other = worker.receipt orelse return error.TestMissingCohortReceipt;
+            try std.testing.expectEqual(receipt, other);
+        }
+        queue.test_before_process = null;
+        hook_attached = false;
+        antfly_db_close(id);
+        closed = true;
+        const reopened = try @import("lite_connection.zig").open(path, .{ .profile = .native, .busy_timeout_ms = 5000 }, false);
+        const fresh_id = try publishHandle(reopened);
+        defer antfly_db_close(fresh_id);
+        const fresh = enterHandle(fresh_id, .read).?;
+        defer fresh.leave();
+        if (fresh.entry_error) |code| {
+            std.debug.print("cohort recovery admission={t} detail={s}\n", .{ code, std.mem.span(capi.lastErrorDetail()) });
+            return error.TestCohortRecoveryAdmissionRefused;
+        }
+        try std.testing.expectEqual(@as(?u64, 1), try fresh.handle.database().readOutcomeMarker(receipt.writer));
+        const acknowledged = (try fresh.handle.database().get(a, "document-0")).?;
+        a.free(acknowledged);
+        for (1..workers.len) |ordinal| {
+            var key: [32]u8 = undefined;
+            if (try fresh.handle.database().get(a, try std.fmt.bufPrint(&key, "document-{d}", .{ordinal}))) |value| {
+                a.free(value);
+                return error.TestUnexpectedCohortPrimaryAfterRejection;
+            }
+        }
+        const report = try fresh.handle.owned_lite_backend.?.native_docstore.?.file.check();
+        if (!report.valid) {
+            std.debug.print("cohort recovery integrity={any}\n", .{report});
+            return error.TestCohortRecoveryIntegrityFailed;
+        }
+        return;
+    }
+    const guard = enterHandle(id, .read).?;
+    defer guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    const current = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+    const physical_publications: u64 = if (case == .invalid_member) 8 else 2;
+    try std.testing.expectEqual(before + physical_publications, current.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(physical_publications, current.test_durability_syncs.load(.monotonic) - syncs);
+    for (workers) |worker| {
+        if (worker.invalid) continue;
+        var key: [32]u8 = undefined;
+        const value = (try guard.handle.database().get(a, try std.fmt.bufPrint(&key, "document-{d}", .{worker.ordinal}))).?;
+        a.free(value);
+    }
+    const entries = try guard.handle.database().core.store.iterateReplayFrom(a, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(a);
+        a.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, if (case == .invalid_member) 8 else 9), entries.len);
+    try std.testing.expect((try current.check()).valid);
 }
 
 test "capi native indexed exports retain owned foreground eligibility after reopen" {
