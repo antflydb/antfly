@@ -11928,7 +11928,7 @@ pub const Node = struct {
         // Regex compilers retain caller controls. They remain exclusive until
         // their validation contexts can be owned by the physical invocation.
         if ((try qualification.requiredFeaturesResolved(request, options.pipeline, options.control)).contains(.regex_validation)) return null;
-        const schema = (try gliner_microbatch.boundaryKey(a, request_json)) orelse return null;
+        const schema = (try gliner_microbatch.boundaryKey(a, request_json, options.pipeline.classification_multi_label_fallback)) orelse return null;
         defer a.free(schema);
         const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
         var preparations = boundary_executor.PreparationStore.init(a);
@@ -11970,10 +11970,7 @@ pub const Node = struct {
             shared.free(results);
         }
         try control.check();
-        return switch (results[0].result) {
-            .value => |value| try a.dupe(u8, value.bytes),
-            .item_error => |failure| failure.cause,
-        };
+        return gliner_microbatch.boundaryResult(a, results[0]);
     }
 
     fn executeBoundaryRequestMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
@@ -11991,7 +11988,10 @@ pub const Node = struct {
                 try self.runBoundaryRequestMicrobatch(items[0..half]);
                 return self.runBoundaryRequestMicrobatch(items[half..]);
             }
-            return if (err == error.BoundaryMicrobatchCapacity) error.MemoryBudgetExceeded else err;
+            // A singleton that cannot admit the additional broker heap/output
+            // rejoins its caller and uses that caller's existing serial budget.
+            // Only this pre-forward capacity refusal permits a retry.
+            return err;
         };
     }
 
@@ -27301,6 +27301,50 @@ test {
     _ = @import("gliner_specialty_artifact_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
     _ = @import("embed_direct_vs_http_bench_test.zig");
+}
+
+test "gliner boundary microbatch capacity rejoins the caller with its original budget intact" {
+    const a = std.testing.allocator;
+    var request = try extraction_v2.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada"}]}
+    , .{});
+    defer request.deinit();
+    // Default limits admit both heaps but refuse the output reservation; a
+    // smaller explicit limit refuses the second heap itself. Neither case
+    // reaches a model, and neither may turn a valid serial request into 507.
+    for ([_]usize{ 0, 256 * 1024 * 1024 }) |scratch_limit| {
+        var node = try Node.init(a, .{
+            .generation_budget_overrides = .{ .scratch_limit_bytes = scratch_limit },
+        });
+        defer node.deinit();
+        const limits = node.config.generation_budget_overrides.apply(node.defaultGenerationLimits(.cpu));
+        const working_bytes = @min(512 * 1024 * 1024, @min(limits.host_limit_bytes, limits.scratch_limit_bytes));
+        var caller = try node.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_scratch_bytes = working_bytes });
+        defer caller.release();
+        const before = node.model_manager.currentAdmissionAmounts();
+        // The capacity refusal must precede any access to the model.
+        const ticket = Node.BoundaryRequestTicket{ .model = undefined, .request = &request, .options = .{}, .working_bytes = working_bytes };
+        var output: Node.BoundaryReply = undefined;
+        var slot = executor_microbatch.ResultSlot{ .output = &output };
+        Node.executeBoundaryRequestMicrobatch(&node, &.{.{ .allocator = a, .identity = .{}, .payload = &ticket, .slot = &slot }});
+        try std.testing.expect(slot.completed);
+        try std.testing.expectEqual(error.BoundaryMicrobatchCapacity, slot.err.?);
+        try std.testing.expectEqualDeep(before, node.model_manager.currentAdmissionAmounts());
+        try std.testing.expectEqual(@as(?[]u8, null), try gliner_microbatch.boundaryResult(a, .{
+            .identity = .{},
+            .execution = slot.execution,
+            .result = .{ .item_error = .{ .cause = slot.err.? } },
+        }));
+        // Serial execution can use the still-admitted caller heap after all
+        // physical-invocation reservations have drained.
+        var bounded = BoundedRequestAllocator{ .backing = a, .limit = working_bytes };
+        const bytes = try bounded.allocator().alloc(u8, 1024);
+        bounded.allocator().free(bytes);
+        try std.testing.expectEqual(@as(usize, 0), bounded.live);
+        try std.testing.expectEqualDeep(before, node.model_manager.currentAdmissionAmounts());
+        caller.release();
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, node.model_manager.currentAdmissionAmounts());
+    }
 }
 
 test "gliner boundary v2 allocation attribution distinguishes recovery and model backing OOM" {

@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const memory = @import("../runtime/tier/memory.zig");
 const span = @import("../extractors/gliner_span_v2_executor.zig");
 const OutputOwner = @import("output_owner.zig").OutputOwner;
+const micro = @import("executor_microbatch.zig");
 
 pub fn classificationBudget(limits: memory.Limits, config: span.EncoderConfig, sequence: usize, rows: usize) !memory.RunBudget {
     if (rows == 0 or rows > 8 or sequence == 0 or sequence > 512) return error.InvalidMicrobatchLimits;
@@ -59,10 +60,22 @@ pub fn destroyBoundaryReply(a: Allocator, reply: BoundaryReply) void {
     reply.owner.release();
 }
 
+/// A capacity refusal precedes model execution. Rejoin the caller before it
+/// uses its already-admitted heap for serial execution. Other failures must
+/// propagate: retrying them could replay a failed backend operation.
+pub fn boundaryResult(a: Allocator, result: micro.ItemResult(BoundaryReply)) !?[]u8 {
+    return switch (result.result) {
+        .value => |reply| try a.dupe(u8, reply.bytes),
+        .item_error => |failure| if (failure.cause == error.BoundaryMicrobatchCapacity) null else failure.cause,
+    };
+}
+
 /// Keep schemas and options identical, including per-input overrides. Text and
 /// source IDs belong to rows, so neither can prevent independent HTTP batching.
 /// A different JSON field order can conservatively create a separate cohort.
-pub fn boundaryKey(a: Allocator, json: []const u8) !?[]u8 {
+/// Legacy upgrades and v2 callers can resolve different presentation policies
+/// from the same wire schema, so include that resolved policy as well.
+pub fn boundaryKey(a: Allocator, json: []const u8, classification_multi_label_fallback: bool) !?[]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
@@ -75,6 +88,7 @@ pub fn boundaryKey(a: Allocator, json: []const u8) !?[]u8 {
         .options = root.get("options"),
         .item_schema = input.get("schema"),
         .item_options = input.get("options"),
+        .classification_multi_label_fallback = classification_multi_label_fallback,
     }, .{});
 }
 
@@ -142,19 +156,58 @@ test "gliner microbatch boundary keys isolate schemas and options while retainin
     const a = std.testing.allocator;
     const one = (try boundaryKey(a,
         \\{"schema":{"entities":["person"]},"inputs":[{"id":"a","content":"Ada"}]}
-    )).?;
+    , true)).?;
     defer a.free(one);
     const two = (try boundaryKey(a,
         \\{"schema":{"entities":["person"]},"inputs":[{"id":"b","content":"Bob"}]}
-    )).?;
+    , true)).?;
     defer a.free(two);
     try std.testing.expectEqualStrings(one, two);
     const other = (try boundaryKey(a,
         \\{"schema":{"entities":["person"]},"inputs":[{"content":"Bob","options":{"threshold":0.9}}]}
-    )).?;
+    , true)).?;
     defer a.free(other);
     try std.testing.expect(!std.mem.eql(u8, one, other));
-    try std.testing.expectEqual(@as(?[]u8, null), try boundaryKey(a, "{\"inputs\":[{},{}]}"));
+    try std.testing.expectEqual(@as(?[]u8, null), try boundaryKey(a, "{\"inputs\":[{},{}]}", true));
+}
+
+test "gliner microbatch boundary keys separate legacy and v2 classification fallback" {
+    const a = std.testing.allocator;
+    const json =
+        \\{"schema":{"classifications":[{"name":"intent","labels":["sales","support"],"multi_label":true,"threshold":0.99}]},"inputs":[{"content":"Help"}]}
+    ;
+    const legacy = (try boundaryKey(a, json, false)).?;
+    defer a.free(legacy);
+    const v2 = (try boundaryKey(a, json, true)).?;
+    defer a.free(v2);
+    try std.testing.expect(!std.mem.eql(u8, legacy, v2));
+}
+
+test "gliner microbatch boundary results fall back only for pre-forward capacity" {
+    const a = std.testing.allocator;
+    const Result = micro.ItemResult(BoundaryReply);
+    try std.testing.expectEqual(@as(?[]u8, null), try boundaryResult(a, Result{
+        .identity = .{},
+        .execution = .serial,
+        .result = .{ .item_error = .{ .cause = error.BoundaryMicrobatchCapacity } },
+    }));
+    for ([_]anyerror{ error.OutOfMemory, error.MemoryBudgetExceeded, error.InvalidInputShape, error.Canceled, error.DeadlineExceeded }) |err| {
+        try std.testing.expectError(err, boundaryResult(a, Result{
+            .identity = .{},
+            .execution = .serial,
+            .result = .{ .item_error = .{ .cause = err } },
+        }));
+    }
+    const owner = try std.heap.smp_allocator.create(OutputOwner);
+    var controller = memory.AdmissionController{};
+    owner.* = .{ .lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 128 }, false), .remaining = .init(1) };
+    const reply = BoundaryReply{ .bytes = try a.dupe(u8, "{\"data\":[]}"), .owner = owner };
+    defer destroyBoundaryReply(a, reply);
+    const copy = (try boundaryResult(a, .{ .identity = .{}, .execution = .native_batch, .result = .{ .value = reply } })).?;
+    defer a.free(copy);
+    try std.testing.expectEqualStrings(reply.bytes, copy);
+    try std.testing.expect(reply.bytes.ptr != copy.ptr);
+    try std.testing.expectEqual(@as(usize, 128), controller.snapshot().host_scratch_bytes);
 }
 
 test "gliner microbatch boundary response retains source IDs and row-local usage and output limits" {

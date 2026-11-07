@@ -247,6 +247,8 @@ matching schemas/options into cohorts of up to eight rows and 4,096 padded
 tokens, with at most 512 prepared tokens per row. Length buckets bound grouping
 padding to 25% when the encoder declares attention masks. Windowed documents,
 larger rows and regex validation retain their existing exclusive execution.
+Cohorts that cannot admit their additional workspace return to the callers'
+existing serial paths before any model execution.
 Each caller retains its IDs, unpadded usage, output limits and cancellation;
 published responses retain a separate memory owner until all consumers rejoin.
 The configured public item ceiling also applies before schema-v2 extraction
