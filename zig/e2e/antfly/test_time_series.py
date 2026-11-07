@@ -212,6 +212,66 @@ def test_time_series_fixed_buckets_and_algebraic_corrections(stateful_api, shard
     )
 
 
+@pytest.mark.parametrize("shards", [1, 2])
+def test_sorted_time_range_preflight_and_bidirectional_pages(stateful_api, shards):
+    """Cold sort admission must count filters without inheriting page controls."""
+    api = stateful_api
+    name = f"series_sorted_probe_{shards}_{time.time_ns()}"
+    finish_create_table(
+        api,
+        name,
+        api._request(
+            "POST",
+            f"/tables/{name}",
+            {
+                "num_shards": shards,
+                "schema": _schema(),
+            },
+        ),
+    )
+    readings = {
+        str(i): {
+            "device_id": "sensor",
+            "observed_at": f"2026-11-06T12:0{i}:00Z",
+            "temperature": i,
+        }
+        for i in range(3)
+    }
+    readings["outside"] = {
+        "device_id": "sensor",
+        "observed_at": "2026-11-06T13:00:00Z",
+        "temperature": 99,
+    }
+    api.batch_write(name, inserts=readings, sync_level="full_index")
+    query = {
+        "order_by": [{"field": "observed_at", "desc": True}],
+        "limit": 1,
+        "profile": True,
+        "filter_query": {
+            "field": "observed_at",
+            "start": "2026-11-06T12:00:00Z",
+            "end": "2026-11-06T13:00:00Z",
+            "inclusive_start": True,
+            "inclusive_end": False,
+        },
+    }
+
+    def read(request):
+        payload = api.query_table(name, request)
+        response = payload.get("responses", [payload])[0]
+        assert not response.get("error"), payload
+        assert response["profile"]["sort"]["plan"] != "stored_json_debug", payload
+        return response
+
+    first = read(query)
+    assert first["hits"]["hits"][0]["_id"] == "2", first
+    page_query = dict(query, remote_snapshot=first["remote_snapshot"])
+    second = read(dict(page_query, search_after=first["hits"]["hits"][0]["_sort"]))
+    assert second["hits"]["hits"][0]["_id"] == "1", second
+    previous = read(dict(page_query, search_before=second["hits"]["hits"][0]["_sort"]))
+    assert previous["hits"]["hits"][0]["_id"] == "2", previous
+
+
 def test_time_series_ttl_removes_exact_aggregate_contributions(stateful_api):
     from helpers import wait_until
 
