@@ -40,6 +40,16 @@ const Namespace = struct {
     directory: std.Io.Dir,
     guard: std.Io.File,
     digest: [32]u8,
+    /// Inode of `path`'s resolved parent directory at open time. A cache
+    /// that keeps this `Namespace` open across commits uses this to cheaply
+    /// detect that the parent has been replaced out from under it (e.g. an
+    /// external rename/recreate dance, as a backup/restore or vacuum can
+    /// do): the already-open `directory`/`guard` handles stay valid by
+    /// inode regardless of what happens to the path, but they stop being
+    /// the directory a *fresh* lookup from the current parent would land
+    /// in, and a cache must not keep trusting them once that is true. See
+    /// `parentUnchanged`.
+    parent_inode: u64,
     fn open(a: Allocator, io: std.Io, path: []const u8, publication: bool, no_sync: bool) !Namespace {
         // Resolve the `.aflite` file's parent directory *once*, as an
         // already-open handle, and reuse that same handle for everything
@@ -84,6 +94,7 @@ const Namespace = struct {
         };
         const directory = try parent.openDir(io, directory_name, .{ .iterate = true });
         errdefer directory.close(io);
+        const parent_inode: u64 = @intCast((try parent.stat(io)).inode);
         parent.close(io);
         parent_open = false;
         // Never recreate this authority for an already published inode. Missing
@@ -118,7 +129,7 @@ const Namespace = struct {
         hash.update(&id);
         var digest: [32]u8 = undefined;
         hash.final(&digest);
-        return .{ .canonical = canonical, .directory = directory, .guard = guard, .digest = digest };
+        return .{ .canonical = canonical, .directory = directory, .guard = guard, .digest = digest, .parent_inode = parent_inode };
     }
     fn close(self: Namespace, a: Allocator, io: std.Io) void {
         self.guard.close(io);
@@ -186,6 +197,15 @@ pub fn scan(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, inode: 
     };
     defer namespace.close(a, io);
     if (!std.mem.eql(u8, &binding, &namespace.digest)) return error.WouldBlock;
+    return scanNamespace(io, namespace, inode);
+}
+
+/// The actual marker walk, factored out of `scan` so a caller that keeps a
+/// `Namespace` open across many calls (`CachedNamespace` below) can reuse the
+/// same directory/guard handles instead of paying `Namespace.open`'s
+/// resolve-canonical-path/hash/open-parent/open-directory/open-identity cost
+/// on every call. No behavior change from the body `scan` used to run inline.
+fn scanNamespace(io: std.Io, namespace: Namespace, inode: u64) !Frontier {
     if (!try namespace.guard.tryLock(io, .exclusive)) return error.WouldBlock;
     defer namespace.guard.unlock(io);
     const dir = namespace.directory;
@@ -227,6 +247,94 @@ pub fn scan(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, inode: 
         if (raw[24] == 1) result.metadata = @min(result.metadata orelse sequence, sequence);
     }
     return result;
+}
+
+/// A `Namespace` kept open across many writer commits instead of being
+/// resolved, opened, and closed from scratch every time -- the dominant
+/// per-commit cost this revision used to pay even with zero readers ever
+/// registered (opening the parent directory, resolving its canonical path,
+/// hashing it, opening the readers directory, and opening+reading+hashing
+/// the `identity` guard, all repeated on every single write). The *safety*
+/// decision (which markers are live) is still made exactly as `scan` makes
+/// it, by `scanNamespace` above, under the same kernel locks; this only
+/// amortizes the handles. Owned by a single `NativeFile` for its lifetime
+/// (or until something rebinds `reader_epoch_namespace`), never shared
+/// across processes or across a rebind.
+pub const CachedNamespace = struct {
+    namespace: Namespace,
+
+    pub fn close(self: CachedNamespace, a: Allocator, io: std.Io) void {
+        self.namespace.close(a, io);
+    }
+};
+
+/// Open (or reopen) the namespace once, verifying it still matches `binding`
+/// exactly as `scan`/`register` do. Returns `error.WouldBlock` on the same
+/// conditions `scan` treats as "no safe reuse decision available" (missing
+/// `.aflite`, or a namespace that no longer matches the caller's binding --
+/// e.g. the file was replaced out from under this handle).
+pub fn openCached(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8) !CachedNamespace {
+    const namespace = Namespace.open(a, io, path, false, true) catch |err| switch (err) {
+        error.FileNotFound => return error.WouldBlock,
+        else => return err,
+    };
+    errdefer namespace.close(a, io);
+    if (!std.mem.eql(u8, &binding, &namespace.digest)) return error.WouldBlock;
+    return .{ .namespace = namespace };
+}
+
+/// Cheap (one syscall on non-Windows, via `Dir.statFile`) check that a
+/// fresh, path-based lookup of `path`'s parent would still resolve to the
+/// same parent directory this `cached` namespace was opened against. A
+/// writer's cache must re-verify this every time it wants to trust an
+/// already-open namespace: the directory/guard handles stay valid by inode
+/// no matter what happens to the filesystem around them, but `register`'s
+/// *next* caller finds its namespace by hashing a freshly-resolved
+/// canonical path starting from the parent directory's current identity --
+/// not from any writer's cached handle. If something external (a
+/// backup/restore or vacuum dance, or just an operator moving directories
+/// around) has renamed or replaced that parent since this namespace was
+/// opened, a fresh registration would land in a different (or missing)
+/// directory than the one this cache still has open, so the cache is no
+/// longer the authority and must not be trusted -- regardless of whether
+/// its own handles still happen to work. Returns `false` (never trust) on
+/// any error resolving the parent, so a transient failure fails closed to
+/// the slow, fully-reopened path rather than to an unverified cache hit.
+pub fn parentUnchanged(io: std.Io, path: []const u8, cached: CachedNamespace) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, std.fs.path.dirname(path) orelse ".", .{}) catch return false;
+    return stat.inode == cached.namespace.parent_inode;
+}
+
+/// A cheap (single `fstat`-equivalent) stand-in for "has the readers
+/// directory's membership changed since the last time this was captured."
+/// `register` creates a file in this directory and `Lease.close`/`scan`'s own
+/// reaping delete one; every one of those mutations bumps the directory's own
+/// mtime for free, with no protocol change to any of them. This is *not*
+/// itself what makes reuse safe -- it is only a cache-invalidation hint for a
+/// caller that reads it while already holding the writer's own exclusive
+/// data-file lock. `register` needs that same file's *shared* lock to reach
+/// the point where it creates its marker (see this file's header comment and
+/// `register`'s own comments), so once a writer holds the data file
+/// exclusively, no *new* registration can complete until it releases that
+/// lock -- the registered-reader set at that instant can only be a subset of
+/// (or equal to) what the last real scan observed. An unchanged fingerprint
+/// therefore proves nothing joined since that scan; a changed one (a join, a
+/// departure, or both) always falls back to a real scan. A missed departure
+/// is always safe: it only makes the cached frontier more conservative, never
+/// unsafe, since it can only ever be lower than or equal to the true current
+/// minimum once there are no new joiners.
+pub fn directoryFingerprint(io: std.Io, cached: CachedNamespace) !i96 {
+    const stat = try cached.namespace.directory.stat(io);
+    return stat.mtime.nanoseconds;
+}
+
+/// Identical safety decision to `scan`, but against an already-open
+/// `CachedNamespace` -- no parent/directory/identity opens, no path
+/// resolution, no hashing. Callers that want the O(1) fast path should
+/// prefer comparing `directoryFingerprint` against a previously cached value
+/// first and only call this when it has changed (or on the first call).
+pub fn scanCached(io: std.Io, cached: CachedNamespace, inode: u64) !Frontier {
+    return scanNamespace(io, cached.namespace, inode);
 }
 
 test "lite reader epochs isolate inode frontiers and reclaim crashed registrations" {
@@ -332,4 +440,83 @@ test "lite reader epochs guard cross-generation registration and reject replaced
     try std.testing.expectError(error.UnsafeNativeReaderAlias, register(a, io, path, binding, inode, 1, true));
     try std.testing.expectError(error.WouldBlock, scan(a, io, path, binding, inode));
     try std.testing.expectError(error.FileNotFound, namespace.directory.access(io, "identity", .{}));
+}
+
+test "lite reader epochs cached namespace matches an uncached scan and tracks membership changes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cached.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    defer data.close(io);
+    const inode = (try data.stat(io)).inode;
+    const binding = try namespaceForPublication(a, io, path);
+
+    // Opened once, with nobody registered: scanCached must agree with scan.
+    const cached = try openCached(a, io, path, binding);
+    defer cached.close(a, io);
+    try std.testing.expectEqual(try scan(a, io, path, binding, inode), try scanCached(io, cached, inode));
+    const empty_fp = try directoryFingerprint(io, cached);
+
+    // A registration -- exactly what another process's `register` call does
+    // -- must change the fingerprint (it creates a file in this directory),
+    // so a cache holding `empty_fp` knows it can no longer trust an "empty"
+    // result without rescanning.
+    const reader = try register(a, io, path, binding, inode, 10, false);
+    var reader_open = true;
+    defer if (reader_open) reader.close(a, io);
+    const after_join_fp = try directoryFingerprint(io, cached);
+    try std.testing.expect(after_join_fp != empty_fp);
+    try std.testing.expectEqual(try scan(a, io, path, binding, inode), try scanCached(io, cached, inode));
+    try std.testing.expectEqual(@as(?u64, 10), (try scanCached(io, cached, inode)).data);
+
+    // A departure (the reader's Lease closing, deleting its own marker) also
+    // changes the fingerprint, even though missing it is always safe (it
+    // can only make a cached frontier more conservative, never unsafe).
+    reader.close(a, io);
+    reader_open = false;
+    const after_leave_fp = try directoryFingerprint(io, cached);
+    try std.testing.expect(after_leave_fp != after_join_fp);
+    try std.testing.expectEqual(@as(?u64, null), (try scanCached(io, cached, inode)).data);
+}
+
+test "lite reader epochs parentUnchanged detects an externally replaced parent directory" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/original-parent", .{tmp.sub_path});
+    defer a.free(parent);
+    try std.Io.Dir.cwd().createDir(io, parent, .fromMode(0o700));
+    const path = try std.fs.path.join(a, &.{ parent, "cached-parent.aflite" });
+    defer a.free(path);
+    const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    defer data.close(io);
+    const binding = try namespaceForPublication(a, io, path);
+    const cached = try openCached(a, io, path, binding);
+    defer cached.close(a, io);
+    // Nothing has moved yet: a fresh lookup from `path`'s current parent
+    // still resolves to the same parent this cache opened against.
+    try std.testing.expect(parentUnchanged(io, path, cached));
+
+    // Move the whole parent elsewhere, then recreate an empty directory at
+    // the same name and hard-link the data file back under the original
+    // path -- the data file itself is unchanged, but the parent a fresh
+    // lookup finds is a brand new directory.
+    const moved = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/moved-parent", .{tmp.sub_path});
+    defer a.free(moved);
+    try std.Io.Dir.cwd().rename(parent, std.Io.Dir.cwd(), moved, io);
+    try std.Io.Dir.cwd().createDir(io, parent, .fromMode(0o700));
+    const moved_file = try std.fs.path.join(a, &.{ moved, "cached-parent.aflite" });
+    defer a.free(moved_file);
+    try std.Io.Dir.cwd().hardLink(moved_file, std.Io.Dir.cwd(), path, io, .{});
+    try std.Io.Dir.cwd().deleteFile(io, moved_file);
+
+    try std.testing.expect(!parentUnchanged(io, path, cached));
+    // A cache that keeps treating this as unchanged is exactly the bug: a
+    // fresh `openCached` from here must not find the old (relocated)
+    // namespace directory inside the new, empty parent.
+    try std.testing.expectError(error.WouldBlock, openCached(a, io, path, binding));
 }
