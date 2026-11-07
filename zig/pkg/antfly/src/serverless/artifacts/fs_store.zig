@@ -59,6 +59,7 @@ pub const FsStore = struct {
     verified_mu: std.atomic.Mutex = .unlocked,
     journal_backfills: std.atomic.Value(usize) = .init(0),
     journal_records_read: std.atomic.Value(usize) = .init(0),
+    temporary_records_read: std.atomic.Value(usize) = .init(0),
     journal_attempt_scans: std.atomic.Value(u64) = .init(0),
     verified_files: std.StringHashMapUnmanaged(VerifiedFile) = .empty,
 
@@ -379,27 +380,127 @@ pub const FsStore = struct {
     }
 
     const journal_header = "AFUPLOAD1\n";
-    /// Append-before-payload makes publication crash safe: a failed upload can
-    /// leave a harmless inventory entry, never an unenumerable payload. The
-    /// lock is interprocess and the completed journal is atomically installed.
-    /// Existing flat attempts are backfilled once, without holding their IDs
-    /// in memory. Journals are advisory discovery data, never read authority.
-    fn uploadJournal(self: *FsStore, io: std.Io, payloads: std.Io.Dir, scope: artifact_store.UploadScope, checksum: ?[]const u8, cancellation: CancellationToken) !std.Io.File {
+    const temporary_header = "AFTEMP1\n";
+    const temporary_name_len = 101;
+    const Journal = struct {
+        file: std.Io.File,
+        temporaries: std.Io.File,
+        identity: [16]u8,
+        fn close(self: Journal, io: std.Io) void {
+            self.temporaries.close(io);
+            self.file.close(io);
+        }
+    };
+    const JournalGuard = struct {
+        io: std.Io,
+        mutex: *std.Io.Mutex,
+        file: std.Io.File,
+        fn deinit(self: *JournalGuard) void {
+            self.file.unlock(self.io);
+            self.file.close(self.io);
+            self.mutex.unlock(self.io);
+        }
+    };
+    // These 64 lock files are permanent. Deleting an attempt must never
+    // replace the lock inode while another initializer is waiting on it.
+    fn journalGuard(self: *FsStore, io: std.Io, scope: artifact_store.UploadScope, cancellation: CancellationToken) !JournalGuard {
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(&scope.domain);
+        hash.update(&scope.attempt);
+        const stripe = hash.final() % journal_mutexes.len;
+        const mutex = &journal_mutexes[stripe];
+        while (!mutex.tryLock()) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        errdefer mutex.unlock(io);
+        try cancellation.check();
+        const root = try std.fs.path.join(self.alloc, &.{ self.inventory_root, ".journal-locks-v1" });
+        defer self.alloc.free(root);
+        try self.durable_dirs.ensure(self.alloc, io, root);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/{x:0>2}", .{ root, stripe });
+        defer self.alloc.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        errdefer file.close(io);
+        while (!try file.tryLock(io, .exclusive)) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        errdefer file.unlock(io);
+        try cancellation.check();
+        return .{ .io = io, .mutex = mutex, .file = file };
+    }
+    fn legacyTemporary(name: []const u8) bool {
+        if (name.len != temporary_name_len or !std.mem.eql(u8, name[64..69], ".tmp-")) return false;
+        artifact_store.validateSha256Checksum(name[0..64]) catch return false;
+        var nonce: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&nonce, name[69..]) catch return false;
+        return true;
+    }
+    fn readJournalIdentity(io: std.Io, directory: std.Io.Dir) !?[16]u8 {
+        const file = directory.openFile(io, ".uploads-id-v1", .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close(io);
+        var id: [16]u8 = undefined;
+        if (try file.length(io) != id.len or try file.readPositionalAll(io, &id, 0) != id.len) return null;
+        return id;
+    }
+    fn journalIdentityMatches(self: *FsStore, io: std.Io, scope: artifact_store.UploadScope, identity: [16]u8, cancellation: CancellationToken) !bool {
+        var guard = try self.journalGuard(io, scope, cancellation);
+        defer guard.deinit();
         const path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
         defer self.alloc.free(path);
-        const journal_mutex = &journal_mutexes[std.hash.Wyhash.hash(0, path) % journal_mutexes.len];
-        try journal_mutex.lock(io);
-        defer journal_mutex.unlock(io);
+        const dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close(io);
+        dir.access(io, ".uploads-v1", .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        const current = (try readJournalIdentity(io, dir)) orelse return false;
+        return std.mem.eql(u8, &current, &identity);
+    }
+    fn journalToken(self: *FsStore, name: [32]u8, identity: [16]u8, offset: u64, temporary_offset: u64) ![]u8 {
+        return std.fmt.allocPrint(self.alloc, "{s}:{s}:{x:0>16}:{x:0>16}", .{ name, std.fmt.bytesToHex(&identity, .lower), offset, temporary_offset });
+    }
+    /// Append-before-payload keeps failed uploads discoverable. Both logs and
+    /// their incarnation are installed under the same retirement guard.
+    fn uploadJournal(self: *FsStore, io: std.Io, payloads: std.Io.Dir, scope: artifact_store.UploadScope, checksum: ?[]const u8, cancellation: CancellationToken) !Journal {
+        var guard = try self.journalGuard(io, scope, cancellation);
+        defer guard.deinit();
+        const payload_path = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+        defer self.alloc.free(payload_path);
+        const current = std.Io.Dir.cwd().openDir(io, payload_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return error.ArtifactUploadAttemptRetired,
+            else => return err,
+        };
+        defer current.close(io);
+        if ((try current.stat(io)).inode != (try payloads.stat(io)).inode) return error.ArtifactUploadAttemptRetired;
+        const path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+        defer self.alloc.free(path);
         try self.durable_dirs.ensure(self.alloc, io, path);
         const attempt = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
         defer attempt.close(io);
         const lock = try attempt.createFile(io, ".uploads-lock", .{ .truncate = false });
         defer lock.close(io);
-        try lock.lock(io, .exclusive);
+        while (!try lock.tryLock(io, .exclusive)) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
         defer lock.unlock(io);
         try cancellation.check();
+        var rebuilt = false;
         var journal = attempt.openFile(io, ".uploads-v1", .{ .mode = .read_write, .allow_directory = false }) catch |err| switch (err) {
             error.FileNotFound => build: {
+                rebuilt = true;
+                attempt.deleteFile(io, ".uploads-id-v1") catch |delete_err| switch (delete_err) {
+                    error.FileNotFound => {},
+                    else => return delete_err,
+                };
                 if (@import("builtin").is_test) _ = self.journal_backfills.fetchAdd(1, .monotonic);
                 const pending = try attempt.createFile(io, ".uploads-building", .{});
                 defer pending.close(io);
@@ -408,9 +509,10 @@ pub const FsStore = struct {
                 var entries = payloads.iterate();
                 while (try entries.next(io)) |entry| {
                     try cancellation.check();
-                    if (entry.kind != .file or entry.name.len != 64) continue;
-                    artifact_store.validateSha256Checksum(entry.name) catch continue;
-                    try pending.writePositionalAll(io, entry.name, offset);
+                    if (entry.kind != .file) continue;
+                    const entry_checksum = if (entry.name.len == 64) entry.name else if (entry.name.len == 75 and std.mem.endsWith(u8, entry.name, ".pending-v2")) entry.name[0..64] else continue;
+                    artifact_store.validateSha256Checksum(entry_checksum) catch continue;
+                    try pending.writePositionalAll(io, entry_checksum, offset);
                     offset += 64;
                 }
                 try pending.sync(io);
@@ -427,12 +529,50 @@ pub const FsStore = struct {
         if (length < journal_header.len) return error.InvalidArtifactUploadInventory;
         const complete = journal_header.len + (length - journal_header.len) / 64 * 64;
         if (length != complete) try journal.setLength(io, complete);
+        var id = if (rebuilt) null else try readJournalIdentity(io, attempt);
+        // Legacy temporaries get their own fixed-record inventory so a tiny
+        // work quantum never rescans a directory for every temporary file.
+        const temp_exists = if (attempt.access(io, ".temporaries-v1", .{})) |_| true else |err| switch (err) {
+            error.FileNotFound => false,
+            else => return err,
+        };
+        if (rebuilt or !temp_exists or id == null) {
+            attempt.deleteFile(io, ".uploads-id-v1") catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            try fs_paths.syncDirectoryHandlePortable(io, attempt);
+            const pending = try attempt.createFile(io, ".temporaries-building", .{});
+            defer pending.close(io);
+            try pending.writePositionalAll(io, temporary_header, 0);
+            var offset: u64 = temporary_header.len;
+            var entries = payloads.iterate();
+            while (try entries.next(io)) |entry| {
+                try cancellation.check();
+                if (entry.kind != .file or !legacyTemporary(entry.name)) continue;
+                try pending.writePositionalAll(io, entry.name, offset);
+                offset += temporary_name_len;
+            }
+            try pending.sync(io);
+            try attempt.rename(".temporaries-building", attempt, ".temporaries-v1", io);
+            var identity: [16]u8 = undefined;
+            io.random(&identity);
+            const id_pending = try attempt.createFile(io, ".uploads-id-building", .{});
+            defer id_pending.close(io);
+            try id_pending.writePositionalAll(io, &identity, 0);
+            try id_pending.sync(io);
+            try attempt.rename(".uploads-id-building", attempt, ".uploads-id-v1", io);
+            id = identity;
+            try fs_paths.syncDirectoryHandlePortable(io, attempt);
+        }
+        const temporaries = try attempt.openFile(io, ".temporaries-v1", .{});
+        errdefer temporaries.close(io);
         if (checksum) |value| {
             try artifact_store.validateSha256Checksum(value);
             try journal.writePositionalAll(io, value, complete);
             try journal.sync(io);
         }
-        return journal;
+        return .{ .file = journal, .temporaries = temporaries, .identity = id.? };
     }
     /// Offset continuations read each inventory record once. The attempt name
     /// is ordered; the record offset is stable across deletion and process
@@ -450,14 +590,28 @@ pub const FsStore = struct {
         };
         defer dir.close(io);
         var after_attempt: ?[]const u8 = null;
-        var after_offset: u64 = 0;
+        var after_identity: ?[16]u8 = null;
+        var after_offset: u64 = journal_header.len;
+        var after_temporary: u64 = temporary_header.len;
         if (visitor.continuation) |token| {
-            if (token.len != 49 or token[32] != ':') return error.InvalidArtifactEnumerationContinuation;
+            if (token.len != 49 and token.len != 99) return error.InvalidArtifactEnumerationContinuation;
+            if (token[32] != ':') return error.InvalidArtifactEnumerationContinuation;
             var decoded: [16]u8 = undefined;
             _ = std.fmt.hexToBytes(&decoded, token[0..32]) catch return error.InvalidArtifactEnumerationContinuation;
             after_attempt = token[0..32];
-            after_offset = std.fmt.parseInt(u64, token[33..49], 16) catch return error.InvalidArtifactEnumerationContinuation;
-            if (after_offset != std.math.maxInt(u64) and (after_offset < journal_header.len or (after_offset - journal_header.len) % 64 != 0)) return error.InvalidArtifactEnumerationContinuation;
+            if (token.len == 99) {
+                if (token[65] != ':' or token[82] != ':') return error.InvalidArtifactEnumerationContinuation;
+                _ = std.fmt.hexToBytes(&decoded, token[33..65]) catch return error.InvalidArtifactEnumerationContinuation;
+                after_identity = decoded;
+                after_offset = std.fmt.parseInt(u64, token[66..82], 16) catch return error.InvalidArtifactEnumerationContinuation;
+                after_temporary = std.fmt.parseInt(u64, token[83..99], 16) catch return error.InvalidArtifactEnumerationContinuation;
+                if (after_offset != std.math.maxInt(u64) and (after_offset < journal_header.len or (after_offset - journal_header.len) % 64 != 0)) return error.InvalidArtifactEnumerationContinuation;
+                if (after_temporary != std.math.maxInt(u64) and (after_temporary < temporary_header.len or (after_temporary - temporary_header.len) % temporary_name_len != 0)) return error.InvalidArtifactEnumerationContinuation;
+            } else {
+                // Old tokens cannot prove an incarnation. Replay this one
+                // attempt once and replace the token with an identified one.
+                _ = std.fmt.parseInt(u64, token[33..49], 16) catch return error.InvalidArtifactEnumerationContinuation;
+            }
         }
         const maximum = visitor.max_entries orelse 256;
         if (maximum == 0 or maximum > 65536) return error.InvalidArtifactEnumerationLimit;
@@ -487,7 +641,12 @@ pub const FsStore = struct {
             if (scope.fencingToken() < visitor.fencing_floor or (visitor.fencing_cutoff != null and scope.fencingToken() >= visitor.fencing_cutoff.?)) continue;
             if (visitor.exclude_attempt) |excluded| if (std.mem.eql(u8, &excluded, &scope.attempt)) continue;
             if (visitor.only_attempt) |only| if (!std.mem.eql(u8, &only, &scope.attempt)) continue;
-            if (after_attempt) |after| if (std.mem.order(u8, entry.name, after) == .lt or (std.mem.eql(u8, entry.name, after) and after_offset == std.math.maxInt(u64))) continue;
+            if (after_attempt) |after| {
+                if (std.mem.order(u8, entry.name, after) == .lt) continue;
+                if (std.mem.eql(u8, entry.name, after) and after_offset == std.math.maxInt(u64)) {
+                    if (after_identity) |identity| if (try self.journalIdentityMatches(io, scope, identity, cancellation)) continue;
+                }
+            }
             const name: Candidate = entry.name[0..32].*;
             if (candidates.items.len == maximum + 1) {
                 if (std.mem.order(u8, &name, &candidates.peek().?) != .lt) continue;
@@ -499,30 +658,54 @@ pub const FsStore = struct {
         for (candidates.items[0..@min(maximum, candidates.items.len)]) |name| {
             var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
             _ = try std.fmt.hexToBytes(&scope.attempt, &name);
+            var identity: [16]u8 = undefined;
             {
                 const attempt = dir.openDir(io, &name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
                 };
                 defer attempt.close(io);
-                const journal = try self.uploadJournal(io, attempt, scope, null, cancellation);
+                const journal = self.uploadJournal(io, attempt, scope, null, cancellation) catch |err| switch (err) {
+                    error.ArtifactUploadAttemptRetired, error.FileNotFound => continue,
+                    else => return err,
+                };
                 defer journal.close(io);
-                var offset: u64 = if (after_attempt != null and std.mem.eql(u8, &name, after_attempt.?)) after_offset else journal_header.len;
-                const end = try journal.length(io);
-                if (offset > end) {
-                    // Retirement may have removed the advisory journal before
-                    // a crash left its empty payload directory discoverable.
-                    var entries = attempt.iterate();
-                    if (!visitor.reclaim_retired_inventory or end != journal_header.len or try entries.next(io) != null) return error.InvalidArtifactEnumerationContinuation;
-                    offset = end;
+                identity = journal.identity;
+                const same = after_attempt != null and std.mem.eql(u8, &name, after_attempt.?) and after_identity != null and std.mem.eql(u8, &identity, &after_identity.?);
+                var offset: u64 = if (same) after_offset else journal_header.len;
+                var temporary_offset: u64 = if (same) after_temporary else temporary_header.len;
+                const end = try journal.file.length(io);
+                const temporary_end = try journal.temporaries.length(io);
+                var temp_header: [temporary_header.len]u8 = undefined;
+                if (try journal.temporaries.readPositionalAll(io, &temp_header, 0) != temp_header.len or !std.mem.eql(u8, &temp_header, temporary_header)) return error.InvalidArtifactUploadInventory;
+                if (temporary_end < temporary_header.len or (temporary_end - temporary_header.len) % temporary_name_len != 0) return error.InvalidArtifactUploadInventory;
+                if (offset > end or temporary_offset > temporary_end) {
+                    offset = journal_header.len;
+                    temporary_offset = temporary_header.len;
                 }
+                if (visitor.cleanup_staging) while (temporary_offset < temporary_end) {
+                    try cancellation.check();
+                    if (visited == maximum) return error.ArtifactEnumerationPaused;
+                    var temporary: [temporary_name_len]u8 = undefined;
+                    if (try journal.temporaries.readPositionalAll(io, &temporary, temporary_offset) != temporary.len or !legacyTemporary(&temporary)) return error.InvalidArtifactUploadInventory;
+                    attempt.deleteFile(io, &temporary) catch |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    };
+                    if (@import("builtin").is_test) _ = self.temporary_records_read.fetchAdd(1, .monotonic);
+                    temporary_offset += temporary.len;
+                    visited += 1;
+                    const token = try self.journalToken(name, identity, offset, temporary_offset);
+                    defer self.alloc.free(token);
+                    try visitor.checkpoint.?(visitor.ptr, token);
+                };
                 while (offset < end) {
                     try cancellation.check();
                     if (visited == maximum) return error.ArtifactEnumerationPaused;
                     var suffix: [97]u8 = undefined;
                     @memcpy(suffix[0..32], &name);
                     suffix[32] = '/';
-                    if (try journal.readPositionalAll(io, suffix[33..97], offset) != 64) return error.InvalidArtifactUploadInventory;
+                    if (try journal.file.readPositionalAll(io, suffix[33..97], offset) != 64) return error.InvalidArtifactUploadInventory;
                     if (@import("builtin").is_test) _ = self.journal_records_read.fetchAdd(1, .monotonic);
                     try artifact_store.validateSha256Checksum(suffix[33..97]);
                     if (visitor.cleanup_staging) {
@@ -560,16 +743,20 @@ pub const FsStore = struct {
                     }
                     offset += 64;
                     visited += 1;
-                    const token = try std.fmt.allocPrint(self.alloc, "{s}:{x:0>16}", .{ name, offset });
+                    const token = try self.journalToken(name, identity, offset, temporary_offset);
                     defer self.alloc.free(token);
                     try visitor.checkpoint.?(visitor.ptr, token);
                 }
             }
-            if (visitor.reclaim_retired_inventory) try self.reclaimEmptyScopedAttempt(io, scope, cancellation);
+            if (visitor.reclaim_retired_inventory) {
+                if (!try self.reclaimEmptyScopedAttempt(io, scope, cancellation)) {
+                    if (visitor.retain_scope) |retain| try retain(visitor.ptr, scope);
+                }
+            }
             // Checkpoint completion only after retirement. If it is canceled,
             // retain the journal offset so the next turn retries this attempt.
             if (visitor.fencing_cutoff != null) {
-                const token = try std.fmt.allocPrint(self.alloc, "{s}:ffffffffffffffff", .{name});
+                const token = try self.journalToken(name, identity, std.math.maxInt(u64), std.math.maxInt(u64));
                 defer self.alloc.free(token);
                 try visitor.checkpoint.?(visitor.ptr, token);
             }
@@ -690,7 +877,9 @@ pub const FsStore = struct {
 
     // Only call after processing an entire attempt behind a fencing cutoff.
     // Non-empty attempts include held payloads and are always preserved.
-    fn reclaimEmptyScopedAttempt(self: *FsStore, io: std.Io, scope: artifact_store.UploadScope, cancellation: CancellationToken) !void {
+    fn reclaimEmptyScopedAttempt(self: *FsStore, io: std.Io, scope: artifact_store.UploadScope, cancellation: CancellationToken) !bool {
+        var guard = try self.journalGuard(io, scope, cancellation);
+        defer guard.deinit();
         try cancellation.check();
         const payload = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
         defer self.alloc.free(payload);
@@ -701,7 +890,25 @@ pub const FsStore = struct {
         if (directory) |dir| {
             defer dir.close(io);
             var entries = dir.iterate();
-            if (try entries.next(io) != null) return;
+            if (try entries.next(io)) |entry| {
+                if (legacyTemporary(entry.name)) {
+                    const inventory_path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+                    defer self.alloc.free(inventory_path);
+                    const metadata = try std.Io.Dir.cwd().openDir(io, inventory_path, .{});
+                    defer metadata.close(io);
+                    metadata.deleteFile(io, ".uploads-id-v1") catch |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    };
+                    metadata.deleteFile(io, ".temporaries-v1") catch |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    };
+                    try fs_paths.syncDirectoryHandlePortable(io, metadata);
+                    return error.ArtifactEnumerationPaused;
+                }
+                return false;
+            }
         }
         const inventory = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
         defer self.alloc.free(inventory);
@@ -728,7 +935,7 @@ pub const FsStore = struct {
                     else => return err,
                 };
             }
-            for ([_][]const u8{ ".uploads-building", ".uploads-lock", ".uploads-v1" }) |name| dir.deleteFile(io, name) catch |err| switch (err) {
+            for ([_][]const u8{ ".uploads-building", ".uploads-lock", ".uploads-v1", ".uploads-id-v1", ".uploads-id-building", ".temporaries-building", ".temporaries-v1" }) |name| dir.deleteFile(io, name) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
             };
@@ -742,10 +949,11 @@ pub const FsStore = struct {
         try self.durable_dirs.invalidate(self.alloc, io, payload);
         std.Io.Dir.cwd().deleteDir(io, payload) catch |err| switch (err) {
             error.FileNotFound => {},
-            error.DirNotEmpty => return,
+            error.DirNotEmpty => return false,
             else => return err,
         };
         try fs_paths.syncDirPortable(io, std.fs.path.dirname(payload).?);
+        return true;
     }
 
     fn reclaimRetiredScopedInventory(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
@@ -768,7 +976,7 @@ pub const FsStore = struct {
             _ = std.fmt.hexToBytes(&scope.attempt, entry.name) catch continue;
             scope.validate() catch continue;
             if (scope.fencingToken() < floor or scope.fencingToken() >= cutoff) continue;
-            try self.reclaimEmptyScopedAttempt(io, scope, cancellation);
+            _ = try self.reclaimEmptyScopedAttempt(io, scope, cancellation);
         }
     }
 
@@ -1577,7 +1785,7 @@ test "external lake filesystem journal reclamation preserves payloads and repair
         count: usize = 0,
         stop_after_record: bool = false,
         stopped: bool = false,
-        token: [49]u8 = undefined,
+        token: [99]u8 = undefined,
         fn visit(raw: *anyopaque, _: artifact_store.UploadScope, id: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.remove) try self.store.delete(id);
@@ -1702,4 +1910,102 @@ test "external lake filesystem concurrent scoped uploads preserve journal and du
     }
     try store.visitScopedUploads(scope.domain, .{ .ptr = &visitor, .visit = Visitor.visit }, .none);
     try std.testing.expectEqual(@as(u32, 32), visitor.seen.count());
+}
+
+test "external lake filesystem journal rejects retired and replaced directory handles" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "journal-retired-handles");
+    defer cleanupTmp(path);
+    var backend = try FsStore.init(a, std.mem.span(path));
+    defer backend.deinit();
+    var store = backend.artifactStore();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(41), 1, std.testing.io);
+    var value = try store.putScoped(scope, "old payload", .none);
+    defer value.deinit(a);
+    try store.delete(value.artifact_id);
+    const payload = try std.fs.path.join(a, &.{ backend.root_dir, "graph", &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+    defer a.free(payload);
+    const inventory = try std.fs.path.join(a, &.{ backend.inventory_root, &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+    defer a.free(inventory);
+    var threaded = threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const held = try std.Io.Dir.cwd().openDir(io, payload, .{ .iterate = true });
+    defer held.close(io);
+    try std.testing.expect(try backend.reclaimEmptyScopedAttempt(io, scope, .none));
+    try std.testing.expectError(error.ArtifactUploadAttemptRetired, backend.uploadJournal(io, held, scope, null, .none));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, inventory, .{}));
+    var fresh = try store.putScoped(scope, "new payload", .none);
+    defer fresh.deinit(a);
+    try std.testing.expectError(error.ArtifactUploadAttemptRetired, backend.uploadJournal(io, held, scope, null, .none));
+    const bytes = try store.getAlloc(fresh.artifact_id);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("new payload", bytes);
+}
+
+test "external lake filesystem journal guard aliases share cancellation and ownership" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "journal-guard-aliases");
+    defer cleanupTmp(path);
+    var first = try FsStore.init(a, std.mem.span(path));
+    defer first.deinit();
+    const alias = try std.fmt.allocPrint(a, "{s}/.", .{std.mem.span(path)});
+    defer a.free(alias);
+    var second = try FsStore.init(a, alias);
+    defer second.deinit();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(47), 1, std.testing.io);
+    var threaded = threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    var guard = try first.journalGuard(io, scope, .none);
+    var held = true;
+    defer if (held) guard.deinit();
+    const Stop = struct {
+        count: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.count += 1;
+            if (self.count > 3) return error.DeadlineExceeded;
+        }
+    };
+    var stop: Stop = .{};
+    try std.testing.expectError(error.DeadlineExceeded, second.journalGuard(io, scope, .{ .ptr = &stop, .check_fn = Stop.check }));
+    guard.deinit();
+    held = false;
+    var resumed = try second.journalGuard(io, scope, .none);
+    resumed.deinit();
+}
+
+test "external lake filesystem journal migrates unidentified legacy continuations conservatively" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "journal-legacy-cursor");
+    defer cleanupTmp(path);
+    var backend = try FsStore.init(a, std.mem.span(path));
+    defer backend.deinit();
+    var store = backend.artifactStore();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(53), 1, std.testing.io);
+    for ([_][]const u8{ "first", "second" }) |text| {
+        var value = try store.putScoped(scope, text, .none);
+        value.deinit(a);
+    }
+    const Visitor = struct {
+        store: *artifact_store.ArtifactStore,
+        count: usize = 0,
+        fn visit(raw: *anyopaque, _: artifact_store.UploadScope, id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.store.delete(id);
+            self.count += 1;
+        }
+        fn checkpoint(_: *anyopaque, token: []const u8) !void {
+            try std.testing.expectEqual(@as(usize, 99), token.len);
+        }
+    };
+    var visitor: Visitor = .{ .store = &store };
+    const legacy = try std.fmt.allocPrint(a, "{s}:ffffffffffffffff", .{std.fmt.bytesToHex(&scope.attempt, .lower)});
+    defer a.free(legacy);
+    try store.visitScopedUploads(scope.domain, .{ .ptr = &visitor, .visit = Visitor.visit, .checkpoint = Visitor.checkpoint, .continuation = legacy, .cleanup_staging = true, .reclaim_retired_inventory = true, .fencing_cutoff = 2, .max_entries = 8 }, .none);
+    try std.testing.expectEqual(@as(usize, 2), visitor.count);
 }

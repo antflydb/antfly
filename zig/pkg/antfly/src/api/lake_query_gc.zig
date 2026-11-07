@@ -27,6 +27,36 @@ const A = std.mem.Allocator;
 pub const horizon_ms = 2 * std.time.ms_per_day;
 pub const renew_ms = std.time.ms_per_hour;
 pub const Result = struct { more: bool = false, retained: bool = false, failed: bool = false, progressed: bool = false };
+const Revision = @import("objectstore").ObjectRevision;
+pub const CompletionProofs = struct {
+    const Proof = union(enum) { unknown, absent, revision: Revision };
+    allocator: A,
+    store: [32]u8 = @splat(0),
+    table: u64 = 0,
+    horizon: u64 = 0,
+    bound: bool = false,
+    slots: [5]Proof = @splat(.unknown),
+    pub fn init(a: A) CompletionProofs {
+        return .{ .allocator = a };
+    }
+    pub fn deinit(self: *CompletionProofs) void {
+        for (&self.slots) |*slot| {
+            if (slot.* == .revision) slot.revision.deinit(self.allocator);
+            slot.* = .unknown;
+        }
+        self.bound = false;
+    }
+    fn begin(self: *CompletionProofs, store: [32]u8, table: u64, horizon: u64) void {
+        self.deinit();
+        self.store = store;
+        self.table = table;
+        self.horizon = horizon;
+        self.bound = true;
+    }
+    fn matches(self: *const CompletionProofs, store: [32]u8, table: u64, horizon: u64) bool {
+        return self.bound and self.table == table and self.horizon == horizon and std.mem.eql(u8, &self.store, &store);
+    }
+};
 pub const Budget = struct {
     deletes: usize,
     reads: u64,
@@ -37,6 +67,17 @@ pub const Budget = struct {
     // Once the durable writer horizon has passed, absent empty categories
     // must stay absent so bounded checkpoint retirement can finish.
     retire_after_ms: u64 = 0,
+    // Turn-owned CAS proofs avoid fetching every completion marker twice.
+    proofs: ?*CompletionProofs = null,
+    proof_category: ?usize = null,
+    fn completion(self: *Budget, revision: ?Revision, retained: bool, completed_at: u64) !void {
+        if (!self.retiring() or retained or completed_at < self.retire_after_ms) return;
+        const proofs = self.proofs orelse return;
+        const category = self.proof_category orelse return;
+        const next: CompletionProofs.Proof = if (revision) |value| .{ .revision = try value.clone(proofs.allocator) } else .absent;
+        if (proofs.slots[category] == .revision) proofs.slots[category].revision.deinit(proofs.allocator);
+        proofs.slots[category] = next;
+    }
     fn retiring(self: *const Budget) bool {
         return self.retire_after_ms != 0;
     }
@@ -89,10 +130,14 @@ pub const AdmissionCache = struct {
 };
 pub fn collect(a: A, store: *Store, table: u64, phase: u8, now: u64, budget: *Budget) Result {
     var result: Result = .{};
+    if (budget.proofs) |proofs| proofs.begin(store.identity, table, budget.retire_after_ms);
+    const previous_category = budget.proof_category;
+    defer budget.proof_category = previous_category;
     // Rotate even after a poisoned category or an exhausted budget. The phase
     // is persisted with the metadata witness, so restart cannot starve a lane.
     for (0..5) |offset| {
         const category = (@as(usize, phase) + offset) % 5;
+        budget.proof_category = category;
         const page = (switch (category) {
             0...2 => collectScopes(a, store, table, scopeDomain(a, store, table, category) catch {
                 result.failed = true;
@@ -128,27 +173,25 @@ fn scopeDomain(a: A, store: *Store, table: u64, category: usize) ![32]u8 {
 /// Remove only completed, unretained checkpoints before consuming the store's
 /// durable ownership witness. A short budget resumes this idempotent cleanup
 /// next turn; a concurrently advanced checkpoint retains ownership instead.
-pub fn retireCompleted(a: A, store: *Store, table: u64, budget: *Budget) !void {
+pub fn retireCompleted(a: A, store: *Store, table: u64, proofs: *const CompletionProofs, budget: *Budget) !void {
+    if (!proofs.matches(store.identity, table, budget.retire_after_ms)) return error.QueryGcRetainedProgress;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
     var client = store.opened.client;
-    for (0..5) |category| {
+    for (proofs.slots, 0..) |proof, category| {
+        const revision = switch (proof) {
+            .unknown => return error.QueryGcRetainedProgress,
+            .absent => continue,
+            .revision => |value| value,
+        };
         const name = if (category < 3)
             try std.fmt.allocPrint(scratch, "scope-{s}", .{std.fmt.bytesToHex(&(try scopeDomain(scratch, store, table, category)), .lower)})
         else if (category == 3) "recent-search" else "row-enrichment";
         const key = try std.fmt.allocPrint(scratch, "{s}{s}expiring-gc/{d}/{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, name });
-        var previous = readObject(client, store.opened.bucket, key, 16384, budget) catch |err| switch (err) {
-            error.FileNotFound, error.NotFound, error.ObjectNotFound => continue,
-            else => return err,
-        };
-        defer previous.deinit(client.allocator);
-        const Completion = struct { retained: bool, resume_after_ms: ?u64 = null, completed_at_ms: ?u64 = null };
-        const progress = std.json.parseFromSliceLeaky(Completion, scratch, previous.body, .{ .ignore_unknown_fields = true }) catch return error.QueryGcRetainedProgress;
-        if (progress.retained or progress.resume_after_ms == null or (progress.completed_at_ms orelse 0) < budget.retire_after_ms) return error.QueryGcRetainedProgress;
         try budget.visit();
         try budget.remove();
-        client.compareAndDelete(store.opened.bucket, key, previous.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } }) catch |err| switch (err) {
+        client.compareAndDelete(store.opened.bucket, key, revision, .{ .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } }) catch |err| switch (err) {
             error.FileNotFound, error.NotFound, error.ObjectNotFound => {},
             error.PreconditionFailed => return error.QueryGcRetainedProgress,
             else => return err,
@@ -196,6 +239,10 @@ fn scanScopes(a: A, target: *artifacts.ArtifactStore, domain: [32]u8, previous: 
             self.suffix = suffix;
             self.result.progressed = true;
         }
+        fn retain(raw: *anyopaque, _: artifacts.UploadScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.result.retained = true;
+        }
         fn checkpoint(raw: *anyopaque, bytes: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.continuation = try self.a.dupe(u8, bytes);
@@ -210,6 +257,7 @@ fn scanScopes(a: A, target: *artifacts.ArtifactStore, domain: [32]u8, previous: 
         .checkpoint = Visitor.checkpoint,
         .cleanup_staging = true,
         .reclaim_retired_inventory = true,
+        .retain_scope = Visitor.retain,
         .continuation = previous.continuation,
         .after_suffix = previous.after_suffix,
         .fencing_cutoff = now -| 30_000,
@@ -242,7 +290,10 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
     var progress: ScopeProgress = if (previous) |value| std.json.parseFromSliceLeaky(ScopeProgress, scratch, value.body, .{ .ignore_unknown_fields = true }) catch .{} else .{};
     if (progress.version != 1 or (if (progress.after_suffix) |suffix| suffix.len != 97 else false)) progress = .{};
     if (progress.resume_after_ms) |retry_after| {
-        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.completed_at_ms orelse 0) >= budget.retire_after_ms)) return .{ .retained = progress.retained };
+        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.completed_at_ms orelse 0) >= budget.retire_after_ms)) {
+            try budget.completion(previous.?.metadata.writeRevision() orelse return error.MissingObjectRevision, progress.retained, progress.completed_at_ms orelse 0);
+            return .{ .retained = progress.retained };
+        }
         progress = .{};
     }
     var target = store.artifactStore();
@@ -254,7 +305,10 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
         // while this category is waiting for its next ordinary sweep.
         page.progress = .{ .retained = page.result.retained, .resume_after_ms = now +| budget.sweep_interval_ms, .completed_at_ms = now };
     }
-    if (budget.retiring() and previous == null and !page.result.more and !page.result.progressed and !page.result.retained) return page.result;
+    if (budget.retiring() and previous == null and !page.result.more and !page.result.progressed and !page.result.retained) {
+        try budget.completion(null, false, now);
+        return page.result;
+    }
     if (!page.result.more or page.result.progressed) {
         const bytes = try std.json.Stringify.valueAlloc(scratch, page.progress, .{ .emit_null_optional_fields = false });
         if (bytes.len > 16384) return error.InvalidArtifactEnumerationContinuation;
@@ -262,7 +316,8 @@ fn collectScopes(a: A, store: *Store, table: u64, domain: [32]u8, now: u64, budg
             error.PreconditionFailed, error.ObjectAlreadyExists => return .{ .more = true, .retained = true },
             else => return err,
         };
-        written.deinit(client.allocator);
+        defer written.deinit(client.allocator);
+        if (!page.result.more) try budget.completion(written.writeRevision() orelse return error.MissingObjectRevision, page.result.retained, now);
     }
     return page.result;
 }
@@ -308,7 +363,10 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
     var progress: Progress = if (previous) |v| std.json.parseFromSliceLeaky(Progress, scratch, v.body, .{ .ignore_unknown_fields = true }) catch .{} else .{};
     if (progress.version != 2 or (progress.cursor != null and progress.after_key != null) or (if (progress.after_key) |key| !std.mem.startsWith(u8, key, prefix) or key.len > 4096 else false)) progress = .{};
     if (progress.resume_after_ms) |retry_after| {
-        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.completed_at_ms orelse 0) >= budget.retire_after_ms)) return .{ .retained = progress.retained };
+        if (retry_after > now and retry_after <= now +| budget.sweep_interval_ms and (!budget.retiring() or (progress.completed_at_ms orelse 0) >= budget.retire_after_ms)) {
+            try budget.completion(previous.?.metadata.writeRevision() orelse return error.MissingObjectRevision, progress.retained, progress.completed_at_ms orelse 0);
+            return .{ .retained = progress.retained };
+        }
         progress = .{};
     }
     var page = try client.listObjects(store.opened.bucket, .{ .prefix = prefix, .max_keys = 128, .continuation_token = progress.cursor, .start_after = progress.after_key, .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } });
@@ -340,17 +398,24 @@ pub fn collectRecords(a: A, store: *Store, table: u64, kind: []const u8, now: u6
     result.progressed = processed != 0;
     result.more = processed != page.entries.len or page.next_continuation_token != null;
     const saved: Progress = .{ .cursor = if (processed == page.entries.len) page.next_continuation_token else null, .after_key = if (processed == page.entries.len) null else last, .retained = result.retained, .resume_after_ms = if (result.more) null else now +| budget.sweep_interval_ms, .completed_at_ms = if (result.more) null else now };
-    if (budget.retiring() and previous == null and page.entries.len == 0) return result;
+    if (budget.retiring() and previous == null and page.entries.len == 0) {
+        try budget.completion(null, false, now);
+        return result;
+    }
     const bytes = try std.json.Stringify.valueAlloc(a, saved, .{ .emit_null_optional_fields = false });
     defer a.free(bytes);
-    if (previous) |v| if (std.mem.eql(u8, bytes, v.body)) return result;
+    if (previous) |v| if (std.mem.eql(u8, bytes, v.body)) {
+        if (!result.more) try budget.completion(v.metadata.writeRevision() orelse return error.MissingObjectRevision, result.retained, now);
+        return result;
+    };
     // This bounded progress write is part of the same deadline. A failed CAS
     // simply replays idempotent discovery on the next pass.
     var written = client.compareAndPut(store.opened.bucket, checkpoint, bytes, if (previous) |v| v.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = .{ .ptr = budget, .is_cancelled_fn = Budget.canceled } }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => return .{ .more = true, .retained = true },
         else => return err,
     };
-    written.deinit(client.allocator);
+    defer written.deinit(client.allocator);
+    if (!result.more) try budget.completion(written.writeRevision() orelse return error.MissingObjectRevision, result.retained, now);
     return result;
 }
 fn record(client: anytype, bucket: []const u8, key: []const u8, now: u64, budget: *Budget) !void {
@@ -607,12 +672,14 @@ test "external lake query cleanup completed categories rest durably while neighb
     try std.testing.expectEqual(@as(usize, 50), deleted);
     var retired = false;
     for (0..6) |_| {
+        var proofs = CompletionProofs.init(a);
+        defer proofs.deinit();
         var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
         defer store.deinit();
-        var budget: Budget = .{ .deletes = 1, .reads = 16384, .work = 1, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 1234, .retire_after_ms = 200000 };
+        var budget: Budget = .{ .deletes = 1, .reads = 512, .work = 1, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .sweep_interval_ms = 1234, .retire_after_ms = 200000, .proofs = &proofs };
         const result = collect(a, &store, 7, 0, 231001, &budget);
         try std.testing.expect(!result.more and !result.retained and !result.failed);
-        retireCompleted(a, &store, 7, &budget) catch |err| {
+        retireCompleted(a, &store, 7, &proofs, &budget) catch |err| {
             if (err != error.QueryGcBudgetExhausted) return err;
             continue;
         };
@@ -651,4 +718,149 @@ test "external lake query cleanup release requires a sweep after the writer hori
     const result = try collectScopes(a, &store, 7, domain, 150001, &budget);
     try std.testing.expect(result.progressed and !result.more and !result.retained and !result.failed);
     try std.testing.expectError(error.FileNotFound, target.getAlloc(value.artifact_id));
+}
+
+test "external lake query cleanup replacement journals restart both short and long continuations" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 1, 20 }) |count| {
+        var directory = try local.common_test_directory.TestDirectory.init("query-recreated-journal");
+        defer directory.cleanup();
+        var config = try local.common_config.Config.parseFromSlice(a, "{}");
+        defer config.deinit();
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        const domain = try scopeDomain(a, &store, 7, 0);
+        const scope = try artifacts.UploadScope.forPublication(domain, 1, std.testing.io);
+        var target = store.artifactStore();
+        var last: ?[]u8 = null;
+        defer if (last) |id| a.free(id);
+        for (0..20) |i| {
+            var text: [32]u8 = undefined;
+            var value = try target.putScoped(scope, try std.fmt.bufPrint(&text, "old-{d}", .{i}), .none);
+            defer value.deinit(a);
+            if (i == 19) last = try a.dupe(u8, value.artifact_id);
+        }
+        for (0..19) |_| {
+            var budget: Budget = .{ .deletes = 1, .reads = 16384, .work = 1, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+            _ = try collectScopes(a, &store, 7, domain, 100000, &budget);
+        }
+        try target.delete(last.?);
+        const inventory = &store.implementation.local_inventory.?;
+        const metadata_path = try std.fs.path.join(a, &.{ inventory.inventory_root, &std.fmt.bytesToHex(&domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+        defer a.free(metadata_path);
+        // Interrupted retirement, followed by orphan re-registration. Old
+        // offsets may exceed the replacement or fit inside unrelated records.
+        try std.Io.Dir.cwd().deleteTree(std.testing.io, metadata_path);
+        try inventory.durable_dirs.invalidate(a, std.testing.io, metadata_path);
+        var ids: std.ArrayList([]u8) = .empty;
+        defer {
+            for (ids.items) |id| a.free(id);
+            ids.deinit(a);
+        }
+        var pending: ?[]u8 = null;
+        defer if (pending) |path| a.free(path);
+        for (0..@max(1, count)) |i| {
+            var text: [32]u8 = undefined;
+            var value = try target.putScoped(scope, try std.fmt.bufPrint(&text, "new-{d}", .{i}), .none);
+            defer value.deinit(a);
+            try ids.append(a, try a.dupe(u8, value.artifact_id));
+            if (count == 0) {
+                const suffix = try artifacts.storageSuffixAlloc(a, value.artifact_id);
+                defer a.free(suffix);
+                pending = try std.fmt.allocPrint(a, "{s}/{s}.pending-v2", .{ inventory.root_dir, suffix });
+                try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = pending.?, .data = "interrupted new upload" });
+                try target.delete(value.artifact_id);
+                try std.Io.Dir.cwd().deleteTree(std.testing.io, metadata_path);
+                try inventory.durable_dirs.invalidate(a, std.testing.io, metadata_path);
+            }
+        }
+        var budget: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+        const result = try collectScopes(a, &store, 7, domain, 100000, &budget);
+        try std.testing.expect(!result.more and !result.retained and !result.failed);
+        for (ids.items) |id| try std.testing.expectError(error.FileNotFound, target.getAlloc(id));
+        if (pending) |path| try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, metadata_path, .{}));
+    }
+}
+
+test "external lake query cleanup legacy temporary inventories resume linearly after restart" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("query-legacy-temporaries");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    const domain: [32]u8 = @splat(43);
+    {
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        var target = store.artifactStore();
+        const scope = try artifacts.UploadScope.forPublication(domain, 1, std.testing.io);
+        var value = try target.putScoped(scope, "legacy staging", .none);
+        defer value.deinit(a);
+        const suffix = try artifacts.storageSuffixAlloc(a, value.artifact_id);
+        defer a.free(suffix);
+        for (0..129) |i| {
+            const pending = try std.fmt.allocPrint(a, "{s}/{s}.tmp-{x:0>32}", .{ store.implementation.local_inventory.?.root_dir, suffix, i });
+            defer a.free(pending);
+            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = pending, .data = "interrupted upload" });
+        }
+        try target.delete(value.artifact_id);
+    }
+    var reads: usize = 0;
+    var complete = false;
+    for (0..135) |_| {
+        var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+        defer store.deinit();
+        var budget: Budget = .{ .deletes = 1, .reads = 16384, .work = 1, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = 90000 };
+        const result = try collectScopes(a, &store, 7, domain, 100000, &budget);
+        reads += store.implementation.local_inventory.?.temporary_records_read.load(.monotonic);
+        if (!result.more) {
+            try std.testing.expect(!result.retained and !result.failed);
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqual(@as(usize, 129), reads);
+    var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    var budget: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+    _ = try collectScopes(a, &store, 7, domain, 131000, &budget);
+    try std.testing.expectEqual(@as(usize, 0), store.implementation.local_inventory.?.temporary_records_read.load(.monotonic));
+}
+
+test "external lake query cleanup retirement reuses read proofs and fences concurrent changes" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("query-retirement-proofs");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{}");
+    defer config.deinit();
+    var store = try Store.openNative(a, &config, null, false, .standalone, directory.path());
+    defer store.deinit();
+    const now = clock.realtimeNs() / std.time.ns_per_ms;
+    var seed: Budget = .{ .deletes = 128, .reads = 16384, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s };
+    _ = collect(a, &store, 7, 0, now, &seed);
+    var proofs = CompletionProofs.init(a);
+    defer proofs.deinit();
+    var budget: Budget = .{ .deletes = 128, .reads = 512, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = now - 1, .proofs = &proofs };
+    const result = collect(a, &store, 7, 0, now + 1, &budget);
+    try std.testing.expect(!result.more and !result.retained and !result.failed);
+    const key = try std.fmt.allocPrint(a, "{s}{s}expiring-gc/7/scope-{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", std.fmt.bytesToHex(&(try scopeDomain(a, &store, 7, 0)), .lower) });
+    defer a.free(key);
+    var client = store.opened.client;
+    var changed = try client.putObject(store.opened.bucket, key, "{\"version\":1,\"retained\":true}", .{});
+    changed.deinit(client.allocator);
+    try std.testing.expectError(error.QueryGcRetainedProgress, retireCompleted(a, &store, 7, &proofs, &budget));
+    // A complete sweep after the retained completion's rest interval clears
+    // its evidence. Retirement then uses the newly collected CAS revisions.
+    var refresh: Budget = .{ .deletes = 128, .reads = 512, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = now - 1, .proofs = &proofs };
+    const held = collect(a, &store, 7, 0, now + 1, &refresh);
+    try std.testing.expect(held.retained and !held.more and !held.failed);
+    var next: Budget = .{ .deletes = 128, .reads = 512, .work = 128, .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_s, .retire_after_ms = now - 1, .proofs = &proofs };
+    const final = collect(a, &store, 7, 0, now + 30002, &next);
+    try std.testing.expect(!final.more and !final.retained and !final.failed);
+    const before = next.reads;
+    try retireCompleted(a, &store, 7, &proofs, &next);
+    try std.testing.expectEqual(before, next.reads);
+    try std.testing.expectEqual(@as(usize, 123), next.deletes);
 }

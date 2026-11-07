@@ -6779,6 +6779,9 @@ pub const ApiHttpServer = struct {
         var store = try @import("lake_index_store.zig").Store.openRetainedNative(a, config, self.cfg.secret_store, binding.locator, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
         var budget = self.queryGcBudget(request);
+        var completion_proofs = @import("lake_query_gc.zig").CompletionProofs.init(a);
+        defer completion_proofs.deinit();
+        budget.proofs = &completion_proofs;
         if (!config.lake_indexes.artifact_gc.dry_run and !(if (self.cfg.lake_artifact_gc_options) |v| v.dry_run else false)) {
             const now = platform_time.realtimeNs() / std.time.ns_per_ms;
             // Admit legacy stores before the first sweep, including ones with
@@ -6801,7 +6804,7 @@ pub const ApiHttpServer = struct {
             self.observeLakeQueryCollection(page_result);
             if (binding.query_until_ms != 0) {
                 var release = now > binding.query_until_ms and !page_result.more and !page_result.retained and !page_result.failed;
-                if (release) @import("lake_query_gc.zig").retireCompleted(a, &store, item.table_id, &budget) catch |err| {
+                if (release) @import("lake_query_gc.zig").retireCompleted(a, &store, item.table_id, &completion_proofs, &budget) catch |err| {
                     release = false;
                     if (err != error.QueryGcBudgetExhausted and err != error.DeadlineExceeded and err != error.Canceled and err != error.Cancelled)
                         std.log.warn("query cleanup checkpoint retirement deferred table_id={d} err={s}", .{ item.table_id, @errorName(err) });

@@ -117,6 +117,8 @@ pub const ScopedUploadVisitor = struct {
     /// Reclaim an empty local attempt and its advisory journal after the
     /// complete fenced attempt has been visited. Remote providers ignore this.
     reclaim_retired_inventory: bool = false,
+    /// Report a non-empty attempt whose remaining files still need discovery.
+    retain_scope: ?*const fn (*anyopaque, UploadScope) anyerror!void = null,
     checkpoint: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     after_suffix: ?[]const u8 = null,
     fencing_floor: u64 = 0,
