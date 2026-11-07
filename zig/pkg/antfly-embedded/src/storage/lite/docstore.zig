@@ -3011,6 +3011,22 @@ pub const Store = struct {
         // Join before taking its mutex: maintenance can need that mutex while
         // canceling capture/copy or finishing an atomic publication boundary.
         prepared.stopMaintenance();
+        // `stopMaintenance` above only stops *future* background reclaim
+        // passes; it does not force a sync of whatever the *last* one
+        // already applied non-durably (`prepared.file.durable_header`).
+        // Callers finish populating `prepared` with ordinary writes (some
+        // durable, clearing it; others plain `commitTransactionWithDurability`
+        // ride-along reclaim with `hooks = null`, setting it again) up until
+        // the moment they call this -- there is no guarantee the very last
+        // commit observed on `prepared.file` was a durable one. Below,
+        // `preparePrivatePublication` -> `bindPrivateEpochNamespace` refuses
+        // outright if `prepared.file.durable_header != null`
+        // (`error.InvalidTransactionState`), so finish the job here instead
+        // of relying on luck in the interleaving between `prepared`'s own
+        // foreground writes and its background reclaim loop. Must run before
+        // `lockStore(prepared)` below: `syncIndexContents` takes that same
+        // mutex itself.
+        if (!prepared.read_only) try prepared.syncIndexContents();
         try self.reserveWriterSlot();
         defer self.releaseWriterSlot();
 
