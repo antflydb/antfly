@@ -15,13 +15,62 @@
 
 import contextlib
 import tempfile
+import queue
+import threading
+import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import lite_sqlite_comparison as bench
 
 
 class MatchedDurabilityTests(unittest.TestCase):
+    def test_worker_retains_acknowledgements_before_a_later_visibility_failure(self):
+        class Database:
+            calls = 0
+            closed = False
+
+            def batch_json(self, request):
+                self.calls += 1
+                if self.calls == 3:
+                    raise RuntimeError("committed visibility pending")
+
+            def close(self):
+                self.closed = True
+
+        db = Database()
+        sdk = SimpleNamespace(
+            open=lambda *args, **kwargs: db, BusyError=BlockingIOError
+        )
+        start = threading.Event()
+        start.set()
+        ready, results = queue.Queue(), queue.Queue()
+        stop = threading.Event()
+        with patch.object(bench, "sdk", return_value=sdk):
+            bench.worker_main(
+                {
+                    "engine": "antfly",
+                    "path": "unused",
+                    "library": "unused",
+                    "indexed": True,
+                    "seconds": 10,
+                },
+                0,
+                ready,
+                start,
+                SimpleNamespace(value=time.monotonic()),
+                stop,
+                results,
+            )
+        result = results.get_nowait()
+        self.assertEqual(result["successful_calls"], 2)
+        self.assertEqual(len(result["latencies_ns"]), 2)
+        self.assertIn("committed visibility pending", result["error"])
+        self.assertTrue(stop.is_set())
+        self.assertTrue(db.closed)
+
     def test_sqlite_document_and_index_rollback_together_and_verify_overwrites(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sqlite.db"

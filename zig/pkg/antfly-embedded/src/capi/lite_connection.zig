@@ -2063,6 +2063,24 @@ pub const Owner = struct {
         self.wake.set(h.handleLockIo());
     }
 
+    /// Called without request admission. A workerless owner uses the same
+    /// bounded service operation, rather than replaying under a caller's lease.
+    pub fn requestVisibilityProgress(self: *Owner, table_id: u64, incarnation: u128) !void {
+        if (self.stopping.load(.acquire)) return error.Canceled;
+        self.runnable_sources.notify(h.handleLockIo(), .{ .table_id = table_id, .incarnation = incarnation });
+        if (self.worker == null) {
+            _ = self.maintenanceTurn() catch |err| {
+                self.gate.mutex.lockUncancelable(h.handleLockIo());
+                self.noteMaintenanceFailure(err, table_id, .capture);
+                self.gate.mutex.unlock(h.handleLockIo());
+                switch (err) {
+                    error.FileBusy, error.WouldBlock, error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged, error.SourceFileChanged, error.TextMergeProducerDeferred => return,
+                    else => return err,
+                }
+            };
+        } else self.wake.set(h.handleLockIo());
+    }
+
     /// Shared and plain fallback leases have no queue acquisition timestamp.
     /// Every telemetry attachment, including initial open, establishes one.
     fn attachPathLeaseStats(self: *Owner, lease: *native.PathWriterLock) void {
@@ -2161,7 +2179,9 @@ pub const Owner = struct {
         defer if (schema) |*view| view.release();
         if (schema) |view| if (view.storageMode() == .relational) return null;
         const indexes = database.core.index_manager;
-        if (indexes.text_indexes.items.len == 0) return null;
+        // With no consumers, a new primary tip is already covered. Keep the
+        // same catalog/control/audit fences rather than constructing a source
+        // runtime merely to discover there is nothing to replay.
         for (indexes.text_indexes.items) |*entry| if (!entry.persistent.hasNativeMetadata()) return null;
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
         const metadata = file.activeCheckpoint().logical.metadata;
@@ -4579,6 +4599,8 @@ pub const Owner = struct {
         if (!qualificationMetricsEnabled()) return;
         self.updatePathLeaseStatistics();
         const p = &self.publication_stats;
+        const namespaces = self.reader_coordinator.epochNamespaceStats();
+        std.log.info("antfly_bench_native_epoch_namespaces opens={d} validations={d}", .{ namespaces.opens, namespaces.validations });
         // Numeric/enum diagnostics only: no path, SQL, model or document data.
         // Preparation overlaps actor service; durations are not additive.
         std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_scope_extensions={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_scope_extensions, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
@@ -9568,11 +9590,15 @@ test "capi native maintenance namespaces service new unindexed source generation
     try std.testing.expect(!owner.current.?.db.core.hasManagedIndexes());
     try std.testing.expect(target != schedule.serviced_sequence);
     const before = owner.publication_stats.maintenance_database_turns;
+    const observations = owner.publication_stats.covered_source_observations;
     for (0..16) |_| {
         _ = try owner.maintenanceTurnForTest();
-        if (owner.publication_stats.maintenance_database_turns != before) break;
+        if (owner.maintenance_schedules.getPtr(key).?.serviced_sequence == target) break;
     }
-    try std.testing.expectEqual(before + 1, owner.publication_stats.maintenance_database_turns);
+    // An unchanged consumerless layout certifies the new tip without a
+    // detached source turn; physical retirement still has to make progress.
+    try std.testing.expectEqual(before, owner.publication_stats.maintenance_database_turns);
+    try std.testing.expect(owner.publication_stats.covered_source_observations > observations);
     try std.testing.expectEqual(target, owner.maintenance_schedules.getPtr(key).?.serviced_sequence);
     const source_turns = owner.publication_stats.maintenance_source_turns;
     // Source progress schedules a bounded physical-retirement continuation;
@@ -11732,4 +11758,121 @@ test "capi native maintenance keeps page failures distinct from cooperative yiel
     owner.noteMaintenanceFailure(error.EnrichmentSourceChanged, 0, .artifacts);
     try std.testing.expectEqual(before + 2, owner.publication_stats.maintenance_page_errors);
     try std.testing.expectEqualStrings("EnrichmentSourceChanged", owner.publication_stats.last_maintenance_failure.?);
+}
+
+test "capi native batch visibility releases publisher admission and never repeats a committed transform" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("batch-visibility-handoff", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"counter\":{\"text\":\"counter token\",\"count\":0}},\"sync_level\":\"write\"}"), &out));
+    api.antfly_buffer_free_zero(&out);
+    // One segment of foreground capacity deliberately routes later records to
+    // owner replay. The fixture has no worker, so no progress is possible until
+    // the request releases admission and explicitly services the owner.
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try fixture.connection.owner.refresh();
+        root.db.core.index_manager.text_merge_segment_limit.store(1, .release);
+    }
+    const Probe = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        id: *anyopaque,
+        owner: *Owner,
+        admission_released: bool = false,
+        code: h.capi.ErrorCode = .internal,
+        fn waiting(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.admission_released = self.owner.gate.mutex.tryLock();
+            if (self.admission_released) self.owner.gate.mutex.unlock(h.handleLockIo());
+            self.entered.set(h.handleLockIo());
+            self.release.waitUncancelable(h.handleLockIo());
+        }
+        fn run(self: *@This()) void {
+            var result: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&result);
+            self.code = api.antfly_db_batch_json(self.id, .fromSlice("{\"transforms\":[{\"key\":\"counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"full_index\"}"), &result);
+            if (self.code != .ok) std.debug.print("visibility handoff: {s}\n", .{std.mem.span(h.capi.lastErrorDetail())});
+        }
+    };
+    var probe: Probe = .{ .id = fixture.id, .owner = fixture.connection.owner };
+    api.test_before_batch_visibility_wait = .{ .ptr = &probe, .run = Probe.waiting };
+    defer api.test_before_batch_visibility_wait = null;
+    const thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Probe.run, .{&probe});
+    var joined = false;
+    defer {
+        probe.release.set(h.handleLockIo());
+        if (!joined) thread.join();
+    }
+    try probe.entered.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    try std.testing.expect(probe.admission_released);
+    // Another logical writer can publish before the first caller's visibility
+    // completes; it must not be trapped behind the queue leader or path lease.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"peer\":{\"text\":\"peer token\"}},\"sync_level\":\"write\"}"), &out));
+    api.antfly_buffer_free_zero(&out);
+    probe.release.set(h.handleLockIo());
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, probe.code);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_lookup_json(fixture.id, .fromSlice("counter"), &out));
+    const value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.ptr.?[0..out.len], .{});
+    defer value.deinit();
+    try std.testing.expectEqual(@as(i64, 1), value.value.object.get("count").?.integer);
+    try std.testing.expect((try fixture.connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
+test "capi native consumerless source observes new tips without replaying empty work" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("consumerless-source", 5000, .batch);
+    defer fixture.deinit();
+    const owner = fixture.connection.owner;
+    try std.testing.expectEqual(@as(usize, 0), owner.current.?.db.core.index_manager.text_indexes.items.len);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const key: Owner.MaintenanceKey = .{ .table_id = owner.current.?.db.core.identity_namespace.table_id, .incarnation = owner.current.?.db.root_incarnation };
+    var warmed = false;
+    for (0..64) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        if (owner.maintenance_schedules.getPtr(key)) |schedule| {
+            if (schedule.covered_text_controls != null and !schedule.database_pending and !schedule.startup_replay_pending and !owner.maintenance_storage_pending) {
+                warmed = true;
+                break;
+            }
+        }
+    }
+    if (!warmed) return error.TestConsumerlessWarmupMissing;
+    const far_future = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds + std.time.ns_per_hour;
+    owner.maintenance_schedules.getPtr(key).?.next_database_audit_ns = far_future;
+    const source_turns = owner.publication_stats.maintenance_source_turns;
+    const runtime_opens = owner.test_runtime_snapshot_opens;
+    const observations = owner.publication_stats.covered_source_observations;
+    for (0..16) |i| {
+        var bytes: [192]u8 = undefined;
+        const request = try std.fmt.bufPrint(&bytes, "{{\"inserts\":{{\"doc-{d}\":{{\"n\":{d}}}}},\"sync_level\":\"write\"}}", .{ i, i });
+        var output: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&output);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice(request), &output));
+        for (0..8) |_| {
+            _ = try owner.maintenanceTurnForTest();
+            if (owner.maintenance_schedules.getPtr(key).?.serviced_sequence == owner.current.?.db.core.nextDerivedSequence()) break;
+        }
+    }
+    try std.testing.expectEqual(source_turns, owner.publication_stats.maintenance_source_turns);
+    try std.testing.expectEqual(runtime_opens, owner.test_runtime_snapshot_opens);
+    try std.testing.expect(owner.publication_stats.covered_source_observations > observations);
+    // Catalog changes revoke the fast witness even without a source append.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    var changed: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&changed);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"new-index-source\":{\"text\":\"catalog change needs service\"}},\"sync_level\":\"write\"}"), &changed));
+    for (0..32) |_| {
+        _ = try owner.maintenanceTurnForTest();
+        if (owner.publication_stats.maintenance_source_turns > source_turns) break;
+    }
+    try std.testing.expect(owner.publication_stats.maintenance_source_turns > source_turns);
+    try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.file.check()).valid);
 }

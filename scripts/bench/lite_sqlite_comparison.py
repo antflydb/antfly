@@ -132,6 +132,7 @@ END;
 
 def worker_main(config, worker, ready, start, begin, stop, results):
     db = None
+    sequence = 0
     result = {
         "worker": worker,
         "successful_calls": 0,
@@ -168,7 +169,6 @@ def worker_main(config, worker, ready, start, begin, stop, results):
             time.sleep(0.001)
         result["started"] = time.monotonic()
         deadline = begin.value + config["seconds"]
-        sequence = 0
         while not stop.is_set() and time.monotonic() < deadline:
             document_key = key(worker, sequence)
             value = payload(worker, sequence)
@@ -203,6 +203,9 @@ def worker_main(config, worker, ready, start, begin, stop, results):
         stop.set()
         ready.put({"worker": worker, "ready": False})
     finally:
+        # Preserve acknowledged progress when a later operation fails. The
+        # failed operation itself is never counted as an acknowledged write.
+        result["successful_calls"] = sequence
         closing = time.monotonic()
         if db is not None:
             try:

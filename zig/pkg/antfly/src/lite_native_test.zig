@@ -28,6 +28,8 @@ test {
     _ = @import("antfly_local_sources").storage_doc_ordinal_binding;
     _ = @import("antfly_local_sources").storage_lite_namespace_store;
     _ = @import("antfly_local_sources").storage_lite_native;
+    _ = @import("antfly_local_sources").storage_lite_reader_epochs;
+    _ = @import("antfly_local_sources").storage_lite_reader_coordinator;
     _ = @import("antfly_local_sources").storage_lite_benchmark;
     _ = @import("antfly_local_sources").storage_lite_snapshot_test;
     _ = @import("antfly_local_sources").storage_lite_secret_store;

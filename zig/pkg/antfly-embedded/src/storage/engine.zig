@@ -388,6 +388,7 @@ pub const VTable = struct {
     rollDenseAutoBulkIngestSessionWithOptions: *const fn (self: *DB, options: @import("backend_types.zig").BulkIngestFinishOptions) Outcome(void),
     admitManagedIndex: *const fn (self: *DB, cfg: types.IndexConfig) Outcome(?u128),
     waitForSyncLevelWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: @import("db/execution_resources.zig").ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) Outcome(void),
+    pollBatchVisibilityCompletion: *const fn (self: *DB, completion: *const @import("db/execution_resources.zig").BatchVisibilityCompletion, cursor: *@import("db/execution_resources.zig").BatchVisibilityCursor) Outcome(bool),
     waitForResolvedTransactionSyncWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) Outcome(void),
     waitForResolvedTransactionSyncTargetWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) Outcome(void),
     enrichmentStart: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) Outcome(void),

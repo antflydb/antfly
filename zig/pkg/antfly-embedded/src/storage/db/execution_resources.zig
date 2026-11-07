@@ -1050,9 +1050,23 @@ pub const BatchVisibilityCompletion = struct {
     sync_level: types.SyncLevel = .write,
     targets: ManagedSyncTargets = .{},
     enrichment_fully_precomputed: bool = false,
+    graph_cleanup_required: bool = false,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.targets.deinit(alloc);
+    }
+};
+
+/// Per-waiter progress. Immutable completion inputs can be shared by a cohort,
+/// but accepted producer/graph cuts must never be chased anew on every probe.
+pub const BatchVisibilityCursor = struct {
+    publication_cut: ?u64 = null,
+    leann_targets: ?[]index_manager_mod.IndexManager.LeannCoverageTarget = null,
+    leann_allocator: ?Allocator = null,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.leann_targets) |targets| index_manager_mod.IndexManager.freeLeannCoverageTargets(self.leann_allocator.?, targets);
+        self.* = .{};
     }
 };
 

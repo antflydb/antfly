@@ -7315,6 +7315,13 @@ pub const DB = struct {
             opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
             opts.native_initial_child_entry != null or opts.restore_staging != null or
             req.restore_staging_scope != null or req.restore_staging != null) return;
+        if (opts.visibility_completion) |completion| if (completion.sequence != null) {
+            // Native publication hands all post-commit work to its owner. The
+            // outer observer must include endpoint cleanup and its replay cut,
+            // even if a resident worker finishes the jobs before its first probe.
+            completion.graph_cleanup_required = req.sync_level == .full_index;
+            return;
+        };
         // Weak sync levels pay for at most one bounded maintenance page.
         // Durable jobs continue through the resident scheduler; full_index
         // and explicit maintenance retain complete cleanup guarantees.
@@ -7609,6 +7616,10 @@ pub const DB = struct {
     }
 
     pub fn batchTrackedWithPreparedDocuments(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
+        return self.batchTrackedWithPreparedDocumentsAndVisibility(req, primary_committed, marker, prepared, null);
+    }
+
+    pub fn batchTrackedWithPreparedDocumentsAndVisibility(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan, completion: ?*execution_resources.BatchVisibilityCompletion) anyerror!void {
         primary_committed.* = false;
         var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
         var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
@@ -7621,7 +7632,7 @@ pub const DB = struct {
         const previous = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = previous;
-        self.batchTrackedProfiled(req, primary_committed, marker_write, prepared) catch |err| {
+        self.batchTrackedProfiled(req, primary_committed, marker_write, prepared, completion) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
                 std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
                 return error.OutcomeUnknown;
@@ -7642,6 +7653,10 @@ pub const DB = struct {
     /// origin's thread. In particular, it must resolve all calls sharing a
     /// writer against that writer's final marker in this atomic publication.
     pub fn batchTrackedWithPreparedCohort(self: *DB, cohort: *const @import("publication_cohort.zig").Group, primary_committed: *bool, markers: []const apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
+        return self.batchTrackedWithPreparedCohortAndVisibility(cohort, primary_committed, markers, prepared, null);
+    }
+
+    pub fn batchTrackedWithPreparedCohortAndVisibility(self: *DB, cohort: *const @import("publication_cohort.zig").Group, primary_committed: *bool, markers: []const apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan, completion: ?*execution_resources.BatchVisibilityCompletion) anyerror!void {
         primary_committed.* = false;
         if (cohort.requests.len == 0 or cohort.requests.len > @import("publication_cohort.zig").maximum_requests) return error.InvalidBatchRequest;
         if (markers.len != 0 and markers.len != cohort.requests.len) return error.InvalidBatchRequest;
@@ -7673,14 +7688,15 @@ pub const DB = struct {
             .prepared_documents = prepared,
             .publication_cohort = cohort,
             .cohort_outcome_marker_writes = writes[0..count],
+            .visibility_completion = completion,
         }) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) return error.OutcomeUnknown;
             return err;
         };
     }
 
-    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
-        const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write, .prepared_documents = prepared };
+    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair, prepared: ?*@import("prepared_document_batch.zig").Plan, completion: ?*execution_resources.BatchVisibilityCompletion) anyerror!void {
+        const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write, .prepared_documents = prepared, .visibility_completion = completion };
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
             try self.batchInternal(req, &profile, opts);
@@ -37401,6 +37417,68 @@ pub const DB = struct {
         return self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait, null);
     }
 
+    /// Observation only. Native request callers release writer admission before
+    /// waiting again; the background publisher owns provider/replay/merge work.
+    /// The caller retains the accepted grouped publication cut across refreshes.
+    pub fn pollBatchVisibilityCompletion(self: *DB, completion: *const execution_resources.BatchVisibilityCompletion, cursor: *execution_resources.BatchVisibilityCursor) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("pollBatchVisibilityCompletion", .{ self, completion, cursor });
+        const sequence = completion.sequence orelse return true;
+        const level = completion.sync_level;
+        try self.executor.checkSyncLevelHealth(level);
+        if (level == .write or level == .propose) return true;
+        for (completion.targets.target_identities) |identity| {
+            const cfg = self.core.index_manager.get(identity.index_name) orelse return error.IndexNotFound;
+            if (cfg.kind != identity.kind or internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json) != identity.incarnation or
+                cfg.coverage_config_fingerprint == null or cfg.coverage_config_fingerprint.? != identity.config_hash) return error.SourceFileChanged;
+        }
+        if (completion.graph_cleanup_required and cursor.publication_cut == null and
+            try self.core.store.hasGraphEndpointCleanup()) return false;
+        const has_groups = self.core.index_manager.hasGroupSources() and (level == .enrichments or level == .full_index);
+        if (has_groups and cursor.publication_cut == null) {
+            var producer_sequence = sequence;
+            if (!try self.groupSourcesReadyThrough(sequence, &producer_sequence)) return false;
+        }
+        if ((level == .enrichments or level == .full_index) and
+            !completion.enrichment_fully_precomputed)
+        {
+            var primary = !has_groups;
+            if (has_groups) {
+                var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
+                defer pinned.release();
+                for (pinned.plan().generated_templates) |request| {
+                    if (request.group_source_json.len == 0 and request.group_artifact_name.len == 0) primary = true;
+                }
+            }
+            if (primary) if (self.enrichment_runtime) |runtime| {
+                try runtime.requireHealthyForQueryCapture();
+                if (runtime.stats().applied_sequence < sequence) return false;
+            };
+        }
+        // Capture only after both grouped and primary-rooted producers finish.
+        // Their accepted outputs can have sequences beyond the primary write.
+        if (level == .full_index and (completion.graph_cleanup_required or has_groups or self.enrichment_runtime != null) and cursor.publication_cut == null)
+            cursor.publication_cut = @max(sequence, self.core.nextDerivedSequence());
+        const target = cursor.publication_cut orelse sequence;
+        const names = if (level == .full_text) completion.targets.full_text_indexes else if (level == .full_index) completion.targets.all_indexes else &.{};
+        for (names) |name| {
+            if (self.core.index_manager.get(name) == null) return error.IndexNotFound;
+            var applied = self.executor.appliedSequence(name) orelse 0;
+            // Workerless drains and a refreshed publication may have durable
+            // progress without a resident worker. Memory progress can also be
+            // ahead of a coalesced retention watermark, so accept either proof.
+            if (applied < target) applied = @max(applied, try self.core.loadAppliedSequence(self.alloc, name));
+            if (applied < target) return false;
+        }
+        if (level == .full_index) {
+            if (cursor.leann_targets == null) {
+                cursor.leann_targets = try self.core.index_manager.captureLeannCoverageTargets(self.alloc);
+                cursor.leann_allocator = self.alloc;
+            }
+            if (!self.core.index_manager.leannCoverageReached(cursor.leann_targets.?)) return false;
+        }
+        return true;
+    }
+
     fn waitForSyncLevelWithPublicationCut(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool, publication_cut: ?PublicationCut) !void {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
@@ -37480,41 +37558,45 @@ pub const DB = struct {
         }
     }
 
+    fn groupSourcesReadyThrough(self: *DB, through: u64, producer_sequence: *u64) !bool {
+        return blk: {
+            var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            const plan = pinned.plan().group_sources orelse break :blk true;
+            var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
+            const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const baseline = @import("group_source_baseline.zig");
+            var namespace: [24]u8 = undefined;
+            doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+            const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
+            var settled = true;
+            for (plan.entries) |entry| {
+                const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
+                if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
+                if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
+                    settled = false;
+                    var source_namespace = namespace;
+                    if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
+                    const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
+                    producer_sequence.* = @max(producer_sequence.*, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
+                }
+            }
+            break :blk settled;
+        };
+    }
+
     fn waitForGroupSourcesThrough(self: *DB, through: u64, wait: derived_executor_mod.VisibilityWait) !u64 {
         const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
         var producer_sequence = through;
         while (true) {
             try wait.check();
             if (self.async_context.background_closing.load(.acquire)) return error.Canceled;
-            const ready = blk: {
-                var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
-                defer arena.deinit();
-                const a = arena.allocator();
-                var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
-                defer pinned.release();
-                const plan = pinned.plan().group_sources orelse break :blk true;
-                var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
-                const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
-                var read = try self.core.store.beginReadTxn();
-                defer read.abort();
-                const baseline = @import("group_source_baseline.zig");
-                var namespace: [24]u8 = undefined;
-                doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-                const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
-                var settled = true;
-                for (plan.entries) |entry| {
-                    const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
-                    if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
-                    if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
-                        settled = false;
-                        var source_namespace = namespace;
-                        if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
-                        const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
-                        producer_sequence = @max(producer_sequence, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
-                    }
-                }
-                break :blk settled;
-            };
+            const ready = try self.groupSourcesReadyThrough(through, &producer_sequence);
             if (ready) return producer_sequence;
             _ = try self.runGroupSourceSlice();
             if (self.local_execution.optional_runtime_workers_enabled) {
@@ -141777,6 +141859,36 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
     try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
 }
 
+test "db graph endpoint cleanup pages owned visibility retains its publication cut" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("owned-cleanup-visibility");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    var completion: execution_resources.BatchVisibilityCompletion = .{};
+    defer completion.deinit(alloc);
+    var cursor: execution_resources.BatchVisibilityCursor = .{};
+    defer cursor.deinit();
+    const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "isolated");
+    defer alloc.free(job);
+    try db.core.store.putBatch(&.{.{ .key = job, .value = "isolated" }}, &.{});
+    var committed = false;
+    try db.batchTrackedWithPreparedDocumentsAndVisibility(.{ .writes = &.{.{ .key = "row", .value = "{}" }}, .sync_level = .full_index }, &committed, null, null, &completion);
+    try std.testing.expect(committed);
+    try std.testing.expect(completion.graph_cleanup_required);
+    try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+    try std.testing.expect(!try db.pollBatchVisibilityCompletion(&completion, &cursor));
+    try std.testing.expect(cursor.publication_cut == null);
+    try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep());
+    try db.runUntilIdle();
+    try std.testing.expect(try db.pollBatchVisibilityCompletion(&completion, &cursor));
+    const accepted = cursor.publication_cut.?;
+    try db.batch(.{ .writes = &.{.{ .key = "later", .value = "{}" }}, .sync_level = .write });
+    try std.testing.expect(try db.pollBatchVisibilityCompletion(&completion, &cursor));
+    try std.testing.expectEqual(accepted, cursor.publication_cut.?);
+}
+
 // White-box hooks for server integration fixtures; absent from production builds.
 const fixture_owner = @This();
 pub const test_support = if (builtin.is_test) struct {
@@ -147431,6 +147543,17 @@ test "grouped sources production visibility retains its publication cut across l
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
     try db.initOptionalEnrichmentRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "earlier", .value = "{\"body\":\"first\"}" }}, .sync_level = .write });
+    var completion: execution_resources.BatchVisibilityCompletion = .{
+        .sequence = db.core.nextDerivedSequence(),
+        .sync_level = .full_index,
+        .targets = try db.currentManagedSyncTargets(.full_index),
+    };
+    defer completion.deinit(alloc);
+    var observed_cut: execution_resources.BatchVisibilityCursor = .{};
+    defer observed_cut.deinit();
+    try std.testing.expect(!try db.pollBatchVisibilityCompletion(&completion, &observed_cut));
+    try std.testing.expect(observed_cut.publication_cut == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     const runtime = db.enrichment_runtime.?;
     try runtime.catchUpUntilForDrain(db.core.nextDerivedSequence());
     var sequence = db.core.nextDerivedSequence();
@@ -147438,6 +147561,9 @@ test "grouped sources production visibility retains its publication cut across l
     try db.waitForResolvedTransactionSyncTargetWithCancellation(.full_index, &sequence, &phase, .none);
     try std.testing.expectEqual(@as(u8, 2), phase);
     const captured = sequence;
+    try std.testing.expect(try db.pollBatchVisibilityCompletion(&completion, &observed_cut));
+    const passive_cut = observed_cut.publication_cut orelse return error.TestMissingPublicationCut;
+    try std.testing.expect(passive_cut >= completion.sequence.?);
     const calls = fixture.calls;
     try std.testing.expect(calls > 0);
 
@@ -147457,6 +147583,9 @@ test "grouped sources production visibility retains its publication cut across l
     try std.testing.expectEqual(calls, fixture.calls);
     try std.testing.expect(runtime.stats().applied_sequence < db.core.nextDerivedSequence());
     try std.testing.expect(runtime.stats().retrying);
+    try std.testing.expect(try db.pollBatchVisibilityCompletion(&completion, &observed_cut));
+    try std.testing.expectEqual(passive_cut, observed_cut.publication_cut.?);
+    try std.testing.expectEqual(calls, fixture.calls);
 }
 
 test "grouped sources production ordered transaction resolution never waits on derived publication" {

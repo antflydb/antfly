@@ -1361,11 +1361,15 @@ pub fn trackedBatch(database: *db_mod.DB, req: db_mod.types.BatchRequest, primar
 }
 
 pub fn trackedBatchWithPreparedDocuments(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8, prepared: ?*@import("../storage/db/prepared_document_batch.zig").Plan) anyerror!void {
+    return trackedBatchWithPreparedDocumentsAndVisibility(database, req, primary_committed, table_name, prepared, null);
+}
+
+fn trackedBatchWithPreparedDocumentsAndVisibility(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8, prepared: ?*@import("../storage/db/prepared_document_batch.zig").Plan, completion: ?*@import("../storage/db/execution_resources.zig").BatchVisibilityCompletion) anyerror!void {
     const receipts = @import("outcome_receipts.zig");
-    const writer = receipts.activeWriter() orelse return database.batchTrackedWithPreparedDocuments(req, primary_committed, null, prepared);
+    const writer = receipts.activeWriter() orelse return database.batchTrackedWithPreparedDocumentsAndVisibility(req, primary_committed, null, prepared, completion);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
-    database.batchTrackedWithPreparedDocuments(req, primary_committed, marker, prepared) catch |err| {
+    database.batchTrackedWithPreparedDocumentsAndVisibility(req, primary_committed, marker, prepared, completion) catch |err| {
         if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
@@ -1379,10 +1383,14 @@ pub fn trackedBatchWithPreparedDocuments(database: *db_mod.DB, req: db_mod.types
 fn batchFailureCode(err: anyerror, primary_committed: bool) capi.ErrorCode {
     // A confirmed primary write wins over later uncertainty in derived or
     // control publication: the batch is committed, not of unknown outcome.
-    if (primary_committed) return capi.recordError(.stalled, if (err == error.EnrichmentWorkerFailed)
-        "batch primary write committed; enrichment failed and needs repair; do not retry the batch"
-    else
-        "batch primary write committed; derived visibility is pending; do not retry the batch");
+    if (primary_committed) {
+        const context = if (err == error.EnrichmentWorkerFailed)
+            "batch primary write committed; enrichment failed and needs repair; do not retry the batch"
+        else
+            "batch primary write committed; derived visibility is pending; do not retry the batch";
+        var detail: [256]u8 = undefined;
+        return capi.recordError(.stalled, std.fmt.bufPrint(&detail, "{s}: {s}", .{ context, @errorName(err) }) catch context);
+    }
     return capi.mapError(err);
 }
 
@@ -5203,9 +5211,85 @@ fn executeBatchWithReplayPreparationBudget(ptr: ?*anyopaque, request: *anyopaque
 const OwnedQueuedBatch = struct {
     handle_ptr: ?*anyopaque,
     request: db_mod.types.BatchRequest,
+    visibility: ?*OwnedBatchVisibility = null,
 };
 
-fn executeSingleOwnedBatch(handle_ptr: ?*anyopaque, batch: db_mod.types.BatchRequest, marker: ?@import("outcome_receipts.zig").Marker, budget: ?*PreparationBudget, writer: ?*@import("outcome_receipts.zig").Writer) capi.ErrorCode {
+/// Immutable completion inputs are shared by a committed cohort. Each origin
+/// owns its observation cursor and waits after leaving the publication queue.
+const OwnedBatchVisibility = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    owner: *@import("lite_connection.zig").Owner,
+    completion: @import("../storage/db/execution_resources.zig").BatchVisibilityCompletion = .{},
+    allocator: Allocator = std.heap.c_allocator,
+    table_id: u64 = 0,
+    incarnation: u128 = 0,
+    metadata: [16]u8 = @splat(0),
+    deadline_ns: i96 = 0,
+    timeout_ms: u64 = 5 * std.time.ms_per_min,
+
+    fn create(owner: *@import("lite_connection.zig").Owner) !*@This() {
+        const result = try std.heap.c_allocator.create(@This());
+        result.* = .{ .owner = owner };
+        return result;
+    }
+
+    fn retain(self: *@This()) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *@This()) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        self.completion.deinit(self.allocator);
+        std.heap.c_allocator.destroy(self);
+    }
+
+    fn capture(self: *@This(), database: *db_mod.DB) void {
+        self.allocator = database.alloc;
+        self.table_id = database.core.identity_namespace.table_id;
+        self.incarnation = database.root_incarnation;
+        if (database.enrichment_runtime) |runtime| self.timeout_ms = runtime.syncWaitTimeoutMs();
+    }
+
+    fn seal(self: *@This()) void {
+        self.metadata = self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical.metadata;
+        self.deadline_ns = std.Io.Clock.awake.now(handleLockIo()).nanoseconds + @as(i96, self.timeout_ms) * std.time.ns_per_ms;
+    }
+};
+
+pub var test_before_batch_visibility_wait: if (builtin.is_test) ?struct { ptr: *anyopaque, run: *const fn (*anyopaque) void } else void = if (builtin.is_test) null else {};
+
+fn waitForOwnedBatchVisibility(handle_ptr: ?*anyopaque, visibility: *const OwnedBatchVisibility) capi.ErrorCode {
+    if (visibility.completion.sequence == null or visibility.completion.sync_level == .write or visibility.completion.sync_level == .propose) return .ok;
+    if (comptime builtin.is_test) if (test_before_batch_visibility_wait) |hook| hook.run(hook.ptr);
+    const io = handleLockIo();
+    var cursor: @import("../storage/db/execution_resources.zig").BatchVisibilityCursor = .{};
+    defer cursor.deinit();
+    var backoff: i96 = std.time.ns_per_ms;
+    while (true) {
+        const remaining = visibility.deadline_ns - std.Io.Clock.awake.now(io).nanoseconds;
+        if (remaining <= 0) return batchFailureCode(error.EnrichmentWaitTimeout, true);
+        const entry = HandleEntry.capture(handle_ptr) orelse return batchFailureCode(error.Canceled, true);
+        const guard = enterWithAdmissionBudget(entry, handle_ptr, .write, .mutation, false, remaining) orelse return batchFailureCode(error.Canceled, true);
+        const ready = blk: {
+            defer guard.leave();
+            if (guard.entry_error != null) return batchFailureCode(error.FileBusy, true);
+            const database = guard.handle.database();
+            if (database.core.identity_namespace.table_id != visibility.table_id or database.root_incarnation != visibility.incarnation or
+                !std.mem.eql(u8, &visibility.metadata, &visibility.owner.current.?.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical.metadata))
+                return batchFailureCode(error.SourceFileChanged, true);
+            break :blk database.pollBatchVisibilityCompletion(&visibility.completion, &cursor) catch |err| return batchFailureCode(err, true);
+        };
+        if (ready) return .ok;
+        visibility.owner.requestVisibilityProgress(visibility.table_id, visibility.incarnation) catch |err| return batchFailureCode(err, true);
+        // No path lease, API lock or mutable DB pointer survives this sleep.
+        const sleep_remaining = visibility.deadline_ns - std.Io.Clock.awake.now(io).nanoseconds;
+        if (sleep_remaining <= 0) return batchFailureCode(error.EnrichmentWaitTimeout, true);
+        io.sleep(.fromNanoseconds(@min(backoff, sleep_remaining)), .awake) catch |err| return batchFailureCode(err, true);
+        backoff = @min(backoff * 2, 10 * std.time.ns_per_ms);
+    }
+}
+
+fn executeSingleOwnedBatch(handle_ptr: ?*anyopaque, batch: db_mod.types.BatchRequest, marker: ?@import("outcome_receipts.zig").Marker, budget: ?*PreparationBudget, writer: ?*@import("outcome_receipts.zig").Writer, visibility: ?*OwnedBatchVisibility) capi.ErrorCode {
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
     var prepared: ?Prepared = null;
     defer if (prepared) |*plan| plan.deinit();
@@ -5215,6 +5299,7 @@ fn executeSingleOwnedBatch(handle_ptr: ?*anyopaque, batch: db_mod.types.BatchReq
         prepared: *?Prepared,
         marker: ?@import("outcome_receipts.zig").Marker,
         writer: ?*@import("outcome_receipts.zig").Writer,
+        visibility: ?*OwnedBatchVisibility,
         fn prepare(raw: *anyopaque, shared: *PreparationBudget) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try prepareOwnedBatchAttempt(self.handle_ptr, self.prepared, self.request, shared);
@@ -5222,14 +5307,18 @@ fn executeSingleOwnedBatch(handle_ptr: ?*anyopaque, batch: db_mod.types.BatchReq
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const plan = if (self.prepared.*) |*value| value else null;
+            const completion = if (self.visibility) |pending| blk: {
+                pending.capture(handle.database());
+                break :blk &pending.completion;
+            } else null;
             if (self.marker) |assigned| {
                 if (!self.writer.?.accepts(assigned)) return error.OutcomeReconciliationRequired;
-                return handle.database().batchTrackedWithPreparedDocuments(self.request, primary_committed, assigned, plan);
-            }
-            return trackedBatchWithPreparedDocuments(handle.database(), self.request, primary_committed, handle.selected_table_name, plan);
+                try handle.database().batchTrackedWithPreparedDocumentsAndVisibility(self.request, primary_committed, assigned, plan, completion);
+            } else try trackedBatchWithPreparedDocumentsAndVisibility(handle.database(), self.request, primary_committed, handle.selected_table_name, plan, completion);
+            if (self.visibility) |pending| pending.seal();
         }
     };
-    var request: Request = .{ .handle_ptr = handle_ptr, .request = batch, .prepared = &prepared, .marker = marker, .writer = writer };
+    var request: Request = .{ .handle_ptr = handle_ptr, .request = batch, .prepared = &prepared, .marker = marker, .writer = writer, .visibility = visibility };
     return executeBatchWithReplayPreparationBudget(handle_ptr, &request, Request.prepare, Request.apply, budget, true);
 }
 
@@ -5255,7 +5344,12 @@ fn processSinglePublication(job: *@import("publication_queue.zig").Job) void {
         return;
     }
     const origin: *OwnedQueuedBatch = @ptrCast(@alignCast(job.context));
-    const code = executeSingleOwnedBatch(origin.handle_ptr, origin.request, job.marker, &job.budget, job.writer);
+    if (origin.visibility) |old| old.release();
+    origin.visibility = if (origin.request.sync_level == .write or origin.request.sync_level == .propose) null else OwnedBatchVisibility.create(@ptrCast(@alignCast(job.scope))) catch |err| {
+        job.complete(capi.mapError(err), "batch completion allocation failed before mutation");
+        return;
+    };
+    const code = executeSingleOwnedBatch(origin.handle_ptr, origin.request, job.marker, &job.budget, job.writer, origin.visibility);
     finishQueuedPublication(&.{job}, code);
 }
 
@@ -5301,6 +5395,16 @@ fn processQueuedPublications(selected: []const *@import("publication_queue.zig")
         return;
     };
     defer cohort.deinit();
+    const visibility: ?*OwnedBatchVisibility = if (cohort.request.sync_level == .write or cohort.request.sync_level == .propose) null else OwnedBatchVisibility.create(@ptrCast(@alignCast(jobs[0].scope))) catch |err| {
+        finishQueuedPublication(jobs[0..count], capi.mapError(err));
+        return;
+    };
+    for (jobs[0..count], 0..) |job, ordinal| {
+        const origin: *OwnedQueuedBatch = @ptrCast(@alignCast(job.context));
+        if (origin.visibility) |old| old.release();
+        if (visibility) |pending| if (ordinal != 0) pending.retain();
+        origin.visibility = visibility;
+    }
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
     var prepared: ?Prepared = null;
     defer if (prepared) |*plan| plan.deinit();
@@ -5310,6 +5414,7 @@ fn processQueuedPublications(selected: []const *@import("publication_queue.zig")
         cohort: *const cohort_mod.Group,
         markers: []const @import("outcome_receipts.zig").Marker,
         prepared: *?Prepared,
+        visibility: ?*OwnedBatchVisibility,
         committed: bool = false,
         fn prepare(raw: *anyopaque, budget: *PreparationBudget) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -5319,11 +5424,13 @@ fn processQueuedPublications(selected: []const *@import("publication_queue.zig")
             const self: *@This() = @ptrCast(@alignCast(raw));
             defer self.committed = primary_committed.*;
             for (self.jobs) |job| if (!job.writer.accepts(job.marker)) return error.OutcomeReconciliationRequired;
-            try handle.database().batchTrackedWithPreparedCohort(self.cohort, primary_committed, self.markers, if (self.prepared.*) |*plan| plan else null);
+            if (self.visibility) |pending| pending.capture(handle.database());
+            try handle.database().batchTrackedWithPreparedCohortAndVisibility(self.cohort, primary_committed, self.markers, if (self.prepared.*) |*plan| plan else null, if (self.visibility) |pending| &pending.completion else null);
+            if (self.visibility) |pending| pending.seal();
         }
     };
     const first: *OwnedQueuedBatch = @ptrCast(@alignCast(jobs[0].context));
-    var request: Request = .{ .jobs = jobs[0..count], .handle_ptr = first.handle_ptr, .cohort = &cohort, .markers = markers[0..count], .prepared = &prepared };
+    var request: Request = .{ .jobs = jobs[0..count], .handle_ptr = first.handle_ptr, .cohort = &cohort, .markers = markers[0..count], .prepared = &prepared, .visibility = visibility };
     var budget: PreparationBudget = .{ .remaining_ns = std.math.maxInt(u64) };
     for (jobs[0..count]) |job| budget.remaining_ns = @min(budget.remaining_ns, job.budget.remaining_ns);
     const code = executeBatchWithReplayPreparationBudget(first.handle_ptr, &request, Request.prepare, Request.apply, &budget, false);
@@ -5342,14 +5449,23 @@ fn processQueuedPublications(selected: []const *@import("publication_queue.zig")
 fn executeOwnedDocumentBatch(handle_ptr: ?*anyopaque, request: db_mod.types.BatchRequest) capi.ErrorCode {
     const entry = HandleEntry.capture(handle_ptr) orelse return capi.mapError(error.InvalidArgument);
     defer entry.release();
-    const connection = entry.lock_handle.lite_connection orelse return executeSingleOwnedBatch(handle_ptr, request, null, null, null);
-    if (connection.options.profile != .native) return executeSingleOwnedBatch(handle_ptr, request, null, null, null);
-    const weight = @import("../storage/db/publication_cohort.zig").Group.measure(request) catch return executeSingleOwnedBatch(handle_ptr, request, null, null, null);
+    const connection = entry.lock_handle.lite_connection orelse return executeSingleOwnedBatch(handle_ptr, request, null, null, null, null);
+    if (connection.options.profile != .native) return executeSingleOwnedBatch(handle_ptr, request, null, null, null, null);
+    const weight = @import("../storage/db/publication_cohort.zig").Group.measure(request) catch {
+        if (request.sync_level == .write or request.sync_level == .propose)
+            return executeSingleOwnedBatch(handle_ptr, request, null, null, null, null);
+        const visibility = OwnedBatchVisibility.create(connection.owner) catch |err| return capi.mapError(err);
+        defer visibility.release();
+        const code = executeSingleOwnedBatch(handle_ptr, request, null, null, null, visibility);
+        if (code != .ok) return code;
+        return waitForOwnedBatchVisibility(handle_ptr, visibility);
+    };
     const receipts = @import("outcome_receipts.zig");
     receipts.clearLast();
     const receipt_scope = receipts.begin(&entry.lock_handle.outcome_writer);
     defer receipt_scope.end();
     var origin: OwnedQueuedBatch = .{ .handle_ptr = handle_ptr, .request = request };
+    defer if (origin.visibility) |visibility| visibility.release();
     const table_name = if (entry.handle.selected_table_name) |name| (if (std.mem.eql(u8, name, "default")) null else @as(?[]const u8, name)) else null;
     var job: @import("publication_queue.zig").Job = .{
         .context = &origin,
@@ -5367,6 +5483,10 @@ fn executeOwnedDocumentBatch(handle_ptr: ?*anyopaque, request: db_mod.types.Batc
     connection.gate.document_publications.submit(handleLockIo(), &job, processQueuedPublications);
     if (job.code == .outcome_unknown) job.writer.retire(job.resolution_marker, if (table_name) |name| .{ .name = name, .id = job.table_id } else null);
     if (job.code == .ok) {
+        if (origin.visibility) |visibility| {
+            const code = waitForOwnedBatchVisibility(handle_ptr, visibility);
+            if (code != .ok) return code;
+        }
         capi.clearLastError();
         return .ok;
     }
@@ -12539,7 +12659,11 @@ test "capi native publication cohort unknown outcome fences all shared writer re
     try testQueuedNativePublication(.unknown);
 }
 
-fn testQueuedNativePublication(case: enum { clean, invalid_member, unknown }) !void {
+test "capi native publication cohort shares owned visibility completion across origins" {
+    try testQueuedNativePublication(.visible);
+}
+
+fn testQueuedNativePublication(case: enum { clean, invalid_member, unknown, visible }) !void {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     const io = handleLockIo();
@@ -12609,10 +12733,11 @@ fn testQueuedNativePublication(case: enum { clean, invalid_member, unknown }) !v
         ordinal: usize,
         code: capi.ErrorCode = .internal,
         invalid: bool = false,
+        full_index: bool = false,
         receipt: ?@import("outcome_receipts.zig").Marker = null,
         fn run(self: *@This()) void {
             var bytes: [256]u8 = undefined;
-            const request = std.fmt.bufPrint(&bytes, "{{\"inserts\":{{\"document-{d}\":{{\"body\":\"cohort unicode résumé 日本語\"}}}},\"sync_level\":\"write\"}}", .{self.ordinal}) catch unreachable;
+            const request = std.fmt.bufPrint(&bytes, "{{\"inserts\":{{\"document-{d}\":{{\"body\":\"cohort unicode résumé 日本語\"}}}},\"sync_level\":\"{s}\"}}", .{ self.ordinal, if (self.full_index) "full_index" else "write" }) catch unreachable;
             var output: capi.Buffer = .{};
             defer antfly_buffer_free(&output);
             if (self.invalid) {
@@ -12644,7 +12769,7 @@ fn testQueuedNativePublication(case: enum { clean, invalid_member, unknown }) !v
         probe.second_release.set(io);
         for (threads[0..spawned]) |thread| thread.join();
     }
-    for (workers, 0..) |*worker, ordinal| worker.* = .{ .id = id, .ordinal = ordinal, .invalid = case == .invalid_member and ordinal == 2 };
+    for (workers, 0..) |*worker, ordinal| worker.* = .{ .id = id, .ordinal = ordinal, .invalid = case == .invalid_member and ordinal == 2, .full_index = case == .visible };
     threads[0] = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Worker.run, .{&workers[0]});
     spawned = 1;
     try probe.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });

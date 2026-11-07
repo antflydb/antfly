@@ -629,6 +629,10 @@ fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.S
     return .{ .value = self.waitForResolvedTransactionSyncWithCancellation(sync_level, sequence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn pollBatchVisibilityCompletion(self: *DB, completion: *const @import("db/execution_resources.zig").BatchVisibilityCompletion, cursor: *@import("db/execution_resources.zig").BatchVisibilityCursor) engine.Outcome(bool) {
+    return .{ .value = self.pollBatchVisibilityCompletion(completion, cursor) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) engine.Outcome(void) {
     return .{ .value = self.waitForResolvedTransactionSyncTargetWithCancellation(sync_level, sequence, phase, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

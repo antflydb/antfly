@@ -21,6 +21,21 @@ can refuse work; cancellation after a durable write cannot make the write
 retryable. A request's contention budget counts waiting rather than expensive
 proof or preparation work, and spans its admission handoffs.
 
+Native batch publication returns owned visibility completion inputs before
+releasing admission. Cohort members share immutable inputs, while each caller
+keeps its own observation cursor. Waiting happens after leaving the publication
+queue. Short admitted probes validate the table incarnation, logical metadata,
+index identities and committed progress; they do not run providers, replay or
+merges. Admission and API locks are released between probes. The background
+owner performs bounded service, or a workerless owner performs that same service
+outside request admission. A completed producer's accepted output cut is retained
+across probes so later unrelated producer debt does not extend the wait.
+Graph endpoint jobs are serviced by the owner too. Full-index completion first
+observes those durable jobs becoming clean and then retains the resulting replay
+cut. A second generic post-batch wait must not reintroduce replay under writer
+admission. Graph coverage targets are also captured once per waiter and owned
+through its completion, rather than recaptured as later vector writes arrive.
+
 SQL normalization can retain an owned packed relational row authority. The final
 mutation reuses that authority only for exact key/value/JSON-null provenance,
 schema/layout and catalog witnesses. Conflict postimages that change those bytes
@@ -115,7 +130,9 @@ requested. Unchanged advisory status does not require a timestamp-only commit.
 An exact covered-source witness can acknowledge a new already-covered text tip
 without reopening every table/index runtime. Metadata and control changes,
 unsupported index mixtures, pending replay, recovery debt or an audit deadline
-invalidate that shortcut. Immutable source/layout caches have explicit entry,
+invalidate that shortcut. A document namespace with no consumers can use the
+same fenced witness; advancing its covered tip still schedules independent
+physical retirement. Immutable source/layout caches have explicit entry,
 byte, range and lifetime bounds and exact inode/value identity checks. They do
 not retain a mutable DB actor as though it were immutable.
 
@@ -162,6 +179,18 @@ coordination component names support long database filenames; marker scans stat
 opened descriptors when directory enumeration cannot supply a type. Integrity
 and allocator inspection require metadata protection in addition to a data fence.
 
+Each reader coordinator caches one bounded namespace descriptor bundle. Every
+registration and scan revalidates the current directory entry, identity-file inode
+and binding seed. Reader frontiers are scanned afresh, including after an earlier
+scan reached the end of the directory. Identity or directory replacement cannot
+inherit cached authority. The cache owns no database snapshot or reader marker;
+idle descriptors do not retain database pages or extend reader lifetimes.
+A changed process identity discards inherited descriptors before taking a guard
+lock, since `flock` ownership follows the inherited open file description.
+Marker sharing stays scoped to an exact checkpoint. Once an admitted writer
+observes a newer checkpoint, it drops obsolete batch anchors immediately;
+escaped readers keep their own references and continue protecting their cut.
+
 Logical checkpoint identities survive publication and replacement correctly.
 Replacement/compaction generations cannot inherit an unrelated clean recovery
 witness. Paged DDL sweeps retain completion across pages, never skip a failed
@@ -201,6 +230,15 @@ full Debug gates and diagnostic limits. The
 [artifact primary-admission receipt](artifact-primary-admission-debug.json)
 records a reproduced stale checkpoint during repair-summary lookup, the corrected
 phase boundary, thirty repeated setup checks and the updated C API/SDK gates.
+
+The subsequent optimized candidate passed live namespace visibility, but its
+synchronous indexed churn found another committed/pending stall. The native
+publication handoff did not cover the generic endpoint-cleanup completion hook,
+which still waited for current index progress under foreground admission. That
+hook now joins the owned outside-admission completion path, including cleanup's
+accepted replay cut. The [publication visibility Debug receipt](publication-visibility-debug.json)
+records local reproductions, operation counts and correctness checks. These
+local diagnostics do not establish optimized importer or contended throughput.
 
 Component receipts: [native namespaces](direct-native-namespaces-debug.json),
 [owned publication](owned-native-publication-debug.json),

@@ -7132,11 +7132,27 @@ test "capi native foreground reuses free pages during a captured worker turn" {
         defer guard.leave();
         const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
         const large: [32768]u8 = @splat('x');
-        for (0..16) |_| try file.putCatalogRecord("test/free-pool", &large);
-        try file.deleteCatalogRecord("test/free-pool");
+        // Distinct live values create an actual pool. Repeatedly overwriting
+        // one key can correctly recycle the same pages and leave only a small
+        // reserve, making the former >16-page setup assumption meaningless.
+        for (0..16) |i| {
+            var key: [32]u8 = undefined;
+            try file.putCatalogRecord(try std.fmt.bufPrint(&key, "test/free-pool-{d}", .{i}), &large);
+        }
+        for (0..16) |i| {
+            var key: [32]u8 = undefined;
+            try file.deleteCatalogRecord(try std.fmt.bufPrint(&key, "test/free-pool-{d}", .{i}));
+        }
         _ = try file.reclaimPages(4096);
-        try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 16);
+        const pool = (try file.allocatorStats()).?;
+        if (pool.reusable_pages <= 16) {
+            const readers = owner.reader_coordinator.readerStats((try file.file.stat(shared.handleLockIo())).inode);
+            std.debug.print("captured reuse setup pool={f} readers={f}\n", .{ std.json.fmt(pool, .{}), std.json.fmt(readers, .{}) });
+            return error.TestReusablePoolNotEstablished;
+        }
         try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"captured\"}" }}, .sync_level = .write });
+        var schedules = owner.maintenance_schedules.valueIterator();
+        while (schedules.next()) |schedule| schedule.next_database_audit_ns = 0;
         owner.maintenance_pending = true;
     }
     const Fixture = struct {
@@ -7149,7 +7165,7 @@ test "capi native foreground reuses free pages during a captured worker turn" {
             const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
             const before = (try file.allocatorStats()).?.reused_pages;
             for (0..4) |i| try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = if (i % 2 == 0) "{\"body\":\"concurrent-a\"}" else "{\"body\":\"concurrent-b\"}" }}, .sync_level = .write });
-            try std.testing.expect((try file.allocatorStats()).?.reused_pages > before);
+            if ((try file.allocatorStats()).?.reused_pages <= before) return error.TestForegroundReuseDidNotAdvance;
         }
         fn notify(raw: *anyopaque, snapshot: *shared.Handle) void {
             if (!snapshot.db_live) return;
@@ -7165,7 +7181,7 @@ test "capi native foreground reuses free pages during a captured worker turn" {
     defer owner.test_after_capture = null;
     _ = try owner.maintenanceTurnForTest();
     if (fixture.failure) |err| return err;
-    try std.testing.expect(fixture.ran);
+    if (!fixture.ran) return error.TestCapturedWorkerTurnNotEntered;
 }
 
 test "capi SQL native maintenance carries orphan sweep progress across replay snapshots" {
@@ -7344,7 +7360,7 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         try std.testing.expectEqual(@as(usize, 0), retained.maintenance_references);
         try std.testing.expectEqual(std.math.maxInt(u64), retained.owned_lite_backend.?.native_docstore.?.reader_frontier.load(.acquire));
     }
-    try std.testing.expect(!owner.wake.isSet());
+    if (owner.wake.isSet()) return error.TestIdleMaintenanceWokeOwner;
     try std.testing.expectEqual(settled_replay_sequence, owner.current.?.db.core.nextDerivedSequence());
     try std.testing.expectEqual(opens, owner.test_runtime_snapshot_opens);
     try std.testing.expectEqual(settled_sequence, owner.maintenance_snapshot.?.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
@@ -7362,7 +7378,7 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         // replay debt after reopen, without relying on a generated producer.
     }
     try drainOwnerMaintenance(owner);
-    try std.testing.expect(owner.test_runtime_snapshot_opens > opens);
+    if (owner.test_runtime_snapshot_opens <= opens) return error.TestResumedWorkDidNotOpenRuntime;
     const after_work = owner.test_runtime_snapshot_opens;
     for (0..8) |_| _ = try owner.maintenanceTurnForTest();
     try std.testing.expectEqual(after_work, owner.test_runtime_snapshot_opens);
@@ -7379,6 +7395,7 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     const External = struct {
         path: []const u8,
         failure: ?anyerror = null,
+        ran: bool = false,
         fn publish(self: *@This()) !void {
             var lease = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
             defer lease.close();
@@ -7389,26 +7406,35 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
             }, false, shared.handleLockIo(), null);
             other.lease_snapshot = true;
             defer shared.closeHandle(other);
+            try other.db.setSchemaJson(a,
+                \\{"version":2,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"peer":{"type":"boolean"}},"additionalProperties":true}}}}
+            );
             try other.db.core.store.put("\x00antfly/test/external-catalog", "external");
         }
         fn notify(ptr: *anyopaque, _: *shared.Handle) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ran = true;
             self.publish() catch |err| {
                 self.failure = err;
             };
         }
     };
-    try std.testing.expect(!owner.maintenance_pending);
+    if (owner.maintenance_pending) return error.TestIdleOwnerStillMarkedPending;
     var external = External{ .path = path };
+    // An idle observation need not capture a runtime. Request a real catalog
+    // audit so the peer publication occurs in the intended detached phase.
+    var schedules = owner.maintenance_schedules.valueIterator();
+    while (schedules.next()) |schedule| schedule.next_database_audit_ns = 0;
     owner.test_after_capture = .{ .ptr = &external, .notify = External.notify };
     defer owner.test_after_capture = null;
     const before_external = owner.current.?;
     _ = try owner.maintenanceTurnForTest();
     owner.test_after_capture = null;
     if (external.failure) |err| return err;
+    if (!external.ran) return error.TestExternalCatalogHookNotEntered;
     const guard = public.enterHandle(handle, .exclusive).?;
     defer guard.leave();
-    try std.testing.expect(guard.handle != before_external);
+    if (guard.handle == before_external) return error.TestExternalCatalogDidNotRefreshRuntime;
     const external_value = try guard.handle.db.core.store.get(a, "\x00antfly/test/external-catalog");
     defer a.free(external_value);
     try std.testing.expectEqualStrings("external", external_value);

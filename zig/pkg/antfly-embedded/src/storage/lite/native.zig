@@ -5488,7 +5488,7 @@ pub const NativeFile = struct {
             if (prefix <= opened.size and prefix > expected) return false;
         }
         if (self.header.indexed_reclamation) {
-            const readers = @import("reader_epochs.zig").scan(self.allocator, io, self.path, self.header.reader_epoch_namespace, opened.inode) catch return false;
+            const readers = self.scanReaderEpochs(opened.inode) catch return false;
             if (readers.data != null or readers.metadata != null) return false;
         }
         try self.file.setLength(io, expected);
@@ -6146,12 +6146,17 @@ pub const NativeFile = struct {
         self.reader_fence = null;
         self.file.unlock(self.runtime());
     }
+    fn scanReaderEpochs(self: *NativeFile, inode: u64) !@import("reader_epochs.zig").Frontier {
+        if (self.reader_coordinator) |coordinator|
+            return coordinator.scanEpochs(self.path, self.header.reader_epoch_namespace, inode);
+        return @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, inode);
+    }
     fn acquireEpochReuseLock(self: *NativeFile) !LockFile {
         self.epoch_window = null;
         const lock = try acquireDataRewriteLock(self.runtime(), self.path);
         errdefer lock.file.close(self.runtime());
         if (self.activeCheckpoint().free_map_root_page != 0 and (try lock.file.stat(self.runtime())).inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
-        if (self.header.indexed_reclamation) self.epoch_window = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
+        if (self.header.indexed_reclamation) self.epoch_window = try self.scanReaderEpochs((try self.file.stat(self.runtime())).inode);
         return lock;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
@@ -6161,6 +6166,7 @@ pub const NativeFile = struct {
             return true;
         }
         const inode = (try self.file.stat(self.runtime())).inode;
+        coordinator.advanceRegistrationCheckpoint(inode, self.activeCheckpoint().commit_sequence);
         const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified);
         errdefer coordinator.end();
         self.reader_window_previous_frontier = self.minimum_reader_sequence;
@@ -10956,7 +10962,7 @@ pub const NativeFile = struct {
         var data_lock = try acquireDataRewriteLock(self.runtimeIo(), self.path);
         defer data_lock.file.close(self.runtimeIo());
         if (self.header.indexed_reclamation) {
-            const epochs = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
+            const epochs = try self.scanReaderEpochs((try self.file.stat(self.runtime())).inode);
             if (epochs.data != null) return error.WouldBlock;
         }
         var image = try self.prepareVacuum(cancel);

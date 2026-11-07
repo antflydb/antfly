@@ -1,0 +1,145 @@
+{
+  "scope": "Local Debug correctness and operation-count diagnostics. Optimized end-to-end qualification remains pending.",
+  "parent_commit": "7d07d8db129da19e34f0fbade4744d63630761f3",
+  "Debug_library_sha256": "af528ecb133d1d6ac35cdff469f377b8857da6ff43c4e4216cb9e0dce2d81f9d",
+  "root_cause": "A generic post-batch endpoint-cleanup hook re-entered a current-tip visibility wait while native writer admission was held. Deferred native publication now hands cleanup completion and its accepted replay cut to the outside-admission observer.",
+  "fixes": [
+    "Owned immutable completion inputs shared across cohort origins; each origin retains its own progress cursor after leaving publication admission.",
+    "Passive exact-identity and progress checks; owner service performs replay, providers, merges and endpoint cleanup.",
+    "Retain accepted producer, endpoint-cleanup and graph coverage cuts across probes; never retry a committed mutation.",
+    "Validate and reuse one bounded epoch namespace descriptor bundle without caching reader frontiers. Reopen guard ownership when the process identity changes.",
+    "Release obsolete checkpoint batch anchors while retaining escaped readers.",
+    "Use existing fenced source coverage for namespaces without consumers; physical retirement remains independently scheduled.",
+    "Preserve already acknowledged benchmark calls if a later operation fails."
+  ],
+  "validation": {
+    "full_C_API_target": {
+      "passed": true,
+      "embedded_passed": 381,
+      "embedded_skipped": 3,
+      "core_owner_passed": 87,
+      "failed": 0,
+      "leaked": 0,
+      "unexpected_logged_errors": 0,
+      "includes_resolver_replay_tests": true
+    },
+    "grouped_source_production": {
+      "passed": 12,
+      "failed": 0,
+      "leaked": 0
+    },
+    "grouped_source_protocol": {
+      "passed": 1,
+      "failed": 0,
+      "leaked": 0
+    },
+    "retained_native_gate": {
+      "passed": 847,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0,
+      "note": "Native implementation and its tests unchanged by the subsequent DB visibility-only correction."
+    },
+    "SDK_SQL_catalog_outcomes_concurrency_crash": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 61.74
+    },
+    "benchmark_reporting": {
+      "passed": 41,
+      "failed": 0
+    },
+    "ABI_exports": 138,
+    "C_executable_and_shared_library_linkage_passed": true,
+    "graph_relationship_ownership_and_cleanup": {
+      "embedded_passed": 118,
+      "core_owner_passed": 3,
+      "failed": 0,
+      "skipped": 0,
+      "leaked": 0,
+      "owned_completion_and_retained_cut_regression_passed": true,
+      "test_selection_fix": "Use the actual renamed portable backup test names; both tests remain selected."
+    }
+  },
+  "indexed_synchronous_diagnostic": {
+    "seconds": 35.38125841598958,
+    "successful_calls": 2777,
+    "errors": 0,
+    "maintenance_page_failures": 0,
+    "maximum_foreground_lease_hold_ns": 47873916,
+    "latest_values_tokens_and_integrity_passed": true,
+    "closed_fixture_removed": true
+  },
+  "primary_operation_count_diagnostic": {
+    "seconds": 12.000329166010488,
+    "successful_calls": 1891,
+    "source_turns": 1,
+    "covered_source_observations": 1746,
+    "maintenance_runtime_opens": 1,
+    "serving_runtime_refreshes": 0,
+    "maintenance_page_failures": 0,
+    "latest_values_and_integrity_passed": true,
+    "closed_fixture_removed": true
+  },
+  "eight_process_smoke": {
+    "seconds_per_case": 20,
+    "optimized_performance_qualification": false,
+    "cases": [
+      {
+        "indexed": false,
+        "workers": 8,
+        "successful_calls": 1601,
+        "busy_calls": 0,
+        "all_workers_progressed": true,
+        "verification": {
+          "every_latest_value_checked": true,
+          "primary_rows_checked": 1024,
+          "expected_rows": 1024,
+          "latest_and_overwritten_tokens_checked": false,
+          "integrity_passed": true,
+          "seconds": 0.6713563340017572
+        },
+        "cleanup": {
+          "removed_bytes": 6021120
+        }
+      },
+      {
+        "indexed": true,
+        "workers": 8,
+        "successful_calls": 208,
+        "busy_calls": 0,
+        "all_workers_progressed": true,
+        "verification": {
+          "every_latest_value_checked": true,
+          "primary_rows_checked": 1024,
+          "expected_rows": 1024,
+          "latest_and_overwritten_tokens_checked": true,
+          "integrity_passed": true,
+          "seconds": 0.8798536249960307
+        },
+        "cleanup": {
+          "removed_bytes": 5898240
+        }
+      }
+    ]
+  },
+  "unchanged_importer_preflight": {
+    "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "completed_inputs": 1,
+    "failed_inputs": 0,
+    "integrity_passed": true,
+    "page_failure_marker": false,
+    "closed_fixture_removed": true,
+    "full_corpus_qualification": false
+  },
+  "measurement_limits": [
+    "Local Debug diagnostics overlapped compilation or other tests; no elapsed-time speedup or optimized throughput claim.",
+    "Only the candidate ran; existing reference artifacts remain unchanged."
+  ],
+  "remaining": [
+    "Optimized unchanged-importer, matched synchronous visibility, contention and active-write storage qualification.",
+    "Externally owned aggregate CI and full factory."
+  ],
+  "database_archives_created": false,
+  "reference_builds_or_executions": false
+}

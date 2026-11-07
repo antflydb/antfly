@@ -32,6 +32,8 @@ pub const Coordinator = struct {
     registration_batch_id: u64 = 0,
     batch_data_epoch: ?*SharedEpoch = null,
     batch_metadata_epoch: ?*SharedEpoch = null,
+    epoch_namespace_mutex: std.Io.Mutex = .init,
+    epoch_namespace: epochs.NamespaceCache = .{},
 
     artifact_release_mutex: std.atomic.Mutex = .unlocked,
     artifact_release_head: ?*ArtifactRelease = null,
@@ -173,6 +175,23 @@ pub const Coordinator = struct {
         return .{ .coordinator = self };
     }
 
+    /// The admitted writer has a newer checkpoint. Old batch anchors cannot
+    /// serve a read at that checkpoint; detach them now rather than retaining
+    /// otherwise dead pages until the entire admission scope finishes.
+    /// Escaped readers retain their independent references and frontiers.
+    pub fn advanceRegistrationCheckpoint(self: *Coordinator, inode: u64, sequence: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        var released: [2]?*SharedEpoch = .{ null, null };
+        for ([_]*?*SharedEpoch{ &self.batch_data_epoch, &self.batch_metadata_epoch }, 0..) |slot, i| {
+            const epoch = slot.* orelse continue;
+            if (epoch.inode != inode or epoch.sequence >= sequence) continue;
+            released[i] = epoch;
+            slot.* = null;
+        }
+        self.mutex.unlock(self.io);
+        for (released) |maybe| if (maybe) |epoch| self.releaseSharedEpoch(epoch);
+    }
+
     fn releaseSharedEpoch(self: *Coordinator, epoch: *SharedEpoch) void {
         self.mutex.lockUncancelable(self.io);
         std.debug.assert(epoch.references != 0);
@@ -264,6 +283,7 @@ pub const Coordinator = struct {
     pub fn deinit(self: *Coordinator) void {
         std.debug.assert(self.readers.items.len == 0);
         std.debug.assert(self.registration_batches == 0 and self.batch_data_epoch == null and self.batch_metadata_epoch == null);
+        self.epoch_namespace.deinit(self.allocator, self.io);
         self.readers.deinit(self.allocator);
         self.destroyArtifactReleases(self.artifact_release_head);
         var roots = self.wal_checkpoints.keyIterator();
@@ -289,7 +309,7 @@ pub const Coordinator = struct {
             file.unlock(self.io);
             return fence;
         }
-        const epoch = epochs.register(self.allocator, self.io, path, binding, inode, sequence, metadata) catch |err| switch (err) {
+        const epoch = self.registerCachedEpoch(path, binding, inode, sequence, metadata) catch |err| switch (err) {
             error.AccessDenied, error.ReadOnlyFileSystem, error.UnsafeNativeReaderAlias => return self.registerWithScope(file, inode, sequence, tip, metadata, null, true, null),
             else => return err,
         };
@@ -301,6 +321,24 @@ pub const Coordinator = struct {
         const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, if (shared == null) epoch else null, false, shared);
         file.unlock(self.io);
         return fence;
+    }
+
+    fn registerCachedEpoch(self: *Coordinator, path: []const u8, binding: [32]u8, inode: u64, sequence: u64, metadata: bool) !epochs.Lease {
+        self.epoch_namespace_mutex.lockUncancelable(self.io);
+        defer self.epoch_namespace_mutex.unlock(self.io);
+        return self.epoch_namespace.register(self.allocator, self.io, path, binding, inode, sequence, metadata);
+    }
+
+    pub fn scanEpochs(self: *Coordinator, path: []const u8, binding: [32]u8, inode: u64) !epochs.Frontier {
+        self.epoch_namespace_mutex.lockUncancelable(self.io);
+        defer self.epoch_namespace_mutex.unlock(self.io);
+        return self.epoch_namespace.scan(self.allocator, self.io, path, binding, inode);
+    }
+
+    pub fn epochNamespaceStats(self: *Coordinator) struct { opens: u64, validations: u64 } {
+        self.epoch_namespace_mutex.lockUncancelable(self.io);
+        defer self.epoch_namespace_mutex.unlock(self.io);
+        return .{ .opens = self.epoch_namespace.opens, .validations = self.epoch_namespace.validations };
     }
     fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool, epoch: ?epochs.Lease, inode_only: bool, shared: ?*SharedEpoch) !*Fence {
         self.mutex.lockUncancelable(self.io);
@@ -613,4 +651,31 @@ test "lite WAL checkpoint ages survive cache refresh and fence inode replacement
     owner.forgetWalCheckpoints("root/index");
     try std.testing.expect(owner.recoveredWalDeadline("root/index", 1, 100) == null);
     try std.testing.expectEqual(@as(?u64, 500), owner.recoveredWalDeadline("root/index-other", 1, 100));
+}
+
+test "lite reader registration batch advances idle anchors without releasing escaped readers" {
+    var fixture = try RegistrationFixture.init();
+    defer fixture.deinit();
+    const batch = fixture.coordinator.beginRegistrationBatch();
+    defer batch.end();
+    var idle = try fixture.reader(10, false, fixture.binding);
+    defer idle.close();
+    var escaped = try fixture.reader(10, true, fixture.binding);
+    defer escaped.close();
+    idle.close();
+    fixture.coordinator.advanceRegistrationCheckpoint(fixture.inode, 20);
+    try std.testing.expect(fixture.coordinator.batch_data_epoch == null);
+    try std.testing.expect(fixture.coordinator.batch_metadata_epoch == null);
+    try std.testing.expectEqual(@as(?u64, 10), (try fixture.scan()).metadata);
+    try std.testing.expectEqual(@as(?u64, 10), fixture.coordinator.beginWithMetadata(fixture.inode, @splat(0), true).data);
+    fixture.coordinator.end();
+    escaped.close();
+    try std.testing.expectEqual(epochs.Frontier{}, try fixture.scan());
+    var current = try fixture.reader(20, false, fixture.binding);
+    defer current.close();
+    current.close();
+    fixture.coordinator.advanceRegistrationCheckpoint(fixture.inode, 20);
+    try std.testing.expectEqual(@as(?u64, 20), (try fixture.scan()).data);
+    fixture.coordinator.advanceRegistrationCheckpoint(fixture.inode, 21);
+    try std.testing.expectEqual(epochs.Frontier{}, try fixture.scan());
 }

@@ -3330,7 +3330,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var pressure_ctx = self.batchContext();
                 const backlog_pressure_start_ns = monotonicTimeNs();
                 try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
-                try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
+                // Native intake already owns bounded durable replay credits.
+                // A completion handoff must not drive post-commit replay while
+                // its caller still holds the publisher's writer admission.
+                if (opts.visibility_completion == null or !pressure_ctx.store.runtime_store.capabilities().bounded_replay_admission)
+                    try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
             }
             const wait_sync_start_ns = monotonicTimeNs();
@@ -3348,7 +3352,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             } else if (append_derived_replay) {
-                if (opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
+                if (opts.visibility_completion == null and opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
                     const derived_apply_start_ns = monotonicTimeNs();
                     if (effective_req.sync_level == .full_text) {
                         try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);

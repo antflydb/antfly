@@ -1735,6 +1735,10 @@ test "lite native index storage content identity ignores primary writes and chan
     defer allocator.free(path);
     var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .no_sync = true, .reclamation = .{ .page_reuse = true } });
     defer docs.close();
+    // This fixture deliberately manipulates NativeFile transactions directly.
+    // A Store worker must not inspect its allocator outside the Store mutex
+    // while those raw mutations bypass the ordinary transaction facade.
+    docs.maintenance_start_suppressed = true;
     var indexes = Store.init(allocator, &docs);
     const io = indexes.storage();
     try writeFileAbsolute(&indexes, "segments/current", "one");
