@@ -233,6 +233,23 @@ const ModeReport = struct {
 };
 
 fn measureSingleWriter(alloc: std.mem.Allocator, comptime name: []const u8, indexed: bool, updates: usize) !ModeReport {
+    return measureSingleWriterWithSyncLevel(alloc, name, indexed, if (indexed) "full_index" else "write", updates);
+}
+
+/// Like `measureSingleWriter`, but with an explicit `sync_level` instead of
+/// the "write"/"full_index" default. WS4 phase 2's inline text publication
+/// fast path (`docs/design/lite-performance/lite-single-commit-write-path.md`
+/// §3.3) is gated on `sync_level == .full_text` specifically: `full_index`
+/// additionally waits for every other derived consumer (enrichments, dense
+/// vectors, LEANN graph coverage, scheduled text merges -- see
+/// `DB.waitForSyncLevelWithPublicationCut`'s `.full_index` branch), which is
+/// out of scope for this change and still takes the pre-existing
+/// notify-workers-and-wait path. Measuring the fast path's own effect
+/// therefore requires this direct `full_text` scenario rather than the
+/// `indexed` (`full_index`) one above, which this harness's "ceilings"
+/// regression gate already covers and which this function deliberately does
+/// not change.
+fn measureSingleWriterWithSyncLevel(alloc: std.mem.Allocator, comptime name: []const u8, indexed: bool, sync_level: []const u8, updates: usize) !ModeReport {
     var fixture = try Fixture.open(alloc, name, indexed);
     defer fixture.close();
 
@@ -244,7 +261,7 @@ fn measureSingleWriter(alloc: std.mem.Allocator, comptime name: []const u8, inde
     for (0..updates) |i| {
         const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % 128});
         const text = payload(&buffer, 0, i);
-        try insertOne(alloc, fixture.handle, key, text, if (indexed) "full_index" else "write");
+        try insertOne(alloc, fixture.handle, key, text, sync_level);
     }
     const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
     return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
@@ -554,6 +571,31 @@ test "lite write amplification ceilings" {
     const indexed_concurrent = try measureConcurrent(alloc, "lite-write-amp-ceil-indexed-concurrent", true, default_writers, updates / default_writers);
     try expectAtMost(primary_concurrent.perUpdate(.calling_thread), 3.0 * slack, "primary-only 8-writer calling-thread syncs/update");
     try expectAtMost(indexed_concurrent.perUpdate(.calling_thread), 67.0 * slack, "indexed 8-writer calling-thread syncs/update");
+}
+
+// WS4 phase 2 round 2: measures the inline text publication fast path
+// directly, through `sync_level: "full_text"` (not `"full_index"`; see
+// `measureSingleWriterWithSyncLevel`'s comment). Runs with the default
+// Lite configuration -- background index workers running -- which is
+// exactly the configuration the no-worker-only `!hasWorkers()` gate used
+// to exclude. Not a regression gate (no asserted ceiling): this is the
+// measurement docs/design/lite-performance/lite-single-commit-write-path.md
+// §5's "Indexed calling-path syncs/update... ≤ 1.0 with 1 writer" gate
+// means for a `full_text`-only workload specifically, reported here for
+// before/after comparison rather than enforced, since the harness has no
+// "before" binary to compare against at runtime.
+test "lite write amplification report: full_text sync level (WS4 phase 2 round 2)" {
+    const alloc = std.testing.allocator;
+    const updates = default_updates;
+
+    const full_text = try measureSingleWriterWithSyncLevel(alloc, "lite-write-amp-fulltext", true, "full_text", updates);
+    std.debug.print("lite write amplification report, full_text sync level (updates={d}, text_bytes={d}):\n", .{ updates, text_bytes });
+    printStageTable("full-text-visible (sync_level=full_text, workers on)", full_text);
+
+    const report = modeJson(full_text);
+    const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_full_text_json_begin\n{s}\nlite_write_amplification_full_text_json_end\n", .{json_text});
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {
