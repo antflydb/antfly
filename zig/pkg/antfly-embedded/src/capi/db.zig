@@ -12091,6 +12091,69 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
 }
 
+test "capi native indexed exports retain owned foreground eligibility after reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("foreground-export-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    const connection_mod = @import("lite_connection.zig");
+    var wrapper = try connection_mod.open(path, .{ .no_sync = true, .profile = .native, .busy_timeout_ms = 5000 }, true);
+    var id: ?*anyopaque = try publishHandle(wrapper);
+    defer if (id) |value| antfly_db_close(value);
+    var output: capi.Buffer = .{};
+    defer antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice("{\"name\":\"selected_text\",\"type\":\"full_text\",\"config_json\":{\"field\":\"text\"}}")));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"one\":{\"text\":\"alpha résumé 日本語\"}},\"sync_level\":\"full_index\"}"), &output));
+    antfly_buffer_free(&output);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+    antfly_db_close(id);
+    id = null;
+    wrapper = try connection_mod.open(path, .{ .no_sync = true, .profile = .native, .busy_timeout_ms = 5000 }, false);
+    id = try publishHandle(wrapper);
+    const io = handleLockIo();
+    const owner = wrapper.lite_connection.?.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    var prepared: ?Prepared = null;
+    defer if (prepared) |*plan| plan.deinit();
+    var budget: PreparationBudget = .{ .remaining_ns = 5 * std.time.ns_per_s };
+    const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "one", .value = "{\"text\":\"beta κόσμος\"}" }}, .sync_level = .write };
+    try prepareOwnedBatchAttempt(id, &prepared, request, &budget);
+    const plan = if (prepared) |*value| value else return error.TestExpectedOwnedPlan;
+    {
+        const guard = enterHandle(id, .read).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const database = guard.handle.database();
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        for (plan.text.items) |item| {
+            const metadata = try @import("../storage/db/derived/apply_state.zig").loadProjectionMetadataTxn(&read, item.config.name);
+            try std.testing.expect(metadata != null and metadata.?.status == .clean);
+            try std.testing.expectEqual(database.core.store.lastReplaySequence(0), metadata.?.applied_sequence);
+            try std.testing.expect(item.publication != null);
+        }
+    }
+    try std.testing.expect(plan.text.items.len != 0);
+    const guard = enterHandle(id, .write).?;
+    defer guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+    const before = file.activeCheckpoint().commit_sequence;
+    var committed = false;
+    try trackedBatchWithPreparedDocuments(guard.handle.database(), request, &committed, guard.handle.selected_table_name, plan);
+    try std.testing.expect(committed);
+    try std.testing.expectEqual(before + 1, file.activeCheckpoint().commit_sequence);
+    const sequence = guard.handle.database().core.store.lastReplaySequence(0);
+    try std.testing.expectEqual(@as(?u64, sequence), guard.handle.database().executor.appliedSequence("selected_text"));
+}
+
 test "capi owned transforms reprepare changed bases without applying an increment twice" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("owned-transform-reprepare");

@@ -475,3 +475,25 @@ request can acquire it. Component evidence is recorded in
 This does not finish same-index publication cohorts, SQL preparation integration,
 or durable normalized posting-delta windows. No end-to-end throughput claim is
 made from these component tests.
+
+
+### Adopt atomically published progress
+
+A live Debug trace exposed a missing activation edge: sixteen indexed writes
+published primary plus text state together, then their visibility waits performed
+sixteen additional text replay publications. The durable root checkpoint was
+current while the serving executor's cached replay watermark was behind.
+
+Successful owned publication now adopts the selected registrations' committed
+frontier while their catalog/apply fence still identifies the exact indexes.
+Manual waits can use that frontier immediately. Threaded workers receive a
+separate atomic frontier, discard superseded private captures and drain their
+sessions before installing it into mutable worker state. They do not re-persist a
+frontier certified by this publication. Ordinary worker progress retains forced
+visibility validation. No retained bytes are credited by progress adoption;
+physical consumer retirement remains authoritative.
+
+The expanded runtime and C API component gates are recorded in
+[publication-progress-debug.json](publication-progress-debug.json). Live performance
+qualification of the rebuilt candidate, commit cohorts and durable normalized
+posting-delta windows remain outstanding.

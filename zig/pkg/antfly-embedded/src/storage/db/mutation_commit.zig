@@ -3141,7 +3141,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .authored = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
                 };
                 const foreground_committed = if (prepared_documents_current and append_derived_replay)
-                    try opts.prepared_documents.?.commitForegroundText(S.ownerField(self, "core").*.index_manager, sequence, effective_req, S.ownerField(self, "core").*.store, write_buffers.identity_writes.items, .{ .ptr = &foreground_primary, .commit_fn = ForegroundPrimary.commit })
+                    try opts.prepared_documents.?.commitForegroundText(S.ownerField(self, "core").*.index_manager, S.ownerField(self, "executor").*, sequence, effective_req, S.ownerField(self, "core").*.store, write_buffers.identity_writes.items, .{ .ptr = &foreground_primary, .commit_fn = ForegroundPrimary.commit })
                 else
                     false;
                 if (!foreground_committed) try S.ownerField(self, "core").*.store.putBatchWithPreparedPublications(

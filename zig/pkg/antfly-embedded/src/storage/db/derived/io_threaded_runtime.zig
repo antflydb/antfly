@@ -49,6 +49,9 @@ const Worker = struct {
     applied_sequence: u64,
     persisted_sequence: u64,
     target_sequence: u64,
+    /// Published by the native owner under its registration/lifecycle fence.
+    /// Only this worker folds it into its mutable replay/session state.
+    committed_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
     stop: bool = false,
     paused: bool = false,
     dispatch_active: bool = false,
@@ -170,6 +173,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = name;
         return null;
     }
+
+    pub fn adoptCommittedSequence(_: *@This(), _: []const u8, _: u64) void {}
 
     pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
         return .{};
@@ -577,6 +582,19 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return null;
     }
 
+    pub fn adoptCommittedSequence(self: *DerivedRuntime, name: []const u8, sequence: u64) void {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.workers.items) |worker| {
+            if (worker.kind.kind == .full_text and std.mem.eql(u8, worker.name, name)) {
+                _ = worker.committed_sequence.fetchMax(sequence, .release);
+                self.cond.broadcast(io);
+                return;
+            }
+        }
+    }
+
     pub fn snapshotStats(self: *DerivedRuntime) types.DerivedWorkerStats {
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
@@ -741,7 +759,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     for (snapshots.items) |snapshot| self.alloc.free(snapshot.name);
                 }
                 for (self.workers.items) |worker| {
-                    if (worker.applied_sequence == 0) continue;
+                    // Atomic native publication certifies clean progress for
+                    // this exact registration. Ordinary persisted watermarks
+                    // still take the forced visibility-validation callback.
+                    if (worker.applied_sequence == 0 or worker.committed_sequence.load(.acquire) >= worker.applied_sequence) continue;
                     try appendPersistSnapshot(self.alloc, &snapshots, worker);
                 }
                 const persist_snapshots = try snapshots.toOwnedSlice(self.alloc);
@@ -862,7 +883,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 }
                 for (self.workers.items) |worker| {
                     if (!indexNameInList(worker.name, index_names)) continue;
-                    if (worker.applied_sequence == 0) continue;
+                    // Atomic native publication certifies clean progress for
+                    // this exact registration. Ordinary persisted watermarks
+                    // still take the forced visibility-validation callback.
+                    if (worker.applied_sequence == 0 or worker.committed_sequence.load(.acquire) >= worker.applied_sequence) continue;
                     try appendPersistSnapshot(self.alloc, &snapshots, worker);
                 }
                 const persist_snapshots = try snapshots.toOwnedSlice(self.alloc);
@@ -1008,6 +1032,22 @@ fn workerMain(worker: *Worker) void {
         };
     };
 
+    const committed = worker.committed_sequence.load(.acquire);
+    if (committed > worker.applied_sequence) {
+        _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |err| {
+            close_success = false;
+            runtime.recordError(io, worker, "committed_progress_close", err);
+            return;
+        };
+        runtime.mutex.lockUncancelable(io);
+        worker.applied_sequence = @max(worker.applied_sequence, committed);
+        worker.persisted_sequence = @max(worker.persisted_sequence, committed);
+        worker.recoverable_retry_backoff.reset();
+        worker.retry_not_before_ns = 0;
+        runtime.cond.broadcast(io);
+        runtime.mutex.unlock(io);
+    }
+
     // One replay window per dispatch. Session state belongs to the worker
     // registration and survives yields; no physical thread is pinned at idle.
     for (0..1) |_| {
@@ -1095,6 +1135,13 @@ fn workerMain(worker: *Worker) void {
         // the pre-wait tail and every newly arrived record forces another
         // publication cycle.
         waitForReplayWindow(runtime, worker, from_sequence, io);
+        if (worker.committed_sequence.load(.acquire) > from_sequence) {
+            runtime.mutex.lockUncancelable(io);
+            worker.catch_up_active = false;
+            runtime.cond.broadcast(io);
+            runtime.mutex.unlock(io);
+            return;
+        }
         ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
             runtime.mutex.lockUncancelable(io);
             worker.catch_up_active = false;
@@ -1201,6 +1248,15 @@ fn workerMain(worker: *Worker) void {
         runtime.mutex.unlock(io);
         if (stats.last_sequence == 0 and worker.replay_cursor != null and !worker.replay_cursor.?.canFollowTail()) {
             closeWorkerReplayCursor(runtime, worker);
+        }
+
+        if (worker.committed_sequence.load(.acquire) > from_sequence) {
+            _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |err| {
+                close_success = false;
+                runtime.recordError(io, worker, "superseded_progress_close", err);
+                return;
+            };
+            return;
         }
 
         const target_advance_allowed = if (stats.shouldTryTargetAdvance(from_sequence, target_sequence))
@@ -1425,6 +1481,7 @@ fn beginCollectedWindowCapture(ctx: *anyopaque, _: index_manager_mod.ManagedInde
     const worker: *Worker = @ptrCast(@alignCast(ctx));
     // Called after collection and before any apply callback. Subsequent chunks
     // borrow this same token; no source record or coalesced transaction is split.
+    if (worker.committed_sequence.load(.acquire) > worker.applied_sequence) return error.ReplayAlreadyPublished;
     try ensureWorkerSourceCapture(worker.runtime, worker);
 }
 
@@ -1509,6 +1566,7 @@ fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
 fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
+        error.ReplayAlreadyPublished,
         error.ReplayDocumentNotVisible,
         error.PostingWalCaptureOwnershipConflict,
         error.ArtifactRepairRequired,
@@ -1525,6 +1583,9 @@ fn workerIsStopping(runtime: *DerivedRuntime, worker: *const Worker, io: Io) boo
 }
 
 fn scheduleRecoverableCatchUpRetry(worker: *Worker, err: anyerror) void {
+    // The committed frontier is immediately adoptable at the next dispatch;
+    // superseding private work is neither capacity pressure nor a failure.
+    if (err == error.ReplayAlreadyPublished) return;
     const delay_ns = catch_up_policy.recordRecoverableRetry(
         &worker.runtime.recoverable_retry_counters,
         worker.runtime.backlog.resource_manager,
@@ -1586,6 +1647,8 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
 
         fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool {
             const session: *@This() = @ptrCast(@alignCast(ptr));
+            if (session.worker.committed_sequence.load(.acquire) > session.worker.applied_sequence)
+                return error.ReplayAlreadyPublished;
             // Deferred capture can open during collection. Read the token at
             // callback time, after beginCollectedWindowCapture has installed it.
             return session.runtime.apply_fn(session.runtime.ctx, batch, index_ref, session.worker.catch_up_token);
@@ -3019,4 +3082,66 @@ test "issue1015 idle cleanup persists a new watermark once" {
     try std.testing.expectEqual(@as(u64, 1), runtime.last_truncated_sequence);
     std.debug.print("LITE_IDLE_CLEANUP durable_sequence=1 dispatches=4 persist_calls={d} truncate_calls={d}\n", .{ probe.persist_calls, probe.truncate_calls });
     try std.testing.expectEqual(@as(usize, 1), probe.persist_calls);
+}
+
+test "io threaded replay drains a stale capture before adopting atomic native progress" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/native-progress", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, a, .{ .sequence = 1, .changed_doc_keys = &.{"document"}, .target_hints = &.{.full_text} });
+    const Atomic = @import("antfly_platform").atomic.Value(u64);
+    const Probe = struct {
+        runtime: *DerivedRuntime = undefined,
+        applied: Atomic = .init(0),
+        persisted: Atomic = .init(0),
+        aborted: Atomic = .init(0),
+        retired: Atomic = .init(0),
+        observed_before_drain: Atomic = .init(99),
+        fn begin(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef) !CatchUpSessionToken {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Reproduce a foreground publication racing with an old worker
+            // after it selected its replay origin, before its apply callback.
+            self.runtime.adoptCommittedSequence("text", 1);
+            self.observed_before_drain.store(self.runtime.appliedSequence("text").?, .release);
+            return .{ .value = 1 };
+        }
+        fn finish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken, _: u64, success: bool) !CatchUpFinishResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!success) _ = self.aborted.fetchAdd(1, .monotonic);
+            return .{};
+        }
+        fn apply(raw: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.applied.fetchAdd(1, .monotonic);
+            return true;
+        }
+        fn persist(raw: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.persisted.fetchAdd(1, .monotonic);
+            return true;
+        }
+        fn truncate(raw: *anyopaque, sequence: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired.store(sequence, .release);
+        }
+    };
+    var probe: Probe = .{};
+    var runtime = try DerivedRuntime.init(a, replay_source_mod.Source.fromJournal(&journal), &probe, Probe.apply, Probe.persist, Probe.truncate, Probe.begin, Probe.finish, null, null, null);
+    defer runtime.deinit();
+    probe.runtime = &runtime;
+    try runtime.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+    try runtime.waitForIndexesWithVisibilityWait(1, &.{"text"}, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s });
+    try std.testing.expectEqual(@as(u64, 0), probe.observed_before_drain.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), probe.applied.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), probe.persisted.load(.acquire));
+    try std.testing.expect(probe.aborted.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(?u64, 1), runtime.appliedSequence("text"));
+    try std.testing.expectEqual(@as(u64, 1), probe.retired.load(.acquire));
+    runtime.adoptCommittedSequence("text", 0);
+    try std.testing.expectEqual(@as(?u64, 1), runtime.appliedSequence("text"));
 }

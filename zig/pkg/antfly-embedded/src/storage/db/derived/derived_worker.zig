@@ -188,6 +188,7 @@ fn logCatchUpError(
 ) void {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return;
     if (err == error.ReplayDocumentNotVisible) return;
+    if (err == error.ReplayAlreadyPublished) return;
     if (err == error.ArtifactRepairRequired) return;
     if (err == error.CatchUpDeadlineExceeded) return;
     // Superseded snapshots retain replay debt for a later maintenance turn.

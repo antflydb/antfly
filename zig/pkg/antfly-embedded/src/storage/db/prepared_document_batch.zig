@@ -384,7 +384,7 @@ pub const Plan = struct {
     /// Bind identities from this primary transaction's authoritative postimage.
     /// One native commit publishes all eligible indexes and the primary batch.
     /// Every bound handle is destroyed before releasing its live target fence.
-    pub fn commitForegroundText(self: *Plan, manager: *manager_mod.IndexManager, sequence: u64, request: types.BatchRequest, store: *docstore.DocStore, identity_writes: []const docstore.KVPair, primary: native_publication.Committer) !bool {
+    pub fn commitForegroundText(self: *Plan, manager: *manager_mod.IndexManager, executor: *@import("derived/derived_executor.zig").Executor, sequence: u64, request: types.BatchRequest, store: *docstore.DocStore, identity_writes: []const docstore.KVPair, primary: native_publication.Committer) !bool {
         if (self.text.items.len == 0 or !self.matchesEffects(request)) return false;
         var selected: usize = 0;
         defer {
@@ -430,7 +430,13 @@ pub const Plan = struct {
             }
         }
         try persistent.PersistentIndex.commitNativePublications(self.text_candidates[0..selected], primary);
-        for (self.text_selected[0..selected], self.text_guards[0..selected]) |index, *guard| self.text.items[index].publication.?.activate(guard);
+        for (self.text_selected[0..selected], self.text_guards[0..selected]) |index, *guard| {
+            const publication = self.text.items[index].publication.?;
+            publication.activate(guard);
+            // Durable index/root progress and live replay progress have one
+            // activation edge. Otherwise a visibility wait replays this record.
+            executor.adoptCommittedSequence(publication.config.name, sequence);
+        }
         return true;
     }
 

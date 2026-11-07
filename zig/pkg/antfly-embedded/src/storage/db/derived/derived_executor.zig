@@ -63,6 +63,7 @@ pub const Executor = struct {
         resume_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         remove_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
+        adopt_committed_sequence: ?*const fn (*anyopaque, []const u8, u64) void = null,
         snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
         notify_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
@@ -132,6 +133,13 @@ pub const Executor = struct {
 
     pub fn appliedSequence(self: *Executor, name: []const u8) ?u64 {
         return self.vtable.applied_sequence(self.ptr, name);
+    }
+
+    /// Infallible activation of progress already durable in the same native
+    /// transaction as the index. Caller holds this registration's catalog/apply
+    /// fence. No persistence, reclamation, allocation or user callback runs here.
+    pub fn adoptCommittedSequence(self: *Executor, name: []const u8, sequence: u64) void {
+        if (self.vtable.adopt_committed_sequence) |adopt| adopt(self.ptr, name, sequence);
     }
 
     pub fn snapshotStats(self: *Executor) types.DerivedWorkerStats {
@@ -658,6 +666,7 @@ const manual_vtable = Executor.VTable{
     .resume_worker = manualResumeWorker,
     .remove_worker = manualRemoveWorker,
     .applied_sequence = manualAppliedSequence,
+    .adopt_committed_sequence = manualAdoptCommittedSequence,
     .snapshot_stats = manualSnapshotStats,
     .notify_sequence = manualNotifySequence,
     .notify_indexes = manualNotifyIndexes,
@@ -671,6 +680,17 @@ const manual_vtable = Executor.VTable{
     .wait_for_all = manualWaitForAll,
     .wait_for_indexes = manualWaitForIndexes,
 };
+
+fn manualAdoptCommittedSequence(ptr: *anyopaque, name: []const u8, sequence: u64) void {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    for (runtime.workers.items) |*worker| {
+        if (worker.kind.kind == .full_text and std.mem.eql(u8, worker.name, name)) {
+            worker.applied_sequence = @max(worker.applied_sequence, sequence);
+            worker.target_sequence = @max(worker.target_sequence, sequence);
+            return;
+        }
+    }
+}
 
 fn manualBeginShutdown(_: *anyopaque) void {}
 
@@ -816,6 +836,7 @@ const io_threaded_vtable = Executor.VTable{
     .resume_worker = ioThreadedResumeWorker,
     .remove_worker = ioThreadedRemoveWorker,
     .applied_sequence = ioThreadedAppliedSequence,
+    .adopt_committed_sequence = ioThreadedAdoptCommittedSequence,
     .snapshot_stats = ioThreadedSnapshotStats,
     .notify_sequence = ioThreadedNotifySequence,
     .notify_indexes = ioThreadedNotifyIndexes,
@@ -829,6 +850,11 @@ const io_threaded_vtable = Executor.VTable{
     .wait_for_all = ioThreadedWaitForAll,
     .wait_for_indexes = ioThreadedWaitForIndexes,
 };
+
+fn ioThreadedAdoptCommittedSequence(ptr: *anyopaque, name: []const u8, sequence: u64) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.adoptCommittedSequence(name, sequence);
+}
 
 fn ioThreadedBeginShutdown(ptr: *anyopaque) void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
@@ -1377,4 +1403,39 @@ test "manual replay feedback includes staging and coarse progress on both wait p
             try std.testing.expect(budget.snapshot().effective_quantum_ns[0] > @import("replay_budget.zig").Controller.quantum_ns);
         }
     }
+}
+
+test "manual replay adopts atomic native progress without replay persistence or early retirement" {
+    const a = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const payload = try @import("change_journal.zig").encodeRecord(a, .{ .sequence = 8, .changed_doc_keys = &.{"document"}, .target_hints = &.{.full_text} });
+    defer a.free(payload);
+    try store.appendReplayOpaque(a, 8, payload);
+    const Probe = struct {
+        retired: u64 = 0,
+        fn apply(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            return error.UnexpectedDuplicateReplay;
+        }
+        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            return error.UnexpectedDuplicatePersistence;
+        }
+        fn truncate(raw: *anyopaque, sequence: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired = sequence;
+        }
+    };
+    var probe: Probe = .{};
+    var executor = try initManual(a, replay_source_mod.Source.fromPrimaryStore(&store, null, null), &probe, Probe.apply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer executor.deinit(a);
+    try executor.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+    executor.adoptCommittedSequence("text", 8);
+    executor.adoptCommittedSequence("text", 4);
+    executor.adoptCommittedSequence("absent", 10);
+    try std.testing.expectEqual(@as(?u64, 8), executor.appliedSequence("text"));
+    try std.testing.expectEqual(@as(u64, 0), probe.retired);
+    try executor.waitForIndexes(8, &.{"text"});
+    try std.testing.expectEqual(@as(u64, 8), probe.retired);
 }
