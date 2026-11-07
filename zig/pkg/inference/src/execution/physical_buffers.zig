@@ -4214,7 +4214,7 @@ test "pending exact managed operation blocks warm credit and sole-bank reuse unt
     try std.testing.checkAllAllocationFailures(std.testing.allocator, TerminalReuseFixture.run, .{});
 }
 
-fn privateNativePreparationCase(a: std.mem.Allocator) !void {
+fn privateNativePreparationCase(a: std.mem.Allocator, borrowable: bool) !void {
     var graph = Graph.init(a);
     defer graph.deinit();
     var builder = ml.graph.Builder.init(&graph);
@@ -4236,7 +4236,7 @@ fn privateNativePreparationCase(a: std.mem.Allocator) !void {
     original.coverage_reachable = analysis.reachable;
     original.coverage_backend = backend;
     original.native_frame_dispatch = true;
-    const facts = [_]route.InputBinding{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = true } } }};
+    const facts = [_]route.InputBinding{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = borrowable } } }};
     // Every pre-entry refusal retains the exact fresh caller-owned pool and
     // creates neither binding owners nor a variant cache. No opaque provider
     // access is needed to reject a copied implementation table.
@@ -4335,9 +4335,9 @@ fn privateNativePreparationCase(a: std.mem.Allocator) !void {
     // Re-enter the actual numerical scope and bind its current host value;
     // the cold preparation scope did not run a kernel or lend its input.
     try frame.begin();
-    try std.testing.expect(frame.ownedHostReleaseHasNoCallbacks());
+    try std.testing.expectEqual(!borrowable, frame.ownedHostReleaseHasNoCallbacks());
     const rebound = try frame.rebindNativeProgramHostInputs(&inputs);
-    try std.testing.expect(frame.ownedHostReleaseHasNoCallbacks());
+    try std.testing.expectEqual(!borrowable, frame.ownedHostReleaseHasNoCallbacks());
     const valid_generation = frame.host_input_generation;
     tensor.shape = &.{8};
     const malformed = frame.rebindNativeProgramHostInputs(&inputs);
@@ -4347,34 +4347,40 @@ fn privateNativePreparationCase(a: std.mem.Allocator) !void {
     for (rebound) |input| values[input.node_id] = input.value;
     const output = try frame.executeNativeProgram(&backend, values, output_node, null, &.{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 });
     try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, (try backend.hostFloat32Read(output)).?);
-    const Callback = struct {
-        packet: *@import("../backends/tensor.zig").Tensor,
-        called: bool = false,
-        fn unbind(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.called = true;
-            self.packet.shape = &.{8};
+    if (!borrowable) {
+        const Callback = struct {
+            packet: *@import("../backends/tensor.zig").Tensor,
+            called: bool = false,
+            fn unbind(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.called = true;
+                self.packet.shape = &.{8};
+            }
+            fn write(_: *anyopaque, _: CT, _: route.AssignedOutput, _: []const u8) !void {
+                return error.UnexpectedRebindWrite;
+            }
+            fn deinit(_: *anyopaque) void {}
+            const table = host_ingress.Upload.VTable{ .write = write, .unbind_borrowed = unbind, .deinit = deinit };
+        };
+        var callback = Callback{ .packet = &tensor };
+        const resource = &frame.host_input_resources[0].?;
+        const original_resource = resource.resource;
+        defer {
+            resource.resource = original_resource;
+            tensor.shape = &.{4};
         }
-        fn write(_: *anyopaque, _: CT, _: route.AssignedOutput, _: []const u8) !void {
-            return error.UnexpectedRebindWrite;
-        }
-        fn deinit(_: *anyopaque) void {}
-        const table = host_ingress.Upload.VTable{ .write = write, .unbind_borrowed = unbind, .deinit = deinit };
-    };
-    var callback = Callback{ .packet = &tensor };
-    const resource = &frame.host_input_resources[0].?;
-    const original_resource = resource.resource;
-    resource.resource.context = &callback;
-    resource.resource.vtable = &Callback.table;
-    resource.resource.borrowed = true;
-    try std.testing.expect(!frame.ownedHostReleaseHasNoCallbacks());
-    // A real supported release callback changes a previously valid packet.
-    // Generic revalidation must catch it before any new binding/write.
-    const changed_after_release = frame.rebindNativeProgramHostInputs(&inputs);
-    resource.resource = original_resource;
-    tensor.shape = &.{4};
-    try std.testing.expectError(error.InvalidHostIngressBinding, changed_after_release);
-    try std.testing.expect(callback.called and frame.retired and frame.bound_host_input_count == 0);
+        resource.resource.context = &callback;
+        resource.resource.vtable = &Callback.table;
+        resource.resource.borrowed = true;
+        try std.testing.expect(!frame.ownedHostReleaseHasNoCallbacks());
+        // A real supported release callback changes a previously valid packet.
+        // Generic revalidation must catch it before any new binding/write.
+        const changed_after_release = frame.rebindNativeProgramHostInputs(&inputs);
+        resource.resource = original_resource;
+        tensor.shape = &.{4};
+        try std.testing.expectError(error.InvalidHostIngressBinding, changed_after_release);
+        try std.testing.expect(callback.called and frame.retired and frame.bound_host_input_count == 0);
+    }
     _ = try frame.finish();
     active = false;
     try std.testing.expect(private.pool.frames.items.len == 1);
@@ -4382,12 +4388,12 @@ fn privateNativePreparationCase(a: std.mem.Allocator) !void {
 
 test "private Native preparation consumes one Pool only after publication and matches cached execution" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
-    try privateNativePreparationCase(std.testing.allocator);
+    for ([_]bool{ true, false }) |borrowable| try privateNativePreparationCase(std.testing.allocator, borrowable);
 }
 
 test "private Native preparation preserves caller cleanup through every allocation failure" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, privateNativePreparationCase, .{});
+    for ([_]bool{ true, false }) |borrowable| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, privateNativePreparationCase, .{borrowable});
 }
 
 fn ineligibleBorrowPreflightCase(a: std.mem.Allocator) !void {
