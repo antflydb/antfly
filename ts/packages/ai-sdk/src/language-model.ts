@@ -87,7 +87,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
         headers: options.headers,
       })
       .catch((error) => {
-        throw providerInferenceError(error, "generate");
+        throw providerInferenceError(error, "generate", options.abortSignal);
       });
     return {
       content: toContent(response),
@@ -113,9 +113,9 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     const chunks = await this.inference
       .openGenerateStream(request, { signal, headers: options.headers })
       .catch((error) => {
-        throw providerInferenceError(error, "generate");
+        throw providerInferenceError(error, "generate", signal);
       });
-    const parts = this.streamParts(chunks, warnings);
+    const parts = this.streamParts(chunks, warnings, signal);
     let cancelled = false;
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
@@ -182,7 +182,8 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
 
   private async *streamParts(
     chunks: ReadableStream<GenerateChunk>,
-    warnings: SharedV4Warning[]
+    warnings: SharedV4Warning[],
+    signal?: AbortSignal
   ): AsyncGenerator<LanguageModelV4StreamPart> {
     yield { type: "stream-start", warnings };
     let sentResponseMetadata = false;
@@ -253,7 +254,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
         if (choice.finish_reason) finishReason = toFinishReason(choice.finish_reason);
       }
     } catch (error) {
-      yield { type: "error", error: providerInferenceError(error, "generate") };
+      yield { type: "error", error: providerInferenceError(error, "generate", signal) };
       return;
     } finally {
       await reader.cancel().catch(() => {});

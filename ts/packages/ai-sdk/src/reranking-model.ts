@@ -42,7 +42,7 @@ export class AntflyRerankingModel implements RerankingModelV4 {
         headers: options.headers,
       })
       .catch((error) => {
-        throw providerInferenceError(error, "rerank");
+        throw providerInferenceError(error, "rerank", options.abortSignal);
       });
     const ranking = response.data
       .map((item) => ({ index: item.index, relevanceScore: item.score }))

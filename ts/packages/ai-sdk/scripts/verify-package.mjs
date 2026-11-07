@@ -85,7 +85,7 @@ for (const [extension, statement] of [
 ]) {
   writeFileSync(
     resolve(consumer, `exports.${extension}`),
-    `${statement}\nfor(const name of ['AntflyHTTPError','AntflyResponseError','AntflyClient']) if(typeof sdk[name] !== 'function') throw new Error('SDK foundation missing: '+name);\nif(typeof StandaloneSourcesClient !== 'function') throw new Error('SDK sources subpath missing');\nfor (const key of ['createAntfly','createMemoryTools','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
+    `${statement}\nfor(const name of ['AntflyHTTPError','AntflyResponseError','AntflyClient','InferenceTransportError']) if(typeof sdk[name] !== 'function') throw new Error('SDK foundation missing: '+name);\nif(typeof StandaloneSourcesClient !== 'function') throw new Error('SDK sources subpath missing');\nfor (const key of ['createAntfly','createMemoryTools','createSearchTool','createGraphTool','createSqlTool','createChatHistory','AntflyChatLanguageModel','AntflyEmbeddingModel','AntflyRerankingModel']) { if (typeof integration[key] !== 'function') throw new Error(key); }\n`
   );
   const runtimeCheck = `
 async function verifyEmbeddingBatching() {

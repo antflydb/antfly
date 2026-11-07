@@ -61,35 +61,46 @@ function sourceStream(
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   let finished = false;
+  let output: ReadableStreamDefaultController<Uint8Array>;
   const release = () => {
-    if (!finished) {
-      finished = true;
-      reader.releaseLock();
-    }
+    signal?.removeEventListener("abort", abort);
+    reader.releaseLock();
+  };
+  const dispose = (reason?: unknown) => {
+    if (finished) return;
+    finished = true;
+    // Cancellation must not wait for an injected transport to settle.
+    void reader.cancel(reason).catch(() => {});
+    release();
+  };
+  const abort = () => {
+    if (finished) return;
+    output.error(transportError(signal));
+    dispose(signal?.reason);
   };
   return new ReadableStream<Uint8Array>({
+    start(controller) {
+      output = controller;
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+    },
     async pull(controller) {
       try {
-        const next = await abortable(reader.read(), signal);
+        const next = await reader.read();
+        if (finished) return;
         if (next.done) {
+          finished = true;
           release();
           controller.close();
         } else controller.enqueue(next.value);
       } catch {
+        if (finished) return;
         controller.error(transportError(signal));
-        // Releasing a lock is permitted even when the abandoned read is pending.
-        void reader.cancel().catch(() => {});
-        release();
+        dispose();
       }
     },
-    async cancel(reason) {
-      try {
-        await abortable(reader.cancel(reason), signal);
-      } catch {
-        throw transportError(signal);
-      } finally {
-        release();
-      }
+    cancel(reason) {
+      dispose(reason);
     },
   });
 }

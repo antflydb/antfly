@@ -1,8 +1,23 @@
 import { APICallError } from "@ai-sdk/provider";
-import { InferenceAPIError, InferenceCapacityError } from "@antfly/sdk";
+import { InferenceAPIError, InferenceCapacityError, InferenceTransportError } from "@antfly/sdk";
 
 /** Preserve Antfly details without retaining prompts or signed source URLs. */
-export function providerInferenceError(error: unknown, endpoint: string): unknown {
+export function providerInferenceError(
+  error: unknown,
+  endpoint: string,
+  signal?: AbortSignal
+): unknown {
+  signal?.throwIfAborted();
+  const transport = InferenceTransportError.from(error);
+  if (transport) {
+    return new APICallError({
+      message: transport.message,
+      url: `antfly:/ai/v1/${endpoint}`,
+      requestBodyValues: undefined,
+      isRetryable: true,
+      cause: transport,
+    });
+  }
   if (!(error instanceof InferenceAPIError)) return error;
   const headers = { ...error.responseHeaders };
   if (error instanceof InferenceCapacityError) {

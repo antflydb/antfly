@@ -385,6 +385,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return 0, "", err
 	}
+	if err := restoreInventoryRelativeKeys(s, connection.Provider, state.Published); err != nil {
+		return 0, "", err
+	}
 	if state.Owned == nil {
 		state.Owned = map[string]string{}
 	}
@@ -458,6 +461,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if err := writeJSON(statePath, state, 256<<20); err != nil {
 			return 0, "", err
 		}
+	}
+	if err := restoreInventoryRelativeKeys(s, connection.Provider, state.Pending); err != nil {
+		return 0, "", err
 	}
 	if !state.Pending.Authoritative || len(state.Pending.Objects) > sourceInventoryLimit(connection.Provider) {
 		return 0, "", fmt.Errorf("invalid persisted inventory authority")

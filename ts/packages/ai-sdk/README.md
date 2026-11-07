@@ -226,7 +226,10 @@ const model = antfly.embeddingModel("embedding-model", { maxEmbeddingsPerCall: 1
 
 Generation, streaming HTTP setup, embedding, and reranking failures use the AI SDK
 retry protocol. Explicit server `retryable: false` responses are never retried;
-otherwise 408, 429, and 5xx responses are retryable by default. Capacity backoff
+otherwise 408, 429, and 5xx responses are retryable by default. Recognized transient
+connection failures (including resets and timeouts) are retryable during setup
+and non-streaming response reads; arbitrary TypeErrors and certificate errors
+are not. Caller aborts retain their original reason. Capacity backoff
 and valid `Retry-After` headers are forwarded to the AI SDK's retry policy.
 `getInferenceError(error)` recovers the original Antfly details from provider errors
 or exhausted retries; asset classification helpers and `retryDelayMs` also accept

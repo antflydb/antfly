@@ -969,3 +969,10 @@ member batch, source-versus-artifact trigram isolation, path/type exclusions and
 retained snapshot completion. Model HTTP replies
 are deterministic fixtures; this validates the integration, not GPU/model quality.
 Private-IP fetching is enabled only in the isolated smoke configuration.
+
+
+Interrupted inventories from older companion versions are upgraded in place:
+local, S3 and GCS relative keys are reconstructed from the pinned item IDs and
+matching source configuration before publication. Namespace adoption therefore
+preserves row IDs on resume without listing the provider again. Inconsistent
+checkpoint identities fail before content publication.

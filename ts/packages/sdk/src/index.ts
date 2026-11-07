@@ -89,6 +89,7 @@ export {
   InferenceAPIError,
   InferenceCapacityError,
   InferenceClient,
+  InferenceTransportError,
 } from "./inference-client.js";
 export {
   decodeNumericDenseFrame,

@@ -73,7 +73,7 @@ it.each([
     handler(new Request("https://app.test/file")).then((response) => response.text())
   );
 });
-it("sanitizes stream cancellation errors without buffering display bytes", async () => {
+it("settles display cancellation even when upstream cleanup fails", async () => {
   const cancel = vi.fn(() => {
     throw leaked();
   });
@@ -94,7 +94,7 @@ it("sanitizes stream cancellation errors without buffering display bytes", async
   const response = await handler(new Request("https://app.test/file"));
   const reader = response.body?.getReader();
   expect((await reader?.read())?.value).toEqual(new Uint8Array([1]));
-  await sanitized(reader?.cancel());
+  await expect(reader?.cancel()).resolves.toBeUndefined();
   expect(cancel).toHaveBeenCalledOnce();
 });
 it.each([
@@ -198,5 +198,43 @@ it("does not pull a discarded HEAD body", async () => {
   const response = await handler(new Request("https://app.test/file", { method: "HEAD" }));
   expect(response.body).toBeNull();
   expect(pull).not.toHaveBeenCalled();
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it.each([
+  false,
+  true,
+])("aborts a backpressured display stream (stalled cleanup: %s)", async (stalled) => {
+  const controller = new AbortController();
+  const reason = new Error("browser disconnected");
+  const cancel = vi.fn(() => (stalled ? new Promise<void>(() => {}) : undefined));
+  const pull = vi.fn((output: ReadableStreamDefaultController<Uint8Array>) =>
+    output.enqueue(new Uint8Array([1]))
+  );
+  const handler = createAssetDisplayHandler({
+    client,
+    authorize: () => true,
+    referenceId: () => encodeAssetReference(reference),
+    fetch: async () => new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 })),
+  });
+  const response = await handler(
+    new Request("https://app.test/file", { signal: controller.signal })
+  );
+  await vi.waitFor(() => expect(pull).toHaveBeenCalledOnce());
+  controller.abort(reason);
+  expect(cancel).toHaveBeenCalledOnce();
+  await expect(response.body?.getReader().read()).rejects.toBe(reason);
+});
+
+it("settles consumer cancellation without waiting for uncooperative cleanup", async () => {
+  const cancel = vi.fn(() => new Promise<void>(() => {}));
+  const handler = createAssetDisplayHandler({
+    client,
+    authorize: () => true,
+    referenceId: () => encodeAssetReference(reference),
+    fetch: async () => new Response(new ReadableStream({ cancel }, { highWaterMark: 0 })),
+  });
+  const response = await handler(new Request("https://app.test/file"));
+  await response.body?.cancel();
   expect(cancel).toHaveBeenCalledOnce();
 });

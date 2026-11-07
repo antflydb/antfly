@@ -68,7 +68,7 @@ export class AntflyEmbeddingModel implements EmbeddingModelV4 {
         headers: options.headers,
       })
       .catch((error) => {
-        throw providerInferenceError(error, "embed");
+        throw providerInferenceError(error, "embed", options.abortSignal);
       });
     if (response.errors?.length) {
       throw new Error(

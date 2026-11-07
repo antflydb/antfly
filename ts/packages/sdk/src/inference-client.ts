@@ -135,6 +135,55 @@ export function isTransientCapacityError(
   );
 }
 
+/** A recognized transient transport failure, without request URLs or raw causes. */
+export class InferenceTransportError extends Error {
+  readonly retryable = true;
+  constructor(readonly code: string) {
+    super(`Inference transport failed (${code})`);
+    this.name = "InferenceTransportError";
+  }
+
+  /** Recognize runtime connection errors without classifying arbitrary TypeErrors. */
+  static from(error: unknown): InferenceTransportError | undefined {
+    const seen = new Set<unknown>();
+    let current: unknown = error;
+    for (let depth = 0; depth < 16 && current instanceof Error && !seen.has(current); depth++) {
+      if (current instanceof InferenceTransportError) return current;
+      seen.add(current);
+      const code = "code" in current ? current.code : undefined;
+      if (typeof code === "string" && TRANSIENT_TRANSPORT_CODES.has(code)) {
+        return new InferenceTransportError(code);
+      }
+      current = "cause" in current ? current.cause : undefined;
+    }
+    return undefined;
+  }
+}
+
+const TRANSIENT_TRANSPORT_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EPIPE",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+
+async function fetchInference(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+  try {
+    return await globalThis.fetch(input, init);
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw InferenceTransportError.from(error) ?? error;
+  }
+}
+
 export class InferenceClient {
   // The embedding and reranking operations also describe a negotiated binary
   // response; naming the media type keeps each `data` typed as its JSON body,
@@ -181,7 +230,7 @@ export class InferenceClient {
     request: Omit<GenerateRequest, "stream">,
     options?: RequestOptions
   ): Promise<GenerateResponse> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
+    const response = await fetchInference(`${this.baseUrl}/ai/v1/generate`, {
       method: "POST",
       headers: this.requestHeaders(options?.headers, "application/json"),
       body: JSON.stringify({ ...request, stream: false }),
@@ -217,7 +266,7 @@ export class InferenceClient {
     request: ContextPrepareRequest,
     options?: RequestOptions
   ): Promise<ContextPrepareResponse> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/generate/context/prepare`, {
+    const response = await fetchInference(`${this.baseUrl}/ai/v1/generate/context/prepare`, {
       method: "POST",
       headers: this.requestHeaders(options?.headers, "application/json"),
       body: JSON.stringify(request),
@@ -248,7 +297,7 @@ export class InferenceClient {
   ): Promise<ReadableStream<GenerateChunk>> {
     options?.signal?.throwIfAborted();
     const response = await awaitResponse(
-      fetch(`${this.baseUrl}/ai/v1/generate`, {
+      fetchInference(`${this.baseUrl}/ai/v1/generate`, {
         method: "POST",
         headers: this.requestHeaders(options?.headers, "text/event-stream"),
         body: JSON.stringify({ ...request, stream: true }),
@@ -404,7 +453,7 @@ export class InferenceClient {
    * ```
    */
   async embedDense(model: string, input: EmbedInput, options?: EmbedOptions): Promise<number[][]> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/embed`, {
+    const response = await fetchInference(`${this.baseUrl}/ai/v1/embed`, {
       method: "POST",
       signal: options?.signal,
       headers: this.requestHeaders(options?.headers, NUMERIC_RESPONSE_ACCEPT),
@@ -519,7 +568,7 @@ export class InferenceClient {
     request: ChunkEmbeddingRequest,
     options?: RequestOptions
   ): AsyncGenerator<ChunkEmbeddingStreamEvent> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/chunk`, {
+    const response = await fetchInference(`${this.baseUrl}/ai/v1/chunk`, {
       method: "POST",
       headers: this.requestHeaders(options?.headers, "application/x-ndjson"),
       body: JSON.stringify({ ...request, stream: true }),
@@ -1073,7 +1122,7 @@ async function fetchLimitedInferenceResponse(
   request: Request,
   maxBinaryResponseBytes: number
 ): Promise<Response> {
-  const response = await globalThis.fetch(request);
+  const response = await fetchInference(request);
   if (!response.body) return response;
 
   const mediaType = responseMediaType(response);
