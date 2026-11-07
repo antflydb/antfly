@@ -10,52 +10,87 @@ private final class FeedbackPanel: NSPanel {
   override var canBecomeMain: Bool { false }
 }
 @MainActor final class RecordingOverlay {
-  private let panel: FeedbackPanel
-  private let hosting: NSHostingView<FeedbackView>
+  private var panel: FeedbackPanel?
+  private var hosting: NSHostingView<FeedbackView>?
+  private struct Snapshot {
+    var phase: DictationPhase
+    var raw: String
+    var draft: String
+    var message: String
+    var note: String
+    var recover: Bool
+  }
+  private var pending: Snapshot?
+  private var scheduled = false
   private let cancel: () -> Void
   private let copy: () -> Void
   private let insert: () -> Void
   private let retry: () -> Void
+  var hasNativeWindow: Bool { panel != nil }
   init(
     cancel: @escaping () -> Void, copy: @escaping () -> Void, insert: @escaping () -> Void,
     retry: @escaping () -> Void
   ) {
+    // StateObject initializers run inside a SwiftUI graph update. Creating or
+    // laying out another NSHostingView here re-enters that graph and aborts.
     self.cancel = cancel
     self.copy = copy
     self.insert = insert
     self.retry = retry
-    hosting = NSHostingView(
-      rootView: FeedbackView(
-        phase: .idle, raw: "", draft: "", message: "", note: "", recover: false, cancel: cancel,
-        copy: copy, insert: insert, retry: retry))
-    panel = FeedbackPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 420, height: 180),
-      styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-    panel.level = .floating
-    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-    panel.hidesOnDeactivate = false
-    panel.isReleasedWhenClosed = false
-    panel.isOpaque = false
-    panel.backgroundColor = .clear
-    panel.hasShadow = true
-    panel.contentView = hosting
   }
-  func hide() { panel.orderOut(nil) }
+  func hide() {
+    pending = nil
+    schedule()
+  }
   func show(
     phase: DictationPhase, raw: String, draft: String, message: String, note: String, recover: Bool
   ) {
-    guard phase != .idle && phase != .canceled else {
+    if phase == .idle || phase == .canceled {
       hide()
       return
     }
-    hosting.rootView = FeedbackView(
-      phase: phase, raw: raw, draft: draft, message: message, note: note,
-      recover: recover, cancel: cancel, copy: copy, insert: insert, retry: retry)
+    pending = Snapshot(
+      phase: phase, raw: raw, draft: draft, message: message, note: note, recover: recover)
+    schedule()
+  }
+  private func schedule() {
+    guard !scheduled else { return }
+    scheduled = true
+    // All native window work belongs outside the caller's SwiftUI update.
+    // Coalescing also prevents a canceled/older frame from reopening the panel.
+    DispatchQueue.main.async { [weak self] in self?.applyPending() }
+  }
+  private func applyPending() {
+    scheduled = false
+    guard let snapshot = pending else {
+      panel?.orderOut(nil)
+      return
+    }
+    let view = FeedbackView(
+      phase: snapshot.phase, raw: snapshot.raw, draft: snapshot.draft,
+      message: snapshot.message, note: snapshot.note, recover: snapshot.recover,
+      cancel: cancel, copy: copy, insert: insert, retry: retry)
+    if panel == nil {
+      let hosting = NSHostingView(rootView: view)
+      let panel = FeedbackPanel(
+        contentRect: NSRect(x: 0, y: 0, width: 420, height: 180),
+        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+      panel.level = .floating
+      panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+      panel.hidesOnDeactivate = false
+      panel.isReleasedWhenClosed = false
+      panel.isOpaque = false
+      panel.backgroundColor = .clear
+      panel.hasShadow = true
+      self.hosting = hosting
+      self.panel = panel
+      panel.contentView = hosting
+    }
+    guard let panel, let hosting else { return }
+    hosting.rootView = view
     hosting.layoutSubtreeIfNeeded()
     panel.setContentSize(NSSize(width: 420, height: max(80, min(300, hosting.fittingSize.height))))
-    if let screen = NSWorkspace.shared.frontmostApplication.flatMap({ _ in NSScreen.main })
-      ?? NSScreen.screens.first
-    {
+    if let screen = NSScreen.main ?? NSScreen.screens.first {
       let area = screen.visibleFrame
       panel.setFrameOrigin(NSPoint(x: area.midX - 210, y: area.minY + 32))
     }
