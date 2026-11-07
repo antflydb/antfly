@@ -8,6 +8,12 @@ allocation guard; batching does not change the 38 GiB read-profile ceiling.
 
 ## Compatibility and ownership
 
+`executor_microbatch.zig` owns the shared broker, while `tensor_microbatch.zig`
+combines compatible tensor forwards. `gliner_microbatch.zig` handles GLiNER
+classification budgets and results, boundary compatibility keys, and per-request
+replies. `output_owner.zig` retains shared output admission until the last consumer
+releases it. Read/write serving profiles remain deployment configuration.
+
 Embedding text groups have at most four rows and 8,192 bucket-padded tokens in
 aggregate. Each input may use the full 8,192-token model context, including task
 prefixes and special tokens. The resident CUDA backend declares this capability
@@ -69,15 +75,15 @@ The process-wide DeviceBuffer guard remains the physical allocation backstop.
 
 ## Evidence and reproduction
 
-`test-read-pool-microbatch` covers broker compatibility, bounded waves,
+`test-executor-microbatch` covers broker compatibility, bounded waves,
 queued/claimed cancellation, deadlines, caller-local presentation, complete
 cohort budgets and output retention through allocation failures. It runs in the
 default inference unit graph and requires neither a model nor a GPU:
 
 ```sh
 cd zig/pkg/inference
-zig build test-read-pool-microbatch -Dcuda=false -Dmetal=false --summary all
-zig build test-read-pool-microbatch -Dcuda=true -Dmetal=false --summary all
+zig build test-executor-microbatch -Dcuda=false -Dmetal=false --summary all
+zig build test-executor-microbatch -Dcuda=true -Dmetal=false --summary all
 ```
 
 The HTTP campaign independently observes native batches for embeddings,
