@@ -235,6 +235,19 @@ The normal baseline in this run was mostly origin processing, while the original
 outlier's unexplained excess remains beyond Google's origin. Cloudflare edge
 telemetry or a fully traced recurrence remains necessary for the specific cause.
 
+An additional three All searches were bracketed by settled engine metrics,
+waiting six seconds on either side for the five-second exposition cache. The
+deltas contained exactly three composed requests and 15 leaf calls. Composed
+execution totaled 6.717 seconds; source setup 3.377 seconds, publication selection
+1.098 seconds, leaf cursor retention 0.605 seconds, WAL-cut work 0.546 seconds,
+composed cursor work 0.327 seconds and ranking 0.074 seconds. Phases nest, so do
+not add every counter. Per search, source/publication averaged 1.492 seconds,
+leaf/composed cursor work 0.311 seconds, WAL work 0.182 seconds and ranking
+0.025 seconds. Client durations were 2.557, 2.407 and 2.240 seconds. These data
+prioritize repeated source/publication setup and durable cursor round trips over
+ranking CPU for the ordinary sample baseline. They do not explain the isolated
+21.497-second excess or establish archive-scale performance.
+
 ## Remaining scope
 
 These are bounded sample checks. Full-archive construction/performance,
