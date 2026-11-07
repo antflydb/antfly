@@ -333,9 +333,65 @@ def unsupported_chroma():
     )
 
 
+def cropped_reference_fixtures():
+    # A tiny presentation can still need a 4K coded reference pool. Use a
+    # conformance window, not a resize, to exercise that distinction.
+    project = Path(__file__).resolve().parents[5]
+    for depth, pix_fmt in ((8, "yuv420p"), (10, "yuv420p10le")):
+        name = f"hevc-cropped4k-{depth}.mp4"
+        target = ROOT / name
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=gray:s=3840x2160:r=1",
+                "-frames:v",
+                "2",
+                "-c:v",
+                "libx265",
+                "-pix_fmt",
+                pix_fmt,
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "pools=1:frame-threads=1:log-level=error:info=0:keyint=1",
+                "-tag:v",
+                "hvc1",
+                "-bsf:v",
+                "hevc_metadata=crop_right=3712:crop_bottom=2032",
+                "-map_metadata",
+                "-1",
+                "-fflags",
+                "+bitexact",
+                str(target),
+            ],
+            check=True,
+        )
+        data = bytearray(target.read_bytes())
+        for start, size, typ, _ in boxes(data):
+            if typ == b"hvc1":
+                data[start + 32 : start + 36] = struct.pack(">HH", 128, 128)
+            elif typ == b"tkhd":
+                data[start + size - 8 : start + size] = struct.pack(
+                    ">II", 128 << 16, 128 << 16
+                )
+        target.write_bytes(data)
+        (project / "zig/lib/video/testdata" / name).write_bytes(data)
+    convert("hevc-cropped4k-8.mp4", "hevc-cropped4k-inband.mp4", False)
+    (project / "zig/lib/video/testdata/hevc-cropped4k-inband.mp4").write_bytes(
+        (ROOT / "hevc-cropped4k-inband.mp4").read_bytes()
+    )
+
+
 if __name__ == "__main__":
     convert("hevc-sar-nopasp.mp4", "hevc-sar-inband.mp4", False)
     convert("hevc-hlg-nocolr.mp4", "hevc-hlg-partial-inband.mp4", True)
     multiple_sps()
     unsupported_chroma()
     hardware_sized_sar()
+    cropped_reference_fixtures()

@@ -70,10 +70,10 @@ pub const Frame = struct {
     tone: u32 = 0,
     sar: PixelAspect = .{},
     /// Square-pixel size the model sees, after SAR and rotation.
-    pub fn displaySize(self: Frame) [2]u32 {
-        const stretched = @max(1, (@as(u64, self.width) * self.sar.horizontal + self.sar.vertical / 2) / self.sar.vertical);
-        const width: u32 = @intCast(@min(stretched, 16384));
-        return if (self.rotation & 1 != 0) .{ self.height, width } else .{ width, self.height };
+    pub fn displaySize(self: Frame) ![2]u32 {
+        if (self.rotation > 3) return error.UnsupportedVideoDisplay;
+        const display = try @import("antfly_video").display.sarLayout(self.width, self.height, self.sar.horizontal, self.sar.vertical, @fromBackingInt(@intCast(self.rotation)));
+        return .{ display.width, display.height };
     }
     /// Pixels in displayed orientation, before SAR changes their aspect.
     pub fn rasterSize(self: Frame) [2]u32 {
@@ -229,7 +229,7 @@ pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control
     const end_us = try validateTimeline(reader.track, reader.packets);
     const sampler = try embeddingSamplerForReader(&reader, end_us);
     const frame = Frame{ .device = 0, .pitch = 0, .width = reader.track.width, .height = reader.track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = try quarterTurns(reader.track.display_matrix), .sar = try displayAspect(allocator, reader.track) };
-    const display = frame.displaySize();
+    const display = try frame.displaySize();
     return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length, .codec = reader.track.codec, .display_width = display[0], .display_height = display[1] };
 }
 
@@ -412,6 +412,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     const color = try containerColor(track.color_info);
     state.rotation = try quarterTurns(track.display_matrix);
     state.sar = try displayAspect(allocator, track);
+    _ = try (Frame{ .device = 0, .pitch = 0, .width = track.width, .height = track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = state.rotation, .sar = state.sar }).displaySize();
     if (reader.packets.len == 0) return error.EmptyVideo;
     state.sampler.end_us = try validateTimeline(track, reader.packets);
     if (sampling == .embedding_gemma2) {
@@ -597,9 +598,9 @@ test "video container color accepts SDR and consistent HDR, and rejects the rest
 
 test "NVDEC display geometry applies SAR before quarter turns" {
     var frame = Frame{ .device = 0, .pitch = 0, .width = 64, .height = 48, .timestamp_us = 0, .matrix = 0, .full_range = 0, .sar = .{ .horizontal = 2, .vertical = 1 } };
-    try std.testing.expectEqual([2]u32{ 128, 48 }, frame.displaySize());
+    try std.testing.expectEqual([2]u32{ 128, 48 }, try frame.displaySize());
     frame.rotation = try quarterTurns(.{ 0, 65536, 0, -65536, 0, 0, 0, 0, 1073741824 });
-    try std.testing.expectEqual([2]u32{ 48, 128 }, frame.displaySize());
+    try std.testing.expectEqual([2]u32{ 48, 128 }, try frame.displaySize());
     try std.testing.expectEqual([2]u32{ 48, 64 }, frame.rasterSize());
     try std.testing.expectError(error.UnsupportedVideoFormat, quarterTurns(.{ 65536, 0, 0, 0, -65536, 0, 0, 0, 1073741824 }));
 }
@@ -1382,4 +1383,37 @@ test "HEVC inband inspection preserves stream SAR and partial configuration colo
             _ = try inspectEmbedding(allocator, @embedFile("../../testdata/video/codecs/hevc-sar-inband.mp4"), .{});
         }
     }.run, .{});
+}
+
+test "NVDEC display geometry rejects out of range SAR before decoder admission" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, @embedFile("../../testdata/video/codecs/hevc-sar192.mp4"));
+    defer a.free(bytes);
+    const pasp = std.mem.indexOf(u8, bytes, "pasp").?;
+    for ([_][2]u32{ .{ 1000, 1 }, .{ 1, 1000 } }) |sar| {
+        std.mem.writeInt(u32, bytes[pasp + 4 ..][0..4], sar[0], .big);
+        std.mem.writeInt(u32, bytes[pasp + 8 ..][0..4], sar[1], .big);
+        try std.testing.expectError(error.ResourceLimitExceeded, inspectEmbedding(a, bytes, .{}));
+        for (0..4) |rotation| {
+            const frame = Frame{ .device = 0, .pitch = 0, .width = 192, .height = 192, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = @intCast(rotation), .sar = .{ .horizontal = sar[0], .vertical = sar[1] } };
+            try std.testing.expectError(error.ResourceLimitExceeded, frame.displaySize());
+        }
+    }
+    if (comptime build_options.enable_cuda and builtin.os.tag == .linux) {
+        var compute = try cuda.CudaCompute.init(a);
+        defer compute.deinit();
+        const Reject = struct {
+            fn consume(_: *anyopaque, _: Frame) !void {
+                return error.TestUnexpectedResult;
+            }
+        };
+        var context_byte: u8 = 0;
+        try std.testing.expectError(error.ResourceLimitExceeded, decodeMp4(a, &compute.ctx, bytes, .{ .context = &context_byte, .consume = Reject.consume }));
+        try std.testing.expect(compute.ctx.video_decoder_cache == null);
+    }
+    // Inclusive upper bound, equivalent large ratios and all quarter turns.
+    for (0..4) |rotation| {
+        const frame = Frame{ .device = 0, .pitch = 0, .width = 4096, .height = 2160, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = @intCast(rotation), .sar = .{ .horizontal = 4000000000, .vertical = 1000000000 } };
+        try std.testing.expectEqual(if (rotation & 1 == 0) [2]u32{ 16384, 2160 } else [2]u32{ 2160, 16384 }, try frame.displaySize());
+    }
 }

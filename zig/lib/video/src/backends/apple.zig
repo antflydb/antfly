@@ -443,9 +443,11 @@ pub fn surfaceAdmissionBytes(width: u32, height: u32, selections: usize) !u64 {
     return surfaceAdmissionBytesForDepth(width, height, selections, 8);
 }
 pub fn surfaceAdmissionBytesForDepth(width: u32, height: u32, selections: usize, depth: u8) !u64 {
+    return std.math.mul(u64, try surfacePayloadBytesForDepth(width, height, depth), try std.math.add(u64, selections, 24));
+}
+pub fn surfacePayloadBytesForDepth(width: u32, height: u32, depth: u8) !u64 {
     const row = std.mem.alignForward(u64, @as(u64, width) + 256, 256);
-    const per_frame = try std.math.mul(u64, row, (@as(u64, height) + 32) * (if (depth > 8) @as(u64, 4) else 2));
-    return std.math.mul(u64, per_frame, try std.math.add(u64, selections, 24));
+    return std.math.mul(u64, row, (@as(u64, height) + 32) * (if (depth > 8) @as(u64, 4) else 2));
 }
 fn decode(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, sink: ?Sink) !Batch {
     if (!supported) return error.UnsupportedVideoBackend;

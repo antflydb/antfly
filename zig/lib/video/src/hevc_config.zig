@@ -61,6 +61,22 @@ pub fn parse(a: std.mem.Allocator, config: []const u8) !?Signal {
     return null;
 }
 
+pub const Geometry = struct { width: u32, height: u32, depth: u8 };
+
+/// Bounded, allocation-free SPS geometry for metadata-only admission. The full
+/// parser is shared with activation, so depth/tool validation cannot drift.
+pub fn spsGeometry(unit: []const u8, control: media.source.Control) !Geometry {
+    if (unit.len > std.math.maxInt(u16)) return error.MalformedVideoConfig;
+    const parsed = try nal.parseHeader(unit);
+    if (parsed.header.nal_unit_type.raw() != 33 or parsed.header.layer_id != 0) return error.UnsupportedVideoProfile;
+    var scratch: [std.math.maxInt(u16)]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    var bits = try bits_mod.Bits.initControlled(fixed.allocator(), parsed.rbsp, control);
+    defer bits.deinit();
+    const sps = try params.parseSps(&bits);
+    return .{ .width = sps.width, .height = sps.height, .depth = sps.bit_depth_luma };
+}
+
 /// Parameter-set identities have codec-defined bounds (16 VPS, 16 SPS, 64 PPS).
 /// Merge into fixed slots, replacing the same ID with the sample's newer value.
 /// Bound parsing work too: repeated IDs must not turn a small request into an

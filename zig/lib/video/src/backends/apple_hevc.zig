@@ -27,8 +27,36 @@ pub const max_surface_bytes: u64 = 1024 * 1024 * 1024;
 /// Selected pictures leave as soon as they decode, so only the reference pool and
 /// one output stay live. That keeps ordinary 4K clips on the hardware route.
 pub fn surfaceBytes(track: media.mp4.Track) !u64 {
-    const surface_format = try format(track.codec_config, false);
-    return apple.surfaceAdmissionBytesForDepth(track.width, track.height, 1, surface_format.bitDepth());
+    return surfaceBytesControlled(track, .{});
+}
+
+pub fn surfaceBytesControlled(track: media.mp4.Track, control: media.source.Control) !u64 {
+    const output_format = try format(track.codec_config, false);
+    const output = try apple.surfacePayloadBytesForDepth(track.width, track.height, output_format.bitDepth());
+    var arrays = (try @import("../hevc_nal.zig").parseConfigurationRecord(track.codec_config)).arrays();
+    var references: u64 = 0;
+    var count: usize = 0;
+    while (try arrays.next()) |array| {
+        if (array.nal_unit_type != 33) continue;
+        var units = array.nals;
+        while (try units.next()) |unit| {
+            try control.check();
+            if (count == 256) return error.ResourceLimitExceeded;
+            count += 1;
+            const geometry = config_info.spsGeometry(unit, control) catch |err| switch (err) {
+                error.UnsupportedVideoProfile => continue,
+                else => return err,
+            };
+            references = @max(references, try apple.surfaceAdmissionBytesForDepth(geometry.width, geometry.height, 0, geometry.depth));
+            // A resolved record puts the active SPS first, and activation has
+            // checked that every picture preserves its geometry/depth policy.
+            if (track.hevc_policy_validated) return std.math.add(u64, references, output);
+        }
+    }
+    if (references == 0) return error.MissingVideoParameterSet;
+    // Unresolved metadata reserves the largest supported SPS envelope. In-band
+    // additions are admitted after controlled activation, before session creation.
+    return std.math.add(u64, references, output);
 }
 
 pub const Sink = struct {
@@ -127,15 +155,15 @@ pub fn decodeTo(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []con
     if (reader.track.timescale > std.math.maxInt(i32)) return error.UnsupportedTimeline;
     const signal = try config_info.parse(a, reader.track.codec_config);
     const surface_format = try format(reader.track.codec_config, try config_info.fullRange(signal, reader.track.color_info));
+    const bytes = try surfaceBytesControlled(reader.track, reader.input.control);
+    if (bytes > options.max_surface_bytes) return error.ResourceLimitExceeded;
+    var reservation = if (options.pool) |pool| try pool.acquire(if (options.device_surfaces) .{ .device_bytes = bytes } else .{ .host_bytes = bytes }) else media.admission.Token{};
+    defer reservation.deinit();
     const sorted = try a.dupe(usize, selected);
     defer a.free(sorted);
     std.mem.sort(usize, sorted, {}, std.sort.asc(usize));
     const runs = try restart.plan(a, reader, sorted);
     defer a.free(runs);
-    const bytes = try surfaceBytes(reader.track);
-    if (bytes > options.max_surface_bytes) return error.ResourceLimitExceeded;
-    var reservation = if (options.pool) |pool| try pool.acquire(if (options.device_surfaces) .{ .device_bytes = bytes } else .{ .host_bytes = bytes }) else media.admission.Token{};
-    defer reservation.deinit();
     const slots = try a.alloc(?apple.Surface, selected.len);
     defer a.free(slots);
     @memset(slots, null);
@@ -206,4 +234,45 @@ test "VideoToolbox HEVC decodes selected pictures from a sparse open timeline" {
     const receipt = try decodeTo(a, &reader, &.{ last, 0, last / 2 }, .{}, .{ .context = &count, .accept = Count.accept });
     try std.testing.expectEqual(@as(usize, 3), count.hits);
     try std.testing.expect(receipt.submitted_packets > 0);
+}
+
+test "HEVC cropped pictures reserve coded references and output separately before decoding" {
+    const a = std.testing.allocator;
+    inline for (.{ "hevc-cropped4k-8.mp4", "hevc-cropped4k-10.mp4", "hevc-cropped4k-inband.mp4" }) |name| {
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../../testdata/" ++ name) }, .identity = "cropped-budget" };
+        var reader = try media.mp4.Reader.init(a, &source, .{ .codecs = std.EnumSet(media.mp4.Codec).initOne(.hevc) });
+        defer reader.deinit();
+        const normalized = try config_info.normalizeReader(a, &reader);
+        defer if (normalized) |bytes| a.free(bytes);
+        const depth: u8 = if (std.mem.indexOf(u8, name, "-10.") != null) 10 else 8;
+        const expected = try std.math.add(u64, try apple.surfaceAdmissionBytesForDepth(3840, 2160, 0, depth), try apple.surfacePayloadBytesForDepth(128, 128, depth));
+        try std.testing.expectEqual(expected, try surfaceBytes(reader.track));
+        var upscaled = reader.track;
+        upscaled.width = 4096;
+        upscaled.height = 4096;
+        try std.testing.expect(try surfaceBytes(upscaled) > expected);
+        if (builtin.os.tag != .macos) continue;
+        const Count = struct {
+            hits: usize = 0,
+            fn accept(raw: *anyopaque, _: usize, surface: *const apple.Surface) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try std.testing.expectEqual(@as(u32, 128), surface.width);
+                try std.testing.expectEqual(@as(u32, 128), surface.height);
+                self.hits += 1;
+            }
+        };
+        var count: Count = .{};
+        const sink = Sink{ .context = &count, .accept = Count.accept };
+        const old_visible_budget = try apple.surfaceAdmissionBytesForDepth(128, 128, 1, depth);
+        try std.testing.expectError(error.ResourceLimitExceeded, decodeTo(a, &reader, &.{0}, .{ .max_surface_bytes = old_visible_budget }, sink));
+        var denied = media.admission.Pool{ .limits = .{ .device_bytes = expected - 1 } };
+        try std.testing.expectError(error.SharedAdmissionExceeded, decodeTo(a, &reader, &.{0}, .{ .pool = &denied, .device_surfaces = true }, sink));
+        try std.testing.expectEqual(@as(usize, 0), count.hits);
+        try std.testing.expectEqualDeep(media.admission.Resources{}, denied.snapshot());
+        var pool = media.admission.Pool{ .limits = .{ .device_bytes = expected } };
+        _ = try decodeTo(a, &reader, &.{0}, .{ .max_surface_bytes = expected, .pool = &pool, .device_surfaces = true }, sink);
+        try std.testing.expectEqual(@as(usize, 1), count.hits);
+        try std.testing.expectEqual(expected, pool.high_water.device_bytes);
+        try std.testing.expectEqualDeep(media.admission.Resources{}, pool.snapshot());
+    }
 }

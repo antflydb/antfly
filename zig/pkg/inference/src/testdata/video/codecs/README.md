@@ -78,3 +78,10 @@ The same generator writes its library-test copy under `zig/lib/video/testdata/`.
 same SAR and activation cases on NVDEC at 192x192, above GB10's 144x144 minimum.
 They are produced by the same generator; the original 64x64 fixtures remain for
 portable parsing and VideoToolbox coverage.
+
+`hevc-cropped4k-8.mp4` and `hevc-cropped4k-10.mp4` contain two 3840×2160
+coded pictures with a 128×128 conformance window. `hevc-cropped4k-inband.mp4`
+moves the 8-bit parameter sets into sample zero. They exercise coded reference
+admission independently of output size, including reservation upgrades after
+in-band activation. Regenerate them with `cropped_reference_fixtures()` in
+`generate_inband_hevc_fixtures.py` (also included in its normal invocation).

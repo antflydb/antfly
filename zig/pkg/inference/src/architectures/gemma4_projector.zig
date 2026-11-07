@@ -277,7 +277,7 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
         }
         fn consume(user_data: *anyopaque, frame: video.Frame) !void {
             const self: *@This() = @ptrCast(@alignCast(user_data));
-            const display = frame.displaySize();
+            const display = try frame.displaySize();
             const g = targetGeometry(self.cfg, display[0], display[1]);
             const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
             defer self.cb.free(patches);
@@ -484,7 +484,7 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
         }
         fn consume(raw: *anyopaque, frame: video.Frame) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const display = frame.displaySize();
+            const display = try frame.displaySize();
             const raster = frame.rasterSize();
             const g = targetGeometry(self.cfg, display[0], display[1]);
             const repeated_rows = std.math.mul(usize, frame.repetitions, g.tokenCount()) catch return error.EmbeddingInputTooLong;

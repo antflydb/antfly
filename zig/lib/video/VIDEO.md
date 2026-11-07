@@ -1373,3 +1373,12 @@ Only actual IRAP indexes are retained; compressed picture payloads are skipped.
 Generation admission uses an allocation-free MP4 metadata probe. Execution owns
 one bounded inspection scope shared by timestamp selection and decoding, under
 request cancellation and the reserved host scratch envelope.
+
+HEVC surface admission reserves 24 references at the active SPS's coded geometry
+and depth, plus one output at the requested container geometry and output depth.
+A conformance crop never shrinks reference storage. Generation initially admits
+only inspection host memory; the exact active reference/output envelope is then
+acquired from both local and shared budgets after controlled activation and
+before decoder creation. This avoids guessing from inactive or incomplete
+metadata. Failed upgrades refund both ledgers. CUDA and portable display planning share checked SAR geometry, including
+zero-rounded and greater-than-16384 widths; neither clamps the aspect ratio.

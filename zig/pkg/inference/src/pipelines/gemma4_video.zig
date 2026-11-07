@@ -74,8 +74,39 @@ const Permit = struct {
     reserved_host: bool = false,
     reserved_surfaces: bool = false,
     shared: ?@import("../backends/session.zig").RunPermit = null,
+    surface_shared: ?@import("../backends/session.zig").RunPermit = null,
+
+    /// Admit an in-band SPS's additional device envelope after activation,
+    /// before opening a decoder. Both ledgers roll back on shared denial.
+    fn ensureSurfaces(self: *Permit, admission: Admission, required: usize) !void {
+        if (required <= self.reservation.surface_bytes) return;
+        if (self.surface_shared != null) return error.InvalidVideoCacheReservation;
+        const growth = required - self.reservation.surface_bytes;
+        const previous_limit = if (self.budget) |budget| budget.limits.scratch_limit_bytes else 0;
+        if (self.budget) |budget| {
+            if (budget.limits.scratch_limit_bytes != 0) budget.limits = try memory.withAutomaticScratchFloor(budget.limits, admission.explicit_scratch_limit, budget.scratchTotalBytes(), growth);
+            budget.reserveEstimate(scratchEstimate(growth, .backend)) catch |err| {
+                budget.limits.scratch_limit_bytes = previous_limit;
+                return err;
+            };
+        }
+        errdefer if (self.budget) |budget| {
+            budget.releaseEstimate(scratchEstimate(growth, .backend));
+            budget.limits.scratch_limit_bytes = previous_limit;
+        };
+        if (admission.session) |original| {
+            var session = original;
+            if (session.run_admission) |*shared| {
+                shared.limits = try memory.withAutomaticScratchFloor(shared.limits, admission.explicit_scratch_limit, shared.controller.snapshot().scratchTotalBytes(), growth);
+            }
+            self.surface_shared = try session.admitRetainedMedia(0, growth);
+        }
+        self.reservation.surface_bytes = required;
+        self.reserved_surfaces = self.budget != null;
+    }
 
     fn deinit(self: *Permit) void {
+        if (self.surface_shared) |*held| held.deinit();
         if (self.shared) |*held| held.deinit();
         if (self.budget) |budget| {
             if (self.reserved_host) budget.releaseEstimate(scratchEstimate(self.reservation.host_bytes, .host));
@@ -111,9 +142,10 @@ fn reservationControlled(bytes: []const u8, control: Control) Reservation {
     const adapter = control.imageWorkControl();
     const track = media.mp4.probeTrack(bytes, video.mp4_coded.limits, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch return .{};
     if (track.codec != .hevc) return .{};
-    const surfaces = video.apple_hevc.surfaceBytes(track) catch return .{};
-    if (surfaces > video.apple_hevc.max_surface_bytes) return .{};
-    return .{ .host_bytes = apple_hevc_host_bytes, .surface_bytes = std.math.cast(usize, surfaces) orelse return .{} };
+    // Do not guess activation from hvcC array order or inspect packet data here.
+    // The execution scope resolves the active SPS under this host reservation,
+    // then acquires the exact reference/output envelope before decoder creation.
+    return .{ .host_bytes = apple_hevc_host_bytes };
 }
 
 pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
@@ -129,12 +161,12 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
         }
         var permit = try admission.acquire(true, .{});
         defer permit.deinit();
-        return encodePortable(cb, a, projector, bytes);
+        return encodePortable(cb, a, projector, bytes, admission, &permit);
     }
     try cb.checkExecutionControl();
     var permit = try admission.acquire(false, reservationControlled(bytes, cb.execution_control orelse .{}));
     defer permit.deinit();
-    return encodePortable(cb, a, projector, bytes);
+    return encodePortable(cb, a, projector, bytes, admission, &permit);
 }
 
 /// Admission reserved nothing for this route, since most clips never take it, and
@@ -271,7 +303,7 @@ const Observer = struct {
     }
 };
 
-fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
+fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8, admission: Admission, permit: *Permit) !projector_mod.ProjectedVideo {
     // Indexing and decoding run under the model execution lock, so they must honor
     // the request's cancellation and deadline between selected frames too.
     const control = cb.execution_control orelse Control{};
@@ -282,6 +314,13 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     const configuration = embedding_video.Configuration{ .sampling = sampling, .pool = &pool, .inspection_scope = &inspection };
     const timestamps = embedding_video.selectedConfiguredPresentationUs(a, bytes, control, configuration) catch |err| return inputError(err);
     defer a.free(timestamps);
+    const inspected = inspection.find(bytes, null, configuration).?;
+    if (!inspected.webm and inspected.reader.track.codec == .hevc) {
+        const adapter = control.imageWorkControl();
+        const required = try video.apple_hevc.surfaceBytesControlled(inspected.reader.track, .{ .context = adapter.context, .check_fn = adapter.check_fn });
+        if (required > video.apple_hevc.max_surface_bytes) return error.SharedAdmissionExceeded;
+        try permit.ensureSurfaces(admission, std.math.cast(usize, required) orelse return error.SharedAdmissionExceeded);
+    }
     var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
     defer frames.deinit();
     var observer: Observer = .{ .a = a, .cb = cb, .frames = &frames };
@@ -448,27 +487,27 @@ test "gemma4 video decodes HEVC in MP4 at FFmpeg's timestamps" {
     try std.testing.expectEqual(@as(u32, 192), count.width);
 }
 
-test "gemma4 video reserves VideoToolbox surfaces for HEVC, not a portable pool" {
+test "gemma4 video prepays HEVC inspection and admits surfaces after activation" {
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const bytes = @embedFile("../testdata/video/codecs/hevc-10bit.mp4");
     const reserved = reservation(a, bytes);
     try std.testing.expectEqual(apple_hevc_host_bytes, reserved.host_bytes);
-    try std.testing.expect(reserved.surface_bytes != 0);
+    try std.testing.expectEqual(@as(usize, 0), reserved.surface_bytes);
     const generation = @import("generation.zig");
     const messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = bytes }};
     const admitted = try generation.nativeGenerationMediaAdmissionForBackend(a, "", &messages, .{ .family = .gemma }, .generic);
     try std.testing.expectEqual(reserved.host_bytes, admitted.host_scratch_bytes);
     try std.testing.expectEqual(reserved.surface_bytes, admitted.backend_scratch_bytes);
     // Surfaces at 4K Main 10 are the case the portable budget undercounted.
-    var track = media.mp4.Track{ .id = 1, .timescale = 1000, .width = 3840, .height = 2160, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
-    var config = @as([23]u8, @splat(0));
-    config[0] = 1;
-    config[16] = 1;
-    config[17] = 2;
-    config[18] = 2;
-    track.codec_config = &config;
-    try std.testing.expect(try video.apple_hevc.surfaceBytes(track) > portable_host_bytes);
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "budget-config" };
+    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+    defer reader.deinit();
+    var track = reader.track;
+    track.width = 3840;
+    track.height = 2160;
+    const output = try video.apple.surfacePayloadBytesForDepth(track.width, track.height, 10);
+    try std.testing.expect(try video.apple_hevc.surfaceBytes(track) > output);
     // Other codecs and unreadable clips keep the portable reservation.
     try std.testing.expectEqual(@as(usize, 0), reservation(a, @embedFile("../testdata/video/codecs/av1.mp4")).surface_bytes);
     try std.testing.expectEqual(portable_host_bytes, reservation(a, "not a video").host_bytes);
@@ -496,7 +535,7 @@ test "gemma4 video decodes in-band HEVC parameter sets through VideoToolbox" {
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const bytes = @embedFile("../testdata/video/codecs/hevc-hev1-inband.mp4");
-    try std.testing.expect(reservation(a, bytes).surface_bytes != 0);
+    try std.testing.expectEqual(@as(usize, 0), reservation(a, bytes).surface_bytes);
     const Count = struct {
         frames: usize = 0,
         fn accept(raw: *anyopaque, _: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) anyerror!void {
@@ -544,7 +583,7 @@ test "gemma4 video tone maps HEVC whose HDR signal is only in the bitstream" {
     inline for (.{ "hevc-hlg-nocolr.mp4", "hevc-hlg-partial-inband.mp4" }) |name| {
         tone.seen = 0;
         const bytes = @embedFile("../testdata/video/codecs/" ++ name);
-        try std.testing.expect(reservation(a, bytes).surface_bytes != 0);
+        try std.testing.expectEqual(@as(usize, 0), reservation(a, bytes).surface_bytes);
         try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &tone, .accept = Tone.accept }, .sampling = sampling, .pool = &pool });
         try std.testing.expect(tone.seen != 0);
     }
@@ -592,7 +631,12 @@ test "HEVC inband SAR agrees across admission planning and decoded presentation"
         const actual = try embedding_video.inspectPlan(a, inband, .{}, sampling, &pool, true);
         try std.testing.expectEqual(expected.sequence_tokens, actual.sequence_tokens);
         try std.testing.expectEqual(expected.patch_output_bytes, actual.patch_output_bytes);
-        try std.testing.expectEqual(reservation(a, original), reservation(a, inband));
+        try std.testing.expectEqual(reservation(a, original).host_bytes, reservation(a, inband).host_bytes);
+        var budget_source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = inband }, .identity = "inband-budget" };
+        var input = try embedding_video.PacketInput.init(a, &budget_source, inband);
+        defer input.deinit();
+        try std.testing.expect(actual.apple_surface_bytes > 0);
+        try std.testing.expectEqual(actual.apple_surface_bytes, try video.apple_hevc.surfaceBytes(input.reader.track));
         const Record = struct {
             seen: usize = 0,
             fn accept(raw: *anyopaque, _: usize, frame: video.preparation.BorrowedFrame, options: video.preparation.Options, control: media.source.Control) anyerror!void {
@@ -629,7 +673,8 @@ test "HEVC admission probes metadata without allocations or sample inspection" {
     inline for (.{ "hevc-10bit.mp4", "hevc-sar-inband.mp4", "hevc-multi-sps.mp4" }) |name| {
         const fixture = @embedFile("../testdata/video/codecs/" ++ name);
         const expected = reservation(a, fixture);
-        try std.testing.expect(expected.surface_bytes != 0);
+        try std.testing.expectEqual(apple_hevc_host_bytes, expected.host_bytes);
+        try std.testing.expectEqual(@as(usize, 0), expected.surface_bytes);
         try std.testing.expectEqualDeep(expected, reservation(denied.allocator(), fixture));
         // Admission never reads samples, even for in-band configuration.
         const corrupted = try a.dupe(u8, fixture);
@@ -644,4 +689,69 @@ test "HEVC admission probes metadata without allocations or sample inspection" {
         try std.testing.expectEqualDeep(expected, reservation(denied.allocator(), corrupted));
     }
     try std.testing.expectEqual(@as(usize, 0), denied.allocated_bytes);
+}
+
+test "HEVC inband surface upgrades enforce both ledgers and roll back denial" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const session = Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 8192, .scratch_limit_bytes = 2048 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var prepaid = try session.admitRetainedMedia(1024, 1024);
+    defer prepaid.deinit();
+    var budget = memory.RunBudget.init(.{ .scratch_limit_bytes = 2048 });
+    const admission = Admission{ .run_budget = &budget, .session = session };
+    var permit = try admission.acquire(false, .{ .host_bytes = 1024, .surface_bytes = 1024 });
+    try permit.ensureSurfaces(admission, 4096);
+    try std.testing.expectEqual(@as(usize, 4096), budget.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), controller.snapshot().backend_scratch_bytes);
+    // Reusing a sufficient reservation never charges it again.
+    try permit.ensureSurfaces(admission, 4096);
+    permit.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), budget.limits.scratch_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), controller.snapshot().backend_scratch_bytes);
+    var explicit = memory.RunBudget.init(.{ .scratch_limit_bytes = 2048 });
+    const capped = Admission{ .run_budget = &explicit, .explicit_scratch_limit = 2048 };
+    var refused = try capped.acquire(false, .{ .host_bytes = 1024 });
+    defer refused.deinit();
+    try std.testing.expectError(error.MemoryBudgetExceeded, refused.ensureSurfaces(capped, 4096));
+    try std.testing.expectEqual(@as(usize, 0), explicit.backend_scratch_bytes);
+    var peer_session = session;
+    peer_session.run_admission.?.limits.scratch_limit_bytes = 0;
+    var peer = try peer_session.admitRetainedMedia(0, 7168);
+    defer peer.deinit();
+    var rollback = try admission.acquire(false, .{ .host_bytes = 1024, .surface_bytes = 1024 });
+    defer rollback.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, rollback.ensureSurfaces(admission, 4096));
+    try std.testing.expectEqual(@as(usize, 1024), budget.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), budget.limits.scratch_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), rollback.reservation.surface_bytes);
+}
+
+test "HEVC cropped reference admission is coded sized before and after inband activation" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    inline for (.{ "hevc-cropped4k-8.mp4", "hevc-cropped4k-10.mp4", "hevc-cropped4k-inband.mp4" }) |name| {
+        const bytes = @embedFile("../testdata/video/codecs/" ++ name);
+        const initial = reservation(a, bytes);
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "cropped-reference-budget" };
+        var input = try embedding_video.PacketInput.init(a, &source, bytes);
+        defer input.deinit();
+        const required = try video.apple_hevc.surfaceBytes(input.reader.track);
+        try std.testing.expect(required > 400 * 1024 * 1024);
+        var controller = memory.AdmissionController{};
+        defer controller.deinit();
+        const session = Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+        var prepaid = try session.admitRetainedMedia(initial.host_bytes, initial.surface_bytes);
+        defer prepaid.deinit();
+        var budget = memory.RunBudget.init(.{});
+        const admission = Admission{ .run_budget = &budget, .session = session };
+        var permit = try admission.acquire(false, initial);
+        try permit.ensureSurfaces(admission, @intCast(required));
+        try std.testing.expectEqual(required, budget.backend_scratch_bytes);
+        try std.testing.expect(controller.snapshot().backend_scratch_bytes >= required);
+        try std.testing.expectEqual(@as(usize, 0), initial.surface_bytes);
+        permit.deinit();
+        try std.testing.expectEqual(@as(usize, 0), budget.backend_scratch_bytes);
+        try std.testing.expectEqual(initial.surface_bytes, controller.snapshot().backend_scratch_bytes);
+    }
 }

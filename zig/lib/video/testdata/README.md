@@ -335,3 +335,10 @@ at module boundaries retain their existing identities and provenance.
 `zig/pkg/inference/scripts/video/generate_inband_hevc_fixtures.py`. It contains an
 unused 1:1-SAR SPS before the 2:1 SPS selected by the pictures, plus known PPS
 identities used by the header-only transition and ownership tests.
+
+`hevc-cropped4k-8.mp4` and `hevc-cropped4k-10.mp4` contain two 3840×2160
+coded pictures with a 128×128 conformance window. `hevc-cropped4k-inband.mp4`
+moves the 8-bit parameter sets into sample zero. They exercise coded reference
+admission independently of output size, including reservation upgrades after
+in-band activation. Regenerate them with `cropped_reference_fixtures()` in
+`generate_inband_hevc_fixtures.py` (also included in its normal invocation).
