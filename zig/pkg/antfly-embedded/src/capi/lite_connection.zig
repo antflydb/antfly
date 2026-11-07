@@ -22,6 +22,7 @@ const h = @import("handles.zig");
 const api = @import("db.zig");
 const std = h.std;
 const native = h.lite_backend.native;
+const antfly_platform = @import("antfly_platform");
 const alloc = std.heap.c_allocator;
 
 const memo_mod = @import("antfly_inference_query_embedding_cache");
@@ -983,6 +984,272 @@ pub const Demand = packed struct(u8) {
     }
 };
 
+/// WS3 writer lane (design doc §3.2/§3.2a): in-process, per-Store admission
+/// for a writer-mode connection's mutation-intent calls. `PathGate`'s kernel
+/// lease exists to exclude *other* processes (and, within one process,
+/// other incompatible `Owner`s sharing this path); it buys same-process
+/// callers sharing this `Owner`'s `Store` nothing, since their actual mutual
+/// exclusion is already enforced by the DB apply lock and the Store's own
+/// group-commit queue. This lane keeps the kernel lease parked for the next
+/// same-Store writer -- unconditionally when one is *already* polling for
+/// it (`checkin`'s `waiting != 0` case, zero cost), otherwise until a
+/// genuinely foreign waiter (a different process, or a different
+/// in-process `Owner`) has been queued past a short fairness quantum --
+/// and releases it, always after a `Store.sync()` so the next holder sees
+/// a durable tip. See `checkin`'s doc comment for why the foreign check
+/// uses `PathWriterLock.othersWaitingAcrossProcesses`, not the plain
+/// `othersWaiting`: this process's own maintenance worker competes for the
+/// same kernel lease through the same file-based fair queue as a
+/// genuinely foreign waiter, and the two are indistinguishable from
+/// `othersWaiting` alone -- `othersWaitingAcrossProcesses` tells them
+/// apart by the process id `writer_queue` now stamps on every ticket.
+///
+/// At most one writer is ever "checked out" of the lane at a time
+/// (`checked_out`): `checkout`/`checkin` replace *when* the kernel lease
+/// and `PathGate` are touched, not the DB-level exclusivity those already
+/// provide. This removes the original register-before-release race: the
+/// old design decided, in a single uncancellable instant right after
+/// dropping the connection's own locks, whether a same-Store waiter was
+/// already registered on `PathGate` -- and in practice almost always lost
+/// that race, since a waiter typically had not yet gotten far enough to
+/// register by then. Here, a new writer that finds nothing parked simply
+/// polls (bounded by its own busy-timeout deadline) instead of needing to
+/// have registered at one exact instant; the current holder's `checkin`
+/// always parks for it as long as it is already polling (`waiting != 0`),
+/// no matter when it started.
+pub const WriterLane = struct {
+    mutex: std.Io.Mutex = .init,
+    /// The kernel lease, parked between writers: held by this process,
+    /// not currently in use by any call. `null` either because nobody has
+    /// ever established the lane yet, or because it was just handed off
+    /// to a remote waiter.
+    parked: ?native.PathWriterLock = null,
+    /// True while exactly one writer is between `checkout` and the
+    /// matching `checkin` -- establishing the lane from cold (its first
+    /// `connection.acquire()`/`refresh()`), refreshing a parked lease, or
+    /// (rarely) handing the parked lease off to a remote waiter.
+    /// Serializes those cases against each other; it is not the DB-level
+    /// write lock (the apply lock already provides that), only this
+    /// lane's own bookkeeping.
+    checked_out: bool = false,
+    /// The lease belonging to the current `checked_out` holder, moved
+    /// here between `checkout`'s success and the matching `checkin` --
+    /// the two calls run from different points in the mutation commit
+    /// path (WS3 releases the connection-level locks, this lane included,
+    /// well before the call's own durability wait). Valid only while
+    /// `checked_out` is true.
+    held_lease: ?native.PathWriterLock = null,
+    /// Same-process callers currently polling in `checkout`, waiting for
+    /// `checked_out` to go false. Read by `checkin` to decide whether a
+    /// local writer gets the parked lease unconditionally (zero cost, no
+    /// `othersWaiting`/fairness check needed) rather than racing a remote
+    /// handoff decision against them.
+    waiting: usize = 0,
+    /// The root this lane handed out last, so a warm checkout can tell
+    /// "nothing has replaced the generation since" by pointer identity
+    /// alone -- see `checkout`'s fast path.
+    last_root: ?*h.Handle = null,
+
+    const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
+    const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
+
+    /// Whether `connection.refresh(root, intent)` might actually need to
+    /// do something (the detached allocator-proof admission branch) for
+    /// `root`, cheaply (no disk I/O beyond an in-memory allocator-stats
+    /// read) -- the same condition `Connection.refresh` itself gates that
+    /// branch on. Used to decide whether `checkout`'s fast path may skip
+    /// calling `refresh` at all.
+    fn mightNeedRefreshAdmission(connection: *Connection, root: *h.Handle, intent: api.StorageIntent) bool {
+        if (connection.options.profile != .native or connection.options.open_mode != .writer) return false;
+        if (Connection.usesCapacityAdmission(root)) return true;
+        if (intent != .mutation) return false;
+        return connection.needsReuseAdmission(root) catch true;
+    }
+
+    /// Check `connection` into the lane, returning the root to use, with
+    /// `connection` already attached to it and that root's `lane_pins`
+    /// incremented (the caller -- `enterCapturedHandleWithDeadline` --
+    /// must decrement it exactly once, in `leaveWithRegistry`, once this
+    /// call's own durability wait has resolved).
+    ///
+    /// Design doc §3.2/§3.2a "no self-replacement": while this lane holds
+    /// the kernel lease continuously, no other *process* can have
+    /// written, and `connection.owner.current` not having moved means no
+    /// same-process replacement (`Owner.refresh`'s slow path, the only
+    /// thing that ever reassigns it) has happened either -- by
+    /// definition, not by inference, so there is nothing a fresh disk
+    /// probe could tell this call that it does not already know. Skipping
+    /// `connection.refresh` entirely in that case (keeping only its cheap,
+    /// in-memory admission check -- `mightNeedRefreshAdmission` -- as a
+    /// safety valve for capacity-limited or reclaiming stores) is what
+    /// stops back-to-back same-Store commits from ever reaching
+    /// `Owner.refresh`'s probe-based "unchanged" comparison at all, which
+    /// is what was spuriously taking the slow replacement path under
+    /// genuine concurrent overlap (a commit's on-disk header can lag its
+    /// own in-memory `current.owned_lite_backend.?.native_docstore.?.file`
+    /// by the time a concurrently-admitted writer's probe runs, even
+    /// though nothing external changed) -- observed empirically as a
+    /// `metadata_pool`/`source_certificates` crash from a generation torn
+    /// down while another writer was still pinned on it.
+    pub fn checkout(self: *WriterLane, connection: *Connection, intent: api.StorageIntent) !*h.Handle {
+        const io = h.handleLockIo();
+        const deadline = connection.admissionDeadline();
+        var backoff_ns: i96 = poll_initial_ns;
+        self.mutex.lockUncancelable(io);
+        while (true) {
+            if (self.parked) |parked| {
+                self.parked = null;
+                self.checked_out = true;
+                const likely_root = self.last_root;
+                self.mutex.unlock(io);
+                if (likely_root != null and likely_root == connection.owner.current and
+                    !mightNeedRefreshAdmission(connection, likely_root.?, intent))
+                {
+                    const root = likely_root.?;
+                    connection.current = root;
+                    connection.attach(root);
+                    _ = root.lane_pins.fetchAdd(1, .release);
+                    self.mutex.lockUncancelable(io);
+                    self.held_lease = parked;
+                    self.mutex.unlock(io);
+                    return root;
+                }
+                // Slow path: either this is the first warm checkout after
+                // a cold start whose own `connection.refresh` never ran
+                // yet for *this* connection (a different connection just
+                // parked the lease), something (almost certainly
+                // same-process maintenance) replaced the generation since
+                // this lease was last used, or admission might be needed.
+                // `refresh` can still briefly need `connection.gate.mutex`
+                // itself (its detached allocator-proof wait toggles it);
+                // hold it only for this call, not across the lease's whole
+                // parked lifetime.
+                connection.gate.mutex.lockUncancelable(io);
+                var lease: ?native.PathWriterLock = parked;
+                const root = connection.refresh(&lease, intent) catch |err| {
+                    connection.gate.mutex.unlock(io);
+                    if (lease) |*held| held.close();
+                    self.mutex.lockUncancelable(io);
+                    self.checked_out = false;
+                    self.mutex.unlock(io);
+                    return err;
+                };
+                connection.gate.mutex.unlock(io);
+                _ = root.lane_pins.fetchAdd(1, .release);
+                self.mutex.lockUncancelable(io);
+                self.held_lease = lease;
+                self.last_root = root;
+                self.mutex.unlock(io);
+                return root;
+            }
+            if (!self.checked_out) {
+                self.checked_out = true;
+                self.mutex.unlock(io);
+                // Cold path: nothing parked yet. Do the full admission
+                // dance exactly as a non-lane call would, then keep the
+                // result in the lane instead of handing it back per-call.
+                var lease: ?native.PathWriterLock = connection.acquire() catch |err| {
+                    self.mutex.lockUncancelable(io);
+                    self.checked_out = false;
+                    self.mutex.unlock(io);
+                    return err;
+                };
+                const root = connection.refresh(&lease, intent) catch |err| {
+                    if (lease) |*held| held.close();
+                    connection.gate.mutex.unlock(io);
+                    self.mutex.lockUncancelable(io);
+                    self.checked_out = false;
+                    self.mutex.unlock(io);
+                    return err;
+                };
+                connection.gate.mutex.unlock(io);
+                _ = root.lane_pins.fetchAdd(1, .release);
+                self.mutex.lockUncancelable(io);
+                self.held_lease = lease;
+                self.last_root = root;
+                self.mutex.unlock(io);
+                return root;
+            }
+            // Someone else is checked out (or mid cold-start/hand-off).
+            // Poll, bounded by this call's own admission deadline, rather
+            // than needing to have registered at one exact instant --
+            // `checkin` checks `waiting` fresh every time, so arriving
+            // late here is never fatal to getting the fast path.
+            self.waiting += 1;
+            self.mutex.unlock(io);
+            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            if (remaining <= 0) {
+                self.mutex.lockUncancelable(io);
+                self.waiting -= 1;
+                self.mutex.unlock(io);
+                return error.FileBusy;
+            }
+            io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake) catch {};
+            backoff_ns = @min(backoff_ns * 2, poll_max_ns);
+            self.mutex.lockUncancelable(io);
+            self.waiting -= 1;
+        }
+    }
+
+    /// How long a lease must have been held before a *genuinely foreign*
+    /// waiter (`PathWriterLock.othersWaitingAcrossProcesses`, never this
+    /// process's own maintenance worker -- see that method's doc comment)
+    /// is allowed to end the lane's parking. Avoids releasing on a
+    /// transient queue blip from a remote caller about to be served by
+    /// someone else regardless; mirrors `QueuedMutex.contended_quantum_ns`,
+    /// the fairness window the old per-call handoff used.
+    const foreign_fairness_quantum_ns: i96 = 20 * std.time.ns_per_ms;
+
+    /// Release `connection`'s hold on this lane once it no longer needs
+    /// `root` (it has staged its write, or failed before staging): detach
+    /// `connection`, then either hand the lease straight to an
+    /// already-polling local writer (zero cost: no sync, no kernel
+    /// release), keep it parked for the next one, or -- only once nobody
+    /// local is waiting and a genuinely foreign (cross-process, or a
+    /// different in-process `Owner`) waiter has outlasted the fairness
+    /// quantum -- sync and give the kernel lease up for good.
+    ///
+    /// Deliberately keys the remote check on `PathWriterLock.
+    /// othersWaitingAcrossProcesses`, not the plain `othersWaiting`: the
+    /// latter cannot tell a genuinely foreign waiter apart from this
+    /// *same* process's own maintenance worker, which competes for the
+    /// same kernel lease through the same file-based fair queue. Treating
+    /// that as "remote" starves the maintenance worker for as long as
+    /// local writers keep arriving (it only ever shows up as "someone is
+    /// queued" and never actually goes away on its own), and was observed
+    /// empirically as repeated, unproductive sync/close/reacquire cycling
+    /// under sustained local load. Excluding same-process tickets by
+    /// their recorded pid avoids that interaction while still giving a
+    /// truly remote process (or a different in-process `Owner`) a bounded
+    /// wait, not an indefinite one, even under continuous local traffic.
+    pub fn checkin(self: *WriterLane, connection: *Connection, store: *NativeStore) void {
+        const io = h.handleLockIo();
+        connection.detach();
+        self.mutex.lockUncancelable(io);
+        var lease = self.held_lease.?;
+        self.held_lease = null;
+        if (self.waiting != 0) {
+            self.parked = lease;
+            self.checked_out = false;
+            self.mutex.unlock(io);
+            return;
+        }
+        const own_pid = antfly_platform.process.currentId() orelse 0;
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        const foreign_overdue = lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns;
+        if (!foreign_overdue) {
+            self.parked = lease;
+            self.checked_out = false;
+            self.mutex.unlock(io);
+            return;
+        }
+        self.checked_out = false;
+        self.mutex.unlock(io);
+        store.sync() catch {};
+        lease.close();
+    }
+};
+
 pub const Owner = struct {
     // Only bootstrap small files at close. Large files must finish their
     // existing worker proof; shutdown never starts another whole-file walk.
@@ -1035,6 +1302,10 @@ pub const Owner = struct {
     owned_ttl_owner_id: ?[]u8 = null,
     owned_models_dir: ?[]u8 = null,
     gate: *PathGate,
+    /// WS3 writer lane: see `WriterLane`'s doc comment. One per Owner (one
+    /// per Store), shared by every compatible `Connection` to this path in
+    /// this process.
+    writer_lane: WriterLane = .{},
     connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
     // The path gate permits one foreground lease wait per owner. The global
@@ -1244,9 +1515,12 @@ pub const Owner = struct {
             certified.?.allocator_cancel_token = &self.verification_cancel;
             if (self.current) |previous| {
                 // Only an idle serving wrapper can donate. Active cursors,
-                // detached work and proof readers retain independent caches.
+                // detached work, proof readers, and a lane writer still
+                // mid-flight on this generation (whose own commit may still
+                // be changing the allocator ledger) retain independent caches.
                 if (previous.query_borrows == 0 and previous.maintenance_references == 0 and
-                    previous.allocator_verification_references == 0 and previous.sql_cursors.count() == 0)
+                    previous.allocator_verification_references == 0 and previous.sql_cursors.count() == 0 and
+                    previous.lane_pins.load(.acquire) == 0)
                     _ = try certified.?.takeAllocatorRebaseBase(&previous.owned_lite_backend.?.native_docstore.?.file);
             }
             _ = try self.copyIdleSnapshotLedger(&certified.?);
@@ -1434,7 +1708,7 @@ pub const Owner = struct {
         while (i < self.retired.items.len) {
             const retired = self.retired.items[i];
             const retained = retained: {
-                if (retired.query_borrows > 0 or retired.maintenance_references != 0 or retired.allocator_verification_references != 0) break :retained true;
+                if (retired.query_borrows > 0 or retired.maintenance_references != 0 or retired.allocator_verification_references != 0 or retired.lane_pins.load(.acquire) != 0) break :retained true;
                 for (self.connections.items) |connection| {
                     // attach moves this connection's registry onto the current
                     // root. Inspect its actual owner during query resume too.
@@ -1826,7 +2100,8 @@ pub const Owner = struct {
     /// A serving runtime whose allocator cache no other thread can touch.
     fn idleServingRuntime(handle: *h.Handle) bool {
         return handle.query_borrows == 0 and handle.maintenance_references == 0 and
-            handle.allocator_verification_references == 0 and handle.sql_cursors.count() == 0;
+            handle.allocator_verification_references == 0 and handle.sql_cursors.count() == 0 and
+            handle.lane_pins.load(.acquire) == 0;
     }
 
     /// Copy an idle maintenance snapshot's warm ledger into a cold `file` as
