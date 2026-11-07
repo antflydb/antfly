@@ -227,6 +227,20 @@ type migrateRepointer interface {
 // modes, once each has resolved the source, its connections and a
 // migrateRepointer of its own.
 func migrateLocalRun(ctx context.Context, opts MigrateLocalOptions, result MigrateLocalResult, source Source, local *LocalConnector, dest migrateDestination, toProvider string, repointer migrateRepointer) (MigrateLocalResult, error) {
+	// A connection can contain several independent local stores. Validate the
+	// selected source before copying, including on dry runs. After cutover its
+	// config is bucket-shaped, so mop-up runs keep using the original explicit
+	// local prefix, as documented by MigrateLocalOptions.
+	if source.Connection == opts.FromConnection {
+		config, err := decodeSourceConfig[LocalConfig](source.Config)
+		if err != nil {
+			return result, fmt.Errorf("read selected source config: %w", err)
+		}
+		if config.Prefix != opts.FromPrefix {
+			return result, fmt.Errorf("%w: from-prefix %q differs from selected source prefix %q", ErrInvalidInput, opts.FromPrefix, config.Prefix)
+		}
+	}
+
 	localConfig, err := json.Marshal(LocalConfig{Prefix: opts.FromPrefix})
 	if err != nil {
 		return result, err
@@ -770,10 +784,9 @@ func migrateUploadOne(ctx context.Context, local *LocalConnector, request Reques
 // one multipart request).
 func migrateReadLocalObject(ctx context.Context, local *LocalConnector, request Request, item Item) ([]byte, error) {
 	if item.Size == 0 {
-		if err := local.CheckAccess(ctx, request, item); err != nil {
-			return nil, fmt.Errorf("read local object: %w", err)
-		}
-		return []byte{}, nil
+		// Read validates the digest of empty content as well as access. An
+		// empty, truncated file must not be mistaken for a verified object.
+		return local.Read(ctx, request, item)
 	}
 	body, err := local.OpenMedia(ctx, request, item, MediaRange{Length: item.Size})
 	if err != nil {
@@ -809,6 +822,10 @@ func migrateVerifyDigest(ctx context.Context, dest migrateDestination, key, dige
 		}
 		if statSize != 0 {
 			return fmt.Errorf("destination object is not empty")
+		}
+		sum := sha256.Sum256(nil)
+		if actual := hex.EncodeToString(sum[:]); actual != digest {
+			return &RevisionChangedError{Expected: digest, Actual: actual}
 		}
 		return nil
 	}

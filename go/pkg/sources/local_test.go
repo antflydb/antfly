@@ -542,3 +542,16 @@ func TestLocalUploadPublishesThroughASingleSourceRun(t *testing.T) {
 	require.Empty(t, backend.records)
 	backend.mu.Unlock()
 }
+
+func TestLocalMediaTypesMatchTheUploadCatalogue(t *testing.T) {
+	var types map[string]string
+	require.NoError(t, json.Unmarshal(localMediaTypesJSON, &types))
+	require.NotEmpty(t, types)
+	for mediaType, ext := range types {
+		t.Run(mediaType, func(t *testing.T) {
+			require.Equal(t, mediaType, MediaMIME(Item{SourceKind: ProviderLocal, Path: "objects/sha256/digest." + ext}))
+			require.Equal(t, mediaType, MediaMIME(Item{SourceKind: ProviderLocal, Path: "objects/sha256/digest." + strings.ToUpper(ext)}))
+		})
+	}
+	require.Equal(t, "audio/custom", MediaMIME(Item{SourceKind: ProviderLocal, Path: "digest.flac", Metadata: map[string]any{"mime_type": "audio/custom"}}))
+}

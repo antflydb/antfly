@@ -9,6 +9,7 @@ import type {
   SharedV4Warning,
 } from "@ai-sdk/provider";
 import type { AntflyClient, GenerateRequest, InferenceClient } from "@antfly/sdk";
+import { abortable, combinedSignal } from "./abort.js";
 import { resolveAuthorizedAsset } from "./asset/catalog.js";
 import { type AuthorizeAsset, decodeAssetReference } from "./asset/reference.js";
 import {
@@ -71,13 +72,14 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     const { client, authorizeAsset } = options;
     this.resolveSource =
       client && authorizeAsset
-        ? (id: string) => resolveAuthorizedAsset(client, authorizeAsset, decodeAssetReference(id))
+        ? (id: string, signal?: AbortSignal) =>
+            resolveAuthorizedAsset(client, authorizeAsset, decodeAssetReference(id), signal)
         : undefined;
   }
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     const warnings: SharedV4Warning[] = [];
-    const request = await this.buildRequest(options, warnings);
+    const request = await abortable(this.buildRequest(options, warnings), options.abortSignal);
     const response = await this.inference.generate(request, { signal: options.abortSignal });
     return {
       content: toContent(response),
@@ -94,20 +96,33 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
 
   async doStream(options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
     const warnings: SharedV4Warning[] = [];
-    const request = await this.buildRequest(options, warnings);
-    const parts = this.streamParts(request, warnings, options.abortSignal);
+    const cancellation = new AbortController();
+    const signal = combinedSignal(options.abortSignal, cancellation.signal);
+    const request = await abortable(
+      this.buildRequest({ ...options, abortSignal: signal }, warnings),
+      signal
+    );
+    const parts = this.streamParts(request, warnings, signal);
+    let cancelled = false;
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
         async pull(controller) {
-          const next = await parts.next();
-          if (next.done) {
-            controller.close();
-          } else {
-            controller.enqueue(next.value);
+          try {
+            const next = await parts.next();
+            // cancel() may run while next() is waiting for a network read.
+            if (cancelled) return;
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
+          } catch (error) {
+            if (!cancelled) controller.error(error);
           }
         },
-        async cancel() {
-          await parts.return?.(undefined);
+        cancel(reason) {
+          cancelled = true;
+          cancellation.abort(reason);
+          // Abort interrupts a pending read. Do not queue cancellation behind
+          // an uncooperative iterator; observe its eventual cleanup instead.
+          void parts.return?.(undefined).catch(() => {});
         },
       }),
     };
@@ -133,9 +148,14 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
     }
     const responseFormat = toResponseFormat(options.responseFormat, warnings);
     const tools = toInferenceTools(options.tools, warnings);
+    const resolver = this.resolveSource;
     return {
       model: this.modelId,
-      messages: await toInferenceMessages(options.prompt, warnings, this.resolveSource),
+      messages: await toInferenceMessages(
+        options.prompt,
+        warnings,
+        resolver ? (id) => resolver(id, options.abortSignal) : undefined
+      ),
       max_tokens: options.maxOutputTokens,
       temperature: options.temperature,
       top_p: options.topP,

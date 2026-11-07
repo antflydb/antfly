@@ -81,7 +81,11 @@ const result = await generateText({
   with `If-Match` and inlines it by default. Set `allowVendorUpload: true`
   and `files: <that provider's files API>` to upload once per provider and
   cache by content digest instead -- off by default, because revoking
-  access in Antfly does not remove a vendor's own copy.
+  access in Antfly does not remove a vendor's own copy. Concurrent references
+  share one fetch/upload while each reference still checks authorization.
+  Cancelling one caller leaves other callers running; cancelling all callers
+  aborts the shared request. The default LRU cache holds at most 1024 entries.
+  Scope any explicitly shared cache to a single vendor account.
 - **Uploading a new asset**: `uploadFile({ client, sources, sourceId,
   localRoot, table, data, mimeType })` writes the bytes under a registered
   source's local content-addressed store and triggers a per-source sync run,
@@ -92,7 +96,12 @@ const result = await generateText({
   with `read_index`, verifying ownership and the pinned content digest. Table
   size and other sources with identical bytes do not affect confirmation.
   Pass `prefix` when the source has a configured prefix. Searchable polling
-  is restricted to this same record.
+  is restricted to this same record. `timeoutMs` is an overall deadline,
+  including file writing and stalled requests; `signal` also cancels requests.
+  Uploads accept the MIME types in the shared
+  [`local_media_types.json`](../../../go/pkg/sources/local_media_types.json)
+  catalogue (including FLAC), normalize common aliases, and reject unsupported
+  types before writing. The local provider uses the same canonical MIME types.
   Only the `local` antfly-sources provider is implemented; a bucket-backed
   connection needs the equivalent provider-specific PUT. `FilesV4` is not
   implemented for Antfly: an existing object can't be re-registered through

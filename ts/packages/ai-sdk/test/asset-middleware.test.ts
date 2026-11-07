@@ -237,3 +237,109 @@ describe("createAssetMiddleware", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+it("coalesces concurrent references across middleware instances without coupling caller cancellation", async () => {
+  const fetchMock = stubCatalogAndMediaFetch();
+  const { createInMemoryAssetUploadCache } = await import("../src/asset/middleware.js");
+  const cache = createInMemoryAssetUploadCache();
+  let finish!: (value: { providerReference: Record<string, string>; warnings: [] }) => void;
+  const uploadFile = vi.fn(
+    (_options: { abortSignal?: AbortSignal }) =>
+      new Promise<{ providerReference: Record<string, string>; warnings: [] }>((resolve) => {
+        finish = resolve;
+      })
+  );
+  const authorize = vi.fn(() => true);
+  const options = {
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    authorize,
+    cache,
+    allowVendorUpload: true,
+    files: { specificationVersion: "v4" as const, provider: "openai", uploadFile },
+  };
+  const first = createAssetMiddleware(options);
+  const second = createAssetMiddleware(options);
+  const controller = new AbortController();
+  const invoke = (middleware: typeof first, signal?: AbortSignal) =>
+    middleware.transformParams?.({
+      type: "generate",
+      params: { ...paramsWithReferencePart(), abortSignal: signal },
+      model: fakeModel("openai"),
+    });
+  const cancelled = Promise.resolve(invoke(first, controller.signal));
+  const reason = new Error("caller cancelled");
+  const rejected = expect(cancelled).rejects.toBe(reason);
+  const surviving = invoke(second);
+  await vi.waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(1));
+  controller.abort(reason);
+  await rejected;
+  const sharedSignal = uploadFile.mock.calls[0]?.[0]?.abortSignal;
+  expect(sharedSignal?.aborted).toBe(false);
+  finish({ providerReference: { openai: "shared-file" }, warnings: [] });
+  await surviving;
+  expect(authorize).toHaveBeenCalledTimes(2);
+  expect(fetchMock.mock.calls.filter(([url]) => url === resource.uri)).toHaveLength(1);
+  await invoke(first);
+  expect(uploadFile).toHaveBeenCalledTimes(1);
+  expect(authorize).toHaveBeenCalledTimes(3);
+});
+
+it("bounds the cache with LRU eviction and drops expired references", async () => {
+  const { createInMemoryAssetUploadCache } = await import("../src/asset/middleware.js");
+  const cache = createInMemoryAssetUploadCache(2);
+  const entry = { reference: { openai: "file" } };
+  cache.set("a", "openai", entry);
+  cache.set("b", "openai", entry);
+  expect(cache.get("a", "openai")).toBe(entry);
+  cache.set("c", "openai", entry);
+  expect(cache.get("b", "openai")).toBeUndefined();
+  expect(cache.get("a", "openai")).toBe(entry);
+  cache.set("a", "openai", { ...entry, expiresAt: new Date(0) });
+  expect(cache.get("a", "openai")).toBeUndefined();
+  expect(() => createInMemoryAssetUploadCache(0)).toThrow(RangeError);
+});
+
+it("aborts an abandoned upload and clears cancelled or failed flights for retry", async () => {
+  stubCatalogAndMediaFetch();
+  let sharedSignal: AbortSignal | undefined;
+  const uploadFile = vi.fn(async (options: { abortSignal?: AbortSignal }) => {
+    sharedSignal = options.abortSignal;
+    if (uploadFile.mock.calls.length === 1) {
+      return await new Promise<{ providerReference: Record<string, string>; warnings: [] }>(
+        (_resolve, reject) => {
+          options.abortSignal?.addEventListener(
+            "abort",
+            () => reject(options.abortSignal?.reason),
+            { once: true }
+          );
+        }
+      );
+    }
+    if (uploadFile.mock.calls.length === 2) throw new Error("vendor unavailable");
+    return { providerReference: { openai: "retried-file" }, warnings: [] };
+  });
+  const middleware = createAssetMiddleware({
+    client: new AntflyClient({ baseUrl: "http://catalog.test" }),
+    authorize: () => true,
+    allowVendorUpload: true,
+    files: { specificationVersion: "v4", provider: "openai", uploadFile },
+  });
+  const invoke = (signal?: AbortSignal) =>
+    Promise.resolve(
+      middleware.transformParams?.({
+        type: "generate",
+        params: { ...paramsWithReferencePart(), abortSignal: signal },
+        model: fakeModel("openai"),
+      })
+    );
+  const caller = new AbortController();
+  const pending = invoke(caller.signal);
+  const rejected = expect(pending).rejects.toThrow("cancelled");
+  await vi.waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(1));
+  caller.abort(new Error("cancelled"));
+  await rejected;
+  await vi.waitFor(() => expect(sharedSignal?.aborted).toBe(true));
+  await expect(invoke()).rejects.toThrow("vendor unavailable");
+  await invoke();
+  expect(uploadFile).toHaveBeenCalledTimes(3);
+});

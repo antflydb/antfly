@@ -60,14 +60,14 @@ export function createGraphTool(options: AntflyGraphToolOptions): Record<string,
       const kind = kinds[0];
       const body = { ...(op[kind] as Record<string, unknown>) };
       if (kind === "match") {
-        const existingReturn = (body.return as Record<string, unknown>) ?? {};
+        const existingReturn = (op.return as Record<string, unknown>) ?? {};
         if (existingReturn.aggregates === undefined) {
-          body.return = {
+          op.return = {
             ...existingReturn,
             limit: clamp(existingReturn.limit as number, maxResults),
           };
         } else {
-          body.return = existingReturn;
+          op.return = existingReturn;
         }
       } else {
         body.max_depth = clamp(body.max_depth as number, maxDepth);

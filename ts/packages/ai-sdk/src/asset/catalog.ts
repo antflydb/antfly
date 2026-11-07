@@ -29,16 +29,19 @@ export class AssetAccessDeniedError extends Error {
 export async function resolveAuthorizedAsset(
   client: AntflyClient,
   authorize: AuthorizeAsset,
-  reference: AntflyAssetReference
+  reference: AntflyAssetReference,
+  signal?: AbortSignal
 ): Promise<CatalogResource> {
+  signal?.throwIfAborted();
   let allowed = false;
   try {
     allowed = await authorize(reference);
   } catch {
     allowed = false;
   }
+  signal?.throwIfAborted();
   if (!allowed) throw new AssetAccessDeniedError(reference);
-  return resolveCatalogResource(client, reference);
+  return resolveCatalogResource(client, reference, signal);
 }
 
 export class AssetMissingResourceError extends Error {
@@ -57,11 +60,13 @@ export class AssetMissingResourceError extends Error {
  */
 export async function resolveCatalogResource(
   client: AntflyClient,
-  reference: AntflyAssetReference
+  reference: AntflyAssetReference,
+  signal?: AbortSignal
 ): Promise<CatalogResource> {
   const { data, response } = await client
     .getRawClient()
     .GET("/db/v1/tables/{tableName}/documents/{key}", {
+      signal,
       params: {
         path: { tableName: reference.table, key: reference.key },
         query: { consistency: "read_index" },

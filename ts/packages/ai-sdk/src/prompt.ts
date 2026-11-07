@@ -17,7 +17,7 @@ type InferenceTool = NonNullable<GenerateRequest["tools"]>[number];
 type InferenceToolChoice = NonNullable<GenerateRequest["tool_choice"]>;
 
 /** Resolves an `{ antfly: <id> }` provider reference to its catalog `content.resource`. */
-export type ResolveAssetReference = (id: string) => Promise<CatalogResource>;
+export type ResolveAssetReference = (id: string, signal?: AbortSignal) => Promise<CatalogResource>;
 
 /**
  * Converts the AI SDK's provider-neutral prompt into the OpenAI-compatible

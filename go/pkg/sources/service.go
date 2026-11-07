@@ -898,6 +898,9 @@ func mediaMIME(item Item) string { return MediaMIME(item) }
 // the same representation MIME, including the filename fallback.
 func MediaMIME(item Item) string {
 	typ := configString(item.Metadata, "mime_type")
+	if typ == "" && item.SourceKind == ProviderLocal {
+		typ = localMediaMIMEForPath(item.Path)
+	}
 	if typ == "" {
 		typ = mime.TypeByExtension(filepath.Ext(item.Path))
 	}

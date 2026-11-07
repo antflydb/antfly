@@ -419,3 +419,33 @@ it("replays parallel tool results as ordered individual wire messages", async ()
     { role: "user", content: [{ type: "text", text: "continue" }] },
   ]);
 });
+
+it("stream cancellation aborts an inference request blocked before its first token", async () => {
+  let signal: AbortSignal | undefined;
+  const fetchMock = vi.fn(
+    (_input: unknown, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        signal = init?.signal ?? undefined;
+        signal?.addEventListener("abort", () => reject(signal?.reason), { once: true });
+      })
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const { stream } = await model().doStream({ prompt: [] });
+  const reader = stream.getReader();
+  expect((await reader.read()).value?.type).toBe("stream-start");
+  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+  await reader.cancel("client disconnected");
+  expect(signal?.aborted).toBe(true);
+  expect(signal?.reason).toBe("client disconnected");
+});
+
+it("retains caller aborts while combining stream cancellation", async () => {
+  const controller = new AbortController();
+  controller.abort(new Error("caller stopped"));
+  const fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
+  await expect(model().doStream({ prompt: [], abortSignal: controller.signal })).rejects.toThrow(
+    "caller stopped"
+  );
+  expect(fetchMock).not.toHaveBeenCalled();
+});

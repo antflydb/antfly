@@ -1173,3 +1173,87 @@ func TestBucketRelativeKeysPreserveExactPrefixSuffix(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrateLocalRejectsWrongOriginalPrefixBeforeCopy(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(fmt.Sprint(dryRun), func(t *testing.T) {
+			opts, root, stateDir, _, bucket, backend := migrateServiceFixture(t)
+			localPut(t, root, "other", ".bin", "unrelated store")
+			pre, err := NewService(ServiceOptions{Profile: opts.Profile, StateDir: stateDir, PublicURL: opts.PublicURL, AdminToken: opts.AdminToken, MediaKey: opts.MediaKey})
+			require.NoError(t, err)
+			require.Equal(t, "completed", startServiceJob(t, pre).State)
+			require.NoError(t, pre.Close())
+			backend.mu.Lock()
+			var oldKey string
+			for key := range backend.records {
+				oldKey = key
+			}
+			backend.mu.Unlock()
+			opts.FromPrefix = "other"
+			opts.DryRun = dryRun
+			result, err := MigrateLocal(t.Context(), opts)
+			require.ErrorIs(t, err, ErrInvalidInput)
+			require.Contains(t, err.Error(), "from-prefix")
+			require.False(t, result.CatalogRepointed)
+			bucket.mu.Lock()
+			puts := bucket.puts
+			bucket.mu.Unlock()
+			require.Zero(t, puts)
+			backend.mu.Lock()
+			_, originalPresent := backend.records[oldKey]
+			count := len(backend.records)
+			backend.mu.Unlock()
+			require.True(t, originalPresent)
+			require.Equal(t, 1, count)
+		})
+	}
+}
+
+func TestMigrateLocalLiveRejectsWrongOriginalPrefix(t *testing.T) {
+	opts, service, root, bucket, _ := migrateLiveFixture(t)
+	localPut(t, root, "other", ".bin", "other")
+	opts.FromPrefix = "other"
+	result, err := MigrateLocal(t.Context(), opts)
+	require.ErrorIs(t, err, ErrInvalidInput)
+	require.False(t, result.CatalogRepointed)
+	service.mu.Lock()
+	connection := service.profile.Sources[0].Connection
+	service.mu.Unlock()
+	require.Equal(t, "local", connection)
+	bucket.mu.Lock()
+	puts := bucket.puts
+	bucket.mu.Unlock()
+	require.Zero(t, puts)
+}
+
+func TestMigrateLocalVerifiesEmptyObjectDigest(t *testing.T) {
+	for _, kind := range migrateTestDestinationKinds {
+		for _, alreadyPresent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/existing=%v", kind, alreadyPresent), func(t *testing.T) {
+				root := t.TempDir()
+				dir := filepath.Join(root, "assets", "objects", "sha256")
+				require.NoError(t, os.MkdirAll(dir, 0700))
+				wrong := strings.Repeat("a", 64)
+				require.NoError(t, os.WriteFile(filepath.Join(dir, wrong+".bin"), nil, 0600))
+				td := newMigrateTestDestination(t, kind)
+				if alreadyPresent {
+					td.seed("copied/objects/sha256/"+wrong+".bin", nil)
+				}
+				local := &LocalConnector{Root: root}
+				result, err := MigrateLocalCopy(t.Context(), local, localRequest(t, "assets"), td.dest, "copied", false, nil)
+				require.Error(t, err)
+				require.Equal(t, 1, result.Failed)
+				require.Zero(t, result.Copied)
+				require.Zero(t, result.Skipped)
+			})
+		}
+		t.Run(kind+"/valid-empty", func(t *testing.T) {
+			root := t.TempDir()
+			localPut(t, root, "assets", ".bin", "")
+			td := newMigrateTestDestination(t, kind)
+			result, err := MigrateLocalCopy(t.Context(), &LocalConnector{Root: root}, localRequest(t, "assets"), td.dest, "copied", false, nil)
+			require.NoError(t, err)
+			require.Equal(t, 1, result.Copied)
+		})
+	}
+}

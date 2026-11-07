@@ -33,14 +33,14 @@
     "test:package": "node scripts/verify-package.mjs"
   },
   "dependencies": {
-    "@antfly/sdk": "workspace:^"
+    "@antfly/sdk": "workspace:^",
+    "@ai-sdk/provider": "4.0.35"
   },
   "peerDependencies": {
     "ai": "^7.0.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@ai-sdk/provider": "4.0.35",
     "@types/node": "^25.9.3",
     "ai": "7.0.162",
     "tsup": "^8.5.1",

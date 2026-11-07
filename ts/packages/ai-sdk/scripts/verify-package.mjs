@@ -99,6 +99,71 @@ const installed = JSON.parse(
 if (registrySDK && installed.version !== registrySDKVersion)
   throw new Error("Registry SDK version mismatch");
 
+// npm's hoisted layout can hide undeclared imports in published .d.ts files.
+// Repeat the export and type checks in a consumer that exposes only declared
+// dependencies. Keep consumer imports limited to packages it actually declares.
+// Keep this outside the npm consumer so parent node_modules cannot hide
+// missing declarations in the non-hoisted dependency graph.
+const isolated = mkdtempSync(resolve(state, "isolated-consumer-"));
+const sdkDependency = registrySDK ? registrySDKVersion : `file:${resolve(artifacts, "sdk.tgz")}`;
+writeFileSync(
+  resolve(isolated, "package.json"),
+  JSON.stringify({
+    private: true,
+    type: "module",
+    dependencies: {
+      "@antfly/sdk": sdkDependency,
+      "@antfly/ai-sdk": `file:${resolve(artifacts, "ai-sdk.tgz")}`,
+      ai: "7.0.162",
+      zod: "4.6.7",
+      typescript: "5.9.3",
+      "@types/node": "25.9.3",
+      // @ai-sdk/provider's own json-schema dependency omits its typings. Supply
+      // those upstream typings so skipLibCheck can remain disabled here.
+      "@types/json-schema": "7.0.15",
+    },
+  })
+);
+writeFileSync(
+  resolve(isolated, "pnpm-workspace.yaml"),
+  `hoist: false\nautoInstallPeers: true\noverrides:\n  '@antfly/sdk': ${JSON.stringify(sdkDependency)}\n`
+);
+run("pnpm", ["install", "--ignore-scripts", "--no-frozen-lockfile"], isolated);
+const isolatedContract = `import type { LanguageModel, EmbeddingModel } from 'ai';
+import { createAntfly, createSearchTool, uploadFile } from '@antfly/ai-sdk';
+const provider = createAntfly({baseUrl:'http://localhost:8080'});
+const language: LanguageModel = provider.languageModel('model');
+const embedding: EmbeddingModel = provider.embeddingModel('model');
+void language; void embedding; void uploadFile;
+void createSearchTool({client:provider.client,table:'docs'});
+`;
+for (const extension of ["mts", "cts"]) {
+  writeFileSync(resolve(isolated, `contract.${extension}`), isolatedContract);
+  run(
+    "node",
+    [
+      "node_modules/typescript/bin/tsc",
+      "--noEmit",
+      "--strict",
+      "--target",
+      "ES2022",
+      "--module",
+      "NodeNext",
+      "--moduleResolution",
+      "NodeNext",
+      `contract.${extension}`,
+    ],
+    isolated
+  );
+}
+for (const extension of ["mjs", "cjs"]) {
+  writeFileSync(
+    resolve(isolated, `exports.${extension}`),
+    readFileSync(resolve(consumer, `exports.${extension}`))
+  );
+  run("node", [`exports.${extension}`], isolated);
+}
+
 const receipt = {
   consumer,
   node: process.version,
@@ -106,6 +171,13 @@ const receipt = {
   esm: "passed",
   commonjs: "passed",
   types: "passed",
+  isolated: {
+    hoisting: false,
+    skipLibCheck: false,
+    types: "passed",
+    esm: "passed",
+    commonjs: "passed",
+  },
   artifacts: Object.fromEntries(
     packedNames.map((name) => [
       name,

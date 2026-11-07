@@ -360,11 +360,16 @@ Instead, a miss whose stored `source_hash` equals the fresh hash skips the
 embedder and republishes the stored output under the new source
 (`embeddingOutputCarriesForward`). The output precondition rejects the command
 if the artifact changes before apply. It fails closed, re-embedding, for a null
-hash, a reprocess generation, a revision or dimension mismatch, an undecodable or
+hash, a changed reprocess generation, a revision or dimension mismatch, an undecodable or
 externally referenced vector, privacy-scoped input, chunk payloads with model
 metadata, and direct producers below protocol 17, which can't bind an output
 guard. The proof now binds those bytes to the new row through the 64-bit source
-hash, the same strength the unordered skip already relies on.
+hash, the same strength the unordered skip already relies on. Reprocess generations
+are part of that hash: a new generation forces inference once, and a fulfilled
+generation can carry its output across subsequent unrelated row changes. Dense
+parts hashing streams the existing canonical JSON/base64 representation through
+a fixed-size buffer, preserving stored hashes without allocating media-sized
+base64 or JSON copies.
 
 `document_extraction` under ordered authority has not been traced, so this
 design's relocation guarantee is only established for the mode the proof ran in.

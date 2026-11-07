@@ -28436,6 +28436,10 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
 // durable acceptance can be reused without depending on the parent's old model.
 fn retainedTextEmbeddingHashAtRevision(request: enrichment_types.GeneratedEnrichmentRequest, text: []const u8, revision: ?[32]u8) u64 {
     const base = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+    return embeddingIdentityAtRevision(base, revision);
+}
+
+fn embeddingIdentityAtRevision(base: u64, revision: ?[32]u8) u64 {
     const actual = revision orelse return base;
     var hash = std.hash.Wyhash.init(base);
     hash.update("retained-text-provider-generation-v1");
@@ -28458,7 +28462,9 @@ fn retainedTextVectorCurrent(a: Allocator, provider: embedder_mod.DenseEmbedder,
 // is then still this input's output, so it is republished under the new row's
 // receipt without calling the provider. Anything short of proof re-embeds.
 fn embeddingOutputCarriesForward(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, encoded: []const u8, source_hash: u64) !bool {
-    if (request.reprocess_generation != 0) return false;
+    // The source hash already includes the durable reprocess generation. A
+    // matching hash proves this generation ran; rejecting all nonzero values
+    // would disable reuse forever after the first explicit reprocess.
     const privacy = @import("../../../privacy/document.zig");
     const name = requestEmbeddingName(request);
     if (privacy.isManagedArtifactName(name) or privacy.consumerPolicyVersion(name) != null or std.mem.eql(u8, request.source_field, privacy.source_field)) return false;
@@ -28512,11 +28518,80 @@ fn carriedChunkVectorAlloc(a: Allocator, read: anytype, request: enrichment_type
 
 // Multimodal inputs without an unfetched URL are fully determined by their
 // bytes. A URL can serve different content, so it never proves the input equal.
-fn densePartsSourceHash(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parts: []const template.ContentPart, revision: ?[32]u8) !?u64 {
+// Feed the same JSON bytes as contentPartsJsonAlloc into the legacy hash,
+// without allocating JSON or a media-sized base64 buffer. Preserving the wire
+// framing keeps already-stored hashes reusable across this optimization.
+const PartsHashWriter = struct {
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain, .flush = std.Io.Writer.noopFlush }, .buffer = &.{} },
+    hash: std.hash.XxHash64 = .init(0),
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @fieldParentPtr("writer", w);
+        for (data[0 .. data.len - 1]) |bytes| self.hash.update(bytes);
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| self.hash.update(pattern);
+        return std.Io.Writer.countSplat(data, splat);
+    }
+};
+
+fn writePartsHashJson(writer: *std.Io.Writer, parts: []const template.ContentPart, counter: ?*std.Io.Writer.Discarding) !void {
+    try writer.writeByte('[');
+    for (parts, 0..) |part, i| {
+        if (i > 0) try writer.writeByte(',');
+        switch (part) {
+            .text => |text| {
+                try writer.writeAll("{\"type\":\"text\",\"text\":");
+                try std.json.Stringify.value(text, .{}, writer);
+                try writer.writeByte('}');
+            },
+            .media_url => unreachable, // Caller rejects unfetched URLs first.
+            .binary => |binary| {
+                try writer.writeAll("{\"type\":\"media\",\"mime_type\":");
+                try std.json.Stringify.value(binary.mime_type, .{}, writer);
+                try writer.writeAll(",\"data\":\"");
+                if (counter) |count| {
+                    // Base64's alphabet never needs JSON string escaping.
+                    try writer.flush();
+                    count.count += std.base64.standard.Encoder.calcSize(binary.data.len);
+                } else {
+                    // All non-final blocks are a multiple of three bytes, so
+                    // padding is emitted only at the actual end of the input.
+                    var encoded: [4096]u8 = undefined;
+                    var offset: usize = 0;
+                    while (offset < binary.data.len) {
+                        const bytes = binary.data[offset .. offset + @min(@as(usize, 3072), binary.data.len - offset)];
+                        const length = std.base64.standard.Encoder.calcSize(bytes.len);
+                        _ = std.base64.standard.Encoder.encode(encoded[0..length], bytes);
+                        try writer.writeAll(encoded[0..length]);
+                        offset += bytes.len;
+                    }
+                }
+                try writer.writeAll("\"}");
+            },
+        }
+    }
+    try writer.writeByte(']');
+}
+
+fn densePartsSourceHash(_: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parts: []const template.ContentPart, revision: ?[32]u8) !?u64 {
     for (parts) |part| if (part == .media_url) return null;
-    const encoded = try contentPartsJsonAlloc(a, parts);
-    defer a.free(encoded);
-    return retainedTextEmbeddingHashAtRevision(request, encoded, revision);
+    var output: PartsHashWriter = .{};
+    var length: [8]u8 = undefined;
+    if (request.producer_json.len > 0) {
+        var count_buffer: [256]u8 = undefined;
+        var counter = std.Io.Writer.Discarding.init(&count_buffer);
+        try writePartsHashJson(&counter.writer, parts, &counter);
+        std.mem.writeInt(u64, &length, counter.fullCount(), .little);
+        output.hash.update(&length);
+    }
+    try writePartsHashJson(&output.writer, parts, null);
+    if (request.producer_json.len > 0) {
+        std.mem.writeInt(u64, &length, @intCast(request.producer_json.len), .little);
+        output.hash.update(&length);
+        output.hash.update(request.producer_json);
+    }
+    const identity = enrichment_artifact_codec.hashEmbeddingIdentityForGeneration(output.hash.final(), request.reprocess_generation);
+    return embeddingIdentityAtRevision(identity, revision);
 }
 
 fn reuseDensePartsOutput(
@@ -39048,11 +39123,13 @@ test "ordered artifact inventory authored document callbacks bypass providers an
 }
 
 test "ordered artifact inventory direct producers carry unchanged input across unrelated row changes" {
-    try testOrderedDirectProducerCarry(true);
-    try testOrderedDirectProducerCarry(false);
+    for ([_]u64{ 0, 1 }) |generation| {
+        try testOrderedDirectProducerCarry(true, generation);
+        try testOrderedDirectProducerCarry(false, generation);
+    }
 }
 
-fn testOrderedDirectProducerCarry(dense: bool) !void {
+fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = ordered_publication;
@@ -39135,6 +39212,17 @@ fn testOrderedDirectProducerCarry(dense: bool) !void {
     defer pin.release();
     var request = pin.plan().generated_templates[0];
     request.doc_key = "doc";
+    request.reprocess_generation = reprocess_generation;
+    if (reprocess_generation != 0) {
+        const intent = @import("../artifact_reprocess_intent.zig");
+        const key = try intent.embeddingKeyAlloc(alloc, "doc", requestEmbeddingName(request));
+        defer alloc.free(key);
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(key, &intent.encode(request.producer_json, reprocess_generation));
+        try txn.commit();
+    }
+
     var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
     defer freeWorkerChunkCache(alloc, &cache);
     var sources = PreparedDocumentSourceCache.init(runtime);
@@ -39222,7 +39310,16 @@ test "ordered artifact inventory embedding output carry forward fails closed" {
     try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, encoded, 7));
     other = dense;
     other.reprocess_generation = 1;
-    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, encoded, 7));
+    const old_hash = retainedTextEmbeddingHashAtRevision(dense, "text", null);
+    const current_hash = retainedTextEmbeddingHashAtRevision(other, "text", null);
+    const before_reprocess = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, old_hash, &.{ 1, 2 });
+    defer alloc.free(before_reprocess);
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, before_reprocess, current_hash));
+    const after_reprocess = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, current_hash, &.{ 1, 2 });
+    defer alloc.free(after_reprocess);
+    try std.testing.expect(try embeddingOutputCarriesForward(alloc, other, after_reprocess, current_hash));
+    other.reprocess_generation = 2;
+    try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, after_reprocess, retainedTextEmbeddingHashAtRevision(other, "text", null)));
     other = dense;
     other.source_field = @import("../../../privacy/document.zig").source_field;
     try std.testing.expect(!try embeddingOutputCarriesForward(alloc, other, encoded, 7));
@@ -39242,6 +39339,23 @@ test "ordered artifact inventory dense parts hash covers inline bytes but never 
     try std.testing.expect(first != changed);
     try std.testing.expect(first != revised);
     try std.testing.expectEqual(@as(?u64, null), try densePartsSourceHash(alloc, request, &.{ .{ .text = "t" }, .{ .media_url = "https://example.test/a.png" } }, null));
+}
+
+test "ordered artifact inventory dense parts hash preserves legacy bytes without allocating" {
+    const a = std.testing.allocator;
+    var bytes: [9000]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    for ([_]usize{ 0, 1, 2, 3, 3071, 3072, 3073, 9000 }) |size| {
+        const parts: []const template.ContentPart = &.{ .{ .text = "quote\"\n\x01/é" }, .{ .binary = .{ .mime_type = "video/mp4", .data = bytes[0..size] } } };
+        const json = try contentPartsJsonAlloc(a, parts);
+        defer a.free(json);
+        for ([_][]const u8{ "", "producer" }) |producer| for ([_]u64{ 0, 1, 2 }) |generation| {
+            const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "v", .doc_key = "doc", .source_field = "body", .producer_json = producer, .reprocess_generation = generation };
+            const expected = retainedTextEmbeddingHashAtRevision(request, json, @splat(3));
+            const actual = (try densePartsSourceHash(std.testing.failing_allocator, request, parts, @splat(3))).?;
+            try std.testing.expectEqual(expected, actual);
+        };
+    }
 }
 
 test "ordered artifact inventory chunk vectors carry unchanged text across unrelated row changes" {
