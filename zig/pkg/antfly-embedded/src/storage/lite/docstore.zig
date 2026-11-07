@@ -12916,3 +12916,72 @@ test "native publication validates preimages before primary writes and stages ag
     try std.testing.expectEqualStrings("committed", joined);
     try std.testing.expect((try store.file.check()).valid);
 }
+
+test "lite cohort source records share one checkpoint and roll back publication as a group" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cohort-source-records.aflite");
+    defer a.free(path);
+    var owner = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer owner.close();
+    owner.maintenance_start_suppressed = true;
+    var runtime = try owner.runtimeStoreWithPrefix(a, "\x02db/cohort\x00");
+    defer runtime.deinit();
+    const facade = @import("../docstore.zig");
+    var store = try facade.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    const source_a = try change_journal_mod.encodeRecord(a, .{ .sequence = 2, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
+    defer a.free(source_a);
+    const source_b = try change_journal_mod.encodeRecord(a, .{ .sequence = 5, .changed_doc_keys = &.{"b"}, .target_hints = &.{.full_text} });
+    defer a.free(source_b);
+    const source_c = try change_journal_mod.encodeRecord(a, .{ .sequence = 8, .changed_doc_keys = &.{"c"}, .target_hints = &.{.full_text} });
+    defer a.free(source_c);
+    const physical = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(physical);
+    const before = owner.file.activeCheckpoint().commit_sequence;
+    try store.putBatchWithReplay(null, &.{.{ .key = physical, .value = "{\"n\":1}" }}, &.{}, .{
+        .sequence = 8,
+        .payload = source_c,
+        .preceding = &.{ .{ .sequence = 2, .payload = source_a }, .{ .sequence = 5, .payload = source_b } },
+    });
+    try std.testing.expectEqual(before + 1, owner.file.activeCheckpoint().commit_sequence);
+    const entries = try store.iterateReplayFrom(a, 0);
+    defer {
+        for (entries) |*entry| entry.deinit(a);
+        a.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    for (entries, [_]u64{ 2, 5, 8 }) |entry, sequence| try std.testing.expectEqual(sequence, entry.sequence);
+    const charge = (try owner.file.replayAdmission()).?;
+    const next_a = try change_journal_mod.encodeRecord(a, .{ .sequence = 10, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
+    defer a.free(next_a);
+    const next_b = try change_journal_mod.encodeRecord(a, .{ .sequence = 12, .changed_doc_keys = &.{"b"}, .target_hints = &.{.full_text} });
+    defer a.free(next_b);
+    const Fail = struct {
+        fn stage(_: *anyopaque, _: @import("../native_publication.zig").View) !void {
+            return error.InjectedCohortPublicationFailure;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(error.InjectedCohortPublicationFailure, store.putBatchWithPublications(null, &.{.{ .key = physical, .value = "{\"n\":2}" }}, &.{}, .{
+        .sequence = 12,
+        .payload = next_b,
+        .preceding = &.{.{ .sequence = 10, .payload = next_a }},
+    }, .{}, null, .{ .ptr = &context, .stage = Fail.stage }));
+    try std.testing.expectEqual(before + 1, owner.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 8), store.lastReplaySequence(0));
+    const after = (try owner.file.replayAdmission()).?;
+    try std.testing.expectEqual(charge.bytes, after.bytes);
+    try std.testing.expectEqual(charge.records, after.records);
+    const value = try store.get(a, physical);
+    defer a.free(value);
+    try std.testing.expectEqualStrings("{\"n\":1}", value);
+    const uncommitted = try store.iterateReplayFrom(a, 9);
+    defer {
+        for (uncommitted) |*entry| entry.deinit(a);
+        a.free(uncommitted);
+    }
+    try std.testing.expectEqual(@as(usize, 0), uncommitted.len);
+    try std.testing.expect((try owner.file.check()).valid);
+}

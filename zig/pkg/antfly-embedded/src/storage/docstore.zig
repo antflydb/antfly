@@ -2283,9 +2283,29 @@ pub const DocStore = struct {
         try self.putBatchWithReplay(null, writes, deletes, null);
     }
 
+    /// One physical publication can retain distinct logical source records.
+    /// Records are ordered, bounded and borrowed through synchronous completion.
     pub const ReplayAppend = struct {
+        pub const Record = struct { sequence: u64, payload: []const u8 };
+        pub const maximum_records = 64;
         sequence: u64,
         payload: []const u8,
+        preceding: []const Record = &.{},
+
+        pub fn validate(self: ReplayAppend) !void {
+            if (self.preceding.len >= maximum_records or self.sequence == std.math.maxInt(u64)) return error.InvalidBatchRequest;
+            var previous: ?u64 = null;
+            for (self.preceding) |record| {
+                if (record.sequence >= self.sequence or (previous != null and record.sequence <= previous.?)) return error.InvalidBatchRequest;
+                previous = record.sequence;
+            }
+        }
+
+        fn stage(self: ReplayAppend, batch: *Batch) !void {
+            try self.validate();
+            for (self.preceding) |record| try batch.setReplayOpaque(record.sequence, record.payload);
+            try batch.setReplayOpaque(self.sequence, self.payload);
+        }
     };
 
     pub const KeyPromotion = struct {
@@ -2390,6 +2410,7 @@ pub const DocStore = struct {
         native_participant: ?@import("native_publication.zig").Participant,
         prepared_values: ?*const @import("document_mutation_revision.zig").PreparedValues,
     ) !void {
+        if (replay) |entry| try entry.validate();
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
             break :blk false;
@@ -2432,9 +2453,7 @@ pub const DocStore = struct {
                 try txn.put(kv.key, kv.value);
             }
         }
-        if (replay) |entry| {
-            try batch.setReplayOpaque(entry.sequence, entry.payload);
-        }
+        if (replay) |entry| try entry.stage(&batch);
         try batch.commit();
     }
 
@@ -2522,6 +2541,7 @@ pub const DocStore = struct {
         transactional_write: ?TransactionalWriteBuilder,
         transactional_guard: ?TransactionalGuard,
     ) !usize {
+        if (replay) |entry| try entry.validate();
         var batch = try self.beginWriteBatchWithOptions(.{});
         errdefer batch.abort();
         var txn = batch.asTxn();
@@ -2550,7 +2570,7 @@ pub const DocStore = struct {
             };
         }
         for (writes) |kv| try txn.put(kv.key, kv.value);
-        if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
+        if (replay) |entry| try entry.stage(&batch);
         // Recheck immediately before commit. A guard may contain a wall-clock
         // lease expiry, and building a large replay value can outlive the tenure
         // even though no competing writer can modify the record mid-transaction.
@@ -7000,4 +7020,37 @@ test "docstore replay retirement atomically bounds scans past pinned source reco
     defer captured.abort();
     _ = try captured.get(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1));
     _ = try captured.get(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, last_source));
+}
+
+test "docstore cohort source records preserve distinct sequences and reject malformed groups before mutation" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    try store.putBatchWithReplay(null, &.{.{ .key = "document", .value = "group" }}, &.{}, .{
+        .sequence = 8,
+        .payload = "eight",
+        .preceding = &.{ .{ .sequence = 2, .payload = "two" }, .{ .sequence = 5, .payload = "five" } },
+    });
+    const entries = try store.iterateReplayFrom(a, 0);
+    defer {
+        for (entries) |*entry| entry.deinit(a);
+        a.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    for (entries, [_]u64{ 2, 5, 8 }, [_][]const u8{ "two", "five", "eight" }) |entry, sequence, payload| {
+        try std.testing.expectEqual(sequence, entry.sequence);
+        try std.testing.expectEqualStrings(payload, entry.payload);
+    }
+    try std.testing.expectEqual(@as(u64, 8), store.lastReplaySequence(0));
+    try std.testing.expectEqual(@as(u64, 9), store.nextReplaySequence(1));
+    try std.testing.expectError(error.InvalidBatchRequest, store.putBatchWithReplay(null, &.{.{ .key = "rejected", .value = "must not apply" }}, &.{}, .{
+        .sequence = 11,
+        .payload = "eleven",
+        .preceding = &.{ .{ .sequence = 10, .payload = "first" }, .{ .sequence = 10, .payload = "duplicate" } },
+    }));
+    try std.testing.expectError(error.NotFound, store.get(a, "rejected"));
+    try std.testing.expectEqual(@as(u64, 8), store.lastReplaySequence(0));
+    try std.testing.expectEqual(@as(u64, 9), store.nextReplaySequence(1));
 }
