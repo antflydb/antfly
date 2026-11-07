@@ -94,7 +94,7 @@ Choose **Control + Option** in the shortcut presets for keyboards without Fn.
 The default behavior is hold-to-talk; toggle mode starts/stops on successive presses.
 The menu bar also provides record, finish, cancel, copy, and settings controls.
 
-**Set up Fn shortcut** selects, registers, and saves Fn in one action. If permission
+**Set up shortcut & paste access** registers and saves the selected shortcut in one action. If permission
 is missing, it opens Accessibility settings and finishes automatically when you
 return after granting access. Cancel setup keeps the previous shortcut. This action
 saves only the shortcut; other unsaved settings and credentials are not changed.

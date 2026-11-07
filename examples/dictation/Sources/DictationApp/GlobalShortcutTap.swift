@@ -26,7 +26,8 @@ final class GlobalShortcutTap: @unchecked Sendable {
     self.action = action
     guard AXIsProcessTrusted() else {
       throw DictationError.invalid(
-        "Enable Accessibility for modifier-only/Fn shortcuts, then save settings again.")
+        "Shortcut not active: enable Antfly Dictation in Accessibility using Set up shortcut & paste access, then return to the app."
+      )
     }
     let mask =
       (CGEventMask(1) << CGEventType.flagsChanged.rawValue)

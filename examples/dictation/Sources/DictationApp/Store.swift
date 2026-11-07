@@ -46,8 +46,8 @@ import SwiftUI
   private var generation = UUID()
   private var registered: DictationCore.KeyboardShortcut?
   @Published var capturingShortcut = false
-  @Published private(set) var fnSetupPending = false
-  @Published private(set) var fnSetupStatus = ""
+  @Published private(set) var shortcutSetupPending = false
+  @Published private(set) var shortcutSetupStatus = ""
   private let keyboardAccess: @MainActor () -> Bool
   private let keyboardAccessRequest: @MainActor () -> Void
   private let settingsOpener: @MainActor (String) -> Void
@@ -134,8 +134,8 @@ import SwiftUI
   }
   func refreshShortcutAccess() {
     guard state == .idle, !capturingShortcut else { return }
-    if fnSetupPending {
-      if keyboardAccess() { completeFnSetup() }
+    if shortcutSetupPending {
+      if keyboardAccess() { completeShortcutSetup() }
       return
     }
     guard registered == nil || hotkey?.isAvailable == false, state == .idle, !capturingShortcut
@@ -146,34 +146,34 @@ import SwiftUI
     } catch { message = error.localizedDescription }
   }
   func captureShortcut(_ capturing: Bool) {
-    if capturing { cancelFnSetup() }
+    if capturing { cancelShortcutSetup() }
     capturingShortcut = capturing
     hotkey?.setSuspended(capturing)
   }
 
-  func setUpFnShortcut() {
+  func setUpShortcut() {
     guard state == .idle, !working, !capturingShortcut else { return }
-    fnSetupPending = true
+    shortcutSetupPending = true
     if keyboardAccess() {
-      completeFnSetup()
+      completeShortcutSetup()
       return
     }
-    fnSetupStatus =
-      "Enable Antfly Dictation in Accessibility, then return here. Fn will be applied automatically."
-    message = fnSetupStatus
+    shortcutSetupStatus =
+      "Enable Antfly Dictation in Accessibility, then return here. Your selected shortcut will be applied automatically."
+    message = shortcutSetupStatus
     keyboardAccessRequest()
     settingsOpener("com.apple.preference.security?Privacy_Accessibility")
   }
-  func cancelFnSetup() {
-    guard fnSetupPending else { return }
-    fnSetupPending = false
-    fnSetupStatus = "Fn setup canceled. The previous shortcut is unchanged."
+  func cancelShortcutSetup() {
+    guard shortcutSetupPending else { return }
+    shortcutSetupPending = false
+    shortcutSetupStatus = "Shortcut setup canceled. The previous shortcut is unchanged."
   }
   func openKeyboardSettings() {
     settingsOpener("com.apple.Keyboard-Settings.extension")
   }
-  private func completeFnSetup() {
-    guard fnSetupPending, keyboardAccess() else { return }
+  private func completeShortcutSetup() {
+    guard shortcutSetupPending, keyboardAccess() else { return }
     let previous = registered
     do {
       // Apply only the shortcut, preserving saved preferences and credentials.
@@ -181,9 +181,10 @@ import SwiftUI
         FileManager.default.fileExists(atPath: settingsFile.path)
         ? try Data(contentsOf: settingsFile) : nil
       var saved = try previousData.map { try Configuration.decode($0) } ?? Configuration()
-      saved.effectiveShortcut = .fn
+      let shortcut = try config.effectiveShortcut.validated()
+      saved.effectiveShortcut = shortcut
       let bytes = try JSONEncoder().encode(saved.validated())
-      try hotkey?.register(.fn)
+      try hotkey?.register(shortcut)
       do { try write(bytes, to: settingsFile) } catch {
         do {
           if let previous { try hotkey?.register(previous) } else { hotkey?.unregister() }
@@ -198,15 +199,16 @@ import SwiftUI
         }
         throw error
       }
-      config.effectiveShortcut = .fn
-      registered = .fn
-      fnSetupPending = false
-      fnSetupStatus = "Fn is enabled and saved. \(config.toggle ? "Press" : "Hold") Fn to dictate."
-      message = fnSetupStatus
+      config.effectiveShortcut = shortcut
+      registered = shortcut
+      shortcutSetupPending = false
+      shortcutSetupStatus =
+        "\(shortcut.label) is enabled and saved. \(config.toggle ? "Press" : "Hold") \(shortcut.label) to dictate."
+      message = shortcutSetupStatus
     } catch {
-      fnSetupPending = false
-      fnSetupStatus = "Could not set up Fn: " + error.localizedDescription
-      message = fnSetupStatus
+      shortcutSetupPending = false
+      shortcutSetupStatus = "Could not set up shortcut: " + error.localizedDescription
+      message = shortcutSetupStatus
     }
   }
 
@@ -254,9 +256,6 @@ import SwiftUI
       message =
         allowed ? "Microphone ready." : "Microphone access denied. Enable it in System Settings."
     }
-  }
-  func requestAccessibility() {
-    keyboardAccessRequest()
   }
   func shortcut(down: Bool) {
     guard !working, !capturingShortcut else { return }

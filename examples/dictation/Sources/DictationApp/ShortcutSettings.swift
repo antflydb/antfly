@@ -131,14 +131,17 @@ struct ShortcutSettings: View {
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
       }
       HStack {
-        Button(store.fnSetupPending ? "Open Accessibility settings…" : "Set up Fn shortcut") {
-          store.setUpFnShortcut()
+        Button(
+          store.shortcutSetupPending
+            ? "Open Accessibility settings…" : "Set up shortcut & paste access"
+        ) {
+          store.setUpShortcut()
         }.buttonStyle(.borderedProminent).disabled(recorder.recording)
-        if store.fnSetupPending { Button("Cancel setup") { store.cancelFnSetup() } }
+        if store.shortcutSetupPending { Button("Cancel setup") { store.cancelShortcutSetup() } }
         Button("Keyboard settings…") { store.openKeyboardSettings() }
       }
-      if !store.fnSetupStatus.isEmpty { Text(store.fnSetupStatus).font(.caption) }
-      Text("Set up Fn saves only your shortcut. Other edits still use Save settings.").font(
+      if !store.shortcutSetupStatus.isEmpty { Text(store.shortcutSetupStatus).font(.caption) }
+      Text("Setup saves only your selected shortcut. Other edits still use Save settings.").font(
         .caption
       ).foregroundStyle(.secondary)
       HStack {
@@ -205,7 +208,7 @@ struct ShortcutSettings: View {
       store.refreshShortcutAccess()
     }
     .onChange(of: store.config.effectiveShortcut) { _, _ in
-      if store.fnSetupPending { store.cancelFnSetup() }
+      if store.shortcutSetupPending { store.cancelShortcutSetup() }
     }
     .onDisappear { recorder.stop() }
     .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification))

@@ -131,7 +131,6 @@ struct SettingsView: View {
           }
           HStack {
             Button("Allow microphone") { store.requestMicrophone() }
-            Button("Enable keyboard & paste access") { store.requestAccessibility() }
           }
           ShortcutSettings(store: store)
           Toggle("Press to toggle recording instead of hold to talk", isOn: $store.config.toggle)

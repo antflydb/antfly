@@ -13,7 +13,7 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
   try JSONEncoder().encode(config).write(to: directory.appendingPathComponent("settings.json"))
   return directory
 }
-@Test @MainActor func fnSetupWaitsForPermissionAndAppliesAutomaticallyOnReturn() throws {
+@Test @MainActor func shortcutSetupWaitsForPermissionAndAppliesAutomaticallyOnReturn() throws {
   var saved = Configuration()
   saved.effectiveShortcut = .controlOptionSpace
   let directory = try setupDirectory(saved)
@@ -24,19 +24,20 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
   let store = Store(
     directory: directory, registerHotkey: false, keyboardAccess: { trusted },
     keyboardAccessRequest: { prompts += 1 }, settingsOpener: { panes.append($0) })
-  store.setUpFnShortcut()
-  #expect(store.fnSetupPending && prompts == 1)
-  #expect(store.config.effectiveShortcut == .controlOptionSpace)
+  store.config.effectiveShortcut = .fn
+  store.setUpShortcut()
+  #expect(store.shortcutSetupPending && prompts == 1)
+  #expect(store.config.effectiveShortcut == .fn)
   #expect(panes == ["com.apple.preference.security?Privacy_Accessibility"])
   let file = directory.appendingPathComponent("settings.json")
   #expect(try Configuration.decode(Data(contentsOf: file)).effectiveShortcut == .controlOptionSpace)
   trusted = true
   store.refreshShortcutAccess()
-  #expect(!store.fnSetupPending && store.config.effectiveShortcut == .fn)
+  #expect(!store.shortcutSetupPending && store.config.effectiveShortcut == .fn)
   #expect(try Configuration.decode(Data(contentsOf: file)).effectiveShortcut == .fn)
-  #expect(store.fnSetupStatus.contains("enabled and saved"))
+  #expect(store.shortcutSetupStatus.contains("enabled and saved"))
 }
-@Test @MainActor func fnSetupSavesOnlyTheShortcutAndDoesNotPersistUnsavedEdits() throws {
+@Test @MainActor func shortcutSetupSavesOnlyTheShortcutAndDoesNotPersistUnsavedEdits() throws {
   var saved = Configuration()
   saved.server = "https://saved.example"
   saved.dictionary = ["Saved"]
@@ -49,17 +50,19 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
     settingsOpener: { _ in Issue.record("Already authorized setup opened Settings") })
   store.config.server = "https://unsaved.example"
   store.config.dictionary = ["Unsaved"]
+  store.config.effectiveShortcut = .controlOption
   store.token = "never-persist-this-token"
-  store.setUpFnShortcut()
+  store.setUpShortcut()
   let data = try Data(contentsOf: directory.appendingPathComponent("settings.json"))
   let result = try Configuration.decode(data)
   #expect(result.server == saved.server && result.dictionary == saved.dictionary)
-  #expect(result.effectiveShortcut == .fn)
+  #expect(result.effectiveShortcut == .controlOption)
   #expect(
     store.config.server == "https://unsaved.example" && store.config.dictionary == ["Unsaved"])
   #expect(!String(decoding: data, as: UTF8.self).contains("never-persist-this-token"))
 }
-@Test @MainActor func cancelingFnSetupKeepsTheExistingShortcutAfterPermissionChanges() throws {
+@Test @MainActor func cancelingShortcutSetupKeepsTheExistingShortcutAfterPermissionChanges() throws
+{
   var saved = Configuration()
   saved.effectiveShortcut = .controlOptionSpace
   let directory = try setupDirectory(saved)
@@ -68,16 +71,16 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
   let store = Store(
     directory: directory, registerHotkey: false, keyboardAccess: { trusted },
     keyboardAccessRequest: {}, settingsOpener: { _ in })
-  store.setUpFnShortcut()
-  store.cancelFnSetup()
+  store.setUpShortcut()
+  store.cancelShortcutSetup()
   trusted = true
   store.refreshShortcutAccess()
-  #expect(!store.fnSetupPending && store.config.effectiveShortcut == .controlOptionSpace)
+  #expect(!store.shortcutSetupPending && store.config.effectiveShortcut == .controlOptionSpace)
   #expect(
     try Configuration.decode(Data(contentsOf: directory.appendingPathComponent("settings.json")))
       == saved)
 }
-@Test @MainActor func fnSetupDoesNotInterruptRecordingOrShortcutCapture() throws {
+@Test @MainActor func shortcutSetupDoesNotInterruptRecordingOrShortcutCapture() throws {
   let directory = try setupDirectory(Configuration())
   defer { try? FileManager.default.removeItem(at: directory) }
   let store = Store(
@@ -85,11 +88,11 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
     keyboardAccessRequest: { Issue.record("Busy app requested permission") },
     settingsOpener: { _ in Issue.record("Busy app opened Settings") })
   store.state = .recording
-  store.setUpFnShortcut()
-  #expect(!store.fnSetupPending)
+  store.setUpShortcut()
+  #expect(!store.shortcutSetupPending)
   store.state = .idle
   store.captureShortcut(true)
-  store.setUpFnShortcut()
-  #expect(!store.fnSetupPending)
+  store.setUpShortcut()
+  #expect(!store.shortcutSetupPending)
   store.captureShortcut(false)
 }
