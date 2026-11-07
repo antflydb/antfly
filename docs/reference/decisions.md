@@ -247,6 +247,10 @@ resolver `adjudicate` policy or decision enrichment.
 - Only choice and predicate questions are accepted, because bands read
   probabilities. Embedding-similarity deciders and nested cascades cannot be
   stages, and a band cannot follow a `verdict_only` generated stage.
+  This also applies to dynamically returned proxy answers: a verdict's `0/1`
+  assertion cannot drive a confidence band. An unmeasurable result follows its
+  producing stage's failure policy, retaining paid usage and completed siblings.
+  A valid veto stops before any later band's evidence is inspected.
 - Escalation applies to successful answers. It is not failover: a stage error
   ends the input unless that stage sets `on_failure: keep_previous`, which keeps
   the previous answer and records the error. The first stage defaults to `fail`;

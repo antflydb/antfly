@@ -99,7 +99,27 @@ pub fn modelRevision(a: std.mem.Allocator, producer: @import("../storage/db/enri
     var scoped = context;
     const deadline = @import("antfly_platform").time.monotonicNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
     scoped.deadline_ns = if (context.deadline_ns) |caller| @min(caller, deadline) else deadline;
-    const capabilities = (try producer.withInvocationContext(scoped).capabilitiesForRequests(a, &.{.{ .producer_type = .decision, .config_json = specification, .source_text = "" }})) orelse return null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    // Ordinary producer specs need no extra prompt/schema parse. Escaped keys
+    // still take the parsed path for the discovery-only envelope.
+    const envelope: std.json.Value = if (std.mem.indexOf(u8, specification, "decision_revision_probe") != null or std.mem.indexOfScalar(u8, specification, '\\') != null)
+        try std.json.parseFromSliceLeaky(std.json.Value, scratch, specification, .{})
+    else
+        .null;
+    var require_revision = false;
+    if (envelope == .object) if (envelope.object.get("decision_revision_probe")) |raw| {
+        _ = try policy.Config.parseRevisionRequest(scratch, raw);
+        // Keep the original Decisions route intact. The producer adapter owns
+        // linked-vs-HTTP routing, alias verification and credential scope.
+        require_revision = true;
+    };
+    const capabilities = (try producer.withInvocationContext(scoped).capabilitiesForRequests(a, &.{.{ .producer_type = .decision, .config_json = specification, .source_text = "" }})) orelse {
+        if (require_revision) return error.CapabilityDiscoveryUnavailable;
+        return null;
+    };
+    if (require_revision and capabilities.model_revision == null) return error.CapabilityDiscoveryUnavailable;
     return capabilities.model_revision;
 }
 

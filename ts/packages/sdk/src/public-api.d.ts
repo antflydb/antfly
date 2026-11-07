@@ -18328,7 +18328,7 @@ export interface components {
                 question?: string;
                 /** @description For choice questions, measure this value's probability. Omitted, the selected value's probability. */
                 choice?: string;
-                /** @description Lower and upper bound, lower strictly below upper. The previous stage must not be verdict_only. */
+                /** @description Lower and upper bound, lower strictly below upper. Inputs must have measured probabilities. The previous stage must not be verdict_only; a dynamically returned proxy verdict fails its producing stage under on_failure instead of driving the band. */
                 probability_between: number[];
             };
             /** @description Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains. */

@@ -3504,14 +3504,15 @@ test "decision provider generated upstream cascades survive actual proxy normali
             for (result.values, result.failures, modes) |value, failure, mode| {
                 const outer = std.mem.eql(u8, name, "outer");
                 const malformed = std.mem.eql(u8, mode, "malformed");
-                if (malformed and !outer) {
+                const unmeasurable = !std.mem.eql(u8, name, "proxy") and std.mem.eql(u8, mode, "verdict");
+                if ((malformed or unmeasurable) and !outer) {
                     try std.testing.expect(value == null);
-                    try std.testing.expectEqual(error.InvalidDecisionOutput, failure.?);
+                    try std.testing.expectEqual(if (unmeasurable) error.UnsupportedDecisionCascadeAnswer else error.InvalidDecisionOutput, failure.?);
                     continue;
                 }
                 try std.testing.expect(failure == null);
                 const response = value.?;
-                const blocked = std.mem.eql(u8, mode, "veto") or std.mem.eql(u8, mode, "unverified") or (outer and guard and (malformed or std.mem.eql(u8, mode, "sampled")));
+                const blocked = std.mem.eql(u8, mode, "veto") or std.mem.eql(u8, mode, "unverified") or (outer and guard and (malformed or unmeasurable or std.mem.eql(u8, mode, "sampled")));
                 try std.testing.expectEqual(blocked, try decisions.cascade_contract.agreementBlocked(response));
                 if (std.mem.eql(u8, name, "proxy")) {
                     try std.testing.expectEqualStrings("generated", response.object.get("answers").?.array.items[0].object.get("decision_method").?.string);
@@ -3520,11 +3521,12 @@ test "decision provider generated upstream cascades survive actual proxy normali
                 const definition = &(try registry.getCascade(name)).definition;
                 _ = try decisions.cascade_contract.validateTrace(definition, response);
                 const trace = response.object.get("cascade").?.object.get("stages").?.array.items;
-                const stopped = blocked or malformed;
+                const stopped = blocked or malformed or unmeasurable;
                 try std.testing.expectEqual(@as(usize, if (outer) (if (stopped) 2 else 3) else (if (stopped) 1 else 2)), trace.len);
                 const remote_stage = trace[if (outer) @as(usize, 1) else 0].object;
-                if (malformed) {
+                if (malformed or unmeasurable) {
                     try std.testing.expect(remote_stage.contains("error"));
+                    if (unmeasurable) try std.testing.expectEqualStrings("UnsupportedDecisionCascadeAnswer", remote_stage.get("error").?.string);
                 } else {
                     try std.testing.expect(!remote_stage.contains("error"));
                     try std.testing.expectEqualStrings("generated", remote_stage.get("answers").?.array.items[0].object.get("decision_method").?.string);

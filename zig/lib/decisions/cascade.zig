@@ -547,6 +547,11 @@ pub fn answerProbability(answer: V, choice: ?[]const u8) !f64 {
     if (answer != .object) return error.InvalidDecisionOutput;
     const kind = answer.object.get("type") orelse return error.InvalidDecisionOutput;
     if (kind != .string) return error.InvalidDecisionOutput;
+    // A categorical verdict is a vote, not measured confidence. Proxies can
+    // resolve their method dynamically, beyond compile-time policy checks.
+    if (answer.object.get("probability_source")) |source| {
+        if (source == .string and std.mem.eql(u8, source.string, "verdict")) return error.UnsupportedDecisionCascadeAnswer;
+    }
     if (std.mem.eql(u8, kind.string, "predicate")) {
         return number(answer.object.get("probability") orelse return error.UnsupportedDecisionCascadeAnswer);
     }
@@ -572,13 +577,15 @@ pub fn inBand(band: Band, answers: V) !bool {
         return band.contains(try answerProbability(answer, band.choice));
     }
     if (answers != .array) return error.InvalidDecisionOutput;
+    var matched = false;
     for (answers.array.items) |answer| {
         const kind = answer.object.get("type") orelse return error.InvalidDecisionOutput;
         // A named choice value only applies to choice answers.
         const choice = if (kind == .string and std.mem.eql(u8, kind.string, "choice")) band.choice else null;
-        if (band.contains(try answerProbability(answer, choice))) return true;
+        // Validate all inspected answers even if an earlier one was in band.
+        matched = band.contains(try answerProbability(answer, choice)) or matched;
     }
-    return false;
+    return matched;
 }
 
 /// Bind selectors to the validated internal question schema before any model
@@ -761,18 +768,7 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
     var calls: u32 = 0;
 
     for (definition.stages, 0..) |stage, stage_index| {
-        if (stage_index > 0) {
-            var next: std.array_list.Managed(usize) = .init(a);
-            for (active.items) |index| {
-                const row = &rows[index];
-                const response = row.response orelse continue;
-                const escalate = try inBand(stage.when.?, response.object.get("answers") orelse return error.InvalidDecisionOutput);
-                try markEscalated(a, row, escalate);
-                if (escalate) try next.append(index);
-            }
-            active.deinit();
-            active = next;
-        }
+        if (stage_index > 0) for (active.items) |index| try markEscalated(a, &rows[index], true);
         if (active.items.len == 0) break;
         if (calls >= definition.budget.max_model_calls) return error.DecisionCascadeBudgetExceeded;
         if (runner.checkpoint) |check| try check(runner.ptr);
@@ -781,7 +777,7 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
             if (isFatal(err)) return err;
             for (active.items) |index| {
                 const row = &rows[index];
-                _ = try appendTrace(a, row, stage, null, null, err);
+                _ = try appendTrace(a, row, stage, null, null, err, null);
                 if (stage_index == 0 or stage.on_failure == .fail) {
                     row.response = null;
                     row.failure = err;
@@ -804,11 +800,12 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
             };
             if (value) |response| {
                 if (response != .object or response.object.get("answers") == null) return error.InvalidDecisionOutput;
-                const blocked = appendTrace(a, row, stage, response, usage, null) catch |err| {
-                    if (err != error.InvalidDecisionOutput) return err;
-                    // Invalid upstream wire metadata is an item failure, not
-                    // permission to drop completed or healthy siblings.
-                    _ = try appendTrace(a, row, stage, null, usage, err);
+                const next_band = if (stage_index + 1 < definition.stages.len) definition.stages[stage_index + 1].when else null;
+                const escalate = appendTrace(a, row, stage, response, usage, null, next_band) catch |err| {
+                    if (err != error.InvalidDecisionOutput and err != error.UnsupportedDecisionCascadeAnswer) return err;
+                    // Invalid metadata or unmeasurable band evidence is an
+                    // item failure; completed and healthy siblings survive.
+                    _ = try appendTrace(a, row, stage, null, usage, err, null);
                     if (stage_index == 0 or stage.on_failure == .fail) {
                         row.response = null;
                         row.failure = err;
@@ -817,12 +814,12 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
                 };
                 row.response = response;
                 row.failure = null;
-                if (!blocked) try still.append(index);
+                if (escalate) try still.append(index);
                 continue;
             }
             const err = failure orelse error.InvalidDecisionOutput;
             if (isFatal(err)) return err;
-            _ = try appendTrace(a, row, stage, null, usage, err);
+            _ = try appendTrace(a, row, stage, null, usage, err, null);
             // keep_previous retains the previous answer; the item stops here.
             if (stage_index > 0 and stage.on_failure == .keep_previous) continue;
             row.response = null;
@@ -846,7 +843,7 @@ pub fn execute(a: A, definition: *const Definition, name: []const u8, item_count
     return out;
 }
 
-fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?anyerror) !bool {
+fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?anyerror, next_band: ?Band) !bool {
     const upstream = if (response) |value| try responseAgreement(value) else null;
     const local: ?Agreement = if (stage.require_agreement)
         (if (response != null and !blockedAgreement(upstream))
@@ -855,6 +852,13 @@ fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?any
             .{ .status = .unverified })
     else
         null;
+    // Validate the next band's evidence before committing this successful
+    // stage. A bad dynamic result belongs to this stage's failure policy;
+    // valid vetoes stop before any later band's evidence is inspected.
+    const escalate = if (response != null and !blockedAgreement(combineAgreement(upstream, local)) and next_band != null)
+        try inBand(next_band.?, response.?.object.get("answers").?)
+    else
+        false;
     var entry = try trace(a, stage, response, usage, err);
     var reference: ?AgreementRef = null;
     if (upstream) |agreement| {
@@ -871,7 +875,7 @@ fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?any
     }
     try row.stages.append(entry);
     if (reference) |value| row.agreement = value;
-    return blockedAgreement(combineAgreement(upstream, local));
+    return escalate;
 }
 
 fn trace(a: A, stage: Stage, response: ?V, usage: ?V, err: ?anyerror) !V {
@@ -1500,4 +1504,58 @@ test "decision cascade malformed upstream state is isolated and uses operational
         _ = try validateTrace(&definition, result.values[0].?);
         _ = try validateTrace(&definition, result.values[1].?);
     }
+}
+
+test "decision cascade verdict confidence is rejected per stage without losing vetoes or siblings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Proxy = struct {
+        fn run(_: *anyopaque, alloc: A, index: usize, _: Stage, indices: []const usize) anyerror!StageResult {
+            try std.testing.expect(index < 2);
+            const values = try alloc.alloc(?V, indices.len);
+            const failures = try alloc.alloc(?anyerror, indices.len);
+            @memset(failures, null);
+            for (values, indices) |*value, row| {
+                value.* = if (index == 0)
+                    try Fake.response(alloc, "fast", "typed", if (row == 0) 0.6 else if (row == 1) 0.4 else 0.1)
+                else
+                    try std.json.parseFromSliceLeaky(V, alloc,
+                        \\{"model":"proxy","answers":[{"name":"same","type":"choice","decision_method":"generated","probability_source":"verdict","raw_structured_answer":"same","choice":"same","probabilities":[{"value":"same","probability":1},{"value":"different","probability":0}]}],"usage":{"input_tokens":20,"output_tokens":1}}
+                    , .{});
+            }
+            return .{ .values = values, .failures = failures };
+        }
+    };
+    for ([_][]const u8{ "fail", "keep_previous" }) |policy| {
+        const definition = try compileJson(a, try std.fmt.allocPrint(a,
+            \\{{"stages":[{{"name":"fast","decider":{{"model":"fast"}}}},{{"name":"proxy","decider":{{"model":"remote"}},"require_agreement":true,"on_failure":"{s}","when":{{"question":"same","choice":"same","probability_between":[0.3,1]}}}},{{"name":"after","decider":{{"model":"after"}},"when":{{"question":"same","choice":"same","probability_between":[0.3,0.9]}}}}]}}
+        , .{policy}));
+        var token: u8 = 0;
+        const out = try execute(a, &definition, "outer", 3, .{ .ptr = &token, .run = Proxy.run });
+        if (std.mem.eql(u8, policy, "fail")) {
+            try std.testing.expect(out.values[0] == null);
+            try std.testing.expectEqual(error.UnsupportedDecisionCascadeAnswer, out.failures[0].?);
+        } else {
+            const fallback = out.values[0].?;
+            try std.testing.expect(try agreementBlocked(fallback));
+            try std.testing.expectEqualStrings("unverified", fallback.object.get("cascade").?.object.get("agreement_status").?.string);
+            try std.testing.expectEqual(@as(i64, 30), fallback.object.get("usage").?.object.get("input_tokens").?.integer);
+            _ = try validateTrace(&definition, fallback);
+        }
+        const veto = out.values[1].?;
+        try std.testing.expect(try agreementBlocked(veto));
+        try std.testing.expectEqualStrings("disagreed", veto.object.get("cascade").?.object.get("agreement_status").?.string);
+        _ = try validateTrace(&definition, veto);
+        try std.testing.expect(!(try agreementBlocked(out.values[2].?)));
+        _ = try validateTrace(&definition, out.values[2].?);
+    }
+    const mixed = try std.json.parseFromSliceLeaky(V, a,
+        \\[{"name":"measured","type":"predicate","probability":0.6},{"name":"verdict","type":"predicate","decision_method":"generated","probability_source":"verdict","raw_structured_answer":true,"probability":1}]
+    , .{});
+    const band = Band{ .low = 0.3, .high = 0.9 };
+    try std.testing.expectError(error.UnsupportedDecisionCascadeAnswer, inBand(band, mixed));
+    var scoped = band;
+    scoped.question = "measured";
+    try std.testing.expect(try inBand(scoped, mixed));
 }

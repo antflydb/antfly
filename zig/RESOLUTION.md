@@ -332,11 +332,25 @@ A response without the trace is invalid. The receipt keeps the normalized
 response, including the trace, under `response`; the `Evidence` layout is
 unchanged. Generated stages get the resolver's per-call batch bounds, and the
 receipt hash mixes in revisions reported by generated stages that actually
-answered. Reuse discovers only those dependencies; unreachable stages do not
+answered, including generated answers returned through typed Antfly proxies. Reuse discovers only those dependencies; unreachable stages do not
 become availability dependencies. If an executed dependency cannot be verified,
 the previous committed verdict is preserved and the refresh fails. Explicit
 `keep_previous` outcomes remain replay-stable until inputs, policy, or a
 reported dependency changes.
+
+Reported generated revisions are execution dependencies for direct proxy
+policies and proxy stages too. Discovery is cached by local stage and resolved
+model within a resolution batch; it never invokes inference. A missing verifier,
+missing revision, or discovery failure preserves the committed receipt and
+returns a discovery error (`CapabilityDiscoveryUnavailable` when verification is
+absent), including under `on_failure: mint`.
+Receipts without reported revisions retain their offline replay behavior.
+The native adapter can verify an exact linked model route using native
+metadata. HTTP Decisions routes and opaque gateway aliases require a host revision verifier that can prove
+the current alias binding; querying the previously resolved leaf is insufficient.
+Earlier dependency-free proxy bindings and native hex-hash bindings are upgraded
+only after the recorded revision is verified, without repeating inference.
+
 Probability thresholds apply to the probabilistic stages; a terminal
 verdict-only stage must provide a categorical 0/1 distribution. Catalogs with a cascade policy
 require reader epoch 30; policies with an enabled `require_agreement` guard

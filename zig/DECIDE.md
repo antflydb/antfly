@@ -159,3 +159,10 @@ persisting definitions, preserving the epoch-30 wire shape. This normalization
 runs on caller-owned trees or configuration copies, outside per-result execution.
 Enabled guards require reader epoch 31 in persisted producers and resolver
 policies; unguarded cascades retain epoch 30.
+
+
+Confidence bands consume measured probabilities. A dynamically proxied
+verdict-only answer is rejected before its producing stage commits success if a
+later band needs that answer. Band validation checks every unscoped question,
+including questions after an earlier in-band answer. Valid upstream or local
+vetoes stop first, so terminal categorical votes remain valid evidence.

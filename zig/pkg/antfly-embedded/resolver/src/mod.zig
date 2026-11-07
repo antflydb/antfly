@@ -2177,7 +2177,8 @@ pub const ResolutionStage = struct {
             const resolve = executor.model_revision orelse break :blk null;
             break :blk try resolve(executor.ptr, arena, try config.producerSpecification(arena), @min(config.timeout_ms, config.budget_ms));
         } else null;
-        const base_receipt_hash = if (self.adjudicate) |config| try fingerprintHex(arena, .{ self.config_generation, self.execution_dependency, try config.semantic(arena), extraction.?, self.mention_descriptions_json, self.sibling_resolutions_json }) else "";
+        const semantic_policy = if (self.adjudicate) |config| try config.semantic(arena) else null;
+        const base_receipt_hash = if (semantic_policy) |config| try fingerprintHex(arena, .{ self.config_generation, self.execution_dependency, config, extraction.?, self.mention_descriptions_json, self.sibling_resolutions_json }) else "";
         const receipt_hash = if (model_revision) |revision| try fingerprintHex(arena, .{ base_receipt_hash, revision }) else base_receipt_hash;
         const receipts = if (self.adjudicate != null and existing != null) try parseResolution(gpa, existing.?) else null;
         defer if (receipts) |value| {
@@ -2185,7 +2186,10 @@ pub const ResolutionStage = struct {
             owner.deinit();
         };
         const reused = try arena.alloc(?ResolvedEntity, parsed.entities.len);
-        var cascade_revisions: adjudication.Config.RevisionCache = @splat(.{});
+        var cascade_revisions: adjudication.Config.RevisionCache = .{};
+        defer cascade_revisions.deinit(arena);
+        var migrated_specifications: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
+        defer migrated_specifications.deinit(arena);
         for (parsed.entities, 0..) |entity, i| {
             reused[i] = null;
             if (alias_mask[i] or (if (self.overrides) |overrides| overrides.overrideFor(entity.local_id) != null else false)) continue;
@@ -2195,7 +2199,8 @@ pub const ResolutionStage = struct {
                     if (!std.mem.eql(u8, prior_entity.local_id, entity.local_id)) continue;
                     if (prior_entity.adjudication) |evidence| {
                         var expected = receipt_hash;
-                        if (self.adjudicate.?.cascadeStages().len > 0) {
+                        var migrate_revision: ?[32]u8 = null;
+                        if (self.adjudicate.?.tracksResponseRevisions()) {
                             const response = evidence.response orelse {
                                 // Failure and exhausted-budget receipts are
                                 // authoritative too. They have no successful
@@ -2205,15 +2210,16 @@ pub const ResolutionStage = struct {
                                     reused[i] = prior_entity;
                                 continue;
                             };
-                            const recorded = self.adjudicate.?.cascadeRevision(arena, response, null, &cascade_revisions) catch continue;
+                            const recorded = self.adjudicate.?.responseRevision(arena, response, null, &cascade_revisions) catch continue;
                             const recorded_hash = if (recorded) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
                             // Changed inputs/policy do not need to discover an
                             // obsolete receipt's model dependencies.
-                            if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash)) continue;
+                            const legacy = recorded != null and std.mem.eql(u8, evidence.execution_hash, base_receipt_hash);
+                            if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash) and !legacy) continue;
                             // Receipts with no model revision dependency can
                             // still replay offline, like ordinary typed ones.
                             if (self.adjudicator == null) {
-                                if (recorded != null) continue;
+                                if (recorded != null) return error.CapabilityDiscoveryUnavailable;
                                 if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, base_receipt_hash)) reused[i] = prior_entity;
                                 continue;
                             }
@@ -2221,10 +2227,33 @@ pub const ResolutionStage = struct {
                             // If an executed dependency cannot be verified,
                             // leave the committed verdict intact. A transient
                             // metadata outage must not silently replace it.
-                            const revision = try self.adjudicate.?.cascadeRevision(arena, response, executor, &cascade_revisions);
+                            const revision = try self.adjudicate.?.responseRevision(arena, response, executor, &cascade_revisions);
                             expected = if (revision) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
+                            if (legacy and std.mem.eql(u8, expected, recorded_hash)) migrate_revision = recorded;
+                        } else if (evidence.response) |response| {
+                            if (try adjudication.Config.reportedRevision(response)) |recorded| {
+                                const recorded_hash = try fingerprintHex(arena, .{ base_receipt_hash, recorded });
+                                // Older native discovery hashed the hexadecimal
+                                // representation. Recognize that historical binding
+                                // only for this unchanged execution identity.
+                                var legacy_revision: [32]u8 = undefined;
+                                std.crypto.hash.sha2.Sha256.hash(&std.fmt.bytesToHex(recorded, .lower), &legacy_revision, .{});
+                                const legacy_hash = try fingerprintHex(arena, .{ base_receipt_hash, legacy_revision });
+                                const legacy = std.mem.eql(u8, evidence.execution_hash, legacy_hash);
+                                if (!std.mem.eql(u8, evidence.execution_hash, recorded_hash) and !legacy) continue;
+                                if (model_revision == null) return error.CapabilityDiscoveryUnavailable;
+                                if (legacy and std.mem.eql(u8, expected, recorded_hash)) migrate_revision = recorded;
+                            }
                         }
-                        if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, expected)) reused[i] = prior_entity;
+                        if (migrate_revision) |revision| {
+                            if (evidence.version != 1) continue;
+                            var upgraded = prior_entity;
+                            upgraded.adjudication.?.execution_hash = expected;
+                            const entry = try migrated_specifications.getOrPut(arena, revision);
+                            if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(arena, .{ semantic_policy.?, revision });
+                            upgraded.adjudication.?.specification_hash = entry.value_ptr.*;
+                            reused[i] = upgraded;
+                        } else if (evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, expected)) reused[i] = prior_entity;
                     }
                 }
             }
@@ -2386,7 +2415,7 @@ pub const ResolutionStage = struct {
                 entity.* = try cloneResolvedEntity(result_arena, receipt);
             }
         }
-        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &resolution, parsed.entities, lists, reused, receipt_hash, model_revision);
+        if (self.adjudicate) |config| try self.adjudicateReviews(result_arena, config, &resolution, parsed.entities, lists, reused, base_receipt_hash, model_revision);
 
         // Apply human-curation overrides: a reviewed mention takes the curator's
         // decision and endpoint (strings copied into the resolution arena so they
@@ -2438,10 +2467,11 @@ pub const ResolutionStage = struct {
         return try resolution.toJson(gpa);
     }
 
-    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, execution_hash: []const u8, model_revision: ?[32]u8) !void {
+    fn adjudicateReviews(self: ResolutionStage, a: std.mem.Allocator, config: adjudication.Config, resolution: *Resolution, mentions: []const ExtractedEntity, lists: [][]const Candidate, reused: []const ?ResolvedEntity, base_execution_hash: []const u8, model_revision: ?[32]u8) !void {
         var classifier = try adjudication.Classifier.init(a, config);
         defer classifier.deinit();
         const specification = classifier.specification_json;
+        const execution_hash = if (model_revision) |revision| try fingerprintHex(a, .{ base_execution_hash, revision }) else base_execution_hash;
         const semantic_config = try config.semantic(a);
         const specification_hash = if (model_revision) |revision| try fingerprintHex(a, .{ semantic_config, revision }) else try fingerprintHex(a, semantic_config);
         // All items share a frozen policy. Hash its large instructions only
@@ -2603,14 +2633,22 @@ pub const ResolutionStage = struct {
                     continue;
                 };
                 evidence.response = response;
-                if (config.cascadeStages().len > 0) {
-                    var unused: adjudication.Config.RevisionCache = @splat(.{});
-                    if (try config.cascadeRevision(a, response, null, &unused)) |revision| {
+                if (config.tracksResponseRevisions()) {
+                    var unused: adjudication.Config.RevisionCache = .{};
+                    defer unused.deinit(a);
+                    if (try config.responseRevision(a, response, null, &unused)) |revision| {
                         evidence.execution_hash = try fingerprintHex(a, .{ execution_hash, revision });
                         const entry = try revision_specifications.getOrPut(a, revision);
                         if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(a, .{ semantic_config, revision });
                         evidence.specification_hash = entry.value_ptr.*;
                     }
+                } else if (try adjudication.Config.reportedRevision(response)) |revision| {
+                    // Pin the identity actually used by execution, rather than
+                    // a discovery snapshot that may predate a model reload.
+                    evidence.execution_hash = try fingerprintHex(a, .{ base_execution_hash, revision });
+                    const entry = try revision_specifications.getOrPut(a, revision);
+                    if (!entry.found_existing) entry.value_ptr.* = try fingerprintHex(a, .{ semantic_config, revision });
+                    evidence.specification_hash = entry.value_ptr.*;
                 }
             }
         }
@@ -4717,5 +4755,165 @@ test "REVIEW frozen cascades validate proxied generated stages without per-resul
         const answer = &response.object.getPtr("answers").?.array.items[0];
         try answer.object.put(a, "raw_structured_answer", .{ .string = "different" });
         try testing.expectError(error.InvalidAdjudicationOutput, classifier.classify(response));
+    }
+}
+
+test "REVIEW generated revisions pin direct proxy cascade and explicit receipts and preserve failures" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Fixture = struct {
+        base: AdjudicationFixture = .{},
+        revision: [32]u8 = @splat(0xaa),
+        probes: usize = 0,
+        fail: bool = false,
+        missing: bool = false,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: adjudication.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return AdjudicationFixture.execute(&self.base, alloc, request);
+        }
+        fn revisionFor(ptr: *anyopaque, alloc: std.mem.Allocator, specification: []const u8, _: u32) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.probes += 1;
+            const request = try std.json.parseFromSliceLeaky(std.json.Value, alloc, specification, .{});
+            const model = if (request.object.get("decision_revision_probe")) |value| blk: {
+                const probe = value.object;
+                const original = try std.json.parseFromSliceLeaky(std.json.Value, alloc, probe.get("specification").?.string, .{});
+                try testing.expectEqualStrings("remote", original.object.get("decider").?.object.get("model").?.string);
+                break :blk probe.get("model").?.string;
+            } else request.object.get("decider").?.object.get("generator").?.object.get("model").?.string;
+            if (self.fail) return error.CapabilityDiscoveryUnavailable;
+            if (self.missing) return null;
+            return if (std.mem.eql(u8, model, "leaf-b")) @splat(0xcc) else self.revision;
+        }
+        fn executor(self: *@This()) adjudication.Executor {
+            return .{ .ptr = self, .execute = execute, .model_revision = revisionFor };
+        }
+        fn response(alloc: std.mem.Allocator, cfg: adjudication.Config, revision: [32]u8, model: []const u8, veto: bool) !std.json.Value {
+            var source = try std.json.parseFromSliceLeaky(std.json.Value, alloc, adjudication_test_response, .{});
+            try source.object.put(alloc, "model", .{ .string = model });
+            try source.object.put(alloc, "model_revision", .{ .string = try alloc.dupe(u8, &std.fmt.bytesToHex(revision, .lower)) });
+            const answer = &source.object.getPtr("answers").?.array.items[0];
+            try answer.object.put(alloc, "decision_method", .{ .string = "generated" });
+            try answer.object.put(alloc, "raw_structured_answer", .{ .string = "same" });
+            try answer.object.put(alloc, "probability_source", .{ .string = "token_logprobs" });
+            const summary = try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+                \\{"agreement_status":"disagreed","agreed":false,"disagreed_questions":["same"]}
+            , .{});
+            if (cfg.cascadeStages().len == 0) {
+                if (veto) try source.object.put(alloc, "cascade", summary);
+                return source;
+            }
+            var result = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try adjudicationCascadeResponse(alloc, cfg), .{});
+            const cascade = result.object.getPtr("cascade").?;
+            const stage = &cascade.object.getPtr("stages").?.array.items[1];
+            try stage.object.put(alloc, "decision_method", .{ .string = "typed" });
+            for ([_][]const u8{ "answers", "model", "model_revision" }) |key| {
+                try result.object.put(alloc, key, source.object.get(key).?);
+                try stage.object.put(alloc, key, source.object.get(key).?);
+            }
+            try stage.object.put(alloc, "agreement_status", .{ .string = if (veto) "unverified" else "agreed" });
+            if (veto) {
+                try stage.object.put(alloc, "upstream_agreement", summary);
+                for (summary.object.keys(), summary.object.values()) |key, value| try cascade.object.put(alloc, key, value);
+            } else {
+                try stage.object.put(alloc, "agreed", .{ .bool = true });
+                try cascade.object.put(alloc, "agreement_status", .{ .string = "agreed" });
+                try cascade.object.put(alloc, "agreed", .{ .bool = true });
+            }
+            return result;
+        }
+    };
+    for ([_]enum { proxy, cascade, generated }{ .proxy, .cascade, .generated }) |mode| {
+        const cascade = mode == .cascade;
+        const explicit = mode == .generated;
+        const raw = try std.fmt.allocPrint(scratch,
+            \\{{"decider":{s},"template":"{{{{m.text}}}} / {{{{c.canonical_name}}}}","question":{{"type":"choice","name":"same","instructions":"Same?","choices":[{{"value":"same"}},{{"value":"different"}}]}},"accept":{{"choice":"same","min_probability":0.9}},"on_failure":"mint"}}
+        , .{if (cascade)
+            \\{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","model":"fast"}},{"name":"strong","decider":{"model":"remote"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0.3,1]}}]}}
+        else if (explicit)
+            \\{"decision_method":"generated","generator":{"provider":"antfly","model":"leaf-a"}}
+        else
+            \\{"provider":"antfly","model":"remote"}
+        });
+        const config = try adjudication.Config.parse(a, raw);
+        defer config.deinit();
+        var fixture = Fixture{};
+        const initial = try Fixture.response(scratch, config.value, fixture.revision, "leaf-a", false);
+        try testing.expectEqual(adjudication.Status.accepted, try adjudication.classify(scratch, config.value, initial));
+        if (!explicit) {
+            var cache: adjudication.Config.RevisionCache = .{};
+            defer cache.deinit(scratch);
+            try testing.expect((try config.value.responseRevision(scratch, initial, null, &cache)) != null);
+            for (0..32) |_| _ = try config.value.responseRevision(scratch, initial, fixture.executor(), &cache);
+            try testing.expectEqual(@as(usize, 1), fixture.probes);
+            const other = try Fixture.response(scratch, config.value, @splat(0xcc), "leaf-b", false);
+            _ = try config.value.responseRevision(scratch, other, fixture.executor(), &cache);
+            try testing.expectEqual(@as(usize, 2), fixture.probes);
+        }
+        fixture.probes = 0;
+        fixture.base.response = try std.json.Stringify.valueAlloc(scratch, initial, .{});
+        var resolver = try Resolver.parse(a,
+            \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+        );
+        defer resolver.deinit();
+        var map: MapStore = .{ .alloc = a };
+        defer map.deinit();
+        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+        var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = config.value, .adjudicator = fixture.executor(), .work_retention = .none };
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, if (explicit) 1 else 0), fixture.probes);
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+        try testing.expectEqual(@as(usize, if (explicit) 2 else 1), fixture.probes);
+        // Migrate earlier dependency-free proxy bindings and the old native
+        // hex-hash binding only after verifying the same recorded revision.
+        const current_bytes = (try map.store().get(a, "resolution")).?;
+        defer a.free(current_bytes);
+        const legacy = try std.json.parseFromSliceLeaky(std.json.Value, scratch, current_bytes, .{});
+        const legacy_evidence = &legacy.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?.*;
+        const source_bytes = (try map.store().get(scratch, "source")).?;
+        const base_hash = try fingerprintHex(scratch, .{ stage.config_generation, stage.execution_dependency, try config.value.semantic(scratch), source_bytes, stage.mention_descriptions_json, stage.sibling_resolutions_json });
+        var old_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&std.fmt.bytesToHex(fixture.revision, .lower), &old_digest, .{});
+        try legacy_evidence.object.put(scratch, "execution_hash", .{ .string = if (explicit) try fingerprintHex(scratch, .{ base_hash, old_digest }) else base_hash });
+        const legacy_bytes = try std.json.Stringify.valueAlloc(scratch, legacy, .{});
+        try map.store().put("resolution", legacy_bytes);
+        fixture.fail = true;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        const unchanged_legacy = (try map.store().get(a, "resolution")).?;
+        defer a.free(unchanged_legacy);
+        try testing.expectEqualStrings(legacy_bytes, unchanged_legacy);
+        fixture.fail = false;
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+        const before = (try map.store().get(a, "resolution")).?;
+        defer a.free(before);
+        fixture.fail = true;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        fixture.fail = false;
+        fixture.missing = true;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        fixture.missing = false;
+        stage.adjudicator = null;
+        try testing.expectError(error.CapabilityDiscoveryUnavailable, stage.run(a, map.store(), fixture.base.provider(), "source", "resolution"));
+        const retained = (try map.store().get(a, "resolution")).?;
+        defer a.free(retained);
+        try testing.expectEqualStrings(before, retained);
+        try testing.expectEqual(@as(usize, 1), fixture.base.calls);
+        stage.adjudicator = fixture.executor();
+        fixture.revision = @splat(0xbb);
+        fixture.base.response = try std.json.Stringify.valueAlloc(scratch, try Fixture.response(scratch, config.value, fixture.revision, "leaf-a", true), .{});
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 2), fixture.base.calls);
+        const updated = (try map.store().get(a, "resolution")).?;
+        defer a.free(updated);
+        var parsed = try parseResolution(a, updated);
+        defer parsed.deinit();
+        try testing.expectEqual(Decision.review, parsed.entities[0].decision);
+        try testing.expectEqual(adjudication.Status.abstained, parsed.entities[0].adjudication.?.status);
+        _ = try stage.run(a, map.store(), fixture.base.provider(), "source", "resolution");
+        try testing.expectEqual(@as(usize, 2), fixture.base.calls);
     }
 }

@@ -42632,8 +42632,9 @@ components:
                 type: number
                 minimum: 0
                 maximum: 1
-              description: Lower and upper bound, lower strictly below upper. The previous stage must
-                not be verdict_only.
+              description: Lower and upper bound, lower strictly below upper. Inputs must have measured
+                probabilities. The previous stage must not be verdict_only; a dynamically returned proxy
+                verdict fails its producing stage under on_failure instead of driving the band.
         require_agreement:
           type: boolean
           description: Require this stage to agree with the preceding stage on the band question, or every
