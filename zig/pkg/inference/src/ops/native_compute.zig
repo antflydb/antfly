@@ -4502,7 +4502,16 @@ pub const NativeCompute = struct {
         }
         pub fn run(self: *const @This(), backend: *const ops.ComputeBackend, inputs: []const CT, output: CT, attention: ?*const AttentionContext, generation: u64) !bool {
             if (backend.vtable != &vtable_impl or backend.ptr != self.selected.implementation.context or @as(*const anyopaque, @ptrCast(backend.vtable)) != self.selected.implementation.table) return error.UnsupportedAuthoredNativeTarget;
-            try self.binding.validateCurrentMetadata(self.output.slot);
+            // The cold bound descriptor cannot change. Only these exact
+            // canonical support functions qualify: generic direct support is
+            // pure geometry, while resident linear also owns a live policy.
+            // Test identity before dereferencing any current opaque context.
+            if (!self.binding.hasSupport(nativeDirectRouteSupported)) {
+                if (!self.binding.hasSupport(nativeResidentDenseLinearRouteSupported)) return error.InvalidPreparedKernelRoute;
+                const compute: *const NativeCompute = @ptrCast(@alignCast(backend.ptr));
+                if (!nativeResidentDenseLinearPolicySupported(compute)) return error.PreparedKernelBindingChanged;
+            }
+            try self.binding.validateCurrentOutputSlot(self.output.slot);
             if (output != self.output_tensor) return error.InvalidTensorShape;
             const target = toBuf(output);
             if (nativeTensorReadOnly(target)) return error.ReadOnlyPhysicalStorage;
@@ -53045,17 +53054,17 @@ fn storageOwnershipOp(ctx: *anyopaque, tensor: CT, visitor: @import("../executio
     return denseStorageOwnership(false, tensor, view, root, lease, visitor);
 }
 const DenseStorageCapture = struct {
-    span: ?@import("../execution/storage_ownership.zig").Span = null,
-    plane: ?@import("../execution/storage_ownership.zig").Plane = null,
+    expected: *const @import("ml").graph.Shape,
+    data: []const f32,
+    valid: bool = false,
+
+    fn accept(self: *@This(), dtype: @import("ml").graph.DType, dimensions: []const i64, base: usize, offset: usize, logical_bytes: usize, readable_bytes: usize, backing_bytes: usize) void {
+        if (offset > backing_bytes or readable_bytes > backing_bytes - offset) return;
+        const address = std.math.add(usize, base, offset) catch return;
+        if (address != @intFromPtr(self.data.ptr) or logical_bytes != self.data.len * @sizeOf(f32)) return;
+        self.valid = @import("../execution/assigned_kernel_route.zig").denseShapeExtentMatches(self.expected.*, dtype, dimensions, logical_bytes, readable_bytes, address);
+    }
 };
-inline fn emitDenseStorage(comptime capture: bool, target: if (capture) *DenseStorageCapture else @import("../execution/storage_ownership.zig").Visitor, report: @import("../execution/storage_ownership.zig").Report) !void {
-    if (comptime capture) {
-        switch (report) {
-            .backing => |span| target.span = span,
-            .plane => |plane| target.plane = plane,
-        }
-    } else try target.emit(report);
-}
 fn denseStorageOwnership(comptime capture: bool, tensor: CT, view: *const Buf, root: *const Buf, lease: ?*ops.physical_storage.Lease, target: if (capture) *DenseStorageCapture else @import("../execution/storage_ownership.zig").Visitor) !@import("../execution/storage_ownership.zig").Coverage {
     const ownership = @import("../execution/storage_ownership.zig");
     const ml = @import("ml");
@@ -53065,10 +53074,14 @@ fn denseStorageOwnership(comptime capture: bool, tensor: CT, view: *const Buf, r
         const dtype: ml.graph.DType = switch (source.dtype) {
             inline else => |tag| @field(ml.graph.DType, @tagName(tag)),
         };
+        if (comptime capture) {
+            target.accept(dtype, source.shape, identity.base, 0, source.data.len, source.data.len, source.data.len);
+            return .complete;
+        }
         var descriptor = backend_contracts.TensorDesc.init(ml.graph.Shape.init(dtype, source.shape), .host_dense);
         descriptor.current_backend = .native;
-        try emitDenseStorage(capture, target, .{ .backing = .{ .identity = identity, .domain = .host, .requested_bytes = source.data.len, .backing_bytes = source.data.len, .access = if (isCachedWeightBuf(root)) .read_only else .writable } });
-        try emitDenseStorage(capture, target, .{ .plane = .{ .descriptor = descriptor, .role = .primary, .backing = identity, .byte_offset = 0, .logical_bytes = source.data.len, .readable_bytes = source.data.len } });
+        try target.emit(.{ .backing = .{ .identity = identity, .domain = .host, .requested_bytes = source.data.len, .backing_bytes = source.data.len, .access = if (isCachedWeightBuf(root)) .read_only else .writable } });
+        try target.emit(.{ .plane = .{ .descriptor = descriptor, .role = .primary, .backing = identity, .byte_offset = 0, .logical_bytes = source.data.len, .readable_bytes = source.data.len } });
         return .complete;
     }
     if (root.declared_dtype != null and root.declared_dtype != .f32) return .unknown;
@@ -53076,6 +53089,23 @@ fn denseStorageOwnership(comptime capture: bool, tensor: CT, view: *const Buf, r
     const bytes = try std.math.mul(usize, storage.len, @sizeOf(f32));
     const identity = ownership.Identity{ .kind = .host, .base = @intFromPtr(storage.ptr) };
     const owned = root.owned or root.dense_storage != null or lease != null;
+    if (comptime capture) {
+        // assignedDenseF32Input has already proved a contiguous F32 view with
+        // zero explicit base offset. Recheck that boundary locally before using
+        // its exact byte extent; matching dimensions below prove the identical
+        // logical product without building Shape/TensorDesc/stride/report data.
+        if (!owned or view.view_strides != null or view.view_base_offset != 0) return .unknown;
+        const flat: [1]i64 = .{std.math.cast(i64, view.data.len) orelse return .unknown};
+        const dimensions: []const i64 = if (view.logical_shape) |shape| shape else &flat;
+        if (dimensions.len > 8) return .unknown;
+        const typed_view = if (lease != null) integerSource(tensor) else null;
+        const dtype: ml.graph.DType = if (typed_view) |typed| (if (typed.dtype == .i64) .i64 else if (typed.dtype == .i32) .i32 else return .unknown) else .f32;
+        const address = if (typed_view) |typed| @intFromPtr(typed.data.ptr) else @intFromPtr(view.data.ptr);
+        if (address < identity.base) return .unknown;
+        const logical_bytes = try std.math.mul(usize, target.data.len, @sizeOf(f32));
+        target.accept(dtype, dimensions, identity.base, address - identity.base, logical_bytes, logical_bytes, bytes);
+        return .complete;
+    }
     var span = ownership.Span{
         .identity = identity,
         .domain = .host,
@@ -53087,7 +53117,7 @@ fn denseStorageOwnership(comptime capture: bool, tensor: CT, view: *const Buf, r
     if (lease) |physical| if (physical.admission) |reserved| {
         span.charged = .{ .identity = reserved.identity, .bytes = physical.admittedBytes() };
     };
-    try emitDenseStorage(capture, target, .{ .backing = span });
+    try target.emit(.{ .backing = span });
     var dimensions: [8]i64 = undefined;
     const shape = view.logical_shape orelse flat: {
         dimensions[0] = @intCast(view.data.len);
@@ -53121,7 +53151,7 @@ fn denseStorageOwnership(comptime capture: bool, tensor: CT, view: *const Buf, r
         readable_bytes = if (elements == 0) 0 else try std.math.mul(usize, try std.math.add(usize, last, 1), @sizeOf(f32));
     }
     if (offset > bytes or readable_bytes > bytes - offset) return .unknown;
-    try emitDenseStorage(capture, target, .{ .plane = .{
+    try target.emit(.{ .plane = .{
         .descriptor = descriptor,
         .role = .primary,
         .backing = identity,
@@ -53182,6 +53212,12 @@ fn assignedKernelWorkspaceOp(_: *anyopaque, descriptor: *const ops.kernel_descri
 }
 
 fn assignedKernelSupportedOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    return assignedKernelGeometrySupported(descriptor);
+}
+
+// Pure cold geometry. Backend policy belongs in separately named live checks;
+// authored calls attest this immutable descriptor before banking resources.
+fn assignedKernelGeometrySupported(descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     if (descriptor.output_shape.dtype != .f32) return descriptor.operation == .slice and (descriptor.output_shape.dtype == .i32 or descriptor.output_shape.dtype == .i64) and descriptor.input_shapes[0].dtype == descriptor.output_shape.dtype;
     return switch (descriptor.operation) {
         .paged_attention => |geometry| geometry.valid(descriptor),
@@ -53222,6 +53258,7 @@ fn assignedDenseF32Input(input: CT, expected: @import("ml").graph.Shape) ?[]cons
 }
 
 fn currentDenseF32Span(backend: ops.ComputeBackend, input: CT, expected: @import("ml").graph.Shape) ?[]const f32 {
+    if (backend.vtable != &vtable_impl or expected.rank() > expected.dims.len) return null;
     const data = assignedDenseF32Input(input, expected) orelse return null;
     const view = toBuf(input);
     if (view.owned and view.retained_parent != null) return null;
@@ -53234,14 +53271,9 @@ fn currentDenseF32Span(backend: ops.ComputeBackend, input: CT, expected: @import
     }
     if (lease) |physical| root = toBuf(physical.tensor);
     if (root.quantized_storage != null or root.owned_quantized_storage != null) return null;
-    var report: DenseStorageCapture = .{};
+    var report: DenseStorageCapture = .{ .expected = &expected, .data = data };
     const coverage = denseStorageOwnership(true, input, view, root, lease, &report) catch return null;
-    const plane = report.plane orelse return null;
-    if (coverage != .complete or !@import("../execution/assigned_kernel_route.zig").densePlaneMatches(backend, plane, expected)) return null;
-    const backing = plane.backing orelse return null;
-    const start = std.math.add(usize, backing.base, plane.byte_offset) catch return null;
-    if (start != @intFromPtr(data.ptr) or plane.logical_bytes != data.len * @sizeOf(f32)) return null;
-    return data;
+    return if (coverage == .complete and report.valid) data else null;
 }
 
 const AssignedPagedBinding = struct {
@@ -56742,15 +56774,19 @@ fn nativeResidentDenseLinearPolicySupported(self: *const NativeCompute) bool {
 fn nativeResidentDenseLinearRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (descriptor.operation != .linear or !nativeResidentDenseLinearPolicySupported(self)) return false;
+    return nativeResidentDenseLinearGeometrySupported(descriptor);
+}
+fn nativeResidentDenseLinearGeometrySupported(descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    if (descriptor.operation != .linear) return false;
     const linear = descriptor.operation.linear;
     if (linear.rows == 0 or linear.in_dim == 0 or linear.out_dim == 0 or descriptor.input_count != @as(u8, if (linear.bias) 3 else 2)) return false;
     if (!descriptor.output_shape.eq(@import("ml").graph.Shape.init(.f32, &.{ linear.rows, linear.out_dim })) or !descriptor.input_shapes[0].eq(@import("ml").graph.Shape.init(.f32, &.{ linear.rows, linear.in_dim })) or !descriptor.input_shapes[1].eq(@import("ml").graph.Shape.init(.f32, &.{ linear.out_dim, linear.in_dim }))) return false;
     return !linear.bias or (descriptor.input_shapes[2].dtype == .f32 and descriptor.input_shapes[2].numElements() == linear.out_dim);
 }
 
-fn nativeDirectRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+fn nativeDirectRouteSupported(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     if (descriptor.operation == .linear) return false;
-    return assignedKernelSupportedOp(ctx, descriptor);
+    return assignedKernelGeometrySupported(descriptor);
 }
 
 test "Native source linear assigned scratch preserves all source conversions without transient allocations" {
@@ -61337,6 +61373,19 @@ test "Native sealed call retains live resident linear policy and original Into a
     const assigned = route.AssignedOutput{ .slot = slot, .region = try lease.writableRegion(0, 17, 8) };
     const inputs = [_]CT{ input, weight };
     const program = (try NativeCompute.PreparedProgramCall.prepare(&cb, .{ .descriptor = &descriptor, .inputs = &inputs, .output = output, .prepared_route = &selected, .assigned_output = &assigned }, lease)) orelse return error.MissingNativeProgramCall;
+    const Probe = struct {
+        var calls: usize = 0;
+        fn supported(_: *anyopaque, _: *const ops.kernel_descriptor.Descriptor) bool {
+            calls += 1;
+            return true;
+        }
+    };
+    Probe.calls = 0;
+    var unknown = (try @import("../execution/assigned_kernel_route.zig").prepareImmutable(cb, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = &facts, .output = slot }, Probe.supported)) orelse return error.MissingPreparedKernelRoute;
+    defer unknown.deinit();
+    const calls = Probe.calls;
+    try std.testing.expect((try NativeCompute.PreparedProgramCall.prepare(&cb, .{ .descriptor = &descriptor, .inputs = &inputs, .output = output, .prepared_route = &unknown, .assigned_output = &assigned }, lease)) == null);
+    try std.testing.expectEqual(calls, Probe.calls);
     @memset(toBuf(output).data, 91);
     compute.cache_embeddinggemma2_bf16_weights = true;
     const denied = program.run(&cb, &inputs, output, null, 1);
@@ -61350,4 +61399,126 @@ test "Native sealed call retains live resident linear policy and original Into a
     try std.testing.expect(try execution);
     try std.testing.expectEqualSlices(f32, getData(original), toBuf(output).data);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+fn referencePlaneDense(plane: @import("../execution/storage_ownership.zig").Plane, expected: @import("ml").graph.Shape) bool {
+    if (plane.role != .primary or plane.descriptor.current_backend != .native or plane.descriptor.quant_format != null) return false;
+    const actual = plane.descriptor.shape;
+    if (actual.dtype != expected.dtype or actual.rank() != expected.rank() or !std.mem.eql(i64, actual.dims[0..actual.rank()], expected.dims[0..expected.rank()])) return false;
+    const count = expected.numElements() orelse return false;
+    if (count <= 0) return false;
+    const bytes = std.math.mul(usize, @intCast(count), expected.dtype.byteSize()) catch return false;
+    if (plane.logical_bytes != bytes) return false;
+    if (expected.dtype == .f32) if (plane.backing) |backing| {
+        if (backing.kind != .host) return false;
+        const address = std.math.add(usize, backing.base, plane.byte_offset) catch return false;
+        if (address % @alignOf(f32) != 0) return false;
+    };
+    const dense = backend_contracts.TensorStrides.dense(expected);
+    return plane.descriptor.strides.rank == dense.rank and std.mem.eql(i64, plane.descriptor.strides.values[0..dense.rank], dense.values[0..dense.rank]) and plane.readable_bytes >= bytes;
+}
+fn checkCompactSpanAgainstReport(cb: ops.ComputeBackend, tensor: CT, expected: @import("ml").graph.Shape) !void {
+    const ownership = @import("../execution/storage_ownership.zig");
+    const Capture = struct {
+        primary: ?ownership.Plane = null,
+        fn emit(raw: *anyopaque, report: ownership.Report) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (report) {
+                .backing => {},
+                .plane => |plane| if (plane.role == .primary) {
+                    self.primary = plane;
+                },
+            }
+        }
+    };
+    var capture: Capture = .{};
+    const coverage = try storageOwnershipOp(cb.ptr, tensor, .{ .context = &capture, .visit = Capture.emit });
+    const current = currentDenseF32Span(cb, tensor, expected);
+    const data = assignedDenseF32Input(tensor, expected);
+    const reference = checked: {
+        const span = data orelse break :checked false;
+        const plane = capture.primary orelse break :checked false;
+        if (coverage != .complete or !referencePlaneDense(plane, expected)) break :checked false;
+        const backing = plane.backing orelse break :checked false;
+        const address = std.math.add(usize, backing.base, plane.byte_offset) catch break :checked false;
+        break :checked address == @intFromPtr(span.ptr) and plane.logical_bytes == span.len * @sizeOf(f32);
+    };
+    try std.testing.expectEqual(reference, current != null);
+    if (current) |span| try std.testing.expect(span.ptr == data.?.ptr and span.len == data.?.len);
+}
+
+test "compact current Native facts match actual full reports for owned source aliases and malformed extents" {
+    const a = std.testing.allocator;
+    const Shape = @import("ml").graph.Shape;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const shape = Shape.init(.f32, &.{4});
+    const owned = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+    defer cb.free(owned);
+    const alias = try cb.primReshape(owned, &.{ 2, 2 });
+    defer cb.free(alias);
+    const source = try compute.makeBufWithOwnedSourceTensor(try tensor_mod.Tensor.initFloat32(a, "source", &.{4}, &.{ 1, 2, 3, 4 }));
+    defer cb.free(source);
+    var values = [_]f32{ 1, 2, 3, 4 };
+    const borrowed = try cb.fromBorrowedFloat32Shape(&values, &.{4});
+    defer cb.free(borrowed);
+    const lease = (try ops.physical_storage.Lease.create(a, cb, 32)).?;
+    defer lease.release();
+    const physical = (try physicalTensorViewOp(&compute, .{ .storage = lease, .shape = &.{4} })).?;
+    defer cb.free(physical);
+    const integer = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 1, 2, 3, 4 }), .i64, &.{4})).?;
+    defer cb.free(integer);
+    for ([_]CT{ owned, source, borrowed, physical, integer }) |value| try checkCompactSpanAgainstReport(cb, value, shape);
+    try checkCompactSpanAgainstReport(cb, alias, Shape.init(.f32, &.{ 2, 2 }));
+    const buffer = toBuf(owned);
+    const old_shape = buffer.logical_shape;
+    const invalid_shape = [_]i64{ 1, 1, 1, 1, 1, 1, 1, 1, 4 };
+    buffer.logical_shape = @constCast(&invalid_shape);
+    const bad_rank = checkCompactSpanAgainstReport(cb, owned, shape);
+    buffer.logical_shape = old_shape;
+    try bad_rank;
+    var strides = [_]usize{2};
+    buffer.view_strides = &strides;
+    const strided = checkCompactSpanAgainstReport(cb, owned, shape);
+    buffer.view_strides = null;
+    try strided;
+    buffer.view_base_offset = 1;
+    const offset = checkCompactSpanAgainstReport(cb, owned, shape);
+    buffer.view_base_offset = 0;
+    try offset;
+    const data = buffer.data;
+    buffer.data = data[0..3];
+    const short = checkCompactSpanAgainstReport(cb, owned, shape);
+    buffer.data = data;
+    try short;
+    const owner = buffer.dense_storage orelse return error.MissingRetainedDenseOwner;
+    const allocation = owner.data;
+    owner.data = allocation[0..3];
+    const short_backing = checkCompactSpanAgainstReport(cb, owned, shape);
+    owner.data = allocation;
+    try short_backing;
+    const source_tensor = @constCast(toBuf(source).source_tensor.?);
+    const source_shape = source_tensor.shape;
+    source_tensor.shape = @constCast(&invalid_shape);
+    const source_rank = checkCompactSpanAgainstReport(cb, source, shape);
+    source_tensor.shape = source_shape;
+    try source_rank;
+    const bytes = toBuf(source).source_tensor.?.data;
+    @constCast(toBuf(source).source_tensor.?).data = (bytes.ptr + 1)[0..bytes.len];
+    const unaligned = checkCompactSpanAgainstReport(cb, source, shape);
+    @constCast(toBuf(source).source_tensor.?).data = bytes;
+    try unaligned;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    const valid = currentDenseF32Span(cb, physical, shape);
+    compute.allocator = a;
+    try std.testing.expect(valid != null);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    var copied = vtable_impl;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(&copied != &vtable_impl);
+    try std.testing.expect(currentDenseF32Span(.{ .ptr = @ptrFromInt(16), .vtable = &copied }, @ptrFromInt(16), shape) == null);
 }

@@ -17,33 +17,14 @@ const physical = @import("physical_buffers.zig");
 const Cleanup = @import("cleanup_context.zig").Context;
 const Plane = @import("storage_ownership.zig").Plane;
 
-// Builder storage can move while cold authoring grows. Keep actual planes by
-// index until the constructor stops growing its contiguous plane span.
-const PendingBinding = struct {
-    node_id: Node,
-    source: union(enum) {
-        resident: struct { logical: Shape, plane: usize },
-        host: Shape,
-    },
-};
+const input_facts = @import("prepared_routes.zig");
+const PendingBinding = input_facts.IndexedInputBinding;
 const BindingSchema = struct {
     values: usize,
     runtime_bindings: usize,
     immutable_bindings: usize,
     planes: usize,
 };
-fn materializeBindings(a: std.mem.Allocator, pending: []const PendingBinding, planes: []const Plane, backend: ops.ComputeBackend) ![]route.InputBinding {
-    const result = try a.alloc(route.InputBinding, pending.len);
-    errdefer a.free(result);
-    for (pending, result) |input, *output| output.* = .{ .node_id = input.node_id, .value = switch (input.source) {
-        .resident => |source| resident: {
-            if (source.plane >= planes.len) return error.DenseDefinitionChanged;
-            break :resident .{ .resident = .{ .logical = source.logical, .planes = planes[source.plane..][0..1], .implementation = .{ .context = backend.ptr, .table = backend.vtable } } };
-        },
-        .host => |shape| .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = false } },
-    } };
-    return result;
-}
 
 /// Cold metadata may be physically freed under the actual decoder Model gate.
 /// Accept only reclaiming allocators with no admission/reclamation callbacks;
@@ -254,7 +235,7 @@ pub const Builder = struct {
         };
         if (reused == null) try self.descriptors.append(self.graph.allocator, null);
         try self.values.append(self.allocator, null);
-        try self.bindings.append(self.allocator, .{ .node_id = id, .source = .{ .host = shape } });
+        try self.bindings.append(self.allocator, .{ .node_id = id, .source = .{ .host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = false } } });
         return id;
     }
     pub fn gather(self: *Builder, weight: Node, indices: Node, width: usize) !Node {
@@ -398,12 +379,11 @@ pub const Schedule = struct {
         self.analysis = definition.analysis;
         self.values = try builder.values.toOwnedSlice(a);
         errdefer a.free(self.values);
-        // Both receiving owners deep-copy these flat planes. Keep only the
-        // constructor's indexed storage until their snapshots are published.
-        const bindings = try materializeBindings(a, builder.bindings.items, builder.planes.items, self.backend);
-        defer a.free(bindings);
-        const immutable = try materializeBindings(a, builder.immutable_resident.items, builder.planes.items, self.backend);
-        defer a.free(immutable);
+        // Both receiving owners copy these actual indexed facts directly;
+        // no intermediate InputBinding arrays or producer pointers survive.
+        const implementation = route.Implementation{ .context = self.backend.ptr, .table = self.backend.vtable };
+        const bindings = input_facts.InputSource{ .indexed = .{ .entries = builder.bindings.items, .planes = builder.planes.items, .implementation = implementation } };
+        const immutable = input_facts.InputSource{ .indexed = .{ .entries = builder.immutable_resident.items, .planes = builder.planes.items, .implementation = implementation } };
         var private_pool: ?*physical.Pool = (definition.layout.createPool(a, &self.graph, &.{&self.backend}, self.descriptors) catch |err| switch (err) {
             error.PhysicalOutputLayoutChanged => fallback: {
                 var fresh = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
@@ -417,7 +397,7 @@ pub const Schedule = struct {
         private_pool.?.coverage_reachable = self.analysis.reachable;
         private_pool.?.coverage_backend = self.backend;
         private_pool.?.native_frame_dispatch = true;
-        self.selected = (try physical.Pool.preparePrivateNativeConsuming(&private_pool, immutable, bindings)) orelse return error.UnsupportedDenseSchedule;
+        self.selected = (try physical.Pool.preparePrivateNativeSourcesConsuming(&private_pool, immutable, bindings)) orelse return error.UnsupportedDenseSchedule;
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.UnsupportedDenseSchedule;
         // A ready authored plan owns its complete cold resource recipe before

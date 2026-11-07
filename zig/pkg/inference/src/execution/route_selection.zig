@@ -40,8 +40,12 @@ pub const Selection = struct {
         return createWithAuthority(pool, runtime, null);
     }
     pub fn createWithAuthority(pool: *physical.Pool, runtime: []const route.InputBinding, authority: ?@import("backend_operation.zig").Borrowed) !Selection {
+        return createSourceWithAuthority(pool, .{ .slice = runtime }, authority);
+    }
+    pub fn createSourceWithAuthority(pool: *physical.Pool, runtime: facts.InputSource, authority: ?@import("backend_operation.zig").Borrowed) !Selection {
         const allocator = pool.allocator;
-        for (runtime) |input| {
+        for (0..runtime.len()) |index| {
+            const input = try runtime.at(index);
             const slot = pool.plan.slotForNode(input.node_id) orelse return error.InvalidKernelInputBinding;
             if (pool.immutable_bindings) |immutable| if (immutable.find(input.node_id) != null) return error.InvalidRuntimeKernelFact;
             if (!slot.roles.runtime_input and slot.kind != .runtime_input) return error.InvalidKernelInputBinding;
@@ -50,7 +54,7 @@ pub const Selection = struct {
                 .resident, .imported_host, .unknown => {},
             }
         }
-        const inputs = try facts.ImmutableBindings.create(allocator, runtime);
+        const inputs = try facts.ImmutableBindings.createSource(allocator, runtime);
         errdefer inputs.release();
         const selected = try allocator.alloc(?route.Owned, pool.kernels.len);
         errdefer allocator.free(selected);

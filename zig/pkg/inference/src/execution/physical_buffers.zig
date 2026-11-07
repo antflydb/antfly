@@ -738,6 +738,9 @@ pub const Pool = struct {
     /// possibly partially prepared Pool and must destroy it, not retry it.
     /// Only successful PreparedRoutes publication clears the caller's pointer.
     pub fn preparePrivateNativeConsuming(owner: *?*Pool, immutable_inputs: []const route.InputBinding, inputs: []const route.InputBinding) !?*prepared_routes.PreparedRoutes {
+        return preparePrivateNativeSourcesConsuming(owner, .{ .slice = immutable_inputs }, .{ .slice = inputs });
+    }
+    pub fn preparePrivateNativeSourcesConsuming(owner: *?*Pool, immutable_inputs: prepared_routes.InputSource, inputs: prepared_routes.InputSource) !?*prepared_routes.PreparedRoutes {
         const self = owner.* orelse return null;
         const backend = self.coverage_backend orelse return null;
         const graph = self.coverage_graph orelse return null;
@@ -754,7 +757,7 @@ pub const Pool = struct {
             self.literal_store != null or self.host_input_plans.len != 0 or self.storage_requirement != null or self.storage_requirement_bounds.len != 0 or self.host_workspace_allocator != null) return null;
         for (self.transfers) |transfer| if (transfer != null) return null;
         for (self.plan.allocations) |allocation| if (allocation.backend != .native) return null;
-        self.immutable_bindings = try prepared_routes.ImmutableBindings.create(self.allocator, immutable_inputs);
+        self.immutable_bindings = try prepared_routes.ImmutableBindings.createSource(self.allocator, immutable_inputs);
         const selected = (try finishPreparedVariant(self, inputs, .compatibility_regions, .unknown, null)) orelse return null;
         owner.* = null;
         return selected;
@@ -1042,16 +1045,16 @@ pub const Pool = struct {
         // This later defer runs before child errdefer; callbacks never execute
         // under the snapshot gate, including candidate-allocation failures.
         defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        return finishPreparedVariant(child, inputs, policy, profile, metadata.token());
+        return finishPreparedVariant(child, .{ .slice = inputs }, policy, profile, metadata.token());
     }
 
     // One finalizer owns selection, resource recipes, ingress and coverage for
     // both cached variants and exclusively owned private Native schedules.
-    fn finishPreparedVariant(child: *Pool, inputs: []const route.InputBinding, policy: @import("region_route.zig").SelectionPolicy, profile: @import("region_route.zig").ExecutionProfile, authority: ?@import("backend_operation.zig").Borrowed) !?*prepared_routes.PreparedRoutes {
+    fn finishPreparedVariant(child: *Pool, inputs: prepared_routes.InputSource, policy: @import("region_route.zig").SelectionPolicy, profile: @import("region_route.zig").ExecutionProfile, authority: ?@import("backend_operation.zig").Borrowed) !?*prepared_routes.PreparedRoutes {
         child.region_policy = policy;
         child.region_execution_profile = profile;
         try @import("reachable_projection.zig").deactivate(child);
-        child.selection = try RouteSelection.createWithAuthority(child, inputs, authority);
+        child.selection = try RouteSelection.createSourceWithAuthority(child, inputs, authority);
         if (policy == .select_regions) try child.prepareRegionsWithAuthority(authority);
         const capture_supported = try child.applyRouteRequirements();
         try child.recomputeHostWorkspace();

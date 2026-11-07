@@ -12,6 +12,49 @@ const route = @import("kernel_route.zig");
 const physical = @import("physical_buffers.zig");
 const platform = @import("antfly_platform");
 
+/// Cold indexed bindings keep a moving producer's storage unpublished until
+/// the receiving snapshot copies it. Indexes grant no source or quota authority.
+pub const IndexedInputBinding = struct {
+    node_id: ml.graph.NodeId,
+    source: union(enum) {
+        resident: struct { logical: ml.graph.Shape, plane: usize },
+        host: @TypeOf(@as(route.Binding, undefined).imported_host),
+    },
+};
+
+/// A borrowed construction source only. Every entry is copied/retained by the
+/// ordinary ImmutableBindings owner before this source may leave its caller.
+pub const InputSource = union(enum) {
+    slice: []const route.InputBinding,
+    indexed: struct {
+        entries: []const IndexedInputBinding,
+        planes: []const @import("storage_ownership.zig").Plane,
+        implementation: route.Implementation,
+    },
+    pub fn len(self: InputSource) usize {
+        return switch (self) {
+            .slice => |items| items.len,
+            .indexed => |items| items.entries.len,
+        };
+    }
+    pub fn at(self: InputSource, index: usize) !route.InputBinding {
+        if (index >= self.len()) return error.InvalidKernelInputBinding;
+        return switch (self) {
+            .slice => |items| items[index],
+            .indexed => |items| source: {
+                const input = items.entries[index];
+                break :source .{ .node_id = input.node_id, .value = switch (input.source) {
+                    .resident => |resident| fact: {
+                        if (resident.plane >= items.planes.len) return error.InvalidKernelInputBinding;
+                        break :fact .{ .resident = .{ .logical = resident.logical, .planes = items.planes[resident.plane..][0..1], .implementation = items.implementation } };
+                    },
+                    .host => |host| .{ .imported_host = host },
+                } };
+            },
+        };
+    }
+};
+
 /// Independently retained declared facts, shared directly by base and variants.
 /// Only explicit metadata retention is allowed; missing provider support yields
 /// unknown facts and preserves compatibility admission instead of cloning data.
@@ -26,26 +69,34 @@ pub const ImmutableBindings = struct {
     indices: std.AutoHashMapUnmanaged(ml.graph.NodeId, usize) = .empty,
 
     pub fn create(allocator: std.mem.Allocator, inputs: []const route.InputBinding) !*ImmutableBindings {
+        return createSource(allocator, .{ .slice = inputs });
+    }
+    pub fn createSource(allocator: std.mem.Allocator, inputs: InputSource) !*ImmutableBindings {
+        const input_count = inputs.len();
         var plane_count: usize = 0;
-        for (inputs) |input| plane_count = try std.math.add(usize, plane_count, switch (input.value) {
-            .planned => |value| value.planes.len,
-            .resident => |value| value.planes.len,
-            else => 0,
-        });
+        for (0..input_count) |index| {
+            const input = try inputs.at(index);
+            plane_count = try std.math.add(usize, plane_count, switch (input.value) {
+                .planned => |value| value.planes.len,
+                .resident => |value| value.planes.len,
+                else => 0,
+            });
+        }
         const planes = try allocator.alloc(@import("storage_ownership.zig").Plane, plane_count);
         errdefer allocator.free(planes);
-        const entries = try allocator.alloc(route.InputBinding, inputs.len);
+        const entries = try allocator.alloc(route.InputBinding, input_count);
         errdefer allocator.free(entries);
-        const original_values = try allocator.alloc(?OriginalTensor, inputs.len);
+        const original_values = try allocator.alloc(?OriginalTensor, input_count);
         errdefer allocator.free(original_values);
         @memset(original_values, null);
         var initialized: usize = 0;
         errdefer for (entries[0..initialized]) |*entry| releaseBindingWithCleanup(&entry.value, .{});
         var indices = std.AutoHashMapUnmanaged(ml.graph.NodeId, usize).empty;
         errdefer indices.deinit(allocator);
-        try indices.ensureTotalCapacity(allocator, std.math.cast(u32, inputs.len) orelse return error.TooManyKernelInputBindings);
+        try indices.ensureTotalCapacity(allocator, std.math.cast(u32, input_count) orelse return error.TooManyKernelInputBindings);
         var plane_offset: usize = 0;
-        for (inputs, entries, 0..) |input, *entry, index| {
+        for (entries, 0..) |*entry, index| {
+            const input = try inputs.at(index);
             const slot = indices.getOrPutAssumeCapacity(input.node_id);
             if (slot.found_existing) return error.DuplicateKernelInputBinding;
             slot.value_ptr.* = index;
@@ -509,4 +560,70 @@ test "packed immutable input snapshots preserve mutable source copies and retain
 test "packed immutable input snapshot construction unwinds every allocation failure including initialized tensor retains" {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, packedInputSnapshotsCase, .{});
+}
+
+fn indexedInputSourceCase(a: std.mem.Allocator) !void {
+    const ownership = @import("storage_ownership.zig");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const value = try cb.fromFloat32Shape(&.{ 1, -2, 3, -4 }, &.{4});
+    defer cb.free(value);
+    const Capture = struct {
+        primary: ?ownership.Plane = null,
+        fn emit(raw: *anyopaque, report: ownership.Report) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (report == .plane and report.plane.role == .primary) self.primary = report.plane;
+        }
+    };
+    var capture = Capture{};
+    try std.testing.expectEqual(ownership.Coverage.complete, try cb.vtable.kernels.?.storageOwnership.?(cb.ptr, value, .{ .context = &capture, .visit = Capture.emit }));
+    const primary = capture.primary orelse return error.MissingActualPrimaryPlane;
+    const implementation = route.Implementation{ .context = cb.ptr, .table = cb.vtable };
+    const empty = try ImmutableBindings.createSource(a, .{ .indexed = .{ .entries = &.{}, .planes = &.{}, .implementation = implementation } });
+    defer empty.release();
+    try std.testing.expect(empty.entries.len == 0 and empty.planes.len == 0);
+    var planes = [_]ownership.Plane{primary};
+    const host = testFact(7).value.imported_host;
+    var indexed = [_]IndexedInputBinding{
+        .{ .node_id = 0, .source = .{ .resident = .{ .logical = primary.descriptor.shape, .plane = 0 } } },
+        .{ .node_id = 1, .source = .{ .host = host } },
+    };
+    const source = InputSource{ .indexed = .{ .entries = &indexed, .planes = &planes, .implementation = implementation } };
+    const direct = try ImmutableBindings.createSource(a, source);
+    defer direct.release();
+    const ordinary = try ImmutableBindings.create(a, &.{ try source.at(0), try source.at(1) });
+    defer ordinary.release();
+    try std.testing.expect(direct.planes.ptr != ordinary.planes.ptr);
+    try std.testing.expectEqualDeep(direct.entries, ordinary.entries);
+    // Source metadata can die or change after synchronous construction. Both
+    // actual receiving owners retain the original complete facts independently.
+    indexed[0].node_id = 99;
+    indexed[0].source.resident.plane = 1;
+    planes[0].readable_bytes = 0;
+    try std.testing.expectEqualDeep(primary, direct.find(0).?.resident.planes[0]);
+    try std.testing.expectEqualDeep(primary, ordinary.find(0).?.resident.planes[0]);
+    try std.testing.expectEqualDeep(host, direct.find(1).?.imported_host);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    // Reject malformed indexes before allocation, SDK callbacks or publication.
+    try std.testing.expectError(error.InvalidKernelInputBinding, ImmutableBindings.createSource(failing.allocator(), source));
+    indexed[0].source.resident.plane = 0;
+    indexed[0].node_id = 1;
+    if (ImmutableBindings.createSource(a, source)) |unexpected| {
+        unexpected.release();
+        return error.ExpectedDuplicateBinding;
+    } else |err| switch (err) {
+        error.DuplicateKernelInputBinding => {},
+        else => return err,
+    }
+}
+
+test "indexed input snapshots match slice facts and own copies after mutable source retirement" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try indexedInputSourceCase(std.testing.allocator);
+}
+
+test "indexed input snapshot source construction unwinds every allocation failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, indexedInputSourceCase, .{});
 }

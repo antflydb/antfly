@@ -50,19 +50,33 @@ fn shapeEqual(a: ml.graph.Shape, b: ml.graph.Shape) bool {
     return a.dtype == b.dtype and a.rank() == b.rank() and std.mem.eql(i64, a.dims[0..a.rank()], b.dims[0..b.rank()]);
 }
 fn planeDense(backend: ops.ComputeBackend, plane: ownership.Plane, expected: ml.graph.Shape) bool {
-    if (plane.role != .primary or !shapeEqual(plane.descriptor.shape, expected) or plane.descriptor.current_backend != backend.kind() or plane.descriptor.quant_format != null) return false;
+    if (plane.role != .primary or plane.descriptor.current_backend != backend.kind() or plane.descriptor.quant_format != null) return false;
+    var address: ?usize = null;
+    if (backend.kind() == .native and expected.dtype == .f32) if (plane.backing) |backing| {
+        if (backing.kind != .host) return false;
+        address = std.math.add(usize, backing.base, plane.byte_offset) catch return false;
+    };
+    const actual = plane.descriptor.shape;
+    if (actual.rank() > actual.dims.len) return false;
+    if (!denseShapeExtentMatches(expected, actual.dtype, actual.dims[0..actual.rank()], plane.logical_bytes, plane.readable_bytes, address)) return false;
+    const dense = contracts.TensorStrides.dense(expected);
+    return plane.descriptor.strides.rank == dense.rank and std.mem.eql(i64, plane.descriptor.strides.values[0..dense.rank], dense.values[0..dense.rank]);
+}
+
+/// Shared exact logical/extent predicate. Backing/complete/provider/stride
+/// authority remains with the actual reporting owner, never these scalar facts.
+/// Native's contiguous current-header path can avoid constructing a TensorDesc
+/// solely to discard it after the same comparison.
+pub inline fn denseShapeExtentMatches(expected: ml.graph.Shape, actual_dtype: ml.graph.DType, dimensions: []const i64, logical_bytes: usize, readable_bytes: usize, host_address: ?usize) bool {
+    if (expected.rank() > expected.dims.len or actual_dtype != expected.dtype or dimensions.len != expected.rank() or !std.mem.eql(i64, dimensions, expected.dims[0..expected.rank()])) return false;
     const count = expected.numElements() orelse return false;
     if (count <= 0) return false;
     const bytes = std.math.mul(usize, @intCast(count), expected.dtype.byteSize()) catch return false;
-    if (plane.logical_bytes != bytes) return false;
-    if (backend.kind() == .native and expected.dtype == .f32) if (plane.backing) |backing| {
-        if (backing.kind != .host) return false;
-        const address = std.math.add(usize, backing.base, plane.byte_offset) catch return false;
-        if (address % @alignOf(f32) != 0) return false;
-    };
-    const dense = contracts.TensorStrides.dense(expected);
-    return plane.descriptor.strides.rank == dense.rank and std.mem.eql(i64, plane.descriptor.strides.values[0..dense.rank], dense.values[0..dense.rank]) and plane.readable_bytes >= bytes;
+    if (logical_bytes != bytes or readable_bytes < bytes) return false;
+    if (expected.dtype == .f32) if (host_address) |address| if (address % @alignOf(f32) != 0) return false;
+    return true;
 }
+
 fn planesDense(backend: ops.ComputeBackend, logical: ml.graph.Shape, planes: []const ownership.Plane, expected: ml.graph.Shape) bool {
     if (!shapeEqual(logical, expected)) return false;
     for (planes) |plane| if (plane.role == .primary) return planeDense(backend, plane, expected);
@@ -254,7 +268,17 @@ pub const NativeProgramBinding = struct {
     }
     pub fn validateCurrentMetadata(self: @This(), slot: route.OutputSlot) !void {
         const selected = self.owner;
-        if (!selected.support(selected.backend.ptr, &selected.descriptor) or slot.epoch != selected.slot.epoch or slot.node != selected.slot.node or slot.allocation != selected.slot.allocation or !shapeEqual(slot.logical, selected.descriptor.output_shape)) return error.PreparedKernelBindingChanged;
+        if (!selected.support(selected.backend.ptr, &selected.descriptor)) return error.PreparedKernelBindingChanged;
+        try self.validateCurrentOutputSlot(slot);
+    }
+    pub fn hasSupport(self: @This(), support: Support) bool {
+        return self.owner.support == support;
+    }
+    /// Slot metadata only. The canonical Native caller separately validates
+    /// its exact known support identity and that owner's live policy.
+    pub fn validateCurrentOutputSlot(self: @This(), slot: route.OutputSlot) !void {
+        const selected = self.owner;
+        if (slot.epoch != selected.slot.epoch or slot.node != selected.slot.node or slot.allocation != selected.slot.allocation or !shapeEqual(slot.logical, selected.descriptor.output_shape)) return error.PreparedKernelBindingChanged;
     }
 };
 
@@ -270,8 +294,51 @@ pub fn bindNativeProgram(selected: *const route.Owned, backend: ops.ComputeBacke
     return bound;
 }
 
-/// This is the exact predicate used by actualDense after the provider report.
-/// A canonical provider may reuse its current report without another visitor.
-pub fn densePlaneMatches(backend: ops.ComputeBackend, plane: ownership.Plane, expected: ml.graph.Shape) bool {
-    return planeDense(backend, plane, expected);
+fn referencePlaneDense(backend: ops.ComputeBackend, plane: ownership.Plane, expected: ml.graph.Shape) bool {
+    if (plane.role != .primary or !shapeEqual(plane.descriptor.shape, expected) or plane.descriptor.current_backend != backend.kind() or plane.descriptor.quant_format != null) return false;
+    const count = expected.numElements() orelse return false;
+    if (count <= 0) return false;
+    const bytes = std.math.mul(usize, @intCast(count), expected.dtype.byteSize()) catch return false;
+    if (plane.logical_bytes != bytes) return false;
+    if (backend.kind() == .native and expected.dtype == .f32) if (plane.backing) |backing| {
+        if (backing.kind != .host) return false;
+        const address = std.math.add(usize, backing.base, plane.byte_offset) catch return false;
+        if (address % @alignOf(f32) != 0) return false;
+    };
+    const dense = contracts.TensorStrides.dense(expected);
+    return plane.descriptor.strides.rank == dense.rank and std.mem.eql(i64, plane.descriptor.strides.values[0..dense.rank], dense.values[0..dense.rank]) and plane.readable_bytes >= bytes;
+}
+
+test "compact dense extent predicate preserves original Native plane rules across malformed facts" {
+    const native = @import("../ops/native_compute.zig");
+    const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &native.vtable_impl };
+    const expected = ml.graph.Shape.init(.f32, &.{ 2, 4 });
+    const base = ownership.Plane{ .descriptor = contracts.TensorDesc.init(expected, .host_f32), .role = .primary, .backing = .{ .kind = .host, .base = 4096 }, .logical_bytes = 32, .readable_bytes = 32 };
+    var original = base;
+    original.descriptor.current_backend = .native;
+    for (0..13) |kind| {
+        var plane = original;
+        switch (kind) {
+            0 => {},
+            1 => plane.logical_bytes -= 1,
+            2 => plane.readable_bytes -= 1,
+            3 => plane.descriptor.shape.dtype = .i32,
+            4 => plane.descriptor.shape.dims[0] = 3,
+            5 => plane.descriptor.strides.values[0] += 1,
+            6 => plane.byte_offset = 1,
+            7 => plane.backing.?.kind = .metal,
+            8 => plane.backing = null,
+            9 => plane.role = .host_mirror,
+            10 => plane.descriptor.current_backend = .cuda,
+            11 => plane.descriptor.shape.rank_ = 1,
+            else => plane.readable_bytes += 32,
+        }
+        try std.testing.expectEqual(referencePlaneDense(backend, plane, expected), planeDense(backend, plane, expected));
+    }
+    var invalid = original;
+    invalid.descriptor.shape.rank_ = 9;
+    try std.testing.expect(!planeDense(backend, invalid, expected));
+    var forged = expected;
+    forged.rank_ = 9;
+    try std.testing.expect(!denseShapeExtentMatches(forged, .f32, &.{ 2, 4 }, 32, 32, 4096));
 }
