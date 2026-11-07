@@ -18322,15 +18322,47 @@ export interface components {
                 review?: number;
             };
         };
+        DeciderCascadeStage: {
+            /** @description Unique within the cascade; reported in traces. */
+            name: string;
+            /** @description Inline typed or generated decider. Cascades and embedding_similarity deciders cannot be stages. */
+            decider: components["schemas"]["DeciderConfig"];
+            /** @description Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer. */
+            when?: {
+                /** @description Measure this question only. Omitted, any question in the band escalates. */
+                question?: string;
+                /** @description For choice questions, measure this value's probability. Omitted, the selected value's probability. */
+                choice?: string;
+                /** @description Lower and upper bound, lower strictly below upper. The previous stage must not be verdict_only. */
+                probability_between: number[];
+            };
+            /**
+             * @description Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
+             * @default fail
+             * @enum {string}
+             */
+            on_failure?: "fail" | "keep_previous";
+        };
+        /** @description Required with decision_method=cascade, which allows no transport, model or rate-limit fields of its own. The first stage answers every input. Each later stage runs only for inputs whose previous answer falls inside its probability band, and all escalating inputs share one call. The final answer is the last answering stage's. Escalation applies to successful answers only; it is not failover. Probabilities are not calibrated across models, so set bands per model on labelled data. */
+        DeciderCascade: {
+            stages: components["schemas"]["DeciderCascadeStage"][];
+            budget?: {
+                /** @description Stage invocations allowed per request. Defaults to the stage count and cannot be lower. */
+                max_model_calls?: number;
+                /** @description Narrows the caller's deadline for the whole cascade. Checked before each stage and enforced by stage transports. */
+                deadline_ms?: number;
+            };
+        };
         DeciderConfig: {
             /** @enum {string} */
             provider?: "antfly" | "jev" | "openai" | "cloudflare";
             /**
-             * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+             * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
              * @default typed
              * @enum {string}
              */
-            decision_method?: "typed" | "embedding_similarity" | "generated";
+            decision_method?: "typed" | "embedding_similarity" | "generated" | "cascade";
+            cascade?: components["schemas"]["DeciderCascade"];
             /** @description Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields. */
             generator?: components["schemas"]["GeneratorConfig"];
             instructions?: string;
@@ -18412,7 +18444,7 @@ export interface components {
         };
         /** @description Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges. */
         GraphResolverAdjudicationConfig: {
-            /** @description Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one. */
+            /** @description Frozen typed, generated or cascade decider configuration. Standalone generated verdict-only thresholds must be zero or one. Mixed cascades apply shared thresholds to probabilistic stages and require categorical zero-or-one terminal verdicts. A cascade answer is validated against the stage that produced it, and the receipt keeps the response's stage trace. */
             decider: components["schemas"]["DeciderConfig"];
             /** @description Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions. */
             template: string;
@@ -24754,6 +24786,7 @@ export interface components {
             answers?: components["schemas"]["InferenceDecideAnswer"][];
             data?: components["schemas"]["DecisionBatchItem"][];
             usage: components["schemas"]["DecisionUsage"];
+            cascade?: components["schemas"]["DecisionCascadeTrace"];
         };
         InferenceModelsResponse: {
             /** @description Whether public inference execution is enabled on this deployment. When false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed. Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy. */
@@ -30765,6 +30798,43 @@ export interface components {
             };
         };
         InferenceDecideAnswer: components["schemas"]["GeneratedChoiceAnswer"] | components["schemas"]["GeneratedMultiChoiceAnswer"] | components["schemas"]["GeneratedPredicateAnswer"] | components["schemas"]["GeneratedScoreAnswer"] | components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
+        DecisionUsage: {
+            /** @description True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured. */
+            estimated?: boolean;
+            /** @description Encoded tokens including repeated input text for split model tasks. */
+            input_tokens: number;
+            /** @description Zero for classifiers, which generate no tokens. */
+            output_tokens: number;
+        };
+        DecisionCascadeStageTrace: {
+            name: string;
+            /** @enum {string} */
+            decision_method: "typed" | "generated";
+            model?: string;
+            /** @description Immutable model revision reported by this stage, when available. */
+            model_revision?: string;
+            /** @description This stage's answers. Absent when the stage failed. */
+            answers?: components["schemas"]["InferenceDecideAnswer"][];
+            usage?: components["schemas"]["DecisionUsage"];
+            /** @description Producer provenance reported for this stage, when present. */
+            provenance?: {
+                [key: string]: unknown;
+            };
+            /** @description Whether this answer fell inside the next stage's band, sending the input on. */
+            escalated: boolean;
+            /** @description Error code when this stage failed for the input. With on_failure keep_previous, the previous stage's answer stands. */
+            error?: string;
+        };
+        /** @description Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages. */
+        DecisionCascadeTrace: {
+            /** @description The configured cascade name. */
+            decider: string;
+            /** @description Identity of the cascade definition, excluding credentials. Any change to stages, bands, failure policy or budget changes it. */
+            definition_sha256: string;
+            /** @description Name of the stage whose answer is final. */
+            answered_by: string;
+            stages: components["schemas"]["DecisionCascadeStageTrace"][];
+        };
         DecisionBatchItem: {
             input_index: number;
             id?: string;
@@ -30773,12 +30843,7 @@ export interface components {
             /** @description Resolved model reported for a successful named gateway batch item. */
             model?: string;
             answers: components["schemas"]["InferenceDecideAnswer"][];
-        };
-        DecisionUsage: {
-            /** @description Encoded tokens including repeated input text for split model tasks. */
-            input_tokens: number;
-            /** @description Zero for classifiers, which generate no tokens. */
-            output_tokens: number;
+            cascade?: components["schemas"]["DecisionCascadeTrace"];
         };
         QueryAdmissionConfig: {
             /**

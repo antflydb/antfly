@@ -36,10 +36,16 @@ pub fn layout(track: media.mp4.Track, width: u32, height: u32, policy: Policy) !
     if (matrix[2] != 0 or matrix[5] != 0 or matrix[8] != 1073741824) return error.UnsupportedVideoDisplay;
     const basis = [4]i32{ matrix[0], matrix[1], matrix[3], matrix[4] };
     const rotation: preparation.Rotation = if (std.mem.eql(i32, &basis, &.{ 65536, 0, 0, 65536 })) .none else if (std.mem.eql(i32, &basis, &.{ 0, 65536, -65536, 0 })) .clockwise90 else if (std.mem.eql(i32, &basis, &.{ -65536, 0, 0, -65536 })) .half_turn else if (std.mem.eql(i32, &basis, &.{ 0, -65536, 65536, 0 })) .clockwise270 else return error.UnsupportedVideoDisplay;
-    const sar = track.pixel_aspect;
-    if (sar.horizontal == 0 or sar.vertical == 0) return error.UnsupportedVideoDisplay;
-    const numerator = @as(u64, width) * sar.horizontal;
-    const display_width = (numerator + sar.vertical / 2) / sar.vertical;
+    return sarLayout(width, height, track.pixel_aspect.horizontal, track.pixel_aspect.vertical, rotation);
+}
+
+/// Shared checked presentation geometry for hardware and portable preparation.
+/// Invalid or oversized SAR is never approximated by clamping one axis.
+pub fn sarLayout(width: u32, height: u32, horizontal: u32, vertical: u32, rotation: preparation.Rotation) !Layout {
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidVideoGeometry;
+    if (horizontal == 0 or vertical == 0) return error.UnsupportedVideoDisplay;
+    const numerator = @as(u64, width) * horizontal;
+    const display_width = (numerator + vertical / 2) / vertical;
     if (display_width == 0 or display_width > 16384) return error.ResourceLimitExceeded;
     return if (rotation == .clockwise90 or rotation == .clockwise270)
         .{ .rotation = rotation, .width = height, .height = @intCast(display_width) }
@@ -131,4 +137,15 @@ test "WebM implicit display aspect follows track dimensions across codec geometr
     const track = media.webm.Track{ .number = 1, .codec = .av1, .width = 720, .height = 480 };
     try std.testing.expectEqual(Layout{ .rotation = .none, .width = 300, .height = 200 }, (try webmLayout(track, 360, 200, .presentation)).display);
     try std.testing.expectEqual(Layout{ .rotation = .none, .width = 360, .height = 200 }, (try webmLayout(track, 360, 200, .coded_pixels)).display);
+}
+
+test "checked SAR geometry preserves limits and rejects approximated aspect" {
+    for ([_]preparation.Rotation{ .none, .clockwise90, .half_turn, .clockwise270 }) |rotation| {
+        const valid = try sarLayout(4096, 2160, 4000000000, 1000000000, rotation);
+        try std.testing.expectEqual(@as(u32, 16384), if (rotation == .clockwise90 or rotation == .clockwise270) valid.height else valid.width);
+        try std.testing.expectError(error.ResourceLimitExceeded, sarLayout(192, 192, 1000, 1, rotation));
+        try std.testing.expectError(error.ResourceLimitExceeded, sarLayout(192, 192, 1, 1000, rotation));
+        try std.testing.expectError(error.UnsupportedVideoDisplay, sarLayout(192, 192, 0, 1, rotation));
+        try std.testing.expectError(error.UnsupportedVideoDisplay, sarLayout(192, 192, 1, 0, rotation));
+    }
 }

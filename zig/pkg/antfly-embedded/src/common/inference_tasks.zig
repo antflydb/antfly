@@ -251,12 +251,13 @@ pub const Executor = struct {
             if (item.id) |id| try decisions.put(a, &row, "id", .{ .string = id });
             try decisions.put(a, &row, "answers", if (value) |valid| valid.object.get("answers").? else .{ .array = std.array_list.Managed(Json).init(a) });
             if (value) |valid| try decisions.put(a, &row, "model", valid.object.get("model").?);
+            if (value) |valid| if (valid.object.get("cascade")) |trace| try decisions.put(a, &row, "cascade", trace);
             if (failure) |err| try decisions.put(a, &row, "error", .{ .string = @errorName(err) });
             try data.array.append(row);
         }
         const cfg = try self.view.providers.getDeciderConfig(name);
         var envelope = decisions.jsonObject();
-        try decisions.put(a, &envelope, "model", .{ .string = if (cfg.generator) |generator| generator.model else cfg.modelName() });
+        try decisions.put(a, &envelope, "model", .{ .string = if (cfg.decision_method == .cascade) name else if (cfg.generator) |generator| generator.model else cfg.modelName() });
         try decisions.put(a, &envelope, "data", data);
         var usage = decisions.jsonObject();
         try decisions.put(a, &usage, "input_tokens", .{ .integer = std.math.cast(i64, runtime.input_tokens) orelse return error.InvalidDecisionOutput });
