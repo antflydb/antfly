@@ -819,6 +819,16 @@ pub const HandleGuard = struct {
     /// Set only on a successful mutation-intent entry to a writer-mode
     /// connection; never set on a failed or pinned/read entry.
     lane_managed: bool = false,
+    /// The root `WriterLane.checkout` pinned (`Handle.lane_pins`) for this
+    /// guard, set alongside `lane_managed`. Unpinned exactly once in
+    /// `leaveWithRegistry`, after this call's own durability wait has
+    /// resolved -- not at `releaseWriterLaneBeforeWait`/checkin time,
+    /// which runs *before* that wait, since the pin's whole purpose is to
+    /// keep this generation alive for as long as this call might still
+    /// touch it, including while its own ticket is still outstanding.
+    /// Tracked separately from `guard.handle` because that field can be
+    /// reassigned to a child table handle later in the same entry.
+    lane_pinned_root: ?*Handle = null,
     /// Busy-wait budget left for this export call. The busy timeout bounds
     /// total admission waiting across every re-entry of one call (for
     /// example after inference), not each admission separately. Null means
@@ -1004,6 +1014,12 @@ pub const HandleGuard = struct {
                     }
                 }
                 if (!guard.writer_lane_released) connection.mutex.unlock(io);
+                // Unpin last: this call's own durability wait (if any) has
+                // already resolved by the time `leave`/`leaveWithRegistry`
+                // runs, so the generation this guard's write may still have
+                // been touching (through `wait()`, not just `checkout`) no
+                // longer needs to be kept alive on its behalf.
+                if (guard.lane_pinned_root) |pinned| _ = pinned.lane_pins.fetchSub(1, .release);
                 return;
             }
             // WS3: once `releaseWriterLaneBeforeWait` has run,
@@ -1288,6 +1304,7 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
                 return guard;
             };
             guard.lane_managed = true;
+            guard.lane_pinned_root = root;
             guard.connection_gate_held = true;
         } else {
             if (!pinned) {
@@ -10495,6 +10512,139 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
     // one fsync in the worst case of zero sharing).
     try std.testing.expect(shared_per_write <= solo_per_write + 0.01);
     try std.testing.expect(separate_per_write <= solo_per_write + 0.01);
+}
+
+/// `connection.owner.current`'s live `Store` (docstore.zig), for the group-
+/// size counters: `NativeFile.test_sync_delay_ns` (set this), `Store.
+/// test_groups_total`/`test_group_members_total` (read these). Like
+/// `ws3WriterLaneTestSyncCalls`, this can in principle go stale across an
+/// `Owner.refresh` generation swap (that replaces the whole `Store`, not
+/// just its `NativeFile`, so there is no cumulative bridge for the group
+/// counters the way `Owner.test_cumulative_sync_calls` bridges syncs) --
+/// acceptable here: this test's total write volume and wall-clock window
+/// are both much smaller than the test that motivated that bridge.
+const Ws3NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@FieldType(Handle, "owned_lite_backend")), "native_docstore")));
+fn ws3WriterLaneStore(handle_ptr: ?*anyopaque) *Ws3NativeStore {
+    const entry = HandleEntry.capture(handle_ptr).?;
+    defer entry.release();
+    const connection = entry.lock_handle.lite_connection.?;
+    return connection.owner.current.?.owned_lite_backend.?.native_docstore.?;
+}
+
+// WS3 fsync-latency acceptance test: the writer lane only ever gets a
+// *chance* to share a group if the group leader's fsync is slow enough
+// for a concurrent writer's own admission and staging to land behind it
+// first. An artificially slow fsync (`NativeFile.test_sync_delay_ns`)
+// removes any doubt about whether real NVMe-speed fsyncs on this
+// particular machine simply finish before an 8-thread race can ever
+// produce two members in the same `commit_head`/`commit_tail` queue at
+// once: with a 5ms fsync, 8 concurrent writers through the public C API
+// must form groups of more than one member, or something upstream of the
+// fsync (lane checkout, the DB apply lock, connection.mutex, the Store
+// writer slot, or `enqueue` itself) is still serializing them.
+test "WS3 writer lane: a slow fsync forces concurrent writers to share groups" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    // Small enough that even zero sharing (64 * 5ms serialized) stays a
+    // fraction of a second; large enough (double the solo/no-delay test's
+    // sample) that the mean-group-size ratio is a stable average over many
+    // groups rather than noise from one lucky/unlucky pair -- a 32-write
+    // run occasionally landed just under the 2.0/0.5 thresholds when this
+    // test ran back-to-back with the other two in one process on a loaded
+    // machine; 64 did not reproduce that in repeated chained runs.
+    const writes_per_run = 64;
+    const writer_count = 8;
+    const sync_delay_ns: u64 = 5 * std.time.ns_per_ms;
+    const create_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .busy_timeout_ms = 60000 };
+
+    const Worker = struct {
+        handle: ?*anyopaque,
+        ordinal: usize,
+        count: usize,
+        start: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..self.count) |i| ws3WriterLaneProbeWrite(self.handle, self.ordinal, i) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+
+    const Scenario = struct {
+        fn run(writer_handles: []const ?*anyopaque) !struct { syncs: u64, writes: usize, groups: u64, members: u64 } {
+            const store = ws3WriterLaneStore(writer_handles[0]);
+            const sync_before = ws3WriterLaneTestSyncCalls(writer_handles[0]);
+            const groups_before = store.test_groups_total.load(.acquire);
+            const members_before = store.test_group_members_total.load(.acquire);
+            var start = std.atomic.Value(bool).init(false);
+            var workers: [writer_count]Worker = undefined;
+            var threads: [writer_count]std.Thread = undefined;
+            const per_writer = writes_per_run / writer_count;
+            for (&workers, &threads, 0..) |*worker, *thread, ordinal| {
+                worker.* = .{ .handle = writer_handles[ordinal % writer_handles.len], .ordinal = ordinal, .count = per_writer, .start = &start };
+                thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+            }
+            start.store(true, .release);
+            for (threads) |thread| thread.join();
+            for (workers) |worker| if (worker.failure) |err| return err;
+            const sync_after = ws3WriterLaneTestSyncCalls(writer_handles[0]);
+            const groups_after = store.test_groups_total.load(.acquire);
+            const members_after = store.test_group_members_total.load(.acquire);
+            return .{
+                .syncs = sync_after - sync_before,
+                .writes = per_writer * writer_count,
+                .groups = groups_after -| groups_before,
+                .members = members_after -| members_before,
+            };
+        }
+    };
+
+    // Eight writer threads sharing one handle.
+    var shared_dir = try TestDirectory.init("ws3-writer-lane-slow-sync-shared-handle");
+    defer shared_dir.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, shared_dir.path());
+    const shared_path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{shared_dir.path()}, 0);
+    defer alloc.free(shared_path);
+    var shared_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(shared_path, &create_options, &shared_handle));
+    defer antfly_db_close(shared_handle);
+    ws3WriterLaneStore(shared_handle).file.test_sync_delay_ns.store(sync_delay_ns, .release);
+    const shared_result = try Scenario.run(&.{shared_handle});
+    const shared_per_write: f64 = @as(f64, @floatFromInt(shared_result.syncs)) / @as(f64, @floatFromInt(shared_result.writes));
+    const shared_mean_group: f64 = if (shared_result.groups == 0) 0 else @as(f64, @floatFromInt(shared_result.members)) / @as(f64, @floatFromInt(shared_result.groups));
+
+    // Eight writer threads, eight separate handles opened to the same path.
+    var separate_dir = try TestDirectory.init("ws3-writer-lane-slow-sync-separate-handles");
+    defer separate_dir.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, separate_dir.path());
+    const separate_path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{separate_dir.path()}, 0);
+    defer alloc.free(separate_path);
+    var separate_handles: [writer_count]?*anyopaque = undefined;
+    var opened: usize = 0;
+    defer for (separate_handles[0..opened]) |handle| antfly_db_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(separate_path, &create_options, &separate_handles[0]));
+    opened = 1;
+    ws3WriterLaneStore(separate_handles[0]).file.test_sync_delay_ns.store(sync_delay_ns, .release);
+    const open_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite, .busy_timeout_ms = 60000 };
+    for (separate_handles[1..]) |*slot| {
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(separate_path, &open_options, slot));
+        opened += 1;
+    }
+    const separate_result = try Scenario.run(&separate_handles);
+    const separate_per_write: f64 = @as(f64, @floatFromInt(separate_result.syncs)) / @as(f64, @floatFromInt(separate_result.writes));
+    const separate_mean_group: f64 = if (separate_result.groups == 0) 0 else @as(f64, @floatFromInt(separate_result.members)) / @as(f64, @floatFromInt(separate_result.groups));
+
+    std.debug.print(
+        "WS3 writer lane (5ms fsync): {d} writers shared handle {d}/{d} ({d:.3}/write, mean group {d:.2}); {d} writers separate handles {d}/{d} ({d:.3}/write, mean group {d:.2})\n",
+        .{ writer_count, shared_result.syncs, shared_result.writes, shared_per_write, shared_mean_group, writer_count, separate_result.syncs, separate_result.writes, separate_per_write, separate_mean_group },
+    );
+
+    try std.testing.expect(shared_mean_group >= 2.0);
+    try std.testing.expect(shared_per_write <= 0.5);
+    try std.testing.expect(separate_mean_group >= 2.0);
+    try std.testing.expect(separate_per_write <= 0.5);
 }
 
 // WS3's "apply lock not held during fsync" test hook, at the capi layer:

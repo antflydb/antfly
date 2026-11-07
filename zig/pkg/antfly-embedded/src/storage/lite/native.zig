@@ -5276,6 +5276,21 @@ pub const NativeFile = struct {
     /// Counts durability barriers (`syncIfRequired`'s underlying `file.sync`
     /// calls), independent of filesystem speed. Used to assert syncs/commit.
     test_sync_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    /// Artificially slows every durability barrier by this many
+    /// nanoseconds (0: no delay), via a raw `nanosleep` -- not `Io.sleep`,
+    /// so it never depends on whatever `Io` scheduler happens to be live
+    /// and cannot interact with a concurrent `Io.concurrent` task the way
+    /// that caused a hang elsewhere. Set on a real filesystem (never
+    /// `no_sync`) to widen the window a concurrent writer's own admission
+    /// and staging has to land in the same group before this one's
+    /// `syncIfRequired` returns, for tests that need to tell "no group
+    /// formed because nothing else was ready yet" apart from "no group
+    /// formed because something still serializes writers upstream of the
+    /// fsync". The lock `sync_lock_hooks` already releases for the real
+    /// `fileSync` call is held released across this delay too (see
+    /// `syncIfRequired`), exactly like the real syscall it is standing in
+    /// front of.
+    test_sync_delay_ns: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     /// Fails the next checkpoint publication inside its uncertain window
     /// (after the flag is set, before the slot write), then disarms.
     test_fail_checkpoint_publication: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
@@ -13087,6 +13102,13 @@ pub const NativeFile = struct {
             // and after, stays under that lock. See `sync_lock_hooks`.
             if (self.sync_lock_hooks) |hooks| hooks.release(hooks.context);
             defer if (self.sync_lock_hooks) |hooks| hooks.reacquire(hooks.context);
+            if (comptime builtin.is_test) {
+                const delay_ns = self.test_sync_delay_ns.load(.monotonic);
+                if (delay_ns != 0) _ = std.c.nanosleep(&.{
+                    .sec = @intCast(delay_ns / std.time.ns_per_s),
+                    .nsec = @intCast(delay_ns % std.time.ns_per_s),
+                }, null);
+            }
             if (self.durability_policy) |policy|
                 try antfly_platform.filesystem.syncData(self.file.handle, policy)
             else

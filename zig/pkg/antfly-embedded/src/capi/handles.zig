@@ -141,6 +141,20 @@ pub const Handle = struct {
     query_producer_mutex: std.Io.Mutex = .init,
     /// Protected by the native path gate; pins provider and extractor lifetime.
     query_borrows: usize = 0,
+    /// WS3 writer lane: how many in-flight lane members (`WriterLane.
+    /// checkout` through the matching unpin in `HandleGuard.
+    /// leaveWithRegistry`, spanning that call's own durability wait) are
+    /// pinning this generation. Atomic, unlike `query_borrows`: lane
+    /// members pin/unpin without holding `connection.gate.mutex`
+    /// (the whole point of the lane), so concurrent same-Store writers
+    /// can touch this from different threads with no other lock in
+    /// common. `Owner.collectRetired` must never close a generation while
+    /// this is nonzero -- a writer still mid-flight on it, specifically
+    /// because another concurrent writer's own lane checkout triggered a
+    /// refresh/replacement, must never see its own backend torn out from
+    /// under it (observed empirically as a `metadata_pool`/
+    /// `source_certificates` crash before this field existed).
+    lane_pins: std.atomic.Value(usize) = .init(0),
 
     // Serialized threading mode (see CAPI.md "Thread Safety"): every export
     // enters through `enterHandle`, which takes `api_lock` shared for reads

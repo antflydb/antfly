@@ -989,9 +989,39 @@ pub const DocStore = struct {
         graph_retirements_maybe: ?bool = null,
         unordered_bulk_append_puts: bool = false,
         runtime: ?backend_erased.Batch = null,
+        /// Set once this batch's `source_certificates.begin()` credit (if
+        /// any) has been released via `end()`. `commitStaged`'s own
+        /// `errdefer` and `StagedBatch.wait`'s `defer` are meant to be
+        /// mutually exclusive paths to exactly one release, but both
+        /// ultimately act on value-copied wrappers (`StagedBatch`,
+        /// `StagedDocBatch`, `backend_erased.Ticket`) around this
+        /// heap-resident `*Batch` -- a second release reached through any
+        /// copy of those wrappers (observed empirically: WS3 concurrent
+        /// capi writers, the first caller to ever make staged batches
+        /// genuinely overlap) must not double-decrement another writer's
+        /// in-flight count. See `releaseSourceCertificateOnce`.
+        source_certificate_released: bool = false,
 
         pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
             try self.artifact_inputs.attach(participant);
+        }
+
+        /// The only path allowed to call `source_certificates.end()` for
+        /// this batch. `owner` is `source_owner`/`columnar_owner` as
+        /// captured at `commitStaged` time, not re-read from `self` here,
+        /// so a caller's own capture stays authoritative even if `self`
+        /// is reused before this runs. Idempotent: see
+        /// `source_certificate_released`'s doc comment.
+        fn releaseSourceCertificateOnce(self: *Batch, owner: ?*DocStore) void {
+            if (self.source_certificate_released) {
+                if (comptime @import("builtin").is_test) std.debug.print(
+                    "source_certificates: ignored a second release for batch {*} (owner {?*})\n",
+                    .{ self, owner },
+                );
+                return;
+            }
+            self.source_certificate_released = true;
+            if (owner) |o| o.source_certificates.end();
         }
 
         pub const BatchTxn = struct {
@@ -1255,7 +1285,12 @@ pub const DocStore = struct {
             /// points below, which heap-allocate it, free it themselves
             /// after this returns.
             pub fn wait(self: StagedBatch) !void {
-                defer if (self.source_owner) |owner| owner.source_certificates.end();
+                // `self.batch` (not yet freed: the caller -- `StagedDocBatch.
+                // wait`/`commit` -- only destroys it after this function has
+                // returned) owns the one-shot guard, so a second `wait()`
+                // reached through another copy of this value-type wrapper
+                // cannot double-release `source_owner`'s certificate credit.
+                defer self.batch.releaseSourceCertificateOnce(self.source_owner);
                 self.ticket.wait() catch |err| {
                     self.batch.retained.poisoned = true;
                     if (self.source_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
@@ -1326,7 +1361,7 @@ pub const DocStore = struct {
             const source_owner = self.columnar_owner;
             const payload_session = self.payload_session;
             if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
-            errdefer if (source_owner) |owner| owner.source_certificates.end();
+            errdefer self.releaseSourceCertificateOnce(source_owner);
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             if (payload_session) |session| try session.prepareCommit();
             if (payload_session) |session| session.primary_commit_attempted = true;

@@ -1045,15 +1045,52 @@ pub const WriterLane = struct {
     /// `othersWaiting`/fairness check needed) rather than racing a remote
     /// handoff decision against them.
     waiting: usize = 0,
+    /// The root this lane handed out last, so a warm checkout can tell
+    /// "nothing has replaced the generation since" by pointer identity
+    /// alone -- see `checkout`'s fast path.
+    last_root: ?*h.Handle = null,
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
 
-    /// Check `connection` into the lane, returning the root to use.
-    /// `connection.refresh` runs every time regardless of path, for
-    /// correctness (background maintenance -- not just another process --
-    /// can still require picking up a new root); only `PathGate`/the
-    /// kernel lease are skipped once something is already parked.
+    /// Whether `connection.refresh(root, intent)` might actually need to
+    /// do something (the detached allocator-proof admission branch) for
+    /// `root`, cheaply (no disk I/O beyond an in-memory allocator-stats
+    /// read) -- the same condition `Connection.refresh` itself gates that
+    /// branch on. Used to decide whether `checkout`'s fast path may skip
+    /// calling `refresh` at all.
+    fn mightNeedRefreshAdmission(connection: *Connection, root: *h.Handle, intent: api.StorageIntent) bool {
+        if (connection.options.profile != .native or connection.options.open_mode != .writer) return false;
+        if (Connection.usesCapacityAdmission(root)) return true;
+        if (intent != .mutation) return false;
+        return connection.needsReuseAdmission(root) catch true;
+    }
+
+    /// Check `connection` into the lane, returning the root to use, with
+    /// `connection` already attached to it and that root's `lane_pins`
+    /// incremented (the caller -- `enterCapturedHandleWithDeadline` --
+    /// must decrement it exactly once, in `leaveWithRegistry`, once this
+    /// call's own durability wait has resolved).
+    ///
+    /// Design doc §3.2/§3.2a "no self-replacement": while this lane holds
+    /// the kernel lease continuously, no other *process* can have
+    /// written, and `connection.owner.current` not having moved means no
+    /// same-process replacement (`Owner.refresh`'s slow path, the only
+    /// thing that ever reassigns it) has happened either -- by
+    /// definition, not by inference, so there is nothing a fresh disk
+    /// probe could tell this call that it does not already know. Skipping
+    /// `connection.refresh` entirely in that case (keeping only its cheap,
+    /// in-memory admission check -- `mightNeedRefreshAdmission` -- as a
+    /// safety valve for capacity-limited or reclaiming stores) is what
+    /// stops back-to-back same-Store commits from ever reaching
+    /// `Owner.refresh`'s probe-based "unchanged" comparison at all, which
+    /// is what was spuriously taking the slow replacement path under
+    /// genuine concurrent overlap (a commit's on-disk header can lag its
+    /// own in-memory `current.owned_lite_backend.?.native_docstore.?.file`
+    /// by the time a concurrently-admitted writer's probe runs, even
+    /// though nothing external changed) -- observed empirically as a
+    /// `metadata_pool`/`source_certificates` crash from a generation torn
+    /// down while another writer was still pinned on it.
     pub fn checkout(self: *WriterLane, connection: *Connection, intent: api.StorageIntent) !*h.Handle {
         const io = h.handleLockIo();
         const deadline = connection.admissionDeadline();
@@ -1063,9 +1100,26 @@ pub const WriterLane = struct {
             if (self.parked) |parked| {
                 self.parked = null;
                 self.checked_out = true;
+                const likely_root = self.last_root;
                 self.mutex.unlock(io);
-                // Warm path: the kernel lease is already held, and
-                // `PathGate` was already released when it was parked.
+                if (likely_root != null and likely_root == connection.owner.current and
+                    !mightNeedRefreshAdmission(connection, likely_root.?, intent))
+                {
+                    const root = likely_root.?;
+                    connection.current = root;
+                    connection.attach(root);
+                    _ = root.lane_pins.fetchAdd(1, .release);
+                    self.mutex.lockUncancelable(io);
+                    self.held_lease = parked;
+                    self.mutex.unlock(io);
+                    return root;
+                }
+                // Slow path: either this is the first warm checkout after
+                // a cold start whose own `connection.refresh` never ran
+                // yet for *this* connection (a different connection just
+                // parked the lease), something (almost certainly
+                // same-process maintenance) replaced the generation since
+                // this lease was last used, or admission might be needed.
                 // `refresh` can still briefly need `connection.gate.mutex`
                 // itself (its detached allocator-proof wait toggles it);
                 // hold it only for this call, not across the lease's whole
@@ -1081,8 +1135,10 @@ pub const WriterLane = struct {
                     return err;
                 };
                 connection.gate.mutex.unlock(io);
+                _ = root.lane_pins.fetchAdd(1, .release);
                 self.mutex.lockUncancelable(io);
                 self.held_lease = lease;
+                self.last_root = root;
                 self.mutex.unlock(io);
                 return root;
             }
@@ -1107,8 +1163,10 @@ pub const WriterLane = struct {
                     return err;
                 };
                 connection.gate.mutex.unlock(io);
+                _ = root.lane_pins.fetchAdd(1, .release);
                 self.mutex.lockUncancelable(io);
                 self.held_lease = lease;
+                self.last_root = root;
                 self.mutex.unlock(io);
                 return root;
             }
@@ -1457,9 +1515,12 @@ pub const Owner = struct {
             certified.?.allocator_cancel_token = &self.verification_cancel;
             if (self.current) |previous| {
                 // Only an idle serving wrapper can donate. Active cursors,
-                // detached work and proof readers retain independent caches.
+                // detached work, proof readers, and a lane writer still
+                // mid-flight on this generation (whose own commit may still
+                // be changing the allocator ledger) retain independent caches.
                 if (previous.query_borrows == 0 and previous.maintenance_references == 0 and
-                    previous.allocator_verification_references == 0 and previous.sql_cursors.count() == 0)
+                    previous.allocator_verification_references == 0 and previous.sql_cursors.count() == 0 and
+                    previous.lane_pins.load(.acquire) == 0)
                     _ = try certified.?.takeAllocatorRebaseBase(&previous.owned_lite_backend.?.native_docstore.?.file);
             }
             _ = try self.copyIdleSnapshotLedger(&certified.?);
@@ -1647,7 +1708,7 @@ pub const Owner = struct {
         while (i < self.retired.items.len) {
             const retired = self.retired.items[i];
             const retained = retained: {
-                if (retired.query_borrows > 0 or retired.maintenance_references != 0 or retired.allocator_verification_references != 0) break :retained true;
+                if (retired.query_borrows > 0 or retired.maintenance_references != 0 or retired.allocator_verification_references != 0 or retired.lane_pins.load(.acquire) != 0) break :retained true;
                 for (self.connections.items) |connection| {
                     // attach moves this connection's registry onto the current
                     // root. Inspect its actual owner during query resume too.
@@ -2039,7 +2100,8 @@ pub const Owner = struct {
     /// A serving runtime whose allocator cache no other thread can touch.
     fn idleServingRuntime(handle: *h.Handle) bool {
         return handle.query_borrows == 0 and handle.maintenance_references == 0 and
-            handle.allocator_verification_references == 0 and handle.sql_cursors.count() == 0;
+            handle.allocator_verification_references == 0 and handle.sql_cursors.count() == 0 and
+            handle.lane_pins.load(.acquire) == 0;
     }
 
     /// Copy an idle maintenance snapshot's warm ledger into a cold `file` as
