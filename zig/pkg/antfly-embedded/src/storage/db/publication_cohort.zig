@@ -150,13 +150,16 @@ pub const Group = struct {
         defer decoded.deinit();
         if (decoded.record.changed_artifact_keys.len != 0) return error.UnsupportedPublicationCohort;
         const records = try a.alloc(ReplayAppend.Record, sequences.len);
+        const changed = try self.distributeKeys(a, decoded.record.changed_doc_keys);
+        const deleted = try self.distributeKeys(a, decoded.record.deleted_doc_keys);
+        const overwritten = try self.distributeKeys(a, decoded.record.overwritten_doc_keys);
         var total_bytes: usize = 0;
         for (sequences, 0..) |sequence, ordinal| {
             var record = decoded.record;
             record.sequence = sequence;
-            record.changed_doc_keys = try self.selectKeys(a, decoded.record.changed_doc_keys, ordinal);
-            record.deleted_doc_keys = try self.selectKeys(a, decoded.record.deleted_doc_keys, ordinal);
-            record.overwritten_doc_keys = try self.selectKeys(a, decoded.record.overwritten_doc_keys, ordinal);
+            record.changed_doc_keys = changed[ordinal];
+            record.deleted_doc_keys = deleted[ordinal];
+            record.overwritten_doc_keys = overwritten[ordinal];
             const encoded = try journal.encodeRecord(a, record);
             total_bytes +|= encoded.len;
             records[ordinal] = .{ .sequence = sequence, .payload = encoded };
@@ -166,13 +169,18 @@ pub const Group = struct {
         return result;
     }
 
-    fn selectKeys(self: *const Group, a: std.mem.Allocator, keys: []const []const u8, ordinal: usize) ![]const []const u8 {
-        var result: std.ArrayList([]const u8) = .empty;
+    fn distributeKeys(self: *const Group, a: std.mem.Allocator, keys: []const []const u8) ![]const []const []const u8 {
+        const buckets = try a.alloc(std.ArrayList([]const u8), self.requests.len);
+        for (buckets) |*bucket| bucket.* = .empty;
+        // One ownership lookup per effect, independent of the number of
+        // requests. Never rescan the whole combined record for every origin.
         for (keys) |key| {
             const owner = self.owners.get(key) orelse return error.UnsupportedPublicationCohort;
-            if (owner == ordinal) try result.append(a, key);
+            try buckets[owner].append(a, key);
         }
-        return result.toOwnedSlice(a);
+        const result = try a.alloc([]const []const u8, buckets.len);
+        for (buckets, result) |*bucket, *out| out.* = try bucket.toOwnedSlice(a);
+        return result;
     }
 };
 
@@ -223,4 +231,43 @@ test "publication cohort splits conflicts private controls and incompatible visi
     try std.testing.expectError(error.UnsupportedPublicationCohort, Group.init(a, &.{ .{ .writes = &.{.{ .key = "same", .value = "{}" }} }, .{ .deletes = &.{"same"} } }));
     try std.testing.expectError(error.UnsupportedPublicationCohort, Group.init(a, &.{ .{ .writes = &.{.{ .key = "a", .value = "{}" }} }, .{ .sync_level = .full_text } }));
     try std.testing.expectError(error.UnsupportedPublicationCohort, Group.init(a, &.{.{ .activate_range_tracking = true }}));
+}
+
+test "publication cohort bounds a full request group and partitions every logical effect" {
+    const a = std.testing.allocator;
+    var inputs = std.heap.ArenaAllocator.init(a);
+    defer inputs.deinit();
+    const scratch = inputs.allocator();
+    var requests: [maximum_requests]types.BatchRequest = undefined;
+    var keys: std.ArrayList([]const u8) = .empty;
+    for (&requests, 0..) |*request, origin| {
+        const writes = try scratch.alloc(types.BatchWrite, maximum_operations / maximum_requests);
+        for (writes, 0..) |*write, row| {
+            const key = try std.fmt.allocPrint(scratch, "{d}/{d}", .{ origin, row });
+            write.* = .{ .key = key, .value = "{}" };
+            try keys.append(scratch, key);
+        }
+        request.* = .{ .writes = writes };
+    }
+    var group = try Group.init(a, &requests);
+    defer group.deinit();
+    const payload = try journal.encodeRecord(a, .{ .sequence = maximum_requests, .changed_doc_keys = keys.items, .target_hints = &.{.full_text} });
+    defer a.free(payload);
+    var sequences: [maximum_requests]u64 = undefined;
+    for (&sequences, 0..) |*sequence, ordinal| sequence.* = ordinal + 1;
+    var prepared = try group.prepareJournal(a, payload, &sequences);
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, maximum_requests), prepared.records.len);
+    var documents: usize = 0;
+    for (prepared.records, 0..) |record, origin| {
+        var decoded = try journal.decodeRecord(a, record.payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, maximum_operations / maximum_requests), decoded.record.changed_doc_keys.len);
+        for (decoded.record.changed_doc_keys) |key| try std.testing.expectEqual(origin, group.owners.get(key).?);
+        documents += decoded.record.changed_doc_keys.len;
+    }
+    try std.testing.expectEqual(@as(usize, maximum_operations), documents);
+    const oversized = try scratch.alloc(types.BatchRequest, maximum_requests + 1);
+    @memset(oversized, requests[0]);
+    try std.testing.expectError(error.UnsupportedPublicationCohort, Group.init(a, oversized));
 }

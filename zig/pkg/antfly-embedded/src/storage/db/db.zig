@@ -7637,6 +7637,7 @@ pub const DB = struct {
     /// writer against that writer's final marker in this atomic publication.
     pub fn batchTrackedWithPreparedCohort(self: *DB, cohort: *const @import("publication_cohort.zig").Group, primary_committed: *bool, markers: []const apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
         primary_committed.* = false;
+        if (cohort.requests.len == 0 or cohort.requests.len > @import("publication_cohort.zig").maximum_requests) return error.InvalidBatchRequest;
         if (markers.len != 0 and markers.len != cohort.requests.len) return error.InvalidBatchRequest;
         if (self.local_execution.replication_write_gate != null or self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_async_effect_mirror != null or self.local_execution.replication_async_metadata_mirror != null) return error.UnsupportedPublicationCohort;
         var view = self.core.acquireSchemaView();
