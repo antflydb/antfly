@@ -30830,6 +30830,8 @@ export interface components {
             output_tokens: number;
         };
         DecisionCascadeStageTrace: {
+            /** @description Sorted question names compared by this stage. Present only when a local comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains. */
+            agreement_questions?: string[];
             /** @description Complete bounded upstream execution dependencies. An empty array explicitly records no versioned dependencies. Omission on historical projected proxy stages indicates incomplete provenance. */
             upstream_revisions?: components["schemas"]["DecisionRevisionDependency"][];
             upstream_agreement?: components["schemas"]["DecisionCascadeUpstreamAgreement"];

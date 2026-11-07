@@ -5727,3 +5727,98 @@ test "REVIEW executor deadlines preserve the shared budget across clock domains"
     Clock.value = 10 * std.time.ns_per_ms;
     try testing.expectError(error.Timeout, request.deadline(host_now));
 }
+
+test "REVIEW reported agreement must match a single question vote" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cfg = try adjudication.Config.parse(a, adjudication_test_config);
+    defer cfg.deinit();
+    var response = try AgreementUpstreamFixture.response(alloc, cfg.value, @splat(0xaa), true);
+    try testing.expectEqual(adjudication.Status.abstained, try adjudication.classify(alloc, cfg.value, response));
+    const trace = response.object.getPtr("cascade").?;
+    const final = &trace.object.getPtr("stages").?.array.items[1];
+    for ([_]*std.json.Value{ trace, final }) |value| {
+        try value.object.put(alloc, "agreement_status", .{ .string = "agreed" });
+        try value.object.put(alloc, "agreed", .{ .bool = true });
+        _ = value.object.swapRemove("disagreed_questions");
+    }
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(alloc, cfg.value, response));
+    // Historical one-question traces are equally unambiguous without scope.
+    _ = final.object.swapRemove("agreement_questions");
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(alloc, cfg.value, response));
+}
+
+test "REVIEW root dependency projection cannot erase a cascade" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const c = @import("antfly_decisions").cascade;
+    const cfg = try adjudication.Config.parse(a, adjudication_test_config);
+    defer cfg.deinit();
+    const Runner = struct {
+        strong: std.json.Value,
+        fn run(ptr: *anyopaque, scratch: std.mem.Allocator, index: usize, _: c.Stage, ids: []const usize) !c.StageResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const typed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, adjudication_test_response, .{});
+            const values = try scratch.alloc(?std.json.Value, ids.len);
+            @memset(values, if (index == 0) self.strong else typed);
+            const failures = try scratch.alloc(?anyerror, ids.len);
+            @memset(failures, null);
+            return .{ .values = values, .failures = failures };
+        }
+    };
+    const definition = try c.compile(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+        \\{"stages":[{"name":"gen","decider":{"decision_method":"generated","generator":{"model":"leaf-a"}}},{"name":"typed","decider":{"model":"typed"},"require_agreement":true,"when":{"question":"same","choice":"same","probability_between":[0,1]}}]}
+    , .{}));
+    var runner = Runner{ .strong = try RevisionedAdjudicationFixture.response(alloc, cfg.value, @splat(0xaa), "leaf-a", false) };
+    const outcome = try c.execute(alloc, &definition, "upstream", 1, .{ .ptr = &runner, .run = Runner.run });
+    var response = outcome.values[0].?;
+    _ = try c.validateTrace(&definition, response);
+    var cache: adjudication.Config.RevisionCache = .{};
+    defer cache.deinit(alloc);
+    try testing.expect((try cfg.value.responseRevision(alloc, response, null, &cache)) != null);
+    const clean_response = try std.json.Stringify.valueAlloc(alloc, response, .{});
+    try response.object.put(alloc, "upstream_revisions", .{ .array = .init(alloc) });
+    try testing.expectError(error.InvalidAdjudicationOutput, adjudication.classify(alloc, cfg.value, response));
+    try testing.expectError(error.InvalidAdjudicationOutput, cfg.value.responseRevision(alloc, response, null, &cache));
+    var fixture = AdjudicationFixture{ .response = try std.json.Stringify.valueAlloc(alloc, response, .{}) };
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{uslug _entity.text}}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+    var stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .adjudicate = cfg.value, .adjudicator = fixture.executor(), .work_retention = .none };
+    _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+    stage.adjudicator = null;
+    _ = try stage.run(a, map.store(), null, "source", "resolution");
+    var receipt = try parseResolution(a, map.map.get("resolution").?);
+    defer receipt.deinit();
+    try testing.expectEqual(Decision.review, receipt.entities[0].decision);
+    try testing.expectEqual(adjudication.Status.failed, receipt.entities[0].adjudication.?.status);
+    try testing.expect(receipt.entities[0].adjudication.?.response == null);
+    try testing.expectEqual(@as(usize, 1), fixture.calls);
+
+    // A historical writer could have persisted this successful response with
+    // an unversioned binding. An upgraded reader must not reuse it offline.
+    var legacy_map = MapStore{ .alloc = a };
+    defer legacy_map.deinit();
+    try legacy_map.store().put("source", map.map.get("source").?);
+    fixture.response = clean_response;
+    stage.adjudicator = fixture.executor();
+    _ = try stage.run(a, legacy_map.store(), fixture.provider(), "source", "resolution");
+    var legacy = try std.json.parseFromSliceLeaky(std.json.Value, alloc, legacy_map.map.get("resolution").?, .{});
+    const evidence = legacy.object.getPtr("entities").?.array.items[0].object.getPtr("adjudication").?;
+    try evidence.object.put(alloc, "response", response);
+    try evidence.object.put(alloc, "execution_hash", legacy.object.get("adjudication_execution_hash").?);
+    const corrupt_receipt = try std.json.Stringify.valueAlloc(alloc, legacy, .{});
+    try legacy_map.store().put("resolution", corrupt_receipt);
+    stage.adjudicator = null;
+    try testing.expectError(error.InvalidAdjudicationOutput, stage.run(a, legacy_map.store(), null, "source", "resolution"));
+    try testing.expectEqualStrings(corrupt_receipt, legacy_map.map.get("resolution").?);
+    try testing.expectEqual(@as(usize, 2), fixture.calls);
+}

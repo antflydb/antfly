@@ -313,6 +313,14 @@ plain typed proxy and `on_failure: mint`. When an upstream response supplies a
 full trace, its bounded stage structure, aggregate status, revision metadata,
 and final answer must be coherent. Metadata-only legacy summaries remain
 supported; upstream policy definitions are not reconstructed locally.
+A performed local comparison records sorted `agreement_questions` on its stage.
+Consumers recompute that comparison from the preceding and current answers,
+including strict predicate tie handling. Older full traces without scope remain
+usable when the answer evidence proves agreement; ambiguous historical scoped
+agreement abstains as `unverified`. Reported disagreement must identify actual
+differing votes. A flat dependency projection cannot coexist with a full trace
+and hide its generated revisions or definition identity. Projections remain on
+stage receipts and are not copied onto the public response root.
 
 For `provider: antfly`, the default `typed` method selects the Decisions
 transport. A remote named decider may return typed or generated answers,

@@ -166,3 +166,9 @@ verdict-only answer is rejected before its producing stage commits success if a
 later band needs that answer. Band validation checks every unscoped question,
 including questions after an earlier in-band answer. Valid upstream or local
 vetoes stop first, so terminal categorical votes remain valid evidence.
+
+Guarded stage receipts record sorted `agreement_questions` for each comparison
+that actually ran. Proxy consumers verify those selected votes without compiling
+the upstream policy. Historical full traces with ambiguous omitted scope abstain;
+metadata-only summaries retain their existing contract. Flat upstream dependency
+projections are stage provenance and cannot override a supplied public trace.

@@ -35,6 +35,9 @@ class DecisionCascadeStageTrace:
         name (str):
         decision_method (DecisionCascadeStageTraceDecisionMethod):
         escalated (bool): Whether this answer fell inside the next stage's band, sending the input on.
+        agreement_questions (list[str] | Unset): Sorted question names compared by this stage. Present only when a local
+            comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without
+            reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains.
         upstream_revisions (list[DecisionRevisionDependency] | Unset): Complete bounded upstream execution dependencies.
             An empty array explicitly records no versioned dependencies. Omission on historical projected proxy stages
             indicates incomplete provenance.
@@ -64,6 +67,7 @@ class DecisionCascadeStageTrace:
     name: str
     decision_method: DecisionCascadeStageTraceDecisionMethod
     escalated: bool
+    agreement_questions: list[str] | Unset = UNSET
     upstream_revisions: list[DecisionRevisionDependency] | Unset = UNSET
     upstream_agreement: DecisionCascadeUpstreamAgreement | Unset = UNSET
     agreement_status: DecisionCascadeAgreementStatus | Unset = UNSET
@@ -104,6 +108,10 @@ class DecisionCascadeStageTrace:
         decision_method = self.decision_method.value
 
         escalated = self.escalated
+
+        agreement_questions: list[str] | Unset = UNSET
+        if not isinstance(self.agreement_questions, Unset):
+            agreement_questions = self.agreement_questions
 
         upstream_revisions: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.upstream_revisions, Unset):
@@ -175,6 +183,8 @@ class DecisionCascadeStageTrace:
                 "escalated": escalated,
             }
         )
+        if agreement_questions is not UNSET:
+            field_dict["agreement_questions"] = agreement_questions
         if upstream_revisions is not UNSET:
             field_dict["upstream_revisions"] = upstream_revisions
         if upstream_agreement is not UNSET:
@@ -222,6 +232,8 @@ class DecisionCascadeStageTrace:
         decision_method = DecisionCascadeStageTraceDecisionMethod(d.pop("decision_method"))
 
         escalated = d.pop("escalated")
+
+        agreement_questions = cast(list[str], d.pop("agreement_questions", UNSET))
 
         _upstream_revisions = d.pop("upstream_revisions", UNSET)
         upstream_revisions: list[DecisionRevisionDependency] | Unset = UNSET
@@ -380,6 +392,7 @@ class DecisionCascadeStageTrace:
             name=name,
             decision_method=decision_method,
             escalated=escalated,
+            agreement_questions=agreement_questions,
             upstream_revisions=upstream_revisions,
             upstream_agreement=upstream_agreement,
             agreement_status=agreement_status,

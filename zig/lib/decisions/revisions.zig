@@ -61,6 +61,9 @@ pub const Manifest = struct {
         if (self.visited > 128) return error.InvalidDecisionOutput;
         if (response != .object) return error.InvalidDecisionOutput;
         if (response.object.get("upstream_revisions")) |flat| {
+            // A stage projection replaces hidden upstream provenance. It must
+            // never override a supplied public trace, even with an empty list.
+            if (response.object.contains("cascade")) return error.InvalidDecisionOutput;
             const first = self.len;
             if (flat != .array or flat.array.items.len > max_nodes) return error.InvalidDecisionOutput;
             for (flat.array.items) |entry| {
@@ -204,7 +207,7 @@ test "flat dependencies preserve generated stages before typed finals and upstre
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const input = try std.json.parseFromSliceLeaky(V, a,
+    var input = try std.json.parseFromSliceLeaky(V, a,
         \\{"model":"typed-final","answers":[{"decision_method":"typed"}],"cascade":{"definition_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stages":[{"name":"fast","decision_method":"generated","model":"gen","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answers":[{"decision_method":"generated"}]},{"name":"strong","decision_method":"typed","upstream_revisions":[],"model":"typed-final","answers":[{"decision_method":"typed"}]}]}}
     , .{});
     var manifest: Manifest = .{};
@@ -212,6 +215,15 @@ test "flat dependencies preserve generated stages before typed finals and upstre
     try std.testing.expectEqual(@as(usize, 2), manifest.len);
     try std.testing.expectEqualStrings("fast", manifest.nodes[0].path[0]);
     const original = manifest.digest(false);
+    // Neither an empty nor populated root projection can shadow a full trace.
+    try input.object.put(a, "upstream_revisions", .{ .array = .init(a) });
+    var conflicting: Manifest = .{};
+    try std.testing.expectError(error.InvalidDecisionOutput, conflicting.collect(input));
+    try input.object.put(a, "upstream_revisions", try manifest.value(a));
+    try std.testing.expectError(error.InvalidDecisionOutput, conflicting.collect(input));
+    _ = input.object.swapRemove("upstream_revisions");
+    try conflicting.collect(input);
+    try std.testing.expectEqualSlices(u8, &original, &conflicting.digest(false));
     var flat = try manifest.value(a);
     var projected = V{ .object = .empty };
     try projected.object.put(a, "upstream_revisions", flat);

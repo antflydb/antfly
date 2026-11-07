@@ -10682,6 +10682,8 @@ pub const DecisionCascadeAgreementStatus = enum {
 };
 
 pub const DecisionCascadeStageTrace = struct {
+    /// Sorted question names compared by this stage. Present only when a local comparison ran. Allows upstream consumers to verify scoped agreement directly from the stage answers without reconstructing its policy. Historical traces may omit this field; ambiguous historical agreement abstains.
+    agreement_questions: ?[]const []const u8 = null,
     /// Complete bounded upstream execution dependencies. An empty array explicitly records no versioned dependencies. Omission on historical projected proxy stages indicates incomplete provenance.
     upstream_revisions: ?[]const DecisionRevisionDependency = null,
     upstream_agreement: ?DecisionCascadeUpstreamAgreement = null,
@@ -10707,6 +10709,7 @@ pub const DecisionCascadeStageTrace = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "agreement_questions", "agreement_questions", true },
         .{ "upstream_revisions", "upstream_revisions", true },
         .{ "upstream_agreement", "upstream_agreement", true },
         .{ "agreement_status", "agreement_status", true },
@@ -10733,6 +10736,10 @@ pub const DecisionCascadeStageTrace = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.agreement_questions) |value| {
+            try jw.objectField("agreement_questions");
+            try jw.write(value);
+        }
         if (self.upstream_revisions) |value| {
             try jw.objectField("upstream_revisions");
             try jw.write(value);

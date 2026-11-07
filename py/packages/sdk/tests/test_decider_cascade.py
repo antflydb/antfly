@@ -94,3 +94,13 @@ def test_upstream_revisions_preserve_empty_presence_and_flat_dependencies():
         if dependencies is not None:
             wire["upstream_revisions"] = dependencies
         assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire
+
+
+def test_comparison_scope_round_trip_preserves_sorted_question_names():
+    from antfly.client_generated.models import DecisionCascadeStageTrace
+
+    for questions in (None, ["same"], ["a", "z"]):
+        wire = {"name": "strong", "decision_method": "typed", "escalated": False}
+        if questions is not None:
+            wire.update(agreement_questions=questions, agreement_status="agreed", agreed=True)
+        assert DecisionCascadeStageTrace.from_dict(wire).to_dict() == wire

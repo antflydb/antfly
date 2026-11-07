@@ -404,6 +404,56 @@ pub fn compareAgreement(previous: V, current: V, scope: ?[]const u8) !Agreement 
     if (!selected) return error.InvalidDecisionOutput;
     return result;
 }
+/// Explicit compared names make scoped upstream checks verifiable without a plan.
+fn comparedQuestions(a: A, answers: V, scope: ?[]const u8) !V {
+    var storage: [64]NamedAnswer = undefined;
+    const ordered = try orderedAnswers(answers, &storage);
+    var names = std.json.Array.init(a);
+    for (ordered) |entry| {
+        if (scope) |name| if (!std.mem.eql(u8, name, entry.name)) continue;
+        try names.append(.{ .string = entry.name });
+    }
+    if (names.items.len == 0) return error.InvalidDecisionOutput;
+    return .{ .array = names };
+}
+
+fn compareReportedQuestions(previous: V, current: V, names: V) !Agreement {
+    if (names != .array or names.array.items.len == 0 or names.array.items.len > 64) return error.InvalidDecisionOutput;
+    var left: [64]NamedAnswer = undefined;
+    var right: [64]NamedAnswer = undefined;
+    const lhs = try orderedAnswers(previous, &left);
+    const rhs = try orderedAnswers(current, &right);
+    if (lhs.len != rhs.len) return error.InvalidDecisionOutput;
+    for (lhs, rhs) |l, r| if (!std.mem.eql(u8, l.name, r.name)) return error.InvalidDecisionOutput;
+    var result = Agreement{};
+    var cursor: usize = 0;
+    for (names.array.items, 0..) |name, index| {
+        if (name != .string or name.string.len == 0) return error.InvalidDecisionOutput;
+        if (index > 0 and !std.mem.lessThan(u8, names.array.items[index - 1].string, name.string)) return error.InvalidDecisionOutput;
+        while (cursor < lhs.len and std.mem.lessThan(u8, lhs[cursor].name, name.string)) cursor += 1;
+        if (cursor == lhs.len or !std.mem.eql(u8, lhs[cursor].name, name.string)) return error.InvalidDecisionOutput;
+        if (!try sameVote(lhs[cursor].value, rhs[cursor].value)) {
+            result.status = .disagreed;
+            result.questions[result.count] = name.string;
+            result.count += 1;
+        }
+    }
+    return result;
+}
+
+fn validateComparedScope(fields: std.json.ObjectMap, previous: V, scope: ?[]const u8) !void {
+    const names = fields.get("agreement_questions") orelse return; // Historical receipt.
+    if (names != .array) return error.InvalidDecisionOutput;
+    var storage: [64]NamedAnswer = undefined;
+    const ordered = try orderedAnswers(previous, &storage);
+    if (scope) |name| {
+        if (names.array.items.len != 1 or names.array.items[0] != .string or !std.mem.eql(u8, names.array.items[0].string, name)) return error.InvalidDecisionOutput;
+    } else {
+        if (names.array.items.len != ordered.len) return error.InvalidDecisionOutput;
+        for (names.array.items, ordered) |name, actual| if (name != .string or !std.mem.eql(u8, name.string, actual.name)) return error.InvalidDecisionOutput;
+    }
+}
+
 fn writeAgreement(a: A, fields: *std.json.ObjectMap, agreement: Agreement) !void {
     try put(a, fields, "agreement_status", .{ .string = @tagName(agreement.status) });
     if (agreement.status != .unverified) try put(a, fields, "agreed", .{ .bool = agreement.status == .agreed });
@@ -483,14 +533,16 @@ fn validateDisagreedQuestions(agreement: Agreement, answers: V) !void {
 pub fn responseAgreement(response: V) !?Agreement {
     if (response != .object) return error.InvalidDecisionOutput;
     const raw = response.object.get("cascade") orelse return null;
-    if (raw != .object) return error.InvalidDecisionOutput;
+    if (raw != .object or response.object.contains("upstream_revisions")) return error.InvalidDecisionOutput;
     const agreement = try readAgreement(raw.object);
     try validateReportedIdentity(raw.object);
     if (agreement) |reported| try validateDisagreedQuestions(reported, response.object.get("answers") orelse return error.InvalidDecisionOutput);
+    var ambiguous_legacy_check = false;
     if (raw.object.get("stages")) |stages| {
         if (stages != .array or stages.array.items.len == 0 or stages.array.items.len > max_stages) return error.InvalidDecisionOutput;
         var aggregate: ?Agreement = null;
         var final: ?std.json.ObjectMap = null;
+        var previous_answers: ?V = null;
         for (stages.array.items, 0..) |entry, index| {
             const fields = try object(entry);
             const name = fields.get("name") orelse return error.InvalidDecisionOutput;
@@ -502,12 +554,13 @@ pub fn responseAgreement(response: V) !?Agreement {
             for (name.string) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return error.InvalidDecisionOutput;
             for (stages.array.items[0..index]) |previous| if (jsonEqual(previous.object.get("name").?, name)) return error.InvalidDecisionOutput;
             const local = try readAgreement(fields);
+            if (index == 0 and local != null) return error.InvalidDecisionOutput;
+            if (fields.contains("agreement_questions") and (local == null or local.?.status == .unverified)) return error.InvalidDecisionOutput;
             if (fields.get("error")) |failure| {
                 if (failure != .string or failure.string.len == 0 or index == 0 or escalated.bool or fields.contains("answers") or fields.contains("upstream_agreement") or fields.contains("upstream_revisions")) return error.InvalidDecisionOutput;
                 if (local) |state| if (state.status != .unverified) return error.InvalidDecisionOutput;
                 aggregate = combineAgreement(aggregate, local);
             } else {
-                final = fields;
                 const model = fields.get("model") orelse return error.InvalidDecisionOutput;
                 if (model != .string or model.string.len == 0 or !std.unicode.utf8ValidateSlice(model.string)) return error.InvalidDecisionOutput;
                 if (fields.get("model_revision")) |revision| {
@@ -521,6 +574,29 @@ pub fn responseAgreement(response: V) !?Agreement {
                 if (local) |state| try validateDisagreedQuestions(state, answers);
                 const upstream = try readUpstreamAgreement(fields, answers);
                 if (blockedAgreement(upstream)) if (local) |state| if (state.status != .unverified) return error.InvalidDecisionOutput;
+                if (local) |state| {
+                    if (state.status == .unverified) {
+                        if (!blockedAgreement(upstream)) return error.InvalidDecisionOutput;
+                    } else if (fields.get("agreement_questions")) |names| {
+                        try validateAgreement(fields, try compareReportedQuestions(previous_answers orelse return error.InvalidDecisionOutput, answers, names));
+                    } else {
+                        // Old scoped traces omitted the scope. Verify every
+                        // disclosed disagreement; agreement needs positive proof.
+                        const actual = try compareAgreement(previous_answers orelse return error.InvalidDecisionOutput, answers, null);
+                        if (state.status == .disagreed) {
+                            for (state.questions[0..state.count]) |question| {
+                                for (actual.questions[0..actual.count]) |different| {
+                                    if (std.mem.eql(u8, question, different)) break;
+                                } else return error.InvalidDecisionOutput;
+                            }
+                        } else if (actual.status != .agreed) {
+                            if (actual.count == answers.array.items.len) return error.InvalidDecisionOutput;
+                            ambiguous_legacy_check = true;
+                        }
+                    }
+                }
+                previous_answers = answers;
+                final = fields;
                 var dependencies: @import("revisions.zig").Manifest = .{};
                 try dependencies.collect(entry);
                 aggregate = combineAgreement(combineAgreement(aggregate, upstream), local);
@@ -569,6 +645,7 @@ pub fn responseAgreement(response: V) !?Agreement {
             }
         }
     }
+    if (ambiguous_legacy_check and !blockedAgreement(agreement)) return .{ .status = .unverified };
     return agreement;
 }
 
@@ -722,7 +799,7 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
         if (name != .string or !std.mem.eql(u8, name.string, stage.name) or method != .string or !std.mem.eql(u8, method.string, @tagName(stage.method)) or escalated != .bool) return error.InvalidDecisionOutput;
         const has_next = index + 1 < executed.array.items.len;
         if (fields.get("error")) |err| {
-            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous or fields.contains("upstream_agreement") or fields.contains("upstream_revisions")) return error.InvalidDecisionOutput;
+            if (err != .string or err.string.len == 0 or fields.contains("answers") or index == 0 or has_next or escalated.bool or stage.on_failure != .keep_previous or fields.contains("upstream_agreement") or fields.contains("upstream_revisions") or fields.contains("agreement_questions")) return error.InvalidDecisionOutput;
             const expected: ?Agreement = if (stage.require_agreement) .{ .status = .unverified } else null;
             try validateAgreement(fields, expected);
             if (expected) |agreement| aggregate = agreement;
@@ -740,6 +817,10 @@ pub fn validateTrace(definition: *const Definition, response: V) !usize {
         else
             null;
         try validateAgreement(fields, expected);
+        if (fields.contains("agreement_questions")) {
+            if (expected == null or expected.?.status == .unverified) return error.InvalidDecisionOutput;
+            try validateComparedScope(fields, previous_answers.?, stage.when.?.question);
+        }
         aggregate = combineAgreement(combineAgreement(aggregate, upstream), expected);
         const blocked = blockedAgreement(aggregate);
         const should_escalate = !blocked and if (index + 1 < definition.stages.len) try inBand(definition.stages[index + 1].when.?, answers) else false;
@@ -964,6 +1045,7 @@ fn appendTrace(a: A, row: *Row, stage: Stage, response: ?V, usage: ?V, err: ?any
     }
     if (local) |agreement| {
         try writeAgreement(a, &entry.object, agreement);
+        if (agreement.status != .unverified) try put(a, &entry.object, "agreement_questions", try comparedQuestions(a, response.?.object.get("answers").?, stage.when.?.question));
         if (!blockedAgreement(upstream)) reference = .{ .stage_index = row.stages.items.len, .upstream = false };
     }
     try row.stages.append(entry);
@@ -990,7 +1072,7 @@ fn assemble(a: A, definition: *const Definition, name: []const u8, row: *Row, fi
     var root = std.json.ObjectMap{};
     // Retain the answering stage's metadata (model, identity, provenance).
     for (final.object.keys(), final.object.values()) |key, value| {
-        if (std.mem.eql(u8, key, "usage") or std.mem.eql(u8, key, "cascade")) continue;
+        if (std.mem.eql(u8, key, "usage") or std.mem.eql(u8, key, "cascade") or std.mem.eql(u8, key, "upstream_revisions")) continue;
         try put(a, &root, key, value);
     }
     var usage = std.json.ObjectMap{};
@@ -1696,4 +1778,111 @@ test "decision cascade reported traces enforce aggregate and final answer cohere
         \\{"answers":[{"name":"same"}],"cascade":{"agreement_status":"unverified"}}
     , .{});
     try std.testing.expect(try agreementBlocked(summary));
+}
+
+fn scopedReceiptFixture(a: A) !V {
+    var value = try std.json.parseFromSliceLeaky(V, a,
+        \\{"model":"strong","cascade":{"decider":"c","definition_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","answered_by":"strong","agreement_status":"agreed","agreed":true,"stages":[{"name":"fast","model":"fast","decision_method":"typed","escalated":true,"upstream_revisions":[],"answers":[{"name":"a","type":"choice","decision_method":"typed","choice":"yes","probabilities":[{"value":"yes","probability":0.97},{"value":"no","probability":0.03}]},{"name":"b","type":"choice","decision_method":"typed","choice":"yes"}]},{"name":"strong","model":"strong","decision_method":"typed","escalated":false,"upstream_revisions":[],"agreement_status":"agreed","agreed":true,"agreement_questions":["a"],"answers":[{"name":"a","type":"choice","decision_method":"typed","choice":"yes","probabilities":[{"value":"yes","probability":0.97},{"value":"no","probability":0.03}]},{"name":"b","type":"choice","decision_method":"typed","choice":"no"}]}]}}
+    , .{});
+    try value.object.put(a, "answers", value.object.get("cascade").?.object.get("stages").?.array.items[1].object.get("answers").?);
+    return value;
+}
+
+test "decision cascade verifies explicit scope and abstains on ambiguous historical agreement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const response = try scopedReceiptFixture(a);
+    try std.testing.expect(!try agreementBlocked(response));
+    const final = &response.object.getPtr("cascade").?.object.getPtr("stages").?.array.items[1];
+    const saved = final.object.get("agreement_questions").?;
+    _ = final.object.swapRemove("agreement_questions");
+    try std.testing.expectEqual(AgreementStatus.unverified, (try responseAgreement(response)).?.status);
+    try std.testing.expect(try agreementBlocked(response));
+    // A previous local definition can still establish the historical scope.
+    const definition = try compileJson(a,
+        \\{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"model":"strong"},"require_agreement":true,"when":{"question":"a","choice":"yes","probability_between":[0,1]}}]}
+    );
+    try response.object.getPtr("cascade").?.object.put(a, "definition_sha256", .{ .string = &definition.sha256 });
+    _ = try validateTrace(&definition, response);
+    try final.object.put(a, "agreement_questions", saved);
+    _ = try validateTrace(&definition, response);
+    for ([_][]const u8{ "[]", "[\"b\"]", "[\"a\",\"a\"]", "[\"b\",\"a\"]", "[\"unknown\"]", "null" }) |raw| {
+        try final.object.put(a, "agreement_questions", try std.json.parseFromSliceLeaky(V, a, raw, .{}));
+        try std.testing.expectError(error.InvalidDecisionOutput, responseAgreement(response));
+        try std.testing.expectError(error.InvalidDecisionOutput, validateTrace(&definition, response));
+    }
+    try final.object.put(a, "agreement_questions", saved);
+    // Reordering questions does not alter the scope or comparison.
+    const answers = final.object.get("answers").?.array.items;
+    std.mem.swap(V, &answers[0], &answers[1]);
+    try std.testing.expect(!try agreementBlocked(response));
+    // Scope omission is safe when every possible scoped comparison agrees.
+    try answers[0].object.put(a, "choice", .{ .string = "yes" });
+    _ = final.object.swapRemove("agreement_questions");
+    try std.testing.expect(!try agreementBlocked(response));
+}
+
+test "decision cascade rejects fabricated disagreement and predicate tie agreement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var response = try scopedReceiptFixture(a);
+    const metadata = response.object.getPtr("cascade").?;
+    const stages = metadata.object.getPtr("stages").?.array.items;
+    const final = &stages[1];
+    for ([_]*V{ metadata, final }) |fields| {
+        try fields.object.put(a, "agreement_status", .{ .string = "disagreed" });
+        try fields.object.put(a, "agreed", .{ .bool = false });
+        try fields.object.put(a, "disagreed_questions", try std.json.parseFromSliceLeaky(V, a, "[\"a\"]", .{}));
+    }
+    try std.testing.expectError(error.InvalidDecisionOutput, responseAgreement(response));
+    _ = final.object.swapRemove("agreement_questions");
+    try std.testing.expectError(error.InvalidDecisionOutput, responseAgreement(response));
+    // Equal predicates at exactly 0.5 are not agreeing votes.
+    for (stages) |stage| {
+        const answer = &stage.object.getPtr("answers").?.array.items[0];
+        try answer.object.put(a, "type", .{ .string = "predicate" });
+        try answer.object.put(a, "probability", .{ .float = 0.5 });
+        _ = answer.object.swapRemove("choice");
+        _ = answer.object.swapRemove("probabilities");
+    }
+    try std.testing.expect(try agreementBlocked(response));
+    for ([_]*V{ metadata, final }) |fields| {
+        try fields.object.put(a, "agreement_status", .{ .string = "agreed" });
+        try fields.object.put(a, "agreed", .{ .bool = true });
+        _ = fields.object.swapRemove("disagreed_questions");
+    }
+    try final.object.put(a, "agreement_questions", try std.json.parseFromSliceLeaky(V, a, "[\"a\"]", .{}));
+    try std.testing.expectError(error.InvalidDecisionOutput, responseAgreement(response));
+}
+
+test "decision cascade retains stage projections without leaking one onto the public root" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = try scopedReceiptFixture(a);
+    const Fixture = struct {
+        stages: []V,
+        fn run(ptr: *anyopaque, alloc: A, index: usize, _: Stage, ids: []const usize) !StageResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const values = try alloc.alloc(?V, ids.len);
+            @memset(values, self.stages[index]);
+            const failures = try alloc.alloc(?anyerror, ids.len);
+            @memset(failures, null);
+            return .{ .values = values, .failures = failures };
+        }
+    };
+    var fixture = Fixture{ .stages = source.object.get("cascade").?.object.get("stages").?.array.items };
+    const definition = try compileJson(a,
+        \\{"stages":[{"name":"fast","decider":{"model":"fast"}},{"name":"strong","decider":{"model":"strong"},"require_agreement":true,"when":{"question":"a","choice":"yes","probability_between":[0,1]}}]}
+    );
+    const outcome = try execute(a, &definition, "c", 1, .{ .ptr = &fixture, .run = Fixture.run });
+    const response = outcome.values[0].?;
+    try std.testing.expect(!response.object.contains("upstream_revisions"));
+    try std.testing.expect(!try agreementBlocked(response));
+    _ = try validateTrace(&definition, response);
+    const fields = response.object.get("cascade").?.object.get("stages").?.array.items[1].object;
+    try std.testing.expectEqual(@as(usize, 0), fields.get("upstream_revisions").?.array.items.len);
+    try std.testing.expectEqualStrings("a", fields.get("agreement_questions").?.array.items[0].string);
 }
