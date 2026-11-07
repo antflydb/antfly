@@ -2590,9 +2590,11 @@ pub const IndexManager = struct {
         output_ordinals: []OrdinalSlot = &.{},
         output_ids: []IdSlot = &.{},
         publication_lookup_built: bool = false,
+        unlinked_output_count: usize = 0,
         source_map: ?segment_mod.MergeSourceMap = null,
         prepared_delta_counts: []usize = &.{},
         prepared_output_deletes: []?roaring.RoaringBitmap = &.{},
+        mapped_input_deletes: []roaring.RoaringBitmap = &.{},
         pending_delta_counts: []usize = &.{},
         pending_deletes: []roaring.RoaringBitmap = &.{},
         prepared_deletion_documents: u64 = 0,
@@ -2754,6 +2756,8 @@ pub const IndexManager = struct {
             result_alloc.free(self.pending_deletes);
             for (self.prepared_output_deletes) |*deleted| if (deleted.*) |*bitmap| bitmap.deinit();
             result_alloc.free(self.prepared_output_deletes);
+            for (self.mapped_input_deletes) |*bitmap| bitmap.deinit();
+            result_alloc.free(self.mapped_input_deletes);
             if (self.source_map) |*map| map.deinit();
             if (self.output_ordinals.len > 0) result_alloc.free(self.output_ordinals);
             if (self.output_ids.len > 0) result_alloc.free(self.output_ids);
@@ -26681,13 +26685,34 @@ pub const IndexManager = struct {
         );
     }
 
+    /// Counts are monotone within an immutable source identity. A fresh
+    /// admitted runtime reconstructs cumulative deltas before this check; new
+    /// appends do not invalidate already resolved source coordinates.
+    pub fn textMergePublicationLookupCurrent(task: *const TextMergeTask, result: *const TextMergeResult) bool {
+        const map = result.source_map orelse return result.publication_lookup_built;
+        if (map.file == null) return result.publication_lookup_built;
+        const output_count = if (result.prepared_segments.len > 0) result.prepared_segments.len else if (result.segments.len > 0) result.segments.len else result.unlinked_output_count;
+        if (result.prepared_output_deletes.len != output_count) return false;
+        if (result.prepared_delta_counts.len == 0) {
+            for (task.deletion_state.deltas) |delta| if (delta.count != 0) return false;
+            return true;
+        }
+        if (result.prepared_delta_counts.len != task.deletion_state.deltas.len) return false;
+        for (task.deletion_state.deltas, result.prepared_delta_counts) |delta, delta_count| if (delta.count != delta_count) return false;
+        return true;
+    }
+
     fn prepareFileMergePublicationLookup(task: *const TextMergeTask, result: *TextMergeResult, map: *segment_mod.MergeSourceMap) !void {
         const alloc = task.mergeAllocator();
-        const output_count = if (result.prepared_segments.len > 0) result.prepared_segments.len else result.segments.len;
+        const output_count = if (result.prepared_segments.len > 0) result.prepared_segments.len else if (result.segments.len > 0) result.segments.len else result.unlinked_output_count;
         if (result.prepared_output_deletes.len == 0) {
             result.prepared_output_deletes = try alloc.alloc(?roaring.RoaringBitmap, output_count);
             @memset(result.prepared_output_deletes, null);
         } else if (result.prepared_output_deletes.len != output_count) return error.InvalidDeletionSnapshot;
+        if (result.mapped_input_deletes.len == 0) {
+            result.mapped_input_deletes = try alloc.alloc(roaring.RoaringBitmap, task.source.len);
+            for (result.mapped_input_deletes) |*bitmap| bitmap.* = roaring.RoaringBitmap.init(alloc);
+        } else if (result.mapped_input_deletes.len != task.source.len) return error.InvalidDeletionSnapshot;
         // Seal the current delta batch with an O(inputs) ownership swap. New
         // commits append to fresh bitmaps while the worker resolves this batch.
         // Keep the sealed batch until success so a read/allocation failure can
@@ -26710,16 +26735,16 @@ pub const IndexManager = struct {
         for (result.pending_deletes, 0..) |delta, input| {
             var iterator = delta.iterator();
             while (iterator.next()) |doc| {
+                if (result.mapped_input_deletes[input].contains(doc)) continue;
                 const location = (try map.lookupRead(input, doc)) orelse return error.MissingMergeDocumentIdentity;
                 if (location.segment >= output_count) return error.InvalidSegment;
                 if (result.prepared_output_deletes[location.segment] == null) result.prepared_output_deletes[location.segment] = roaring.RoaringBitmap.init(alloc);
                 try result.prepared_output_deletes[location.segment].?.add(location.doc);
+                try result.mapped_input_deletes[input].add(doc);
+                result.prepared_deletion_documents += 1;
             }
         }
-        for (result.pending_deletes) |*delta| {
-            result.prepared_deletion_documents += delta.cardinality();
-            delta.deinit();
-        }
+        for (result.pending_deletes) |*delta| delta.deinit();
         alloc.free(result.pending_deletes);
         result.pending_deletes = &.{};
         alloc.free(result.prepared_delta_counts);
@@ -48250,13 +48275,23 @@ test "text merge file provenance resolves deletion races off lock and retries re
     try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
     try std.testing.expectEqual(@as(usize, 1), result.prepared_output_deletes[0].?.cardinality());
 
+    try std.testing.expect(IndexManager.textMergePublicationLookupCurrent(&task, &result));
+    // Reopening a publication runtime reconstructs cumulative source deletes.
+    // Previously resolved coordinates must not be read/count-charged again.
+    {
+        task.deletion_state.preparation_mutex.lockUncancelable(task.deletion_state.preparation_io);
+        defer task.deletion_state.preparation_mutex.unlock(task.deletion_state.preparation_io);
+        try task.deletion_state.deltas[0].bitmap.add(0); // "a", already resolved.
+    }
     // A new delete after preparation requires another off-lock pass rather
     // than an unexpected filesystem read in atomic publication.
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{"b"}, options);
+    try std.testing.expect(!IndexManager.textMergePublicationLookupCurrent(&task, &result));
     try std.testing.expectError(error.TextMergePublicationLookupRequired, manager.finishTextMergeTask(&task, &result));
     try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
     try std.testing.expectEqual(@as(usize, 2), result.prepared_output_deletes[0].?.cardinality());
     try std.testing.expectEqual(@as(u64, 2), result.prepared_deletion_documents);
+    try std.testing.expect(IndexManager.textMergePublicationLookupCurrent(&task, &result));
     const read_calls = mapping.read_calls;
     const lease = manager.tryTextMergePublicationLease(&task).?;
     try std.testing.expect(try manager.finishTextMergeTaskWithPublicationLease(&task, &result));

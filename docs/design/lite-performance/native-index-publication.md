@@ -599,3 +599,22 @@ work retain their authoritative paths. Normalization/RETURNING currently has a
 separate preparation phase; sharing its row authority is further work. The
 [Debug receipt](owned-relational-rows-debug.json) records ownership/fault tests
 and SDK validation, without claiming final performance qualification.
+
+## Prepared merge activation under active writes
+
+Merge capture uses the current admitted checkpoint, while immutable segment
+construction and private output staging run outside writer admission. Final
+publication reopens the current index inventory under a fresh admitted checkpoint
+and validates source identities before activation. Newly appended segments are
+retained. File-backed deletion coordinates are resolved outside admission; the
+final transaction verifies cumulative deletion witnesses and requests another
+lookup pass if necessary. Resolved source coordinates remain cached across
+re-adoption, with bounded task accounting and retry-safe bitmap ownership.
+
+Prepared linked segments retain their runtime until they are destroyed, and
+cleanup that owns native aliases runs before releasing writer admission. Ready
+publication runs before optional cleanup, preventing unrelated maintenance from
+starving completed work. The [Debug receipt](prepared-merge-publication-debug.json)
+records five applied merges with no discards during the current-only hot-write
+diagnostic, plus lifecycle and file-backed lookup validation. This is not final
+performance qualification.
