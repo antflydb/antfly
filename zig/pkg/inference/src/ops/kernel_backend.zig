@@ -89,6 +89,11 @@ pub const VTable = struct {
     /// True means this exact operation materializes a dense result on this
     /// implementation. It does not establish input readiness or alias legality.
     materializesOutput: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) bool = null,
+    /// Explicit descriptor-only counterpart of materializesOutput. This owns
+    /// no provider/context/environment policy. An immutable graph/layout owner
+    /// may bind its exact canonical implementation identity once; ordinary or
+    /// mutable graphs still use the full current output-layout validation.
+    materializesOutputDescriptorOnly: ?*const fn (descriptor: *const kernel_descriptor.Descriptor) bool = null,
     assignedKernelAuxiliaries: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) anyerror!kernel_descriptor.AuxiliaryRequirements = null,
     assignedKernelWorkspace: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) anyerror!kernel_descriptor.WorkspaceRequirement = null,
     prepareKernelRoute: ?*const fn (*anyopaque, @import("../execution/kernel_route.zig").Prepare) anyerror!?@import("../execution/kernel_route.zig").Owned = null,

@@ -134,6 +134,21 @@ pub fn PinnedSlot(comptime Value: type, comptime Key: type, comptime keyOf: fn (
             self.stats.misses +%= 1;
             return null;
         }
+        /// Retain a digest candidate only. Full semantic/provider checks run
+        /// outside the slot mutex; their caller records one qualified outcome.
+        pub fn acquireUncounted(self: *@This(), key: Key) ?Value {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.value) |value| if (equal(keyOf(value), key)) return retain(value);
+            return null;
+        }
+        /// Cumulative lookup outcomes, including concurrent constructors. This
+        /// records no ownership and calls no validation or provider callback.
+        pub fn recordLookup(self: *@This(), qualified: bool) void {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (qualified) self.stats.hits +%= 1 else self.stats.misses +%= 1;
+        }
         pub fn publish(self: *@This(), value: Value) ?Value {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
@@ -163,4 +178,80 @@ pub fn PinnedSlot(comptime Value: type, comptime Key: type, comptime keyOf: fn (
             return old;
         }
     };
+}
+
+test "qualified pinned lookup validates outside slot mutex and counts semantic misses across concurrent replacement" {
+    if (comptime @import("builtin").single_threaded) return error.SkipZigTest;
+    const Entry = struct {
+        references: std.atomic.Value(usize) = .init(1),
+        deaths: *std.atomic.Value(usize),
+        semantic: u32,
+        fn key(_: *@This()) u32 {
+            return 0;
+        }
+        fn equal(a: u32, b: u32) bool {
+            return a == b;
+        }
+        fn retain(self: *@This()) *@This() {
+            _ = self.references.fetchAdd(1, .monotonic);
+            return self;
+        }
+        fn pinned(self: *@This()) bool {
+            return self.references.load(.acquire) > 1;
+        }
+        fn release(self: *@This()) void {
+            if (self.references.fetchSub(1, .acq_rel) == 1) _ = self.deaths.fetchAdd(1, .monotonic);
+        }
+    };
+    const Slot = PinnedSlot(*Entry, u32, Entry.key, Entry.equal, Entry.retain, Entry.pinned);
+    const Worker = struct {
+        fn replace(slot: *Slot, replacement: *Entry) void {
+            // Model/owner teardown can detach the cached root while a source
+            // qualifier still retains its digest candidate independently.
+            const old = slot.take().?;
+            old.release();
+            if (slot.publish(replacement) != null) @panic("unexpected replacement victim");
+        }
+    };
+    var deaths = std.atomic.Value(usize).init(0);
+    var first = Entry{ .deaths = &deaths, .semantic = 7 };
+    var replacement = Entry{ .deaths = &deaths, .semantic = 9 };
+    var slot = Slot{};
+    defer if (slot.take()) |entry| entry.release();
+    var replacement_open = true;
+    defer if (replacement_open) replacement.release();
+    try std.testing.expect(slot.publish(&first) == null);
+    first.release();
+    const candidate = slot.acquireUncounted(0).?;
+    var candidate_live = true;
+    defer if (candidate_live) candidate.release();
+    try std.testing.expect(slot.mutex.tryLock());
+    slot.mutex.unlock();
+    const thread = try std.Thread.spawn(.{}, Worker.replace, .{ &slot, &replacement });
+    thread.join();
+
+    try std.testing.expectEqual(@as(u32, 7), candidate.semantic);
+    try std.testing.expectEqual(@as(usize, 0), deaths.load(.acquire));
+    // Same digest is a semantic mismatch. The retained old candidate stays
+    // live while the actual cache now owns a different semantic definition.
+    slot.recordLookup(candidate.semantic == 9);
+    const current = slot.acquireUncounted(0).?;
+    var current_live = true;
+    defer if (current_live) current.release();
+    try std.testing.expect(slot.mutex.tryLock());
+    slot.mutex.unlock();
+    slot.recordLookup(current.semantic == 9);
+    const stats = slot.trySnapshot().?;
+    try std.testing.expectEqual(@as(u64, 1), stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.misses);
+    try std.testing.expectEqual(@as(u64, 2), stats.builds);
+    candidate.release();
+    candidate_live = false;
+    try std.testing.expectEqual(@as(usize, 1), deaths.load(.acquire));
+    current.release();
+    current_live = false;
+    slot.take().?.release();
+    replacement.release();
+    replacement_open = false;
+    try std.testing.expectEqual(@as(usize, 2), deaths.load(.acquire));
 }

@@ -5370,6 +5370,29 @@ fn prepareColdNativeFlorenceImpl(session: Session, allocator: std.mem.Allocator,
     return self;
 }
 
+// Complete current semantic facts and Domain identity qualify the candidate
+// outside the cache mutex. Only then may its actual Shared bytes enter the
+// request denial floor. Digest matches alone never authorize metadata reuse.
+fn acquireDenseDefinitionForSpec(slot: *@import("dense_decoder_schedule.zig").DefinitionSlot, key: [32]u8, header: *const @import("dense_decoder_schedule.zig").ProgramSpec, source: anytype, domain: *const @import("../runtime/tier/admission_domain.zig").Pin, current: @import("cleanup_context.zig").Context) !?*@import("dense_decoder_schedule.zig").Definition {
+    var qualified = false;
+    defer slot.recordLookup(qualified);
+    const candidate = slot.acquireUncounted(key) orelse return null;
+    defer if (!qualified) candidate.release(current);
+    const shared = candidate.shared orelse return null;
+    if (shared.domain.owner != domain.owner or shared.domain.controller() != domain.controller()) return null;
+    if (!try candidate.matchesSpecSource(header, source)) return null;
+    qualified = true;
+    return candidate;
+}
+
+fn createDenseProgramSpecStorage(preparation: *const @import("dense_decoder_schedule.zig").Preparation, fallback_allocator: std.mem.Allocator, header: *const @import("dense_decoder_schedule.zig").ProgramSpec, source: anytype) !@import("dense_decoder_schedule.zig").ProgramSpecStorage {
+    const allocator = if (preparation.shared) |shared| shared.allocator() else fallback_allocator;
+    return @import("dense_decoder_schedule.zig").ProgramSpecStorage.fromSource(allocator, header, source) catch |err| {
+        if (err == error.OutOfMemory) if (preparation.shared) |shared| return shared.admissionError() orelse err;
+        return err;
+    };
+}
+
 fn buildColdNativeFlorence(self: *ColdNativeFlorence, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: florence_arch.Config, encoder_rows: usize, capacity: usize, base: *const @import("../backends/session.zig").RunPermit, data: *native_mod.WeightStore, domain: *const @import("../runtime/tier/admission_domain.zig").Pin, current: @import("cleanup_context.zig").Context) !bool {
     const Dense = @import("dense_decoder_schedule.zig");
     const metadata = self.metadata;
@@ -5380,17 +5403,21 @@ fn buildColdNativeFlorence(self: *ColdNativeFlorence, allocator: std.mem.Allocat
     self.program = (try florence_arch.PreparedSingleToken.create(metadata.allocator(), cb, data, domain, config, encoder_rows, capacity)) orelse return false;
     const program = self.program.?;
     const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    var preparation = Dense.Preparation{ .key = try program.key() };
+    const source = try program.specSource();
+    const header = source.header();
+    var preparation = Dense.Preparation{ .key = try Dense.specKeySource(&header, &source) };
     defer preparation.deinit(current);
     if (Dense.sharedBackingSupported(arch.allocator)) {
-        preparation.cached = arch.dense_decoder_definitions.acquire(preparation.key);
-        if (preparation.cached) |value| if (value.shared.?.domain.owner != domain.owner or value.shared.?.domain.controller() != domain.controller()) {
-            value.release(current);
-            preparation.cached = null;
-        };
+        preparation.cached = try acquireDenseDefinitionForSpec(&arch.dense_decoder_definitions, preparation.key, &header, &source, domain, current);
         if (preparation.cached) |value| try metadata.setSharedMetadataFloor(value.shared.?.admittedAmounts()) else preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
     }
-    program.author(&preparation) catch |err| {
+    var owned_spec: ?Dense.ProgramSpecStorage = null;
+    defer if (owned_spec) |*storage| storage.deinit();
+    const spec = if (preparation.cached) |definition| try definition.programSpec() else create: {
+        owned_spec = try createDenseProgramSpecStorage(&preparation, metadata.allocator(), &header, &source);
+        break :create &owned_spec.?.value;
+    };
+    program.author(&preparation, spec, if (owned_spec) |*storage| storage else null) catch |err| {
         if (err == error.OutOfMemory) if (preparation.shared) |shared| return shared.admissionError() orelse err;
         return err;
     };
@@ -5508,32 +5535,28 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     try NativeCompute.stampHeldF32WeightSources(cb, data, self.weights.?.fetcher.handles.items);
     const schedule = @import("dense_decoder_schedule.zig");
     const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    var preparation = schedule.Preparation{ .key = @splat(0) };
+    const source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, 1, false)) orelse return false;
+    const header = source.header();
+    var preparation = schedule.Preparation{ .key = try schedule.specKeySource(&header, &source) };
     defer preparation.deinit(current);
     var initial_preparation = schedule.Preparation{ .key = @splat(0) };
     defer initial_preparation.deinit(current);
-    // Only independently admitted managed metadata can enter the Model cache.
-    // Raw/no-Domain callers retain their original request-owned preparation.
+    var initial_source: ?@TypeOf(source) = null;
+    var initial_header: ?schedule.ProgramSpec = null;
+    if (initial_rows) |query_rows| {
+        initial_source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, query_rows, true)) orelse return false;
+        initial_header = initial_source.?.header();
+        initial_preparation.key = try schedule.specKeySource(&initial_header.?, &initial_source.?);
+    }
+    // Full expected semantics, roles, names and Domain are compared without
+    // allocation before either cached phase enters the mandatory denial floor.
+    // Raw/no-Domain callers retain request-owned preparation.
     if (domain != null and schedule.sharedBackingSupported(arch.allocator)) {
-        preparation.key = try whisper_arch.PreparedSingleToken.definitionKey(cb, data, config, geometry.encoder_rows, &self.weights.?);
-        preparation.cached = arch.dense_decoder_definitions.acquire(preparation.key);
-        if (preparation.cached) |value| if (value.shared.?.domain.owner != domain.?.owner or value.shared.?.domain.controller() != domain.?.controller()) {
-            value.release(current);
-            preparation.cached = null;
-        };
-        if (preparation.cached) |definition| {
-            try metadata.addSharedDefinitionFloor(definition.shared.?);
-        }
-        // All known cached phase metadata is a denial floor BEFORE any KV
-        // acquisition, preventing intrinsic request excess looking temporary.
-        if (initial_rows) |query_rows| {
-            initial_preparation.key = whisper_arch.PreparedSingleToken.initialDefinitionKey(preparation.key, query_rows);
-            initial_preparation.cached = arch.dense_decoder_initial_definitions.acquire(initial_preparation.key);
-            if (initial_preparation.cached) |value| if (value.shared.?.domain.owner != domain.?.owner or value.shared.?.domain.controller() != domain.?.controller()) {
-                value.release(current);
-                initial_preparation.cached = null;
-            };
-            if (initial_preparation.cached) |value| try metadata.addSharedDefinitionFloor(value.shared.?);
+        preparation.cached = try acquireDenseDefinitionForSpec(&arch.dense_decoder_definitions, preparation.key, &header, &source, domain.?, current);
+        if (preparation.cached) |definition| try metadata.addSharedDefinitionFloor(definition.shared.?);
+        if (initial_source != null) {
+            initial_preparation.cached = try acquireDenseDefinitionForSpec(&arch.dense_decoder_initial_definitions, initial_preparation.key, &initial_header.?, &initial_source.?, domain.?, current);
+            if (initial_preparation.cached) |definition| try metadata.addSharedDefinitionFloor(definition.shared.?);
         }
         if (preparation.cached == null) preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
     }
@@ -5541,7 +5564,13 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     if (session.run_admission != null) {
         if (self.cache_permit) |*cache| try metadata.setHeldPermitsReplacingPending(&.{ base, cache }) else try metadata.setHeldPermitsReplacingPending(&.{base});
     }
-    self.program = (whisper_arch.PreparedSingleToken.init(cb, data, metadata.allocator(), config, self.encoder.?, geometry.encoder_rows, &self.weights.?, &preparation) catch |err| {
+    var owned_spec: ?schedule.ProgramSpecStorage = null;
+    defer if (owned_spec) |*storage| storage.deinit();
+    const spec = if (preparation.cached) |definition| try definition.programSpec() else create: {
+        owned_spec = try createDenseProgramSpecStorage(&preparation, metadata.allocator(), &header, &source);
+        break :create &owned_spec.?.value;
+    };
+    self.program = (whisper_arch.PreparedSingleToken.init(cb, data, metadata.allocator(), config, self.encoder.?, geometry.encoder_rows, &self.weights.?, &preparation, spec, if (owned_spec) |*storage| storage else null) catch |err| {
         if (err == error.OutOfMemory) if (preparation.shared) |shared| return shared.admissionError() orelse err;
         return err;
     }) orelse return false;
@@ -5551,7 +5580,16 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     };
     if (initial_rows) |query_rows| {
         if (domain != null and schedule.sharedBackingSupported(arch.allocator) and initial_preparation.cached == null) initial_preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
-        try self.program.?.initInitial(config, self.encoder.?, geometry.encoder_rows, &self.weights.?, &initial_preparation, query_rows);
+        var owned_initial_spec: ?schedule.ProgramSpecStorage = null;
+        defer if (owned_initial_spec) |*storage| storage.deinit();
+        const initial_spec = if (initial_preparation.cached) |cached_definition| try cached_definition.programSpec() else create: {
+            owned_initial_spec = try createDenseProgramSpecStorage(&initial_preparation, metadata.allocator(), &initial_header.?, &initial_source.?);
+            break :create &owned_initial_spec.?.value;
+        };
+        self.program.?.initInitial(config, self.encoder.?, geometry.encoder_rows, &self.weights.?, &initial_preparation, query_rows, initial_spec, if (owned_initial_spec) |*storage| storage else null) catch |err| {
+            if (err == error.OutOfMemory) if (initial_preparation.shared) |shared| return shared.admissionError() orelse err;
+            return err;
+        };
         const initial = self.program.?.initial.?;
         if (initial_preparation.cached == null) if (initial.schedule.definition.shared) |shared| try shared.sealBeforeExecution();
         try initial.schedule.setHostWorkspaceAllocator(allocator);
@@ -19490,6 +19528,104 @@ fn destroyColdWhisperFixture(cold: *ColdNativeWhisper) void {
     cold.destroy(.{ .boundary = cleanup.boundary() });
 }
 
+fn checkDenseDefinitionReuseGuards(slot: *@import("dense_decoder_schedule.zig").DefinitionSlot, definition: *@import("dense_decoder_schedule.zig").Definition) !void {
+    const Dense = @import("dense_decoder_schedule.zig");
+    const Source = struct {
+        parameters: []const Dense.ParameterSpec,
+        slot: *Dense.DefinitionSlot,
+        calls: *usize,
+        corrupt_name: bool = false,
+        fail: bool = false,
+        pub fn len(self: @This()) usize {
+            return self.parameters.len;
+        }
+        pub fn at(self: @This(), index: usize, _: *[256]u8) !Dense.ParameterSpec {
+            if (!self.slot.mutex.tryLock()) return error.SpecLookupHeldCacheMutex;
+            self.slot.mutex.unlock();
+            self.calls.* += 1;
+            if (self.fail) return error.TestSpecSourceFailure;
+            var parameter = self.parameters[index];
+            if (self.corrupt_name and parameter.source_kind == .held_weight) parameter.source_name = "different.checkpoint.role";
+            return parameter;
+        }
+    };
+    const spec = try definition.programSpec();
+    const shared = definition.shared orelse return error.MissingSharedProgramSpecification;
+    const budget = shared.domain.controller().snapshot();
+    const references = definition.references.load(.acquire);
+    const before = slot.trySnapshot() orelse return error.UnavailableCacheStatistics;
+    var calls: usize = 0;
+    const source = Source{ .parameters = spec.parameters, .slot = slot, .calls = &calls };
+    const current = @import("cleanup_context.zig").Context{ .outside_execution = true };
+    const hit = (try acquireDenseDefinitionForSpec(slot, definition.key, spec, source, &shared.domain, current)) orelse return error.MissingQualifiedDefinition;
+    const same_owner = hit == definition;
+    hit.release(current);
+    try std.testing.expect(same_owner);
+    // Force the same digest with different semantics and a same-shaped named
+    // role. Neither candidate may become a shared metadata denial floor.
+    var changed = spec.*;
+    changed.semantics.position_offset += 1;
+    try std.testing.expect((try acquireDenseDefinitionForSpec(slot, definition.key, &changed, source, &shared.domain, current)) == null);
+    var wrong_name = source;
+    wrong_name.corrupt_name = true;
+    try std.testing.expect((try acquireDenseDefinitionForSpec(slot, definition.key, spec, wrong_name, &shared.domain, current)) == null);
+    var failed_source = source;
+    failed_source.fail = true;
+    try std.testing.expectError(error.TestSpecSourceFailure, acquireDenseDefinitionForSpec(slot, definition.key, spec, failed_source, &shared.domain, current));
+    const alien = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer alien.release();
+    const alien_pin = alien.pin();
+    defer alien_pin.release();
+    const prior_calls = calls;
+    try std.testing.expect((try acquireDenseDefinitionForSpec(slot, definition.key, spec, source, &alien_pin, current)) == null);
+    try std.testing.expectEqual(prior_calls, calls);
+    var missing = definition.key;
+    missing[0] ^= 1;
+    try std.testing.expect((try acquireDenseDefinitionForSpec(slot, missing, spec, source, &shared.domain, current)) == null);
+    const after = slot.trySnapshot() orelse return error.UnavailableCacheStatistics;
+    try std.testing.expectEqual(before.hits + 1, after.hits);
+    try std.testing.expectEqual(before.misses + 5, after.misses);
+    try std.testing.expectEqual(references, definition.references.load(.acquire));
+    try std.testing.expectEqualDeep(budget, shared.domain.controller().snapshot());
+}
+
+fn checkWhisperProgramRoleAndPhaseGuards(cold: *ColdNativeWhisper, config: whisper_mod.Config, encoder_rows: usize) !void {
+    const Dense = @import("dense_decoder_schedule.zig");
+    const cb = &cold.cb.?.backend;
+    const data = cold.program.?.source_data;
+    const weights = &cold.weights.?;
+    const decode = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, encoder_rows, weights, 1, false)) orelse return error.MissingDecodeProgramSpecification;
+    const initial = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, encoder_rows, weights, 1, true)) orelse return error.MissingInitialProgramSpecification;
+    const decode_header = decode.header();
+    const initial_header = initial.header();
+    const decode_key = try Dense.specKeySource(&decode_header, &decode);
+    const initial_key = try Dense.specKeySource(&initial_header, &initial);
+    try std.testing.expect(!std.mem.eql(u8, &decode_key, &initial_key));
+    var scratch: [256]u8 = undefined;
+    var decode_self_slabs: usize = 0;
+    for (0..decode.len()) |index| {
+        const role = (try decode.at(index, &scratch)).role;
+        if (role.kind == .self_slab_k or role.kind == .self_slab_v) decode_self_slabs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, config.decoder_layers) * 2, decode_self_slabs);
+    for (0..initial.len()) |index| {
+        const role = (try initial.at(index, &scratch)).role;
+        try std.testing.expect(role.kind != .self_slab_k and role.kind != .self_slab_v);
+    }
+    if (weights.weights.layers.len != 0) {
+        const q = weights.weights.layers[0].q;
+        const k = weights.weights.layers[0].k;
+        // Swap the complete tuples, including optional bias and any recorded
+        // lookup metadata. Independent expected semantic names must reject it.
+        weights.weights.layers[0].q = k;
+        weights.weights.layers[0].k = q;
+        const rejected = Dense.specKeySource(&decode_header, &decode);
+        weights.weights.layers[0].q = q;
+        weights.weights.layers[0].k = k;
+        try std.testing.expectError(error.NativeWeightRoleChanged, rejected);
+    }
+}
+
 fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
@@ -19524,6 +19660,8 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     const one = first.program.?.schedule;
     const two = second.program.?.schedule;
     const definition = one.definition;
+    try checkWhisperProgramRoleAndPhaseGuards(first, config, geometry.encoder_rows);
+    try checkDenseDefinitionReuseGuards(&arch.dense_decoder_definitions, definition);
     try std.testing.expect(definition == two.definition and definition.shared != null);
     try std.testing.expect(one.graph.nodes.items.ptr == two.graph.nodes.items.ptr);
     try std.testing.expect(one.descriptors.ptr == two.descriptors.ptr and one.steps.ptr == two.steps.ptr);
@@ -19827,6 +19965,16 @@ fn nativeFlorenceScheduleCase(a: std.mem.Allocator) !void {
         source.finishInputLifetime();
         cold.destroyOutsideExecution(epoch);
     }
+    const q = cold.program.?.weights.layers[0].q;
+    const k = cold.program.?.weights.layers[0].k;
+    const semantic_source = try cold.program.?.specSource();
+    const semantic_header = semantic_source.header();
+    cold.program.?.weights.layers[0].q = k;
+    cold.program.?.weights.layers[0].k = q;
+    const rejected_role = @import("dense_decoder_schedule.zig").specKeySource(&semantic_header, &semantic_source);
+    cold.program.?.weights.layers[0].q = q;
+    cold.program.?.weights.layers[0].k = k;
+    try std.testing.expectError(error.NativeWeightRoleChanged, rejected_role);
     const ColdQuotaDrain = struct {
         node: @import("resource_retirement.zig").Node = undefined,
         gate: *std.atomic.Mutex,

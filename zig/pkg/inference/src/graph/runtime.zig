@@ -168,16 +168,7 @@ pub const PhysicalLayout = struct {
     }
 
     pub fn validateCurrent(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend) !void {
-        if (self.output_policy.len != 0) for (backends) |backend| {
-            const functions = backend.vtable.kernels orelse return error.PhysicalOutputLayoutChanged;
-            if (!functions.accepts(backend.vtable)) return error.PhysicalOutputLayoutChanged;
-        };
-        if (backends.len != (if (self.fallback) @as(usize, 2) else 1) or backendKindForPartition(backends[0].kind()) != self.target_kind or (self.fallback and backends[1].kind() != .native)) return error.InvalidPhysicalBackendCount;
-        if (graphPartitionReportRequested()) {
-            if (graphPartitionReportTargetOverride()) |target| if (target != self.target_kind) try dumpPartitionReportForTarget(allocator, graph, target);
-            dumpPartitionReport(graph, &self.partition, self.target_kind, self.fallback, &self.diagnostics);
-        }
-        try enforceGraphRuntimePartitionGates(graph, &self.partition, self.target_kind, .{ .require_no_fallback = graphRuntimeRequireNoFallbackRequested(), .require_no_host_assisted = graphRuntimeRequireNoHostAssistedRequested() });
+        try self.validateReceiving(allocator, graph, backends);
         if (self.output_policy.len != 0) {
             if (self.output_policy.len != graph.nodeCount()) return error.InvalidTensorDescriptorTable;
             const policy = PhysicalOutputLayout{ .graph = graph, .backends = backends };
@@ -188,10 +179,27 @@ pub const PhysicalLayout = struct {
         }
     }
 
+    // Current receiving identity/report/gates are mandatory for either path.
+    fn validateReceiving(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend) !void {
+        if (self.output_policy.len != 0) for (backends) |backend| {
+            const functions = backend.vtable.kernels orelse return error.PhysicalOutputLayoutChanged;
+            if (!functions.accepts(backend.vtable)) return error.PhysicalOutputLayoutChanged;
+        };
+        if (backends.len != (if (self.fallback) @as(usize, 2) else 1) or backendKindForPartition(backends[0].kind()) != self.target_kind or (self.fallback and backends[1].kind() != .native)) return error.InvalidPhysicalBackendCount;
+        if (graphPartitionReportRequested()) {
+            if (graphPartitionReportTargetOverride()) |target| if (target != self.target_kind) try dumpPartitionReportForTarget(allocator, graph, target);
+            dumpPartitionReport(graph, &self.partition, self.target_kind, self.fallback, &self.diagnostics);
+        }
+        try enforceGraphRuntimePartitionGates(graph, &self.partition, self.target_kind, .{ .require_no_fallback = graphRuntimeRequireNoFallbackRequested(), .require_no_host_assisted = graphRuntimeRequireNoHostAssistedRequested() });
+    }
+
     /// Reuse layout only; actual provider eligibility/workspace/aliases and
     /// literal/storage owners are resolved anew by the existing Pool factory.
     pub fn createPool(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("../execution/physical_buffers.zig").Pool {
         try self.validateCurrent(allocator, graph, backends);
+        return self.createValidatedPool(allocator, graph, backends, descriptors);
+    }
+    fn createValidatedPool(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("../execution/physical_buffers.zig").Pool {
         var plan = try self.buffers.clone(allocator);
         var transferred = false;
         errdefer if (!transferred) plan.deinit();
@@ -210,6 +218,76 @@ pub const PhysicalLayout = struct {
         self.allocator.free(self.output_policy);
         if (self.buffers_owned) self.buffers.deinit();
         if (self.partition_owned) self.partition.deinit();
+    }
+};
+
+/// Sole owner of an immutable semantic graph AND the physical layout validated
+/// against it. No mutable graph argument, provider context, Model or invocation
+/// is accepted on receiving. Creating this value consumes both original owners;
+/// the only public graph/layout accessors are const views. The owner must
+/// remain alive through every Pool created from it (as the retained immutable
+/// Definition does); this does not extend provider or Graph lifetime by itself.
+pub const FrozenPhysicalLayout = struct {
+    owned_graph: Graph,
+    owned_layout: PhysicalLayout,
+    descriptor_policy: ?DescriptorPolicy,
+
+    const DescriptorPolicy = struct {
+        table: *const ComputeBackend.VTable,
+        kernels: *const ops_mod.KernelBackend,
+        ordinary: *const fn (*anyopaque, *const ops_mod.kernel_descriptor.Descriptor) bool,
+        pure: *const fn (*const ops_mod.kernel_descriptor.Descriptor) bool,
+
+        fn capture(source_layout: *const PhysicalLayout, source_graph: *const Graph, backends: []const *const ComputeBackend) ?DescriptorPolicy {
+            if (source_layout.target_kind != .native or source_layout.fallback or backends.len != 1 or source_layout.output_policy.len != source_graph.nodeCount()) return null;
+            const backend = backends[0];
+            if (backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return null;
+            const functions = backend.vtable.kernels orelse return null;
+            if (!functions.accepts(backend.vtable)) return null;
+            return .{ .table = backend.vtable, .kernels = functions, .ordinary = functions.materializesOutput orelse return null, .pure = functions.materializesOutputDescriptorOnly orelse return null };
+        }
+        fn validate(self: DescriptorPolicy, backends: []const *const ComputeBackend) !void {
+            if (backends.len != 1 or backends[0].vtable != self.table) return error.PhysicalOutputLayoutChanged;
+            const functions = backends[0].vtable.kernels orelse return error.PhysicalOutputLayoutChanged;
+            if (functions != self.kernels or !functions.accepts(backends[0].vtable) or functions.materializesOutput != self.ordinary or functions.materializesOutputDescriptorOnly != self.pure) return error.PhysicalOutputLayoutChanged;
+        }
+    };
+
+    /// Failure leaves both caller owners intact. Success transfers their full
+    /// destruction obligations, empties Graph, and leaves Layout safely inert.
+    /// Full current output policy and the complete plan validate BEFORE transfer.
+    pub fn initConsuming(source_graph: *Graph, source_layout: *PhysicalLayout, backends: []const *const ComputeBackend) !FrozenPhysicalLayout {
+        if (!source_layout.partition_owned or !source_layout.buffers_owned) return error.InvalidImmutablePhysicalLayout;
+        for (source_layout.partition.partitions) |part| if (part.executor != null) return error.InvalidImmutablePhysicalLayout;
+        try source_layout.validateCurrent(source_layout.allocator, source_graph, backends);
+        try source_layout.buffers.validate(source_graph, &source_layout.partition);
+        const policy = DescriptorPolicy.capture(source_layout, source_graph, backends);
+        const result = FrozenPhysicalLayout{ .owned_graph = source_graph.*, .owned_layout = source_layout.*, .descriptor_policy = policy };
+        source_graph.* = Graph.init(source_graph.allocator);
+        source_layout.partition_owned = false;
+        source_layout.buffers_owned = false;
+        source_layout.output_policy = &.{};
+        return result;
+    }
+    pub fn graph(self: *const FrozenPhysicalLayout) *const Graph {
+        return &self.owned_graph;
+    }
+    pub fn layout(self: *const FrozenPhysicalLayout) *const PhysicalLayout {
+        return &self.owned_layout;
+    }
+    pub fn createPool(self: *const FrozenPhysicalLayout, allocator: std.mem.Allocator, backends: []const *const ComputeBackend, descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor) !?*@import("../execution/physical_buffers.zig").Pool {
+        if (self.descriptor_policy) |policy| {
+            try self.owned_layout.validateReceiving(allocator, &self.owned_graph, backends);
+            if (self.owned_layout.output_policy.len != self.owned_graph.nodeCount()) return error.InvalidTensorDescriptorTable;
+            try policy.validate(backends);
+            return self.owned_layout.createValidatedPool(allocator, &self.owned_graph, backends, descriptors);
+        }
+        return self.owned_layout.createPool(allocator, &self.owned_graph, backends, descriptors);
+    }
+    pub fn deinit(self: *FrozenPhysicalLayout) void {
+        self.owned_layout.deinit();
+        self.owned_graph.deinit();
+        self.* = undefined;
     }
 };
 
@@ -1689,4 +1767,130 @@ test "actual Native executable publishes owned admission coverage metadata after
         const value = retained.payload_admission_coverage.?.value;
         if (prepared) try std.testing.expect(value == .complete) else try std.testing.expectEqual(@import("../execution/owned_coverage.zig").Reason.no_selected_routes, value.compatibility);
     }
+}
+
+fn frozenNativeLayoutCase(a: std.mem.Allocator) !void {
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const input = try builder.parameter("frozen.x", Shape.init(.f32, &.{ 2, 4 }));
+    const partial = try builder.sliceLastDim(input, 1, 3);
+    const full = try builder.sliceLastDim(input, 0, 4);
+    try graph.markOutput(partial);
+    var layout = try PhysicalLayout.create(a, &graph, &.{&backend}, .{}, true);
+    defer layout.deinit();
+    // A valid semantic mutation must still invalidate ordinary mutable layouts.
+    const original = graph.nodes.items[partial];
+    graph.nodes.items[partial] = graph.nodes.items[full];
+    const changed = layout.validateCurrent(a, &graph, &.{&backend});
+    graph.nodes.items[partial] = original;
+    var mutation_rejected = false;
+    changed catch |err| {
+        if (err != error.PhysicalOutputLayoutChanged) return err;
+        mutation_rejected = true;
+    };
+    try std.testing.expect(mutation_rejected);
+    var copied = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(&copied != backend.vtable);
+    const foreign = ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    // Refusal is before transfer; the original owners remain complete and can
+    // be destroyed or passed again to the genuine canonical constructor.
+    try std.testing.expectError(error.PhysicalOutputLayoutChanged, FrozenPhysicalLayout.initConsuming(&graph, &layout, &.{&foreign}));
+    try std.testing.expect(graph.nodeCount() == 3 and layout.partition_owned and layout.buffers_owned);
+    var frozen = try FrozenPhysicalLayout.initConsuming(&graph, &layout, &.{&backend});
+    defer frozen.deinit();
+    try std.testing.expect(graph.nodeCount() == 0 and !layout.partition_owned and !layout.buffers_owned and layout.output_policy.len == 0);
+    try std.testing.expect(frozen.descriptor_policy != null);
+    try frozen.layout().validateCurrent(a, frozen.graph(), &.{&backend});
+    const ordinary = (try frozen.layout().createPool(a, frozen.graph(), &.{&backend}, null)) orelse return error.MissingPhysicalPool;
+    defer ordinary.deinit();
+    const first = (try frozen.createPool(a, &.{&backend}, null)) orelse return error.MissingPhysicalPool;
+    defer first.deinit();
+    const second = (try frozen.createPool(a, &.{&backend}, null)) orelse return error.MissingPhysicalPool;
+    defer second.deinit();
+    try std.testing.expect(first.owns_plan and second.owns_plan);
+    try std.testing.expect(first.plan.slots.ptr != second.plan.slots.ptr and first.plan.slots.ptr != frozen.layout().buffers.slots.ptr);
+    try std.testing.expectEqualSlices(buffer_plan_mod.LogicalSlot, ordinary.plan.slots, first.plan.slots);
+    try std.testing.expectEqualSlices(buffer_plan_mod.PhysicalAllocation, ordinary.plan.allocations, first.plan.allocations);
+    try std.testing.expectError(error.PhysicalOutputLayoutChanged, frozen.createPool(a, &.{&foreign}, null));
+    try std.testing.expectError(error.InvalidPhysicalBackendCount, frozen.createPool(a, &.{ &backend, &backend }, null));
+    // The mutable BF16 linear policy is unrelated to this explicit pure output
+    // policy. Both the original full check and the frozen proof remain equal;
+    // later route/source/resource preparation is still the actual Pool's job.
+    const native: *@import("../ops/native_compute.zig").NativeCompute = @ptrCast(@alignCast(backend.ptr));
+    const previous = native.cache_embeddinggemma2_bf16_weights;
+    const changed_pool = current: {
+        native.cache_embeddinggemma2_bf16_weights = !previous;
+        defer native.cache_embeddinggemma2_bf16_weights = previous;
+        try frozen.layout().validateCurrent(a, frozen.graph(), &.{&backend});
+        break :current (try frozen.createPool(a, &.{&backend}, null)) orelse return error.MissingPhysicalPool;
+    };
+    defer changed_pool.deinit();
+    try std.testing.expectEqualSlices(buffer_plan_mod.LogicalSlot, ordinary.plan.slots, changed_pool.plan.slots);
+}
+
+const DynamicOutputPolicyFixture = struct {
+    var enabled: bool = true;
+    fn accepts(table: *const anyopaque) bool {
+        return table == @as(*const anyopaque, @ptrCast(&compute_table));
+    }
+    fn materializes(_: *anyopaque, descriptor: *const ops_mod.kernel_descriptor.Descriptor) bool {
+        return enabled and descriptor.operation == .slice;
+    }
+    const kernels: ops_mod.KernelBackend = block: {
+        var value = @import("../ops/native_compute.zig").vtable_impl.kernels.?.*;
+        value.implementation_table = null;
+        value.acceptsImplementation = accepts;
+        value.materializesOutput = materializes;
+        // Even an inherited pure callback must not certify this FOREIGN table.
+        break :block value;
+    };
+    const compute_table: ComputeBackend.VTable = block: {
+        var value = @import("../ops/native_compute.zig").vtable_impl;
+        value.kernels = &kernels;
+        break :block value;
+    };
+};
+fn frozenDynamicLayoutCase(a: std.mem.Allocator) !void {
+    DynamicOutputPolicyFixture.enabled = true;
+    defer DynamicOutputPolicyFixture.enabled = true;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const actual = context.computeBackend();
+    const backend = ComputeBackend{ .ptr = actual.ptr, .vtable = &DynamicOutputPolicyFixture.compute_table };
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const input = try builder.parameter("dynamic.x", Shape.init(.f32, &.{ 2, 4 }));
+    const partial = try builder.sliceLastDim(input, 1, 3);
+    try graph.markOutput(partial);
+    var layout = try PhysicalLayout.create(a, &graph, &.{&backend}, .{}, true);
+    defer layout.deinit();
+    var frozen = try FrozenPhysicalLayout.initConsuming(&graph, &layout, &.{&backend});
+    defer frozen.deinit();
+    try std.testing.expect(frozen.descriptor_policy == null);
+    try frozen.layout().validateCurrent(a, frozen.graph(), &.{&backend});
+    DynamicOutputPolicyFixture.enabled = false;
+    const unexpected = frozen.createPool(a, &.{&backend}, null) catch |err| switch (err) {
+        error.PhysicalOutputLayoutChanged => return,
+        else => return err,
+    };
+    if (unexpected) |pool| pool.deinit();
+    return error.TestExpectedError;
+}
+
+test "immutable layout owns its graph preserves original Native policy and clones only private plans" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try frozenNativeLayoutCase(std.testing.allocator);
+    try frozenDynamicLayoutCase(std.testing.allocator);
+}
+
+test "immutable layout transfer and actual private Pool creation unwind every allocation failure" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, frozenNativeLayoutCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, frozenDynamicLayoutCase, .{});
 }

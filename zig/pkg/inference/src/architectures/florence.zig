@@ -4506,16 +4506,26 @@ pub const PreparedSingleToken = struct {
     const Native = @import("../ops/native_compute.zig").NativeCompute;
     const Cleanup = @import("../execution/cleanup_context.zig").Context;
     const DomainPin = @import("../runtime/tier/admission_domain.zig").Pin;
-    const Pair = struct { w: CT, b: CT };
+    const Namespace = enum(u1) { language_model, model };
+    const Pair = struct {
+        w: CT,
+        b: CT,
+        // These choices belong to the checkpoint lookup, independently of CT.
+        w_namespace: Namespace = .language_model,
+        b_namespace: Namespace = .language_model,
+    };
     const Layer = struct { q: Pair, k: Pair, v: Pair, o: Pair, cross_q: Pair, cross_k: Pair, cross_v: Pair, cross_o: Pair, self_norm: Pair, cross_norm: Pair, final_norm: Pair, fc1: Pair, fc2: Pair };
     const Weights = struct {
         a: std.mem.Allocator,
         handles: std.ArrayListUnmanaged(CT) = .empty,
         embed: CT = undefined,
+        embed_source: u8 = 0,
         positions: CT = undefined,
+        positions_source: u8 = 0,
         embed_norm: Pair = undefined,
         final_norm: ?Pair = null,
         head: CT = undefined,
+        head_source: u8 = 0,
         head_bias: ?CT = null,
         layers: []Layer = &.{},
         fn fetch(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, name: []const u8) !CT {
@@ -4539,26 +4549,34 @@ pub const PreparedSingleToken = struct {
                 else => return err,
             };
         }
-        fn any(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, names: []const []const u8) !CT {
-            for (names) |name| if (try self.optional(cb, data, pin, name)) |value| return value;
+        const Resolved = struct { value: CT, choice: u8 };
+        fn any(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, names: []const []const u8) !Resolved {
+            for (names, 0..) |name, index| if (try self.optional(cb, data, pin, name)) |value| return .{ .value = value, .choice = std.math.cast(u8, index) orelse return error.NameTooLong };
             return error.MissingWeight;
         }
-        fn decoder(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, layer: usize, suffix: []const u8) !CT {
+        fn decoder(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, layer: usize, suffix: []const u8) !Resolved {
             var name: [256]u8 = undefined;
-            if (try self.optional(cb, data, pin, try std.fmt.bufPrint(&name, "language_model.model.decoder.layers.{d}.{s}", .{ layer, suffix }))) |value| return value;
-            return self.fetch(cb, data, pin, try std.fmt.bufPrint(&name, "model.decoder.layers.{d}.{s}", .{ layer, suffix }));
+            if (try self.optional(cb, data, pin, try std.fmt.bufPrint(&name, "language_model.model.decoder.layers.{d}.{s}", .{ layer, suffix }))) |value| return .{ .value = value, .choice = 0 };
+            return .{ .value = try self.fetch(cb, data, pin, try std.fmt.bufPrint(&name, "model.decoder.layers.{d}.{s}", .{ layer, suffix })), .choice = 1 };
         }
         fn pair(self: *@This(), cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, layer: usize, role: []const u8) !Pair {
             var suffix: [128]u8 = undefined;
             const w = try self.decoder(cb, data, pin, layer, try std.fmt.bufPrint(&suffix, "{s}.weight", .{role}));
-            return .{ .w = w, .b = try self.decoder(cb, data, pin, layer, try std.fmt.bufPrint(&suffix, "{s}.bias", .{role})) };
+            const b = try self.decoder(cb, data, pin, layer, try std.fmt.bufPrint(&suffix, "{s}.bias", .{role}));
+            return .{ .w = w.value, .b = b.value, .w_namespace = @fromBackingInt(@intCast(w.choice)), .b_namespace = @fromBackingInt(@intCast(b.choice)) };
         }
         fn init(a: std.mem.Allocator, cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, cfg: Config) !Weights {
             var self = Weights{ .a = a };
             errdefer self.deinit(cb, .{ .outside_execution = true });
-            self.embed = try self.any(cb, data, pin, &.{ "language_model.model.shared.weight", "language_model.model.encoder.embed_tokens.weight", "language_model.model.decoder.embed_tokens.weight", "model.decoder.embed_tokens.weight" });
-            self.positions = try self.any(cb, data, pin, &.{ "language_model.model.decoder.embed_positions.weight", "model.decoder.embed_positions.weight" });
-            self.embed_norm = .{ .w = try self.any(cb, data, pin, &.{ "language_model.model.decoder.layernorm_embedding.weight", "model.decoder.layernorm_embedding.weight" }), .b = try self.any(cb, data, pin, &.{ "language_model.model.decoder.layernorm_embedding.bias", "model.decoder.layernorm_embedding.bias" }) };
+            const embedding = try self.any(cb, data, pin, &.{ "language_model.model.shared.weight", "language_model.model.encoder.embed_tokens.weight", "language_model.model.decoder.embed_tokens.weight", "model.decoder.embed_tokens.weight" });
+            self.embed = embedding.value;
+            self.embed_source = embedding.choice;
+            const positions = try self.any(cb, data, pin, &.{ "language_model.model.decoder.embed_positions.weight", "model.decoder.embed_positions.weight" });
+            self.positions = positions.value;
+            self.positions_source = positions.choice;
+            const embed_w = try self.any(cb, data, pin, &.{ "language_model.model.decoder.layernorm_embedding.weight", "model.decoder.layernorm_embedding.weight" });
+            const embed_b = try self.any(cb, data, pin, &.{ "language_model.model.decoder.layernorm_embedding.bias", "model.decoder.layernorm_embedding.bias" });
+            self.embed_norm = .{ .w = embed_w.value, .b = embed_b.value, .w_namespace = @fromBackingInt(@intCast(embed_w.choice)), .b_namespace = @fromBackingInt(@intCast(embed_b.choice)) };
             self.layers = try a.alloc(Layer, cfg.decoder_layers);
             for (self.layers, 0..) |*layer, index| layer.* = .{
                 .q = try self.pair(cb, data, pin, index, "self_attn.q_proj"),
@@ -4577,8 +4595,10 @@ pub const PreparedSingleToken = struct {
             };
             if (try self.optional(cb, data, pin, "language_model.model.decoder.layer_norm.weight")) |w| {
                 self.final_norm = .{ .w = w, .b = try self.fetch(cb, data, pin, "language_model.model.decoder.layer_norm.bias") };
-            } else if (try self.optional(cb, data, pin, "model.decoder.layer_norm.weight")) |w| self.final_norm = .{ .w = w, .b = try self.fetch(cb, data, pin, "model.decoder.layer_norm.bias") };
-            self.head = try self.any(cb, data, pin, &.{ "language_model.lm_head.weight", "lm_head.weight", "language_model.model.shared.weight", "model.decoder.embed_tokens.weight" });
+            } else if (try self.optional(cb, data, pin, "model.decoder.layer_norm.weight")) |w| self.final_norm = .{ .w = w, .b = try self.fetch(cb, data, pin, "model.decoder.layer_norm.bias"), .w_namespace = .model, .b_namespace = .model };
+            const head = try self.any(cb, data, pin, &.{ "language_model.lm_head.weight", "lm_head.weight", "language_model.model.shared.weight", "model.decoder.embed_tokens.weight" });
+            self.head = head.value;
+            self.head_source = head.choice;
             self.head_bias = try self.optional(cb, data, pin, "language_model.final_logits_bias");
             try Native.stampHeldF32WeightSources(cb, data, self.handles.items);
             for (self.handles.items) |value| _ = try Native.heldF32WeightPrimary(cb, data, value);
@@ -4590,18 +4610,210 @@ pub const PreparedSingleToken = struct {
             self.a.free(self.layers);
         }
     };
+    pub const SpecSource = struct {
+        program: *const PreparedSingleToken,
+        const Role = Dense.RoleKey;
+        const Kind = @FieldType(Role, "kind");
+        const Resolved = struct {
+            source_kind: @FieldType(Dense.ParameterSpec, "source_kind"),
+            shape: ?@import("ml").graph.Shape = null,
+            source_name: []const u8 = "",
+            value: ?CT = null,
+        };
+        const layer_kinds = [_]Kind{ .self_q, .self_k, .self_v, .self_o, .self_norm, .cross_q, .cross_o, .cross_norm, .fc1, .fc2, .ffn_norm };
+        pub fn header(self: @This()) Dense.ProgramSpec {
+            const p = self.program;
+            const c = p.config;
+            return .{ .family = .florence, .phase = .decode, .geometry = .{ .layers = c.decoder_layers, .width = c.d_model, .heads = c.decoder_attention_heads, .ffn_dim = c.decoder_ffn_dim, .vocab_size = c.vocab_size, .encoder_rows = p.encoder_rows, .capacity = p.capacity, .query_rows = 1 }, .semantics = .{ .epsilon = 1e-5, .activation = .gelu_exact, .norm_order = .post, .position_offset = @intCast(bart_position_offset), .global_final_norm = p.weights.final_norm != null }, .parameters = &.{} };
+        }
+        pub fn len(self: @This()) usize {
+            return 6 + self.program.weights.layers.len * 26 + (if (self.program.weights.final_norm != null) @as(usize, 2) else 0);
+        }
+        fn roleAt(self: @This(), index: usize) !Role {
+            const globals = [_]Role{ .{ .kind = .token_ids }, .{ .kind = .position_ids }, .{ .kind = .embedding, .part = .weight }, .{ .kind = .positions, .part = .weight }, .{ .kind = .embed_norm, .part = .weight }, .{ .kind = .embed_norm, .part = .bias } };
+            if (index < globals.len) return globals[index];
+            const slot = index - globals.len;
+            const layer = slot / 26;
+            const local = slot % 26;
+            if (layer < self.program.weights.layers.len) {
+                if (local < 22) return .{ .kind = layer_kinds[local / 2], .layer = @intCast(layer), .part = if (local % 2 == 0) .weight else .bias };
+                return .{ .kind = ([_]Kind{ .self_slab_k, .self_slab_v, .cross_slab_k, .cross_slab_v })[local - 22], .layer = @intCast(layer) };
+            }
+            if (self.program.weights.final_norm != null and layer == self.program.weights.layers.len and local < 2) return .{ .kind = .final_norm, .part = if (local == 0) .weight else .bias };
+            return error.DenseDefinitionChanged;
+        }
+        fn layerPair(layer: Layer, kind: Kind) !Pair {
+            return switch (kind) {
+                .self_q => layer.q,
+                .self_k => layer.k,
+                .self_v => layer.v,
+                .self_o => layer.o,
+                .self_norm => layer.self_norm,
+                .cross_q => layer.cross_q,
+                .cross_k => layer.cross_k,
+                .cross_v => layer.cross_v,
+                .cross_o => layer.cross_o,
+                .cross_norm => layer.cross_norm,
+                .fc1 => layer.fc1,
+                .fc2 => layer.fc2,
+                .ffn_norm => layer.final_norm,
+                else => error.DenseDefinitionChanged,
+            };
+        }
+        fn pairName(pair: Pair, role: Role, buffer: *[256]u8) ![]const u8 {
+            if (role.part == .value) return error.DenseDefinitionChanged;
+            const namespace = if (role.part == .weight) pair.w_namespace else pair.b_namespace;
+            const prefix = if (namespace == .language_model) "language_model.model.decoder" else "model.decoder";
+            const part = if (role.part == .weight) "weight" else "bias";
+            if (role.layer) |layer| {
+                const suffix = switch (role.kind) {
+                    .self_q => "self_attn.q_proj",
+                    .self_k => "self_attn.k_proj",
+                    .self_v => "self_attn.v_proj",
+                    .self_o => "self_attn.out_proj",
+                    .self_norm => "self_attn_layer_norm",
+                    .cross_q => "encoder_attn.q_proj",
+                    .cross_k => "encoder_attn.k_proj",
+                    .cross_v => "encoder_attn.v_proj",
+                    .cross_o => "encoder_attn.out_proj",
+                    .cross_norm => "encoder_attn_layer_norm",
+                    .fc1 => "fc1",
+                    .fc2 => "fc2",
+                    .ffn_norm => "final_layer_norm",
+                    else => return error.DenseDefinitionChanged,
+                };
+                return std.fmt.bufPrint(buffer, "{s}.layers.{d}.{s}.{s}", .{ prefix, layer, suffix, part });
+            }
+            const suffix = switch (role.kind) {
+                .embed_norm => "layernorm_embedding",
+                .final_norm => "layer_norm",
+                else => return error.DenseDefinitionChanged,
+            };
+            return std.fmt.bufPrint(buffer, "{s}.{s}.{s}", .{ prefix, suffix, part });
+        }
+        fn resolve(self: @This(), role: Role, buffer: *[256]u8) !Resolved {
+            const p = self.program;
+            const g = self.header().geometry;
+            if (role.kind == .token_ids or role.kind == .position_ids) {
+                if (role.layer != null or role.part != .value) return error.DenseDefinitionChanged;
+                return .{ .shape = Shape.init(.i64, &.{1}), .source_kind = .host };
+            }
+            if (role.kind == .self_slab_k or role.kind == .self_slab_v or role.kind == .cross_slab_k or role.kind == .cross_slab_v) {
+                const layer = role.layer orelse return error.DenseDefinitionChanged;
+                if (layer >= g.layers or role.part != .value) return error.DenseDefinitionChanged;
+                const rows = if (role.kind == .self_slab_k or role.kind == .self_slab_v) g.capacity else g.encoder_rows;
+                return .{ .shape = Shape.init(.f32, &.{ @intCast(rows), @intCast(g.width) }), .source_kind = .external };
+            }
+            var value: CT = undefined;
+            var name: []const u8 = undefined;
+            if (role.layer) |layer| {
+                if (layer >= p.weights.layers.len or role.part == .value) return error.DenseDefinitionChanged;
+                const pair = try layerPair(p.weights.layers[layer], role.kind);
+                value = if (role.part == .weight) pair.w else pair.b;
+                name = try pairName(pair, role, buffer);
+            } else switch (role.kind) {
+                .embedding => {
+                    if (role.part != .weight) return error.DenseDefinitionChanged;
+                    value = p.weights.embed;
+                    name = switch (p.weights.embed_source) {
+                        0 => "language_model.model.shared.weight",
+                        1 => "language_model.model.encoder.embed_tokens.weight",
+                        2 => "language_model.model.decoder.embed_tokens.weight",
+                        3 => "model.decoder.embed_tokens.weight",
+                        else => return error.NativeWeightRoleChanged,
+                    };
+                },
+                .positions => {
+                    if (role.part != .weight) return error.DenseDefinitionChanged;
+                    value = p.weights.positions;
+                    name = switch (p.weights.positions_source) {
+                        0 => "language_model.model.decoder.embed_positions.weight",
+                        1 => "model.decoder.embed_positions.weight",
+                        else => return error.NativeWeightRoleChanged,
+                    };
+                },
+                .embed_norm, .final_norm => {
+                    if (role.part == .value) return error.DenseDefinitionChanged;
+                    const pair = if (role.kind == .embed_norm) p.weights.embed_norm else p.weights.final_norm orelse return error.DenseDefinitionChanged;
+                    value = if (role.part == .weight) pair.w else pair.b;
+                    name = try pairName(pair, role, buffer);
+                },
+                else => return error.DenseDefinitionChanged,
+            }
+            return .{ .source_kind = .held_weight, .source_name = name, .value = value };
+        }
+        pub fn at(self: @This(), index: usize, buffer: *[256]u8) !Dense.ParameterSpec {
+            const role = try self.roleAt(index);
+            const resolved = try self.resolve(role, buffer);
+            const shape = if (resolved.source_kind == .held_weight)
+                (try Native.heldF32WeightPrimaryNamed(&self.program.backend, self.program.source_data, resolved.value.?, resolved.source_name)).descriptor.shape
+            else
+                resolved.shape.?;
+            if ((shape.numElements() orelse return error.UnsupportedDenseSchedule) <= 0) return error.UnsupportedDenseSchedule;
+            return .{ .role = role, .shape = shape, .source_kind = resolved.source_kind, .source_name = resolved.source_name };
+        }
+        fn bind(self: @This(), a: std.mem.Allocator, spec: *const Dense.ProgramSpec) ![]Dense.BoundParameter {
+            const expected_header = self.header();
+            if (spec.family != expected_header.family or spec.phase != expected_header.phase or !std.meta.eql(spec.geometry, expected_header.geometry) or !std.meta.eql(spec.semantics, expected_header.semantics) or spec.parameters.len != self.len()) return error.DenseDefinitionChanged;
+            const result = try a.alloc(Dense.BoundParameter, spec.parameters.len);
+            errdefer a.free(result);
+            for (spec.parameters, result, 0..) |declared, *bound, index| {
+                if (!std.meta.eql(declared.role, try self.roleAt(index))) return error.DenseDefinitionChanged;
+                var buffer: [256]u8 = undefined;
+                const resolved = try self.resolve(declared.role, &buffer);
+                if (declared.source_kind != resolved.source_kind or !std.mem.eql(u8, declared.source_name, resolved.source_name)) return error.DenseDefinitionChanged;
+                if (resolved.shape) |shape| if (!declared.shape.eq(shape)) return error.DenseDefinitionChanged;
+                bound.* = .{ .role = declared.role, .value = resolved.value, .source_data = if (declared.source_kind == .held_weight) self.program.source_data else null };
+                if (declared.source_kind == .external) {
+                    const root = self.program.roots[declared.role.layer.?];
+                    const value = switch (declared.role.kind) {
+                        .self_slab_k => root.self_k,
+                        .self_slab_v => root.self_v,
+                        .cross_slab_k => root.cross_k,
+                        .cross_slab_v => root.cross_v,
+                        else => return error.DenseDefinitionChanged,
+                    };
+                    bound.value = value;
+                }
+            }
+            return result;
+        }
+    };
+    pub fn specSource(self: *const @This()) !SpecSource {
+        try self.validateCache();
+        return .{ .program = self };
+    }
+    fn validateExtraNames(self: *const @This()) !void {
+        // These projections remain outside the authored Frame and earn no
+        // ProgramSpec coverage. Preserve current named sources before writes.
+        var buffer: [256]u8 = undefined;
+        for (self.weights.layers, 0..) |layer, index| for ([_]Dense.RoleKey{ .{ .kind = .cross_k, .layer = @intCast(index), .part = .weight }, .{ .kind = .cross_k, .layer = @intCast(index), .part = .bias }, .{ .kind = .cross_v, .layer = @intCast(index), .part = .weight }, .{ .kind = .cross_v, .layer = @intCast(index), .part = .bias } }) |role| {
+            const pair = try SpecSource.layerPair(layer, role.kind);
+            const value = if (role.part == .weight) pair.w else pair.b;
+            _ = try Native.heldF32WeightPrimaryNamed(&self.backend, self.source_data, value, try SpecSource.pairName(pair, role, &buffer));
+        };
+        const head_name = switch (self.weights.head_source) {
+            0 => "language_model.lm_head.weight",
+            1 => "lm_head.weight",
+            2 => "language_model.model.shared.weight",
+            3 => "model.decoder.embed_tokens.weight",
+            else => return error.NativeWeightRoleChanged,
+        };
+        _ = try Native.heldF32WeightPrimaryNamed(&self.backend, self.source_data, self.weights.head, head_name);
+        if (self.weights.head_bias) |bias| _ = try Native.heldF32WeightPrimaryNamed(&self.backend, self.source_data, bias, "language_model.final_logits_bias");
+    }
+
     const Author = struct {
         builder: *Dense.Builder,
-        cb: *const ComputeBackend,
-        data: *const anyopaque,
-        fn weight(self: @This(), value: CT) !Node {
-            return self.builder.residentWeight(value, try Native.heldF32WeightPrimary(self.cb, self.data, value));
+        spec: *const Dense.ProgramSpec,
+        fn weight(self: @This(), kind: @FieldType(Dense.RoleKey, "kind"), layer: ?u32, part: @FieldType(Dense.RoleKey, "part")) !Node {
+            return self.builder.parameterRole(.{ .kind = kind, .layer = layer, .part = part });
         }
-        fn linear(self: @This(), input: Node, weights: Pair, width: usize, output: usize) !Node {
-            return self.builder.linear(input, try self.weight(weights.w), try self.weight(weights.b), width, output);
+        fn linear(self: @This(), input: Node, kind: @FieldType(Dense.RoleKey, "kind"), layer: ?u32, width: usize, output: usize) !Node {
+            return self.builder.linear(input, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), width, output);
         }
-        fn norm(self: @This(), input: Node, weights: Pair, width: usize) !Node {
-            return self.builder.norm(input, try self.weight(weights.w), try self.weight(weights.b), width);
+        fn norm(self: @This(), input: Node, kind: @FieldType(Dense.RoleKey, "kind"), layer: ?u32) !Node {
+            return self.builder.norm(input, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), self.spec.geometry.width);
         }
     };
     allocator: std.mem.Allocator,
@@ -4623,21 +4835,6 @@ pub const PreparedSingleToken = struct {
     initialized: bool = false,
     completed_steps: usize = 0,
 
-    pub fn key(self: *const @This()) ![32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("florence.postnorm.erf.single.f32.v1");
-        const cfg = self.config;
-        const geometry = [_]u64{ cfg.d_model, cfg.decoder_layers, cfg.decoder_attention_heads, cfg.decoder_ffn_dim, cfg.vocab_size, cfg.max_position_embeddings, self.cache.?.enc_seq, self.cache.?.self.capacity };
-        hash.update(std.mem.sliceAsBytes(&geometry));
-        for (self.weights.handles.items) |value| {
-            const shape = (try Native.heldF32WeightPrimary(&self.backend, self.source_data, value)).descriptor.shape;
-            const rank = shape.rank();
-            hash.update(std.mem.asBytes(&rank));
-            hash.update(std.mem.sliceAsBytes(shape.dims[0..rank]));
-        }
-        hash.update(&.{@intFromBool(self.weights.final_norm != null)});
-        return hash.finalResult();
-    }
     /// All payloads are ordinary private cache roots funded by the ORIGINAL
     /// task's KV class. Only metadata uses a; Frame banks have separate funding.
     pub fn create(a: std.mem.Allocator, cb: *const ComputeBackend, data: *const anyopaque, pin: *const DomainPin, cfg: Config, rows: usize, capacity: usize) !?*PreparedSingleToken {
@@ -4691,45 +4888,61 @@ pub const PreparedSingleToken = struct {
         @memset(self_mask, 1);
         return .{ .cross = .{ .keys = keys, .values = values }, .self = self_cache, .encoder_mask = encoder_mask, .self_mask = self_mask, .batch = 1, .enc_seq = rows };
     }
-    pub fn author(self: *@This(), preparation: ?*Dense.Preparation) !void {
-        var builder = Dense.Builder.initPrepared(self.allocator, &self.backend, preparation);
+    pub fn author(self: *@This(), preparation: ?*Dense.Preparation, spec: *const Dense.ProgramSpec, storage: ?*Dense.ProgramSpecStorage) !void {
+        const source = try self.specSource();
+        try self.validateExtraNames();
+        const bound = try source.bind(self.allocator, spec);
+        defer self.allocator.free(bound);
+        if (preparation) |prepared| if (prepared.cached) |definition| {
+            const schedule = try Dense.Schedule.instantiate(self.allocator, &self.backend, definition, spec, bound);
+            errdefer schedule.deinit(.{ .outside_execution = true });
+            const token_node = try definition.parameterNode(.{ .kind = .token_ids });
+            const position_node = try definition.parameterNode(.{ .kind = .position_ids });
+            self.token_node = token_node;
+            self.position_node = position_node;
+            self.schedule = schedule;
+            self.cache.?.assigned = schedule;
+            return;
+        };
+        if (spec.family != .florence or spec.phase != .decode or spec.geometry.query_rows != 1 or spec.semantics.activation != .gelu_exact or spec.semantics.norm_order != .post or spec.semantics.epsilon != 1e-5 or spec.semantics.position_offset != bart_position_offset) return error.DenseDefinitionChanged;
+        var builder = if (storage) |owned| Dense.Builder.initSpecStorage(self.allocator, &self.backend, preparation, owned, bound) else Dense.Builder.initSpec(self.allocator, &self.backend, preparation, spec, bound);
         defer builder.deinit();
-        const writer = Author{ .builder = &builder, .cb = &self.backend, .data = self.source_data };
-        const cfg = self.config;
-        const cache = &self.cache.?;
-        self.token_node = try builder.hostParameter(Shape.init(.i64, &.{1}));
-        self.position_node = try builder.hostParameter(Shape.init(.i64, &.{1}));
-        const embedded = try builder.gather(try writer.weight(self.weights.embed), self.token_node, cfg.d_model);
-        const positions = try builder.gather(try writer.weight(self.weights.positions), self.position_node, cfg.d_model);
-        var hidden = try writer.norm(try builder.add(embedded, positions), self.weights.embed_norm, cfg.d_model);
-        for (self.weights.layers, 0..) |layer, index| {
-            const q = try writer.linear(hidden, layer.q, cfg.d_model, cfg.d_model);
-            const k = try writer.linear(hidden, layer.k, cfg.d_model, cfg.d_model);
-            const v = try writer.linear(hidden, layer.v, cfg.d_model, cfg.d_model);
+        const writer = Author{ .builder = &builder, .spec = spec };
+        const g = spec.geometry;
+        const token_node = try builder.parameterRole(.{ .kind = .token_ids });
+        const position_node = try builder.parameterRole(.{ .kind = .position_ids });
+        const embedded = try builder.gather(try writer.weight(.embedding, null, .weight), token_node, g.width);
+        const positions = try builder.gather(try writer.weight(.positions, null, .weight), position_node, g.width);
+        var hidden = try writer.norm(try builder.add(embedded, positions), .embed_norm, null);
+        for (0..g.layers) |index| {
+            const layer: u32 = @intCast(index);
+            const q = try writer.linear(hidden, .self_q, layer, g.width, g.width);
+            const k = try writer.linear(hidden, .self_k, layer, g.width, g.width);
+            const v = try writer.linear(hidden, .self_v, layer, g.width, g.width);
             try builder.output(k);
             try builder.output(v);
-            const full = Shape.init(.f32, &.{ @intCast(cache.self.capacity), @intCast(cfg.d_model) });
-            const self_k = try builder.parameter(full, cache.self.keys[index].?);
-            const self_v = try builder.parameter(full, cache.self.values[index].?);
-            const attended = try builder.prefix(q, self_k, self_v, cfg.decoder_attention_heads, cfg.decoderHeadDim(), cache.self.capacity);
-            const projected = try writer.linear(attended, layer.o, cfg.d_model, cfg.d_model);
-            const self_normed = try writer.norm(try builder.add(hidden, projected), layer.self_norm, cfg.d_model);
-            const cross_q = try writer.linear(self_normed, layer.cross_q, cfg.d_model, cfg.d_model);
-            const cross_shape = Shape.init(.f32, &.{ @intCast(cache.enc_seq), @intCast(cfg.d_model) });
-            const cross_k = try builder.parameter(cross_shape, cache.cross.keys[index]);
-            const cross_v = try builder.parameter(cross_shape, cache.cross.values[index]);
-            const cross_attention = try builder.prefix(cross_q, cross_k, cross_v, cfg.decoder_attention_heads, cfg.decoderHeadDim(), cache.enc_seq);
-            const cross_projected = try writer.linear(cross_attention, layer.cross_o, cfg.d_model, cfg.d_model);
-            const cross_normed = try writer.norm(try builder.add(self_normed, cross_projected), layer.cross_norm, cfg.d_model);
-            const fc1 = try writer.linear(cross_normed, layer.fc1, cfg.d_model, cfg.decoder_ffn_dim);
+            const self_k = try builder.parameterRole(.{ .kind = .self_slab_k, .layer = layer });
+            const self_v = try builder.parameterRole(.{ .kind = .self_slab_v, .layer = layer });
+            const attended = try builder.prefix(q, self_k, self_v, g.heads, g.width / g.heads, g.capacity);
+            const projected = try writer.linear(attended, .self_o, layer, g.width, g.width);
+            const self_normed = try writer.norm(try builder.add(hidden, projected), .self_norm, layer);
+            const cross_q = try writer.linear(self_normed, .cross_q, layer, g.width, g.width);
+            const cross_k = try builder.parameterRole(.{ .kind = .cross_slab_k, .layer = layer });
+            const cross_v = try builder.parameterRole(.{ .kind = .cross_slab_v, .layer = layer });
+            const cross_attention = try builder.prefix(cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.encoder_rows);
+            const cross_projected = try writer.linear(cross_attention, .cross_o, layer, g.width, g.width);
+            const cross_normed = try writer.norm(try builder.add(self_normed, cross_projected), .cross_norm, layer);
+            const fc1 = try writer.linear(cross_normed, .fc1, layer, g.width, g.ffn_dim);
             const activated = try builder.geluExact(fc1);
-            const fc2 = try writer.linear(activated, layer.fc2, cfg.decoder_ffn_dim, cfg.d_model);
-            hidden = try writer.norm(try builder.add(cross_normed, fc2), layer.final_norm, cfg.d_model);
+            const fc2 = try writer.linear(activated, .fc2, layer, g.ffn_dim, g.width);
+            hidden = try writer.norm(try builder.add(cross_normed, fc2), .ffn_norm, layer);
         }
-        if (self.weights.final_norm) |norm| hidden = try writer.norm(hidden, norm, cfg.d_model);
+        if (spec.semantics.global_final_norm) hidden = try writer.norm(hidden, .final_norm, null);
         try builder.output(hidden);
         self.schedule = try Dense.Schedule.create(&builder);
-        cache.assigned = self.schedule;
+        self.token_node = token_node;
+        self.position_node = position_node;
+        self.cache.?.assigned = self.schedule;
     }
     pub fn prepareInto(self: *@This(), capability: ?@import("../execution/storage_admission.zig").Capability, current: Cleanup) !void {
         try self.bindInputs(capability, current, true);
@@ -4755,6 +4968,7 @@ pub const PreparedSingleToken = struct {
         try self.validateCache();
         if (self.initialized or self.poisoned or rows != self.cache.?.enc_seq) return error.PreparedFlorenceSourceChanged;
         try Native.validateHeldF32WeightSources(&self.backend, self.source_data, self.weights.handles.items);
+        try self.validateExtraNames();
         const cache = &self.cache.?;
         for (self.weights.layers, 0..) |layer, index| {
             if (control) |active| try active.check();

@@ -4375,6 +4375,14 @@ pub const NativeCompute = struct {
     /// The caller retains its actual Model/store and witness through use, with
     /// the same strict source stamps required by authored decoder reception.
     pub fn heldF32WeightPrimary(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT) !@import("../execution/storage_ownership.zig").Plane {
+        return heldF32WeightPrimaryImpl(backend, expected_data, witness, null);
+    }
+    /// Cold semantic role binding uses the producer's checkpoint-resolved
+    /// expected name, never the witness's own name as its alleged authority.
+    pub fn heldF32WeightPrimaryNamed(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT, expected_name: []const u8) !@import("../execution/storage_ownership.zig").Plane {
+        return heldF32WeightPrimaryImpl(backend, expected_data, witness, expected_name);
+    }
+    fn heldF32WeightPrimaryImpl(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT, expected_name: ?[]const u8) !@import("../execution/storage_ownership.zig").Plane {
         if (backend.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
         const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
         if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
@@ -4386,6 +4394,7 @@ pub const NativeCompute = struct {
         if (owner.attached_compute != self or owner.data != self.data) return error.NativeWeightPreparationChanged;
         const source = try self.heldF32WeightSourceLocked(witness, false);
         const name = toBuf(witness).weight_handle.?.name();
+        if (expected_name) |expected| if (!std.mem.eql(u8, expected, name)) return error.NativeWeightRoleChanged;
         return authoredResidentF32PlaneFromLoaded(name, witness, @import("ml").graph.Shape.init(.f32, source.tensor.shape), source);
     }
 
@@ -7696,6 +7705,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .assignedKernelSupported = &assignedKernelSupportedOp,
     .assignedKernelWorkspace = &assignedKernelWorkspaceOp,
     .materializesOutput = &materializesOutputOp,
+    .materializesOutputDescriptorOnly = &materializesOutputGeometry,
     .prepareKernelRoute = &prepareKernelRouteOp,
     .hostInputRequirements = &nativeHostInputRequirementsOp,
     .hostInputViewExclusive = &nativeHostInputViewExclusiveOp,
@@ -58187,9 +58197,12 @@ test "Native concrete negative slice limit preserves declared partial geometry w
     try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, toBuf(symbolic).logical_shape.?);
 }
 
-fn materializesOutputOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+fn materializesOutputOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    return materializesOutputGeometry(descriptor);
+}
+fn materializesOutputGeometry(descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     // Transpose/broadcast and full-range slices retain their lazy alias path.
-    return descriptor.operation == .slice and assignedKernelSupportedOp(ctx, descriptor);
+    return descriptor.operation == .slice and assignedKernelGeometrySupported(descriptor);
 }
 
 fn nativeSourceF32AssignedReads(a: std.mem.Allocator) !void {
@@ -61036,11 +61049,19 @@ fn nativeHeldSourceCase(a: std.mem.Allocator) !void {
     const received = NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses);
     const resident_primary = NativeCompute.heldF32WeightPrimary(&cb, &store, resident);
     const lazy_primary = NativeCompute.heldF32WeightPrimary(&cb, &store, lazy);
+    const resident_named = NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, resident, "resident");
+    const lazy_named = NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, lazy, "lazy");
     compute.allocator = a;
     try stamped;
     try received;
     const primary = try resident_primary;
     const pinned_primary = try lazy_primary;
+    try std.testing.expectEqualDeep(primary, try resident_named);
+    try std.testing.expectEqualDeep(pinned_primary, try lazy_named);
+    // Both actual retained handles have the SAME shape, bytes and backing
+    // values. Only checkpoint-resolved semantic names distinguish these roles.
+    try std.testing.expectError(error.NativeWeightRoleChanged, NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, resident, "lazy"));
+    try std.testing.expectError(error.NativeWeightRoleChanged, NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, lazy, "resident"));
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqualDeep(try NativeCompute.authoredResidentF32Plane(&cb, "resident", resident), primary);
     try std.testing.expectEqualDeep(primary, pinned_primary);
@@ -61087,6 +61108,8 @@ fn nativeHeldSourceCase(a: std.mem.Allocator) !void {
     const foreign = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied_table };
     try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.validateHeldF32WeightSources(&foreign, &store, &witnesses));
     try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.heldF32WeightPrimary(&foreign, &store, @ptrFromInt(16)));
+    try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.heldF32WeightPrimaryNamed(&foreign, @ptrFromInt(16), @ptrFromInt(16), "resident"));
+    try std.testing.expectError(error.ForeignNativeWeightModel, NativeCompute.heldF32WeightPrimaryNamed(&cb, @ptrFromInt(16), resident, "resident"));
     try std.testing.expectEqualSlices(f32, &bits, getData(resident));
     try std.testing.expectEqualSlices(f32, &bits, getData(lazy));
 }
@@ -61521,4 +61544,45 @@ test "compact current Native facts match actual full reports for owned source al
     std.mem.doNotOptimizeAway(&copied);
     try std.testing.expect(&copied != &vtable_impl);
     try std.testing.expect(currentDenseF32Span(.{ .ptr = @ptrFromInt(16), .vtable = &copied }, @ptrFromInt(16), shape) == null);
+}
+
+fn namedHeldWeightCase(a: std.mem.Allocator) !void {
+    const bits = [_]f32{ 1, 2, 3, 4 };
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer {
+        deinitPrefetchQueue(&store);
+        store.resident_weights.deinit(a);
+        store.lazy_weights.deinit(a);
+    }
+    for ([_][]const u8{ "q", "k" }) |name| try store.resident_weights.put(a, name, .{ .tensor = .{ .name = name, .data = @constCast(std.mem.sliceAsBytes(&bits)), .shape = &.{ 2, 2 }, .dtype = .f32, .allocator = a, .owns_data = false, .owns_shape = false }, .source_version = 11 });
+    initPrefetchQueue(&store, a);
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const q = try cb.getWeight("q");
+    defer cb.free(q);
+    const k = try cb.getWeight("k");
+    defer cb.free(k);
+    try NativeCompute.stampHeldF32WeightSources(&cb, &store, &.{ q, k });
+    const q_plane = try NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, q, "q");
+    const k_plane = try NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, k, "k");
+    // Deliberately identical shape, bytes, source kind and physical backing.
+    // A layout check or data-pointer comparison cannot establish semantic role.
+    try std.testing.expectEqualDeep(q_plane, k_plane);
+    try std.testing.expectError(error.NativeWeightRoleChanged, NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, q, "k"));
+    try std.testing.expectError(error.NativeWeightRoleChanged, NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, k, "q"));
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    const current = NativeCompute.heldF32WeightPrimaryNamed(&cb, &store, q, "q");
+    compute.allocator = a;
+    try std.testing.expectEqualDeep(q_plane, try current);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "Native held F32 semantic names distinguish identical Q K sources before cold role binding" {
+    try namedHeldWeightCase(std.testing.allocator);
+}
+
+test "Native named held F32 role preparation unwinds every allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, namedHeldWeightCase, .{});
 }

@@ -878,6 +878,8 @@ pub const PreparedDecoderWeights = struct {
     weights: DecoderWeights,
     fetcher: WeightFetcher,
     cross: ?[]Cross,
+    // Captured by the original lookup, never inferred from a later witness.
+    lm_head_source: enum { projection, tied_embedding } = .projection,
 
     pub const Cross = struct { k: Linear, v: Linear };
 
@@ -918,6 +920,7 @@ pub const PreparedDecoderWeights = struct {
             lw.qkv_slots = .{ q_slot, k_slot, v_slot };
         }
         const embed = try fetcher.fetch("model.decoder.embed_tokens.weight");
+        var lm_head_source: @FieldType(PreparedDecoderWeights, "lm_head_source") = .projection;
         const weights = DecoderWeights{
             .embed = embed,
             .positions = try fetcher.fetch("model.decoder.embed_positions.weight"),
@@ -926,7 +929,10 @@ pub const PreparedDecoderWeights = struct {
                 .b = try fetcher.fetch("model.decoder.layer_norm.bias"),
             },
             .lm_head = fetcher.fetch("proj_out.weight") catch |err| switch (err) {
-                error.MissingWeight, error.WeightNotFound => embed,
+                error.MissingWeight, error.WeightNotFound => tied: {
+                    lm_head_source = .tied_embedding;
+                    break :tied embed;
+                },
                 else => return err,
             },
             .layers = layer_weights,
@@ -942,7 +948,7 @@ pub const PreparedDecoderWeights = struct {
         }
         fetcher.cb = undefined;
         fetcher.cold = null;
-        return .{ .allocator = allocator, .backend = cb.withoutSynchronousBorrows(), .weights = weights, .fetcher = fetcher, .cross = cross };
+        return .{ .allocator = allocator, .backend = cb.withoutSynchronousBorrows(), .weights = weights, .fetcher = fetcher, .cross = cross, .lm_head_source = lm_head_source };
     }
     pub fn deinit(self: *PreparedDecoderWeights) void {
         self.fetcher.release(&self.backend);
@@ -987,55 +993,217 @@ pub const PreparedSingleToken = struct {
     const Authored = struct { schedule: *schedule_mod.Schedule, token_node: NodeId, position_node: NodeId };
     const Author = struct {
         b: *schedule_mod.Builder,
-        cb: *const ComputeBackend,
-        source_data: *const anyopaque,
-        fn weight(self: Author, value: CT) !NodeId {
-            const plane = try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightPrimary(self.cb, self.source_data, value);
-            return self.b.residentWeight(value, plane);
+        spec: *const schedule_mod.ProgramSpec,
+        fn weight(self: @This(), kind: @FieldType(schedule_mod.RoleKey, "kind"), layer: ?u32, part: @FieldType(schedule_mod.RoleKey, "part")) !NodeId {
+            return self.b.parameterRole(.{ .kind = kind, .layer = layer, .part = part });
         }
-        fn linear(self: Author, x: NodeId, value: Linear, rows: usize, width: usize, out: usize) !NodeId {
-            const w = try self.weight(value.w);
-            const b = if (value.b) |bias| try self.weight(bias) else null;
+        fn linear(self: @This(), x: NodeId, kind: @FieldType(schedule_mod.RoleKey, "kind"), layer: ?u32, rows: usize, width: usize, out: usize) !NodeId {
+            const w = try self.weight(kind, layer, .weight);
+            const bias = schedule_mod.RoleKey{ .kind = kind, .layer = layer, .part = .bias };
+            const b = if (self.spec.hasRole(bias)) try self.b.parameterRole(bias) else null;
             return self.b.linearRows(x, w, b, rows, width, out);
         }
-        fn norm(self: Author, x: NodeId, value: Norm, width: usize) !NodeId {
-            return self.b.norm(x, try self.weight(value.w), try self.weight(value.b), width);
+        fn norm(self: @This(), x: NodeId, kind: @FieldType(schedule_mod.RoleKey, "kind"), layer: ?u32) !NodeId {
+            return self.b.norm(x, try self.weight(kind, layer, .weight), try self.weight(kind, layer, .bias), self.spec.geometry.width);
         }
     };
-
-    /// Value-only key: every config field, encoder length, actual ordered
-    /// source shapes and optional-bias topology. No handle, source or provider
-    /// identity crosses into the immutable Definition.
-    pub fn definitionKey(cb: *const ComputeBackend, source_data: *const anyopaque, config: Config, rows: usize, weights: *const PreparedDecoderWeights) ![32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("whisper.decode.prefix.v1");
-        inline for (@typeInfo(Config).@"struct".field_names) |name| {
-            const value = @field(config, name);
-            hash.update(std.mem.asBytes(&value));
+    pub const SpecSource = struct {
+        cb: *const ComputeBackend,
+        data: *const anyopaque,
+        config: Config,
+        rows: usize,
+        weights: *const PreparedDecoderWeights,
+        query_rows: usize,
+        initial: bool,
+        parameter_count: usize,
+        const Role = schedule_mod.RoleKey;
+        const Kind = @FieldType(Role, "kind");
+        const Resolved = struct {
+            source_kind: @FieldType(schedule_mod.ParameterSpec, "source_kind"),
+            shape: ?@import("ml").graph.Shape = null,
+            source_name: []const u8 = "",
+            value: ?CT = null,
+        };
+        const linear_kinds = [_]Kind{ .self_q, .self_k, .self_v, .self_o, .cross_q, .cross_o, .fc1, .fc2 };
+        fn linearAt(layer: LayerWeights, kind: Kind) Linear {
+            return switch (kind) {
+                .self_q => layer.q,
+                .self_k => layer.k,
+                .self_v => layer.v,
+                .self_o => layer.o,
+                .cross_q => layer.cross_q,
+                .cross_o => layer.cross_o,
+                .fc1 => layer.fc1,
+                .fc2 => layer.fc2,
+                else => unreachable,
+            };
         }
-        hash.update(std.mem.asBytes(&rows));
-        const count = weights.fetcher.handles.items.len;
-        hash.update(std.mem.asBytes(&count));
-        for (weights.fetcher.handles.items) |value| {
-            const shape = (try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightPrimary(cb, source_data, value)).descriptor.shape;
-            const rank = shape.rank();
-            hash.update(std.mem.asBytes(&rank));
-            hash.update(std.mem.sliceAsBytes(shape.dims[0..rank]));
+        fn layerCount(layer: LayerWeights, initial: bool) usize {
+            var count: usize = 6 + linear_kinds.len + (if (initial) @as(usize, 2) else 4);
+            for (linear_kinds) |kind| if (linearAt(layer, kind).b != null) {
+                count += 1;
+            };
+            return count;
         }
-        for (weights.weights.layers) |layer| inline for (@typeInfo(LayerWeights).@"struct".field_names) |name| {
-            if (comptime @TypeOf(@field(layer, name)) == Linear) {
-                const present: u8 = @intFromBool(@field(layer, name).b != null);
-                hash.update(&.{present});
+        pub fn header(self: @This()) schedule_mod.ProgramSpec {
+            return .{ .family = .whisper, .phase = if (self.initial) .initial else .decode, .geometry = .{ .layers = self.config.decoder_layers, .width = self.config.d_model, .heads = self.config.decoder_attention_heads, .ffn_dim = self.config.decoder_ffn_dim, .vocab_size = self.config.vocab_size, .encoder_rows = self.rows, .capacity = @max(@as(usize, 1), self.config.max_target_positions), .query_rows = self.query_rows }, .semantics = .{ .epsilon = 1e-5, .activation = .gelu, .norm_order = .pre, .position_offset = 0, .global_final_norm = true }, .parameters = &.{} };
+        }
+        pub fn len(self: @This()) usize {
+            return self.parameter_count;
+        }
+        fn roleAt(self: @This(), index: usize) !Role {
+            var slot = index;
+            const globals = [_]Role{ .{ .kind = .token_ids }, .{ .kind = .position_ids }, .{ .kind = .embedding, .part = .weight }, .{ .kind = .positions, .part = .weight } };
+            if (slot < globals.len) return globals[slot];
+            slot -= globals.len;
+            for (self.weights.weights.layers, 0..) |layer, layer_index| {
+                const count = layerCount(layer, self.initial);
+                if (slot >= count) {
+                    slot -= count;
+                    continue;
+                }
+                const groups = [_]Kind{ .self_norm, .self_q, .self_k, .self_v, .self_o, .cross_norm, .cross_q, .cross_o, .ffn_norm, .fc1, .fc2 };
+                for (groups) |kind| {
+                    const has_bias = switch (kind) {
+                        .self_norm, .cross_norm, .ffn_norm => true,
+                        else => linearAt(layer, kind).b != null,
+                    };
+                    if (slot == 0) return .{ .kind = kind, .layer = @intCast(layer_index), .part = .weight };
+                    slot -= 1;
+                    if (has_bias) {
+                        if (slot == 0) return .{ .kind = kind, .layer = @intCast(layer_index), .part = .bias };
+                        slot -= 1;
+                    }
+                }
+                const slabs = if (self.initial) &[_]Kind{ .cross_slab_k, .cross_slab_v } else &[_]Kind{ .self_slab_k, .self_slab_v, .cross_slab_k, .cross_slab_v };
+                if (slot < slabs.len) return .{ .kind = slabs[slot], .layer = @intCast(layer_index) };
+                return error.DenseDefinitionChanged;
             }
-        };
-        if (weights.cross) |crosses| for (crosses) |cross| {
-            const bits = [_]u8{ @intFromBool(cross.k.b != null), @intFromBool(cross.v.b != null) };
-            hash.update(&bits);
-        };
-        return hash.finalResult();
+            const tail = [_]Role{ .{ .kind = .final_norm, .part = .weight }, .{ .kind = .final_norm, .part = .bias }, .{ .kind = .lm_head, .part = .weight } };
+            return if (slot < tail.len) tail[slot] else error.DenseDefinitionChanged;
+        }
+        fn resolve(self: @This(), role: Role, buffer: *[256]u8) !Resolved {
+            const Shape = @import("ml").graph.Shape;
+            const g = self.header().geometry;
+            if (role.kind == .token_ids or role.kind == .position_ids) {
+                if (role.layer != null or role.part != .value) return error.DenseDefinitionChanged;
+                return .{ .shape = Shape.init(.i64, &.{@intCast(g.query_rows)}), .source_kind = .host };
+            }
+            if (role.kind == .self_slab_k or role.kind == .self_slab_v or role.kind == .cross_slab_k or role.kind == .cross_slab_v) {
+                const layer = role.layer orelse return error.DenseDefinitionChanged;
+                if (layer >= g.layers or role.part != .value or (self.initial and (role.kind == .self_slab_k or role.kind == .self_slab_v))) return error.DenseDefinitionChanged;
+                const rows = if (role.kind == .self_slab_k or role.kind == .self_slab_v) g.capacity else g.encoder_rows;
+                return .{ .shape = Shape.init(.f32, &.{ @intCast(rows), @intCast(g.width) }), .source_kind = .external };
+            }
+            var name: []const u8 = undefined;
+            var value: CT = undefined;
+            if (role.layer) |layer| {
+                if (layer >= self.weights.weights.layers.len or role.part == .value) return error.DenseDefinitionChanged;
+                const w = self.weights.weights.layers[layer];
+                const pair = switch (role.kind) {
+                    .self_norm => Linear{ .w = w.self_ln.w, .b = w.self_ln.b },
+                    .cross_norm => Linear{ .w = w.cross_ln.w, .b = w.cross_ln.b },
+                    .ffn_norm => Linear{ .w = w.ffn_ln.w, .b = w.ffn_ln.b },
+                    .self_q, .self_k, .self_v, .self_o, .cross_q, .cross_o, .fc1, .fc2 => linearAt(w, role.kind),
+                    else => return error.DenseDefinitionChanged,
+                };
+                value = if (role.part == .weight) pair.w else pair.b orelse return error.DenseDefinitionChanged;
+                const suffix = switch (role.kind) {
+                    .self_norm => "self_attn_layer_norm",
+                    .cross_norm => "encoder_attn_layer_norm",
+                    .ffn_norm => "final_layer_norm",
+                    .self_q => "self_attn.q_proj",
+                    .self_k => "self_attn.k_proj",
+                    .self_v => "self_attn.v_proj",
+                    .self_o => "self_attn.out_proj",
+                    .cross_q => "encoder_attn.q_proj",
+                    .cross_o => "encoder_attn.out_proj",
+                    .fc1 => "fc1",
+                    .fc2 => "fc2",
+                    else => unreachable,
+                };
+                name = try std.fmt.bufPrint(buffer, "model.decoder.layers.{d}.{s}.{s}", .{ layer, suffix, if (role.part == .weight) "weight" else "bias" });
+            } else switch (role.kind) {
+                .embedding => {
+                    if (role.part != .weight) return error.DenseDefinitionChanged;
+                    value = self.weights.weights.embed;
+                    name = "model.decoder.embed_tokens.weight";
+                },
+                .positions => {
+                    if (role.part != .weight) return error.DenseDefinitionChanged;
+                    value = self.weights.weights.positions;
+                    name = "model.decoder.embed_positions.weight";
+                },
+                .lm_head => {
+                    if (role.part != .weight) return error.DenseDefinitionChanged;
+                    value = self.weights.weights.lm_head;
+                    name = switch (self.weights.lm_head_source) {
+                        .projection => "proj_out.weight",
+                        .tied_embedding => "model.decoder.embed_tokens.weight",
+                    };
+                },
+                .final_norm => {
+                    if (role.part == .value) return error.DenseDefinitionChanged;
+                    value = if (role.part == .weight) self.weights.weights.final_ln.w else self.weights.weights.final_ln.b;
+                    name = if (role.part == .weight) "model.decoder.layer_norm.weight" else "model.decoder.layer_norm.bias";
+                },
+                else => return error.DenseDefinitionChanged,
+            }
+            return .{ .source_kind = .held_weight, .source_name = name, .value = value };
+        }
+        pub fn at(self: @This(), index: usize, buffer: *[256]u8) !schedule_mod.ParameterSpec {
+            const role = try self.roleAt(index);
+            const resolved = try self.resolve(role, buffer);
+            const shape = if (resolved.source_kind == .held_weight)
+                (try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightPrimaryNamed(self.cb, self.data, resolved.value.?, resolved.source_name)).descriptor.shape
+            else
+                resolved.shape.?;
+            if ((shape.numElements() orelse return error.UnsupportedDenseSchedule) <= 0) return error.UnsupportedDenseSchedule;
+            return .{ .role = role, .shape = shape, .source_kind = resolved.source_kind, .source_name = resolved.source_name };
+        }
+        fn bind(self: @This(), a: std.mem.Allocator, spec: *const schedule_mod.ProgramSpec, slabs: []const Slab) ![]schedule_mod.BoundParameter {
+            const expected_header = self.header();
+            if (spec.family != expected_header.family or spec.phase != expected_header.phase or !std.meta.eql(spec.geometry, expected_header.geometry) or !std.meta.eql(spec.semantics, expected_header.semantics) or spec.parameters.len != self.len() or slabs.len != self.config.decoder_layers) return error.DenseDefinitionChanged;
+            const result = try a.alloc(schedule_mod.BoundParameter, spec.parameters.len);
+            errdefer a.free(result);
+            for (spec.parameters, result, 0..) |declared, *bound, index| {
+                if (!std.meta.eql(declared.role, try self.roleAt(index))) return error.DenseDefinitionChanged;
+                var name: [256]u8 = undefined;
+                const resolved = try self.resolve(declared.role, &name);
+                if (declared.source_kind != resolved.source_kind or !std.mem.eql(u8, declared.source_name, resolved.source_name)) return error.DenseDefinitionChanged;
+                if (resolved.shape) |shape| if (!declared.shape.eq(shape)) return error.DenseDefinitionChanged;
+                bound.* = .{ .role = declared.role, .value = resolved.value, .source_data = if (declared.source_kind == .held_weight) self.data else null };
+                if (declared.source_kind == .external) {
+                    const slab = slabs[declared.role.layer.?];
+                    const value = switch (declared.role.kind) {
+                        .self_slab_k => slab.k,
+                        .self_slab_v => slab.v,
+                        .cross_slab_k => slab.cross_k,
+                        .cross_slab_v => slab.cross_v,
+                        else => return error.DenseDefinitionChanged,
+                    };
+                    bound.value = value;
+                }
+            }
+            return result;
+        }
+    };
+    pub fn specSource(cb: *const ComputeBackend, data: *const anyopaque, config: Config, rows: usize, weights: *const PreparedDecoderWeights, query_rows: usize, initial: bool) !?SpecSource {
+        const Native = @import("../ops/native_compute.zig");
+        if (cb.vtable != &Native.vtable_impl or cb.vtable.addLayerNormSum != null or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
+        for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
+        const embed = try Native.NativeCompute.heldF32WeightPrimaryNamed(cb, data, weights.weights.embed, "model.decoder.embed_tokens.weight");
+        const position = try Native.NativeCompute.heldF32WeightPrimaryNamed(cb, data, weights.weights.positions, "model.decoder.embed_positions.weight");
+        if (embed.descriptor.shape.rank() != 2 or position.descriptor.shape.rank() != 2 or embed.descriptor.shape.dims[1] != config.d_model or position.descriptor.shape.dims[1] != config.d_model or embed.descriptor.shape.dims[0] <= 0 or position.descriptor.shape.dims[0] <= 0) return null;
+        const geometry = try CacheGeometry.init(config, rows);
+        if (config.decoder_attention_heads == 0 or config.d_model % config.decoder_attention_heads != 0 or rows > std.math.maxInt(i32) or geometry.capacity > std.math.maxInt(i32) or config.d_model > std.math.maxInt(i32) or config.decoder_ffn_dim > std.math.maxInt(i32) or config.vocab_size > std.math.maxInt(i32)) return null;
+        if (query_rows == 0 or (!initial and query_rows != 1) or (initial and (query_rows > config.max_target_positions or query_rows > 2048))) return error.UnsupportedDenseSchedule;
+        var count: usize = 7;
+        for (weights.weights.layers) |layer| count = try std.math.add(usize, count, SpecSource.layerCount(layer, initial));
+        return .{ .cb = cb, .data = data, .config = config, .rows = rows, .weights = weights, .query_rows = query_rows, .initial = initial, .parameter_count = count };
     }
 
-    pub fn init(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation) !?PreparedSingleToken {
+    pub fn init(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !?PreparedSingleToken {
         const Native = @import("../ops/native_compute.zig");
         if (cb.vtable != &Native.vtable_impl or cb.vtable.addLayerNormSum != null or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
         for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
@@ -1044,6 +1212,7 @@ pub const PreparedSingleToken = struct {
         if (embed_shape.rank() != 2 or position_shape.rank() != 2 or embed_shape.dims[1] != config.d_model or position_shape.dims[1] != config.d_model) return null;
         const geometry = try CacheGeometry.init(config, rows);
         if (config.decoder_attention_heads == 0 or config.d_model % config.decoder_attention_heads != 0 or rows > std.math.maxInt(i32) or geometry.capacity > std.math.maxInt(i32) or config.d_model > std.math.maxInt(i32) or config.decoder_ffn_dim > std.math.maxInt(i32) or config.vocab_size > std.math.maxInt(i32) or embed_shape.dims[0] <= 0 or position_shape.dims[0] <= 0) return null;
+        if (spec.phase != .decode or spec.geometry.query_rows != 1) return error.DenseDefinitionChanged;
         const slabs = try a.alloc(Slab, config.decoder_layers);
         var built: usize = 0;
         errdefer {
@@ -1068,7 +1237,7 @@ pub const PreparedSingleToken = struct {
             slab.* = .{ .k = k, .v = v, .cross_k = cross_k, .cross_v = cross_v };
             built += 1;
         }
-        const authored = try authorPhase(cb, source_data, a, config, encoder, rows, weights, slabs, preparation, 1, false);
+        const authored = try authorPhase(cb, source_data, a, config, encoder, rows, weights, slabs, preparation, spec, storage);
         errdefer authored.schedule.deinit(.{ .outside_execution = true });
         const cache_layers = try a.alloc(DecodeCache.LayerCache, config.decoder_layers);
         errdefer a.free(cache_layers);
@@ -1080,77 +1249,90 @@ pub const PreparedSingleToken = struct {
         @memset(self_mask, 1);
         return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = authored.schedule, .source_data = source_data, .self_slabs = slabs, .token_node = authored.token_node, .position_node = authored.position_node, .cache_layers = cache_layers, .encoder_mask = encoder_mask, .self_mask = self_mask, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
     }
-    fn authorPhase(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, slabs: []const Slab, preparation: ?*schedule_mod.Preparation, query_rows: usize, initial: bool) !Authored {
-        const geometry = try CacheGeometry.init(config, rows);
+    fn authorPhase(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, slabs: []const Slab, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !Authored {
         const Native = @import("../ops/native_compute.zig");
-        var b = schedule_mod.Builder.initPrepared(a, cb, preparation);
-        defer b.deinit();
-        const author = Author{ .b = &b, .cb = cb, .source_data = source_data };
-        for (weights.cross.?, slabs) |cross, slab| {
+        const source = (try specSource(cb, source_data, config, rows, weights, spec.geometry.query_rows, spec.phase == .initial)) orelse return error.UnsupportedDenseSchedule;
+        // Cross-cache production is outside this graph. Keep its actual named
+        // source and original destination/geometry preflight before any write.
+        for (weights.cross.?, slabs, 0..) |cross, slab, layer| {
+            var buffer: [256]u8 = undefined;
+            for ([_]Linear{ cross.k, cross.v }, [_][]const u8{ "k_proj", "v_proj" }) |pair, projection| {
+                _ = try Native.NativeCompute.heldF32WeightPrimaryNamed(cb, source_data, pair.w, try std.fmt.bufPrint(&buffer, "model.decoder.layers.{d}.encoder_attn.{s}.weight", .{ layer, projection }));
+                if (pair.b) |bias| _ = try Native.NativeCompute.heldF32WeightPrimaryNamed(cb, source_data, bias, try std.fmt.bufPrint(&buffer, "model.decoder.layers.{d}.encoder_attn.{s}.bias", .{ layer, projection }));
+            }
             const k_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.k.w, cross.k.b, slab.cross_k, rows, config.d_model, config.d_model);
             const v_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.v.w, cross.v.b, slab.cross_v, rows, config.d_model, config.d_model);
             if (!Native.NativeCompute.canApplyDenseProjectionInto(cb, &k_desc, if (cross.k.b) |bias| &.{ encoder, cross.k.w, bias } else &.{ encoder, cross.k.w }, slab.cross_k) or !Native.NativeCompute.canApplyDenseProjectionInto(cb, &v_desc, if (cross.v.b) |bias| &.{ encoder, cross.v.w, bias } else &.{ encoder, cross.v.w }, slab.cross_v)) return error.UnsupportedDenseSchedule;
         }
-        const token_node = try b.hostParameter(@import("ml").graph.Shape.init(.i64, &.{@intCast(query_rows)}));
-        const position_node = try b.hostParameter(@import("ml").graph.Shape.init(.i64, &.{@intCast(query_rows)}));
-        const embedded = try b.gather(try author.weight(weights.weights.embed), token_node, config.d_model);
-        const positioned = try b.gather(try author.weight(weights.weights.positions), position_node, config.d_model);
+        const bound = try source.bind(a, spec, slabs);
+        defer a.free(bound);
+        if (preparation) |prepared| if (prepared.cached) |definition| {
+            const schedule = try schedule_mod.Schedule.instantiate(a, cb, definition, spec, bound);
+            errdefer schedule.deinit(.{ .outside_execution = true });
+            return .{ .schedule = schedule, .token_node = try definition.parameterNode(.{ .kind = .token_ids }), .position_node = try definition.parameterNode(.{ .kind = .position_ids }) };
+        };
+        return authorPure(cb, a, preparation, spec, storage, bound);
+    }
+    fn authorPure(cb: *const ComputeBackend, a: std.mem.Allocator, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage, bound: []const schedule_mod.BoundParameter) !Authored {
+        if (spec.family != .whisper or spec.semantics.activation != .gelu or spec.semantics.norm_order != .pre or spec.semantics.epsilon != 1e-5 or spec.semantics.position_offset != 0 or !spec.semantics.global_final_norm) return error.DenseDefinitionChanged;
+        var b = if (storage) |owned| schedule_mod.Builder.initSpecStorage(a, cb, preparation, owned, bound) else schedule_mod.Builder.initSpec(a, cb, preparation, spec, bound);
+        defer b.deinit();
+        const author = Author{ .b = &b, .spec = spec };
+        const g = spec.geometry;
+        const token_node = try b.parameterRole(.{ .kind = .token_ids });
+        const position_node = try b.parameterRole(.{ .kind = .position_ids });
+        const embedded = try b.gather(try author.weight(.embedding, null, .weight), token_node, g.width);
+        const positioned = try b.gather(try author.weight(.positions, null, .weight), position_node, g.width);
         var sum = try b.add(embedded, positioned);
         var pending: ?NodeId = null;
-        for (weights.weights.layers, slabs) |w, slab| {
+        for (0..g.layers) |index| {
+            const layer: u32 = @intCast(index);
             if (pending) |p| sum = try b.add(p, sum);
-            const norm = try author.norm(sum, w.self_ln, config.d_model);
-            const q = try author.linear(norm, w.q, query_rows, config.d_model, config.d_model);
-            const k = try author.linear(norm, w.k, query_rows, config.d_model, config.d_model);
-            const v = try author.linear(norm, w.v, query_rows, config.d_model, config.d_model);
-            // The original eager append copies K/V into the external slab.
-            // Rooting these values conservatively extends their physical life
-            // past that synchronous copy without inventing a graph KV write.
+            const norm = try author.norm(sum, .self_norm, layer);
+            const q = try author.linear(norm, .self_q, layer, g.query_rows, g.width, g.width);
+            const k = try author.linear(norm, .self_k, layer, g.query_rows, g.width, g.width);
+            const v = try author.linear(norm, .self_v, layer, g.query_rows, g.width, g.width);
             try b.output(k);
             try b.output(v);
-            const slab_shape = @import("ml").graph.Shape.init(.f32, &.{ @intCast(geometry.capacity), @intCast(config.d_model) });
-            const self_k = try b.parameter(slab_shape, slab.k);
-            const self_v = try b.parameter(slab_shape, slab.v);
-            const self_attention = if (initial) try b.attentionRows(.causal, q, k, v, config.decoder_attention_heads, config.decoderHeadDim(), query_rows, query_rows) else try b.prefix(q, self_k, self_v, config.decoder_attention_heads, config.decoderHeadDim(), geometry.capacity);
-            const self_out = try author.linear(self_attention, w.o, query_rows, config.d_model, config.d_model);
+            const self_attention = if (spec.phase == .initial)
+                try b.attentionRows(.causal, q, k, v, g.heads, g.width / g.heads, g.query_rows, g.query_rows)
+            else prefix: {
+                const self_k = try b.parameterRole(.{ .kind = .self_slab_k, .layer = layer });
+                const self_v = try b.parameterRole(.{ .kind = .self_slab_v, .layer = layer });
+                break :prefix try b.prefix(q, self_k, self_v, g.heads, g.width / g.heads, g.capacity);
+            };
+            const self_out = try author.linear(self_attention, .self_o, layer, g.query_rows, g.width, g.width);
             const after_self = try b.add(self_out, sum);
-            const cross_norm = try author.norm(after_self, w.cross_ln, config.d_model);
-            const cross_q = try author.linear(cross_norm, w.cross_q, query_rows, config.d_model, config.d_model);
-            const cross_shape = @import("ml").graph.Shape.init(.f32, &.{ @intCast(rows), @intCast(config.d_model) });
-            const cross_k = try b.parameter(cross_shape, slab.cross_k);
-            const cross_v = try b.parameter(cross_shape, slab.cross_v);
-            const cross_attention = if (initial) try b.attentionRows(.cross, cross_q, cross_k, cross_v, config.decoder_attention_heads, config.decoderHeadDim(), query_rows, rows) else try b.prefix(cross_q, cross_k, cross_v, config.decoder_attention_heads, config.decoderHeadDim(), rows);
-            const cross_out = try author.linear(cross_attention, w.cross_o, query_rows, config.d_model, config.d_model);
+            const cross_norm = try author.norm(after_self, .cross_norm, layer);
+            const cross_q = try author.linear(cross_norm, .cross_q, layer, g.query_rows, g.width, g.width);
+            const cross_k = try b.parameterRole(.{ .kind = .cross_slab_k, .layer = layer });
+            const cross_v = try b.parameterRole(.{ .kind = .cross_slab_v, .layer = layer });
+            const cross_attention = if (spec.phase == .initial) try b.attentionRows(.cross, cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.query_rows, g.encoder_rows) else try b.prefix(cross_q, cross_k, cross_v, g.heads, g.width / g.heads, g.encoder_rows);
+            const cross_out = try author.linear(cross_attention, .cross_o, layer, g.query_rows, g.width, g.width);
             sum = try b.add(cross_out, after_self);
-            const ffn_norm = try author.norm(sum, w.ffn_ln, config.d_model);
-            const fc1 = try author.linear(ffn_norm, w.fc1, query_rows, config.d_model, config.decoder_ffn_dim);
+            const ffn_norm = try author.norm(sum, .ffn_norm, layer);
+            const fc1 = try author.linear(ffn_norm, .fc1, layer, g.query_rows, g.width, g.ffn_dim);
             const activated = try b.gelu(fc1);
-            pending = try author.linear(activated, w.fc2, query_rows, config.decoder_ffn_dim, config.d_model);
+            pending = try author.linear(activated, .fc2, layer, g.query_rows, g.ffn_dim, g.width);
         }
         if (pending) |p| sum = try b.add(p, sum);
-        const norm = try author.norm(sum, weights.weights.final_ln, config.d_model);
-        const last = if (query_rows == 1) norm else try b.lastRow(norm, query_rows, config.d_model);
-        const logits = try b.linear(last, try author.weight(weights.weights.lm_head), null, config.d_model, config.vocab_size);
+        const norm = try author.norm(sum, .final_norm, null);
+        const last = if (g.query_rows == 1) norm else try b.lastRow(norm, g.query_rows, g.width);
+        const logits = try b.linear(last, try author.weight(.lm_head, null, .weight), null, g.width, g.vocab_size);
         try b.output(logits);
         return .{ .schedule = try schedule_mod.Schedule.create(&b), .token_node = token_node, .position_node = position_node };
     }
-    pub fn initInitial(self: *PreparedSingleToken, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize) !void {
+    pub fn initInitial(self: *PreparedSingleToken, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !void {
         if (self.initial != null or query_rows == 0 or query_rows > config.max_target_positions or query_rows > 2048) return error.UnsupportedDenseSchedule;
+        if (spec.phase != .initial or spec.geometry.query_rows != query_rows) return error.DenseDefinitionChanged;
         const tokens = try self.allocator.alloc(i64, query_rows);
         errdefer self.allocator.free(tokens);
         const positions = try self.allocator.alloc(i64, query_rows);
         errdefer self.allocator.free(positions);
         @memset(tokens, 0);
         for (positions, 0..) |*position, i| position.* = @intCast(i);
-        const phase = try authorPhase(&self.backend, self.source_data, self.allocator, config, encoder, rows, weights, self.self_slabs, preparation, query_rows, true);
+        const phase = try authorPhase(&self.backend, self.source_data, self.allocator, config, encoder, rows, weights, self.self_slabs, preparation, spec, storage);
         self.initial = .{ .schedule = phase.schedule, .token_node = phase.token_node, .position_node = phase.position_node, .tokens = tokens, .positions = positions };
-    }
-    pub fn initialDefinitionKey(decode_key: [32]u8, query_rows: usize) [32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("whisper.initial.causal.v1");
-        hash.update(&decode_key);
-        hash.update(std.mem.asBytes(&query_rows));
-        return hash.finalResult();
     }
     fn bindInitial(self: *PreparedSingleToken, capability: ?@import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context, enter: bool) !void {
         const phase = if (self.initial) |*value| value else return error.UnsupportedDenseSchedule;
