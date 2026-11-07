@@ -172,6 +172,7 @@ const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const json_helpers = @import("../../api/json_helpers.zig");
 
 test {
+    _ = @import("mutation_effects.zig");
     _ = durable_outbox;
     _ = durable_outbox_store;
     _ = apply_receipts;
