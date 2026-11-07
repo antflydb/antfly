@@ -1881,6 +1881,89 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
     }
 }
 
+// Deterministic regression test for a second instance of the same bug class,
+// one step earlier in the lifecycle: a transient fault during `db.addIndex`'s
+// own *post-commit* bookkeeping (after the catalog admission itself already
+// committed durably). `installIndexForReconciliation` (db.zig) always writes
+// a managed-admission outbox row as part of that same catalog transaction,
+// even for an *ordinary* (non-managed) `addIndex`; when a later bookkeeping
+// step (`saveAppliedSequence`/`saveIndexStatusSnapshots`/etc.) then hits a
+// transient error, `recoverCommittedIndexAdmission` degrades the whole call
+// into "committed, repair pending" and returns success instead of
+// propagating -- so `addIndex` itself returns `void` with no error at all.
+// That outbox row only ever gets turned into a durable generation-repair
+// *intent* (`materializeManagedIndexAdmissionValueLocked` ->
+// `createGenerationRepairIntentAtTarget`); nothing then executes that
+// intent. In production it is the independent-maintenance owner's `.repair`
+// work that does so, but that owner is gated to borrowed-IO runtimes under
+// test (`startArtifactRepairMetadataWorkerIfNeeded`) and plenty of
+// production embeddings never borrow IO either, so until
+// `runUntilIdleWithReplayDrainOptions` also drove
+// `repairRecoverableStartupIndexFailures` here, `body_text` stayed
+// `markUnscopedRepairUnavailable`-gated (`search()` -> `IndexRebuilding`)
+// forever, even though the fault was one-shot and the repair itself
+// succeeds instantly once actually attempted.
+test "crash sweep: full text addIndex recovers from one transient post-commit fault" {
+    const allocator = std.testing.allocator;
+    const kinds = [_]sim_io.IoFaultKind{ .write, .sync };
+    for (kinds) |kind| {
+        var at_op: u64 = 0;
+        while (at_op < 40) : (at_op += 1) {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try testAflitePath(allocator, tmp);
+            defer allocator.free(path);
+
+            const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+            defer sim.deinit();
+
+            // Open a fresh DB without `openDbWithIo`'s own `addIndex("body_
+            // text")` call, so the fault below lands on exactly that call
+            // and nothing earlier.
+            var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = sim.io() });
+            var backend_open = true;
+            defer if (backend_open) lite_backend.deinit();
+            const identity = connection.identityOpenOptions(true);
+            var db_opts = db_mod.OpenOptions{
+                .open_mode = .writer,
+                .identity_namespace = identity.identity_namespace,
+                .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
+            };
+            try lite_backend.configureDbOpenOptions(&db_opts);
+            var db = try db_mod.DB.open(allocator, path, db_opts);
+            var db_open = true;
+            defer if (db_open) db.close();
+
+            sim.setIoFaultPlan(.{ .at_op = at_op, .kind = kind, .err = error.InputOutput });
+            // An earlier op can make `addIndex` itself surface the fault
+            // (before catalog commit); that is a different, already-covered
+            // contract (plain call failure, nothing committed) and not what
+            // this test targets. Only the silent-success case -- the fault
+            // landing on post-commit bookkeeping, which `addIndex` swallows
+            // into a pending repair instead of returning -- exercises the
+            // bug this test is a regression for, so skip every op where
+            // `addIndex` did not itself return success.
+            db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" }) catch {
+                sim.setIoFaultPlan(null);
+                continue;
+            };
+            sim.setIoFaultPlan(null);
+            try db.runUntilIdle();
+
+            try db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+
+            var handle = DbHandle{ .backend = lite_backend, .db = db };
+            db_open = false;
+            backend_open = false;
+            defer handle.close();
+            assertSearchable(&handle, allocator, "body_text", "body", "ft-doc", "needle") catch |err| {
+                std.debug.print("addIndex io-fault regression failed kind={s} at_op={d}: {s}\n", .{ @tagName(kind), at_op, @errorName(err) });
+                return err;
+            };
+        }
+    }
+}
+
 // Bug repro: a commit that fails *after staging* (an injected, persistent
 // `error.InputOutput` on the write op below -- `IoFaultPlan.repeat = true`
 // never clears it) must not leak the retained/artifact_inputs/

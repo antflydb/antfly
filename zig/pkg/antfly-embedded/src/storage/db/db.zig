@@ -12631,6 +12631,7 @@ pub const DB = struct {
         intent: index_repair_state.IndexRepairIntent,
     ) !bool {
         if (try self.localArtifactSourceRecoveryIsServiceable(alloc, intent)) return true;
+        if (try self.activationFenceAdmissionIsServiceable(alloc, intent)) return true;
         const minimum_replay = (try self.managedInitialBuildMinimumReplay(alloc, intent)) orelse return false;
         if (!initialBuildCanRetireBeforeActivation(intent) or intent.source_replay_state == .pending) return false;
         if (intent.candidate_relative_path) |candidate| {
@@ -12694,6 +12695,49 @@ pub const DB = struct {
             if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or
                 counts.produced.? +| counts.skipped.? != total) return false;
         }
+        return true;
+    }
+
+    /// A `.catalog_admission` repair intent whose durable marker disposition
+    /// is `.activation_fence` (every *ordinary*, non-managed `addIndex`
+    /// always uses this disposition, and a *managed* admission of a
+    /// still-empty table does too -- see `installIndexForReconciliation`)
+    /// names an index whose physical construction already fully succeeded,
+    /// synchronously, inside the original admission call: `addWithOptions`
+    /// opens (and, for a non-empty ordinary admission, backfills) the index
+    /// before it ever persists the catalog/admission-marker transaction, so
+    /// a transient error here can only have hit *post*-commit bookkeeping
+    /// (`recoverCommittedIndexAdmission`'s comment on
+    /// `runUntilIdleWithReplayDrainOptions` has the long version). There is
+    /// no corpus to rebuild and -- unlike `localArtifactSourceRecoveryIsServiceable`'s
+    /// managed_rebuild case above -- no artifact-source replay to wait on:
+    /// this index has no admission debt at all beyond the unfinished
+    /// bookkeeping. Routing it into a shadow rebuild instead of retiring it
+    /// here would use this intent's own (now-stale, captured-at-admission)
+    /// `target_sequence` as the candidate's backfill floor, silently
+    /// discarding every document the live index already applied since.
+    fn activationFenceAdmissionIsServiceable(
+        self: *DB,
+        alloc: Allocator,
+        intent: index_repair_state.IndexRepairIntent,
+    ) !bool {
+        if (intent.trigger != .catalog_admission or intent.work_class != .initial_build) return false;
+        if (!initialBuildCanRetireBeforeActivation(intent) or intent.source_replay_state == .pending) return false;
+        const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, intent.index_name);
+        defer alloc.free(key);
+        const raw = self.core.store.get(alloc, key) catch |err| if (err == error.NotFound) return false else return err;
+        defer alloc.free(raw);
+        const marker = try decodeManagedIndexAdmissionMarker(raw);
+        if (marker.disposition != .activation_fence or marker.config_hash != intent.config_hash) return false;
+        const cfg = self.core.index_manager.get(intent.index_name) orelse return false;
+        if (types.indexConfigHash(cfg.*) != intent.config_hash) return false;
+        // A load failure means this process's own reopen of the index never
+        // reached the live state the marker promises -- that is the
+        // quarantine/`retryQuarantinedIndexLoads` recovery path's debt, not
+        // this one's; fail closed into the ordinary rebuild path below
+        // rather than retiring an intent over an index that is not actually
+        // open.
+        if (self.core.index_manager.loadFailure(intent.index_name) != null) return false;
         return true;
     }
 
@@ -33865,6 +33909,47 @@ pub const DB = struct {
         // resolve a stuck activation once the underlying I/O recovers,
         // instead of leaving the affected index `IndexRebuilding` forever.
         if (self.managedAdmissionMaterializationPending()) try self.drainManagedIndexAdmissions(self.alloc);
+        // Materializing the admission marker above only converts it into a
+        // durable generation-repair intent (`materializeManagedIndexAdmission
+        // ValueLocked` -> `createGenerationRepairIntentAtTarget`); it does not
+        // itself open or activate anything. An *ordinary* (non-managed)
+        // `addIndex` whose post-commit bookkeeping hit this same transient-
+        // error class (see `recoverCommittedIndexAdmission`) is left exactly
+        // here: catalog-committed, query-gated (`markUnscopedRepairUnavailable`
+        // was never paired with a `clearUnscopedRepairUnavailable`/activation
+        // fence because `completeInstalledIndexAdmission` is skipped whenever
+        // `installed.post_commit_error != null`), with a runnable repair
+        // intent nothing has executed yet. In production that intent is
+        // executed by the independent-maintenance owner's `.repair` work
+        // (`independentMaintenanceRun`), but that owner is only started for a
+        // borrowed-IO runtime under test (`startArtifactRepairMetadataWorkerIfNeeded`)
+        // and plenty of production embeddings never borrow IO either, so
+        // nothing but an explicit `repairRecoverableStartupIndexFailures`/
+        // `advanceIndexRepairIntent` call ever advances it. Drive every
+        // immediately-runnable repair intent to completion here too, bounded
+        // the same way the replay drain above is, so a transient open/
+        // activation fault resolves itself exactly like the managed-admission
+        // case once the underlying I/O recovers, instead of leaving the index
+        // `IndexRebuilding` forever. `activationFenceAdmissionIsServiceable`
+        // (db.zig, next to `localArtifactSourceRecoveryIsServiceable`) makes
+        // this a cheap retire instead of a destructive shadow rebuild for the
+        // ordinary-admission case this drain exists for. A deferred/paused/
+        // terminal intent is left alone -- this is a retry of a known-
+        // transient class, not a repair driver; `repairRecoverableStartupIndexFailures`'s
+        // own `wake` decision is authoritative for whether anything is due
+        // right now.
+        if (!openModeRequiresReadOnlyBackends(self.open_mode)) {
+            var repair_rounds: usize = 0;
+            while (repair_rounds < run_until_idle_max_replay_rounds) : (repair_rounds += 1) {
+                const repair_result = self.repairRecoverableStartupIndexFailures(self.alloc, 8, .{}) catch |err| switch (err) {
+                    error.ReadOnly, error.NotLeader, error.Busy => break,
+                    else => return err,
+                };
+                if (repair_result.remaining == 0) break;
+                if (repair_result.wake != .immediate) break;
+                if (repair_result.attempted == 0 and repair_result.repaired == 0) break;
+            }
+        }
         // Manual owners need synchronous resolver drivers both during shadow
         // construction and after a crash between activation and promotion.
         // Creating these drivers does not start background workers.
