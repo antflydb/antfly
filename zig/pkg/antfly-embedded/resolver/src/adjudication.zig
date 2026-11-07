@@ -47,6 +47,7 @@ pub const Config = struct {
         var parsed = try std.json.parseFromSlice(Config, a, raw, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try parsed.value.validate();
+        _ = @import("antfly_decisions").cascade.omitDisabledAgreement(&parsed.value.decider);
         return parsed;
     }
     pub fn validate(self: Config) !void {
@@ -145,18 +146,172 @@ pub const Config = struct {
         revision: ?[32]u8 = null,
         failure: ?anyerror = null,
     };
-    pub const RevisionCache = [@import("antfly_decisions").cascade.max_stages]RevisionProbe;
+    pub const RevisionRequest = struct {
+        version: u32 = 1,
+        specification: []const u8,
+        model: []const u8,
+        dependencies: ?[]const @import("antfly_decisions").revisions.Node = null,
+    };
 
-    /// Receipt dependencies are the generated stages that actually answered,
-    /// not unreachable stages. With an executor, refresh those dependencies
-    /// for reuse; without one, hash the revisions recorded by execution.
-    pub fn cascadeRevision(self: Config, a: std.mem.Allocator, response: std.json.Value, executor: ?Executor, cache: *RevisionCache) !?[32]u8 {
+    pub fn parseRevisionRequest(a: std.mem.Allocator, raw: std.json.Value) !RevisionRequest {
+        const probe = std.json.parseFromValueLeaky(RevisionRequest, a, raw, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidAdjudicationOutput;
+        if ((probe.version != 1 and probe.version != 2) or probe.model.len == 0 or probe.model.len > 2048 or !std.unicode.utf8ValidateSlice(probe.model)) return error.InvalidAdjudicationOutput;
+        if (probe.version == 1 and probe.dependencies != null) return error.InvalidAdjudicationOutput;
+        if (probe.version == 2) {
+            const nodes = probe.dependencies orelse return error.InvalidAdjudicationOutput;
+            if (nodes.len == 0 or nodes.len > @import("antfly_decisions").revisions.max_nodes) return error.InvalidAdjudicationOutput;
+            var manifest: @import("antfly_decisions").revisions.Manifest = .{};
+            var projection = std.json.Value{ .object = .empty };
+            try projection.object.put(a, "upstream_revisions", raw.object.get("dependencies").?);
+            manifest.collect(projection) catch return error.InvalidAdjudicationOutput;
+        }
+        return probe;
+    }
+
+    pub const RevisionCache = struct {
+        stages: [@import("antfly_decisions").cascade.max_stages]RevisionProbe = @splat(.{}),
+        proxies: std.AutoHashMapUnmanaged([32]u8, RevisionProbe) = .empty,
+
+        pub fn deinit(self: *RevisionCache, a: std.mem.Allocator) void {
+            self.proxies.deinit(a);
+        }
+    };
+
+    pub fn isDecisionProxy(decider: std.json.Value) bool {
+        if (decider != .object) return false;
+        const method = decider.object.get("decision_method") orelse std.json.Value{ .string = "typed" };
+        const provider = decider.object.get("provider") orelse std.json.Value{ .string = "antfly" };
+        return method == .string and std.mem.eql(u8, method.string, "typed") and provider == .string and std.mem.eql(u8, provider.string, "antfly");
+    }
+
+    pub fn tracksResponseRevisions(self: Config) bool {
+        return self.cascadeStages().len > 0 or isDecisionProxy(self.decider);
+    }
+
+    pub fn reportedRevision(response: std.json.Value) !?[32]u8 {
+        if (response != .object) return error.InvalidAdjudicationOutput;
+        const raw = response.object.get("model_revision") orelse return null;
+        if (raw != .string or raw.string.len != 64) return error.InvalidAdjudicationOutput;
+        for (raw.string) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidAdjudicationOutput;
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, raw.string) catch return error.InvalidAdjudicationOutput;
+        return digest;
+    }
+
+    fn proxyRevision(self: Config, a: std.mem.Allocator, decider: std.json.Value, response: std.json.Value, executor: ?Executor, cache: *RevisionCache, index: usize) !?[32]u8 {
+        var dependencies: @import("antfly_decisions").revisions.Manifest = .{};
+        dependencies.collect(response) catch return error.InvalidAdjudicationOutput;
+        if (dependencies.len == 0) return null;
+        const scalar = dependencies.len == 1 and dependencies.nodes[0].kind == .model and dependencies.nodes[0].path.len == 0;
+        const recorded: [32]u8 = if (scalar) blk: {
+            var digest: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&digest, dependencies.nodes[0].identity) catch return error.InvalidAdjudicationOutput;
+            break :blk digest;
+        } else dependencies.digest(false);
+        // Incomplete historical projection cannot establish current execution
+        // dependencies. Preserve the stored receipt until explicitly rerun.
+        if (executor != null) for (dependencies.items()) |node| {
+            if (node.kind == .unverified) return error.CapabilityDiscoveryUnavailable;
+        };
+        const model = response.object.get("model") orelse return error.InvalidAdjudicationOutput;
+        if (model != .string or model.string.len == 0 or model.string.len > 2048 or !std.unicode.utf8ValidateSlice(model.string)) return error.InvalidAdjudicationOutput;
+        const current = executor orelse return recorded;
+        const resolve = current.model_revision orelse return error.CapabilityDiscoveryUnavailable;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&.{@intCast(index)});
+        hash.update(model.string);
+        const selectors = dependencies.digest(true);
+        hash.update(&selectors);
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        const cached = try cache.proxies.getOrPut(a, key);
+        if (!cached.found_existing) {
+            cached.value_ptr.* = .{};
+            var copy = self;
+            copy.decider = decider;
+            // Discovery-only envelope: never used as an inference request or
+            // persisted producer configuration. Hosts verify this exact route.
+            const probe = try std.json.Stringify.valueAlloc(a, .{ .decision_revision_probe = RevisionRequest{
+                .version = if (scalar) 1 else 2,
+                .specification = try copy.producerSpecification(a),
+                .model = model.string,
+                .dependencies = if (scalar) null else dependencies.items(),
+            } }, .{ .emit_null_optional_fields = false });
+            cached.value_ptr.revision = resolve(current.ptr, a, probe, self.revisionTimeout()) catch |err| {
+                cached.value_ptr.failure = err;
+                return err;
+            };
+        }
+        if (cached.value_ptr.failure) |err| return err;
+        return cached.value_ptr.revision orelse error.CapabilityDiscoveryUnavailable;
+    }
+
+    /// Previous writers pinned only the final generated answer of a proxy.
+    /// Used solely to recognize old bindings, never as proof of completeness.
+    pub fn legacyResponseRevision(self: Config, response: std.json.Value) !?[32]u8 {
+        if (response != .object) return error.InvalidAdjudicationOutput;
         const stages = self.cascadeStages();
-        if (stages.len == 0 or response != .object) return error.InvalidAdjudicationOutput;
+        if (stages.len == 0) return legacyProxyRevision(response);
+        const trace = response.object.get("cascade") orelse return error.InvalidAdjudicationOutput;
+        if (trace != .object) return error.InvalidAdjudicationOutput;
+        const entries = trace.object.get("stages") orelse return error.InvalidAdjudicationOutput;
+        if (entries != .array or entries.array.items.len > stages.len) return error.InvalidAdjudicationOutput;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var pinned = false;
+        for (entries.array.items, 0..) |entry, i| {
+            if (entry != .object) return error.InvalidAdjudicationOutput;
+            if (!entry.object.contains("answers")) continue;
+            const decider = stages[i].object.get("decider").?;
+            const revision = if (isDecisionProxy(decider)) try legacyProxyRevision(entry) else blk: {
+                const method = decider.object.get("decision_method") orelse continue;
+                if (method != .string or !std.mem.eql(u8, method.string, "generated")) continue;
+                break :blk try reportedRevision(entry);
+            };
+            if (revision) |digest| {
+                hash.update(stages[i].object.get("name").?.string);
+                hash.update(&digest);
+                pinned = true;
+            }
+        }
+        if (!pinned) return null;
+        var out: [32]u8 = undefined;
+        hash.final(&out);
+        return out;
+    }
+    fn legacyProxyRevision(response: std.json.Value) !?[32]u8 {
+        if (response != .object) return error.InvalidAdjudicationOutput;
+        const answers = response.object.get("answers") orelse return error.InvalidAdjudicationOutput;
+        if (answers != .array or answers.array.items.len != 1 or answers.array.items[0] != .object) return error.InvalidAdjudicationOutput;
+        const method = answers.array.items[0].object.get("decision_method") orelse return error.InvalidAdjudicationOutput;
+        if (method != .string) return error.InvalidAdjudicationOutput;
+        return if (std.mem.eql(u8, method.string, "generated")) try reportedRevision(response) else null;
+    }
+
+    fn revisionTimeout(self: Config) u32 {
+        var timeout = @min(self.timeout_ms, self.budget_ms);
+        if (self.cascadeStages().len > 0) {
+            const body = self.decider.object.get("cascade").?;
+            if (body.object.get("budget")) |budget| if (budget == .object) if (budget.object.get("deadline_ms")) |deadline| {
+                if (deadline == .integer and deadline.integer > 0) timeout = @intCast(@min(timeout, deadline.integer));
+            };
+        }
+        return timeout;
+    }
+
+    /// Receipt dependencies are the generated executions that actually answered,
+    /// including typed proxy stages, never unreachable stages. With an executor, refresh those dependencies
+    /// for reuse; without one, hash the revisions recorded by execution.
+    pub fn responseRevision(self: Config, a: std.mem.Allocator, response: std.json.Value, executor: ?Executor, cache: *RevisionCache) !?[32]u8 {
+        const stages = self.cascadeStages();
+        if (response != .object) return error.InvalidAdjudicationOutput;
+        if (stages.len == 0) {
+            if (!isDecisionProxy(self.decider)) return error.InvalidAdjudicationOutput;
+            return self.proxyRevision(a, self.decider, response, executor, cache, 0);
+        }
         const trace = response.object.get("cascade") orelse return error.InvalidAdjudicationOutput;
         if (trace != .object) return error.InvalidAdjudicationOutput;
         const executed = trace.object.get("stages") orelse return error.InvalidAdjudicationOutput;
-        if (executed != .array or executed.array.items.len > stages.len or stages.len > cache.len) return error.InvalidAdjudicationOutput;
+        if (executed != .array or executed.array.items.len > stages.len or stages.len > cache.stages.len) return error.InvalidAdjudicationOutput;
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         var pinned = false;
         for (executed.array.items, 0..) |entry, i| {
@@ -166,19 +321,25 @@ pub const Config = struct {
             if (name != .string or !std.mem.eql(u8, name.string, configured_name)) return error.InvalidAdjudicationOutput;
             if (!entry.object.contains("answers")) continue;
             const decider = stages[i].object.get("decider").?;
+            if (isDecisionProxy(decider)) {
+                if (try self.proxyRevision(a, decider, entry, executor, cache, i)) |digest| {
+                    hasher.update(configured_name);
+                    hasher.update(&digest);
+                    pinned = true;
+                }
+                continue;
+            }
             const method = decider.object.get("decision_method") orelse continue;
             if (method != .string or !std.mem.eql(u8, method.string, "generated")) continue;
+            const recorded = try reportedRevision(entry);
             const revision: ?[32]u8 = if (executor) |current| blk: {
-                const resolve = current.model_revision orelse break :blk null;
-                const probe = &cache[i];
+                const resolve = current.model_revision orelse {
+                    if (recorded != null) return error.CapabilityDiscoveryUnavailable;
+                    break :blk null;
+                };
+                const probe = &cache.stages[i];
                 if (!probe.resolved) {
-                    var timeout = @min(self.timeout_ms, self.budget_ms);
-                    const body = self.decider.object.get("cascade").?;
-                    if (body.object.get("budget")) |budget| if (budget == .object) if (budget.object.get("deadline_ms")) |deadline| {
-                        if (deadline != .integer or deadline.integer <= 0) return error.InvalidAdjudicationConfig;
-                        timeout = @intCast(@min(timeout, deadline.integer));
-                    };
-                    probe.revision = resolve(current.ptr, a, try self.stageProducerSpecification(a, stages[i]), timeout) catch |err| {
+                    probe.revision = resolve(current.ptr, a, try self.stageProducerSpecification(a, stages[i]), self.revisionTimeout()) catch |err| {
                         probe.resolved = true;
                         probe.failure = err;
                         return err;
@@ -186,14 +347,9 @@ pub const Config = struct {
                     probe.resolved = true;
                 }
                 if (probe.failure) |err| return err;
+                if (recorded != null and probe.revision == null) return error.CapabilityDiscoveryUnavailable;
                 break :blk probe.revision;
-            } else blk: {
-                const raw = entry.object.get("model_revision") orelse break :blk null;
-                if (raw != .string or raw.string.len != 64) return error.InvalidAdjudicationOutput;
-                var digest: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&digest, raw.string) catch return error.InvalidAdjudicationOutput;
-                break :blk digest;
-            };
+            } else recorded;
             if (revision) |digest| {
                 hasher.update(configured_name);
                 hasher.update(&digest);
@@ -213,6 +369,7 @@ pub const Config = struct {
         defer a.free(raw);
         copy.decider = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .allocate = .alloc_always });
         redactCredentials(&copy.decider);
+        _ = @import("antfly_decisions").cascade.omitDisabledAgreement(&copy.decider);
         return copy;
     }
     pub fn producerSpecification(self: Config, a: std.mem.Allocator) ![]u8 {
@@ -222,6 +379,7 @@ pub const Config = struct {
             const raw = try std.json.Stringify.valueAlloc(a, decider, .{});
             defer a.free(raw);
             decider = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .allocate = .alloc_always });
+            _ = @import("antfly_decisions").cascade.omitDisabledAgreement(&decider);
             if (std.mem.eql(u8, method.string, "generated")) {
                 try self.boundGeneratedBatch(a, &decider);
             } else for (decider.object.get("cascade").?.object.get("stages").?.array.items) |*stage| {
@@ -312,6 +470,15 @@ pub const Result = union(enum) { value: []u8, failure: []const u8 };
 pub const Executor = struct {
     ptr: *anyopaque,
     execute: *const fn (*anyopaque, std.mem.Allocator, Request) anyerror![]u8,
+    /// Discovery only. Proxy dependencies use a versioned
+    /// decision_revision_probe envelope containing the original specification
+    /// and reported model. Version 1 returns the raw single-model revision.
+    /// Version 2 includes a bounded flat dependencies array; return the current
+    /// Manifest.digest(false), preserving execution order and checking every
+    /// cascade definition and executed model against the configured route.
+    /// A verifier must prove the current configured route,
+    /// not merely that the old resolved leaf still exists. Missing verification
+    /// is an availability failure for a recorded dependency.
     model_revision: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32) anyerror!?[32]u8 = null,
     execute_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const Request) anyerror![]Result = null,
     get_description: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!?[]u8 = null,
@@ -363,7 +530,7 @@ fn answeringDecider(config: Config, response: std.json.Value, definition: ?*cons
     return stages[index].object.get("decider").?;
 }
 
-/// Only a well-formed, typed, normalized choice distribution can change identity.
+/// Only well-formed normalized decision evidence can change identity.
 pub fn classify(a: std.mem.Allocator, config: Config, response: std.json.Value) !Status {
     if (config.cascadeStages().len == 0) return classifyResponse(config, response, null);
     var classifier = try Classifier.init(a, config);
@@ -374,7 +541,8 @@ pub fn classify(a: std.mem.Allocator, config: Config, response: std.json.Value) 
 fn classifyResponse(config: Config, response: std.json.Value, definition: ?*const @import("antfly_decisions").cascade.Definition) !Status {
     if (response != .object) return error.InvalidAdjudicationOutput;
     const model = response.object.get("model") orelse return error.InvalidAdjudicationOutput;
-    if (model != .string or model.string.len == 0) return error.InvalidAdjudicationOutput;
+    if (model != .string or model.string.len == 0 or model.string.len > 2048 or !std.unicode.utf8ValidateSlice(model.string)) return error.InvalidAdjudicationOutput;
+    _ = try Config.reportedRevision(response);
     const answers = response.object.get("answers") orelse return error.InvalidAdjudicationOutput;
     if (answers != .array or answers.array.items.len != 1) return error.InvalidAdjudicationOutput;
     const answer = answers.array.items[0];
@@ -386,17 +554,34 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
     // A cascade answer is checked against the stage that produced it.
     const answering = try answeringDecider(config, response, definition);
     const expected_method = answering.object.get("decision_method") orelse std.json.Value{ .string = "typed" };
-    if (expected_method != .string or !std.mem.eql(u8, method.string, expected_method.string)) return error.InvalidAdjudicationOutput;
+    // `typed` selects the Decisions transport. A remote named decider may
+    // return generated evidence, including from inside a local frozen cascade.
+    const proxy = Config.isDecisionProxy(answering);
+    if (expected_method != .string or (!proxy and !std.mem.eql(u8, method.string, expected_method.string))) return error.InvalidAdjudicationOutput;
+    const generated = std.mem.eql(u8, method.string, "generated");
     var verdict_only = false;
-    if (std.mem.eql(u8, method.string, "generated")) {
+    if (generated) {
         const source = answer.object.get("probability_source") orelse return error.InvalidAdjudicationOutput;
-        const policy = answering.object.get("probabilities") orelse std.json.Value{ .string = "token_logprobs" };
-        verdict_only = policy == .string and std.mem.eql(u8, policy.string, "verdict_only");
-        if (source != .string or !std.mem.eql(u8, source.string, if (verdict_only) "verdict" else "token_logprobs")) return error.InvalidAdjudicationOutput;
+        if (proxy) {
+            if (source != .string or (!std.mem.eql(u8, source.string, "verdict") and !std.mem.eql(u8, source.string, "token_logprobs"))) return error.InvalidAdjudicationOutput;
+            verdict_only = std.mem.eql(u8, source.string, "verdict");
+        } else {
+            const policy = answering.object.get("probabilities") orelse std.json.Value{ .string = "token_logprobs" };
+            verdict_only = policy == .string and std.mem.eql(u8, policy.string, "verdict_only");
+            if (source != .string or !std.mem.eql(u8, source.string, if (verdict_only) "verdict" else "token_logprobs")) return error.InvalidAdjudicationOutput;
+        }
         if (!answer.object.contains("raw_structured_answer")) return error.InvalidAdjudicationOutput;
     }
     const probabilities = answer.object.get("probabilities") orelse return error.InvalidAdjudicationOutput;
     if (probabilities != .array or probabilities.array.items.len != config.question.choices.len) return error.InvalidAdjudicationOutput;
+    const selected = answer.object.get("choice") orelse return error.InvalidAdjudicationOutput;
+    if (selected != .string) return error.InvalidAdjudicationOutput;
+    if (generated) {
+        const raw = answer.object.get("raw_structured_answer").?;
+        if (raw != .string or !std.mem.eql(u8, raw.string, selected.string)) return error.InvalidAdjudicationOutput;
+    }
+    var selected_probability: ?f64 = null;
+    var maximum: f64 = 0;
     var accepted: f64 = 0;
     var rejected: f64 = 0;
     var total: f64 = 0;
@@ -416,8 +601,11 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
                 else => return error.InvalidAdjudicationOutput,
             };
             if (!std.math.isFinite(probability) or probability < 0 or probability > 1) return error.InvalidAdjudicationOutput;
-            if (verdict_only and probability != 0 and probability != 1) return error.InvalidAdjudicationOutput;
+            // Verdict-only evidence must assert exactly the sampled choice.
+            if (verdict_only and probability != @as(f64, if (std.mem.eql(u8, selected.string, choice.value)) 1 else 0)) return error.InvalidAdjudicationOutput;
             total += probability;
+            maximum = @max(maximum, probability);
+            if (std.mem.eql(u8, selected.string, choice.value)) selected_probability = probability;
             if (std.mem.eql(u8, choice.value, config.accept.choice)) accepted = probability;
             if (config.reject) |reject| if (std.mem.eql(u8, choice.value, reject.choice)) {
                 rejected = probability;
@@ -425,8 +613,12 @@ fn classifyResponse(config: Config, response: std.json.Value, definition: ?*cons
         }
         if (!found) return error.InvalidAdjudicationOutput;
     }
-    if (@abs(total - 1) > 0.001) return error.InvalidAdjudicationOutput;
-    if (accepted >= config.accept.min_probability and accepted > 0.5) return .accepted;
-    if (config.reject) |reject| if (rejected >= reject.min_probability and rejected > 0.5) return .rejected;
+    const selected_p = selected_probability orelse return error.InvalidAdjudicationOutput;
+    // Typed choices are derived from their distribution. Generated choices are
+    // sampled decoder output and can legitimately have a lower probability.
+    if (@abs(total - 1) > 0.001 or (!generated and selected_p != maximum)) return error.InvalidAdjudicationOutput;
+    if (@import("antfly_decisions").cascade.agreementBlocked(response) catch return error.InvalidAdjudicationOutput) return .abstained;
+    if (std.mem.eql(u8, selected.string, config.accept.choice) and accepted >= config.accept.min_probability and accepted > 0.5) return .accepted;
+    if (config.reject) |reject| if (std.mem.eql(u8, selected.string, reject.choice) and rejected >= reject.min_probability and rejected > 0.5) return .rejected;
     return .abstained;
 }

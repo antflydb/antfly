@@ -247,6 +247,10 @@ resolver `adjudicate` policy or decision enrichment.
 - Only choice and predicate questions are accepted, because bands read
   probabilities. Embedding-similarity deciders and nested cascades cannot be
   stages, and a band cannot follow a `verdict_only` generated stage.
+  This also applies to dynamically returned proxy answers: a verdict's `0/1`
+  assertion cannot drive a confidence band. An unmeasurable result follows its
+  producing stage's failure policy, retaining paid usage and completed siblings.
+  A valid veto stops before any later band's evidence is inspected.
 - Escalation applies to successful answers. It is not failover: a stage error
   ends the input unless that stage sets `on_failure: keep_previous`, which keeps
   the previous answer and records the error. The first stage defaults to `fail`;
@@ -261,6 +265,72 @@ resolver `adjudicate` policy or decision enrichment.
   when every stage does. Question and choice selectors are validated against
   the request before any stage runs. Native model discovery runs only when a
   stage is reached, under its deadline and failure policy.
+
+Set `require_agreement: true` on a later stage to require its vote to match
+that of the preceding stage before accepting the result:
+
+```yaml
+- name: strong
+  decider:
+    decision_method: generated
+    generator: {provider: openai, model: your-strong-model}
+  when: {question: same, choice: same, probability_between: [0.3, 1.0]}
+  require_agreement: true
+```
+
+This band sends **every positive candidate**, including confident positives,
+for confirmation. A narrower uncertainty band leaves confident earlier answers
+unchecked. `when.choice` selects the probability used for escalation; agreement
+compares selected choice strings. Predicate votes must be strictly on the same
+side of 0.5; a tie at 0.5 does not agree. `when.question` scopes the comparison
+to that question; without it, all questions must agree.
+
+Disagreement stops that input immediately. Later stages cannot override the
+veto, and other inputs continue independently. Raw final answers and accumulated
+usage remain available through `ai_decide` and the Decisions API; SQL
+`ai_choice`, `ai_score`, and `ai_probability` return NULL. Predicate convenience
+clients return `DecisionAbstained`. Resolver adjudication remains REVIEW even
+with `on_failure: mint`, because disagreement is an abstention rather than an
+operational failure.
+
+Guarded stage traces and the aggregate trace contain `agreement_status`:
+`agreed`, `disagreed`, or `unverified`. The derived `agreed` boolean appears for
+completed comparisons, and sorted `disagreed_questions` appears only for
+disagreement. A guarded stage failing with `keep_previous` retains the earlier
+answer but reports `unverified` and abstains. No agreement fields appear when
+neither a local nor an upstream check ran. A successful check remains recorded
+if a later unguarded stage runs; guard every later stage whose answer must also
+be confirmed.
+
+An upstream cascade's `disagreed` or `unverified` result also stops an outer
+cascade, including at its first or an unguarded stage. Stage receipts preserve a
+bounded `upstream_agreement` summary with its reported status, disagreement
+question names, and available cascade identity. They do not recursively embed
+upstream traces or claim to verify the upstream definition. A local required
+comparison is `unverified` when its upstream abstains; the aggregate retains the
+upstream veto. Resolver policies honor this abstention even when they use a
+plain typed proxy and `on_failure: mint`.
+
+For `provider: antfly`, the default `typed` method selects the Decisions
+transport. A remote named decider may return typed or generated answers,
+including a sampled choice that differs from its distribution's argmax. Proxy
+consumers validate each answer's reported method and probability evidence before
+honoring agreement. Generated token probabilities and categorical verdicts keep
+their original meaning; embedding-similarity responses still require explicit
+configuration. A stage receipt records its configured execution method; each
+answer retains the method that actually produced it.
+
+Generated choice votes retain the sampled structured answer, which need not be
+the highest-probability alternative. Resolver thresholds apply to that selected
+vote; probability mass on another choice cannot accept or reject the pair.
+
+Disabled guards are omitted from forwarded and persisted configuration, so
+unguarded cascades remain readable at epoch 30. Enabled guards require epoch 31.
+SDK constructors omit the optional guard unless explicitly configured.
+
+Agreement records matching votes; it does not establish model independence or
+calibrated confidence. Use suitable independent evidence and evaluate the
+resulting policy on representative data.
 
 Responses carry a `cascade` trace per input (top-level for single input, on each
 batch row otherwise):
@@ -278,6 +348,17 @@ provide token logprobs. Such stages can appear only last. Resolver probability
 thresholds still apply to the probabilistic stages; a terminal verdict-only
 stage must choose categorically, and its reported 0/1 distribution is not a
 calibrated confidence estimate.
+Stage traces also retain a flat `upstream_revisions` manifest, bounded to 32
+entries and eight stage path levels. It records every successful generated
+model revision and the upstream cascade definitions, including dependencies
+before a typed final answer. An empty manifest explicitly records no versioned
+dependencies; missing provenance on older projected upstream traces cannot
+establish that the upstream was unversioned. Resolver replay requires an
+authoritative verifier for composite routes and preserves stored receipts when
+that verification is unavailable. Stored successful responses are reclassified
+under the current policy without model inference; an upstream veto retracts a
+historical accepted verdict to REVIEW and restores the mention's own endpoint.
+
 Stage traces include `model_revision` when the provider reports an immutable
 revision. Resolver adjudication verifies the definition, escalation decisions,
 stage order, and agreement between the trace and the final answer.

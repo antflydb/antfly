@@ -332,14 +332,35 @@ A response without the trace is invalid. The receipt keeps the normalized
 response, including the trace, under `response`; the `Evidence` layout is
 unchanged. Generated stages get the resolver's per-call batch bounds, and the
 receipt hash mixes in revisions reported by generated stages that actually
-answered. Reuse discovers only those dependencies; unreachable stages do not
+answered, including generated answers returned through typed Antfly proxies. Reuse discovers only those dependencies; unreachable stages do not
 become availability dependencies. If an executed dependency cannot be verified,
 the previous committed verdict is preserved and the refresh fails. Explicit
 `keep_previous` outcomes remain replay-stable until inputs, policy, or a
 reported dependency changes.
+
+Reported generated revisions are execution dependencies for direct proxy
+policies and proxy stages too. Discovery is cached by local stage and resolved
+model within a resolution batch; it never invokes inference. A missing verifier,
+missing revision, or discovery failure preserves the committed receipt and
+returns a discovery error (`CapabilityDiscoveryUnavailable` when verification is
+absent), including under `on_failure: mint`.
+Receipts without reported revisions retain their offline replay behavior.
+The native adapter can verify an exact linked model route using native
+metadata. HTTP Decisions routes and opaque gateway aliases require a host revision verifier that can prove
+the current alias binding; querying the previously resolved leaf is insufficient.
+Earlier dependency-free proxy bindings and native hex-hash bindings are upgraded
+only after the recorded revision is verified, without repeating inference.
+
 Probability thresholds apply to the probabilistic stages; a terminal
 verdict-only stage must provide a categorical 0/1 distribution. Catalogs with a cascade policy
-require reader epoch 30.
+require reader epoch 30; policies with an enabled `require_agreement` guard
+require epoch 31. Disabled guards are omitted from stored definitions, preserving
+the epoch-30 wire contract. Generated choice votes remain the sampled structured
+answer; they need not be the distribution's argmax. Thresholds act only on the
+selected vote, and raw-answer inconsistencies remain invalid. Agreement is recomputed from validated stage answers before
+thresholds apply. Disagreed or unverified comparisons commit an abstained
+receipt and remain REVIEW even with `on_failure: mint`. These receipts replay
+without fresh inference until their normal policy or dependency invalidation.
 
 **Description inputs.** Extraction mentions may supply `description` and a numeric
 `description_embedding`; candidate document fields supply the corresponding text
@@ -3223,4 +3244,5 @@ compiled trace validator once per resolution batch. Classifying each response
 validates every executed stage without allocating or rebuilding the plan;
 revision-dependent specification hashes are reused within the batch. Both
 cascade adjudication and cascade decision enrichments fence readers below
-epoch 30, including grouped enrichment producers.
+epoch 30, including grouped enrichment producers. Enabling an agreement guard
+raises that fence to epoch 31; absent or explicit-false guards retain epoch 30.

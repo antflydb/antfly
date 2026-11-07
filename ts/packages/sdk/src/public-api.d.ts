@@ -18328,9 +18328,11 @@ export interface components {
                 question?: string;
                 /** @description For choice questions, measure this value's probability. Omitted, the selected value's probability. */
                 choice?: string;
-                /** @description Lower and upper bound, lower strictly below upper. The previous stage must not be verdict_only. */
+                /** @description Lower and upper bound, lower strictly below upper. Inputs must have measured probabilities. The previous stage must not be verdict_only; a dynamically returned proxy verdict fails its producing stage under on_failure instead of driving the band. */
                 probability_between: number[];
             };
+            /** @description Require this stage to agree with the preceding stage on the band question, or every question when unscoped. True is allowed only after the first stage. Disagreement stops this input and abstains; a keep_previous failure leaves agreement unverified and also abstains. */
+            require_agreement?: boolean;
             /**
              * @description Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
              * @default fail
@@ -18352,7 +18354,7 @@ export interface components {
             /** @enum {string} */
             provider?: "antfly" | "jev" | "openai" | "cloudflare";
             /**
-             * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
+             * @description Execution contract. With provider antfly, typed invokes the Decisions endpoint; remote named deciders may return validated typed or generated answers, including upstream cascade outcomes. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities. cascade runs the stages in `cascade` and accepts choice and predicate questions only.
              * @default typed
              * @enum {string}
              */
@@ -30793,6 +30795,30 @@ export interface components {
             };
         };
         InferenceDecideAnswer: components["schemas"]["GeneratedChoiceAnswer"] | components["schemas"]["GeneratedMultiChoiceAnswer"] | components["schemas"]["GeneratedPredicateAnswer"] | components["schemas"]["GeneratedScoreAnswer"] | components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
+        /**
+         * @description A required comparison agreed, disagreed, or could not run because its stage failed with keep_previous or its upstream abstained. Disagreed and unverified outcomes abstain without discarding model answers or usage.
+         * @enum {string}
+         */
+        DecisionCascadeAgreementStatus: "agreed" | "disagreed" | "unverified";
+        /** @description Flat execution dependency relative to the upstream Decisions invocation. Model entries pin generated model revisions; cascade entries pin definitions. Unverified entries mark incomplete historical provenance and cannot authorize receipt reuse. */
+        DecisionRevisionDependency: {
+            /** @enum {string} */
+            kind: "model" | "cascade" | "unverified";
+            path: string[];
+            identity: string;
+            model?: string;
+        };
+        /** @description Bounded agreement summary reported by the stage's upstream provider. This preserves upstream abstention without recursively embedding its trace; the upstream definition is not locally verified. A disagreed or unverified upstream stops the input, including at the first or an unguarded stage. */
+        DecisionCascadeUpstreamAgreement: {
+            agreement_status: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description True for agreed, false for disagreed, absent for unverified. */
+            agreed?: boolean;
+            /** @description Sorted names from this stage's answers; required only for disagreed. */
+            disagreed_questions?: string[];
+            decider?: string;
+            definition_sha256?: string;
+            answered_by?: string;
+        };
         DecisionUsage: {
             /** @description True for estimated usage, including apportioned shared generated-batch costs and embedding-based estimates. Generated cascades divide shared totals evenly, assigning integer remainders in input order; their request aggregate remains measured. */
             estimated?: boolean;
@@ -30802,6 +30828,14 @@ export interface components {
             output_tokens: number;
         };
         DecisionCascadeStageTrace: {
+            /** @description Complete bounded upstream execution dependencies. An empty array explicitly records no versioned dependencies. Omission on historical projected proxy stages indicates incomplete provenance. */
+            upstream_revisions?: components["schemas"]["DecisionRevisionDependency"][];
+            upstream_agreement?: components["schemas"]["DecisionCascadeUpstreamAgreement"];
+            agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
+            agreed?: boolean;
+            /** @description Sorted question names that disagreed. Present only when agreement_status is disagreed. */
+            disagreed_questions?: string[];
             name: string;
             /** @enum {string} */
             decision_method: "typed" | "generated";
@@ -30822,6 +30856,11 @@ export interface components {
         };
         /** @description Present when a cascade decider answered. Lists the stages that ran for this input, in order. The top-level model and answers come from the answering stage, and usage is the sum over these stages. */
         DecisionCascadeTrace: {
+            agreement_status?: components["schemas"]["DecisionCascadeAgreementStatus"];
+            /** @description Derived comparison result. Present only for agreed or disagreed checks; absent when no check ran or verification was unavailable. */
+            agreed?: boolean;
+            /** @description Sorted question names that disagreed. Present only when agreement_status is disagreed. */
+            disagreed_questions?: string[];
             /** @description The configured cascade name. */
             decider: string;
             /** @description Identity of the cascade definition, excluding credentials. Any change to stages, bands, failure policy or budget changes it. */
