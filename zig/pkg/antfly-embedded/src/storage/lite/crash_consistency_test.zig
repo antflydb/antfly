@@ -935,6 +935,83 @@ fn runFullTextWithRetirement(allocator: Allocator, path: []const u8, io: std.Io,
     try runRetirementTurn(allocator, &handle);
 }
 
+/// Regression coverage for a bug found alongside dense's native-catalog
+/// storage work: a crash-sweep scenario that calls `db.addIndex()` for a
+/// SECOND index mid-run (after the default `body_text` index already
+/// exists) used to see cascading `OutcomeUnknown`/`InputOutput` in the
+/// UNCRASHED discovery pass, including on `body_text` itself, which this
+/// scenario never touches via `addIndex`. Root cause:
+/// `DB.addIndexForReconciliation` funneled every post-commit activation
+/// error -- including an outcome-unknown one from an injected crash/fault --
+/// into `recoverCommittedIndexAdmission`, which always returned success (a
+/// repair id or `null`). That violated this harness's own contract (`Scenario
+/// .run` "must propagate every error, including the shim's injected crash
+/// error"): `addIndex()` reporting success over state the native commit
+/// protocol could not actually confirm let the discovery pass's "never
+/// crashed" branch run strict checks against a reopened file whose on-disk
+/// checkpoint had legitimately rolled back, and `checkpoint_publication_
+/// uncertain` is file-wide, so that rollback poisoned every subsequent
+/// `beginTransaction()` -- including `body_text`'s own background catch-up.
+/// Fixed in `recoverCommittedIndexAdmission` (db.zig): an outcome-unknown
+/// activation error is now propagated instead of swallowed (same error
+/// class `batchTrackedWithMarkerAndWriterLaneHook` already refuses to
+/// swallow for ordinary primary writes).
+///
+/// Like `runFullTextWithRetirement`'s retirement turn, `addIndex` itself
+/// touches no document key, so it adds no `Checkpoint` of its own -- but the
+/// sweep still crosses every barrier inside that call. A `body_text` write
+/// both before and after `addIndex` proves the shared catalog/checkpoint
+/// state survives the second index's admission; the vector write afterward
+/// proves the new index's own admission+write path is crash-consistent too.
+fn runDenseVectorAddIndexMidScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed body", .searchable_after = "seed" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .full_text });
+
+    try handle.db.addIndex(.{
+        .name = "dv_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "after-add-index", .before = null, .after = "needle in a haystack", .searchable_after = "needle" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "after-add-index", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+
+    // `after` checks a substring of the stored document's own JSON (see
+    // `checkInFlightResolutionDb`'s round-trip note), so this checks a
+    // plain marker field rather than the `_embeddings` directive itself,
+    // whose own on-disk round-trip shape is not this test's concern.
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "dv-doc", .before = null, .after = "dv-doc-marker" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" }}, .sync_level = .full_index });
+}
+
+/// Sparse analog of `runDenseVectorAddIndexMidScenario`: same bug, same
+/// fix, same shape, with a `sparse_vector` index and the flat
+/// `{"<token id>": <weight>}` `_embeddings` wire shape instead of a dense
+/// array (see `write_amplification_bench_test.zig`'s `sparseVectorJsonAlloc`
+/// for the same shape used elsewhere).
+fn runSparseVectorAddIndexMidScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed body", .searchable_after = "seed" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .full_text });
+
+    try handle.db.addIndex(.{
+        .name = "sp_idx",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"embedding\",\"external\":true}",
+    });
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "after-add-index", .before = null, .after = "needle in a haystack", .searchable_after = "needle" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "after-add-index", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "sp-doc", .before = null, .after = "sp-doc-marker" }} });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "sp-doc", .value = "{\"marker\":\"sp-doc-marker\",\"_embeddings\":{\"sp_idx\":{\"5\":1.0,\"12\":0.5}}}" }}, .sync_level = .full_index });
+}
+
 test "crash sweep: primary single doc" {
     var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-single-doc", .run = runPrimarySingleDoc }, .{});
     defer report.deinit();
@@ -1064,6 +1141,30 @@ test "crash sweep: full text with non-durable commit" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "full-text-with-non-durable-commit",
         .run = runFullTextWithNonDurableCommit,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: dense vector add-index mid-scenario" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "dense-vector-add-index-mid-scenario",
+        .run = runDenseVectorAddIndexMidScenario,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: sparse vector add-index mid-scenario" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "sparse-vector-add-index-mid-scenario",
+        .run = runSparseVectorAddIndexMidScenario,
         .via_db = true,
         .search_index = "body_text",
         .search_field = "body",
