@@ -24,9 +24,9 @@ class DeciderCascadeStage:
         decider (DeciderConfig):
         when (DeciderCascadeStageWhen | Unset): Required on every stage except the first, which must omit it. Inclusive
             band on the previous stage's answer.
-        on_failure (DeciderCascadeStageOnFailure | Unset): Not allowed on the first stage. fail ends the input with this
-            stage's error; keep_previous keeps the previous answer and records the error in the trace. Default:
-            DeciderCascadeStageOnFailure.FAIL.
+        on_failure (DeciderCascadeStageOnFailure | Unset): Defaults to fail, including on the first stage. fail ends the
+            input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and
+            is allowed only after the first stage. Default: DeciderCascadeStageOnFailure.FAIL.
     """
 
     name: str

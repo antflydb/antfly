@@ -18332,7 +18332,7 @@ export interface components {
                 probability_between: number[];
             };
             /**
-             * @description Not allowed on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace.
+             * @description Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
              * @default fail
              * @enum {string}
              */

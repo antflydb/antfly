@@ -3040,3 +3040,50 @@ test "decision provider cascade enrichment publication and reopen preserve reade
         try std.testing.expectEqual(catalog.decider_cascade_reader_version, manager.minimum_reader_version.load(.acquire));
     }
 }
+
+test "decision provider cascade public image declarations constrain HTTP SQL and expressions" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var client = httpx.Client.init(a, std.testing.io);
+    defer client.deinit();
+    var registry = try registry_mod.Registry.parseFromSlice(a,
+        \\{"deciders":{"c":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","max_image_input_tokens":100}},{"name":"strong","decider":{"provider":"jev","max_image_input_tokens":100},"when":{"probability_between":[0.3,0.9]}}]}}}}
+    );
+    defer registry.deinit();
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = std.testing.io };
+    defer runtime.deinit();
+    const view = @import("../common/inference_gateway.zig").View{ .providers = &registry };
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\{"same":{"type":"choice","instructions":"Same?","criteria":{"same":"Same","different":"Different"}}}
+    , .{});
+    const image = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}]
+    , .{}));
+    const text = try decisions.Input.fromJson(try std.json.parseFromSliceLeaky(decisions.Json, scratch,
+        \\[{"role":"user","content":"text"}]
+    , .{}));
+    try std.testing.expect((try registry.getDeciderCapabilities("c")).images);
+    const id = try a.dupe(u8, "deciders/c");
+    try registry.inference_capabilities.put(a, id, .{});
+    const Support = @import("../common/inference_capabilities.zig").Support;
+    for ([_]Support{ .unknown, .unsupported, .supported }) |support| {
+        registry.inference_capabilities.getPtr(id).?.images = support;
+        for ([_][]const u8{ "c", "deciders/c" }) |name| {
+            const caps = try registry.getDeciderCapabilities(name);
+            try std.testing.expectEqual(support == .supported, caps.images);
+            try std.testing.expect(caps.messages);
+            const requests = [_]decisions.Request{.{ .decider = name, .questions = questions, .input = image }};
+            if (support == .supported) {
+                try runtime.provider().validateRequests(scratch, &requests);
+            } else try std.testing.expectError(error.UnsupportedInferenceFeature, runtime.provider().validateRequests(scratch, &requests));
+            try runtime.provider().validateRequests(scratch, &.{.{ .decider = name, .questions = questions, .input = text }});
+        }
+        try std.testing.expectEqual(if (support == .supported) Support.supported else Support.unsupported, view.capabilities(.{ .configured = .{ .task = .decide, .name = "c" } }).images);
+    }
+    // A positive public declaration cannot expand a text-only stage.
+    registry.decider_configs.getPtr("c#fast").?.max_image_input_tokens = null;
+    try std.testing.expect(!(try registry.getDeciderCapabilities("c")).images);
+    try std.testing.expectEqual(@as(u64, 0), runtime.rows);
+}

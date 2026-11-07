@@ -10397,7 +10397,7 @@ pub const DeciderCascadeStage = struct {
     decider: DeciderConfig,
     /// Required on every stage except the first, which must omit it. Inclusive band on the previous stage's answer.
     when: ?std.json.Value = null,
-    /// Not allowed on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace.
+    /// Defaults to fail, including on the first stage. fail ends the input with this stage's error; keep_previous keeps the previous answer and records the error in the trace, and is allowed only after the first stage.
     on_failure: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

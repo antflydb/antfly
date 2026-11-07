@@ -24,8 +24,10 @@ All notable changes to Antfly will be documented in this file.
   trace. Definitions compile once; optional native stages discover models under
   the cascade deadline and failure policy. Shared generated-batch usage is
   apportioned across inputs and marked as estimated; retained typed failures
-  preserve measured usage. Resolver batches reuse one compiled classification
-  plan. Resolver catalogs and decision enrichment producers that use a cascade
+  preserve measured usage. SDK-emitted first-stage `on_failure: fail` defaults
+  are accepted, public image-capability denials constrain the whole cascade,
+  and committed failure receipts remain stable on replay. Resolver batches reuse
+  one compiled classification plan. Resolver catalogs and decision enrichment producers that use a cascade
   require reader epoch 30.
 
 - **`@antfly/design-system` license** — first-party code in the package is now

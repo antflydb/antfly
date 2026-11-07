@@ -245,7 +245,9 @@ resolver `adjudicate` policy or decision enrichment.
   stages, and a band cannot follow a `verdict_only` generated stage.
 - Escalation applies to successful answers. It is not failover: a stage error
   ends the input unless that stage sets `on_failure: keep_previous`, which keeps
-  the previous answer and records the error. A later stage's operational failure
+  the previous answer and records the error. The first stage defaults to `fail`;
+  explicitly setting `on_failure: fail` is equivalent to omission, while
+  `keep_previous` requires a preceding stage. A later stage's operational failure
   does not discard confident siblings that already completed an earlier stage.
 - `budget.max_model_calls` (at most 8, at least the stage count) bounds stage
   invocations; `budget.deadline_ms` narrows the caller's deadline.

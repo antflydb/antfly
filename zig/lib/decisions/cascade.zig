@@ -138,7 +138,9 @@ pub fn compile(a: A, value: V) !Definition {
         if (fields.get("on_failure")) |policy| stage.on_failure = std.meta.stringToEnum(OnFailure, try text(policy)) orelse return error.InvalidDecisionCascade;
         if (i == 0) {
             // The first stage answers every item and has nothing to fall back to.
-            if (fields.contains("when") or fields.contains("on_failure")) return error.InvalidDecisionCascade;
+            // Explicit fail is equivalent to omission, including defaults
+            // emitted by generated SDKs. Only keep_previous needs a prior answer.
+            if (fields.contains("when") or stage.on_failure != .fail) return error.InvalidDecisionCascade;
             continue;
         }
         const when = try object(fields.get("when") orelse return error.InvalidDecisionCascade);
@@ -935,4 +937,20 @@ test "decision cascade rejects similarity-only answers as band input" {
     try std.testing.expect(try inBand(.{ .low = 0.3, .high = 0.9 }, predicate));
     try std.testing.expect(!try inBand(.{ .low = 0.3, .high = 0.89 }, predicate));
     try std.testing.expect(try inBand(.{ .question = "q", .low = 0.9, .high = 1 }, predicate));
+}
+
+test "decision cascade accepts SDK defaults and canonicalizes explicit first-stage fail" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Also asserted by the Python SDK constructor/round-trip regression.
+    const fixture = try std.json.parseFromSliceLeaky(V, a, @embedFile("testdata/sdk_cascade_defaults.json"), .{});
+    const body = fixture.object.get("cascade").?;
+    const explicit = try compile(a, body);
+    const first = &body.object.getPtr("stages").?.array.items[0];
+    try std.testing.expect(first.object.swapRemove("on_failure"));
+    const omitted = try compile(a, body);
+    try std.testing.expectEqualSlices(u8, &explicit.sha256, &omitted.sha256);
+    try first.object.put(a, "on_failure", .{ .string = "keep_previous" });
+    try std.testing.expectError(error.InvalidDecisionCascade, compile(a, body));
 }

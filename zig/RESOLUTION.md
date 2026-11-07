@@ -306,7 +306,9 @@ loss and portable backup. Recovery of the same source/execution reuses committed
 identity and evidence without candidate search, embedding, or model inference.
 The existing source transaction publishes the decision and downstream replay
 handoff atomically. A crash before publication may repeat inference; execution is
-not exactly-once. A committed failure is replay-stable too. Retry it by explicitly
+not exactly-once. A committed failure is replay-stable too, including a cascade
+failure or exhausted budget that produced no model response. Recovery reuses that
+receipt without model discovery, candidate search, or inference. Retry it by explicitly
 re-resolving, rather than relying on a later drain to flip identity.
 
 Policy changes participate in material config comparison, advance the effective

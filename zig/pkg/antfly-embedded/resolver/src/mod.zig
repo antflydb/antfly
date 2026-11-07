@@ -2196,7 +2196,15 @@ pub const ResolutionStage = struct {
                     if (prior_entity.adjudication) |evidence| {
                         var expected = receipt_hash;
                         if (self.adjudicate.?.cascadeStages().len > 0) {
-                            const response = evidence.response orelse continue;
+                            const response = evidence.response orelse {
+                                // Failure and exhausted-budget receipts are
+                                // authoritative too. They have no successful
+                                // response/revision dependency to refresh.
+                                if ((evidence.status == .failed or evidence.status == .budget_exhausted) and
+                                    evidence.version == 1 and std.mem.eql(u8, evidence.execution_hash, base_receipt_hash))
+                                    reused[i] = prior_entity;
+                                continue;
+                            };
                             const recorded = self.adjudicate.?.cascadeRevision(arena, response, null, &cascade_revisions) catch continue;
                             const recorded_hash = if (recorded) |digest| try fingerprintHex(arena, .{ base_receipt_hash, digest }) else base_receipt_hash;
                             // Changed inputs/policy do not need to discover an
@@ -4414,4 +4422,47 @@ test "REVIEW adjudication prepared cascade classification allocates no per-resul
     const trace = response.object.getPtr("cascade").?;
     try trace.object.put(a, "definition_sha256", .{ .string = "stale" });
     try testing.expectError(error.InvalidAdjudicationOutput, classifier.classify(response));
+}
+
+test "REVIEW adjudication failed cascade receipts survive recovery until explicit re-resolution" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var resolver = try Resolver.parse(a,
+        \\{"table":"entities","key_template":"concept/{{ uslug _entity.text }}","scorer":{"comparisons":[],"combine":{"bias":1},"decision":{"match":0.95,"review":0.6}}}
+    );
+    defer resolver.deinit();
+    const parsed = try adjudication.Config.parse(a, adjudication_cascade_config);
+    defer parsed.deinit();
+    for ([_]bool{ false, true }) |mint| for ([_]anyerror{ error.Timeout, error.DecisionUpstreamFailure }) |failure| {
+        var fixture = AdjudicationFixture{ .fail = failure, .response = try adjudicationCascadeResponse(arena.allocator(), parsed.value) };
+        var map = MapStore{ .alloc = a };
+        defer map.deinit();
+        try map.store().put("source", "{\"entities\":[{\"id\":\"e\",\"label\":\"concept\",\"text\":\"Antfly database\"}]}");
+        var stage = ResolutionStage{ .resolver = &resolver, .config_generation = 1, .adjudicate = parsed.value, .adjudicator = fixture.executor(), .work_retention = .none };
+        if (mint) stage.adjudicate.?.on_failure = .mint;
+        _ = try stage.run(a, map.store(), fixture.provider(), "source", "resolution");
+        const before = (try map.store().get(a, "resolution")).?;
+        defer a.free(before);
+        var committed = try parseResolution(a, before);
+        defer committed.deinit();
+        try testing.expectEqual(if (mint) Decision.new else Decision.review, committed.entities[0].decision);
+        try testing.expect(committed.entities[0].adjudication.?.response == null);
+        fixture.fail = null; // Recovery must not silently change identity.
+        try testing.expectEqual(RunResult.unchanged, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+        try testing.expectEqual(@as(usize, 1), fixture.calls);
+        try testing.expectEqual(@as(usize, 1), fixture.candidate_calls);
+        stage.adjudicator = null;
+        try testing.expectEqual(RunResult.unchanged, try stage.run(a, map.store(), null, "source", "resolution"));
+        // Deliberate re-resolution still permits new model evidence.
+        stage.adjudicator = fixture.executor();
+        stage.config_generation += 1;
+        try testing.expectEqual(RunResult.written, try stage.run(a, map.store(), fixture.provider(), "source", "resolution"));
+        try testing.expectEqual(@as(usize, 2), fixture.calls);
+        const after = (try map.store().get(a, "resolution")).?;
+        defer a.free(after);
+        var refreshed = try parseResolution(a, after);
+        defer refreshed.deinit();
+        try testing.expectEqual(Decision.match, refreshed.entities[0].decision);
+    };
 }

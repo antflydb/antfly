@@ -262,24 +262,23 @@ pub const Registry = struct {
     /// explicit backend declaration. HTTP, SQL and expressions all use this.
     pub fn getDeciderCapabilities(self: *const Registry, name: []const u8) !decisions.Capabilities {
         const cfg = try self.getDeciderConfig(name);
-        if (cfg.decision_method == .cascade) {
-            const compiled = try self.getCascade(name);
-            var caps = compiled.capabilities;
+        const compiled = if (cfg.decision_method == .cascade) try self.getCascade(name) else null;
+        var caps = if (compiled) |plan| plan.capabilities else cfg.resolvedCapabilities();
+        if (compiled) |plan| {
             // Media must be admitted by every stage, each under its own bounds.
             var buffer: [512]u8 = undefined;
             var storage = std.heap.BufferFirstAllocator.init(&buffer, std.heap.smp_allocator);
             const a = storage.allocator();
-            for (compiled.definition.stages) |stage| {
+            for (plan.definition.stages) |stage| {
                 const stage_name = try cascadeStageName(a, name, stage.name);
                 defer a.free(stage_name);
                 const stage_caps = try self.getDeciderCapabilities(stage_name);
                 caps.images = caps.images and stage_caps.images;
                 caps.messages = caps.messages and stage_caps.messages;
             }
-            return caps;
-        }
-        var caps = cfg.resolvedCapabilities();
-        caps.images = caps.images and cfg.max_image_input_tokens != null;
+        } else caps.images = caps.images and cfg.max_image_input_tokens != null;
+        // Declarations on the public composite narrow its stage intersection,
+        // exactly as they narrow an ordinary named decider.
         if (!caps.images or self.inference_capabilities.count() == 0) return caps;
         var buffer: [1024]u8 = undefined;
         var storage = std.heap.BufferFirstAllocator.init(&buffer, std.heap.smp_allocator);
