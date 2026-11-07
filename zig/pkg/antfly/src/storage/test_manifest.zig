@@ -215,6 +215,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_derived_catch_up_policy;
     _ = @import("antfly_local_sources").storage_db_derived_change_journal;
     _ = @import("antfly_local_sources").storage_db_derived_derived_log;
+    _ = @import("antfly_local_sources").storage_db_derived_derived_executor;
     _ = @import("antfly_local_sources").storage_db_derived_derived_types;
     _ = @import("antfly_local_sources").storage_db_derived_derived_worker;
     _ = @import("antfly_local_sources").storage_db_derived_index_generation_manifest;
@@ -574,6 +575,10 @@ comptime {
 }
 
 test {
+    _ = @import("antfly_local_sources").storage_segment_admission;
+    _ = @import("antfly_local_sources").storage_lite_replay_admission;
+    _ = @import("antfly_local_sources").storage_lite_semantic_revision;
+    _ = @import("antfly_local_sources").storage_db_derived_replay_fragment;
     _ = @import("antfly_local_sources").storage_db_enrichment_media_output;
 }
 

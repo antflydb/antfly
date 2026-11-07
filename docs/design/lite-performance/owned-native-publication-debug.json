@@ -1,0 +1,76 @@
+{
+  "source_commit": "aecea5dd49a12946b598e0e733ea856ceedad71d",
+  "build_mode": "Debug, stripped; bounded 30 GiB compiler; j1",
+  "library_sha256": "8df1ff3c3f09aadb7674a75630223f4d102d126770b8b75bcbc4b7e16e5b6231",
+  "qualified": false,
+  "changes": [
+    "Owned text analysis/sort/cache/IO build inputs independent of a closed runtime, with external ResourceManager fallback.",
+    "Prepare multiple native index replacements before admission; primary, index metadata, artifacts and progress share one host transaction; all memory snapshots activate before reader fences release.",
+    "Bounded weak resident-source reuse with full-content comparison; file-owned handoff retains resident bytes without file-range pins.",
+    "Failed private merge explicitly requeues smaller artifact debt with bounded retry delay.",
+    "Preparing a native index publication cannot commit a collision-frontier reservation."
+  ],
+  "validation": {
+    "native": {
+      "passed": 816,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "persistent": {
+      "passed": 83,
+      "skipped_benchmarks": 1,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_local": {
+      "passed": 362,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_owner": {
+      "passed": 87,
+      "failed": 0,
+      "leaked": 0
+    },
+    "abi": {
+      "public_exports": 138,
+      "export_boundary": "passed",
+      "c_executable_and_shared_library_linkage": "passed"
+    },
+    "python_sql_concurrency_outcomes_recovery": {
+      "passed": 209,
+      "seconds": 106.07
+    },
+    "focused_owned_and_borrowed_build_resources": {
+      "passed": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "focused_merge_retry_and_runtime_handoff": {
+      "passed": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "full_gate_wall_seconds": 881.322
+  },
+  "retention": {
+    "successful_sdk_databases_deleted": 214,
+    "sdk_bytes_removed": 335605760,
+    "policy": "Keep receipts/hashes, reuse fixtures, preserve existing failed qualification evidence; do not archive one database per run."
+  },
+  "limits": [
+    "This stage does not connect foreground primary writes and all cheap indexes to the grouped publisher.",
+    "Same-index request cohorts and posting batches independent of RPC boundaries remain unfinished.",
+    "Original-importer, optimized performance, and final ten-minute active-write qualification remain pending.",
+    "Full factory belongs to Beads; aggregate CI requires human approval."
+  ],
+  "local_evidence": [
+    ".tools/import-regression/root-cause/owned-publication-aecea5dd49-debug.json",
+    ".tools/import-regression/root-cause/owned-publication-aecea5dd49-sdk.log",
+    ".tools/import-regression/root-cause/owned-publication-aecea5dd49-sdk-cleanup.json",
+    ".tools/import-regression/root-cause/detached-resource-owner-guard.json",
+    ".tools/import-regression/root-cause/private-merge-retry-requeue.json"
+  ]
+}

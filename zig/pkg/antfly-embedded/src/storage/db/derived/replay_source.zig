@@ -14,6 +14,9 @@
 // limitations under the License.
 
 const std = @import("std");
+const replay_chunks = @import("replay_chunks.zig");
+const replay_fragment = @import("replay_fragment.zig");
+const replay_reference = @import("replay_reference.zig");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
 const change_journal_mod = @import("change_journal.zig");
@@ -66,6 +69,15 @@ pub const MatchingCursor = struct {
         };
     }
 
+    /// Collection owns its keys independently. A bounded one-window caller
+    /// can release the journal read generation before applying index effects.
+    pub fn releaseReadSnapshot(self: *MatchingCursor) void {
+        switch (self.state) {
+            .journal => {},
+            .primary_store => |*cursor| cursor.releaseReadSnapshot(),
+        }
+    }
+
     pub fn deinit(self: *MatchingCursor, alloc: Allocator) void {
         _ = alloc;
         switch (self.state) {
@@ -75,11 +87,175 @@ pub const MatchingCursor = struct {
         self.* = undefined;
     }
 
+    pub const FamilySlice = struct { payload: []u8, position: replay_fragment.Position, families: usize, budget_exhausted: bool, records: usize = 1 };
+
+    pub fn readFamilySlice(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, target_sequence: u64) !?FamilySlice {
+        return self.readFamilySliceWithBudget(a, index_name, saved, max_families, 0, target_sequence);
+    }
+
+    /// Read only the authenticated chunks touched by this service budget.
+    /// Physical chunk boundaries do not force extra publication/admission turns.
+    /// One oversized family may progress alone; every family's effects stay together.
+    /// Null preserves the portable/legacy record iterator.
+    pub fn readFamilySliceWithBudget(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, max_payload_bytes: u64, target_sequence: u64) !?FamilySlice {
+        return self.readFamilySlicePart(a, index_name, saved, max_families, max_payload_bytes, target_sequence, true, false);
+    }
+
+    /// Coalesce complete canonical records under one atomic publication.
+    /// Unfinished continuations remain isolated, including scan-only no-ops:
+    /// their existing witness must complete before changing record identity.
+    pub fn readFamilyWindowWithBudget(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, max_payload_bytes: u64, target_sequence: u64, max_records: usize) !?FamilySlice {
+        var result = (try self.readFamilySlicePart(a, index_name, saved, max_families, max_payload_bytes, target_sequence, true, false)) orelse return null;
+        errdefer a.free(result.payload);
+        if (max_records != 0 and result.records >= max_records) result.budget_exhausted = true;
+        if (result.budget_exhausted or result.position.next_item != result.position.total_items or
+            (if (saved) |position| position.next_item != position.total_items else false)) return result;
+        var collected = replay_chunks.Collector.init(a);
+        defer collected.deinit();
+        try collected.append(result.payload);
+        var bytes: u64 = result.payload.len;
+        while (result.families < max_families and (max_payload_bytes == 0 or bytes < max_payload_bytes)) {
+            const slice = (self.readFamilySlicePart(a, index_name, null, max_families - result.families, if (max_payload_bytes == 0) 0 else max_payload_bytes - bytes, target_sequence, false, true) catch |err| switch (err) {
+                error.ReplayWindowFull => {
+                    result.budget_exhausted = true;
+                    break;
+                },
+                else => return err,
+            }) orelse break;
+            defer a.free(slice.payload);
+            try collected.append(slice.payload);
+            bytes +|= slice.payload.len;
+            result.families += slice.families;
+            result.records += 1;
+            result.position = slice.position;
+            result.budget_exhausted = slice.budget_exhausted or result.families == max_families or (max_payload_bytes != 0 and bytes >= max_payload_bytes) or (max_records != 0 and result.records >= max_records);
+            if (result.budget_exhausted or result.position.next_item != result.position.total_items) break;
+        }
+        if (result.records != 1) {
+            const hints = [_]TargetHint{switch (self.state) {
+                .journal => unreachable,
+                .primary_store => |cursor| cursor.hint,
+            }};
+            const payload = try replay_reference.encodeForHint(a, collected.recordAtSequence(result.position.sequence, &hints), hints[0]);
+            a.free(result.payload);
+            result.payload = payload;
+        }
+        return result;
+    }
+
+    fn readFamilySlicePart(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, max_payload_bytes: u64, target_sequence: u64, allow_oversized_family: bool, require_complete: bool) !?FamilySlice {
+        if (max_families == 0) return error.InvalidArgument;
+        const cursor = switch (self.state) {
+            .journal => return null,
+            .primary_store => |*value| value,
+        };
+        const entry = (try filterLaneEntry(cursor.entry, cursor.scan_lane_ordinal)) orelse {
+            cursor.entry = null;
+            return null;
+        };
+        if (cursor.scan_txn.?.current_scan.?.vtable.get == null) return null;
+        const sequence = internal_keys.parseReplayEntrySequence(entry.key, cursor.scan_lane_ordinal) orelse return error.InvalidReplayEntryKey;
+        if (target_sequence != 0 and sequence > target_sequence) return null;
+        const canonical = try replay_reference.canonicalRaw(&cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
+        if (!replay_chunks.isManifest(canonical)) return null;
+        const manifest = try replay_chunks.Manifest.decode(canonical);
+        if (manifest.sequence != sequence) return error.InvalidReplayChunk;
+        if (manifest.hints & change_journal_mod.singleHintMask(cursor.hint) == 0) {
+            // Legacy canonical-lane fallback can encounter unrelated records.
+            // Its normal iterator accounts and skips this without reading any
+            // already-retired chunks. A hint-lane mismatch remains corruption.
+            if (cursor.fallback_all) return null;
+            return error.InvalidReplayChunk;
+        }
+        // Look ahead only at the manifest when another whole record cannot
+        // fit. Do not reconstruct its chunks or invent a combined partial ID.
+        if (require_complete and manifest.families > max_families) return error.ReplayWindowFull;
+        const fingerprint = manifest.fingerprint(index_name);
+        var start: u64 = 0;
+        var applied = false;
+        if (saved) |position| {
+            if (position.sequence == sequence) {
+                if (position.total_items != manifest.families or !std.mem.eql(u8, &position.fingerprint, &fingerprint) or position.next_item >= position.total_items) return error.InvalidDerivedApplyState;
+                start = position.next_item;
+                applied = position.applied;
+            } else if (position.sequence > sequence or position.next_item != position.total_items) return error.InvalidDerivedApplyState;
+        }
+        var collected = replay_chunks.Collector.init(a);
+        defer collected.deinit();
+        var next = start;
+        var families: usize = 0;
+        var bytes: u64 = 0;
+        var byte_limited = false;
+        while (next < manifest.families and families < max_families) {
+            const ordinal: u32 = @intCast(next / replay_chunks.families_per_chunk);
+            if (ordinal < manifest.retired_chunks) return error.ReplayHistoryUnavailable;
+            const key = replay_chunks.chunkKey(sequence, ordinal);
+            const raw = try cursor.scan_txn.?.get(&key);
+            var limit = max_families - families;
+            var slice = try replay_chunks.sliceFamilies(a, manifest, ordinal, raw, @intCast(next % replay_chunks.families_per_chunk), limit);
+            defer a.free(slice.payload);
+            if (max_payload_bytes != 0) {
+                if (families != 0 and slice.payload.len > max_payload_bytes -| bytes) {
+                    byte_limited = true;
+                    break;
+                }
+                // A single large physical chunk must still obey a smaller
+                // requested window without splitting one document family.
+                while (families == 0 and slice.payload.len > max_payload_bytes and slice.families > 1) {
+                    limit = @max(1, slice.families / 2);
+                    const smaller = try replay_chunks.sliceFamilies(a, manifest, ordinal, raw, @intCast(next % replay_chunks.families_per_chunk), limit);
+                    a.free(slice.payload);
+                    slice = smaller;
+                }
+                // The oversized-family exception belongs to an empty window,
+                // never to a later record following already collected work.
+                if (families == 0 and slice.payload.len > max_payload_bytes and !allow_oversized_family) return error.ReplayWindowFull;
+            }
+            if (slice.families == 0) return error.InvalidReplayChunk;
+            try collected.append(slice.payload);
+            families += slice.families;
+            bytes +|= slice.payload.len;
+            next += slice.families;
+            if (next > manifest.families) return error.InvalidReplayChunk;
+            if (max_payload_bytes != 0 and bytes >= max_payload_bytes) break;
+        }
+        if (require_complete and next != manifest.families) return error.ReplayWindowFull;
+        const hints = [_]TargetHint{cursor.hint};
+        const payload = try replay_reference.encodeForHint(a, collected.record(manifest, &hints), cursor.hint);
+        errdefer a.free(payload);
+        if (next == manifest.families) {
+            cursor.next_sequence = sequence;
+            cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
+        }
+        return .{ .payload = payload, .position = .{ .sequence = sequence, .next_item = next, .total_items = manifest.families, .fingerprint = fingerprint, .applied = applied }, .families = families, .budget_exhausted = families == max_families or byte_limited or (max_payload_bytes != 0 and bytes >= max_payload_bytes) };
+    }
+
     pub fn forEachNext(
         self: *MatchingCursor,
         max_matched_entries: usize,
         ctx: *anyopaque,
         consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+    ) !MatchingRecordStats {
+        return self.forEachNextWithMode(max_matched_entries, ctx, consume, false);
+    }
+
+    /// Coalesce complete records, leaving a chunked lookahead untouched for
+    /// the next seekable window rather than reconstructing its whole payload.
+    pub fn forEachWholeRecordWindow(
+        self: *MatchingCursor,
+        max_matched_entries: usize,
+        ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+    ) !MatchingRecordStats {
+        return self.forEachNextWithMode(max_matched_entries, ctx, consume, true);
+    }
+
+    fn forEachNextWithMode(
+        self: *MatchingCursor,
+        max_matched_entries: usize,
+        ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+        stop_before_chunks: bool,
     ) !MatchingRecordStats {
         self.last_scan_stats = .{};
         return switch (self.state) {
@@ -96,6 +272,7 @@ pub const MatchingCursor = struct {
                 max_matched_entries,
                 ctx,
                 consume,
+                stop_before_chunks,
             ),
         };
     }
@@ -184,16 +361,26 @@ pub const Source = struct {
         return try self.vtable.collect_enrichment_document_groups(self.ptr, alloc, from_sequence);
     }
 
-    /// Stop only between complete replay records. Every key in a sequence
-    /// must be processed before advancing the durable applied checkpoint.
-    /// Bound discovery rather than rebuilding the remaining backlog. The
-    /// document limit is soft: a single record must retain all of its keys.
+    /// A complete sequence is certified only after all its families settle.
+    /// Seekable discovery returns an authenticated continuation separately.
+    /// Portable/legacy records retain their complete-record soft limit.
     pub const EnrichmentWindow = struct {
         groups: []PendingDocumentGroup,
         last_sequence: u64,
+        fragment: ?replay_fragment.Position = null,
+    };
+
+    pub const EnrichmentDocumentFilter = struct {
+        ptr: *anyopaque,
+        accepts: *const fn (*anyopaque, []const u8) anyerror!bool,
     };
 
     pub const EnrichmentWindowLimits = struct {
+        seekable: bool = false,
+        fragment: ?replay_fragment.Position = null,
+        /// Exclude catalog-inapplicable rows before they occupy durable retry
+        /// slots. The owner must retain documents with unfinished outbox work.
+        document_filter: ?EnrichmentDocumentFilter = null,
         max_records: usize = 0,
         max_document_groups: usize = 0,
         max_input_bytes: usize = 0,
@@ -224,10 +411,64 @@ pub const Source = struct {
             }
         };
         var ctx: Context = .{
-            .groups = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch },
+            .groups = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch, .document_filter = limits.document_filter },
             .max_document_groups = limits.max_document_groups,
             .max_input_bytes = limits.max_input_bytes,
         };
+        if (limits.seekable) {
+            var cursor = try self.openMatchingCursor(alloc, from_sequence, .enrichment);
+            defer cursor.deinit(alloc);
+            // Capability belongs to the opened cursor, not the address of
+            // its factory vtable (which can be forwarded across source owners).
+            const can_seek = switch (cursor.state) {
+                .journal => false,
+                .primary_store => |primary| if (primary.scan_txn) |txn| txn.current_scan.?.vtable.get != null else false,
+            };
+            if (can_seek) {
+                var fragment = limits.fragment;
+                var records: usize = @intFromBool(limits.fragment != null);
+                var scanned_families: usize = 0;
+                var last_sequence = from_sequence;
+                while (true) {
+                    const remaining = if (limits.max_document_groups == 0) 128 else limits.max_document_groups -| pending.count();
+                    if (remaining == 0 or scanned_families >= 4096 or (limits.max_input_bytes != 0 and ctx.input_bytes >= limits.max_input_bytes) or
+                        (fragment == null and limits.max_records != 0 and records >= limits.max_records)) break;
+                    const bytes_left: u64 = if (limits.max_input_bytes == 0) 0 else limits.max_input_bytes - ctx.input_bytes;
+                    if (try cursor.readFamilySliceWithBudget(alloc, "generated-discovery", fragment, @min(remaining, 4096 - scanned_families), bytes_left, 0)) |slice| {
+                        defer alloc.free(slice.payload);
+                        try EnrichmentGroupContext.consume(&ctx.groups, slice.position.sequence, slice.payload);
+                        ctx.input_bytes +|= slice.payload.len;
+                        scanned_families += slice.families;
+                        if (fragment == null) records += 1;
+                        const complete = slice.position.next_item == slice.position.total_items;
+                        fragment = if (complete) null else slice.position;
+                        last_sequence = if (complete) slice.position.sequence else slice.position.sequence - 1;
+                        continue;
+                    }
+                    // A saved physical position must never silently fall back
+                    // to a different record, encoding or unavailable history.
+                    if (fragment != null) return error.InvalidDerivedApplyState;
+                    const stats = try cursor.forEachWholeRecordWindow(1, &ctx, Context.consume);
+                    last_sequence = @max(last_sequence, @max(stats.last_sequence, ctx.last_sequence));
+                    records += @max(stats.matched_entries, @intFromBool(ctx.last_sequence > stats.last_sequence));
+                    // The fallback cursor already capped this page of
+                    // unrelated records. Return its certified prefix instead
+                    // of repeatedly reopening that budget within one turn.
+                    if (stats.matched_entries == 0 and stats.scanned_entries != 0) break;
+                    if (pending.count() >= limits.max_document_groups and limits.max_document_groups != 0) break;
+                    if (stats.scanned_entries == 0 and ctx.last_sequence <= last_sequence) {
+                        // A chunk manifest stops the whole-record iterator
+                        // without consuming it. Inspect that lookahead next.
+                        const entry = cursor.state.primary_store.entry orelse break;
+                        const sequence = internal_keys.parseReplayEntrySequence(entry.key, cursor.state.primary_store.scan_lane_ordinal) orelse return error.InvalidReplayEntryKey;
+                        const raw = try replay_reference.canonicalRaw(&cursor.state.primary_store.scan_txn.?, sequence, cursor.state.primary_store.scan_lane_ordinal, entry.value);
+                        if (!replay_chunks.isManifest(raw)) break;
+                    }
+                }
+                return .{ .groups = try pendingDocumentGroupsToOwnedSlice(alloc, &pending), .last_sequence = if (last_sequence > from_sequence) last_sequence else 0, .fragment = fragment };
+            }
+            if (limits.fragment != null) return error.InvalidDerivedApplyState;
+        }
         const stats = try self.forEachMatchingRecord(alloc, from_sequence, .enrichment, limits.max_records, &ctx, Context.consume);
         return .{ .groups = try pendingDocumentGroupsToOwnedSlice(alloc, &pending), .last_sequence = @max(stats.last_sequence, ctx.last_sequence) };
     }
@@ -277,9 +518,16 @@ const PrimaryStoreMatchingCursor = struct {
     fallback_all: bool = false,
     hint_exhausted: bool = false,
 
-    pub fn deinit(self: *@This()) void {
+    fn releaseReadSnapshot(self: *@This()) void {
         if (self.cursor) |*cursor| cursor.close();
+        self.cursor = null;
         if (self.scan_txn) |*txn| txn.abort();
+        self.scan_txn = null;
+        self.entry = null;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.releaseReadSnapshot();
         self.* = undefined;
     }
 
@@ -295,12 +543,19 @@ const PrimaryStoreMatchingCursor = struct {
         self.scan_lane_ordinal = lane_ordinal;
         self.scan_txn = txn;
         self.cursor = scan_cursor;
-        self.entry = if (entry) |kv|
-            if (internal_keys.parseReplayEntrySequence(kv.key, lane_ordinal) != null) kv else null
-        else
-            null;
+        self.entry = try filterLaneEntry(entry, lane_ordinal);
     }
 };
+
+// Cursor upper bounds are borrowed by some backends. Do not retain a pointer
+// to an openLane stack buffer; enforce the lane boundary on every advance.
+fn filterLaneEntry(entry: ?backend_erased.Entry, lane: u8) !?backend_erased.Entry {
+    const row = entry orelse return null;
+    const upper = internal_keys.replayRangeUpper(lane);
+    if (std.mem.order(u8, row.key, &upper) != .lt) return null;
+    if (internal_keys.parseReplayEntrySequence(row.key, lane) == null) return error.InvalidReplayEntryKey;
+    return row;
+}
 
 fn primaryStoreFallbackScanBudget(max_matched_entries: usize) usize {
     if (max_matched_entries == 0) return primary_store_fallback_scan_budget_max;
@@ -355,6 +610,7 @@ fn primaryStoreMatchingCursorForEachNext(
     max_matched_entries: usize,
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+    stop_before_chunks: bool,
 ) !MatchingRecordStats {
     if (cursor.hint_exhausted) return .{};
     var stats = MatchingRecordStats{ .scan_batches = 1 };
@@ -369,17 +625,38 @@ fn primaryStoreMatchingCursorForEachNext(
             cursor.entry = null;
             break;
         };
-        if (cursor.fallback_all and !try change_journal_mod.encodedRecordHasHint(entry.value, cursor.hint)) {
+        if (cursor.fallback_all or stop_before_chunks) {
+            const canonical = try replay_reference.canonicalRaw(&cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
+            if (replay_chunks.isManifest(canonical)) {
+                const manifest = try replay_chunks.Manifest.decode(canonical);
+                if (manifest.sequence != sequence) return error.InvalidReplayChunk;
+                if (manifest.hints & change_journal_mod.singleHintMask(cursor.hint) == 0) {
+                    if (!cursor.fallback_all) return error.InvalidReplayChunk;
+                    stats.scanned_entries += 1;
+                    stats.hint_filter_skips += 1;
+                    stats.last_sequence = sequence;
+                    cursor.next_sequence = sequence;
+                    cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
+                    if (stats.scanned_entries >= max_scanned_entries) return stats;
+                    continue;
+                }
+                if (stop_before_chunks) return stats;
+            }
+        }
+        const resolved = try replay_reference.resolve(cursor.store.alloc, &cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
+        defer if (resolved) |owned| cursor.store.alloc.free(owned);
+        const payload = resolved orelse entry.value;
+        if (cursor.fallback_all and !try change_journal_mod.encodedRecordHasHint(payload, cursor.hint)) {
             stats.scanned_entries += 1;
             stats.hint_filter_skips += 1;
             stats.last_sequence = sequence;
             cursor.next_sequence = sequence;
-            cursor.entry = try cursor.cursor.?.next();
+            cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
             if (stats.scanned_entries >= max_scanned_entries) return stats;
             continue;
         }
 
-        consume(ctx, sequence, entry.value) catch |err| switch (err) {
+        consume(ctx, sequence, payload) catch |err| switch (err) {
             // Keep this entry current: the builder rejected it before taking
             // ownership, so the following replay window must retry it.
             StopReplayChunk.StopReplayChunk => return stats,
@@ -389,7 +666,7 @@ fn primaryStoreMatchingCursorForEachNext(
         stats.matched_entries += 1;
         stats.last_sequence = sequence;
         cursor.next_sequence = sequence;
-        cursor.entry = try cursor.cursor.?.next();
+        cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
         if (max_matched_entries != 0 and stats.matched_entries >= max_matched_entries) return stats;
     }
     cursor.hint_exhausted = true;
@@ -650,6 +927,11 @@ const EnrichmentGroupContext = struct {
     alloc: Allocator,
     pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
     scratch: *change_journal_mod.BorrowedBinaryRecordScratch,
+    document_filter: ?Source.EnrichmentDocumentFilter = null,
+
+    fn accepts(self: @This(), key: []const u8) !bool {
+        return if (self.document_filter) |filter| try filter.accepts(filter.ptr, key) else true;
+    }
 
     fn consume(ctx_ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
         const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -663,12 +945,16 @@ const EnrichmentGroupContext = struct {
             if (!recordHasEnrichmentHint(record)) return;
             // Retain only the returned group's unique keys; input payloads
             // and scratch descriptors are borrowed through this callback.
-            for (record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+            for (record.changed_doc_keys) |key| {
+                if (try ctx.accepts(key)) try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+            }
         } else {
             var record = try change_journal_mod.decodeRecord(ctx.alloc, payload);
             defer record.deinit();
             if (!recordHasEnrichmentHint(record.record)) return;
-            for (record.record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+            for (record.record.changed_doc_keys) |key| {
+                if (try ctx.accepts(key)) try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+            }
         }
     }
 };
@@ -1811,4 +2097,174 @@ test "replay source enrichment trims oversized scratch on filtered callback exit
     defer alloc.free(ordinary);
     try EnrichmentGroupContext.consume(&ctx, 2, ordinary);
     try std.testing.expectEqual(@as(u64, 2), pending.get("doc").?.sequence);
+}
+
+test "replay source whole record windows leave chunked lookahead unhydrated" {
+    const a = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var keys: [130][]const u8 = undefined;
+    for (&keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(arena.allocator(), "large-{d}", .{i});
+    const small = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"small"}, .target_hints = &.{.full_text} });
+    defer a.free(small);
+    const record: change_journal_mod.Record = .{ .sequence = 2, .changed_doc_keys = &keys, .target_hints = &.{.full_text} };
+    const large = try change_journal_mod.encodeRecord(a, record);
+    defer a.free(large);
+    var prepared = (try replay_chunks.prepare(a, record)).?;
+    defer prepared.deinit();
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(1, small);
+        try write.setReplayOpaque(2, large);
+        const canonical = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+        const hint = internal_keys.replayEntryKey(@intCast(@backingInt(@as(TargetHint, .full_text))), 2);
+        try write.put(&canonical, &prepared.manifest.encode());
+        try write.put(&hint, &replay_reference.encodeReference(2, .full_text));
+        // No chunk rows exist: looking ahead must not attempt their hydration.
+        try write.commit();
+    }
+    var source = Source.fromPrimaryStore(&store, null, null);
+    var cursor = try source.openMatchingCursor(a, 0, .full_text);
+    defer cursor.deinit(a);
+    const Probe = struct {
+        count: usize = 0,
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            try std.testing.expectEqual(@as(u64, 1), sequence);
+            @as(*@This(), @ptrCast(@alignCast(ptr))).count += 1;
+        }
+    };
+    var probe: Probe = .{};
+    const stats = try cursor.forEachWholeRecordWindow(64, &probe, Probe.consume);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.last_sequence);
+    try std.testing.expectError(error.NotFound, cursor.readFamilySlice(a, "text", null, 64, 0));
+}
+
+test "seekable replay window keeps a later oversized family out of a nonempty publication" {
+    const a = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var keys: [96][]const u8 = undefined;
+    for (&keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(arena.allocator(), "z-{d:0>4}", .{i});
+    for (1..5) |sequence| {
+        if (sequence == 2) {
+            const huge = try arena.allocator().alloc(u8, 64 * 1024);
+            @memset(huge, 'a');
+            keys[0] = huge;
+        } else if (sequence == 3) keys[0] = "z-0000";
+        const record: change_journal_mod.Record = .{ .sequence = sequence, .changed_doc_keys = &keys, .target_hints = &.{.full_text} };
+        const encoded = try change_journal_mod.encodeRecord(a, record);
+        defer a.free(encoded);
+        var prepared = (try replay_chunks.prepare(a, record)).?;
+        defer prepared.deinit();
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(sequence, encoded);
+        try write.put(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence), &prepared.manifest.encode());
+        try write.put(&internal_keys.replayEntryKey(@intCast(@backingInt(@as(TargetHint, .full_text))), sequence), &replay_reference.encodeReference(sequence, .full_text));
+        for (prepared.chunks, 0..) |raw, ordinal| try write.put(&replay_chunks.chunkKey(sequence, @intCast(ordinal)), raw);
+        try write.commit();
+    }
+    var source = Source.fromPrimaryStore(&store, null, null);
+    var cursor = try source.openMatchingCursor(a, 0, .full_text);
+    defer cursor.deinit(a);
+    const first = (try cursor.readFamilyWindowWithBudget(a, "text", null, 192, 4096, 0, 0)).?;
+    defer a.free(first.payload);
+    try std.testing.expectEqual(@as(u64, 1), first.position.sequence);
+    try std.testing.expectEqual(first.position.total_items, first.position.next_item);
+    try std.testing.expectEqual(@as(usize, 96), first.families);
+    try std.testing.expect(first.payload.len <= 4096 and first.budget_exhausted);
+    const second = (try cursor.readFamilyWindowWithBudget(a, "text", null, 192, 4096, 0, 0)).?;
+    defer a.free(second.payload);
+    try std.testing.expectEqual(@as(u64, 2), second.position.sequence);
+    try std.testing.expectEqual(@as(usize, 1), second.families);
+    try std.testing.expectEqual(@as(u64, 1), second.position.next_item);
+    try std.testing.expect(second.payload.len > 4096 and second.budget_exhausted);
+    const tail = (try cursor.readFamilyWindowWithBudget(a, "text", second.position, 192, 4096, 0, 0)).?;
+    defer a.free(tail.payload);
+    try std.testing.expectEqual(@as(usize, 95), tail.families);
+    try std.testing.expectEqual(@as(u64, 2), tail.position.sequence);
+    try std.testing.expectEqual(@as(usize, 1), tail.records);
+    try std.testing.expectEqual(tail.position.total_items, tail.position.next_item);
+    // A continuation completes its own identity, even when the following
+    // whole record would fit. This also preserves scan-only no-op witnesses.
+    const following = (try cursor.readFamilyWindowWithBudget(a, "text", null, 192, 4096, 0, 1)).?;
+    defer a.free(following.payload);
+    try std.testing.expectEqual(@as(u64, 3), following.position.sequence);
+    try std.testing.expectEqual(@as(usize, 96), following.families);
+    try std.testing.expectEqual(@as(usize, 1), following.records);
+    try std.testing.expect(following.budget_exhausted);
+    // Record count is an independent cap, even when another record fits both
+    // the family and byte budgets.
+    const last = (try cursor.readFamilyWindowWithBudget(a, "text", null, 192, 4096, 0, 0)).?;
+    defer a.free(last.payload);
+    try std.testing.expectEqual(@as(u64, 4), last.position.sequence);
+    try std.testing.expectEqual(@as(usize, 96), last.families);
+}
+
+test "enrichment discovery filters inapplicable rows before retry window sizing" {
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const a = allocator_state.allocator();
+    var journal = try change_journal_mod.Journal.open("filtered-enrichment-window", .{ .backend = .lsm_memory });
+    defer journal.close();
+    var backend = mem_backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var keys: [1025][]const u8 = undefined;
+    for (keys[0..1024], 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "ordinary:{d}", .{i});
+    defer for (keys[0..1024]) |key| a.free(key);
+    keys[1024] = "applicable";
+    for (1..4) |sequence| {
+        const encoded = try change_journal_mod.encodeRecord(a, .{
+            .sequence = sequence,
+            .changed_doc_keys = if (sequence == 2) &keys else keys[0..1024],
+            .target_hints = &.{.enrichment},
+        });
+        defer a.free(encoded);
+        _ = try journal.appendOpaque(encoded);
+        try store.appendReplayOpaque(a, sequence, encoded);
+    }
+    const Filter = struct {
+        visits: usize = 0,
+        fail: bool = false,
+        fn accepts(ptr: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.visits += 1;
+            if (self.fail) return error.InjectedDiscoveryFailure;
+            return std.mem.eql(u8, key, "applicable");
+        }
+    };
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null) }) |source| {
+        var filter = Filter{};
+        const limits: Source.EnrichmentWindowLimits = .{ .max_records = 2, .max_document_groups = 8, .document_filter = .{ .ptr = &filter, .accepts = Filter.accepts } };
+        const window = try source.collectEnrichmentDocumentGroupsWindow(a, 0, limits);
+        defer freePendingDocumentGroups(a, window.groups);
+        try std.testing.expectEqual(@as(u64, 2), window.last_sequence);
+        try std.testing.expectEqual(@as(usize, 1), window.groups.len);
+        try std.testing.expectEqualStrings("applicable", window.groups[0].doc_key);
+        try std.testing.expectEqual(@as(usize, 2049), filter.visits);
+        const rest = try source.collectEnrichmentDocumentGroupsWindow(a, window.last_sequence, limits);
+        defer freePendingDocumentGroups(a, rest.groups);
+        try std.testing.expectEqual(@as(u64, 3), rest.last_sequence);
+        try std.testing.expectEqual(@as(usize, 0), rest.groups.len);
+        filter.fail = true;
+        try std.testing.expectError(error.InjectedDiscoveryFailure, source.collectEnrichmentDocumentGroupsWindow(a, 0, limits));
+        filter.fail = false;
+        const retried = try source.collectEnrichmentDocumentGroupsWindow(a, 0, limits);
+        defer freePendingDocumentGroups(a, retried.groups);
+        try std.testing.expectEqual(@as(u64, 2), retried.last_sequence);
+        try std.testing.expectEqual(@as(usize, 1), retried.groups.len);
+    }
 }

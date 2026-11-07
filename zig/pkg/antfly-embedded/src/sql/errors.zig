@@ -111,7 +111,7 @@ pub fn notApplied(err: anyerror) anyerror {
     if (isUnknownOutcome(err)) return error.SqlReconciliationRequired;
     if (!std.mem.eql(u8, describe(err).code, "XX000")) return err;
     return switch (err) {
-        error.Busy, error.WriterLocked, error.ConcurrencyUnavailable, error.CapacityUnavailable, error.CapacityObservationStale, error.LiteRetirementBacklogExceeded, error.TextMergeBackpressureTimeout, error.SourceFileChanged, error.GenerationTransitionActive, error.IndexArtifactCleanupPending, error.EmbeddingProbeUnavailable, error.InferenceProviderCallCapacityExhausted, error.IntegrityCatalogUnavailable, error.ResourceTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable => error.SqlMutationNotAppliedBusy,
+        error.Busy, error.WriterLocked, error.ConcurrencyUnavailable, error.CapacityUnavailable, error.CapacityObservationStale, error.LiteRetirementBacklogExceeded, error.LiteReplayBacklogExceeded, error.TextMergeBackpressureTimeout, error.SourceFileChanged, error.GenerationTransitionActive, error.IndexArtifactCleanupPending, error.EmbeddingProbeUnavailable, error.InferenceProviderCallCapacityExhausted, error.IntegrityCatalogUnavailable, error.ResourceTemporarilyUnavailable, error.StorageReadTemporarilyUnavailable => error.SqlMutationNotAppliedBusy,
         error.LiteStorageBudgetExceeded, error.LiteInsufficientDiskSpace, error.NoSpaceLeft, error.DiskQuota => error.SqlMutationNotAppliedNoSpace,
         else => error.SqlMutationNotApplied,
     };

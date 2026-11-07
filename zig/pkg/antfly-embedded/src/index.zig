@@ -16,10 +16,10 @@
 //! Multi-segment index with MVCC snapshots.
 //!
 //! Provides IndexSnapshot (immutable, ref-counted view of segments) and
-//! IndexWriter (serialized writes with lock-free snapshot reads).
+//! IndexWriter (serialized writes with retained snapshot reads).
 //!
 //! Key design choices (improvements over bleve):
-//!   - Lock-free snapshot reads via atomic pointer swap (no RWMutex)
+//!   - Atomic snapshot pointer publication with retained reader captures
 //!   - Ref-counted snapshots for safe concurrent read/write access
 //!   - Global BM25 stats across all segments for consistent scoring
 //!   - Block-Max WAND acceleration when v4 inverted indexes are present
@@ -196,6 +196,17 @@ pub const SegmentData = union(enum) {
 pub const SegmentShared = struct {
     const deletion_writer_bit: u32 = 1 << 31;
 
+    // Compatibility routing is built once for an old immutable segment. It
+    // shares the physical reader's accounting/lifetime, never a pathname or
+    // reusable page number. Compact persisted tables use the same bounded
+    // immutable owner; larger tables use bounded immutable navigation pages.
+    identity_lookup_mutex: std.atomic.Mutex = .unlocked,
+    identity_lookup_entries: ?[]@import("document_identity_lookup.zig").Entry = null,
+    identity_lookup_pages: ?*@import("document_identity_lookup.zig").Paged = null,
+    identity_lookup_decoded: ?@import("segment_source.zig").Decoded = null,
+    identity_lookup_reads: u64 = 0,
+    identity_lookup_reservation: ?resource_manager_mod.Reservation = null,
+
     /// Private visibility state may borrow an immutable physical reader.
     physical_parent: ?*SegmentEntry = null,
 
@@ -238,6 +249,172 @@ pub const SegmentShared = struct {
     /// Set when the segment is replaced/removed from the live index. Runs
     /// once the last reference dies, after resources are deinited.
     retired_cleanup: ?RetiredSegmentCleanup = null,
+
+    /// Compact persisted routing is immutable navigation, independent of
+    /// visibility bitmaps. Share it with the exact artifact owner across DB
+    /// reopenings; larger tables use paged navigation, and refused cache
+    /// admissions keep the bounded persisted seek path.
+    fn cachedIdentityLookup(self: *SegmentShared, reader: *const SegmentReader, view: @import("segment_source.zig").View) !?[]const @import("document_identity_lookup.zig").Entry {
+        if (self.physical_parent) |parent| return parent.shared.cachedIdentityLookup(&parent.reader, view);
+        const source = reader.immutableSource();
+        if (source != .ranges or source.ranges.acquire_decoded == null or view.length > 256 * 1024) return null;
+        @import("antfly_platform").sync.lockYielding(&self.identity_lookup_mutex);
+        defer self.identity_lookup_mutex.unlock();
+        if (self.identity_lookup_entries) |entries| return entries;
+        if (self.identity_lookup_pages != null) return null;
+        const lookup = @import("document_identity_lookup.zig");
+        const Payload = struct { entries: []lookup.Entry };
+        const Loader = struct {
+            view: @import("segment_source.zig").View,
+            count: u32,
+            fn decode(raw: *anyopaque, a: Allocator) !*const anyopaque {
+                const context: *@This() = @ptrCast(@alignCast(raw));
+                const payload = try a.create(Payload);
+                payload.* = .{ .entries = try lookup.decode(a, context.view, context.count) };
+                return payload;
+            }
+        };
+        var loader: Loader = .{ .view = view, .count = reader.doc_count };
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update("antfly persisted document identity routing v1");
+        var count: [4]u8 = undefined;
+        std.mem.writeInt(u32, &count, reader.doc_count, .little);
+        digest.update(&count);
+        const held = (try source.acquireDecoded(.{ .offset = view.offset, .length = view.length, .interpretation = digest.finalResult(), .context = &loader, .decode = Loader.decode })) orelse return null;
+        const payload: *const Payload = @ptrCast(@alignCast(held.value));
+        self.identity_lookup_decoded = held;
+        self.identity_lookup_entries = payload.entries;
+        return payload.entries;
+    }
+
+    fn cachedIdentityPages(self: *SegmentShared, reader: *const SegmentReader, view: @import("segment_source.zig").View) !?*@import("document_identity_lookup.zig").Paged {
+        if (self.physical_parent) |parent| return parent.shared.cachedIdentityPages(&parent.reader, view);
+        const source = reader.immutableSource();
+        if (source != .ranges or source.ranges.acquire_decoded == null) return null;
+        @import("antfly_platform").sync.lockYielding(&self.identity_lookup_mutex);
+        defer self.identity_lookup_mutex.unlock();
+        if (self.identity_lookup_pages) |pages| return pages;
+        const lookup = @import("document_identity_lookup.zig");
+        const Loader = struct {
+            view: @import("segment_source.zig").View,
+            count: u32,
+            fn decode(raw: *anyopaque, a: Allocator) !*const anyopaque {
+                const context: *@This() = @ptrCast(@alignCast(raw));
+                return try lookup.Paged.create(a, context.view, context.count);
+            }
+        };
+        var loader: Loader = .{ .view = view, .count = reader.doc_count };
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update("antfly paged document identity routing v1");
+        var count: [4]u8 = undefined;
+        std.mem.writeInt(u32, &count, reader.doc_count, .little);
+        digest.update(&count);
+        const held = (try source.acquireDecoded(.{ .offset = view.offset, .length = view.length, .interpretation = digest.finalResult(), .context = &loader, .decode = Loader.decode })) orelse return null;
+        // The representation cache synchronizes its fixed slots internally;
+        // their contents are immutable rows, independent of deletion visibility.
+        const pages: *lookup.Paged = @ptrCast(@alignCast(@constCast(held.value)));
+        self.identity_lookup_decoded = held;
+        self.identity_lookup_pages = pages;
+        return pages;
+    }
+
+    fn legacyIdentityLookup(self: *SegmentShared, reader: *const SegmentReader) ![]const @import("document_identity_lookup.zig").Entry {
+        if (self.physical_parent) |parent| return parent.shared.legacyIdentityLookup(&parent.reader);
+        @import("antfly_platform").sync.lockYielding(&self.identity_lookup_mutex);
+        defer self.identity_lookup_mutex.unlock();
+        if (self.identity_lookup_entries) |entries| return entries;
+        const lookup = @import("document_identity_lookup.zig");
+        if (reader.stored_length == 5 and reader.stored_metadata_length == 5) {
+            self.identity_lookup_entries = &.{};
+            return &.{};
+        }
+        const source = reader.immutableSource();
+        if (source == .ranges and source.ranges.acquire_decoded != null) {
+            const Payload = struct { entries: []lookup.Entry };
+            const Loader = struct {
+                shared: *SegmentShared,
+                reader: *const SegmentReader,
+                fn decode(raw: *anyopaque, a: Allocator) !*const anyopaque {
+                    const context: *@This() = @ptrCast(@alignCast(raw));
+                    const payload = try a.create(Payload);
+                    payload.* = .{ .entries = try context.shared.buildIdentityLookup(a, context.reader) };
+                    return payload;
+                }
+            };
+            var loader: Loader = .{ .shared = self, .reader = reader };
+            var digest = std.crypto.hash.sha2.Sha256.init(.{});
+            digest.update("antfly legacy document identity routing v1");
+            var bounds: [28]u8 = undefined;
+            std.mem.writeInt(u32, bounds[0..4], reader.doc_count, .little);
+            std.mem.writeInt(u64, bounds[4..12], reader.stored_offset, .little);
+            std.mem.writeInt(u64, bounds[12..20], reader.stored_length, .little);
+            std.mem.writeInt(u64, bounds[20..28], reader.stored_metadata_length, .little);
+            digest.update(&bounds);
+            if (try source.acquireDecoded(.{ .offset = 0, .length = source.len(), .interpretation = digest.finalResult(), .context = &loader, .decode = Loader.decode })) |held| {
+                const payload: *const Payload = @ptrCast(@alignCast(held.value));
+                self.identity_lookup_decoded = held;
+                self.identity_lookup_entries = payload.entries;
+                return payload.entries;
+            }
+        }
+        const manager = if (source == .ranges) source.ranges.resource_manager else self.residency_manager;
+        var reservation: ?resource_manager_mod.Reservation = if (manager) |owner|
+            try owner.reserveWithoutReclaim(.full_text_segment_residency, @as(u64, reader.doc_count) * @sizeOf(lookup.Entry))
+        else
+            null;
+        errdefer if (reservation) |*owned| owned.release();
+        self.identity_lookup_entries = try self.buildIdentityLookup(self.allocator, reader);
+        if (reservation) |*owned| owned.shrink((@as(u64, reader.doc_count) - self.identity_lookup_entries.?.len) * @sizeOf(lookup.Entry));
+        self.identity_lookup_reservation = reservation;
+        return self.identity_lookup_entries.?;
+    }
+
+    fn buildIdentityLookup(self: *SegmentShared, a: Allocator, reader: *const SegmentReader) ![]@import("document_identity_lookup.zig").Entry {
+        const lookup = @import("document_identity_lookup.zig");
+        var entries: std.ArrayListUnmanaged(lookup.Entry) = .empty;
+        errdefer entries.deinit(a);
+        try entries.ensureTotalCapacityPrecise(a, reader.doc_count);
+        var scratch = @import("segment_source.zig").Scratch.init(self.allocator, 64 * 1024);
+        defer scratch.deinit();
+        for (0..reader.doc_count) |local| {
+            scratch.reset();
+            if (@import("builtin").is_test) self.identity_lookup_reads += 1;
+            const id = (try reader.storedIdAlloc(scratch.allocator(), @intCast(local))) orelse continue;
+            entries.appendAssumeCapacity(.{ .hash = lookup.hash(id), .doc = @intCast(local) });
+        }
+        lookup.sort(entries.items);
+        return entries.toOwnedSlice(a);
+    }
+
+    fn releaseIdentityLookup(self: *SegmentShared) void {
+        if (self.identity_lookup_decoded) |held| {
+            self.identity_lookup_decoded = null;
+            held.release();
+        } else if (self.identity_lookup_entries) |entries| self.allocator.free(entries);
+        self.identity_lookup_entries = null;
+        self.identity_lookup_pages = null;
+        if (self.identity_lookup_reservation) |*owned| owned.release();
+        self.identity_lookup_reservation = null;
+    }
+
+    fn retainedMetadataBytes(self: *SegmentShared) u64 {
+        // Match deletion -> lookup lock order used by update publication.
+        self.lockDeletionShared();
+        defer self.unlockDeletionShared();
+        @import("antfly_platform").sync.lockYielding(&self.identity_lookup_mutex);
+        defer self.identity_lookup_mutex.unlock();
+        var bytes: u64 = @sizeOf(SegmentShared) + self.typed_doc_values_coverage.len * @sizeOf(TypedDocValuesFieldCoverage);
+        if (self.identity_lookup_entries) |entries| bytes +|= entries.len * @sizeOf(@import("document_identity_lookup.zig").Entry);
+        if (self.identity_lookup_pages != null) bytes +|= @sizeOf(@import("document_identity_lookup.zig").Paged);
+        if (self.deleted) |*deleted| bytes +|= deleted.retainedBytes();
+        for (self.typed_doc_values_coverage) |*field| {
+            bytes +|= field.field.len;
+            if (field.initialized.load(.acquire)) if (field.membership_doc_ids) |*membership| {
+                bytes +|= membership.retainedBytes();
+            };
+        }
+        return bytes;
+    }
 
     fn observeResidency(self: *SegmentShared, manager: ?*resource_manager_mod.ResourceManager) void {
         while (!self.residency_mutex.tryLock()) spinOrYield();
@@ -623,6 +800,7 @@ pub const SegmentEntry = struct {
     fn destroyShared(alloc: Allocator, shared: *SegmentShared) void {
         if (shared.residency_manager) |manager| manager.observeUsageWithHostCharge(.full_text_segment_residency, &shared.residency_accounted, 0, 0);
         if (shared.deleted) |*deleted| deleted.deinit();
+        shared.releaseIdentityLookup();
         freeTypedDocValuesCoverage(alloc, shared.typed_doc_values_coverage);
         alloc.destroy(shared);
     }
@@ -656,6 +834,39 @@ pub const SegmentEntry = struct {
         return result;
     }
 
+    /// Owns exactly one physical reader, without its inventory's global
+    /// statistics or any query capability. Range use and reader ownership
+    /// must both survive a runtime teardown during immutable-source handoff.
+    pub const ImmutableLease = struct {
+        entry: SegmentEntry,
+        source: SegmentSource,
+
+        pub fn deinit(self: *ImmutableLease) void {
+            self.source.releaseUse();
+            self.entry.releaseRef();
+            self.* = undefined;
+        }
+    };
+
+    /// Admission cost for retaining a decoder, rather than its logical file
+    /// length. Provider overhead includes the remaining bounded source cache.
+    pub fn immutableRetainedBytes(self: *const SegmentEntry) u64 {
+        const owned = self.shared.retainedMetadataBytes();
+        if (self.shared.physical_parent) |parent| return owned +| parent.immutableRetainedBytes();
+        const source = self.reader.immutableSource();
+        return owned +| self.reader.nativeNavigationBytes() +|
+            (if (source == .ranges) source.ranges.retention_overhead_bytes else 0);
+    }
+
+    pub fn retainImmutable(self: *const SegmentEntry) ?ImmutableLease {
+        if (self.query_base_reader != null or self.query_source != null) return null;
+        const source = self.reader.immutableSource();
+        if (source != .ranges or !source.ranges.retention_artifact_only or source.ranges.immutable_identity == null or source.ranges.check_read_context != null) return null;
+        if (!source.acquireUse()) return null;
+        self.retain();
+        return .{ .entry = self.*, .source = source };
+    }
+
     fn retain(self: *const SegmentEntry) void {
         _ = @atomicRmw(u32, &self.shared.ref_count, .Add, 1, .monotonic);
     }
@@ -681,6 +892,9 @@ pub const SegmentEntry = struct {
             alloc.destroy(parent);
             return;
         }
+        // A lookup reservation may belong to the source's accounting owner.
+        // Release it before the final source close can destroy that owner.
+        self.shared.releaseIdentityLookup();
         self.data.madviseDiscardCleanPages();
         self.reader.deinit();
         self.data.deinit(alloc);
@@ -1270,6 +1484,9 @@ test "graph predicate cache declines unmanaged and soft-pressure admission" {
 /// Snapshots obtained via `snapshot()` are borrowed (no ref change) and must
 /// not outlive the next write operation.
 pub const IndexSnapshot = struct {
+    /// Cached navigation and predicates must retain their accounting owner
+    /// even when all sources came from a retired runtime's resident pool.
+    native_resources: ?@import("storage/immutable_artifact.zig").BuildResources = null,
     alloc: Allocator,
     ref_count: u32,
     epoch: u64,
@@ -1665,6 +1882,7 @@ pub const IndexSnapshot = struct {
     fn freeFinal(self: *IndexSnapshot) void {
         self.quiesceOwnedSources();
         const alloc = self.alloc;
+        var native_resources = self.native_resources;
         self.graph_predicates.deinit(alloc);
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
@@ -1709,6 +1927,7 @@ pub const IndexSnapshot = struct {
         if (self.scoring_owner) |owner| owner.release();
         const backing = if (self.binding_allocator) |locked| locked.backing else alloc;
         backing.destroy(self);
+        if (native_resources) |*resources| resources.deinit();
     }
 
     pub fn bm25BoundTable(
@@ -2504,8 +2723,8 @@ fn compareU32(expected: u32, item: u32) std.math.Order {
 }
 
 /// Coordinates writes and maintains the current snapshot.
-/// Reads are lock-free (atomic snapshot pointer).
-/// Writes are serialized (mutex).
+/// Snapshot pointer publication is atomic; retained captures join external
+/// visibility boundaries. Writes are serialized by the writer mutex.
 pub const IndexWriter = struct {
     alloc: Allocator,
     current: *IndexSnapshot,
@@ -2518,10 +2737,15 @@ pub const IndexWriter = struct {
     // Critical sections are a pointer load + refcount op, so a spinlock is
     // appropriate; the heavy release/deinit stays outside it.
     snapshot_mu: std.atomic.Mutex,
+    /// Native metadata may publish the applied watermark before the prepared
+    /// in-memory pointer is installed. New snapshot captures join this narrow
+    /// external publication boundary; already retained snapshots remain valid.
+    external_visibility_gate: std.atomic.Mutex = .unlocked,
     next_segment_id: u64,
     next_epoch: u64,
     retired_segment_cleanup: ?RetiredSegmentCleanup = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    native_resources: ?@import("storage/immutable_artifact.zig").BuildResources = null,
     mapped_residency_mu: std.atomic.Mutex,
     mapped_residency_next_check_ns: @import("antfly_platform").atomic.Value(u64),
     mapped_residency_evictions: u64,
@@ -2530,48 +2754,147 @@ pub const IndexWriter = struct {
     /// mutex. Persistent stores prepare this before committing their metadata
     /// transaction, making publication after durable commit infallible.
     pub const PreparedSegmentReplacement = struct {
-        writer: *IndexWriter,
+        writer: ?*IndexWriter,
         snapshot: *IndexSnapshot,
+        /// A detached candidate retains its exact base without borrowing the
+        /// writer. The caller binds a live target under lifecycle admission.
+        detached_base: ?*IndexSnapshot = null,
+        detached_revisions: []u64 = &.{},
         retired: []SegmentEntry,
+        reused_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
         staging_alloc: Allocator,
         carried_count: usize,
         next_segment_id: u64,
         active: bool = true,
+        external_visibility_owned: bool = false,
+
+        /// Release writer serialization before waiting for native admission.
+        /// Abort remains independent of the writer's lifetime after detaching.
+        pub fn detach(self: *PreparedSegmentReplacement) !void {
+            std.debug.assert(self.active and !self.external_visibility_owned);
+            const writer = self.writer.?;
+            std.debug.assert(self.detached_base != null);
+            self.writer = null;
+            writer.mu.unlock();
+        }
+
+        /// Exact base identity prevents publishing a prepared deletion bitmap
+        /// or carried inventory over an intervening mutation. The retained base
+        /// prevents pointer ABA. The caller fences the live writer's lifetime.
+        pub fn bind(self: *PreparedSegmentReplacement, writer: *IndexWriter) !void {
+            std.debug.assert(self.active and self.writer == null);
+            writer.lockMutex();
+            if (@atomicLoad(*IndexSnapshot, &writer.current, .acquire) != self.detached_base.?) {
+                writer.mu.unlock();
+                return error.EnrichmentWaitCanceled;
+            }
+            for (self.detached_base.?.segments, self.detached_revisions) |segment, revision| {
+                if (segment.shared.deletion_revision.load(.acquire) != revision) {
+                    writer.mu.unlock();
+                    return error.EnrichmentWaitCanceled;
+                }
+            }
+            self.writer = writer;
+        }
+
+        /// Rebind across a runtime refresh only when both runtimes describe
+        /// the same durable native namespace. The native host independently
+        /// validates that witness before committing any primary/index effects.
+        pub fn bindNative(self: *PreparedSegmentReplacement, writer: *IndexWriter, prepared_identity: @import("storage/native_publication.zig").NamespaceIdentity, target_identity: ?@import("storage/native_publication.zig").NamespaceIdentity) !void {
+            const current_identity = target_identity orelse return error.EnrichmentWaitCanceled;
+            if (!prepared_identity.eql(current_identity)) return error.EnrichmentWaitCanceled;
+            std.debug.assert(self.active and self.writer == null);
+            writer.lockMutex();
+            for (self.detached_base.?.segments, self.detached_revisions) |segment, revision| {
+                if (segment.shared.deletion_revision.load(.acquire) != revision) {
+                    writer.mu.unlock();
+                    return error.EnrichmentWaitCanceled;
+                }
+            }
+            self.writer = writer;
+        }
+
+        pub fn guardExternalVisibility(self: *PreparedSegmentReplacement) void {
+            std.debug.assert(self.active and !self.external_visibility_owned);
+            @import("antfly_platform").sync.lockYielding(&self.writer.?.external_visibility_gate);
+            self.external_visibility_owned = true;
+        }
+
+        fn releaseExternalVisibility(self: *PreparedSegmentReplacement) void {
+            if (!self.external_visibility_owned) return;
+            self.external_visibility_owned = false;
+            self.writer.?.external_visibility_gate.unlock();
+        }
 
         pub fn publish(self: *PreparedSegmentReplacement) void {
+            self.publishImpl(false);
+        }
+
+        /// A native commit can activate several independent indexes. Keep
+        /// readers behind this fence until every group snapshot is installed.
+        /// The caller owns the writer's lifecycle through the finishing phase.
+        pub fn publishRetainingExternalVisibility(self: *PreparedSegmentReplacement) void {
+            std.debug.assert(self.external_visibility_owned);
+            self.publishImpl(true);
+        }
+
+        pub fn finishExternalVisibility(self: *PreparedSegmentReplacement) void {
+            std.debug.assert(!self.active);
+            self.releaseExternalVisibility();
+        }
+
+        fn publishImpl(self: *PreparedSegmentReplacement, retain_external_visibility: bool) void {
             std.debug.assert(self.active);
-            const writer = self.writer;
+            const writer = self.writer.?;
             const old = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
 
             for (self.snapshot.segments[0..self.carried_count]) |*seg| seg.retain();
             for (self.retired) |*seg| {
+                // A deletion-only replacement keeps this physical artifact.
+                // Its new shared cell owns an independent Source reference.
+                if (self.reused_ids.contains(seg.id)) continue;
                 seg.data.madviseDiscardCleanPages();
                 std.debug.assert(seg.shared.retired_cleanup == null);
                 seg.shared.retired_cleanup = if (writer.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
             }
+            self.reused_ids.deinit(self.staging_alloc);
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
 
             writer.next_segment_id = @max(writer.next_segment_id, self.next_segment_id);
+            self.snapshot.epoch = writer.next_epoch;
             writer.next_epoch += 1;
             writer.publishSnapshot(self.snapshot);
+            if (!retain_external_visibility) self.releaseExternalVisibility();
             old.release();
             writer.mu.unlock();
+            self.staging_alloc.free(self.detached_revisions);
+            self.detached_revisions = &.{};
+            if (self.detached_base) |base| base.release();
+            self.detached_base = null;
             self.active = false;
         }
 
         pub fn abort(self: *PreparedSegmentReplacement) void {
             if (!self.active) return;
-            const writer = self.writer;
+            self.releaseExternalVisibility();
+            const alloc = self.snapshot.alloc;
+            var native_resources = self.snapshot.native_resources;
             for (self.snapshot.segments[self.carried_count..]) |*seg| {
-                SegmentEntry.destroyShared(writer.alloc, seg.shared);
+                SegmentEntry.destroyShared(alloc, seg.shared);
                 seg.reader.deinit();
             }
-            writer.alloc.free(self.snapshot.segments);
-            self.snapshot.global_total_field_len.deinit(writer.alloc);
-            writer.alloc.destroy(self.snapshot);
+            alloc.free(self.snapshot.segments);
+            self.snapshot.global_total_field_len.deinit(alloc);
+            alloc.destroy(self.snapshot);
+            self.reused_ids.deinit(self.staging_alloc);
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
-            writer.mu.unlock();
+            if (self.writer) |writer| writer.mu.unlock();
+            self.staging_alloc.free(self.detached_revisions);
+            self.detached_revisions = &.{};
+            if (self.detached_base) |base| base.release();
+            self.detached_base = null;
             self.active = false;
+            if (native_resources) |*resources| resources.deinit();
         }
     };
 
@@ -2590,7 +2913,10 @@ pub const IndexWriter = struct {
     /// Publish a new snapshot. Must be the only way `current` is replaced.
     fn publishSnapshot(self: *IndexWriter, new_snap: *IndexSnapshot) void {
         self.lockMappedResidencyMutex();
-        new_snap.graph_predicates.attachManager(self.resource_manager);
+        if (new_snap.native_resources == null) if (self.native_resources) |resources| {
+            new_snap.native_resources = resources.retained();
+        };
+        new_snap.graph_predicates.attachManager(if (new_snap.native_resources) |resources| resources.resource_manager else self.resource_manager);
         self.mapped_residency_mu.unlock();
         self.lockSnapshotMutex();
         @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
@@ -2872,6 +3198,15 @@ pub const IndexWriter = struct {
         self.retired_segment_cleanup = cleanup;
     }
 
+    /// Called while the writer is unpublished or under its serialization.
+    /// Existing snapshots keep their own owner when this writer is retired.
+    pub fn setNativeResources(self: *IndexWriter, resources: @import("storage/immutable_artifact.zig").BuildResources) void {
+        const retained = resources.retained();
+        if (self.native_resources) |*previous| previous.deinit();
+        self.native_resources = retained;
+        if (self.current.native_resources == null) self.current.native_resources = resources.retained();
+    }
+
     pub fn deinit(self: *IndexWriter) void {
         self.lockMappedResidencyMutex();
         self.resource_manager = null;
@@ -2883,6 +3218,8 @@ pub const IndexWriter = struct {
         // never deletes persisted segment files).
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         snap.release();
+        if (self.native_resources) |*resources| resources.deinit();
+        self.native_resources = null;
     }
 
     /// Get the current snapshot (lock-free read, no ref change).
@@ -2903,6 +3240,8 @@ pub const IndexWriter = struct {
     }
 
     fn acquireSnapshotRaw(self: *IndexWriter) *IndexSnapshot {
+        @import("antfly_platform").sync.lockYielding(&self.external_visibility_gate);
+        defer self.external_visibility_gate.unlock();
         self.lockSnapshotMutex();
         defer self.snapshot_mu.unlock();
         return @atomicLoad(*IndexSnapshot, &self.current, .acquire).retain();
@@ -2964,7 +3303,10 @@ pub const IndexWriter = struct {
         defer self.mapped_residency_mu.unlock();
 
         const manager = self.resource_manager orelse return;
-        for (snap.segments) |segment| if (segment.data.isFileBacked()) segment.shared.observeResidency(manager);
+        // Native range/resident sources own their cache/accounting lifetime.
+        // They can be reused through another runtime's manager and are not
+        // mappings. Only actual mmap-backed segments belong to this policy.
+        for (snap.segments) |segment| if (segment.data.isMapped()) segment.shared.observeResidency(manager);
 
         var decision = manager.pressureDecision(.full_text_segment_residency);
         if (decision.action != .shrink_cache or decision.pressure == .normal) return;
@@ -3147,7 +3489,7 @@ pub const IndexWriter = struct {
         global_field_lens: *std.StringHashMapUnmanaged(u64),
         reader: *const segment_mod.SegmentReader,
     ) !void {
-        for (reader.fields) |*fi| {
+        for (reader.fields, 0..) |*fi, ordinal| {
             if (std.mem.eql(u8, fi.name, segment_mod.doc_ordinals_field)) continue;
             for (fi.sections) |*si| {
                 if (si.section_type != .inverted_text) continue;
@@ -3155,7 +3497,7 @@ pub const IndexWriter = struct {
                     const offset: usize = @intCast(si.offset);
                     if (offset > reader.data.len or si.length > reader.data.len - offset) continue;
                 }
-                const inv = (try reader.invertedFieldStats(fi.name)) orelse continue;
+                const inv = reader.invertedFieldStatsAt(ordinal) orelse continue;
                 const gop = try global_field_lens.getOrPut(alloc, fi.name);
                 if (!gop.found_existing) gop.value_ptr.* = 0;
                 gop.value_ptr.* += inv.total_field_len;
@@ -3291,6 +3633,59 @@ pub const IndexWriter = struct {
         prepared.publish();
     }
 
+    /// Immutable input to fallible replacement preparation. This owns its
+    /// exact base/revisions and accounting resources, never a mutable writer.
+    pub const Preparation = struct {
+        alloc: Allocator,
+        base: *IndexSnapshot,
+        revisions: []u64,
+        resources: ?@import("storage/immutable_artifact.zig").BuildResources,
+        next_segment_id: u64,
+        next_epoch: u64,
+
+        pub fn deinit(self: *Preparation) void {
+            self.base.release();
+            self.alloc.free(self.revisions);
+            if (self.resources) |*resources| resources.deinit();
+            self.* = undefined;
+        }
+
+        pub fn requireCurrentRevisions(self: *const Preparation) !void {
+            for (self.base.segments, self.revisions) |segment, revision| {
+                if (segment.shared.deletion_revision.load(.acquire) != revision) return error.EnrichmentWaitCanceled;
+            }
+        }
+
+        pub fn prepareDeleteInfos(self: *const Preparation, a: Allocator, keys: []const []const u8) ![]DeleteInfo {
+            try self.requireCurrentRevisions();
+            const infos = try prepareDeleteInfosFromSnapshot(self.base, a, keys);
+            errdefer freeDeleteInfos(a, infos);
+            try self.requireCurrentRevisions();
+            return infos;
+        }
+
+        pub fn prepareReplacement(self: *const Preparation, scratch: Allocator, old_ids: []const u64, replacements: []ReplacementSegmentData) !PreparedSegmentReplacement {
+            try self.requireCurrentRevisions();
+            var prepared = try buildReplacementFromSnapshot(self, scratch, old_ids, replacements);
+            errdefer prepared.abort();
+            try self.requireCurrentRevisions();
+            return prepared;
+        }
+    };
+
+    pub fn capturePreparation(self: *IndexWriter) !Preparation {
+        self.lockMutex();
+        defer self.mu.unlock();
+        return self.capturePreparationAssumeLocked();
+    }
+
+    fn capturePreparationAssumeLocked(self: *IndexWriter) !Preparation {
+        const base = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        const revisions = try self.alloc.alloc(u64, base.segments.len);
+        for (base.segments, revisions) |segment, *revision| revision.* = segment.shared.deletion_revision.load(.acquire);
+        return .{ .alloc = self.alloc, .base = base.retain(), .revisions = revisions, .resources = if (self.native_resources) |resources| resources.retained() else null, .next_segment_id = self.next_segment_id, .next_epoch = self.next_epoch };
+    }
+
     /// Stage every fallible allocation needed to replace segments while
     /// holding the writer serialization mutex. Callers must publish or abort.
     pub fn prepareSegmentsManyData(self: *IndexWriter, old_ids: []const u64, replacements: []ReplacementSegmentData) !PreparedSegmentReplacement {
@@ -3309,10 +3704,25 @@ pub const IndexWriter = struct {
         old_ids: []const u64,
         replacements: []ReplacementSegmentData,
     ) !PreparedSegmentReplacement {
-        if (old_ids.len == 0 and replacements.len == 0) return error.EmptySegmentReplacement;
-
         self.lockMutex();
         errdefer self.mu.unlock();
+        var inputs = try self.capturePreparationAssumeLocked();
+        defer inputs.deinit();
+        var prepared = try inputs.prepareReplacement(scratch_alloc, old_ids, replacements);
+        prepared.writer = self;
+        return prepared;
+    }
+
+    fn buildReplacementFromSnapshot(
+        self: *const Preparation,
+        scratch_alloc: Allocator,
+        old_ids: []const u64,
+        replacements: []ReplacementSegmentData,
+    ) !PreparedSegmentReplacement {
+        if (old_ids.len == 0 and replacements.len == 0) return error.EmptySegmentReplacement;
+
+        const detached_revisions = try scratch_alloc.dupe(u64, self.revisions);
+        errdefer scratch_alloc.free(detached_revisions);
 
         const replacement_readers = try scratch_alloc.alloc(segment_mod.SegmentReader, replacements.len);
         var replacement_readers_initialized: usize = 0;
@@ -3330,18 +3740,20 @@ pub const IndexWriter = struct {
             replacement_readers_initialized += 1;
         }
 
-        const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        var old_set = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer old_set.deinit(scratch_alloc);
+        for (old_ids) |id| try old_set.put(scratch_alloc, id, {});
+        var reused_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        errdefer reused_ids.deinit(scratch_alloc);
+        for (replacements) |replacement| if (old_set.contains(replacement.id)) {
+            try reused_ids.put(scratch_alloc, replacement.id, {});
+        };
+        const old = self.base;
 
         var keep_count: usize = 0;
         var retire_count: usize = 0;
         for (old.segments) |*seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
+            const is_old = old_set.contains(seg.id);
             if (is_old) {
                 retire_count += 1;
             } else {
@@ -3356,13 +3768,7 @@ pub const IndexWriter = struct {
         var idx: usize = 0;
         var ret_idx: usize = 0;
         for (old.segments) |seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
+            const is_old = old_set.contains(seg.id);
             if (is_old) {
                 retired[ret_idx] = seg;
                 ret_idx += 1;
@@ -3448,10 +3854,14 @@ pub const IndexWriter = struct {
         for (replacements) |replacement| {
             if (replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
         }
+        new_snap.native_resources = if (self.resources) |resources| resources.retained() else null;
         return .{
-            .writer = self,
+            .writer = null,
+            .detached_base = old.retain(),
+            .detached_revisions = detached_revisions,
             .snapshot = new_snap,
             .retired = retired,
+            .reused_ids = reused_ids,
             .staging_alloc = scratch_alloc,
             .carried_count = keep_count,
             .next_segment_id = next_segment_id,
@@ -3573,15 +3983,97 @@ pub const IndexWriter = struct {
         }
     }
 
+    /// Stage deletion bitmaps without changing a reader-visible shared cell.
+    /// Persistent replay publishes them with a complete replacement snapshot.
+    pub fn prepareDeleteInfos(self: *IndexWriter, alloc: Allocator, doc_ids: []const []const u8) ![]DeleteInfo {
+        self.lockMutex();
+        defer self.mu.unlock();
+        return prepareDeleteInfosFromSnapshot(@atomicLoad(*IndexSnapshot, &self.current, .acquire), alloc, doc_ids);
+    }
+
+    fn prepareDeleteInfosFromSnapshot(snap: *IndexSnapshot, alloc: Allocator, doc_ids: []const []const u8) ![]DeleteInfo {
+        var wanted = std.StringHashMapUnmanaged(void).empty;
+        defer wanted.deinit(alloc);
+        for (doc_ids) |key| if (key.len != 0) {
+            try wanted.put(alloc, key, {});
+        };
+        if (wanted.count() == 0) return alloc.alloc(DeleteInfo, 0);
+        var infos = std.ArrayListUnmanaged(DeleteInfo).empty;
+        errdefer {
+            for (infos.items) |info| {
+                alloc.free(info.bitmap_bytes);
+                alloc.free(info.local_ids);
+            }
+            infos.deinit(alloc);
+        }
+        for (snap.segments) |*seg| {
+            var local_ids = std.ArrayListUnmanaged(u32).empty;
+            defer local_ids.deinit(alloc);
+            {
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                var identities = @import("segment_source.zig").Scratch.init(alloc, 64 * 1024);
+                defer identities.deinit();
+                const lookup = @import("document_identity_lookup.zig");
+                var view = try seg.reader.documentIdentityLookup();
+                var pages: ?*lookup.Paged = null;
+                const legacy = if (view) |persisted| rows: {
+                    const cached = try seg.shared.cachedIdentityLookup(&seg.reader, persisted) orelse {
+                        pages = try seg.shared.cachedIdentityPages(&seg.reader, persisted);
+                        break :rows &.{};
+                    };
+                    view = null;
+                    break :rows cached;
+                } else try seg.shared.legacyIdentityLookup(&seg.reader);
+                var keys = wanted.keyIterator();
+                while (keys.next()) |key| {
+                    const hash = lookup.hash(key.*);
+                    var cursor: usize = if (view) |data| if (pages) |cached| try cached.seek(data, hash) else try lookup.seek(data, seg.reader.doc_count, hash) else lookup.lowerBound(legacy, hash);
+                    const count = if (view != null) seg.reader.doc_count else legacy.len;
+                    while (cursor < count) : (cursor += 1) {
+                        const entry = if (view) |data| if (pages) |cached| try cached.readEntry(data, @intCast(cursor)) else try lookup.readEntry(data, @intCast(cursor), seg.reader.doc_count) else legacy[cursor];
+                        if (entry.hash != hash) break;
+                        if (seg.shared.deleted) |d| if (d.contains(entry.doc)) continue;
+                        // Hash collisions are harmless only when the exact
+                        // stored external identity is checked before mutation.
+                        identities.reset();
+                        if (@import("builtin").is_test) seg.shared.identity_lookup_reads += 1;
+                        const id = (try seg.reader.storedIdAlloc(identities.allocator(), entry.doc)) orelse return error.InvalidSegment;
+                        if (std.mem.eql(u8, id, key.*)) try local_ids.append(alloc, entry.doc);
+                    }
+                }
+                // Keep mutation/rollback deltas deterministic even though the
+                // input hash set and ID routing use different iteration orders.
+                std.sort.pdq(u32, local_ids.items, {}, std.sort.asc(u32));
+            }
+            if (local_ids.items.len == 0) continue;
+
+            const ids = try local_ids.toOwnedSlice(alloc);
+            errdefer alloc.free(ids);
+            seg.shared.lockDeletionShared();
+            var bitmap = if (seg.shared.deleted) |*deleted| deleted.clone(alloc) catch |err| {
+                seg.shared.unlockDeletionShared();
+                return err;
+            } else roaring.RoaringBitmap.init(alloc);
+            seg.shared.unlockDeletionShared();
+            defer bitmap.deinit();
+            for (ids) |id| try bitmap.add(id);
+            const bytes = try bitmap.toBytes(alloc);
+            errdefer alloc.free(bytes);
+            try infos.append(alloc, .{ .seg_id = seg.id, .bitmap_bytes = bytes, .local_ids = ids, .applied_count = ids.len, .created_bitmap = false, .deleted_count_incremented = false });
+        }
+        return infos.toOwnedSlice(alloc);
+    }
+
     /// Delete every live copy of a document and return one updated deletion
     /// bitmap per affected segment for atomic persistence by the caller.
     pub fn deleteAllByIdTracked(self: *IndexWriter, alloc: Allocator, doc_id: []const u8) ![]DeleteInfo {
         return self.deleteAllByIdsTracked(alloc, &.{doc_id});
     }
 
-    /// Delete every live copy of a set of external document IDs with one
-    /// traversal of each segment. Returning one bitmap per affected segment
-    /// lets persistent callers commit the complete batch atomically.
+    /// Seek every live copy of changed external IDs in each immutable segment.
+    /// Returning one bitmap per affected segment lets persistent callers commit
+    /// the complete batch atomically, without scanning retained documents.
     pub fn deleteAllByIdsTracked(self: *IndexWriter, alloc: Allocator, doc_ids: []const []const u8) ![]DeleteInfo {
         self.lockMutex();
         defer self.mu.unlock();
@@ -3592,6 +4084,7 @@ pub const IndexWriter = struct {
             if (doc_id.len > 0) try wanted.put(alloc, doc_id, {});
         }
 
+        if (wanted.count() == 0) return try alloc.alloc(DeleteInfo, 0);
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         var delete_infos = std.ArrayListUnmanaged(DeleteInfo).empty;
         errdefer {
@@ -3611,16 +4104,37 @@ pub const IndexWriter = struct {
                 defer seg.shared.unlockDeletionShared();
                 var identities = @import("segment_source.zig").Scratch.init(alloc, 64 * 1024);
                 defer identities.deinit();
-                for (0..seg.reader.doc_count) |local_id| {
-                    identities.reset();
-                    const id = (try seg.reader.storedIdAlloc(identities.allocator(), @intCast(local_id))) orelse continue;
-                    if (wanted.contains(id)) {
-                        if (seg.shared.deleted) |d| {
-                            if (d.contains(@intCast(local_id))) continue;
-                        }
-                        try local_ids.append(alloc, @intCast(local_id));
+                const lookup = @import("document_identity_lookup.zig");
+                var view = try seg.reader.documentIdentityLookup();
+                var pages: ?*lookup.Paged = null;
+                const legacy = if (view) |persisted| rows: {
+                    const cached = try seg.shared.cachedIdentityLookup(&seg.reader, persisted) orelse {
+                        pages = try seg.shared.cachedIdentityPages(&seg.reader, persisted);
+                        break :rows &.{};
+                    };
+                    view = null;
+                    break :rows cached;
+                } else try seg.shared.legacyIdentityLookup(&seg.reader);
+                var keys = wanted.keyIterator();
+                while (keys.next()) |key| {
+                    const hash = lookup.hash(key.*);
+                    var cursor: usize = if (view) |data| if (pages) |cached| try cached.seek(data, hash) else try lookup.seek(data, seg.reader.doc_count, hash) else lookup.lowerBound(legacy, hash);
+                    const count = if (view != null) seg.reader.doc_count else legacy.len;
+                    while (cursor < count) : (cursor += 1) {
+                        const entry = if (view) |data| if (pages) |cached| try cached.readEntry(data, @intCast(cursor)) else try lookup.readEntry(data, @intCast(cursor), seg.reader.doc_count) else legacy[cursor];
+                        if (entry.hash != hash) break;
+                        if (seg.shared.deleted) |d| if (d.contains(entry.doc)) continue;
+                        // Hash collisions are harmless only when the exact
+                        // stored external identity is checked before mutation.
+                        identities.reset();
+                        if (@import("builtin").is_test) seg.shared.identity_lookup_reads += 1;
+                        const id = (try seg.reader.storedIdAlloc(identities.allocator(), entry.doc)) orelse return error.InvalidSegment;
+                        if (std.mem.eql(u8, id, key.*)) try local_ids.append(alloc, entry.doc);
                     }
                 }
+                // Keep mutation/rollback deltas deterministic even though the
+                // input hash set and ID routing use different iteration orders.
+                std.sort.pdq(u32, local_ids.items, {}, std.sort.asc(u32));
             }
             if (local_ids.items.len == 0) continue;
 
@@ -3672,6 +4186,499 @@ pub const IndexWriter = struct {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "identity lookup deletes duplicates without scanning retained stored IDs" {
+    const a = std.testing.allocator;
+    var builder = segment_mod.SegmentWriter.init(a);
+    defer builder.deinit();
+    for (0..4096) |i| {
+        var buffer: [32]u8 = undefined;
+        try builder.addStoredDoc(try std.fmt.bufPrint(&buffer, "doc:{d}", .{i}), "{}");
+    }
+    try builder.addStoredDoc("doc:2048", "{}");
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    for ([_]bool{ false, true }) |native| {
+        var state: State = .{ .bytes = bytes };
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        if (native) try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } })) else try writer.addSegment(bytes);
+        const shared = writer.snapshot().segments[0].shared;
+        try std.testing.expect(!try writer.deleteById("new-document"));
+        try std.testing.expectEqual(@as(u64, 0), shared.identity_lookup_reads);
+        const deleted = try writer.deleteAllByIdsTracked(a, &.{ "doc:2048", "doc:1", "doc:2048", "", "not-present" });
+        defer IndexWriter.freeDeleteInfos(a, deleted);
+        try std.testing.expectEqual(@as(usize, 1), deleted.len);
+        try std.testing.expectEqualSlices(u32, &.{ 1, 2048, 4096 }, deleted[0].local_ids);
+        try std.testing.expectEqual(@as(u64, 3), shared.identity_lookup_reads);
+        try std.testing.expect(shared.identity_lookup_entries == null);
+        writer.rollbackDeleteInfos(deleted);
+        try std.testing.expectEqual(@as(u32, 4097), writer.snapshot().liveDocCount());
+        try std.testing.expect(try writer.deleteById("doc:2048"));
+        try std.testing.expectEqual(@as(u32, 4095), writer.snapshot().liveDocCount());
+    }
+}
+
+test "identity lookup legacy routing is built once and verifies hash collisions" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "beta", .freq = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const entry = &writer.snapshot().segments[0];
+    // Suppress only the reader's new-section descriptor to exercise precisely
+    // the same fallback used by v4/v5 segments, without altering payloads.
+    for (entry.reader.fields) |field| for (field.sections) |*section| {
+        if (section.section_type == .doc_id_lookup) section.section_type = .doc_key_range;
+    };
+    try std.testing.expect(!try writer.deleteById("absent"));
+    try std.testing.expectEqual(@as(u64, 2), entry.shared.identity_lookup_reads);
+    try std.testing.expect(!try writer.deleteById("another-absent"));
+    try std.testing.expectEqual(@as(u64, 2), entry.shared.identity_lookup_reads);
+    const lookup = @import("document_identity_lookup.zig");
+    // Force both candidates into a's hash bucket. Only the exact stored ID
+    // may be deleted, even if the routing hash collides with an unrelated ID.
+    for (entry.shared.identity_lookup_entries.?) |*candidate| candidate.hash = lookup.hash("a");
+    try std.testing.expect(try writer.deleteById("a"));
+    try std.testing.expectEqual(@as(u32, 1), writer.snapshot().liveDocCount());
+    const results = try writer.snapshot().search(a, "body", &.{"beta"}, 10);
+    defer a.free(results.hits);
+    try std.testing.expectEqual(@as(usize, 1), results.hits.len);
+}
+
+test "identity lookup source ownership reuses legacy routing across independent visibility runtimes" {
+    const source_module = @import("segment_source.zig");
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "beta", .freq = 1 }} },
+    });
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        cache: *source_module.ImmutableDecodeCache,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn release(raw: *anyopaque, item: *anyopaque) void {
+            (source_module.ImmutableDecodeCache.Lease{ .cache = @ptrCast(@alignCast(raw)), .entry = @ptrCast(@alignCast(item)) }).release();
+        }
+        fn acquire(raw: *anyopaque, request: source_module.DecodeRequest) !?source_module.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const held = (try self.cache.acquire(request)) orelse return null;
+            return .{ .owner = self.cache, .item = held.entry, .value = held.entry.value.?, .release_fn = release };
+        }
+        fn source(self: *@This()) SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .acquire_decoded = acquire } };
+        }
+    };
+    const cache = try source_module.ImmutableDecodeCache.create(a, null, 1024 * 1024);
+    defer cache.deinit();
+    var state: State = .{ .bytes = bytes, .cache = cache };
+    var original_rows: [*]const @import("document_identity_lookup.zig").Entry = undefined;
+    for (0..2) |turn| {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, .fromNative(state.source()));
+        const entry = &writer.snapshot().segments[0];
+        // Exercise legacy metadata without changing the immutable payload.
+        for (entry.reader.fields) |field| for (field.sections) |*section| {
+            if (section.section_type == .doc_id_lookup) section.section_type = .doc_key_range;
+        };
+        try std.testing.expect(!try writer.deleteById("absent"));
+        try std.testing.expect(entry.shared.identity_lookup_decoded != null);
+        if (turn == 0) {
+            try std.testing.expectEqual(@as(u64, 2), entry.shared.identity_lookup_reads);
+            original_rows = entry.shared.identity_lookup_entries.?.ptr;
+            try std.testing.expect(try writer.deleteById("a"));
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), entry.shared.identity_lookup_reads);
+            try std.testing.expectEqual(original_rows, entry.shared.identity_lookup_entries.?.ptr);
+            try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
+            try std.testing.expect(try writer.deleteById("b"));
+            const found = try writer.snapshot().search(a, "body", &.{"alpha"}, 10);
+            defer a.free(found.hits);
+            try std.testing.expectEqual(@as(usize, 1), found.hits.len);
+        }
+        try std.testing.expectEqual(@as(u32, 1), writer.snapshot().liveDocCount());
+    }
+}
+
+test "identity lookup source ownership reuses persisted routing across independent visibility runtimes" {
+    const source_module = @import("segment_source.zig");
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "beta", .freq = 1 }} },
+    });
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        read_calls: usize = 0,
+        allow_cache: bool = true,
+        cache: *source_module.ImmutableDecodeCache,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.read_calls += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn release(raw: *anyopaque, item: *anyopaque) void {
+            (source_module.ImmutableDecodeCache.Lease{ .cache = @ptrCast(@alignCast(raw)), .entry = @ptrCast(@alignCast(item)) }).release();
+        }
+        fn acquire(raw: *anyopaque, request: source_module.DecodeRequest) !?source_module.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allow_cache) return null;
+            const held = (try self.cache.acquire(request)) orelse return null;
+            return .{ .owner = self.cache, .item = held.entry, .value = held.entry.value.?, .release_fn = release };
+        }
+        fn source(self: *@This()) SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .acquire_decoded = acquire } };
+        }
+    };
+    const cache = try source_module.ImmutableDecodeCache.create(a, null, 1024 * 1024);
+    defer cache.deinit();
+    var state: State = .{ .bytes = bytes, .cache = cache };
+    var original_rows: [*]const @import("document_identity_lookup.zig").Entry = undefined;
+    for (0..3) |turn| {
+        state.allow_cache = turn != 2;
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, .fromNative(state.source()));
+        const entry = &writer.snapshot().segments[0];
+        const before_empty = state.read_calls;
+        const empty = try writer.prepareDeleteInfos(a, &.{});
+        defer IndexWriter.freeDeleteInfos(a, empty);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+        try std.testing.expectEqual(before_empty, state.read_calls);
+        try std.testing.expect(!try writer.deleteById("absent"));
+        if (turn == 2) {
+            try std.testing.expect(entry.shared.identity_lookup_decoded == null);
+            try std.testing.expect(try writer.deleteById("a"));
+            try std.testing.expectEqual(@as(u32, 1), writer.snapshot().liveDocCount());
+            continue;
+        }
+        try std.testing.expect(entry.shared.identity_lookup_decoded != null);
+        if (turn == 0) {
+            const reads = state.read_calls;
+            const changes = try writer.prepareDeleteInfos(a, &.{ "another-absent", "still-absent" });
+            defer IndexWriter.freeDeleteInfos(a, changes);
+            try std.testing.expectEqual(@as(usize, 0), changes.len);
+            try std.testing.expectEqual(reads, state.read_calls);
+            original_rows = entry.shared.identity_lookup_entries.?.ptr;
+            try std.testing.expect(try writer.deleteById("a"));
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), entry.shared.identity_lookup_reads);
+            try std.testing.expectEqual(original_rows, entry.shared.identity_lookup_entries.?.ptr);
+            try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
+            try std.testing.expect(try writer.deleteById("b"));
+            const found = try writer.snapshot().search(a, "body", &.{"alpha"}, 10);
+            defer a.free(found.hits);
+            try std.testing.expectEqual(@as(usize, 1), found.hits.len);
+        }
+        try std.testing.expectEqual(@as(u32, 1), writer.snapshot().liveDocCount());
+    }
+}
+
+test "identity lookup large persisted navigation stays bounded and survives runtime replacement" {
+    const source_module = @import("segment_source.zig");
+    const a = std.testing.allocator;
+    var builder = segment_mod.SegmentWriter.init(a);
+    defer builder.deinit();
+    const documents = 32768;
+    for (0..documents) |i| {
+        var buffer: [32]u8 = undefined;
+        try builder.addStoredDoc(try std.fmt.bufPrint(&buffer, "large-{d}", .{i}), "{}");
+    }
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        read_calls: usize = 0,
+        read_bytes: usize = 0,
+        allow_cache: bool = true,
+        cache: *source_module.ImmutableDecodeCache,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.read_calls += 1;
+            self.read_bytes += out.len;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn release(raw: *anyopaque, item: *anyopaque) void {
+            (source_module.ImmutableDecodeCache.Lease{ .cache = @ptrCast(@alignCast(raw)), .entry = @ptrCast(@alignCast(item)) }).release();
+        }
+        fn acquire(raw: *anyopaque, request: source_module.DecodeRequest) !?source_module.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allow_cache) return null;
+            const held = (try self.cache.acquire(request)) orelse return null;
+            return .{ .owner = self.cache, .item = held.entry, .value = held.entry.value.?, .release_fn = release };
+        }
+        fn source(self: *@This()) SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .acquire_decoded = acquire } };
+        }
+    };
+    const cache = try source_module.ImmutableDecodeCache.create(a, null, 1024 * 1024);
+    defer cache.deinit();
+    var state: State = .{ .bytes = bytes, .cache = cache };
+    var original: *@import("document_identity_lookup.zig").Paged = undefined;
+    for (0..3) |turn| {
+        state.allow_cache = turn != 2;
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, .fromNative(state.source()));
+        const entry = &writer.snapshot().segments[0];
+        const before_calls = state.read_calls;
+        const before_bytes = state.read_bytes;
+        const changes = try writer.prepareDeleteInfos(a, &.{"absent-large-identity"});
+        defer IndexWriter.freeDeleteInfos(a, changes);
+        try std.testing.expectEqual(@as(usize, 0), changes.len);
+        try std.testing.expect(entry.shared.identity_lookup_entries == null);
+        if (turn == 2) {
+            try std.testing.expect(entry.shared.identity_lookup_pages == null);
+        } else {
+            try std.testing.expect(entry.shared.identity_lookup_pages != null);
+            if (turn == 0) {
+                original = entry.shared.identity_lookup_pages.?;
+                // The range facade authenticates 64 KiB integrity frames on
+                // first touch, even for a small logical navigation page.
+                const max_probes = @bitSizeOf(u32) - @clz(@as(u32, documents)) + 2;
+                try std.testing.expect(state.read_bytes - before_bytes <= 2 * max_probes * @import("segment_integrity.zig").page_size);
+                std.debug.print("IDENTITY_PAGED_NAV documents={d} cold_source_calls={d} cold_source_bytes={d} cache_bytes={d}\n", .{ documents, state.read_calls - before_calls, state.read_bytes - before_bytes, @sizeOf(@import("document_identity_lookup.zig").Paged) });
+            } else {
+                try std.testing.expectEqual(original, entry.shared.identity_lookup_pages.?);
+                try std.testing.expectEqual(before_calls, state.read_calls);
+            }
+            const warm = state.read_calls;
+            const again = try writer.prepareDeleteInfos(a, &.{"absent-large-identity"});
+            defer IndexWriter.freeDeleteInfos(a, again);
+            try std.testing.expectEqual(@as(usize, 0), again.len);
+            try std.testing.expectEqual(warm, state.read_calls);
+        }
+        // Each independent visibility owner still sees and removes its own row.
+        try std.testing.expectEqual(@as(u32, documents), writer.snapshot().liveDocCount());
+        try std.testing.expect(try writer.deleteById("large-7"));
+        try std.testing.expectEqual(@as(u32, documents - 1), writer.snapshot().liveDocCount());
+    }
+}
+
+test "identity lookup paged navigation validates misses and checks warm read authority" {
+    const a = std.testing.allocator;
+    const lookup = @import("document_identity_lookup.zig");
+    const source_module = @import("segment_source.zig");
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    const Sink = struct {
+        bytes: *std.ArrayList(u8),
+        pub fn appendSlice(self: @This(), data: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, data);
+        }
+    };
+    const sink: Sink = .{ .bytes = &bytes };
+    const documents = 65536;
+    try lookup.writeHeader(sink, documents);
+    for (0..documents) |i| try lookup.writeEntry(sink, .{ .hash = i * 2, .doc = @intCast(i) });
+    const State = struct {
+        bytes: []const u8,
+        calls: usize = 0,
+        read_bytes: usize = 0,
+        max_read: usize = 0,
+        canceled: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.read_bytes += out.len;
+            self.max_read = @max(self.max_read, out.len);
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled) return error.Canceled;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state: State = .{ .bytes = bytes.items };
+    const view = try source_module.View.init(.{ .ranges = .{ .ptr = &state, .length = bytes.items.len, .read_into = State.read, .close = State.close, .check_read_context = State.check } }, 0, bytes.items.len);
+    const pages = try lookup.Paged.create(a, view, documents);
+    defer a.destroy(pages);
+    const ordinal: u32 = 32123;
+    try std.testing.expectEqual(ordinal + 1, try pages.seek(view, ordinal * 2 + 1));
+    try std.testing.expect(state.calls < 20);
+    try std.testing.expect(state.max_read <= lookup.Paged.page_entries * lookup.entry_size);
+    try std.testing.expect(state.read_bytes < 32 * 1024);
+    const warm = state.calls;
+    for (0..100) |_| try std.testing.expectEqual(ordinal + 1, try pages.seek(view, ordinal * 2 + 1));
+    try std.testing.expectEqual(warm, state.calls);
+    state.canceled = true;
+    try std.testing.expectError(error.Canceled, pages.seek(view, ordinal * 2));
+    try std.testing.expectError(error.Canceled, pages.readEntry(view, ordinal));
+    try std.testing.expectEqual(warm, state.calls);
+    state.canceled = false;
+    // A corrupt uncached page must never become a warm success. A failed
+    // decode leaves the previous slot intact and can be loaded after repair.
+    std.mem.writeInt(u32, bytes.items[lookup.header_size + 8 ..][0..4], documents, .little);
+    try std.testing.expectError(error.InvalidSegment, pages.readEntry(view, 0));
+    try std.testing.expectError(error.InvalidSegment, pages.readEntry(view, 0));
+    std.mem.writeInt(u32, bytes.items[lookup.header_size + 8 ..][0..4], 0, .little);
+    try std.testing.expectEqual(@as(u64, 0), (try pages.readEntry(view, 0)).hash);
+    try std.testing.expectError(error.InvalidSegment, pages.readEntry(view, documents));
+    const Worker = struct {
+        pages: *lookup.Paged,
+        view: source_module.View,
+        first: usize,
+        failed: *std.atomic.Value(bool),
+        fn run(self: @This()) void {
+            for (0..1024) |i| {
+                const ordinal_value: u32 = @intCast((i * 257 + self.first) % documents);
+                const actual = self.pages.seek(self.view, @as(u64, ordinal_value) * 2 + 1) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                if (actual != ordinal_value + 1) self.failed.store(true, .release);
+            }
+        }
+    };
+    var failed = std.atomic.Value(bool).init(false);
+    const first = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .pages = pages, .view = view, .first = 0, .failed = &failed }});
+    const second = std.Thread.spawn(.{}, Worker.run, .{Worker{ .pages = pages, .view = view, .first = 127, .failed = &failed }}) catch |err| {
+        first.join();
+        return err;
+    };
+    first.join();
+    second.join();
+    try std.testing.expect(!failed.load(.acquire));
+}
+
+test "identity lookup compact decoding bounds reads and rejects malformed routing" {
+    const a = std.testing.allocator;
+    const lookup = @import("document_identity_lookup.zig");
+    const Range = struct {
+        bytes: []const u8,
+        length: u64,
+        calls: *usize,
+        pub fn readInto(self: @This(), offset: u64, out: []u8) !void {
+            self.calls.* += 1;
+            if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.EndOfStream;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+    };
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    const Sink = struct {
+        bytes: *std.ArrayList(u8),
+        pub fn appendSlice(self: @This(), data: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, data);
+        }
+    };
+    const sink: Sink = .{ .bytes = &bytes };
+    try lookup.writeHeader(sink, 129);
+    for (0..129) |i| try lookup.writeEntry(sink, .{ .hash = i, .doc = @intCast(i) });
+    var calls: usize = 0;
+    const view: Range = .{ .bytes = bytes.items, .length = bytes.items.len, .calls = &calls };
+    const entries = try lookup.decode(a, view, 129);
+    defer a.free(entries);
+    try std.testing.expectEqual(@as(usize, 3), calls);
+    try std.testing.expectEqual(@as(u64, 128), entries[128].hash);
+    try std.testing.expectError(error.InvalidSegment, lookup.decode(a, view, 128));
+    std.mem.writeInt(u32, bytes.items[lookup.header_size + 8 ..][0..4], 129, .little);
+    try std.testing.expectError(error.InvalidSegment, lookup.decode(a, view, 129));
+    std.mem.writeInt(u32, bytes.items[lookup.header_size + 8 ..][0..4], 0, .little);
+    std.mem.writeInt(u64, bytes.items[lookup.header_size..][0..8], 1000, .little);
+    try std.testing.expectError(error.InvalidSegment, lookup.decode(a, view, 129));
+}
+
+test "identity lookup allocation failures preserve ownership and deletion rollback" {
+    const Scenario = struct {
+        fn run(a: Allocator) !void {
+            var builder = segment_mod.SegmentWriter.init(a);
+            defer builder.deinit();
+            for ([_][]const u8{ "a", "b", "a" }) |id| try builder.addStoredDoc(id, "{}");
+            const bytes = try builder.build();
+            defer a.free(bytes);
+            var writer = try IndexWriter.init(a);
+            defer writer.deinit();
+            try writer.addSegment(bytes);
+            const changes = try writer.deleteAllByIdsTracked(a, &.{ "a", "b" });
+            defer IndexWriter.freeDeleteInfos(a, changes);
+            try std.testing.expectEqual(@as(u32, 0), writer.snapshot().liveDocCount());
+            writer.rollbackDeleteInfos(changes);
+            try std.testing.expectEqual(@as(u32, 3), writer.snapshot().liveDocCount());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "identity lookup compatibility cache obeys residency admission and releases before source close" {
+    const a = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_segment_residency)] = .{ .soft_limit_bytes = 48, .hard_limit_bytes = 48 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var builder = segment_mod.SegmentWriter.init(a);
+    defer builder.deinit();
+    try builder.addStoredDoc("a", "{}");
+    try builder.addStoredDoc("b", "{}");
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        manager: *resource_manager_mod.ResourceManager,
+        closed: bool = false,
+        used_at_close: u64 = std.math.maxInt(u64),
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+            self.used_at_close = self.manager.sliceStats(.full_text_segment_residency).used_bytes;
+        }
+    };
+    var state: State = .{ .bytes = bytes, .manager = &manager };
+    {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close, .resource_manager = &manager } }));
+        const entry = &writer.snapshot().segments[0];
+        const before = entry.immutableRetainedBytes();
+        for (entry.reader.fields) |field| for (field.sections) |*section| {
+            if (section.section_type == .doc_id_lookup) section.section_type = .doc_key_range;
+        };
+        var held = try manager.reserveWithoutReclaim(.full_text_segment_residency, 32);
+        defer held.release();
+        try std.testing.expectError(error.ResourceBudgetExceeded, writer.deleteById("a"));
+        try std.testing.expect(entry.shared.identity_lookup_entries == null);
+        try std.testing.expectEqual(@as(u64, 0), entry.shared.identity_lookup_reads);
+        try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
+        held.release();
+        try std.testing.expect(try writer.deleteById("a"));
+        try std.testing.expectEqual(@as(u64, 32), manager.sliceStats(.full_text_segment_residency).used_bytes);
+        try std.testing.expect(entry.immutableRetainedBytes() >= before + 32);
+        const backing = &entry.reader.native.?.range.paged_source.?.original.ranges;
+        backing.immutable_identity = @splat(1);
+        try std.testing.expect(entry.retainImmutable() == null);
+        backing.retention_artifact_only = true;
+        var pin = entry.retainImmutable() orelse return error.TestUnexpectedResult;
+        pin.deinit();
+    }
+    try std.testing.expect(state.closed);
+    try std.testing.expectEqual(@as(u64, 0), state.used_at_close);
+}
 
 fn buildTestSegment(alloc: Allocator, docs: []const struct { terms: []const inverted.InvertedIndexBuilder.TermHit }) ![]u8 {
     var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
@@ -3867,6 +4874,48 @@ fn mapTestSegment(segment_bytes: []const u8) !SegmentData {
     );
     @memcpy(mapped, segment_bytes);
     return SegmentData.fromMapped(mapped);
+}
+
+test "native shared segment residency remains source owned across runtime managers" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegment(a, &.{.{ .terms = &.{.{ .term = "shared", .freq = 1, .norm = 8 }} }});
+    defer a.free(bytes);
+    var first = resource_manager_mod.ResourceManager.init(.{});
+    defer first.deinit(a);
+    var second = resource_manager_mod.ResourceManager.init(.{});
+    defer second.deinit(a);
+    const SourceState = struct {
+        bytes: []const u8,
+        closes: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            if (offset > state.bytes.len or out.len > state.bytes.len - @as(usize, @intCast(offset))) return error.EndOfStream;
+            @memcpy(out, state.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(raw: *anyopaque) void {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            state.closes += 1;
+        }
+    };
+    var source: SourceState = .{ .bytes = bytes };
+    {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &source, .length = bytes.len, .read_into = SourceState.read, .close = SourceState.close, .resource_manager = &first } }));
+        writer.attachResourceManager(&first);
+        var fork = try writer.forkImmutable();
+        defer fork.deinit();
+        fork.attachResourceManager(&second);
+        const snapshot_ref = fork.acquireSnapshot();
+        defer snapshot_ref.release();
+        const entry = snapshot_ref.segments[0];
+        try std.testing.expect(entry.data.isFileBacked() and !entry.data.isMapped());
+        try std.testing.expect(entry.shared.residency_manager == null);
+        try std.testing.expect(entry.data.native.resourceManager().? == &first);
+        try std.testing.expectEqual(@as(u64, 0), first.sliceStats(.full_text_segment_residency).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), second.sliceStats(.full_text_segment_residency).used_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.closes);
 }
 
 test "external lake shared immutable mapped segments have one residency owner across forks" {
@@ -4953,17 +6002,23 @@ test "external lake range segment admission defers dictionary diagnostics across
     var unpublished = [_]ReplacementSegmentData{.{ .id = 4, .data = state.data(), .prepared_reader = try state.data().initReader(a) }};
     defer unpublished[0].data.deinit(a);
     defer if (unpublished[0].prepared_reader) |*reader| reader.deinit();
-    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    writer.alloc = failing.allocator();
-    const attempted = writer.prepareSegmentsManyDataWithScratch(a, &.{3}, &unpublished);
-    writer.alloc = a;
-    if (attempted) |value| {
-        var unexpected = value;
-        unexpected.abort();
-        return error.TestExpectedError;
-    } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
-    try std.testing.expect(unpublished[0].prepared_reader == null);
-    try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
+    // Capturing immutable revisions is now the first writer allocation.
+    // Refusal there leaves the caller's reader intact. Refusal at the next
+    // retained-snapshot allocation happens after ownership transfer and must
+    // close the transferred reader exactly once.
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        writer.alloc = failing.allocator();
+        const attempted = writer.prepareSegmentsManyDataWithScratch(a, &.{3}, &unpublished);
+        writer.alloc = a;
+        if (attempted) |value| {
+            var unexpected = value;
+            unexpected.abort();
+            return error.TestExpectedError;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(fail_index == 0, unpublished[0].prepared_reader != null);
+        try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
+    }
 }
 
 test "text statistics mixed warm cold batches fetch only missing slots" {
@@ -5538,4 +6593,259 @@ test "ordinal bitmap streaming projection cancels during traversal" {
     defer shared.unlockDeletionShared();
     while ((shared.deletion_lock.load(.acquire) & SegmentShared.deletion_writer_bit) == 0) spinOrYield();
     try std.testing.expect((try snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{})) == null);
+}
+
+test "identity lookup seeks logarithmically as retained corpus grows" {
+    const lookup = @import("document_identity_lookup.zig");
+    // Persistent routing pins this hash recipe; a standard-library change
+    // needs a deliberate routing version change rather than false misses.
+    try std.testing.expectEqual(@as(u64, 0x0409638ee2bde459), lookup.hash(""));
+    const View = struct {
+        length: u64,
+        count: u32,
+        reads: *usize,
+        pub fn readInto(self: @This(), offset: u64, out: []u8) !void {
+            self.reads.* += 1;
+            if (offset == 0) {
+                out[0] = lookup.version;
+                std.mem.writeInt(u32, out[1..5], self.count, .little);
+                return;
+            }
+            const ordinal = (offset - lookup.header_size) / lookup.entry_size;
+            std.mem.writeInt(u64, out[0..8], ordinal * 2, .little);
+            std.mem.writeInt(u32, out[8..12], @intCast(ordinal), .little);
+        }
+    };
+    for ([_]u32{ 1024, 1024 * 1024 }) |count| {
+        var reads: usize = 0;
+        const view: View = .{ .length = lookup.header_size + @as(u64, count) * lookup.entry_size, .count = count, .reads = &reads };
+        try std.testing.expectEqual(count / 2, try lookup.seek(view, count, count));
+        try std.testing.expect(reads <= 22);
+    }
+}
+
+test "external progress publication gates new index snapshots through activation and abort" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Context = struct {
+        writer: *IndexWriter,
+        started: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        count: usize = 0,
+        fn read(self: *@This()) void {
+            self.started.set(std.testing.io);
+            const snapshot = self.writer.acquireSnapshot();
+            defer snapshot.release();
+            self.count = snapshot.segments.len;
+            self.done.set(std.testing.io);
+        }
+    };
+    for ([_]bool{ false, true }) |commit| {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+        defer a.free(bytes);
+        try writer.addSegment(bytes);
+        const retained = writer.acquireSnapshot();
+        defer retained.release();
+        var prepared = try writer.prepareSegmentsManyData(&.{1}, &.{});
+        defer prepared.abort();
+        prepared.guardExternalVisibility();
+        var context: Context = .{ .writer = &writer };
+        const reader = try std.Thread.spawn(.{}, Context.read, .{&context});
+        // Always release before joining, including an assertion/error path.
+        defer {
+            prepared.abort();
+            reader.join();
+        }
+        try context.started.wait(std.testing.io);
+        try std.testing.expectError(error.Timeout, context.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }));
+        if (commit) prepared.publish() else prepared.abort();
+        try context.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try std.testing.expectEqual(@as(usize, if (commit) 0 else 1), context.count);
+        try std.testing.expectEqual(@as(usize, 1), retained.segments.len);
+    }
+}
+
+test "detached index publication releases serialization and validates snapshot and deletion revisions" {
+    const a = std.testing.allocator;
+    for ([_]enum { unchanged, replaced, deleted }{ .unchanged, .replaced, .deleted }) |change| {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+        defer a.free(bytes);
+        try writer.addSegment(bytes);
+        var prepared = try writer.prepareSegmentsManyData(&.{1}, &.{});
+        defer prepared.abort();
+        try prepared.detach();
+        try std.testing.expect(writer.mu.tryLock());
+        writer.mu.unlock();
+        switch (change) {
+            .unchanged => {
+                try prepared.bind(&writer);
+                prepared.guardExternalVisibility();
+                prepared.publish();
+                try std.testing.expectEqual(@as(usize, 0), writer.current.segments.len);
+            },
+            .replaced => {
+                try writer.addSegment(bytes);
+                try std.testing.expectError(error.EnrichmentWaitCanceled, prepared.bind(&writer));
+            },
+            .deleted => {
+                const pointer = writer.current;
+                try std.testing.expect(try writer.deleteById("old"));
+                try std.testing.expect(pointer == writer.current);
+                try std.testing.expectError(error.EnrichmentWaitCanceled, prepared.bind(&writer));
+            },
+        }
+    }
+}
+
+test "detached index publication abort owns its lifetime after writer shutdown" {
+    const a = std.testing.allocator;
+    var writer = try IndexWriter.init(a);
+    var writer_live = true;
+    defer if (writer_live) writer.deinit();
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    var prepared = try writer.prepareSegmentsManyData(&.{1}, &.{});
+    defer prepared.abort();
+    try prepared.detach();
+    writer.deinit();
+    writer_live = false;
+    prepared.abort();
+}
+
+test "group activation retains every external fence until all snapshots are installed" {
+    const a = std.testing.allocator;
+    var first = try IndexWriter.init(a);
+    defer first.deinit();
+    var second = try IndexWriter.init(a);
+    defer second.deinit();
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try first.addSegment(bytes);
+    try second.addSegment(bytes);
+    var first_plan = try first.prepareSegmentsManyData(&.{1}, &.{});
+    defer first_plan.abort();
+    var second_plan = try second.prepareSegmentsManyData(&.{1}, &.{});
+    defer second_plan.abort();
+    first_plan.guardExternalVisibility();
+    second_plan.guardExternalVisibility();
+    first_plan.publishRetainingExternalVisibility();
+    defer first_plan.finishExternalVisibility();
+    try std.testing.expectEqual(@as(usize, 0), first.current.segments.len);
+    try std.testing.expectEqual(@as(usize, 1), second.current.segments.len);
+    try std.testing.expect(!first.external_visibility_gate.tryLock());
+    try std.testing.expect(!second.external_visibility_gate.tryLock());
+    second_plan.publishRetainingExternalVisibility();
+    defer second_plan.finishExternalVisibility();
+    try std.testing.expectEqual(@as(usize, 0), second.current.segments.len);
+    try std.testing.expect(!first.external_visibility_gate.tryLock());
+    try std.testing.expect(!second.external_visibility_gate.tryLock());
+    // Memory activation has already released both writer mutexes. Only the
+    // reader fences remain until the coordinator finishes the whole group.
+    try std.testing.expect(first.mu.tryLock());
+    first.mu.unlock();
+    try std.testing.expect(second.mu.tryLock());
+    second.mu.unlock();
+}
+
+test "native detached publication rebinds exact namespaces after writer shutdown and retains accounting" {
+    const a = std.testing.allocator;
+    const Lease = struct {
+        references: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn resources(self: *@This()) @import("storage/immutable_artifact.zig").BuildResources {
+            return .{ .ptr = self, .allocator = std.testing.allocator, .io = std.testing.io, .resource_manager = null, .retain_fn = retain, .release_fn = release };
+        }
+    };
+    var old_owner: Lease = .{};
+    var new_owner: Lease = .{};
+    defer std.debug.assert(old_owner.references == 1 and new_owner.references == 1);
+    var writer = try IndexWriter.init(a);
+    var writer_live = true;
+    defer if (writer_live) writer.deinit();
+    writer.setNativeResources(old_owner.resources());
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    var prepared = try writer.prepareSegmentsManyData(&.{1}, &.{});
+    defer prepared.abort();
+    try prepared.detach();
+    writer.deinit();
+    writer_live = false;
+    var replacement = try IndexWriter.init(a);
+    var replacement_live = true;
+    defer if (replacement_live) replacement.deinit();
+    replacement.setNativeResources(new_owner.resources());
+    try replacement.addSegment(bytes);
+    try std.testing.expect(prepared.detached_base.? != replacement.current);
+    const identity: @import("storage/native_publication.zig").NamespaceIdentity = .{ .inode = 17, .file_namespace = @splat(3), .root = @splat(7), .generation = @splat(11) };
+    var changed = identity;
+    changed.generation = @splat(12);
+    try std.testing.expectError(error.EnrichmentWaitCanceled, prepared.bindNative(&replacement, identity, changed));
+    try std.testing.expect(replacement.mu.tryLock());
+    replacement.mu.unlock();
+    try prepared.bindNative(&replacement, identity, identity);
+    prepared.guardExternalVisibility();
+    prepared.publish();
+    const retained = replacement.acquireSnapshot();
+    defer retained.release();
+    try std.testing.expectEqual(@as(usize, 0), retained.segments.len);
+    try std.testing.expectEqual(@as(*anyopaque, &old_owner), retained.native_resources.?.ptr);
+    replacement.deinit();
+    replacement_live = false;
+    try std.testing.expect(old_owner.references > 1);
+    try std.testing.expectEqual(@as(usize, 1), new_owner.references);
+}
+
+fn testOwnedIndexPreparationAfterShutdown(a: Allocator) !void {
+    var writer = try IndexWriter.init(a);
+    var live = true;
+    defer if (live) writer.deinit();
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    var preparation = try writer.capturePreparation();
+    var seed_live = true;
+    defer if (seed_live) preparation.deinit();
+    writer.deinit();
+    live = false;
+    const infos = try preparation.prepareDeleteInfos(a, &.{"old"});
+    defer IndexWriter.freeDeleteInfos(a, infos);
+    try std.testing.expectEqual(@as(usize, 1), infos.len);
+    var candidate = try preparation.prepareReplacement(a, &.{1}, &.{});
+    defer candidate.abort();
+    try std.testing.expect(candidate.writer == null);
+    try std.testing.expectEqual(@as(usize, 0), candidate.snapshot.segments.len);
+    // The candidate must own its base independently of the preparation seed.
+    preparation.deinit();
+    seed_live = false;
+}
+
+test "owned index preparation survives writer shutdown and allocation faults" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testOwnedIndexPreparationAfterShutdown, .{});
+}
+
+test "owned index preparation rejects deletion changes before building a replacement" {
+    const a = std.testing.allocator;
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    var preparation = try writer.capturePreparation();
+    defer preparation.deinit();
+    try std.testing.expect(try writer.deleteById("old"));
+    try std.testing.expectError(error.EnrichmentWaitCanceled, preparation.prepareDeleteInfos(a, &.{"old"}));
+    try std.testing.expectError(error.EnrichmentWaitCanceled, preparation.prepareReplacement(a, &.{1}, &.{}));
 }

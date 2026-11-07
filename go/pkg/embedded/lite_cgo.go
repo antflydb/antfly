@@ -88,10 +88,11 @@ const (
 
 // OpenOptions configures OpenWithOptions and CreateWithOptions.
 //
-// BusyTimeout, like sqlite3_busy_timeout, retries Lite admission while another
-// process holds the writer lease or advances the allocator checkpoint. Mutation
-// bodies are never replayed by this admission retry. Zero fails immediately with
-// Busy. The C ABI takes whole milliseconds.
+// BusyTimeout, like sqlite3_busy_timeout, bounds waits for Lite writer admission
+// and replay capacity. Active batch preparation is excluded from the capacity
+// wait budget. Refusals before primary commit may retry; committed mutations
+// are never replayed. Zero fails immediately with Busy. The C ABI takes whole
+// milliseconds.
 //
 // HostBudgetMB, BackendBudgetMB, CombinedBudgetMB, KVBudgetMB,
 // ScratchBudgetMB, and ProcessMemoryBudgetMB are explicit resource-budget
@@ -657,9 +658,8 @@ func (db *DB) BatchJSON(request []byte) ([]byte, error) {
 
 // OutcomeReceiptStatus resolves an outcome receipt from an OutcomeUnknown
 // batch or autocommit SQL write, on any handle for the same database. It
-// returns Stalled while the uncertain commit is not reconciled yet: retry on
-// a Lite database; for a directory database, close the issuing handle and
-// reopen first.
+// returns Stalled while the uncertain commit is not reconciled yet: close
+// the issuing handle and reopen first.
 func (db *DB) OutcomeReceiptStatus(receipt string) (OutcomeReceiptStatus, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

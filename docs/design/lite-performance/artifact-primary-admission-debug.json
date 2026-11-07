@@ -1,0 +1,98 @@
+{
+  "scope": "Artifact-phase read safety and local Debug correctness qualification. Optimized end-to-end qualification remains pending.",
+  "Debug_library_sha256": "28ae2ccf5057eba156550778c9fdf47181e7b6fa80f82a6f44e20cfae06bbe67",
+  "reproduction": {
+    "parent_commit": "05693374c411d987e831080051955c8d55280fab",
+    "setup_iterations": 30,
+    "escaped_page_kind_failures": 2,
+    "all_final_integrity_checks_passed": true,
+    "call_path": [
+      "artifact control sweep",
+      "artifact-repair summary readiness",
+      "DocStore.get point probe",
+      "native transaction checkpoint document-index lookup"
+    ],
+    "controlled_primary_checkpoint": 41,
+    "peer_checkpoint": 169,
+    "test_gap": "The former hook could return a failed assertion into optional maintenance, where it was swallowed. The strengthened test propagates every hook error and checks the read generation before inspecting the returned value."
+  },
+  "fix": "After ending the replay source epoch, artifact/control primary reads join current owner/path admission before pinning their checkpoint. Replay preparation retains its original immutable source semantics. No global reader lock or long-lived primary fence was added.",
+  "after": {
+    "setup_iterations": 30,
+    "all_integrity_checks_passed": true,
+    "owner_page_failure_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "page_failure_warning_count": 0
+  },
+  "validation": {
+    "generation_regression": {
+      "passed": 1,
+      "failed": 0,
+      "leaked": 0
+    },
+    "default_C_API": {
+      "passed": 402,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0,
+      "unexpected_logged_errors": 0
+    },
+    "SDK_SQL_catalog_outcomes_concurrency_crash": {
+      "passed": 209,
+      "seconds": 72.21,
+      "failed": 0
+    },
+    "benchmark_reporting": {
+      "passed": 14,
+      "failed": 0
+    },
+    "retained_native_component_gate": {
+      "source_commit": "05693374c411d987e831080051955c8d55280fab",
+      "native_implementation_sources_unchanged": true,
+      "native_passed": 843,
+      "benchmark_skips": 5,
+      "backup_passed": 2,
+      "generic_storage_passed": 12,
+      "failed": 0,
+      "leaked": 0
+    },
+    "ABI_exports": 138
+  },
+  "qualification_rule": "Absolute page-failure counts preserve setup failures even when the measured delta is zero or a later cooperative yield overwrites the last cause. A default warning marker allows nested importer logs to enforce the same rule without per-operation benchmark tracing. Later successful integrity checks do not erase a page failure.",
+  "remaining": [
+    "Full corrected-candidate optimized qualification against retained references.",
+    "Externally owned aggregate CI and full factory."
+  ],
+  "reference_builds_or_executions": false,
+  "database_archives_created": false
+}

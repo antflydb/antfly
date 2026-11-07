@@ -87,6 +87,11 @@ pub const Namespace = struct {
     /// always retained normally. This is a read hint and is deliberately not
     /// part of namespace identity or persisted state.
     block_cache_admission: BlockCacheAdmission = .retain,
+    /// An admitted short metadata scan may borrow one provider snapshot until
+    /// its cursor closes. Ordinary/long scans retain artifact-specific sources
+    /// instead, avoiding a checkpoint-wide pin in an idle or streaming owner.
+    /// This opt-in lifetime contract is not namespace identity or durable data.
+    transient_storage_snapshot: bool = false,
     /// Opt-in owner-bounded local point borrowing; ordinary point APIs keep
     /// their owned-result contract. This hint is not namespace identity.
     borrow_local_point_results: bool = false,
@@ -144,8 +149,9 @@ pub const BatchMode = enum {
 /// direct ingest was attempted, or the write was published). The commit
 /// returns its original error so internal callers can act on the cause, for
 /// example cancellation; a caller that must classify a public outcome
-/// installs a record here for the duration of its call. Thread-local because
-/// commits run on the calling thread under the backend lock.
+/// installs a record here for the duration of its call. Thread-local to the
+/// requesting operation. Grouped native commits may run on a leader thread; the group result must carry its captured uncertainty
+/// back to each originating thread before updating this record.
 pub const CommitProgress = struct {
     maybe_applied: bool = false,
 };
@@ -226,6 +232,9 @@ pub const CursorOptions = struct {
 /// evolving. Higher layers should only depend on capabilities they actively
 /// require.
 pub const Capabilities = struct {
+    /// Replay storage enforces a durable high-water mark. Namespaces without
+    /// consumers must also retire their journal through the normal safe fence.
+    bounded_replay_admission: bool = false,
     ordered_ranges: bool = true,
     reverse_ranges: bool = false,
     cursors: bool = true,

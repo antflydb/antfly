@@ -1,0 +1,170 @@
+{
+  "source_commit": "b24c740669-plus-v37-lease-transfer",
+  "library_sha256": "517a8202412a77fd5592ae80515d8ba6063c1ffcf4c557a5381c6fa249546181",
+  "shim_sha256": "5922fac595545f87d8a41b99b5f9da5878a9ca5b53ba88214b6bfa1db8c93406",
+  "script_sha256": "bf8e6345318f2571b044605cdba18b97e5237ba8d610ff16eaca840bb7507ee0",
+  "counter_source_sha256": "f79fade832344d80563ae9ef547a840b5218c49fee422374dcb536f2d587ff0a",
+  "scope": "Synthetic operation counts, not elapsed performance qualification; reset_thread identifies execution thread, not semantic request ownership.",
+  "status": "passed",
+  "cases": [
+    {
+      "engine": "antfly",
+      "indexed": false,
+      "writes": 128,
+      "local_diagnostic_not_performance_qualification": true,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 384,
+            "write_calls": 1530,
+            "write_bytes": 5590144,
+            "read_calls": 3944,
+            "read_bytes": 16154624,
+            "fsync_ns": 38155000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 253,
+            "write_bytes": 16192,
+            "read_calls": 765,
+            "read_bytes": 24480,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 177,
+            "write_calls": 486,
+            "write_bytes": 1362915,
+            "read_calls": 2512,
+            "read_bytes": 10289152,
+            "fsync_ns": 14328000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 139,
+            "write_bytes": 8896,
+            "read_calls": 380,
+            "read_bytes": 11248,
+            "fsync_ns": 0
+          }
+        }
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.27867991698440164
+      },
+      "cleanup": {
+        "removed_bytes": 1093632
+      }
+    },
+    {
+      "engine": "antfly",
+      "indexed": true,
+      "writes": 128,
+      "local_diagnostic_not_performance_qualification": true,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 2352,
+            "write_calls": 8000,
+            "write_bytes": 25342608,
+            "read_calls": 7020,
+            "read_bytes": 30384128,
+            "fsync_ns": 321486000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 769,
+            "write_bytes": 49216,
+            "read_calls": 2603,
+            "read_bytes": 104448,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 211,
+            "write_calls": 509,
+            "write_bytes": 1670115,
+            "read_calls": 7101,
+            "read_bytes": 30105600,
+            "fsync_ns": 29347000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 89,
+            "write_bytes": 156243,
+            "read_calls": 398,
+            "read_bytes": 394489,
+            "fsync_ns": 0
+          }
+        }
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.49484595807734877
+      },
+      "cleanup": {
+        "removed_bytes": 2187264
+      }
+    }
+  ],
+  "build_profile": "Debug, stripped",
+  "validation": {
+    "hermetic_storage_contracts_passed": 352,
+    "explicit_model_skips": 3,
+    "adapter_contracts_passed": 87,
+    "failures": 0,
+    "leaks": 0
+  },
+  "source_file_sha256": {
+    "zig/pkg/antfly-embedded/src/storage/lite/artifact_source.zig": "4877022a162d3ace89f8078ce74e616b22ca93b363a0f5591db62eddf64040f7",
+    "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig": "1def46f80a0e74b98c8d3d983bb34e20935c5e1343c16c1687778c4917cbaa00",
+    "zig/pkg/antfly-embedded/src/storage/docstore.zig": "8dfc4779d7f50b54086e4332ec93a628b4c7c15cc39c54813287987f3e95c7c3",
+    "zig/pkg/antfly-embedded/src/storage/db/derived/apply_state.zig": "0273e64a3d04ee002e9aad14da71f695d2d9924d360b71cbb39347aa71be40cf",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "741e7410fac77298756207c228c008e5a05036fa128e125af2959d1cc53b79e2",
+    "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "7cea91cee9345700eee5ae628d7dc2b037a7db3eff23b81a79b040f10b4c0a9f"
+  },
+  "comparison_limit": "Compare operation counts only with the recorded optimized reference. Build profile and background scheduling differ; no elapsed-time or throughput improvement is established by this receipt."
+}

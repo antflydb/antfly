@@ -21,7 +21,7 @@
 //! Layout, in `<sidecar>.q/` (see `queuePathAlloc` for names too long for
 //! that suffix):
 //! - `tail`: the next-ticket counter, 8 little-endian bytes followed by their
-//!   complement, so a torn or partial write is detected instead of read as a
+//!   XOR check word, so a torn or partial write is detected instead of read as a
 //!   smaller number. Its own `flock` is held only for the few syscalls that
 //!   issue a ticket.
 //! - `t-<ticket>`: one file per waiter. The waiter holds an exclusive `flock`
@@ -94,7 +94,8 @@
 //!    may have the database open.
 
 const std = @import("std");
-const path_lock_wait = @import("path_lock_wait.zig");
+// The standalone process fixture shares this module ownership.
+pub const path_lock_wait = @import("path_lock_wait.zig");
 
 const State = enum(u8) {
     waiting = 'W',

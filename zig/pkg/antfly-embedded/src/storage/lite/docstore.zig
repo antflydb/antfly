@@ -1199,6 +1199,46 @@ test "lite reclamation staged generation joins maintenance before owner adoption
     try std.testing.expect((try live.checkWithCancel(null)).valid);
 }
 
+test "lite docstore mutation groups reuse the path allocator during pressure admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "mutation-pressure-allocator-loan.aflite");
+    defer a.free(path);
+    var cache: native.WriterAllocatorCache = .{};
+    defer cache.deinit();
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .externally_locked = true });
+    defer store.close();
+    store.file.writer_allocator_cache = &cache;
+    store.file.allocator_certificate_on_commit = true;
+    store.file.incremental_checkpoints = true;
+    {
+        var warm = try store.beginWrite();
+        errdefer warm.abort();
+        try warm.put("document", "warm allocator");
+        try warm.commit();
+    }
+    const ledger = cache.holder.?.ledger.?;
+    const before = store.file.allocatorWorkSnapshot();
+    for (0..16) |_| {
+        {
+            var write = try store.beginWrite();
+            errdefer write.abort();
+            try write.put("document", "updated");
+            try write.commit();
+        }
+        try std.testing.expect(store.file.ledger == null);
+        try std.testing.expectEqual(ledger, cache.holder.?.ledger.?);
+    }
+    const after = store.file.allocatorWorkSnapshot();
+    try std.testing.expectEqual(before.full_loads, after.full_loads);
+    try std.testing.expectEqual(before.digest_rebuilds, after.digest_rebuilds);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("updated", try read.get("document"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
 test "lite allocator v4 owner pins readers and reuses pages with shrinking disabled" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1311,6 +1351,50 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "lite reclamation background batches residual roots while explicit service remains immediate" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retirement-coalescing.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    // Isolate residual background debt from foreground contributions.
+    store.file.retirement_work_pages = 0;
+    for ([_][]const u8{ "first", "second", "third" }) |value| {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("document", value);
+        try write.commit();
+    }
+    try std.testing.expect(try store.file.retirementNeedsService());
+    const before = store.file.activeCheckpoint().commit_sequence;
+    // Keep the fixture independent of scheduler pauses between assertions;
+    // the pure policy test covers establishing the first real-time deadline.
+    store.maintenance_policy.retirement_batch.first_pending_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds + std.time.ns_per_min;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(before, store.file.activeCheckpoint().commit_sequence);
+    const deadline = store.maintenance_policy.retirement_batch.deadline() orelse return error.TestUnexpectedResult;
+    // Notifications and a second visit retain the first debt's deadline.
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(deadline, store.maintenance_policy.retirement_batch.deadline().?);
+    try std.testing.expectEqual(before, store.file.activeCheckpoint().commit_sequence);
+    // Expiration needs no new foreground mutation.
+    store.maintenance_policy.retirement_batch.first_pending_ns = 0;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expect(store.file.activeCheckpoint().commit_sequence > before);
+    const serviced = store.file.activeCheckpoint().commit_sequence;
+    if (try store.file.retirementNeedsService()) {
+        try store.maintainOnce(false);
+        try std.testing.expect(store.file.activeCheckpoint().commit_sequence > serviced);
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("third", try read.get("document"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
 pub const OpenOptions = struct {
     externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
@@ -1339,6 +1423,8 @@ const MutationRequest = struct {
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
+    artifact_retirement: bool = false,
+    publication_possible: bool = false,
     result: anyerror!void = {},
 };
 
@@ -1416,7 +1502,7 @@ var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
 /// Optional owner admission around every document/index publication.
 /// Detached computation can retain this Store without retaining a file
 /// writer lease; admission must validate its checkpoint before mutation.
-pub const PublicationScope = enum { primary, index, reclamation, artifact_lease, allocator_service };
+pub const PublicationScope = enum { primary, index, reclamation, artifact_lease, allocator_service, index_read };
 
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
@@ -1476,9 +1562,16 @@ pub const Store = struct {
     retired_file_bytes: u64 = 0,
     artifact_account: ?*ArtifactAccount = null,
     artifact_registry: ?*artifact_source.Registry = null,
+    /// Borrowed while this Store lives. Registries retain it independently, so
+    /// owned staging never keeps the mutable Store/Owner alive while queued.
+    artifact_publication_gate: ?@import("publication_gate.zig").Gate = null,
     /// Short-lived capture runtimes fence artifact readers instead of changing
     /// the durable catalog merely to open their existing immutable inputs.
     artifact_reader_fence: bool = false,
+    /// Artifact-only detached work has no turn-wide primary pin. Each catalog
+    /// lookup must refresh/validate under owner admission before pinning pages.
+    index_reads_require_admission: bool = false,
+    primary_reads_require_admission: bool = false,
     artifact_cleanup_cursor: artifact_source.SweepCursor = .{},
     artifact_marker_sweep: artifact_source.MarkerSweep = .{},
     maintenance_policy: reclamation.Policy = .{},
@@ -1500,6 +1593,9 @@ pub const Store = struct {
     maintenance_wake: std.Io.Event = .unset,
     maintenance_cancel: maintenance.CancelToken = .{},
     maintenance_running: bool = false,
+    /// An owner is staging immutable output on this inode. Reuse/retirement
+    /// must continue, but an automatic rewrite would discard that construction.
+    defer_background_vacuum: bool = false,
     generation_workspace_active: bool = false,
     maintenance_start_suppressed: bool = false,
     test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
@@ -1525,6 +1621,9 @@ pub const Store = struct {
     next_writer_ticket: u64 = 0,
     serving_writer_ticket: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    /// Set only by the backend which transfers this manager to the artifact
+    /// registry on close. External managers require their caller's lifetime.
+    resource_manager_transfers_on_close: bool = false,
 
     pub const MaintenancePhase = enum { assessment, copy, verification };
     pub const MaintenanceTestHook = struct {
@@ -1567,7 +1666,7 @@ pub const Store = struct {
         result.file.reserve_retirement_capacity = true;
         result.file.vacuum_target_indexed = opts.reclamation.page_reuse;
         if (!opts.read_only and !opts.externally_locked) {
-            if (opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
+            if (opts.reclamation.page_reuse and (!result.file.header.indexed_reclamation or result.file.header.indexed_revision < native.indexed_format_version)) {
                 _ = try result.vacuumWithCancel(null);
             }
             result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
@@ -1763,17 +1862,40 @@ pub const Store = struct {
     /// Initialize after the returned Store has its stable address. Sources
     /// independently own their runtime and descriptor.
     pub fn openArtifactSource(self: *Store, key: []const u8) !@import("../../segment_source.zig").Source {
+        // The optional pool lookup reads the catalog before lease publication.
+        // Refresh first; a late lease cannot protect an already reused root.
+        const admission = try self.acquireIndexReadAdmission();
+        defer if (admission) |held| held.leave(held.ptr);
+        return (try self.artifactRegistry()).open(key);
+    }
+
+    pub fn beginArtifactConstruction(self: *Store) !artifact_source.Construction {
+        const admission = try self.acquireIndexReadAdmission();
+        defer if (admission) |held| held.leave(held.ptr);
+        return (try self.artifactRegistry()).beginConstruction();
+    }
+
+    pub fn setArtifactPublicationGate(self: *Store, gate: @import("publication_gate.zig").Gate) void {
         lockStore(self);
-        const registry = self.artifact_registry orelse blk: {
-            const created = artifact_source.Registry.create(self.allocator, self) catch |err| {
-                self.mutex.unlock();
-                return err;
-            };
-            self.artifact_registry = created;
-            break :blk created;
-        };
-        self.mutex.unlock();
-        return registry.open(key);
+        defer self.mutex.unlock();
+        self.artifact_publication_gate = gate;
+        if (self.artifact_registry) |registry| registry.installPublicationGate(gate);
+    }
+
+    pub fn artifactRegistry(self: *Store) !*artifact_source.Registry {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.artifact_registry) |registry| return registry;
+        const created = try artifact_source.Registry.create(self.allocator, self);
+        self.artifact_registry = created;
+        return created;
+    }
+
+    pub fn fenceUncertainPublication(self: *Store) void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        self.file.checkpoint_publication_uncertain = true;
+        self.publishReadCheckpointAssumeLocked();
     }
 
     pub fn recordArtifactSourceOpen(self: *Store, reused: bool) void {
@@ -1984,6 +2106,15 @@ pub const Store = struct {
         return NativeBackendStore.init(self);
     }
 
+    /// The caller holds path publication admission and has rebound this
+    /// wrapper to the admitted tip. Move no mutable allocator across an
+    /// unlocked Store boundary, even when detached readers retain this DB.
+    pub fn prepareWriterAllocatorAssumeAdmitted(self: *Store) !void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.file.writer_allocator_cache) |cache| try cache.prepare(&self.file);
+    }
+
     /// Starts only after the owner has reached its permanent address. A Store
     /// returned by value from open/create must never start a self-referencing task.
     pub fn startMaintenance(self: *Store) void {
@@ -1999,7 +2130,7 @@ pub const Store = struct {
     fn startMaintenanceAssumeLocked(self: *Store) void {
         if (self.read_only or self.maintenance_start_suppressed or self.maintenance_cancel.requested.load(.acquire) or
             self.maintenance_future != null) return;
-        const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
+        const retirement = self.file.recovery_tail_pending or (self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false);
         if (!retirement and (!self.maintenance_policy.options.enabled or self.file.activeCheckpoint().page_count *| self.file.header.page_size < self.maintenance_policy.options.minimum_reclaim_bytes)) return;
         self.maintenance_future = self.file.runtime().concurrent(maintenanceLoop, .{self}) catch |err| {
             self.maintenance_policy.status.state = .deferred;
@@ -2030,7 +2161,7 @@ pub const Store = struct {
             self.mutex.unlock();
             if (@import("builtin").is_test) _ = self.test_maintenance_cycles.fetchAdd(1, .release);
             var failed = false;
-            self.maintainOnceWithCancel(retry, &self.maintenance_cancel) catch |err| {
+            self.maintainBackgroundOnceWithForce(retry, &self.maintenance_cancel) catch |err| {
                 failed = true;
                 self.recordMaintenanceError(err);
             };
@@ -2048,7 +2179,20 @@ pub const Store = struct {
                 retry_at = .zero;
                 const more = self.maintenanceNeedsService() catch false;
                 if (self.maintenance_cancel.requested.load(.acquire)) break;
-                if (!more) {
+                if (more) {
+                    lockStore(self);
+                    const retirement_deadline = self.maintenance_policy.retirement_batch.deadline();
+                    self.mutex.unlock();
+                    if (retirement_deadline) |deadline| {
+                        // A mutation can wake this wait to report pressure.
+                        // Residual debt retains its original deadline, so a
+                        // quiet final write needs no later notification.
+                        self.maintenance_wake.waitTimeout(io, .{ .duration = .{
+                            .raw = std.Io.Clock.awake.now(io).durationTo(.{ .nanoseconds = deadline }),
+                            .clock = .awake,
+                        } }) catch {};
+                    }
+                } else {
                     lockStore(self);
                     const rewrite_retry = self.maintenance_policy.rewrite_retry_at_ns;
                     self.mutex.unlock();
@@ -2071,7 +2215,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         try self.maintenance_cancel.check();
         if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return false;
-        return self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel);
+        return self.file.recovery_tail_pending or try self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel);
     }
 
     /// One owner-controlled assessment/cycle. Public for cooperative runtimes
@@ -2084,31 +2228,105 @@ pub const Store = struct {
     /// The detached connection owner calls this before provider/index work,
     /// while no foreground gate or writer path lease is held.
     pub fn prepareAllocatorVerification(self: *Store, cancel: ?*const maintenance.CancelToken) !void {
-        if (self.file.free_pages_verified) return;
-        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .verification);
-        const reader = try self.file.allocatorVerificationSnapshot(cancel);
+        // Capture the mutable wrapper's proof lineage under its Store mutex.
+        // The graph walk owns an independent inode-fenced reader; it never
+        // races a writer loaning the root wrapper's allocator state.
+        lockStore(self);
+        const reader = capture: {
+            defer self.mutex.unlock();
+            if (self.file.free_pages_verified) return;
+            break :capture try self.file.captureAllocatorVerificationSnapshot(cancel);
+        };
         defer {
             reader.close();
             self.file.allocator.destroy(reader);
         }
+        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .verification);
+        try reader.completeAllocatorVerification();
         // Publish the completed proof under the same short owner fence as
         // lease metadata. Foreground readers may inherit this flag, so the
         // detached scan must never mutate it concurrently outside that fence.
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .artifact_lease);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        lockStore(self);
+        defer self.mutex.unlock();
         try self.file.inheritAllocatorVerification(reader);
         if (!self.file.free_pages_verified) return error.EnrichmentWaitCanceled;
+        _ = try self.file.takeVerifiedAllocator(reader);
+        if (self.file.writer_allocator_cache) |cache| try cache.prepare(&self.file);
     }
 
+    /// Automatic shrinking is optional and preemptible. Required allocator,
+    /// orphan and retirement service still runs before the replay/quiet checks.
+    pub fn maintainBackgroundOnce(self: *Store, cancel: ?*const maintenance.CancelToken) !void {
+        return self.maintainBackgroundOnceWithForce(false, cancel);
+    }
+
+    fn maintainBackgroundOnceWithForce(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
+        self.maintainOnceWithMode(force, cancel, true) catch |err| {
+            if (err != error.ShrinkPreempted) return err;
+            lockStore(self);
+            defer self.mutex.unlock();
+            self.maintenance_policy.status.assessment_preemptions +|= 1;
+            self.maintenance_policy.status.state = .deferred;
+            self.maintenance_policy.status.reason = .writer_busy;
+            self.maintenance_policy.status.last_error = null;
+        };
+    }
+
+    const ShrinkGuard = struct {
+        file: *native.NativeFile,
+        parent: ?*const maintenance.CancelToken,
+        expected: [32]u8 = undefined,
+        next_probe_ns: i96 = 0,
+
+        fn check(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.parent) |parent| try parent.check();
+            const now = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds;
+            if (now < self.next_probe_ns) return;
+            self.next_probe_ns = now + 10 * std.time.ns_per_ms;
+            if (!self.file.primaryPublicationUnchanged(self.expected)) return error.ShrinkPreempted;
+        }
+    };
+
     fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
+        return self.maintainOnceWithMode(force, cancel, false);
+    }
+
+    fn maintainOnceWithMode(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken, cooperative: bool) !void {
         if (self.read_only) return;
         // External owners also defer requested allocator-format conversion to
         // this detached maintenance turn. Vacuum uses the same short capture
         // and checked publication boundaries as an ordinary reclamation copy.
-        if (self.maintenance_policy.options.page_reuse and !self.file.header.indexed_reclamation) {
-            _ = try self.vacuumWithCancel(cancel);
+        if (self.maintenance_policy.options.page_reuse and (!self.file.header.indexed_reclamation or self.file.header.indexed_revision < native.indexed_format_version)) {
+            if (cooperative) {
+                var conversion: ShrinkGuard = .{ .file = &self.file, .parent = cancel };
+                {
+                    if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
+                    defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+                    lockStore(self);
+                    defer self.mutex.unlock();
+                    if (self.generation_workspace_active or self.file.change_capture != null) return;
+                    if (cancel) |token| try token.check();
+                    conversion.expected = native.NativeFile.primaryPublicationIdentity(self.file.header);
+                    const debt = try self.file.replayAdmission();
+                    if (!self.maintenance_policy.observeShrinkQuiet(conversion.expected, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds, if (debt) |value| value.records != 0 else false)) {
+                        self.maintenance_policy.status.state = .deferred;
+                        self.maintenance_policy.status.reason = .writer_busy;
+                        self.maintenance_policy.status.last_error = null;
+                        return;
+                    }
+                }
+                // An upgrade copies the complete generation too. It must yield
+                // to primary progress just like an optional automatic shrink,
+                // rather than repeatedly copying a legacy database under load.
+                var token: maintenance.CancelToken = .{ .observer = .{ .ptr = &conversion, .check = ShrinkGuard.check } };
+                _ = try self.vacuumWithCancel(&token);
+            } else _ = try self.vacuumWithCancel(cancel);
             return;
         }
+        var replay_defers_shrink = false;
         {
             if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
@@ -2120,17 +2338,46 @@ pub const Store = struct {
             self.file.allocator_cancel_token = cancel;
             defer self.file.allocator_cancel_token = previous_cancel;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            const tail_blocked = self.file.recovery_tail_pending and !try self.file.recoverUncommittedTail();
+            try self.releaseDeferredArtifactLeases();
             _ = try artifact_source.cleanupOrphans(&self.file, &self.artifact_cleanup_cursor);
             try self.artifact_marker_sweep.run(&self.file);
-            if (try self.file.retirementNeedsService()) {
+            const retirement_pending = try self.file.retirementNeedsService();
+            const retirement_hint = if (retirement_pending) try self.file.retirementServiceHint() else native.NativeFile.RetirementServiceHint{ .objects = 0, .pressure = false };
+            const retirement_due = self.maintenance_policy.retirement_batch.due(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds, retirement_hint.objects, self.maintenance_policy.options.retirement_work_pages, retirement_hint.pressure);
+            if (retirement_pending and (!cooperative or retirement_due)) {
                 try self.refreshAdmissionAssumeLocked();
                 _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
+                self.maintenance_policy.retirement_batch.serviced();
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
             }
+            if (tail_blocked) {
+                // A live reader can retain a private or newer recovery prefix.
+                // Keep timed debt instead of spinning or truncating its pages.
+                self.maintenance_policy.status.state = .deferred;
+                self.maintenance_policy.status.reason = .retained_readers;
+                self.maintenance_policy.status.last_error = null;
+            }
+            if (cooperative and self.maintenance_policy.options.enabled and !self.defer_background_vacuum) {
+                const debt = try self.file.replayAdmission();
+                if (debt) |value| if (value.records != 0) {
+                    // The allocator lease already checked the current tip.
+                    // Do not enter optional shrink admission just to discover
+                    // known replay debt after another writer has moved it.
+                    _ = self.maintenance_policy.observeShrinkQuiet(native.NativeFile.primaryPublicationIdentity(self.file.header), std.Io.Clock.awake.now(self.file.runtime()).nanoseconds, true);
+                    self.maintenance_policy.status.state = .deferred;
+                    self.maintenance_policy.status.reason = .writer_busy;
+                    self.maintenance_policy.status.last_error = null;
+                    replay_defers_shrink = true;
+                };
+            }
         }
-        if (!self.maintenance_policy.options.enabled) return;
+        if (!self.maintenance_policy.options.enabled or self.defer_background_vacuum or replay_defers_shrink) return;
+        var guard: ShrinkGuard = .{ .file = &self.file, .parent = cancel };
+        var guard_token: maintenance.CancelToken = .{ .observer = .{ .ptr = &guard, .check = ShrinkGuard.check } };
+        const shrink_cancel: ?*const maintenance.CancelToken = if (cooperative) &guard_token else cancel;
         var snapshot: ?native.NativeFile = null;
         defer if (snapshot) |*source| source.close();
         var cached_stats: ?native.NativeFile.LiveStats = null;
@@ -2157,6 +2404,20 @@ pub const Store = struct {
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             const retry_due = self.maintenance_policy.rewriteRetryDue(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds);
             if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
+            guard.expected = native.NativeFile.primaryPublicationIdentity(self.file.header);
+            if (cooperative) {
+                const debt = try self.file.replayAdmission();
+                const replay_pending = if (debt) |value| value.records != 0 else false;
+                if (!self.maintenance_policy.observeShrinkQuiet(guard.expected, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds, replay_pending)) {
+                    // Quiet deferral still owns future work. The standalone
+                    // worker must take its timed retry path even when no new
+                    // mutation arrives after the final writer releases it.
+                    self.maintenance_policy.status.state = .deferred;
+                    self.maintenance_policy.status.reason = .writer_busy;
+                    self.maintenance_policy.status.last_error = null;
+                    return;
+                }
+            }
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             assessed_checkpoint = self.file.activeCheckpoint();
             assessed_size = size;
@@ -2172,7 +2433,7 @@ pub const Store = struct {
                         // the growth/activity budget. Bound revalidation by
                         // time and scan cost instead of scanning every retry.
                         if (std.Io.Clock.awake.now(self.file.runtime()).nanoseconds < cache.revalidate_at.nanoseconds and
-                            try self.admitShrinkWorkspaceAssumeLocked(cache.stats.compact_size, cancel) == null) return;
+                            try self.admitShrinkWorkspaceAssumeLocked(cache.stats.compact_size, shrink_cancel) == null) return;
                     }
                 }
             }
@@ -2191,12 +2452,12 @@ pub const Store = struct {
         }
         if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .assessment);
         const scan_started = std.Io.Clock.awake.now(self.file.runtime());
-        const stats = cached_stats orelse try snapshot.?.liveStats(cancel);
+        const stats = cached_stats orelse try snapshot.?.liveStats(shrink_cancel);
         const scan_finished = std.Io.Clock.awake.now(self.file.runtime());
         const rewrite = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (cancel) |token| try token.check();
+            if (shrink_cancel) |token| try token.check();
             if (self.assessment_generation != assessed_generation) return error.FileBusy;
             const due = if (cached_stats != null)
                 self.maintenance_policy.worthwhile(assessed_size, stats.compact_size)
@@ -2217,7 +2478,7 @@ pub const Store = struct {
                 break :blk false;
             }
             self.maintenance_policy.scheduleRewriteRetry(scan_finished.nanoseconds, if (cached_stats == null) scan_started.durationTo(scan_finished).nanoseconds else null);
-            const workspace = (try self.admitShrinkWorkspaceAssumeLocked(stats.compact_size, cancel)) orelse break :blk false;
+            const workspace = (try self.admitShrinkWorkspaceAssumeLocked(stats.compact_size, shrink_cancel)) orelse break :blk false;
             self.maintenance_policy.status.state = .rewriting;
             self.maintenance_policy.status.temporary_bytes = workspace;
             break :blk true;
@@ -2232,7 +2493,7 @@ pub const Store = struct {
         // lock before vacuum; the owner takes its own capture snapshot.
         if (snapshot) |*source| source.close();
         snapshot = null;
-        const report = self.performVacuum(cancel, true) catch |err| {
+        const report = self.performVacuum(shrink_cancel, true) catch |err| {
             if (err == error.FileBusy or err == error.WouldBlock) {
                 lockStore(self);
                 self.shrink_waiting_for_writer = true;
@@ -2427,7 +2688,7 @@ pub const Store = struct {
             status.oldest_data_retirement_epoch = stats.oldest_data_epoch;
             status.oldest_metadata_retirement_epoch = stats.oldest_metadata_epoch;
         }
-        status.allocator_work = self.file.allocator_work;
+        status.allocator_work = self.file.allocatorWorkSnapshot();
         if (self.file.reader_coordinator) |coordinator| {
             const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode);
             status.coordinated_reader_count = readers.count;
@@ -2825,14 +3086,33 @@ pub const Store = struct {
         return self.submitMutationWithDurability(context, apply, true);
     }
 
+    pub fn submitMutationWithPublicationState(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, publication_possible: *bool) !void {
+        return self.submitScopedMutation(context, apply, true, false, false, false, publication_possible);
+    }
+
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false);
+        return self.submitScopedMutation(context, apply, durable, true, false, false, null);
+    }
+
+    /// Report the group's decision, captured before another group can change
+    /// the file's uncertainty flags. Queued callers receive the same snapshot
+    /// as their leader, including cancellation before checkpoint publication.
+    pub fn submitIndexMutationWithPublicationState(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, publication_possible: *bool) !void {
+        return self.submitScopedMutation(context, apply, durable, true, false, false, publication_possible);
     }
 
     /// A durability barrier allocates no pages and requires no allocator
     /// admission, retirement service, or synthetic mutation transaction.
     pub fn syncIndexContents(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
+        // A completed checkpoint already covers every byte this wrapper
+        // published. Peer publication cannot undo its durability. Check before
+        // queuing for admission: validation may otherwise refresh a serving
+        // runtime merely to rediscover an already-complete barrier.
+        lockStore(self);
+        const complete = !self.secret_store_uncertain and self.file.syncAlreadyComplete();
+        self.mutex.unlock();
+        if (complete) return;
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .index);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
@@ -2842,16 +3122,24 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false);
+        return self.submitScopedMutation(context, apply, durable, false, false, false, null);
     }
 
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true);
+        return self.submitScopedMutation(context, apply, true, false, true, false, null);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
+    /// Only the typed retirement capability may submit these groups. Keep them
+    /// separate from authored changes so physical unlink cannot rotate logical
+    /// index identities or bypass the admission of a primary mutation.
+    pub fn submitArtifactRetirement(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitScopedMutation(context, apply, true, true, false, true, null);
+    }
+
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool, artifact_retirement: bool, publication_possible: ?*bool) !void {
+        if (publication_possible) |out| out.* = false;
         if (self.read_only) return error.ReadOnly;
         defer {
             // Start after publication: even one large final mutation crossing
@@ -2860,7 +3148,10 @@ pub const Store = struct {
             self.maintenance_wake.set(self.file.runtime());
         }
         const io = self.file.runtime();
-        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease };
+        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease, .artifact_retirement = artifact_retirement };
+        defer if (publication_possible) |out| {
+            out.* = request.publication_possible;
+        };
         self.commit_mutex.lockUncancelable(io);
         if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
         self.commit_tail = &request;
@@ -2875,16 +3166,26 @@ pub const Store = struct {
         const head = self.commit_head.?;
         var tail = head;
         var count: usize = 1;
-        while (count < 64) : (count += 1) tail = tail.next orelse break;
+        while (count < 64) : (count += 1) {
+            const next = tail.next orelse break;
+            // Lease bookkeeping must retain its own admission/durability
+            // semantics even when ordinary writes arrive concurrently. Mixing
+            // it into a normal transaction changes the logical metadata
+            // generation and invalidates unrelated detached constructions.
+            if (next.artifact_lease != head.artifact_lease or next.artifact_retirement != head.artifact_retirement) break;
+            tail = next;
+        }
         self.commit_head = tail.next;
         if (self.commit_head == null) self.commit_tail = null;
         tail.next = null;
         self.commit_mutex.unlock(io);
-        const result = self.applyMutationGroup(head);
+        var group_publication_possible = false;
+        const result = self.applyMutationGroup(head, &group_publication_possible);
         self.commit_mutex.lockUncancelable(io);
         var current: ?*MutationRequest = head;
         while (current) |item| {
             item.result = result;
+            item.publication_possible = group_publication_possible;
             item.done = true;
             current = item.next;
         }
@@ -2897,29 +3198,71 @@ pub const Store = struct {
         return request.result;
     }
 
-    fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
+    /// Queue ownership is returned on failure; retries are idempotent. The
+    /// inode check prevents old-generation cleanup from touching a replacement.
+    fn stageArtifactReleases(self: *Store, first: ?*native.ReaderCoordinator.ArtifactRelease) !void {
+        if (first == null) return;
+        const inode = (try self.file.file.stat(self.file.runtime())).inode;
+        var mutations: [64]native.CatalogMutation = undefined;
+        var count: usize = 0;
+        var next = first;
+        while (next) |ticket| : (next = ticket.next) {
+            if (ticket.inode != inode) continue;
+            mutations[count] = .{ .key = ticket.key, .is_delete = true };
+            count += 1;
+        }
+        if (count != 0) try self.file.putCatalogBatch(mutations[0..count]);
+    }
+
+    fn releaseDeferredArtifactLeases(self: *Store) !void {
+        const coordinator = self.file.reader_coordinator orelse return;
+        const first = coordinator.takeArtifactReleases(64) orelse return;
+        errdefer coordinator.enqueueArtifactReleases(first);
+        try self.file.beginArtifactLeaseTransaction();
+        errdefer self.file.abortTransaction();
+        try self.stageArtifactReleases(first);
+        try self.file.commitTransactionWithDurability(self.writer_admission != null);
+        coordinator.destroyArtifactReleases(first);
+    }
+
+    fn applyMutationGroup(self: *Store, head: *MutationRequest, publication_possible: *bool) !void {
+        publication_possible.* = false;
         var index_only = true;
         var artifact_lease_only = true;
+        var artifact_retirement_only = true;
         var member: ?*MutationRequest = head;
         while (member) |item| : (member = item.next) {
             index_only = index_only and item.index_only;
             artifact_lease_only = artifact_lease_only and item.artifact_lease;
+            artifact_retirement_only = artifact_retirement_only and item.artifact_retirement;
         }
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (index_only) .index else .primary);
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (artifact_retirement_only) .reclamation else if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
+        // This runs after rollback but before unlocking. A later group's
+        // success must not erase an earlier uncertain decision, and ordinary
+        // admission/staging cancellation must not manufacture uncertainty.
+        errdefer publication_possible.* = self.file.checkpoint_publication_uncertain or self.secret_store_uncertain;
         if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
         errdefer self.publishReadCheckpointAssumeLocked();
-        if (artifact_lease_only) {
+        const was_maintenance = self.file.maintenance_publication;
+        if (artifact_retirement_only) self.file.maintenance_publication = true;
+        defer self.file.maintenance_publication = was_maintenance;
+        if (artifact_retirement_only) {
+            try self.file.beginArtifactRetirementTransaction();
+        } else if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
-            try self.file.reclaimRetirementPressure();
-            try self.file.beginTransaction();
+            try self.file.beginTransactionWithRetirementPressure();
         }
         errdefer self.file.abortTransaction();
+        const coordinator = self.file.reader_coordinator;
+        const releases = if (artifact_lease_only and coordinator != null) coordinator.?.takeArtifactReleases(64) else null;
+        errdefer if (releases) |first| coordinator.?.enqueueArtifactReleases(first);
+        try self.stageArtifactReleases(releases);
         var current: ?*MutationRequest = head;
         // Detached writers release their kernel lease after this group. The
         // next owner must see its allocator and index roots on disk; a volatile
@@ -2931,6 +3274,8 @@ pub const Store = struct {
             current = item.next;
         }
         try self.file.commitTransactionWithDurability(durable);
+        publication_possible.* = true;
+        if (releases) |first| coordinator.?.destroyArtifactReleases(first);
     }
 
     fn writerSlotAvailable(self: *Store) bool {
@@ -2994,8 +3339,9 @@ pub const Store = struct {
         .begin_batch_with_options = beginBatchWithOptions,
     });
 
-    pub fn capabilities(_: *Store) backend_types.Capabilities {
+    pub fn capabilities(self: *Store) backend_types.Capabilities {
         return .{
+            .bounded_replay_admission = self.file.header.indexed_reclamation and self.file.header.indexed_revision >= 8,
             .ordered_ranges = true,
             .reverse_ranges = true,
             .cursors = true,
@@ -3008,6 +3354,21 @@ pub const Store = struct {
 
     pub fn beginRead(self: *Store) !Txn {
         return try Txn.openRead(self);
+    }
+
+    fn acquireIndexReadAdmission(self: *Store) !?WriterAdmission {
+        if (!self.index_reads_require_admission) return null;
+        const admission = self.writer_admission orelse return error.EnrichmentWaitCanceled;
+        try admission.enter(admission.ptr, .index_read);
+        return admission;
+    }
+
+    /// Register a current read pin while detached artifact admission excludes
+    /// peer publication. The old captured catalog need not remain retained.
+    pub fn beginIndexRead(self: *Store) !Txn {
+        const admission = try self.acquireIndexReadAdmission();
+        defer if (admission) |held| held.leave(held.ptr);
+        return self.beginRead();
     }
 
     /// Pin both checkpoint and file generation while inspecting metadata.
@@ -3105,12 +3466,25 @@ const RuntimeStore = struct {
     store: *Store,
     prefix: []const u8 = "",
 
+    pub fn nativePublicationScope(self: *RuntimeStore, alloc: Allocator) !?@import("../native_publication.zig").Scope {
+        if (self.store.read_only) return error.ReadOnly;
+        const inode = (try self.store.file.file.stat(self.store.file.runtime())).inode;
+        return .{ .inode = inode, .file_namespace = self.store.file.header.reader_epoch_namespace, .prefix = try alloc.dupe(u8, self.prefix) };
+    }
+
     pub fn capabilities(self: *RuntimeStore) backend_types.Capabilities {
         return Store.capabilities(self.store);
     }
 
     pub fn beginRead(self: *RuntimeStore) !Txn {
         return try Txn.openReadWithPrefix(self.store, self.prefix);
+    }
+
+    /// Native snapshots are already constant-size. Preserve the concrete
+    /// transaction's bounded-prefix capability instead of wrapping it through
+    /// another erased ReadTxn before constructing the current scan.
+    pub fn beginCurrentScan(self: *RuntimeStore) !Txn {
+        return self.beginRead();
     }
 
     pub fn beginWrite(self: *RuntimeStore) !Txn {
@@ -3200,6 +3574,7 @@ pub const Txn = struct {
     snapshot_reads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     read_generation: ?*ReadGeneration = null,
     read_pin: ?*ReadPin = null,
+    native_publication: ?@import("../native_publication.zig").Participant = null,
     checkpoint: native.CheckpointSlot = .{},
 
     pub fn decodedResultsNamespace(self: *const Txn) []const u8 {
@@ -3222,6 +3597,9 @@ pub const Txn = struct {
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try validatePrefix(prefix);
+        const admission: ?WriterAdmission = if (store.primary_reads_require_admission) store.writer_admission orelse return error.EnrichmentWaitCanceled else null;
+        if (admission) |port| try port.enter(port.ptr, .index_read);
+        defer if (admission) |port| port.leave(port.ptr);
         if (store.read_only and !store.file.externally_locked) return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = store.file.activeCheckpoint() };
         const io = store.file.runtime();
         store.generation_lock.lockSharedUncancelable(io);
@@ -3273,6 +3651,7 @@ pub const Txn = struct {
 
         lockStore(store);
         defer store.mutex.unlock();
+        if (store.file.recovery_tail_pending and !try store.file.recoverUncommittedTail()) return error.FileBusy;
 
         const checkpoint = store.file.activeCheckpoint();
         const pin = if (store.file.header.indexed_reclamation) try store.readMetadataAllocator().create(ReadPin) else null;
@@ -3302,6 +3681,7 @@ pub const Txn = struct {
 
         lockStore(store);
         defer store.mutex.unlock();
+        if (store.file.recovery_tail_pending and !try store.file.recoverUncommittedTail()) return error.FileBusy;
 
         const checkpoint = store.file.activeCheckpoint();
         const pin = if (store.file.header.indexed_reclamation) try store.readMetadataAllocator().create(ReadPin) else null;
@@ -3328,13 +3708,19 @@ pub const Txn = struct {
         self.* = undefined;
     }
 
+    pub fn setNativePublication(self: *Txn, participant: @import("../native_publication.zig").Participant) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.native_publication != null) return error.InvalidBatch;
+        self.native_publication = participant;
+    }
+
     pub fn commit(self: *Txn) !void {
         if (self.read_only) return error.ReadOnly;
         const store = self.store orelse return error.ReadOnly;
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0) {
+        if (self.pending_count == 0 and self.native_publication == null) {
             self.abort();
             return;
         }
@@ -3351,19 +3737,30 @@ pub const Txn = struct {
 
         const Commit = struct {
             mutations: []const native.DocumentMutation,
+            publication: ?@import("../native_publication.zig").Participant,
+            allocator: Allocator,
             fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
                 const context: *@This() = @ptrCast(@alignCast(ptr));
+                var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = context.allocator, .index_prefix = "" };
+                if (context.publication) |participant| try participant.validate(host.view());
                 try file.putDocumentBatch(context.mutations);
+                if (context.publication) |participant| try participant.apply(host.view());
             }
         };
-        var context = Commit{ .mutations = mutations };
+        var context = Commit{ .mutations = mutations, .publication = self.native_publication, .allocator = allocator };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
                 self.writer_reserved = false;
             }
         }
-        try store.submitMutation(&context, Commit.apply);
+        var possible = false;
+        store.submitMutationWithPublicationState(&context, Commit.apply, &possible) catch |err| {
+            if (possible) if (backend_types.commit_progress) |progress| {
+                progress.maybe_applied = true;
+            };
+            return err;
+        };
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             store.releaseWriterSlot();
@@ -3406,6 +3803,18 @@ pub const Txn = struct {
             return out[0..value.len];
         }
         return (try self.readFile()).readDocumentInto(self.checkpoint, full, out);
+    }
+
+    pub fn getPrefixInto(self: *Txn, key: []const u8, out: []u8) ![]const u8 {
+        const full = try self.prefixedKey(key);
+        defer if (self.prefix.len > 0) self.allocator.free(full);
+        if (self.pending_tree.getEntryFor(full).node) |node| {
+            const value = self.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+            const copied = @min(value.len, out.len);
+            @memcpy(out[0..copied], value[0..copied]);
+            return out[0..copied];
+        }
+        return (try self.readFile()).readDocumentPrefixInto(self.checkpoint, full, out);
     }
 
     pub const ReadScope = struct {
@@ -4521,6 +4930,9 @@ pub const Cursor = struct {
     }
 };
 
+const replay_reference = @import("../db/derived/replay_reference.zig");
+const replay_chunks = @import("../db/derived/replay_chunks.zig");
+
 const replay_hints = [_]change_journal_mod.TargetHint{
     .enrichment,
     .full_text,
@@ -4542,68 +4954,6 @@ fn encodeReplaySequence(sequence: u64) [8]u8 {
     return raw;
 }
 
-fn isEmbeddingReplayArtifactKey(key: []const u8) bool {
-    return internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key);
-}
-
-fn appendReplayArtifactsForHint(
-    alloc: Allocator,
-    out: *std.ArrayListUnmanaged([]const u8),
-    artifact_keys: []const []const u8,
-    hint: change_journal_mod.TargetHint,
-) !void {
-    for (artifact_keys) |key| {
-        const keep = switch (hint) {
-            .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
-            .graph => internal_keys.isGraphEdgeArtifactKey(key) or
-                internal_keys.isAssetArtifactKey(key) or
-                internal_keys.isResolutionArtifactKey(key),
-            .resolution => internal_keys.isAssetArtifactKey(key),
-            .promotion => internal_keys.isResolutionArtifactKey(key),
-            .enrichment, .full_text, .algebraic => false,
-        };
-        if (keep) try out.append(alloc, key);
-    }
-}
-
-fn encodeReplayPayloadForHint(
-    alloc: Allocator,
-    record: change_journal_mod.Record,
-    hint: change_journal_mod.TargetHint,
-) ![]u8 {
-    var target_hints = [_]change_journal_mod.TargetHint{hint};
-    var artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
-    defer artifact_keys.deinit(alloc);
-    try appendReplayArtifactsForHint(alloc, &artifact_keys, record.changed_artifact_keys, hint);
-
-    var filtered = change_journal_mod.Record{
-        .version = record.version,
-        .sequence = record.sequence,
-        .target_hints = target_hints[0..],
-    };
-    switch (hint) {
-        .enrichment => {
-            filtered.changed_doc_keys = record.changed_doc_keys;
-        },
-        .full_text, .algebraic => {
-            filtered.changed_doc_keys = record.changed_doc_keys;
-            filtered.deleted_doc_keys = record.deleted_doc_keys;
-            filtered.overwritten_doc_keys = record.overwritten_doc_keys;
-        },
-        .dense_vector, .sparse_vector => {
-            filtered.changed_doc_keys = record.changed_doc_keys;
-            filtered.deleted_doc_keys = record.deleted_doc_keys;
-            filtered.overwritten_doc_keys = record.overwritten_doc_keys;
-            filtered.changed_artifact_keys = artifact_keys.items;
-        },
-        .graph, .resolution, .promotion => {
-            filtered.deleted_doc_keys = record.deleted_doc_keys;
-            filtered.changed_artifact_keys = artifact_keys.items;
-        },
-    }
-    return try change_journal_mod.encodeRecord(alloc, filtered);
-}
-
 fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload: []const u8) !void {
     const latest_raw = encodeReplaySequence(sequence);
     for (replay_hints) |hint| {
@@ -4616,6 +4966,15 @@ fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload
 }
 
 fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+    if (sequence == std.math.maxInt(u64)) return error.InvalidBatchRequest;
+    const previous = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (previous) |raw| {
+        if (raw.len != 8) return error.CorruptReplayMetadata;
+        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) return error.InvalidBatchRequest;
+    }
     try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplaySequence(sequence + 1);
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
@@ -4634,13 +4993,26 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
         return;
     };
     defer decoded.deinit();
+    if (decoded.record.sequence != sequence) return error.InvalidReplayReference;
+    if (txn.store.?.file.header.indexed_reclamation and txn.store.?.file.header.indexed_revision >= 11) {
+        if (try replay_chunks.prepare(alloc, decoded.record)) |value| {
+            var chunked = value;
+            defer chunked.deinit();
+            try chunked.stage(txn);
+        }
+    }
 
     for (replay_hints) |hint| {
         if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
-        const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
-        defer alloc.free(lane_payload);
         const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
-        try txn.put(key[0..], lane_payload);
+        if (txn.store.?.file.header.indexed_reclamation and txn.store.?.file.header.indexed_revision >= 10) {
+            const reference = replay_reference.encodeReference(sequence, hint);
+            try txn.put(&key, &reference);
+        } else {
+            const lane_payload = try replay_reference.encodeForHint(alloc, decoded.record, hint);
+            defer alloc.free(lane_payload);
+            try txn.put(&key, lane_payload);
+        }
         const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
         try txn.put(latest_key[0..], latest_raw[0..]);
     }
@@ -4675,7 +5047,9 @@ fn forEachReplayLane(
     };
     while (true) {
         const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return error.InvalidReplayEntryKey;
-        try callback(context, sequence, entry.value);
+        const resolved = try replay_reference.resolve(store.allocator, &read, sequence, kind, entry.value);
+        defer if (resolved) |owned| store.allocator.free(owned);
+        try callback(context, sequence, resolved orelse entry.value);
         stats.scanned_entries += 1;
         stats.matched_entries += 1;
         stats.last_sequence = sequence;
@@ -4719,9 +5093,11 @@ const replay_cleanup_max_key_bytes = 256 * 1024;
 /// can be deleted using an older read snapshot. Release it between chunks.
 fn truncateReplay(store: *Store, prefix: []const u8, yielding: bool, up_to_sequence: u64) !void {
     if (up_to_sequence == 0) return;
-    try truncateReplayLane(store, prefix, yielding, internal_keys.replay_all_kind, up_to_sequence);
+    // A reader opening between these bounded commits must never find a
+    // reference whose canonical payload has already been retired.
     for (replay_hints) |hint|
         try truncateReplayLane(store, prefix, yielding, replayHintOrdinal(hint), up_to_sequence);
+    try truncateReplayLane(store, prefix, yielding, internal_keys.replay_all_kind, up_to_sequence);
 }
 
 fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u8, up_to_sequence: u64) !void {
@@ -4751,6 +5127,22 @@ fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u
             };
             while (true) {
                 const sequence = internal_keys.parseReplayEntrySequence(key, kind) orelse return error.InvalidReplayEntryKey;
+                if (kind == internal_keys.replay_all_kind) {
+                    // One extra byte distinguishes an exact manifest from
+                    // an oversized malformed one without loading legacy blobs.
+                    var header: [replay_chunks.manifest_size + 1]u8 = undefined;
+                    const value = try write.getPrefixInto(key, &header);
+                    if (replay_chunks.isManifest(value)) {
+                        const manifest = try replay_chunks.Manifest.decode(value);
+                        if (count + manifest.count + 1 > replay_cleanup_max_keys) break;
+                        for (manifest.retired_chunks..manifest.count) |ordinal| {
+                            const chunk_key = replay_chunks.chunkKey(sequence, @intCast(ordinal));
+                            try write.delete(&chunk_key);
+                            count += 1;
+                            bytes += prefix.len + chunk_key.len;
+                        }
+                    }
+                }
                 try write.delete(key);
                 count += 1;
                 bytes += prefix.len + key.len;
@@ -4764,7 +5156,9 @@ fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u
         }
         try write.commit();
         committed = true;
-        if (count < replay_cleanup_max_keys and bytes < replay_cleanup_max_key_bytes) return;
+        // A chunk group can leave slack without exhausting the lane. Keep
+        // scanning from the last fully retired sequence after committing it.
+        if (count == 0) return;
     }
 }
 
@@ -5051,6 +5445,258 @@ test "lite native write cursors merge pending writes and deletes in order" {
     entry = try cursor.next();
     try std.testing.expectEqualStrings("doc:d", entry.key);
     try std.testing.expectError(error.NotFound, cursor.next());
+}
+
+test "lite seekable replay resumes bounded families and retires charged chunks atomically" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seekable-replay.aflite");
+    defer a.free(path);
+    var native_store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer native_store.close();
+    const namespace = "\x02db/embedded/tables/7\x00";
+    var runtime = try native_store.runtimeStoreWithPrefix(a, namespace);
+    defer runtime.deinit();
+    const facade = @import("../docstore.zig");
+    var store = try facade.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    var key_buffer: [130][32]u8 = undefined;
+    var doc_keys: [130][]const u8 = undefined;
+    for (&doc_keys, 0..) |*key, ordinal| key.* = try std.fmt.bufPrint(&key_buffer[ordinal], "document-{d:0>4}", .{ordinal});
+    doc_keys[0] = "a\x00escaped";
+    doc_keys[1] = "你好";
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &doc_keys, .deleted_doc_keys = &.{doc_keys[0]}, .overwritten_doc_keys = &.{doc_keys[0]}, .target_hints = &.{ .full_text, .algebraic } });
+    defer a.free(payload);
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(1, payload);
+        try write.commit();
+    }
+    const charged = (try native_store.file.replayAdmission()).?;
+    try std.testing.expectEqual(@as(u64, 3), charged.records);
+    try std.testing.expectEqualDeep(charged, try native_store.file.scanReplayAdmission());
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var iterator = seen.keyIterator();
+        while (iterator.next()) |key| a.free(key.*);
+        seen.deinit(a);
+    }
+    const source = @import("../db/derived/replay_source.zig").Source.fromPrimaryStore(&store, null, null);
+    // The application budget may span physical encoding chunks. A larger
+    // service window must not silently publish only the first 64 families.
+    {
+        var cursor = try source.openMatchingCursor(a, 0, .full_text);
+        defer cursor.deinit(a);
+        const slice = (try cursor.readFamilySliceWithBudget(a, "text", null, 96, 1024 * 1024, 0)).?;
+        defer a.free(slice.payload);
+        try std.testing.expectEqual(@as(usize, 96), slice.families);
+        try std.testing.expectEqual(@as(u64, 96), slice.position.next_item);
+        var decoded = try change_journal_mod.decodeRecord(a, slice.payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 96), decoded.record.changed_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.deleted_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.overwritten_doc_keys.len);
+    }
+    {
+        var cursor = try source.openMatchingCursor(a, 0, .full_text);
+        defer cursor.deinit(a);
+        const slice = (try cursor.readFamilySliceWithBudget(a, "text", null, 130, 1, 0)).?;
+        defer a.free(slice.payload);
+        try std.testing.expectEqual(@as(usize, 1), slice.families);
+        try std.testing.expectEqual(@as(u64, 1), slice.position.next_item);
+        var decoded = try change_journal_mod.decodeRecord(a, slice.payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.deleted_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.record.overwritten_doc_keys.len);
+    }
+    var position: ?@import("../db/derived/replay_fragment.zig").Position = null;
+    var slices: usize = 0;
+    var deletion_families: usize = 0;
+    while (position == null or position.?.next_item != position.?.total_items) {
+        var cursor = try source.openMatchingCursor(a, 0, .full_text);
+        defer cursor.deinit(a);
+        const slice = (try cursor.readFamilySlice(a, "text", position, 8, 0)).?;
+        defer a.free(slice.payload);
+        var decoded = try change_journal_mod.decodeRecord(a, slice.payload);
+        defer decoded.deinit();
+        try std.testing.expect(decoded.record.changed_doc_keys.len <= 8);
+        for (decoded.record.changed_doc_keys) |key| {
+            try std.testing.expect(!seen.contains(key));
+            const owned = try a.dupe(u8, key);
+            errdefer a.free(owned);
+            try seen.put(a, owned, {});
+        }
+        if (decoded.record.deleted_doc_keys.len != 0) {
+            deletion_families += 1;
+            try std.testing.expectEqualStrings(doc_keys[0], decoded.record.deleted_doc_keys[0]);
+            try std.testing.expectEqualStrings(doc_keys[0], decoded.record.overwritten_doc_keys[0]);
+            try std.testing.expect(seen.contains(doc_keys[0]));
+        }
+        position = slice.position;
+        if (position.?.next_item == 64) {
+            // Model two durable consumers: one at 64 and one still at 63.
+            // No chunk credit is returned until their minimum crosses 64.
+            var writer = try store.beginWriteTxn();
+            var done = false;
+            defer if (!done) writer.abort();
+            const canonical_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+            const manifest = try replay_chunks.Manifest.decode(try writer.get(&canonical_key));
+            try std.testing.expect(!try replay_chunks.retirePrefix(&writer, manifest, 63));
+            try std.testing.expect(try replay_chunks.retirePrefix(&writer, manifest, 64));
+            try writer.commit();
+            done = true;
+            const updated = (try native_store.file.replayAdmission()).?;
+            try std.testing.expectEqual(charged.records, updated.records);
+            try std.testing.expect(updated.bytes < charged.bytes);
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const retained = try replay_chunks.Manifest.decode(try read.get(&canonical_key));
+            try std.testing.expectEqual(@as(u32, 1), retained.retired_chunks);
+            try std.testing.expectEqual(manifest.fingerprint("text"), retained.fingerprint("text"));
+            try std.testing.expectError(error.ReplayHistoryUnavailable, replay_chunks.resolveAll(a, &read, &retained.encode()));
+        }
+        slices += 1;
+        try std.testing.expect(slices <= 17);
+    }
+    try std.testing.expectEqual(@as(usize, 17), slices);
+    try std.testing.expectEqual(@as(usize, 130), seen.count());
+    try std.testing.expectEqual(@as(usize, 1), deletion_families);
+    {
+        // An unrelated hint falls back to the canonical lane. It must skip
+        // this manifest without resolving the prefix released by its consumers.
+        const Unrelated = struct {
+            fn consume(_: *anyopaque, _: u64, _: []const u8) !void {
+                return error.UnexpectedReplayHint;
+            }
+        };
+        var token: u8 = 0;
+        var unrelated = try source.openMatchingCursor(a, 0, .graph);
+        defer unrelated.deinit(a);
+        try std.testing.expect((try unrelated.readFamilySlice(a, "graph", null, 8, 0)) == null);
+        const skipped = try unrelated.forEachNext(8, &token, Unrelated.consume);
+        try std.testing.expectEqual(@as(usize, 1), skipped.hint_filter_skips);
+        try std.testing.expect((try unrelated.readFamilySlice(a, "graph", null, 8, 0)) == null);
+    }
+    const before_retirement = try native_store.checkWithCancel(null);
+    if (!before_retirement.valid) std.debug.print("before chunk retirement: {f}\n", .{std.json.fmt(before_retirement, .{})});
+    try std.testing.expect(before_retirement.valid);
+    var retirement: facade.ReplayRetirement = .{ .lane = 8, .watermark = 1 };
+    store.deferred_replay_retirement = &retirement;
+    store.bounded_replay_retirement = true;
+    try store.truncateReplayUpTo(a, 1);
+    try store.truncateReplayUpTo(a, 1);
+    const retired = (try native_store.file.replayAdmission()).?;
+    try std.testing.expectEqual(@as(u64, 0), retired.bytes);
+    try std.testing.expectEqual(@as(u64, 0), retired.records);
+    const checked = try native_store.checkWithCancel(null);
+    if (!checked.valid) std.debug.print("seekable replay integrity: {f}\n", .{std.json.fmt(checked, .{})});
+    try std.testing.expect(checked.valid);
+}
+
+test "lite canonical replay facade resolves cursors and protects rotating retirement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "canonical-replay-facade.aflite");
+    defer a.free(path);
+    var native_store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer native_store.close();
+    var runtime = try native_store.runtimeStore(a);
+    defer runtime.deinit();
+    const facade = @import("../docstore.zig");
+    var store = try facade.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{ "你好", "one\x00two" }, .target_hints = &.{ .full_text, .algebraic } });
+    defer a.free(payload);
+    // Exercise the actual foreground facade, not just native appendReplay.
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(1, payload);
+        try write.commit();
+    }
+    const lane = internal_keys.replayEntryKey(1, 1);
+    {
+        var read = try native_store.beginRead();
+        defer read.abort();
+        try std.testing.expect(replay_reference.isReference(try read.get(&lane)));
+    }
+    var source = @import("../db/derived/replay_source.zig").Source.fromPrimaryStore(&store, null, null);
+    var cursor = try source.openMatchingCursor(a, 0, .full_text);
+    defer cursor.deinit(a);
+    const Context = struct {
+        alloc: Allocator,
+        count: usize = 0,
+        fn consume(raw: *anyopaque, sequence: u64, bytes: []const u8) anyerror!void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 1), sequence);
+            var decoded = try change_journal_mod.decodeRecord(ctx.alloc, bytes);
+            defer decoded.deinit();
+            try std.testing.expectEqualStrings("one\x00two", decoded.record.changed_doc_keys[1]);
+            ctx.count += 1;
+        }
+    };
+    var context: Context = .{ .alloc = a };
+    _ = try cursor.forEachNext(1, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), context.count);
+    cursor.releaseReadSnapshot();
+    // Start at the canonical lane as if an earlier turn stopped on another
+    // lane's key budget. It must not retire bytes still referenced on disk.
+    var retirement: facade.ReplayRetirement = .{ .lane = 8, .watermark = 1 };
+    store.deferred_replay_retirement = &retirement;
+    store.bounded_replay_retirement = true;
+    try store.truncateReplayUpTo(a, 1);
+    const canonical = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    {
+        var read = try native_store.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings(payload, try read.get(&canonical));
+    }
+    try store.truncateReplayUpTo(a, 1);
+    try std.testing.expectEqual(@as(u64, 0), (try native_store.file.replayAdmission()).?.bytes);
+}
+
+test "lite native replay canonical references preserve snapshots and exact quota" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "canonical-replay.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer store.close();
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{ "你好", "one\x00two" }, .target_hints = &.{ .full_text, .algebraic } });
+    defer a.free(payload);
+    {
+        var writer = try store.beginWrite();
+        errdefer writer.abort();
+        try writer.setReplayOpaque(1, payload);
+        try writer.commit();
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    const lane = internal_keys.replayEntryKey(1, 1);
+    const raw = try read.get(&lane);
+    try std.testing.expectEqual(@as(usize, replay_reference.reference_size), raw.len);
+    const resolved = (try replay_reference.resolve(a, &read, 1, 1, raw)).?;
+    defer a.free(resolved);
+    var decoded = try change_journal_mod.decodeRecord(a, resolved);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("one\x00two", decoded.record.changed_doc_keys[1]);
+    const canonical = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    var before = (try store.file.replayAdmission()).?;
+    const expected = (try native.replay_admission.charge(&canonical, payload.len)) + 2 * (try native.replay_admission.charge(&lane, raw.len));
+    try std.testing.expectEqual(expected, before.bytes);
+    try store.truncateReplayUpTo(a, 2);
+    // The old checkpoint still owns both rows while the current generation
+    // has returned exactly the physical charge of all three records.
+    const old_resolved = (try replay_reference.resolve(a, &read, 1, 1, raw)).?;
+    defer a.free(old_resolved);
+    before = (try store.file.replayAdmission()).?;
+    try std.testing.expectEqual(@as(u64, 0), before.bytes);
+    try std.testing.expectEqual(@as(u64, 0), before.records);
 }
 
 test "lite native docstore persists replay lanes across reopen and truncation" {
@@ -5764,7 +6410,7 @@ test "lite group commit hands leadership to a bounded queued group" {
     try testQueuedMutationGroups(.normal);
 }
 
-test "lite group commit upgrades mixed lease groups to authored validation" {
+test "lite group commit keeps mixed queued lease and authored publications separate" {
     try testQueuedMutationGroups(.mixed);
 }
 
@@ -5772,14 +6418,20 @@ test "lite group commit batches lease-only queued publications" {
     try testQueuedMutationGroups(.leases);
 }
 
-fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
+test "lite group commit reports each queued publication decision" {
+    try testQueuedMutationGroups(.reported);
+}
+
+fn testQueuedMutationGroups(mode: enum { normal, mixed, leases, reported }) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "queued-group-commit.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .externally_locked = true, .reclamation = .{ .page_reuse = false, .enabled = false } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .externally_locked = true, .reclamation = .{ .page_reuse = mode == .mixed, .enabled = false } });
     defer store.close();
+    const sequence = store.file.activeCheckpoint().commit_sequence;
+    const metadata = store.file.activeCheckpoint().logical.metadata;
     const Gate = struct {
         started: std.atomic.Value(bool) = .init(false),
         proceed: std.atomic.Value(bool) = .init(false),
@@ -5789,11 +6441,12 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
         gate: *Gate,
         id: usize,
         artifact_lease: bool,
-        lease_transaction: bool,
+        report_publication: bool,
+        publication_possible: bool = false,
         result: anyerror!void = {},
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(self.lease_transaction, file.artifact_lease_transaction);
+            try std.testing.expectEqual(self.artifact_lease, file.artifact_lease_transaction);
             if (self.id == 0) {
                 self.gate.started.store(true, .release);
                 while (!self.gate.proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
@@ -5807,7 +6460,12 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
             } else try file.putIndexCatalogRecord(key, "committed");
         }
         fn run(self: *@This()) void {
-            self.result = if (self.artifact_lease) self.store.submitArtifactLeaseMutation(self, apply) else self.store.submitMutation(self, apply);
+            self.result = if (self.artifact_lease)
+                self.store.submitArtifactLeaseMutation(self, apply)
+            else if (self.report_publication)
+                self.store.submitIndexMutationWithPublicationState(self, apply, true, &self.publication_possible)
+            else
+                self.store.submitMutation(self, apply);
         }
     };
     var gate = Gate{};
@@ -5819,7 +6477,7 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
         for (threads[0..spawned]) |thread| thread.join();
     }
     for (&workers, 0..) |*worker, i| {
-        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1)), .lease_transaction = i != 0 and mode == .leases };
+        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1)), .report_publication = mode == .reported };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
         spawned += 1;
         if (i == 0) while (!gate.started.load(.acquire)) @import("antfly_platform").time.yieldNow();
@@ -5848,8 +6506,17 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
     gate.proceed.store(true, .release);
     for (threads[0..spawned]) |thread| thread.join();
     spawned = 0;
-    for (workers) |worker| try worker.result;
-    try std.testing.expectEqual(@as(u64, 2), store.file.activeCheckpoint().commit_sequence);
+    for (workers) |worker| {
+        try worker.result;
+        if (worker.report_publication) try std.testing.expect(worker.publication_possible);
+    }
+    // Mixed requests were queued in alternating order. Each type boundary
+    // ends a group, while homogeneous queues still coalesce into one group.
+    const groups: u64 = if (mode == .mixed) workers.len else 2;
+    try std.testing.expectEqual(sequence + groups, store.file.activeCheckpoint().commit_sequence);
+    // Alias bookkeeping beside authored index writes must not change the
+    // logical metadata witness used by detached source publication.
+    try std.testing.expectEqualSlices(u8, &metadata, &store.file.activeCheckpoint().logical.metadata);
     for (0..workers.len) |i| {
         var buf: [32]u8 = undefined;
         const lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1));
@@ -5862,6 +6529,7 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
         defer alloc.free(value);
         try std.testing.expectEqualStrings("committed", value);
     }
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
 test "lite failed commit group discards every root and allows a clean retry" {
@@ -5885,7 +6553,9 @@ test "lite failed commit group discards every root and allows a clean retry" {
     var bad = Context{ .fail = true };
     var second = MutationRequest{ .context = &bad, .apply = Context.apply };
     var first = MutationRequest{ .context = &good, .apply = Context.apply, .next = &second };
-    try std.testing.expectError(error.InjectedGroupFailure, store.applyMutationGroup(&first));
+    var publication_possible = true;
+    try std.testing.expectError(error.InjectedGroupFailure, store.applyMutationGroup(&first, &publication_possible));
+    try std.testing.expect(!publication_possible);
     try std.testing.expect((try store.file.getDocumentAlloc(alloc, "doc")) == null);
     try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(alloc, "index")) == null);
     try std.testing.expect((try store.checkWithCancel(null)).valid);
@@ -5946,6 +6616,80 @@ test "lite publication mutex reserves queued owners before a writer can reacquir
         try std.testing.expect(mutex.tryLock());
         mutex.unlock();
     }
+}
+
+test "lite artifact lease groups preserve metadata identities beside queued primary mutations" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "artifact-primary-groups.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const metadata = store.file.activeCheckpoint().logical.metadata;
+    const Request = struct {
+        store: *Store,
+        key: []const u8,
+        artifact: bool = false,
+        result: anyerror!void = {},
+        fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.artifact) try file.putCatalogRecord(self.key, "leased") else try file.putDocument(self.key, "acknowledged");
+        }
+        fn run(self: *@This()) void {
+            self.result = if (self.artifact) self.store.submitArtifactLeaseMutation(self, apply) else self.store.submitMutation(self, apply);
+        }
+        fn waitQueued(owner: *Store, expected: usize) !void {
+            for (0..1000) |_| {
+                owner.commit_mutex.lockUncancelable(owner.file.runtime());
+                var count: usize = 0;
+                var node = owner.commit_head;
+                while (node) |item| : (node = item.next) count += 1;
+                const ready = owner.commit_draining and count == expected;
+                owner.commit_mutex.unlock(owner.file.runtime());
+                if (ready) return;
+                try owner.file.runtime().sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.MutationQueueDidNotReachExpectedState;
+        }
+    };
+    var requests = [_]Request{
+        .{ .store = &store, .key = "primary-one" },
+        .{ .store = &store, .key = "\x00AFLEASE/0123456789abcdef0123456789abcdef", .artifact = true },
+        .{ .store = &store, .key = "primary-two" },
+    };
+    var threads: [3]std.Thread = undefined;
+    var started: usize = 0;
+    var locked = true;
+    store.mutex.lock();
+    defer {
+        if (locked) store.mutex.unlock();
+        for (threads[0..started]) |thread| thread.join();
+    }
+    threads[0] = try std.Thread.spawn(.{}, Request.run, .{&requests[0]});
+    started = 1;
+    try Request.waitQueued(&store, 0);
+    threads[1] = try std.Thread.spawn(.{}, Request.run, .{&requests[1]});
+    started = 2;
+    try Request.waitQueued(&store, 1);
+    threads[2] = try std.Thread.spawn(.{}, Request.run, .{&requests[2]});
+    started = 3;
+    try Request.waitQueued(&store, 2);
+    store.mutex.unlock();
+    locked = false;
+    for (threads) |thread| thread.join();
+    started = 0;
+    for (requests) |request| try request.result;
+    try std.testing.expectEqualSlices(u8, &metadata, &store.file.activeCheckpoint().logical.metadata);
+    for ([_][]const u8{ "primary-one", "primary-two" }) |key| {
+        const value = (try store.file.getDocumentAlloc(a, key)).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("acknowledged", value);
+    }
+    try std.testing.expect((try store.file.check()).valid);
 }
 
 test "lite online vacuum publishes while group-commit mutations keep landing" {
@@ -6163,7 +6907,7 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = Fault.sync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    for (1..4) |barrier| {
+    for ([_]bool{ false, true }) |proof| for (1..@as(usize, if (proof) 2 else 3)) |barrier| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp, "group-sync-failure.aflite");
@@ -6171,20 +6915,20 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
         {
             var store = try Store.createWithOptions(alloc, path, .{ .io = io });
             defer store.close();
+            store.file.test_force_two_barrier_commit = !proof;
             try store.file.putDocument("doc", "before");
             try store.file.putIndexCatalogRecord("index", "before");
             try store.file.putCatalogRecord("meta", "before");
             Fault.remaining = barrier;
             defer Fault.remaining = 0;
             var context: u8 = 0;
-            // The first barrier precedes checkpoint publication, so nothing
-            // committed. Later barriers fail while the checkpoint is being
-            // published, which leaves the commit's durability unknown.
-            const expected: anyerror = if (barrier == 1) error.InputOutput else error.OutcomeUnknown;
+            // A one-sync proof commits pages and slot at the same barrier.
+            // The safe fallback still distinguishes its pre-slot barrier.
+            const expected: anyerror = if (!proof and barrier == 1) error.InputOutput else error.OutcomeUnknown;
             try std.testing.expectError(expected, store.submitMutation(&context, Fault.apply));
             try std.testing.expectEqual(@as(usize, 0), Fault.remaining);
             // Later mutations never run until the outcome is reconciled.
-            if (barrier > 1) try std.testing.expectError(error.OutcomeReconciliationRequired, store.submitMutation(&context, Fault.apply));
+            if (proof or barrier > 1) try std.testing.expectError(error.OutcomeReconciliationRequired, store.submitMutation(&context, Fault.apply));
         }
         var reopened = try Store.open(alloc, path, true);
         defer reopened.close();
@@ -6198,7 +6942,7 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
         try std.testing.expectEqualStrings(doc, index);
         try std.testing.expectEqualStrings(doc, meta);
         try std.testing.expect((try reopened.file.check()).valid);
-    }
+    };
 }
 
 test "lite packed document cursors read each physical bundle once per scan" {
@@ -6352,6 +7096,17 @@ test "lite replay cleanup avoids external values and propagates allocation error
     defer a.free(old);
     try std.testing.expectEqualSlices(u8, value, old);
     try std.testing.expect((try store.checkWithCancel(null)).valid);
+    // An oversized payload with the reserved manifest discriminator is
+    // malformed, not a legacy record. Inspect its prefix without materializing
+    // it and leave every root unchanged on refusal.
+    @memcpy(value[0..8], "AFRCHK01");
+    const malformed = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 3);
+    try store.file.putDocumentBatch(&.{.{ .key = &malformed, .value = value }});
+    const before_bad = store.file.activeCheckpoint();
+    budget.limit = budget.live + 1024 * 1024;
+    try std.testing.expectError(error.InvalidReplayChunk, store.truncateReplayUpTo(a, 4));
+    budget.limit = std.math.maxInt(usize);
+    try std.testing.expectEqualDeep(before_bad, store.file.activeCheckpoint());
 }
 
 test "lite replay cleanup commits bounded chunks isolates namespaces and retries" {
@@ -11706,6 +12461,133 @@ test "lite typed score spans admit exact encoder after warmed graph scratch" {
     for (values[1..]) |value| try std.testing.expect(std.math.isNan(value));
 }
 
+test "lite reclamation cooperative conversion defers replay and yields to primary writes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cooperative-format-conversion.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    // Revision 8 has the same checkpoint representation, but lacks the
+    // revision-9 semantic publication contract and needs a replacement.
+    store.file.header.indexed_revision = 8;
+    // Transaction publication changes checkpoint slots, not file-format bytes.
+    // Establish a real legacy header before exercising ordinary mutations.
+    var legacy_header: [native.header_size]u8 = undefined;
+    native.encodeHeader(&legacy_header, store.file.header);
+    try store.file.file.writePositionalAll(std.testing.io, &legacy_header, 0);
+    try store.file.putDocument("retained", "original");
+    try store.appendReplayOpaque(a, 1, "pending replay");
+    for (0..3) |_| {
+        store.maintenance_policy.shrink_primary_since_ns = -std.time.ns_per_s;
+        try store.maintainBackgroundOnce(null);
+        try std.testing.expectEqual(@as(u32, 8), store.file.header.indexed_revision);
+    }
+    try std.testing.expectEqual(@as(u64, 3), store.maintenance_policy.status.assessment_deferrals);
+    try store.truncateReplayUpTo(a, 2);
+    try store.maintainBackgroundOnce(null);
+    store.maintenance_policy.shrink_primary_since_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 2 * std.time.ns_per_s;
+    const Hook = struct {
+        store: *Store,
+        writes: usize = 0,
+        fn notify(ptr: *anyopaque, phase: Store.MaintenancePhase) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (phase != .copy) return;
+            try self.store.file.putDocument("peer", "new primary");
+            self.writes += 1;
+            try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+    };
+    var hook: Hook = .{ .store = &store };
+    store.test_maintenance_hook = .{ .ptr = &hook, .notify = Hook.notify };
+    defer store.test_maintenance_hook = null;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(@as(usize, 1), hook.writes);
+    try std.testing.expectEqual(@as(u32, 8), store.file.header.indexed_revision);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_preemptions);
+    try std.testing.expect(store.file.change_capture == null);
+    store.test_maintenance_hook = null;
+    try store.maintainBackgroundOnce(null);
+    store.maintenance_policy.shrink_primary_since_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 2 * std.time.ns_per_s;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(native.indexed_format_version, store.file.header.indexed_revision);
+    const value = (try store.file.getDocumentAlloc(a, "peer")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("new primary", value);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite reclamation cooperative shrink defers while replay is pending and resumes after quiet" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cooperative-replay-shrink.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try store.file.putDocument("retained", "primary data");
+    try store.appendReplayOpaque(a, 1, "pending consumer work");
+    store.maintenance_policy = try reclamation.Policy.init(.{ .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 });
+    for (0..3) |_| {
+        store.maintenance_policy.shrink_primary_since_ns = -std.time.ns_per_s;
+        try store.maintainBackgroundOnce(null);
+    }
+    try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(@as(u64, 3), store.maintenance_policy.status.assessment_deferrals);
+    try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
+    // The raw adapter cutoff is exclusive; remove sequence 1.
+    try store.truncateReplayUpTo(a, 2);
+    try store.maintainBackgroundOnce(null);
+    store.maintenance_policy.shrink_primary_since_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 2 * std.time.ns_per_s;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect(!store.maintenance_running);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite reclamation cooperative shrink yields to an unannounced primary publication" {
+    const Hook = struct {
+        store: *Store,
+        writes: usize = 0,
+        fn notify(ptr: *anyopaque, phase: Store.MaintenancePhase) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (phase != .assessment) return;
+            // No connection notification or cancellation flag: peer writers
+            // are detected through the on-disk publication identity.
+            try self.store.file.putDocument("peer", "new primary value");
+            self.writes += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cooperative-primary-preemption.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try store.file.putDocument("retained", "original primary value");
+    store.maintenance_policy = try reclamation.Policy.init(.{ .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 });
+    try store.maintainBackgroundOnce(null);
+    store.maintenance_policy.shrink_primary_since_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 2 * std.time.ns_per_s;
+    var hook: Hook = .{ .store = &store };
+    store.test_maintenance_hook = .{ .ptr = &hook, .notify = Hook.notify };
+    defer store.test_maintenance_hook = null;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(@as(usize, 1), hook.writes);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_preemptions);
+    try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect(!store.maintenance_running);
+    try std.testing.expect(!store.maintenance_cancel.requested.load(.acquire));
+    const value = (try store.file.getDocumentAlloc(a, "peer")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("new primary value", value);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
 test "lite reclamation issue1431 canceled automatic rewrites retry without file growth" {
     const Admission = struct {
         captures: usize = 0,
@@ -11754,4 +12636,423 @@ test "lite reclamation issue1431 canceled automatic rewrites retry without file 
     defer a.free(value);
     try std.testing.expectEqualStrings("retained value", value);
     try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite completed index durability barrier avoids admission but uncertain barriers do not" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "completed-index-sync.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var indexes = @import("index_storage.zig").Store.init(a, &store);
+    try indexes.storage().writeFileAbsolute("/wal", "durable");
+    const Refuse = struct {
+        fn enter(_: *anyopaque, _: PublicationScope) !void {
+            return error.TestAdmissionRefused;
+        }
+        fn leave(_: *anyopaque) void {
+            @panic("refused admission must not leave");
+        }
+    };
+    store.writer_admission = .{ .ptr = &store, .enter = Refuse.enter, .leave = Refuse.leave };
+    defer store.writer_admission = null;
+    try store.syncIndexContents();
+    store.file.checkpoint_publication_uncertain = true;
+    defer store.file.checkpoint_publication_uncertain = false;
+    try std.testing.expectError(error.TestAdmissionRefused, store.syncIndexContents());
+}
+
+test "lite primary reads after detached source release require current admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "detached-primary-read.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const Refuse = struct {
+        fn enter(_: *anyopaque, scope: PublicationScope) !void {
+            try std.testing.expectEqual(PublicationScope.index_read, scope);
+            return error.EnrichmentWaitCanceled;
+        }
+        fn leave(_: *anyopaque) void {
+            @panic("refused admission must not leave");
+        }
+    };
+    store.writer_admission = .{ .ptr = &store, .enter = Refuse.enter, .leave = Refuse.leave };
+    defer store.writer_admission = null;
+    store.primary_reads_require_admission = true;
+    defer store.primary_reads_require_admission = false;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, store.beginRead());
+    try std.testing.expectError(error.EnrichmentWaitCanceled, Txn.openReadWithPrefix(&store, "\x02db/named\x00"));
+}
+
+test "lite reclamation cooperative shrink preserves parent observer cancellation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cooperative-parent-cancellation.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const Observer = struct {
+        fn check(_: *anyopaque) anyerror!void {
+            return error.MaintenanceCanceled;
+        }
+    };
+    var context: u8 = 0;
+    var cancel: maintenance.CancelToken = .{ .observer = .{ .ptr = &context, .check = Observer.check } };
+    try std.testing.expectError(error.MaintenanceCanceled, store.maintainBackgroundOnce(&cancel));
+    try std.testing.expect(!cancel.requested.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.assessment_preemptions);
+}
+
+test "lite replay cleanup bounded facade avoids materializing large legacy records" {
+    const a = std.testing.allocator;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "facade-retirement-prefix.aflite");
+    defer a.free(path);
+    var physical = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+    defer physical.close();
+    physical.maintenance_start_suppressed = true;
+    const payload = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'v');
+    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try physical.file.putDocumentBatch(&.{ .{ .key = &internal_keys.replay_meta_init_key, .value = "" }, .{ .key = &key, .value = payload } });
+    const facade = @import("../docstore.zig");
+    var logical = try facade.DocStore.openRuntime(budget.allocator(), try physical.runtimeStore(budget.allocator()));
+    defer logical.close();
+    // Warm only the small replay-index witness, before imposing the ceiling.
+    try std.testing.expect(try logical.hasReplayEntries());
+    var retirement: facade.ReplayRetirement = .{};
+    logical.deferred_replay_retirement = &retirement;
+    defer logical.deferred_replay_retirement = null;
+    logical.bounded_replay_retirement = true;
+    const baseline = budget.live;
+    budget.peak = baseline;
+    budget.limit = baseline + 1024 * 1024;
+    try logical.truncateReplayUpTo(budget.allocator(), 1);
+    budget.limit = std.math.maxInt(usize);
+    try std.testing.expect(budget.peak - baseline < 1024 * 1024);
+    try std.testing.expect((try physical.file.getDocumentAlloc(a, &key)) == null);
+    try std.testing.expect((try physical.file.check()).valid);
+}
+
+test "lite reclamation defers optional shrink before admission while replay is pending" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pending-replay-shrink.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try store.file.putDocument(&key, "retained replay");
+    const Admission = struct {
+        allocator: usize = 0,
+        shrink: usize = 0,
+        fn enter(ptr: *anyopaque, scope: PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scope == .allocator_service) self.allocator += 1;
+            if (scope == .reclamation) self.shrink += 1;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var admission: Admission = .{};
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expect(admission.allocator > 0);
+    try std.testing.expectEqual(@as(usize, 0), admission.shrink);
+    try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
+    try std.testing.expectEqual(@as(u64, 1), (try store.file.replayAdmission()).?.records);
+}
+
+test "lite seekable producer discovery persists authenticated bounded continuations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seekable-producer.aflite");
+    defer a.free(path);
+    var native_store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer native_store.close();
+    var runtime = try native_store.runtimeStoreWithPrefix(a, "\x02db/producer\x00");
+    defer runtime.deinit();
+    const facade = @import("../docstore.zig");
+    var store = try facade.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    var buffers: [1024][32]u8 = undefined;
+    var names: [1024][]const u8 = undefined;
+    for (&names, 0..) |*name, i| name.* = try std.fmt.bufPrint(&buffers[i], "document-{d:0>4}", .{i});
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &names, .target_hints = &.{.enrichment} });
+    defer a.free(payload);
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(1, payload);
+        const later = try change_journal_mod.encodeRecord(a, .{ .sequence = 2, .changed_doc_keys = &.{"later"}, .target_hints = &.{.enrichment} });
+        defer a.free(later);
+        try write.setReplayOpaque(2, later);
+        try write.commit();
+    }
+    const charged = (try native_store.file.replayAdmission()).?;
+    const chunk_key = replay_chunks.chunkKey(1, 15);
+    const last_chunk = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :blk try a.dupe(u8, try read.get(&chunk_key));
+    };
+    defer a.free(last_chunk);
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.put(&chunk_key, "unreadable later chunk");
+        try write.commit();
+    }
+    const source_mod = @import("../db/derived/replay_source.zig");
+    const original_source = source_mod.Source.fromPrimaryStore(&store, null, null);
+    const forwarded_vtable = original_source.vtable.*;
+    const source = source_mod.Source{ .ptr = original_source.ptr, .vtable = &forwarded_vtable };
+    const State = @import("../db/enrichment/scoped_retries.zig").State;
+    var state: State = .{};
+    defer state.deinit(a);
+    var seen: usize = 0;
+    while (seen < names.len) {
+        const window = try source.collectEnrichmentDocumentGroupsWindow(a, state.scanned_sequence, .{ .seekable = true, .fragment = state.scan_fragment, .max_document_groups = 9, .max_records = 1 });
+        defer source_mod.freePendingDocumentGroups(a, window.groups);
+        try std.testing.expectEqual(@min(@as(usize, 9), names.len - seen), window.groups.len);
+        for (window.groups) |group| {
+            try std.testing.expectEqualStrings(names[seen], group.doc_key);
+            try std.testing.expectEqual(@as(u64, 1), group.sequence);
+            seen += 1;
+        }
+        if (seen == 9) {
+            // The first turn succeeded without reading a deliberately damaged
+            // distant chunk. Whole-record reconstruction would reject it.
+            var write = try store.beginWriteBatch();
+            errdefer write.abort();
+            try write.put(&chunk_key, last_chunk);
+            try write.commit();
+            var wrong = window.fragment.?;
+            wrong.fingerprint[0] ^= 1;
+            try std.testing.expectError(error.InvalidDerivedApplyState, source.collectEnrichmentDocumentGroupsWindow(a, 0, .{ .seekable = true, .fragment = wrong, .max_document_groups = 9 }));
+        }
+        if (seen < names.len) {
+            try std.testing.expectEqual(@as(u64, 0), window.last_sequence);
+            try std.testing.expectEqual(@as(u64, seen), window.fragment.?.next_item);
+        } else {
+            try std.testing.expectEqual(@as(u64, 1), window.last_sequence);
+            try std.testing.expect(window.fragment == null);
+        }
+        state.scanned_sequence = if (window.fragment) |fragment| fragment.sequence - 1 else window.last_sequence;
+        state.scan_fragment = window.fragment;
+        const encoded = try state.encode(a);
+        defer a.free(encoded);
+        const restored = try State.decode(a, encoded);
+        state.deinit(a);
+        state = restored;
+    }
+    const Filter = struct {
+        visits: usize = 0,
+        fn accepts(ptr: *anyopaque, _: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.visits += 1;
+            return false;
+        }
+    };
+    var filter = Filter{};
+    const filtered = try source.collectEnrichmentDocumentGroupsWindow(a, 0, .{ .seekable = true, .max_records = 1, .max_document_groups = 9, .document_filter = .{ .ptr = &filter, .accepts = Filter.accepts } });
+    defer source_mod.freePendingDocumentGroups(a, filtered.groups);
+    try std.testing.expectEqual(@as(usize, 1024), filter.visits);
+    try std.testing.expectEqual(@as(usize, 0), filtered.groups.len);
+    try std.testing.expectEqual(@as(u64, 1), filtered.last_sequence);
+    try std.testing.expect(filtered.fragment == null);
+    try std.testing.expectEqualDeep(charged, (try native_store.file.replayAdmission()).?);
+}
+
+test "lite seekable producer fallback bounds unrelated journal scans" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "producer-fallback-bounds.aflite");
+    defer a.free(path);
+    var native_store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer native_store.close();
+    var runtime = try native_store.runtimeStoreWithPrefix(a, "\x02db/no-producer-hints\x00");
+    defer runtime.deinit();
+    var store = try @import("../docstore.zig").DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        for (1..514) |sequence| {
+            const encoded = try change_journal_mod.encodeRecord(a, .{ .sequence = sequence, .changed_doc_keys = &.{"ordinary"}, .target_hints = &.{.full_text} });
+            defer a.free(encoded);
+            try write.setReplayOpaque(sequence, encoded);
+        }
+        try write.commit();
+    }
+    const source_mod = @import("../db/derived/replay_source.zig");
+    const source = source_mod.Source.fromPrimaryStore(&store, null, null);
+    var completed: u64 = 0;
+    for ([_]u64{ 256, 512, 513 }) |expected| {
+        const window = try source.collectEnrichmentDocumentGroupsWindow(a, completed, .{ .seekable = true, .max_records = 1, .max_document_groups = 8 });
+        defer source_mod.freePendingDocumentGroups(a, window.groups);
+        try std.testing.expectEqual(expected, window.last_sequence);
+        try std.testing.expectEqual(@as(usize, 0), window.groups.len);
+        try std.testing.expect(window.fragment == null);
+        completed = window.last_sequence;
+    }
+}
+
+test "native publication validates preimages before primary writes and stages against their postimages" {
+    const a = std.testing.allocator;
+    const publication = @import("../native_publication.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-publication-phases.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const selected = "\x00\x00__test__:preimage";
+    const joined_key = "\x00\x00__test__:joined";
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(selected, "before");
+        try write.commit();
+    }
+    const Context = struct {
+        scope: publication.Scope,
+        expected: []const u8 = "stale",
+        validated: bool = false,
+        staged: bool = false,
+        fn validate(raw: *anyopaque, view: publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const current = try view.getMetadata(std.testing.allocator, self.scope, selected);
+            defer std.testing.allocator.free(current);
+            if (!std.mem.eql(u8, current, self.expected)) return error.FileBusy;
+            self.validated = true;
+        }
+        fn stage(raw: *anyopaque, view: publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.validated) return error.MissingNativePreimageValidation;
+            const current = try view.getMetadata(std.testing.allocator, self.scope, selected);
+            defer std.testing.allocator.free(current);
+            if (!std.mem.eql(u8, current, "after")) return error.MissingNativePrimaryPostimage;
+            try view.putMetadata(self.scope, joined_key, "committed");
+            self.staged = true;
+        }
+    };
+    var context: Context = .{ .scope = .{ .inode = (try store.file.file.stat(std.testing.io)).inode, .prefix = &.{}, .file_namespace = store.file.header.reader_epoch_namespace } };
+    const before = store.file.activeCheckpoint().commit_sequence;
+    {
+        var write = try store.beginWrite();
+        defer write.abort();
+        try write.put(selected, "after");
+        try write.setNativePublication(.{ .ptr = &context, .stage = Context.stage, .validate_fn = Context.validate });
+        try std.testing.expectError(error.FileBusy, write.commit());
+    }
+    try std.testing.expect(!context.validated and !context.staged);
+    try std.testing.expectEqual(before, store.file.activeCheckpoint().commit_sequence);
+    const unchanged = (try store.file.getDocumentAlloc(a, selected)).?;
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings("before", unchanged);
+    try std.testing.expect((try store.file.getDocumentAlloc(a, joined_key)) == null);
+    context.expected = "before";
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(selected, "after");
+        try write.setNativePublication(.{ .ptr = &context, .stage = Context.stage, .validate_fn = Context.validate });
+        try write.commit();
+    }
+    try std.testing.expect(context.validated and context.staged);
+    try std.testing.expectEqual(before + 1, store.file.activeCheckpoint().commit_sequence);
+    const after = (try store.file.getDocumentAlloc(a, selected)).?;
+    defer a.free(after);
+    const joined = (try store.file.getDocumentAlloc(a, joined_key)).?;
+    defer a.free(joined);
+    try std.testing.expectEqualStrings("after", after);
+    try std.testing.expectEqualStrings("committed", joined);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite cohort source records share one checkpoint and roll back publication as a group" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cohort-source-records.aflite");
+    defer a.free(path);
+    var owner = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer owner.close();
+    owner.maintenance_start_suppressed = true;
+    var runtime = try owner.runtimeStoreWithPrefix(a, "\x02db/cohort\x00");
+    defer runtime.deinit();
+    const facade = @import("../docstore.zig");
+    var store = try facade.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    const source_a = try change_journal_mod.encodeRecord(a, .{ .sequence = 2, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
+    defer a.free(source_a);
+    const source_b = try change_journal_mod.encodeRecord(a, .{ .sequence = 5, .changed_doc_keys = &.{"b"}, .target_hints = &.{.full_text} });
+    defer a.free(source_b);
+    const source_c = try change_journal_mod.encodeRecord(a, .{ .sequence = 8, .changed_doc_keys = &.{"c"}, .target_hints = &.{.full_text} });
+    defer a.free(source_c);
+    const physical = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(physical);
+    const before = owner.file.activeCheckpoint().commit_sequence;
+    try store.putBatchWithReplay(null, &.{.{ .key = physical, .value = "{\"n\":1}" }}, &.{}, .{
+        .sequence = 8,
+        .payload = source_c,
+        .preceding = &.{ .{ .sequence = 2, .payload = source_a }, .{ .sequence = 5, .payload = source_b } },
+    });
+    try std.testing.expectEqual(before + 1, owner.file.activeCheckpoint().commit_sequence);
+    const entries = try store.iterateReplayFrom(a, 0);
+    defer {
+        for (entries) |*entry| entry.deinit(a);
+        a.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    for (entries, [_]u64{ 2, 5, 8 }) |entry, sequence| try std.testing.expectEqual(sequence, entry.sequence);
+    const charge = (try owner.file.replayAdmission()).?;
+    const next_a = try change_journal_mod.encodeRecord(a, .{ .sequence = 10, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
+    defer a.free(next_a);
+    const next_b = try change_journal_mod.encodeRecord(a, .{ .sequence = 12, .changed_doc_keys = &.{"b"}, .target_hints = &.{.full_text} });
+    defer a.free(next_b);
+    const Fail = struct {
+        fn stage(_: *anyopaque, _: @import("../native_publication.zig").View) !void {
+            return error.InjectedCohortPublicationFailure;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(error.InjectedCohortPublicationFailure, store.putBatchWithPublications(null, &.{.{ .key = physical, .value = "{\"n\":2}" }}, &.{}, .{
+        .sequence = 12,
+        .payload = next_b,
+        .preceding = &.{.{ .sequence = 10, .payload = next_a }},
+    }, .{}, null, .{ .ptr = &context, .stage = Fail.stage }));
+    try std.testing.expectEqual(before + 1, owner.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 8), store.lastReplaySequence(0));
+    const after = (try owner.file.replayAdmission()).?;
+    try std.testing.expectEqual(charge.bytes, after.bytes);
+    try std.testing.expectEqual(charge.records, after.records);
+    const value = try store.get(a, physical);
+    defer a.free(value);
+    try std.testing.expectEqualStrings("{\"n\":1}", value);
+    const uncommitted = try store.iterateReplayFrom(a, 9);
+    defer {
+        for (uncommitted) |*entry| entry.deinit(a);
+        a.free(uncommitted);
+    }
+    try std.testing.expectEqual(@as(usize, 0), uncommitted.len);
+    try std.testing.expect((try owner.file.check()).valid);
 }

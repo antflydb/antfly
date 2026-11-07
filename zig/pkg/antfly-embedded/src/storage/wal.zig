@@ -186,16 +186,24 @@ const default_namespace: backend_types.Namespace = .{};
 
 const StoreOwner = union(enum) {
     lsm: lsm_backend.BackendHandle,
+    native: ?backend_erased.NamespaceStore,
 
     fn close(self: *StoreOwner, _: Allocator) void {
         switch (self.*) {
-            .lsm => |*handle| handle.close(),
+            .native => |*pending| if (pending.*) |*store| store.deinit(),
+            .lsm => |*handle| {
+                if (handle.backend.options.wal_enabled and if (handle.backend.storage) |storage| storage.requiresForegroundPublication() else false)
+                    handle.closePreservingWal()
+                else
+                    handle.close();
+            },
         }
         self.* = undefined;
     }
 
     fn abandonAfterCrash(self: *StoreOwner, _: Allocator) void {
         switch (self.*) {
+            .native => |*pending| if (pending.*) |*store| store.deinit(),
             .lsm => |*handle| handle.abandonAfterCrash(),
         }
         self.* = undefined;
@@ -203,24 +211,35 @@ const StoreOwner = union(enum) {
 
     pub fn sync(self: *StoreOwner, force: bool) !void {
         switch (self.*) {
+            .native => {},
             .lsm => |*handle| try handle.backend.sync(force),
+        }
+    }
+
+    fn syncReplayState(self: *StoreOwner) !void {
+        switch (self.*) {
+            .native => {},
+            .lsm => |*handle| try handle.backend.syncReplayState(),
         }
     }
 
     fn checkpointLsmWalAfterDurableBoundary(self: *StoreOwner) !void {
         switch (self.*) {
+            .native => {},
             .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
         }
     }
 
     fn pinNativeCheckpoint(self: *StoreOwner) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.*) {
+            .native => error.Unsupported,
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
         };
     }
 
     fn syncCommitDurability(self: *StoreOwner) !DurabilitySyncStats {
         return switch (self.*) {
+            .native => .{},
             // The LSM transaction has already appended and fsynced its replay
             // WAL. Sync that durable boundary without forcing an unrelated
             // memtable flush and compaction build on every outer WAL append.
@@ -236,24 +255,31 @@ const StoreOwner = union(enum) {
 
     fn commitProvidesDurability(self: *const StoreOwner) bool {
         return switch (self.*) {
+            .native => true,
             .lsm => |*handle| handle.backend.commitProvidesDurability(),
         };
     }
 
     fn lsmWriteStatsSnapshot(self: *const StoreOwner) ?lsm_backend.Backend.WriteStats {
         return switch (self.*) {
+            .native => null,
             .lsm => |*handle| handle.backend.snapshotWriteStats(),
         };
     }
 
     fn commitStatsSnapshot(self: *StoreOwner) ?CommitStats {
         return switch (self.*) {
-            .lsm => null,
+            .lsm, .native => null,
         };
     }
 
-    fn runtimeNamespaceStore(self: StoreOwner, allocator: Allocator) !backend_erased.NamespaceStore {
-        return switch (self) {
+    fn runtimeNamespaceStore(self: *StoreOwner, allocator: Allocator) !backend_erased.NamespaceStore {
+        return switch (self.*) {
+            .native => |*pending| blk: {
+                const store = pending.* orelse return error.TransactionClosed;
+                pending.* = null;
+                break :blk store;
+            },
             .lsm => |handle| try handle.backend.runtimeNamespaceStore(allocator),
         };
     }
@@ -412,6 +438,7 @@ pub const WAL = struct {
         }
         var cur = try read_txn.cursor();
         defer cur.close();
+        cur.setKeysOnly();
 
         const last = try cur.last();
 
@@ -604,6 +631,17 @@ pub const WAL = struct {
         try self.store_owner.sync(force);
     }
 
+    /// Drain admitted logical writes, then sync their physical WAL without
+    /// manufacturing an immutable SST generation for every replay watermark.
+    pub fn syncReplayState(self: *WAL) !void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (self.coordinator_active or self.pending_head != null) {
+            self.completed.waitUncancelable(self.sync_io, &self.mutex);
+        }
+        try self.store_owner.syncReplayState();
+    }
+
     /// Manifest the physical LSM generation which backs this logical WAL.
     /// Native capture uses the resulting immutable runs and deliberately omits
     /// the appendable physical WAL payloads.
@@ -640,6 +678,7 @@ pub const WAL = struct {
         {
             var cur = try txn.cursor();
             defer cur.close();
+            cur.setKeysOnly();
 
             var maybe_entry = try cur.first();
             if (maybe_entry == null) {
@@ -696,6 +735,7 @@ pub const WAL = struct {
         {
             var cur = try txn.cursor();
             defer cur.close();
+            cur.setKeysOnly();
 
             const start_key = std.mem.toBytes(std.mem.nativeToBig(u64, next_lsn));
             var maybe_entry = try cur.seekAtOrAfter(&start_key);
@@ -1101,6 +1141,9 @@ pub const WAL = struct {
 fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !StoreOwner {
     return switch (opts.resolvedBackend()) {
         .lsm => blk: {
+            if (opts.storage orelse opts.lsm_options.storage) |storage| {
+                if (try storage.openNativeNamespaces(alloc, std.mem.span(path), opts.read_only)) |store| break :blk .{ .native = store };
+            }
             const path_slice = std.mem.span(path);
             const path_owned = try alloc.dupe(u8, path_slice);
             defer alloc.free(path_owned);
@@ -3677,6 +3720,7 @@ test "wal routes lsm profile options" {
 
     switch (wal.store_owner) {
         .lsm => |handle| try std.testing.expectEqual(@as(usize, 37), handle.backend.options.flush_threshold),
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -3684,4 +3728,52 @@ fn cleanupWalDir(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "lite native namespace WAL retains idempotency through reopen and payload retirement" {
+    const a = std.testing.allocator;
+    const lite = @import("lite/docstore.zig");
+    const index_storage = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-wal.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = index_storage.Store.init(a, &docs);
+    const options: WalOptions = .{ .backend = .lsm, .storage = adapter.storage(), .no_sync = true };
+    var wal = try WAL.open("/indexes/text/wal", options);
+    var live = true;
+    defer if (live) wal.close();
+    try std.testing.expect(wal.store_owner == .native);
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    const first = try wal.appendIdempotent("receipt", "digest", "payload");
+    try std.testing.expect(first.appended);
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    {
+        const entries = try wal.iterateFrom(a, first.lsn);
+        defer {
+            for (entries) |entry| a.free(@constCast(entry.data));
+            a.free(entries);
+        }
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqualStrings("payload", entries[0].data);
+    }
+    wal.close();
+    live = false;
+    wal = try WAL.open("/indexes/text/wal", options);
+    live = true;
+    try wal.truncate(first.lsn);
+    const duplicate = try wal.appendIdempotent("receipt", "digest", "payload");
+    try std.testing.expect(!duplicate.appended);
+    try std.testing.expectEqual(first.lsn, duplicate.lsn);
+    try std.testing.expectError(error.IdempotencyConflict, wal.appendIdempotent("receipt", "other", "payload"));
+    const entries = try wal.iterateFrom(a, 1);
+    defer {
+        for (entries) |entry| a.free(@constCast(entry.data));
+        a.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }

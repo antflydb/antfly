@@ -1,0 +1,73 @@
+{
+  "qualified": false,
+  "source_commit": "2c04e1913337993c9823cc70badeb3ca2279def5",
+  "mode": "Debug",
+  "scope": "Local metrics-enabled, sampled diagnosis with up to seven unrelated compiler processes. No clean timing comparison. No reference build or execution.",
+  "result": {
+    "input_index": 7,
+    "importer_exit_code": 1,
+    "censored": false,
+    "importer_succeeded": false,
+    "summary": [
+      0,
+      0,
+      1
+    ],
+    "seconds": 128.41688179189805,
+    "peak_native_builds": 7,
+    "metrics_enabled": true,
+    "library_sha256": "a18115416e9af2fe22660ade55997c09cea49afb2fe8b9b7a127c54f843fb248",
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+    "seed_copy_method": "native_stable_snapshot",
+    "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+  },
+  "validation": {
+    "index_segment_passed": 190,
+    "persistence_delete_passed": 3,
+    "strict_executor_passed": 7,
+    "selected_capi_sql_passed": 160,
+    "sdk_passed": 209,
+    "cabi_exports": 134,
+    "skips": 0,
+    "leaks": 0
+  },
+  "primary_batch_profiles": 20,
+  "full_text_profiles": 72,
+  "full_text_sums": {
+    "documents": 1643,
+    "total_ms": 12523,
+    "full_text_collect_ms": 407,
+    "full_text_plan_ms": 126,
+    "full_text_prepare_ms": 432,
+    "full_text_apply_lock_held_ms": 3399
+  },
+  "invalid_manifest_errors": 0,
+  "sample": {
+    "sample_seconds": 3,
+    "sample_exit": 0,
+    "elapsed_at_sample": 114.85831254196819,
+    "sample_sha256": "d1d098cbacccf4fb7fe653bde9833a3f11fc0c18b66290133358fa1477b971bf",
+    "scope": "Profiled local diagnosis; not a clean latency measurement."
+  },
+  "segment_inventory": {
+    "segments": 37,
+    "logical_bytes": 142509498,
+    "largest_bytes": 46607503,
+    "prior_handoff_source_cap_bytes": 268435456
+  },
+  "sample_findings": {
+    "foreground_table_open_max_inclusive_samples": 382,
+    "configured_text_open_max_inclusive_samples": 329,
+    "durable_artifact_lease_submission_max_inclusive_samples": 261,
+    "note": "Inclusive sample counts are not additive. The largest open stack is reached from antfly_db_open_table, not only maintenance replay. The measured text-segment set fits the prior 256 MiB source-length cap; that cap does not explain this fixture by itself."
+  },
+  "next_mechanism": "Foreground refresh constructs the default namespace and collects its predecessor before the requested named namespace opens. A scoped predecessor lifetime reference can preserve exact immutable input pooling through that namespace acquisition without borrowing old query or allocator state. Native regression validation is pending.",
+  "limitations": [
+    "Persisted ID lookup removed a corpus-wide update scan, but this importer gate still failed.",
+    "The replacement lifetime change and separate resident/generation handoff limits are not qualified by this receipt.",
+    "Raw inputs, stack sample and database stay private under ignored .tools."
+  ]
+}

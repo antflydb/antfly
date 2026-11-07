@@ -1,0 +1,87 @@
+{
+  "scope": "Direct native text namespaces and logical WAL, prepared-index lifecycle and queued native C API retirement; incomplete whole-system architecture.",
+  "parent_commit": "059a879f0fa33103bc0d83efc06bfd8afb5e88dc",
+  "mode": "Debug",
+  "format_revision": 13,
+  "namespace_layout": "AFNS1",
+  "source_sha256": {
+    "scripts/bench/lite_catalog_accounting.py": "8a3ecde97bfeae2cf988d45169dc5204f0066b4cb57d4344ad65db4e3faba46c",
+    "scripts/bench/test_lite_catalog_accounting.py": "762768176061d8b82cb90d97c785dd286b31021119f4498bc31b40b19ee440b7",
+    "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "f792db4818b9e60a02d8a5c012a792760016b208ce115b352aa48d8d56335908",
+    "zig/pkg/antfly-embedded/src/index.zig": "b6b5273f88e6a97ccfefe2566b9f5829e19bcbdf6371dfe4336148ece6474674",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "123a3a49b950167acc571ef1357e14f91f793dbaa31e9e10d2be20ff74a8ed17",
+    "zig/pkg/antfly-embedded/src/storage/db/execution_resources.zig": "fc3c23bf43a06616ecca3a9f2a64f92387985d60f47b14de7369fc99ff3432f4",
+    "zig/pkg/antfly-embedded/src/storage/lite/artifact_source.zig": "cee9866033128951de1c7adb357049ce0f3095da5641e2ec790804c2675cc70c",
+    "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig": "c7e1c505ed2ab915b289bc4f0384d75c4ecc4e068aa0c7fddd7317069664212f",
+    "zig/pkg/antfly-embedded/src/storage/lite/namespace_store.zig": "34fce1650532f2e2cdb8c8a10c0d8d70a5e1c55191282bd63aaa8fc74127d8e1",
+    "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "9ca6813e97ed978a85462184f39158f9690ea0f102bdf42db2972b2797c6876e",
+    "zig/pkg/antfly-embedded/src/storage/lite/publication_host.zig": "803898e7ba6d85bba378a1e29e7d36ae5c4fe41a8586055dee4d069de7b6ae0b",
+    "zig/pkg/antfly-embedded/src/storage/lsm_backend/storage_io.zig": "fca395f1b765c5a6178c682a2f24c3b29ce0511d21fffce3492621ab564fdacf",
+    "zig/pkg/antfly-embedded/src/storage/persistent.zig": "e2b9aa947462a68279881cc450b76bf93bef4d2f4f2b54df30d5b5b069a2a281",
+    "zig/pkg/antfly-embedded/src/storage/wal.zig": "77f0dd8b242f42ce23a0148893b56433bab9e805d6c3ad77247e7b1f3528cbb3",
+    "zig/pkg/antfly/src/storage_batch_contract_test_root.zig": "e67b591800af43325a31c1453e443564ed35602334a8b6f6567475365d010e5c"
+  },
+  "implemented": [
+    "New hosted native text main stores and logical WALs use native transactional namespaces; existing LSM roots retain their compatibility backend.",
+    "Ordered binary namespace/key encoding uses filesystem-safe bounded components, preserving generation manifests and managed repair.",
+    "Owned namespace mutation descriptors and generation entropy are prepared before queuing; metadata snapshots close before publication waits.",
+    "Artifact activation, index metadata and joined projection progress share one native checkpoint.",
+    "Prepared index snapshots release writer serialization before native admission and validate retained base identity plus deletion revisions before rebinding.",
+    "Native C API visibility acknowledgement schedules bounded physical retirement; physical deletion remains necessary before returning credits.",
+    "Virtual directory parent synchronization adds no synthetic native checkpoint.",
+    "Existing bounded leased-source handoff remains intact; an experimental copied-source fast path was removed after full-gate handoff regressions."
+  ],
+  "validation": {
+    "native": {
+      "passed": 796,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_local": {
+      "passed": 362,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_owner": {
+      "passed": 87,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    "persistent": {
+      "passed": 74,
+      "skipped": 1,
+      "failed": 0,
+      "leaked": 0
+    },
+    "wal": {
+      "passed": 110,
+      "failed": 0,
+      "leaked": 0
+    },
+    "wal_portable": {
+      "passed": 4,
+      "failed": 0,
+      "leaked": 0
+    },
+    "abi_exports": 138,
+    "accounting_parity_and_corruption_detection": {
+      "passed": 1
+    },
+    "complete_gate_exit_code": 0,
+    "complete_gate_wall_seconds": 533.584
+  },
+  "qualified": false,
+  "remaining": [
+    "Combined foreground primary/index prepared publication and coalesced commit cohorts.",
+    "Posting-delta batching independent of RPC boundaries.",
+    "Crash-safe one-sync native protocol; existing data-before-checkpoint durability barrier remains.",
+    "Complete semantic generation/resource-reclamation separation.",
+    "Migration/rebuild qualification and remaining graph/vector metadata backend work.",
+    "Final unchanged-importer and optimized wolfspider qualification; no baseline rebuild or rerun."
+  ],
+  "retention": "Synthetic unit fixtures close and clean their databases. No new qualification database archive. Existing failed import fixture remains in place; full factory remains assigned to Beads.",
+  "library_sha256": "19eb9bd94a1126f08e9d5b0bbd71f9edef3bbcf8f3987ed16c9536f5bada830e"
+}

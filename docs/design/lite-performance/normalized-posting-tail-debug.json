@@ -1,0 +1,83 @@
+{
+  "scope": "Debug component correctness and current-candidate operation counts; not end-to-end or optimized qualification",
+  "base_commit": "df3a16317b337812f1f260997d1c9b62a6b43e2a",
+  "format_revision": 17,
+  "posting_delta_format": "segment-v7 / AFTPD001",
+  "bounds": {
+    "documents_per_fragment": 256,
+    "bytes_per_fragment": 4194304,
+    "target_documents_per_window": 256,
+    "target_bytes_per_window": 4194304,
+    "fragment_window_trigger": 32
+  },
+  "validation": {
+    "reader_gate": {
+      "passed": 541,
+      "skipped": 2,
+      "failed": 0,
+      "leaked": 0,
+      "includes": "exact frozen-byte equivalence; phrase, prefix, wildcard and regexp scoring; all-allocation-failure ownership sweep"
+    },
+    "native_publication_contracts": {
+      "passed": 43,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "source_note": "Built before the final malformed-frequency upper-bound guard and query-test-only corrections."
+    },
+    "abi_exports": 138,
+    "serial_publication": "96 synchronous writes; owner window freezing; per-write search; overwrite/delete; reopen and integrity"
+  },
+  "retained_previous_indexed_receipt": {
+    "library_sha256": "30a6b2c159a0deb7c2318305668962664bca5bcd7d760b7edf65244e4d5fe825",
+    "writes": 128,
+    "p50_ns": 28798792,
+    "p95_ns": 91493000,
+    "mutation_elapsed_ns": 4743664292,
+    "verification": {
+      "every_latest_value_checked": true,
+      "primary_rows_checked": 128,
+      "expected_rows": 128,
+      "latest_and_overwritten_tokens_checked": true,
+      "integrity_passed": true,
+      "seconds": 0.2704408329882426
+    },
+    "cleanup": {
+      "removed_bytes": 3997696
+    },
+    "foreground_syncs": 128,
+    "background_syncs": 126,
+    "main_write_bytes": 16610210
+  },
+  "current_indexed": {
+    "library_sha256": "a98fe6a7a9fcba70363ca370b5d514adbd99ac1fc2585432a03d0276e7942aa4",
+    "writes": 128,
+    "p50_ns": 33633583,
+    "p95_ns": 122890708,
+    "mutation_elapsed_ns": 5555440750,
+    "verification": {
+      "every_latest_value_checked": true,
+      "primary_rows_checked": 128,
+      "expected_rows": 128,
+      "latest_and_overwritten_tokens_checked": true,
+      "integrity_passed": true,
+      "seconds": 0.19332908300566487
+    },
+    "cleanup": {
+      "removed_bytes": 2256896
+    },
+    "foreground_syncs": 128,
+    "background_syncs": 129,
+    "main_write_bytes": 16406895
+  },
+  "interpretation": "The tail reduces closed file size but these shared-host runs do not demonstrate a latency or sync-count improvement. Background publication remains near one sync per write, including primary-only workloads. Attribute those publications before performance qualification.",
+  "remaining": [
+    "SQL/relational preparation outside C API writer admission",
+    "background physical-publication attribution and coalescing",
+    "complete exact-head correctness and crash gates",
+    "unchanged importer local qualification",
+    "final optimized wolfspider qualification"
+  ],
+  "reference_workloads_rebuilt_or_rerun": false,
+  "qualification_databases_archived": false
+}

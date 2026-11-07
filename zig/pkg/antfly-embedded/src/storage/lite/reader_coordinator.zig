@@ -32,8 +32,104 @@ pub const Coordinator = struct {
     registration_batch_id: u64 = 0,
     batch_data_epoch: ?*SharedEpoch = null,
     batch_metadata_epoch: ?*SharedEpoch = null,
+    epoch_namespace_mutex: std.Io.Mutex = .init,
+    epoch_namespace: epochs.NamespaceCache = .{},
 
+    artifact_release_mutex: std.atomic.Mutex = .unlocked,
+    artifact_release_head: ?*ArtifactRelease = null,
+    artifact_release_tail: ?*ArtifactRelease = null,
+
+    wal_checkpoint_mutex: std.atomic.Mutex = .unlocked,
+    wal_checkpoints: std.StringHashMapUnmanaged(struct { inode: u64, completed_at_ns: u64 }) = .empty,
     known: ?struct { inode: u64, tip: [32]u8 } = null,
+
+    /// A cache re-open is not a process restart. A known successful checkpoint
+    /// provides a conservative lower bound for the age of every later append.
+    /// Peers may checkpoint later; an older local bound only schedules earlier.
+    pub fn recoveredWalDeadline(self: *Coordinator, root: []const u8, inode: u64, max_age_ns: u64) ?u64 {
+        @import("antfly_platform").sync.lockYielding(&self.wal_checkpoint_mutex);
+        defer self.wal_checkpoint_mutex.unlock();
+        const known = self.wal_checkpoints.get(root) orelse return null;
+        if (known.inode != inode) return null;
+        return known.completed_at_ns +| max_age_ns;
+    }
+    pub fn noteWalCheckpoint(self: *Coordinator, root: []const u8, inode: u64, now_ns: u64) void {
+        @import("antfly_platform").sync.lockYielding(&self.wal_checkpoint_mutex);
+        defer self.wal_checkpoint_mutex.unlock();
+        if (self.wal_checkpoints.getPtr(root)) |known| {
+            known.* = .{ .inode = inode, .completed_at_ns = now_ns };
+            return;
+        }
+        const key = self.allocator.dupe(u8, root) catch return;
+        self.wal_checkpoints.put(self.allocator, key, .{ .inode = inode, .completed_at_ns = now_ns }) catch self.allocator.free(key);
+    }
+    pub fn forgetWalCheckpoints(self: *Coordinator, prefix: []const u8) void {
+        @import("antfly_platform").sync.lockYielding(&self.wal_checkpoint_mutex);
+        defer self.wal_checkpoint_mutex.unlock();
+        var removed = false;
+        var it = self.wal_checkpoints.iterator();
+        while (it.next()) |entry| {
+            const root = entry.key_ptr.*;
+            if (!std.mem.eql(u8, root, prefix) and
+                !(std.mem.startsWith(u8, root, prefix) and root.len > prefix.len and root[prefix.len] == '/')) continue;
+            std.debug.assert(self.wal_checkpoints.remove(root));
+            self.allocator.free(root);
+            removed = true;
+        }
+        if (removed) self.wal_checkpoints.rehash(std.hash_map.StringContext{});
+    }
+
+    pub const ArtifactRelease = struct {
+        inode: u64,
+        key: []u8,
+        next: ?*ArtifactRelease = null,
+    };
+    pub fn retain(self: *Coordinator) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+    pub fn reserveArtifactRelease(self: *Coordinator, inode: u64, key: []const u8) !*ArtifactRelease {
+        const ticket = try self.allocator.create(ArtifactRelease);
+        errdefer self.allocator.destroy(ticket);
+        ticket.* = .{ .inode = inode, .key = try self.allocator.dupe(u8, key) };
+        return ticket;
+    }
+    fn lockArtifactReleases(self: *Coordinator) void {
+        @import("antfly_platform").sync.lockYielding(&self.artifact_release_mutex);
+    }
+    pub fn enqueueArtifactReleases(self: *Coordinator, first: *ArtifactRelease) void {
+        var tail = first;
+        while (tail.next) |next| tail = next;
+        self.lockArtifactReleases();
+        defer self.artifact_release_mutex.unlock();
+        if (self.artifact_release_tail) |last| last.next = first else self.artifact_release_head = first;
+        self.artifact_release_tail = tail;
+    }
+    pub fn hasArtifactReleases(self: *Coordinator) bool {
+        self.lockArtifactReleases();
+        defer self.artifact_release_mutex.unlock();
+        return self.artifact_release_head != null;
+    }
+    pub fn takeArtifactReleases(self: *Coordinator, maximum: usize) ?*ArtifactRelease {
+        std.debug.assert(maximum > 0);
+        self.lockArtifactReleases();
+        defer self.artifact_release_mutex.unlock();
+        const first = self.artifact_release_head orelse return null;
+        var tail = first;
+        var count: usize = 1;
+        while (count < maximum) : (count += 1) tail = tail.next orelse break;
+        self.artifact_release_head = tail.next;
+        if (tail.next == null) self.artifact_release_tail = null;
+        tail.next = null;
+        return first;
+    }
+    pub fn destroyArtifactReleases(self: *Coordinator, first: ?*ArtifactRelease) void {
+        var next = first;
+        while (next) |ticket| {
+            next = ticket.next;
+            self.allocator.free(ticket.key);
+            self.allocator.destroy(ticket);
+        }
+    }
 
     const SharedEpoch = struct {
         lease: epochs.Lease,
@@ -77,6 +173,23 @@ pub const Coordinator = struct {
         self.registration_batches += 1;
         _ = self.references.fetchAdd(1, .monotonic);
         return .{ .coordinator = self };
+    }
+
+    /// The admitted writer has a newer checkpoint. Old batch anchors cannot
+    /// serve a read at that checkpoint; detach them now rather than retaining
+    /// otherwise dead pages until the entire admission scope finishes.
+    /// Escaped readers retain their independent references and frontiers.
+    pub fn advanceRegistrationCheckpoint(self: *Coordinator, inode: u64, sequence: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        var released: [2]?*SharedEpoch = .{ null, null };
+        for ([_]*?*SharedEpoch{ &self.batch_data_epoch, &self.batch_metadata_epoch }, 0..) |slot, i| {
+            const epoch = slot.* orelse continue;
+            if (epoch.inode != inode or epoch.sequence >= sequence) continue;
+            released[i] = epoch;
+            slot.* = null;
+        }
+        self.mutex.unlock(self.io);
+        for (released) |maybe| if (maybe) |epoch| self.releaseSharedEpoch(epoch);
     }
 
     fn releaseSharedEpoch(self: *Coordinator, epoch: *SharedEpoch) void {
@@ -170,7 +283,12 @@ pub const Coordinator = struct {
     pub fn deinit(self: *Coordinator) void {
         std.debug.assert(self.readers.items.len == 0);
         std.debug.assert(self.registration_batches == 0 and self.batch_data_epoch == null and self.batch_metadata_epoch == null);
+        self.epoch_namespace.deinit(self.allocator, self.io);
         self.readers.deinit(self.allocator);
+        self.destroyArtifactReleases(self.artifact_release_head);
+        var roots = self.wal_checkpoints.keyIterator();
+        while (roots.next()) |root| self.allocator.free(root.*);
+        self.wal_checkpoints.deinit(self.allocator);
     }
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.
@@ -191,7 +309,7 @@ pub const Coordinator = struct {
             file.unlock(self.io);
             return fence;
         }
-        const epoch = epochs.register(self.allocator, self.io, path, binding, inode, sequence, metadata) catch |err| switch (err) {
+        const epoch = self.registerCachedEpoch(path, binding, inode, sequence, metadata) catch |err| switch (err) {
             error.AccessDenied, error.ReadOnlyFileSystem, error.UnsafeNativeReaderAlias => return self.registerWithScope(file, inode, sequence, tip, metadata, null, true, null),
             else => return err,
         };
@@ -203,6 +321,24 @@ pub const Coordinator = struct {
         const fence = try self.registerWithScope(file, inode, sequence, tip, metadata, if (shared == null) epoch else null, false, shared);
         file.unlock(self.io);
         return fence;
+    }
+
+    fn registerCachedEpoch(self: *Coordinator, path: []const u8, binding: [32]u8, inode: u64, sequence: u64, metadata: bool) !epochs.Lease {
+        self.epoch_namespace_mutex.lockUncancelable(self.io);
+        defer self.epoch_namespace_mutex.unlock(self.io);
+        return self.epoch_namespace.register(self.allocator, self.io, path, binding, inode, sequence, metadata);
+    }
+
+    pub fn scanEpochs(self: *Coordinator, path: []const u8, binding: [32]u8, inode: u64) !epochs.Frontier {
+        self.epoch_namespace_mutex.lockUncancelable(self.io);
+        defer self.epoch_namespace_mutex.unlock(self.io);
+        return self.epoch_namespace.scan(self.allocator, self.io, path, binding, inode);
+    }
+
+    pub fn epochNamespaceStats(self: *Coordinator) struct { opens: u64, validations: u64 } {
+        self.epoch_namespace_mutex.lockUncancelable(self.io);
+        defer self.epoch_namespace_mutex.unlock(self.io);
+        return .{ .opens = self.epoch_namespace.opens, .validations = self.epoch_namespace.validations };
     }
     fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool, epoch: ?epochs.Lease, inode_only: bool, shared: ?*SharedEpoch) !*Fence {
         self.mutex.lockUncancelable(self.io);
@@ -502,4 +638,44 @@ test "lite reader registration batch allocation failures release every fence and
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+}
+
+test "lite WAL checkpoint ages survive cache refresh and fence inode replacement" {
+    var owner = Coordinator{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer owner.deinit();
+    try std.testing.expect(owner.recoveredWalDeadline("root/index", 1, 100) == null);
+    owner.noteWalCheckpoint("root/index", 1, 200);
+    for (0..20) |_| try std.testing.expectEqual(@as(?u64, 300), owner.recoveredWalDeadline("root/index", 1, 100));
+    try std.testing.expect(owner.recoveredWalDeadline("root/index", 2, 100) == null);
+    owner.noteWalCheckpoint("root/index-other", 1, 400);
+    owner.forgetWalCheckpoints("root/index");
+    try std.testing.expect(owner.recoveredWalDeadline("root/index", 1, 100) == null);
+    try std.testing.expectEqual(@as(?u64, 500), owner.recoveredWalDeadline("root/index-other", 1, 100));
+}
+
+test "lite reader registration batch advances idle anchors without releasing escaped readers" {
+    var fixture = try RegistrationFixture.init();
+    defer fixture.deinit();
+    const batch = fixture.coordinator.beginRegistrationBatch();
+    defer batch.end();
+    var idle = try fixture.reader(10, false, fixture.binding);
+    defer idle.close();
+    var escaped = try fixture.reader(10, true, fixture.binding);
+    defer escaped.close();
+    idle.close();
+    fixture.coordinator.advanceRegistrationCheckpoint(fixture.inode, 20);
+    try std.testing.expect(fixture.coordinator.batch_data_epoch == null);
+    try std.testing.expect(fixture.coordinator.batch_metadata_epoch == null);
+    try std.testing.expectEqual(@as(?u64, 10), (try fixture.scan()).metadata);
+    try std.testing.expectEqual(@as(?u64, 10), fixture.coordinator.beginWithMetadata(fixture.inode, @splat(0), true).data);
+    fixture.coordinator.end();
+    escaped.close();
+    try std.testing.expectEqual(epochs.Frontier{}, try fixture.scan());
+    var current = try fixture.reader(20, false, fixture.binding);
+    defer current.close();
+    current.close();
+    fixture.coordinator.advanceRegistrationCheckpoint(fixture.inode, 20);
+    try std.testing.expectEqual(@as(?u64, 20), (try fixture.scan()).data);
+    fixture.coordinator.advanceRegistrationCheckpoint(fixture.inode, 21);
+    try std.testing.expectEqual(epochs.Frontier{}, try fixture.scan());
 }

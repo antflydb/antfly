@@ -951,6 +951,17 @@ pub const RoaringBitmap = struct {
         return bytes;
     }
 
+    /// Allocated payload retained by this bitmap, including spare capacity
+    /// left by rollback/removal. Callers provide synchronization.
+    pub fn retainedBytes(self: *const RoaringBitmap) usize {
+        var bytes = self.keys.capacity * @sizeOf(u16) + self.containers.capacity * @sizeOf(Container);
+        for (self.containers.items) |container| bytes += switch (container) {
+            .array => |values| values.capacity * @sizeOf(u16),
+            .bitmap => |words| words.len * @sizeOf(u64),
+        };
+        return bytes;
+    }
+
     pub fn cloneExact(self: *const RoaringBitmap, alloc: Allocator) !RoaringBitmap {
         var copied = RoaringBitmap.init(alloc);
         errdefer copied.deinit();

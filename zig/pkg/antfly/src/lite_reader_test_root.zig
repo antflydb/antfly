@@ -19,6 +19,7 @@ test {
     _ = @import("antfly_local_sources").section_doc_values;
     _ = @import("antfly_local_sources").search_search;
     _ = @import("antfly_local_sources").segment;
+    _ = @import("antfly_local_sources").section_posting_delta;
     _ = @import("antfly_local_sources").merger;
 }
 

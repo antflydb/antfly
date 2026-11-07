@@ -1489,8 +1489,10 @@ pub const Backend = struct {
         reset_proven: bool = false,
         primary: ?wal_mod.RetentionStats = null,
         primary_ns: u64 = 0,
+        primary_revision: ?Storage.ContentRevision = null,
         replay: ?wal_mod.RetentionStats = null,
         replay_ns: u64 = 0,
+        replay_revision: ?Storage.ContentRevision = null,
 
         fn append(
             self: *@This(),
@@ -1503,6 +1505,7 @@ pub const Backend = struct {
             now_ns: u64,
         ) !wal_mod.AppendResult {
             self.reset_proven = false;
+            if (!std.meta.eql(self.primary_revision, storage.loadedWalMetadataRevision(root_dir))) self.invalidatePrimary();
             errdefer self.invalidatePrimary();
             const result = try wal_mod.appendStateWithOptionsResult(
                 storage,
@@ -1513,6 +1516,7 @@ pub const Backend = struct {
                 options,
             );
             self.noteAppend(result, now_ns);
+            if (self.primary != null) self.primary_revision = storage.loadedWalMetadataRevision(root_dir);
             return result;
         }
 
@@ -1542,6 +1546,8 @@ pub const Backend = struct {
             self.invalidateAll();
             try wal_mod.reset(storage, allocator, root_dir);
             self.installReset(now_ns);
+            self.primary_revision = storage.loadedWalMetadataRevision(root_dir);
+            self.replay_revision = self.primary_revision;
         }
 
         fn noteAppend(self: *@This(), result: wal_mod.AppendResult, now_ns: u64) void {
@@ -1565,6 +1571,7 @@ pub const Backend = struct {
             self.reset_proven = false;
             self.primary = null;
             self.primary_ns = 0;
+            self.primary_revision = null;
         }
 
         fn invalidateAll(self: *@This()) void {
@@ -1975,6 +1982,17 @@ pub const Backend = struct {
         self.waitForGenerationReadersToDrain();
         self.releaseTrackedResourceUsage();
         recovery_mod.close(Backend, self);
+    }
+
+    /// Close a reconstructible cache without flushing its durable WAL again.
+    /// Unlike crash teardown, ordinary close still drains generation readers.
+    pub fn closePreservingWal(self: *Backend) void {
+        self.closing.store(true, .release);
+        self.detachLocalBlockCacheReclaimer();
+        self.background_executor.drain();
+        self.waitForGenerationReadersToDrain();
+        self.releaseTrackedResourceUsage();
+        recovery_mod.abandon(Backend, self);
     }
 
     pub fn abandonAfterCrash(self: *Backend) void {
@@ -2897,17 +2915,22 @@ pub const Backend = struct {
     }
 
     /// WAL replay proves this mutable state was already dirty before this
-    /// process started. Its original monotonic timestamp cannot be recovered,
-    /// so granting it a fresh maximum-age interval on every restart could
-    /// postpone checkpointing forever. Make recovered state immediately
-    /// eligible; the maintenance worker still performs the normal atomic
-    /// run/manifest/WAL checkpoint sequence.
+    /// process started. A provider may retain a successful checkpoint's age
+    /// across cache re-opens. Without that knowledge, granting a fresh maximum-
+    /// age interval on every restart could postpone checkpointing forever.
+    /// Unknown ages remain immediately eligible; known cache owners keep the
+    /// original bound. Maintenance still performs the atomic run/manifest/WAL
+    /// checkpoint sequence.
     pub fn noteRecoveredWriteMutationLocked(self: *Backend) void {
         if (self.options.mutable_idle_flush_after_ns > 0 and
             self.mutable.entryCount() > 0 and
             !self.options.backend.read_only)
         {
-            const due_ns = @max(self.nowNs(), 1);
+            const remembered = if (self.options.mutable_idle_flush_max_age_ns > 0 and self.storage != null and self.root_dir != null)
+                self.storage.?.recoveredWalIdleDeadline(self.root_dir.?, self.options.mutable_idle_flush_max_age_ns)
+            else
+                null;
+            const due_ns = remembered orelse @max(self.nowNs(), 1);
             self.mutable_idle_flush_deadline_ns = due_ns;
             self.mutable_idle_flush_max_deadline_ns = due_ns;
         } else {
@@ -5910,17 +5933,24 @@ pub const Backend = struct {
     }
 
     pub fn appendWalForMutable(self: *Backend, state: anytype) !void {
-        try self.appendWalWithPreparation(state, null);
+        try self.appendWalWithPreparation(state, null, null);
     }
 
     pub fn prepareAndAppendWalForMutable(self: *Backend, state: *const ActiveMemTable) !ActiveMemTable {
         var prepared: ActiveMemTable = .{};
         errdefer prepared.deinit(self.allocator);
-        try self.appendWalWithPreparation(state, &prepared);
+        try self.appendWalWithPreparation(state, &prepared, null);
         return prepared;
     }
 
-    fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable) !void {
+    pub fn prepareAndAppendWalForPublication(self: *Backend, state: *const ActiveMemTable, participant: @import("native_publication.zig").Participant) !ActiveMemTable {
+        var prepared: ActiveMemTable = .{};
+        errdefer prepared.deinit(self.allocator);
+        try self.appendWalWithPreparation(state, &prepared, participant);
+        return prepared;
+    }
+
+    fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable, publication: ?@import("native_publication.zig").Participant) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         const wal_enabled = self.options.wal_enabled and self.root_dir != null and !self.options.backend.read_only and state.entryCount() != 0;
 
@@ -5939,6 +5969,7 @@ pub const Backend = struct {
                 }
             }
         } else std.debug.assert(prepared == null);
+        if (publication != null and (!wal_enabled or self.storage.?.vtable.append_publication == null)) return error.Unsupported;
         if (!wal_enabled) return;
 
         const start_ns = self.writeStatsNowNs();
@@ -5974,7 +6005,7 @@ pub const Backend = struct {
             self.root_dir.?,
             state,
             self.options.wal_sync_on_commit,
-            .{ .segment_bytes = self.options.wal_segment_bytes, .unrepaired_tail = &self.wal_unrepaired_tail, .proven_unwritten = &proven_unwritten },
+            .{ .segment_bytes = self.options.wal_segment_bytes, .unrepaired_tail = &self.wal_unrepaired_tail, .proven_unwritten = &proven_unwritten, .publication = publication },
             self.writeStatsNowNs(),
         );
         self.noteMutableWalSegment(append_result.segment);
@@ -6159,6 +6190,10 @@ pub const Backend = struct {
         // durably manifested. Keep cleanup-only retry paths and future callers
         // from retaining stale publication debt after a successful reset.
         self.clearPublishedWalLogicalDebtLocked();
+        // Only completed durable reset advances the cache-owner age. A no-op
+        // barrier or failed checkpoint must not postpone the next real cut.
+        if (self.options.mutable_idle_flush_after_ns > 0 and self.options.mutable_idle_flush_max_age_ns > 0)
+            self.storage.?.walCheckpointCompleted(self.root_dir.?, self.nowNs());
     }
 
     pub fn checkpointWalAfterDurableBoundary(self: *Backend) !void {
@@ -7102,6 +7137,10 @@ pub const Backend = struct {
     }
 
     pub fn getCachedRunIndexIndex(self: *Backend, path: []const u8, run_id: u64) !usize {
+        return try self.getCachedRunIndexIndexWithStorage(path, run_id, self.storage.?);
+    }
+
+    pub fn getCachedRunIndexIndexWithStorage(self: *Backend, path: []const u8, run_id: u64, read_storage: storage_io.Storage) !usize {
         for (self.run_index_cache.items, 0..) |*cached, i| {
             if (cached.run_id == run_id and std.mem.eql(u8, cached.path, path)) return i;
         }
@@ -7112,7 +7151,7 @@ pub const Backend = struct {
         const loaded = try self.allocator.create(lsm_table_file.TableIndex);
         errdefer self.allocator.destroy(loaded);
         const start_ns = self.readStatsNowNs();
-        const loaded_index = repository_mod.loadRunTableIndexAllocWithStorage(self.storage.?, self.allocator, path);
+        const loaded_index = repository_mod.loadRunTableIndexAllocWithStorage(read_storage, self.allocator, path);
         self.recordTableIndexLoad(self.readStatsElapsedNs(start_ns));
         loaded.* = try loaded_index;
         errdefer loaded.deinit(self.allocator);
@@ -7745,29 +7784,50 @@ pub const Backend = struct {
     // wal.snapshotRetention re-reads the checkpoint index and current segment
     // and fstats every retained segment. Serve read-only/background callers
     // from a short-lived cache, while every in-process mutation updates or
-    // invalidates WalRetentionState. The cache is therefore exact with respect
-    // to this Backend; the TTL only bounds visibility of out-of-process changes.
+    // invalidates WalRetentionState. Loaded logical-generation identities avoid
+    // repeated filesystem admission for an unchanged Native index view. Providers
+    // without such identities retain the TTL for out-of-process changes.
     const wal_retention_cache_ttl_ns: u64 = 250 * std.time.ns_per_ms;
 
     fn cachedWalRetentionLocked(self: *Backend) !wal_mod.RetentionStats {
-        const now_ns = self.writeStatsNowNs();
-        if (self.wal_retention.primary) |cached| {
-            if (now_ns -| self.wal_retention.primary_ns < wal_retention_cache_ttl_ns) return cached;
-        }
-        const fresh = try wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?);
-        self.wal_retention.primary = fresh;
-        self.wal_retention.primary_ns = now_ns;
-        return fresh;
+        return self.cachedWalRetentionForLaneLocked(false);
     }
 
     fn cachedWalReplayRetentionLocked(self: *Backend) !wal_mod.RetentionStats {
+        return self.cachedWalRetentionForLaneLocked(true);
+    }
+
+    fn cachedWalRetentionForLaneLocked(self: *Backend, comptime replay: bool) !wal_mod.RetentionStats {
+        const storage = self.storage.?;
         const now_ns = self.writeStatsNowNs();
-        if (self.wal_retention.replay) |cached| {
-            if (now_ns -| self.wal_retention.replay_ns < wal_retention_cache_ttl_ns) return cached;
+        const revision = storage.loadedWalMetadataRevision(self.root_dir.?);
+        const cached = if (replay) &self.wal_retention.replay else &self.wal_retention.primary;
+        const cached_ns = if (replay) &self.wal_retention.replay_ns else &self.wal_retention.primary_ns;
+        const cached_revision = if (replay) &self.wal_retention.replay_revision else &self.wal_retention.primary_revision;
+        if (cached.*) |value| {
+            if (revision != null) {
+                if (std.meta.eql(revision, cached_revision.*)) return value;
+            } else if (cached_revision.* == null and now_ns -| cached_ns.* < wal_retention_cache_ttl_ns) return value;
         }
-        const fresh = try wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?);
-        self.wal_retention.replay = fresh;
-        self.wal_retention.replay_ns = now_ns;
+        var read_scope = try storage.acquireReadSnapshot();
+        defer if (read_scope) |*scope| scope.deinit();
+        const view = if (read_scope) |scope| scope.view else storage;
+        const fresh = if (replay)
+            try wal_mod.snapshotReplayRetention(view, self.allocator, self.root_dir.?)
+        else
+            try wal_mod.snapshotRetention(view, self.allocator, self.root_dir.?);
+        const after = storage.loadedWalMetadataRevision(self.root_dir.?);
+        // A provider may adopt a new generation during collection. Return the
+        // ordinary pressure estimate, but never certify mixed-generation data
+        // as an indefinitely reusable snapshot.
+        if (std.meta.eql(revision, after)) {
+            cached.* = fresh;
+            cached_ns.* = now_ns;
+            cached_revision.* = after;
+        } else {
+            cached.* = null;
+            cached_revision.* = null;
+        }
         return fresh;
     }
 
@@ -8718,7 +8778,7 @@ pub const Backend = struct {
                 self.obsolete_reclaim_after = null;
                 // Other backend instances may release global file pins without
                 // notifying us. A bounded periodic retry guarantees progress.
-                self.obsolete_reclaim_retry_at_ns = now_ns +| @max(std.time.ns_per_ms, self.options.obsolete_delete_retry_ns);
+                self.obsolete_reclaim_retry_at_ns = self.nowNs() +| @max(std.time.ns_per_ms, self.options.obsolete_delete_retry_ns);
                 return;
             };
             const bookmark = try self.allocator.dupe(u8, obsolete.path);
@@ -9311,6 +9371,20 @@ pub const BackendHandle = struct {
             self.internal_flush_worker = null;
         }
         self.backend.close();
+        self.allocator.destroy(self.backend);
+        if (self.background_runtime) |*runtime| runtime.deinit();
+        self.* = undefined;
+    }
+
+    pub fn closePreservingWal(self: *BackendHandle) void {
+        if (self.internal_flush_worker) |worker| {
+            worker.stopAndJoin(false);
+            self.backend.options.maintenance_waker = null;
+            worker.deinit();
+            self.allocator.destroy(worker);
+            self.internal_flush_worker = null;
+        }
+        self.backend.closePreservingWal();
         self.allocator.destroy(self.backend);
         if (self.background_runtime) |*runtime| runtime.deinit();
         self.* = undefined;
@@ -11793,6 +11867,108 @@ fn implementationTests() type {
             try std.testing.expect(try backend.runMaintenanceStep());
             try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
             try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
+        }
+
+        test "lsm backend wal retention generation caches survive elapsed time and reject changed or mixed views" {
+            const Probe = struct {
+                var original: Storage = undefined;
+                var generation: Storage.ContentRevision = @splat(1);
+                var supported: bool = true;
+                var flip_on_read: bool = false;
+                var reads: usize = 0;
+                fn revision(_: *anyopaque) ?Storage.ContentRevision {
+                    return if (supported) generation else null;
+                }
+                fn size(ptr: *anyopaque, path: []const u8) !u64 {
+                    reads += 1;
+                    if (flip_on_read) {
+                        generation[0] +%= 1;
+                        flip_on_read = false;
+                    }
+                    return original.vtable.file_size(ptr, path);
+                }
+            };
+            var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer memory.deinit();
+            Probe.original = memory.storage();
+            Probe.generation = @splat(1);
+            Probe.supported = true;
+            Probe.flip_on_read = false;
+            Probe.reads = 0;
+            var io = memory.storage();
+            var vtable = io.vtable.*;
+            vtable.loaded_content_revision = Probe.revision;
+            vtable.file_size = Probe.size;
+            io.vtable = &vtable;
+            var backend = try Backend.open(std.testing.allocator, "/wal-generation", .{ .storage = io });
+            defer backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "row", "value");
+                try write.commit();
+            }
+            backend.wal_retention.invalidateAll();
+            _ = try backend.cachedWalRetentionLocked();
+            const first_reads = Probe.reads;
+            try std.testing.expect(first_reads != 0);
+            backend.wal_retention.primary_ns = 0;
+            _ = try backend.cachedWalRetentionLocked();
+            try std.testing.expectEqual(first_reads, Probe.reads);
+            Probe.generation[0] +%= 1;
+            _ = try backend.cachedWalRetentionLocked();
+            try std.testing.expect(Probe.reads > first_reads);
+            _ = try backend.cachedWalReplayRetentionLocked();
+            const replay_reads = Probe.reads;
+            backend.wal_retention.replay_ns = 0;
+            _ = try backend.cachedWalReplayRetentionLocked();
+            try std.testing.expectEqual(replay_reads, Probe.reads);
+            Probe.supported = false;
+            _ = try backend.cachedWalRetentionLocked();
+            const legacy_reads = Probe.reads;
+            backend.wal_retention.primary_ns = 0;
+            _ = try backend.cachedWalRetentionLocked();
+            try std.testing.expect(Probe.reads > legacy_reads);
+            Probe.supported = true;
+            backend.wal_retention.invalidateAll();
+            Probe.flip_on_read = true;
+            _ = try backend.cachedWalRetentionLocked();
+            try std.testing.expect(backend.wal_retention.primary == null);
+            try expectWalRetentionCacheMatchesStorage(&backend);
+        }
+
+        test "lsm obsolete retry starts after slow deletion completes" {
+            const Probe = struct {
+                var original: Storage = undefined;
+                var clock: u64 = std.time.ns_per_s;
+                fn now(_: *anyopaque) u64 {
+                    return clock;
+                }
+                fn delete(ptr: *anyopaque, path: []const u8) !void {
+                    clock += 500 * std.time.ns_per_ms;
+                    return original.vtable.delete_file_absolute(ptr, path);
+                }
+            };
+            const allocator = std.testing.allocator;
+            var memory = storage_io.MemoryStorage.init(allocator);
+            defer memory.deinit();
+            Probe.original = memory.storage();
+            var io = memory.storage();
+            var vtable = io.vtable.*;
+            vtable.now_ns = Probe.now;
+            vtable.delete_file_absolute = Probe.delete;
+            io.vtable = &vtable;
+            var backend = try Backend.open(allocator, "/slow-obsolete", .{ .storage = io, .obsolete_retention_ns = 0 });
+            defer backend.close();
+            try backend.persistManifest();
+            try std.testing.expect(backend.mu.tryLock());
+            defer backend.mu.unlock();
+            const path = "/slow-obsolete/runs/old.tbl";
+            try io.writeFileAbsolute(path, "old");
+            try backend.queueObsoleteFilePath(try allocator.dupe(u8, path));
+            try backend.reconcileObsoletePathsForManifest();
+            try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
+            try std.testing.expect(backend.obsolete_reclaim_retry_at_ns >= Probe.clock + @max(std.time.ns_per_ms, backend.options.obsolete_delete_retry_ns));
         }
 
         test "lsm backend wal retention cache stays coherent across append retire and reset" {
@@ -26605,4 +26781,31 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
     std.debug.print("lite mixed writer: 100 batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
     try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
     metadata.limit = std.math.maxInt(usize);
+}
+
+test "lsm namespace publication refuses storage without atomic participation" {
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try Backend.open(a, "/publication-capability", .{ .storage = storage.storage(), .flush_threshold = 32 * 1024 * 1024 });
+    defer backend.close();
+    var namespaces = try backend.runtimeNamespaceStore(a);
+    defer namespaces.deinit();
+    var transaction = try namespaces.beginWrite();
+    defer transaction.abort();
+    try transaction.put(.{ .name = "meta" }, "activation", "must not commit alone");
+    const Stage = struct {
+        called: bool = false,
+        fn apply(raw: *anyopaque, _: @import("native_publication.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+        }
+    };
+    var stage: Stage = .{};
+    try std.testing.expectError(error.Unsupported, transaction.commitWithPublication(.{ .ptr = &stage, .stage = Stage.apply }));
+    try std.testing.expect(!stage.called);
+    var read = try namespaces.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(.{ .name = "meta" }, "activation"));
+    try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_append_records);
 }

@@ -500,8 +500,7 @@ impl Database {
     /// Resolves an outcome receipt from an `OutcomeUnknown` batch or
     /// autocommit SQL write, on any handle for the same database. Returns
     /// [`Error::Stalled`] while the uncertain commit is not reconciled yet:
-    /// retry on a Lite database; for a directory database, close the issuing
-    /// handle and reopen first.
+    /// close the issuing handle and reopen first.
     pub fn outcome_receipt_status(&self, receipt: &str) -> Result<OutcomeReceiptStatus> {
         self.with_handle(|handle| {
             let mut status: u8 = 0;

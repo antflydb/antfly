@@ -26,78 +26,10 @@ const mem_backend = @import("../../mem_backend.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const platform_time = @import("antfly_platform").time;
 
+pub const replay_fragment = @import("replay_fragment.zig");
+
 const metadata_prefix = "\x00\x00__metadata__:derived_apply:";
 const projection_metadata_prefix = "\x00\x00__metadata__:derived_projection:";
-const partial_cursor_prefix = "\x00\x00__metadata__:derived_partial:";
-
-/// Resume point inside one oversized replay record: the items of `sequence`
-/// before `offset` are already applied and durable in the index. Valid only
-/// for the index configuration it was written under, and only while
-/// `sequence` is the next record to apply; once that sequence completes, the
-/// ordinary applied sequence passes it and the cursor is ignored.
-pub const PartialReplayCursor = struct {
-    sequence: u64,
-    offset: u64,
-    config_hash: u64,
-};
-
-const partial_cursor_value_len = 3 * @sizeOf(u64);
-
-pub fn savePartialReplayCursor(alloc: Allocator, store: anytype, index_name: []const u8, cursor: PartialReplayCursor) !void {
-    var key_buf: [256]u8 = undefined;
-    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ partial_cursor_prefix, index_name });
-    var value: [partial_cursor_value_len]u8 = undefined;
-    std.mem.writeInt(u64, value[0..8], cursor.sequence, .little);
-    std.mem.writeInt(u64, value[8..16], cursor.offset, .little);
-    std.mem.writeInt(u64, value[16..24], cursor.config_hash, .little);
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    try txn.put(key, &value);
-    try txn.commit();
-}
-
-/// Removes an index's resume point. Every reset of its applied progress
-/// (drop, recreate, rebuild, recovery replacement) must also clear it: a
-/// recreated index replaying the same record must not skip items that only
-/// the old index applied.
-pub fn clearPartialReplayCursor(alloc: Allocator, store: anytype, index_name: []const u8) !void {
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    try clearPartialReplayCursorTxn(&txn, index_name);
-    try txn.commit();
-}
-
-fn clearPartialReplayCursorTxn(txn: anytype, index_name: []const u8) !void {
-    var key_buf: [256]u8 = undefined;
-    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ partial_cursor_prefix, index_name });
-    txn.delete(key) catch |err| switch (err) {
-        error.NotFound => {},
-        else => return err,
-    };
-}
-
-pub fn loadPartialReplayCursor(alloc: Allocator, store: anytype, index_name: []const u8) !?PartialReplayCursor {
-    var key_buf: [256]u8 = undefined;
-    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ partial_cursor_prefix, index_name });
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginProbe();
-    defer txn.abort();
-    const raw = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    if (raw.len != partial_cursor_value_len) return error.InvalidDerivedApplyState;
-    return .{
-        .sequence = std.mem.readInt(u64, raw[0..8], .little),
-        .offset = std.mem.readInt(u64, raw[8..16], .little),
-        .config_hash = std.mem.readInt(u64, raw[16..24], .little),
-    };
-}
 const projection_metadata_magic = "AFPRJMD1";
 const projection_metadata_len = 46;
 const checkpoint_file_name = "derived_apply.checkpoint";
@@ -215,6 +147,62 @@ fn encodeProjectionMetadata(checkpoint: ProjectionCheckpoint) [projection_metada
     return raw;
 }
 
+/// Own fixed scalar/rich progress values before admission. Their only late
+/// input is the actual logical sequence selected by the publication owner.
+pub const BoundProjectionProgress = struct {
+    scalar: @import("../../native_publication_value.zig").Builder,
+    rich: @import("../../native_publication_value.zig").Builder,
+    template: ProjectionCheckpoint,
+    bound_sequence: ?u64 = null,
+
+    pub fn deinit(self: *@This()) void {
+        self.scalar.deinit();
+        self.rich.deinit();
+        self.* = undefined;
+    }
+
+    pub fn bind(self: *@This(), sequence: u64) !void {
+        if (sequence < self.template.applied_sequence or sequence == std.math.maxInt(u64)) return error.InvalidDerivedApplyState;
+        if (self.bound_sequence) |previous| {
+            if (sequence != previous) return error.InvalidDerivedApplyState;
+            return;
+        }
+        var checkpoint = self.template;
+        checkpoint.applied_sequence = sequence;
+        var scalar: [8]u8 = undefined;
+        std.mem.writeInt(u64, &scalar, sequence, .little);
+        const rich = encodeProjectionMetadata(checkpoint);
+        try self.scalar.write(0, &scalar);
+        try self.rich.write(0, &rich);
+        try self.scalar.seal();
+        try self.rich.seal();
+        self.bound_sequence = sequence;
+    }
+};
+
+/// `prepared` owns the planned metadata effects. Discard it if this setup
+/// fails; every value remains unsealed until the publisher supplies its cut.
+pub fn bindPreparedProjectionProgress(resources: anytype, index_name: []const u8, prepared: anytype) !BoundProjectionProgress {
+    var scalar_key_buffer: [256]u8 = undefined;
+    var rich_key_buffer: [256]u8 = undefined;
+    const scalar_key = try std.fmt.bufPrint(&scalar_key_buffer, "{s}{s}", .{ metadata_prefix, index_name });
+    const rich_key = try projectionMetadataKey(&rich_key_buffer, index_name);
+    const scalar_bytes = try prepared.postimage(scalar_key);
+    const template = try decodeProjectionMetadata(try prepared.postimage(rich_key));
+    if (scalar_bytes.len != 8 or std.mem.readInt(u64, scalar_bytes[0..8], .little) != template.applied_sequence) return error.InvalidDerivedApplyState;
+    var scalar = try resources.createPublicationValue(8);
+    errdefer scalar.deinit();
+    var rich = try resources.createPublicationValue(projection_metadata_len);
+    errdefer rich.deinit();
+    var scalar_value = scalar.value();
+    defer scalar_value.deinit();
+    var rich_value = rich.value();
+    defer rich_value.deinit();
+    try prepared.bindValue(scalar_key, scalar_value);
+    try prepared.bindValue(rich_key, rich_value);
+    return .{ .scalar = scalar, .rich = rich, .template = template };
+}
+
 fn decodeProjectionMetadata(raw: []const u8) !ProjectionCheckpoint {
     if (raw.len != projection_metadata_len or !std.mem.eql(u8, raw[0..8], projection_metadata_magic) or
         raw[33] > 1 or Crc32.hash(raw[0..42]) != std.mem.readInt(u32, raw[42..46], .little))
@@ -228,7 +216,7 @@ fn decodeProjectionMetadata(raw: []const u8) !ProjectionCheckpoint {
     };
 }
 
-fn loadProjectionMetadataTxn(txn: anytype, index_name: []const u8) !?ProjectionCheckpoint {
+pub fn loadProjectionMetadataTxn(txn: anytype, index_name: []const u8) !?ProjectionCheckpoint {
     // Legacy writers update only the scalar key. A mismatched or missing
     // watermark invalidates the richer record's generation/count proof.
     const sequence = (try loadScalarAppliedSequenceTxn(txn, index_name)) orelse return null;
@@ -253,6 +241,81 @@ fn loadScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8) !?u64 {
     return std.mem.readInt(u64, raw[0..8], .little);
 }
 
+fn fragmentKey(buffer: []u8, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ replay_fragment.prefix, name });
+}
+
+pub const ReplayProgress = struct { applied_sequence: u64, fragment: ?replay_fragment.Position = null };
+
+/// Read coarse and partial progress from one metadata snapshot. A second
+/// independent scalar probe can otherwise turn a current partial witness stale.
+pub fn loadReplayProgress(alloc: Allocator, store: anytype, index_name: []const u8, identity: replay_fragment.Identity) !ReplayProgress {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    var result: ReplayProgress = .{ .applied_sequence = try loadScalarAppliedSequenceTxn(&txn, index_name) orelse 0 };
+    var buffer: [256]u8 = undefined;
+    const raw = txn.get(try fragmentKey(&buffer, index_name)) catch |err| return if (err == error.NotFound) result else err;
+    const checkpoint = try replay_fragment.decode(raw);
+    if (std.meta.eql(checkpoint.identity, identity) and checkpoint.position.sequence > result.applied_sequence)
+        result.fragment = checkpoint.position;
+    return result;
+}
+
+pub fn loadReplayFragment(alloc: Allocator, store: anytype, index_name: []const u8, identity: replay_fragment.Identity) !?replay_fragment.Position {
+    return (try loadReplayProgress(alloc, store, index_name, identity)).fragment;
+}
+
+/// The caller first checkpoints index output, then enters its checked metadata
+/// publication lane. A crash before this transaction replays the last fragment;
+/// a crash after it resumes without advancing the scalar record watermark.
+pub fn saveReplayFragment(alloc: Allocator, store: anytype, index_name: []const u8, identity: replay_fragment.Identity, position: replay_fragment.Position) !void {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    const applied = (try loadScalarAppliedSequenceTxn(&txn, index_name)) orelse 0;
+    if (applied >= position.sequence) {
+        txn.abort();
+        return;
+    }
+    var buffer: [256]u8 = undefined;
+    const key = try fragmentKey(&buffer, index_name);
+    const previous_raw: ?[]const u8 = txn.get(key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (previous_raw) |raw| {
+        const previous = try replay_fragment.decode(raw);
+        if (std.meta.eql(previous.identity, identity) and previous.position.sequence > applied and
+            !(previous.position.sequence < position.sequence and previous.position.next_item == previous.position.total_items and !previous.position.applied))
+        {
+            // A completely scanned no-op record carries no output/seal debt.
+            // Its successor may replace that scan witness without inventing
+            // an applied scalar watermark for the no-op.
+            if (previous.position.sequence != position.sequence or previous.position.total_items != position.total_items or
+                !std.mem.eql(u8, &previous.position.fingerprint, &position.fingerprint)) return error.InvalidDerivedApplyState;
+            if (previous.position.next_item > position.next_item) {
+                txn.abort();
+                return;
+            }
+            if (previous.position.applied and !position.applied) return error.InvalidDerivedApplyState;
+        }
+    }
+    const encoded = replay_fragment.encode(.{ .identity = identity, .position = position });
+    try txn.put(key, &encoded);
+    try txn.commit();
+}
+
+fn clearReplayFragmentTxn(txn: anytype, index_name: []const u8) !void {
+    var buffer: [256]u8 = undefined;
+    txn.delete(try fragmentKey(&buffer, index_name)) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+
 fn loadProjectionMetadata(alloc: Allocator, store: anytype, index_name: []const u8) !ProjectionCheckpoint {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
@@ -272,35 +335,45 @@ fn saveProjectionMetadataTxn(txn: anytype, name: []const u8, checkpoint: Project
 
 const MetadataUpdateMode = enum { replace, set, advance };
 
-fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []const AppliedSequenceUpdate, mode: MetadataUpdateMode) !void {
+fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []const AppliedSequenceUpdate, comptime mode: MetadataUpdateMode) !void {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+    try saveProjectionMetadataUpdatesTxn(&txn, updates, mode);
+    try txn.commit();
+}
+
+/// Advance authoritative progress inside a caller-owned metadata publication.
+/// The caller commits or aborts all accompanying status/evidence mutations.
+pub fn advanceProjectionMetadataTxn(txn: anytype, updates: []const AppliedSequenceUpdate) !void {
+    try saveProjectionMetadataUpdatesTxn(txn, updates, .advance);
+}
+
+fn saveProjectionMetadataUpdatesTxn(txn: anytype, updates: []const AppliedSequenceUpdate, comptime mode: MetadataUpdateMode) !void {
     for (updates) |update| {
         // Replacement is an explicit recovery boundary. Neither malformed
         // metadata record may prevent an authoritative replacement/reset.
-        const previous = if (mode == .replace) null else try loadProjectionMetadataTxn(&txn, update.index_name);
+        const previous = if (mode == .replace) null else try loadProjectionMetadataTxn(txn, update.index_name);
         var checkpoint = previous orelse ProjectionCheckpoint{
-            .applied_sequence = if (mode == .replace) 0 else (try loadScalarAppliedSequenceTxn(&txn, update.index_name)) orelse 0,
+            .applied_sequence = if (mode == .replace) 0 else (try loadScalarAppliedSequenceTxn(txn, update.index_name)) orelse 0,
         };
         if (mode == .replace) {
+            try clearReplayFragmentTxn(txn, update.index_name);
             checkpoint = update.checkpoint();
         } else {
             const previous_sequence = checkpoint.applied_sequence;
             checkpoint.applied_sequence = if (mode == .advance) @max(previous_sequence, update.sequence) else update.sequence;
             mergeSequenceMetadata(&checkpoint, update, previous_sequence, mode == .set);
         }
-        if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact_projection_epoch.zig").revoke(&txn);
-        if (mode == .replace) try clearPartialReplayCursorTxn(&txn, update.index_name);
+        if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact_projection_epoch.zig").revoke(txn);
         if (mode == .replace) {
-            try putScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
+            try putScalarAppliedSequenceTxn(txn, update.index_name, checkpoint.applied_sequence);
         } else {
-            try saveScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
+            try saveScalarAppliedSequenceTxn(txn, update.index_name, checkpoint.applied_sequence);
         }
-        try saveProjectionMetadataTxn(&txn, update.index_name, checkpoint);
+        try saveProjectionMetadataTxn(txn, update.index_name, checkpoint);
     }
-    try txn.commit();
 }
 
 /// A coherent receiver-local projection checkpoint cut. The file lock remains
@@ -691,8 +764,6 @@ pub fn clearAppliedSequenceWithCheckpointWithStorage(
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try clearAppliedSequence(store, index_name);
     if (checkpoint_path) |path| {
         try clearAppliedSequenceCheckpointWithStorage(storage, alloc, io, path, store, index_name);
-        // The sidecar holds applied progress; the resume point is in the store.
-        try clearPartialReplayCursor(alloc, store, index_name);
         return;
     }
     try clearAppliedSequence(store, index_name);
@@ -708,7 +779,7 @@ pub fn clearAppliedSequenceTxn(txn: anytype, index_name: []const u8) !void {
         else => return err,
     };
     try clearProjectionMetadataTxn(mutable_txn, index_name);
-    try clearPartialReplayCursorTxn(mutable_txn, index_name);
+    try clearReplayFragmentTxn(mutable_txn, index_name);
 }
 
 fn clearProjectionMetadataTxn(txn: anytype, index_name: []const u8) !void {
@@ -1528,6 +1599,55 @@ test "projection metadata rejects corrupt recovery identities (#1207)" {
     try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(&encoded));
 }
 
+test "derived replay fragments advance past complete no-op records without skipping unfinished output" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "fragments" });
+    defer runtime.deinit();
+    const identity: replay_fragment.Identity = .{ .generation = 7, .config_hash = 8, .incarnation = 9 };
+    const empty: replay_fragment.Position = .{ .sequence = 1, .next_item = 64, .total_items = 64, .fingerprint = @splat(1) };
+    try saveReplayFragment(a, runtime, "index", identity, empty);
+    const next: replay_fragment.Position = .{ .sequence = 2, .next_item = 8, .total_items = 64, .fingerprint = @splat(2), .applied = true };
+    try saveReplayFragment(a, runtime, "index", identity, next);
+    try std.testing.expectEqualDeep(next, (try loadReplayFragment(a, runtime, "index", identity)).?);
+    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(a, runtime, "index"));
+    var skipped = next;
+    skipped.sequence = 3;
+    try std.testing.expectError(error.InvalidDerivedApplyState, saveReplayFragment(a, runtime, "index", identity, skipped));
+}
+
+test "derived replay fragment checkpoints fence identities preserve monotonic progress and clear on reset" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "fragments" });
+    defer runtime.deinit();
+    const identity: replay_fragment.Identity = .{ .generation = 7, .config_hash = 8, .incarnation = 9 };
+    var position: replay_fragment.Position = .{ .sequence = 42, .next_item = 2, .total_items = 6, .fingerprint = @splat(1), .applied = true };
+    try saveReplayFragment(a, runtime, "index", identity, position);
+    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(a, runtime, "index"));
+    try std.testing.expectEqualDeep(position, (try loadReplayFragment(a, runtime, "index", identity)).?);
+    for ([_]replay_fragment.Identity{
+        .{ .generation = 77, .config_hash = 8, .incarnation = 9 },
+        .{ .generation = 7, .config_hash = 88, .incarnation = 9 },
+        .{ .generation = 7, .config_hash = 8, .incarnation = 99 },
+    }) |changed| try std.testing.expect((try loadReplayFragment(a, runtime, "index", changed)) == null);
+    position.next_item = 4;
+    try saveReplayFragment(a, runtime, "index", identity, position);
+    var stale = position;
+    stale.next_item = 2;
+    try saveReplayFragment(a, runtime, "index", identity, stale);
+    try std.testing.expectEqualDeep(position, (try loadReplayFragment(a, runtime, "index", identity)).?);
+    stale = position;
+    stale.fingerprint[0] ^= 1;
+    try std.testing.expectError(error.InvalidDerivedApplyState, saveReplayFragment(a, runtime, "index", identity, stale));
+    try saveAppliedSequence(runtime, "index", 42);
+    try std.testing.expect((try loadReplayFragment(a, runtime, "index", identity)) == null);
+    try clearAppliedSequence(runtime, "index");
+    try std.testing.expect((try loadReplayFragment(a, runtime, "index", identity)) == null);
+}
+
 test "derived apply state works with memory backend store" {
     var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
@@ -1550,32 +1670,6 @@ test "derived apply state works with lsm backend store" {
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
     try saveAppliedSequence(runtime, "idx", 31);
     try std.testing.expectEqual(@as(u64, 31), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
-}
-
-test "partial replay cursor round-trips per index and is independent of applied progress" {
-    var backend = lsm_backend.Backend.init(std.testing.allocator, .{ .flush_threshold = 2 });
-    defer backend.close();
-    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
-    defer runtime.deinit();
-
-    try std.testing.expectEqual(@as(?PartialReplayCursor, null), try loadPartialReplayCursor(std.testing.allocator, runtime, "text"));
-    try savePartialReplayCursor(std.testing.allocator, runtime, "text", .{ .sequence = 9, .offset = 128, .config_hash = 77 });
-    try savePartialReplayCursor(std.testing.allocator, runtime, "other", .{ .sequence = 3, .offset = 1, .config_hash = 5 });
-    try std.testing.expectEqual(PartialReplayCursor{ .sequence = 9, .offset = 128, .config_hash = 77 }, (try loadPartialReplayCursor(std.testing.allocator, runtime, "text")).?);
-    // Overwritten in place as the record advances.
-    try savePartialReplayCursor(std.testing.allocator, runtime, "text", .{ .sequence = 9, .offset = 256, .config_hash = 77 });
-    try std.testing.expectEqual(@as(u64, 256), (try loadPartialReplayCursor(std.testing.allocator, runtime, "text")).?.offset);
-    // Applied progress is a separate record.
-    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "text"));
-    try std.testing.expectEqual(@as(u64, 3), (try loadPartialReplayCursor(std.testing.allocator, runtime, "other")).?.sequence);
-    // Resetting an index's applied progress (drop, recreate, rebuild) clears
-    // its resume point, and only its own.
-    try saveAppliedSequence(runtime, "text", 8);
-    try clearAppliedSequence(runtime, "text");
-    try std.testing.expectEqual(@as(?PartialReplayCursor, null), try loadPartialReplayCursor(std.testing.allocator, runtime, "text"));
-    try std.testing.expect(try loadPartialReplayCursor(std.testing.allocator, runtime, "other") != null);
-    try clearPartialReplayCursor(std.testing.allocator, runtime, "other");
-    try std.testing.expectEqual(@as(?PartialReplayCursor, null), try loadPartialReplayCursor(std.testing.allocator, runtime, "other"));
 }
 
 test "derived apply state lsm point load does not clone mutable snapshot" {

@@ -1,0 +1,78 @@
+{
+  "scope": "Correctness gates and local causal diagnostics; optimized end-to-end performance qualification remains pending.",
+  "final_Debug_library_sha256": "cb124b9f6d3e09c3e7e0f206f86d179a9fe3c92e6155efdb5eb05134aabbeb28",
+  "validation": {
+    "default_C_API": {
+      "passed": 401,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0,
+      "unexpected_logged_errors": 0
+    },
+    "native_storage": {
+      "passed": 843,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "backup": {
+      "passed": 2,
+      "failed": 0
+    },
+    "generic_storage": {
+      "passed": 12,
+      "failed": 0
+    },
+    "SDK_SQL_catalog_outcomes_concurrency_crash": {
+      "passed": 209,
+      "failed": 0,
+      "note": "208 passed in the sandbox; the loopback embedder test was denied socket binding there and passed separately with loopback access."
+    },
+    "benchmark_reporting": {
+      "passed": 13,
+      "failed": 0
+    },
+    "ABI_exports": 138
+  },
+  "root_cause": {
+    "old_optimized_45_idle_namespaces": {
+      "active_seconds": 45,
+      "successful_batches": 875,
+      "replay_stalled_at_sequence": 255,
+      "active_segments": 231,
+      "producer_segment_limit": 64,
+      "live_visibility_passed": false,
+      "acknowledged_writes_integrity_and_reopen_passed": true
+    },
+    "mechanism": "Owned foreground publication bypassed the replay segment budget. Cooperative capacity refusal was reported as source cancellation, which skipped the merge service needed to restore headroom and repeatedly discarded source runtimes."
+  },
+  "fixes": [
+    "Check the existing per-index segment limit before foreground preparation and the actual replacement inventory under final publication admission.",
+    "Use a distinct recoverable producer-capacity yield. Preserve valid immutable source state, keep the source target pending, and run merge/artifact service even when replay cannot admit another publication.",
+    "Do not require a stale allocator proof before immutable indexed source preparation; actual publication still authenticates the admitted current allocator.",
+    "Capture text capacity and index progress through one benchmark stats call to avoid adding observer admission."
+  ],
+  "deterministic_regressions": [
+    "A full index with no pending merge starts and publishes a merge, then resumes replay without a source failure.",
+    "Foreground publication respects a two-segment limit while all primary writes commit.",
+    "Moving primary state and an invalidated allocator capability do not prevent preparation from a retained immutable source; final integrity passes. The old behavior failed this test."
+  ],
+  "Debug_45_idle_namespaces_diagnostic": {
+    "active_seconds": 120,
+    "successful_batches": 482,
+    "acknowledged_documents": 61696,
+    "live_visibility_passed": true,
+    "overdue_visibility_observations": 0,
+    "replay_index_publications": 198,
+    "applied_merge_jobs": 183,
+    "max_sampled_active_segments": 18,
+    "integrity_search_acknowledgment_drain_and_reopen_passed": true,
+    "note": "Intermediate Debug diagnostic with compiler overlap; finalization additionally classifies the typed yield and handles projector yields. No elapsed-time speedup or optimized performance claim."
+  },
+  "remaining": [
+    "Full corrected-candidate optimized importer, contention, visibility, matched-cost and sustained-storage qualification on wolfspider.",
+    "Externally owned aggregate CI and full factory."
+  ],
+  "database_archives_created": false,
+  "reference_builds_or_executions": false
+}

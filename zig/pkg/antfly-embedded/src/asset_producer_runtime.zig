@@ -9251,6 +9251,96 @@ test "index document checkpoint producer extracts explicit documents and replays
     try std.testing.expectEqual(@as(usize, 1), local.calls);
 }
 
+test "index document checkpoint producer resumes after repeated owner cancellation without phantom output spend" {
+    const checkpoint = @import("storage/db/enrichment/document_checkpoints.zig");
+    const runs = readers.document_runs;
+    const a = std.testing.allocator;
+    var backend = checkpoint.TestBackend.init(a);
+    defer backend.deinit();
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var canceled = std.atomic.Value(bool).init(false);
+    var owner = checkpoint.Owner{ .allocator = a, .backend = backend.backend(), .binding = .{ .document = "small", .producer = "extract", .source_key = "small", .source_digest = @splat(1), .producer_digest = @splat(2) }, .io = io, .cancellation = .fromAtomic(&canceled) };
+    defer owner.drain();
+    const Local = struct {
+        calls: usize = 0,
+        canceled: *std.atomic.Value(bool),
+        const result = "{\"object\":\"extraction\",\"model\":\"agent\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]}]}";
+        fn dense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.UnsupportedOperation;
+        }
+        fn sparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]managed_embedder.SparseEmbedding {
+            return error.UnsupportedOperation;
+        }
+        fn now(_: ?*anyopaque) u64 {
+            return checkpoint.now();
+        }
+        fn leaf(self: *@This(), _: Allocator) !runs.Session.Output {
+            if (self.calls <= 3) {
+                // Closing the owner prevents even failure cleanup from writing.
+                // The successor must recover from the persisted intent alone.
+                self.canceled.store(true, .release);
+                return error.Canceled;
+            }
+            return .{ .bytes = result, .actual = .{ .calls = 1, .tokens = 173, .output_bytes = result.len } };
+        }
+        fn invoke(raw: *anyopaque, alloc: Allocator, _: []const u8, is_extract: bool, context: RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(is_extract);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const work = arena.allocator();
+            var client = try readers.document_rpc.Client.initBound(alloc, context.document_store, context.io);
+            defer client.deinit();
+            const store = client.store();
+            const record = try store.load(work, client.id, client.owner);
+            const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+            if (!record.prepared) try store.prepare(work, lease, record.identity, record.limits, record.inputs, checkpoint.now());
+            var session = try runs.Session.init(alloc, store, lease, record.identity, .{ .now_fn = now }, 512, 32 * 1024 * 1024);
+            defer session.deinit();
+            const output = try session.execute(work, session.key("model"), .{ .calls = 1, .tokens = 131072, .output_bytes = 64 * 1024 * 1024 }, 64 * 1024 * 1024, self, leaf);
+            try store.finish(work, lease, try session.reference(work, session.key("model")), checkpoint.now());
+            return alloc.dupe(u8, output.bytes);
+        }
+    };
+    var local: Local = .{ .canceled = &canceled };
+    var client = httpx.Client.initWithConfig(a, io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &local, .owns_invocation_admission = true, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse, .document_json = Local.invoke } });
+    defer runtime.deinit();
+    const producer = runtime.producer().withInvocationContext(.{ .io = io, .document_checkpoints = owner.factory() });
+    const request: asset_producer.Request = .{ .producer_type = .extractor, .config_json = "{\"provider\":\"antfly\",\"model\":\"agent\",\"schema\":{\"entities\":[\"person\"]}}", .source_text = "Ada", .content_type = "application/json" };
+    for (0..3) |_| {
+        canceled.store(false, .release);
+        try std.testing.expectError(error.Canceled, producer.produce(a, request));
+        try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    }
+    canceled.store(false, .release);
+    const completed = try producer.produce(a, request);
+    defer a.free(completed);
+    const replay = try producer.produce(a, request);
+    defer a.free(replay);
+    try std.testing.expectEqualStrings(completed, replay);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\"Ada\"") != null);
+    try std.testing.expectEqual(@as(usize, 4), local.calls);
+    var entries = backend.values.iterator();
+    var roots: usize = 0;
+    while (entries.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, checkpoint.root_prefix)) {
+        var parsed = try std.json.parseFromSlice(checkpoint.Root, a, entry.value_ptr.*, .{});
+        defer parsed.deinit();
+        const record = parsed.value.run;
+        try std.testing.expect(record.state == .succeeded);
+        try std.testing.expectEqual(@as(u64, 3), record.uncertain.calls);
+        try std.testing.expectEqual(@as(u64, 3 * 131072), record.uncertain.tokens);
+        try std.testing.expectEqual(@as(u64, 0), record.uncertain.output_bytes);
+        try std.testing.expect(record.used.output_bytes < 1024 * 1024);
+        roots += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), roots);
+}
+
 test "index document checkpoint producer uses duplex remote execution with table routing and persisted final replay" {
     const checkpoint = @import("storage/db/enrichment/document_checkpoints.zig");
     const protocol = readers.document_stream;

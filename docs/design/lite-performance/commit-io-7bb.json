@@ -1,0 +1,267 @@
+{
+  "native_source_commit": "7bb05eb2b1f92ce2d447eae39082c768e1161fad",
+  "scope": "Local synthetic operation counts; no performance timing claim. Counts include file I/O in the private fixture directory. reset_thread identifies execution thread, not semantic request ownership.",
+  "source_hashes": {
+    "io_commit_trace.c": "b2593c5095b30da224b299a4a92fa8d6a9d54c0cdec0c905e36aea448f7c4188",
+    "count_commit_io.py": "d3ddb70652a547877c7989d80937bcbb3b208a2173f9144bd75f343f5aaedaf2"
+  },
+  "shim_sha256": "5922fac595545f87d8a41b99b5f9da5878a9ca5b53ba88214b6bfa1db8c93406",
+  "native_library_sha256": "5ef9007c2326a474e377c7a7c05e8af1dafba2c5104ea29023427a98d8d96dfe",
+  "results": {
+    "antfly-primary.json": "59202f0ebcfac7ab1e7c166dd032c02b2c7c18e117c47bcd2eb51ad8a9540808",
+    "antfly-indexed.json": "af95ff9763bf217a9cab3e1bd7159a598c3acbedd6768820ccd78f16f675e9fc",
+    "sqlite-primary.json": "58493ddbbef95a71d719cf2219d26a5499ea87a2d198b957fa855f4ec3b4cd6f",
+    "sqlite-indexed.json": "eef73519430b3f2166afb7e05ba76c214a74c0ef4904eb5090a9130a487ce794"
+  },
+  "cases": [
+    {
+      "engine": "antfly",
+      "indexed": false,
+      "writes": 128,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 384,
+            "write_calls": 1515,
+            "write_bytes": 5581952,
+            "read_calls": 5186,
+            "read_bytes": 21241856,
+            "fsync_ns": 1951251000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 277,
+            "write_bytes": 17728,
+            "read_calls": 789,
+            "read_bytes": 25248,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 276,
+            "write_calls": 746,
+            "write_bytes": 2055036,
+            "read_calls": 3181,
+            "read_bytes": 13029376,
+            "fsync_ns": 416545000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 112,
+            "write_bytes": 7168,
+            "read_calls": 485,
+            "read_bytes": 14032,
+            "fsync_ns": 0
+          }
+        }
+      }
+    },
+    {
+      "engine": "antfly",
+      "indexed": true,
+      "writes": 128,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 4656,
+            "write_calls": 15615,
+            "write_bytes": 47480208,
+            "read_calls": 8981,
+            "read_bytes": 38391808,
+            "fsync_ns": 8994832000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 1409,
+            "write_bytes": 90176,
+            "read_calls": 4943,
+            "read_bytes": 206528,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 368,
+            "write_calls": 886,
+            "write_bytes": 2618245,
+            "read_calls": 8737,
+            "read_bytes": 36990976,
+            "fsync_ns": 116283000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 96,
+            "write_bytes": 156691,
+            "read_calls": 509,
+            "read_bytes": 397465,
+            "fsync_ns": 0
+          }
+        }
+      }
+    },
+    {
+      "engine": "sqlite",
+      "indexed": false,
+      "writes": 128,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 45,
+            "read_bytes": 184320,
+            "fsync_ns": 0
+          },
+          "wal": {
+            "fsync_calls": 129,
+            "write_calls": 257,
+            "write_bytes": 527392,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 5912000
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          }
+        }
+      }
+    },
+    {
+      "engine": "sqlite",
+      "indexed": true,
+      "writes": 128,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 53,
+            "read_bytes": 217088,
+            "fsync_ns": 0
+          },
+          "wal": {
+            "fsync_calls": 129,
+            "write_calls": 1683,
+            "write_bytes": 3464952,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 114305000
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          }
+        }
+      }
+    }
+  ],
+  "calling_thread_syncs_by_indexed_stage": {
+    "primary_commit": 384,
+    "artifact_staging": 384,
+    "artifact_linking": 384,
+    "durable_artifact_pin": 384,
+    "index_wal": 384,
+    "projection_progress": 384,
+    "status_snapshot": 384,
+    "physical_replay_retirement": 1920,
+    "retired_artifact_cleanup": 48
+  },
+  "stack_attribution_writes": 128,
+  "stack_attribution_lost_or_truncated_samples": 0
+}

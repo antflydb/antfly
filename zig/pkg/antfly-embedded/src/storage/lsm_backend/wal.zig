@@ -69,6 +69,7 @@ fn scratchAllocator(allocator: Allocator) Allocator {
 pub const ReplayEntry = backend_types.ReplayEntry;
 
 pub const AppendOptions = struct {
+    publication: ?@import("../native_publication.zig").Participant = null,
     segment_bytes: u64 = default_wal_segment_bytes,
     /// Set when a failed append may have left bytes that could not be cut
     /// back; the caller must repair (`repairSegmentTail`) before appending.
@@ -282,8 +283,16 @@ pub fn appendStateWithOptionsResult(
         segment_path_owned = true;
     }
     const segment_became_nonempty = current_size == 0;
-    appendRecordOnce(storage, allocator, wal_dir, segment_path, record, sync, segment_became_nonempty) catch |err| {
+    appendRecordOnce(storage, allocator, wal_dir, segment_path, record, sync, segment_became_nonempty, options.publication) catch |err| {
         if (comptime @import("builtin").is_test) if (err == error.TestCrashAfterPartialAppend) return err;
+        if (options.publication != null) {
+            // Only the native owner can reconcile a possibly committed root.
+            // Do not inspect/repair through a runtime fenced by uncertainty.
+            if (err != error.OutcomeUnknown and err != error.OutcomeReconciliationRequired) {
+                if (options.proven_unwritten) |out| out.* = true;
+            }
+            return err;
+        }
         // The original error is always returned: callers act on its cause
         // (for example cancellation). Only the tail is handled here.
         const size: ?u64 = storage.fileSize(segment_path) catch |size_err| switch (size_err) {
@@ -322,7 +331,11 @@ pub var test_append_fault: if (@import("builtin").is_test) ?TestAppendFault else
 /// Test hook: fail this many upcoming tail repairs.
 pub var test_fail_repairs: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {};
 
-fn appendRecordOnce(storage: storage_io.Storage, allocator: Allocator, wal_dir: []const u8, segment_path: []const u8, record: []const u8, sync: bool, segment_became_nonempty: bool) !void {
+fn appendRecordOnce(storage: storage_io.Storage, allocator: Allocator, wal_dir: []const u8, segment_path: []const u8, record: []const u8, sync: bool, segment_became_nonempty: bool, publication: ?@import("../native_publication.zig").Participant) !void {
+    if (publication) |participant| {
+        try storage.appendPublication(segment_path, record, sync, participant);
+        return;
+    }
     if (comptime @import("builtin").is_test) if (test_append_fault) |fault| {
         test_append_fault = null;
         test_fail_repairs = fault.fail_repairs;
@@ -358,11 +371,15 @@ pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_
     const temp_allocator = allocator;
     const segment_path = try segmentPathAlloc(temp_allocator, root_dir, current.segment);
     defer temp_allocator.free(segment_path);
-    try storage.appendFileAbsolute(allocator, segment_path, "", true);
+    const native_barrier = storage.requiresForegroundPublication() and storage.vtable.sync_contents_absolute != null;
+    // Native catalog writes are already checkpointed. An empty append would
+    // publish a new index generation just to fsync unchanged bytes, invalidating
+    // detached inputs and rebuilding metadata caches. Use the actual barrier.
+    if (native_barrier) try storage.syncFileContentsAbsolute(segment_path) else try storage.appendFileAbsolute(allocator, segment_path, "", true);
 
     const index_path = try indexPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(index_path);
-    try storage.appendFileAbsolute(allocator, index_path, "", true);
+    if (native_barrier) try storage.syncFileContentsAbsolute(index_path) else try storage.appendFileAbsolute(allocator, index_path, "", true);
     return .{ .segment_syncs = 1, .index_syncs = 1 };
 }
 

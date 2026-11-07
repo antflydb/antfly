@@ -21,11 +21,15 @@ const std = @import("std");
 const native = @import("native.zig");
 const docs = @import("docstore.zig");
 const Source = @import("../../segment_source.zig").Source;
+const DecodedCache = @import("../../segment_source.zig").ImmutableDecodeCache;
 const limits = @import("antfly_runtime_fs").threaded_io_limits;
 const Allocator = std.mem.Allocator;
+const platform_sync = @import("antfly_platform").sync;
 
 const key_prefix = native.NativeFile.artifact_lease_key_prefix;
 const marker_prefix = ".aflite-lease-";
+const source_cache_bytes = 160 * 1024;
+const decoded_cache_bytes = 1024 * 1024;
 
 const ArtifactIdentity = struct {
     path: []const u8,
@@ -37,7 +41,6 @@ const ArtifactIdentity = struct {
     pub fn hash(_: @This(), key: ArtifactIdentity) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(key.path);
-        h.update(key.key);
         h.update(std.mem.asBytes(&key.inode));
         h.update(std.mem.asBytes(&key.root));
         h.update(std.mem.asBytes(&key.length));
@@ -45,12 +48,14 @@ const ArtifactIdentity = struct {
         return h.final();
     }
     pub fn eql(_: @This(), a: ArtifactIdentity, b: ArtifactIdentity) bool {
-        return a.inode == b.inode and a.root == b.root and a.length == b.length and std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.key, b.key) and std.mem.eql(u8, a.inline_bytes, b.inline_bytes);
+        return a.inode == b.inode and a.root == b.root and a.length == b.length and std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.inline_bytes, b.inline_bytes);
     }
 };
 
-// Weak entries: only open Sources own references. An existing durable alias
-// keeps its immutable value alive, making root identity safe against page ABA.
+// Weak entries: only open Sources own references. The source's exact durable
+// extent lease prevents root/page ABA, including before a numerical alias is
+// chosen. Logical aliases may share the same immutable value. A hit requires
+// the current alias's actual inode/root/length/inline bytes, never just its name.
 // Never share inode-fenced readers: that would extend a coarse reuse fence.
 var source_pool_mutex: std.atomic.Mutex = .unlocked;
 var source_pool: std.HashMapUnmanaged(ArtifactIdentity, *State, ArtifactIdentity, 80) = .empty;
@@ -85,10 +90,339 @@ fn retainPooled(identity: ArtifactIdentity) ?*State {
     return state;
 }
 
+// Weak, allocation-free and bounded independently of the number of live
+// artifacts. Full bytes are compared after the digest; native page addresses
+// cannot authorize resident reuse because they may be recycled without leases.
+var resident_pool_mutex: std.atomic.Mutex = .unlocked;
+var resident_pool: [128]?*OwnedBytes = @splat(null);
+
+fn findResident(candidate: *OwnedBytes) ?Source {
+    platform_sync.lockYielding(&resident_pool_mutex);
+    defer resident_pool_mutex.unlock();
+    for (resident_pool) |slot| if (slot) |existing| {
+        if (existing == candidate or existing.data.len != candidate.data.len or
+            !std.mem.eql(u8, &existing.identity, &candidate.identity) or
+            !std.mem.eql(u8, existing.registry.path, candidate.registry.path) or
+            !std.mem.eql(u8, existing.data, candidate.data)) continue;
+        _ = existing.references.fetchAdd(1, .monotonic);
+        return existing.rawSource();
+    };
+    return null;
+}
+
+/// A file owner may retain immutable artifact Sources across runtime teardown.
+/// Entries hold neither a DB nor a primary snapshot. Exact pooled identities
+/// remain protected by their durable artifact leases for the retained lifetime.
+/// All methods are serialized by the file owner's admission gate.
+pub const WorkingSet = struct {
+    const max_entries = 128;
+    const max_bytes = 128 * 1024 * 1024;
+    pub const max_range_bytes = 128 * 1024 * 1024;
+    const lifetime_ns = 5 * std.time.ns_per_s;
+    const Entry = union(enum) { native: *State, resident: *OwnedBytes };
+    entries: [max_entries]?Entry = @splat(null),
+    count: usize = 0,
+    inode: ?u64 = null,
+    bytes: u64 = 0,
+    range_bytes: u64 = 0,
+    expires_ns: u64 = 0,
+
+    pub fn clear(self: *WorkingSet) void {
+        // Release outside both pool and registry mutexes: final release may
+        // retire its marker and resource-accounting owner.
+        for (self.entries[0..self.count]) |entry| switch (entry.?) {
+            .native => |state| {
+                State.releaseUse(state);
+                State.close(state);
+            },
+            .resident => |bytes| bytes.deinit(),
+        };
+        self.* = .{};
+    }
+
+    pub fn observe(self: *WorkingSet, inode: u64, now_ns: u64) void {
+        if ((self.inode != null and self.inode.? != inode) or now_ns >= self.expires_ns)
+            self.clear();
+    }
+
+    pub fn capture(self: *WorkingSet, registry: *Registry, inode: u64, generation_bytes: u64, now_ns: u64) void {
+        self.observe(inode, now_ns);
+        if (self.count == max_entries) return;
+        {
+            // Source references are protected by the pool mutex. Registry owns
+            // list membership; each state's lifetime mutex protects active uses.
+            @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+            defer source_pool_mutex.unlock();
+            const io = registry.io();
+            registry.mutex.lockUncancelable(io);
+            defer registry.mutex.unlock(io);
+            var next = registry.first;
+            var visited: usize = 0;
+            while (next) |state| {
+                next = state.next;
+                visited += 1;
+                if (visited > max_entries or self.count == max_entries) break;
+                self.captureState(state, inode, generation_bytes, now_ns);
+            }
+            // A pooled hit can belong to a detached prior registry. Remember only
+            // bounded copied identities here, never raw State pointers or strong
+            // Registry references. Resolve them while holding the pool mutex.
+            for (registry.borrowed[0..registry.borrowed_count]) |identity| {
+                if (self.count == max_entries) break;
+                if (source_pool.getContext(identity, identity)) |state|
+                    self.captureState(state, inode, generation_bytes, now_ns);
+            }
+        }
+        platform_sync.lockYielding(&resident_pool_mutex);
+        defer resident_pool_mutex.unlock();
+        for (resident_pool) |slot| {
+            if (self.count == max_entries) break;
+            const bytes = slot orelse continue;
+            if (bytes.registry.inode != inode or !std.mem.eql(u8, bytes.registry.path, registry.path)) continue;
+            var duplicate = false;
+            for (self.entries[0..self.count]) |entry| if (entry.? == .resident and entry.?.resident == bytes) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            const charge = bytes.rawSource().ranges.retention_overhead_bytes;
+            if (charge > max_bytes -| self.bytes) continue;
+            _ = bytes.references.fetchAdd(1, .monotonic);
+            self.entries[self.count] = .{ .resident = bytes };
+            self.count += 1;
+            self.bytes += charge;
+            self.inode = inode;
+            // Resident data pins no file pages, so it adds no range charge.
+            if (self.expires_ns == 0) self.expires_ns = now_ns +| lifetime_ns;
+        }
+    }
+
+    // Caller holds pool and registry mutexes, in that order.
+    fn captureState(self: *WorkingSet, state: *State, inode: u64, generation_bytes: u64, now_ns: u64) void {
+        const identity = state.pool_identity orelse return;
+        if (identity.inode != inode) return;
+        var duplicate = false;
+        for (self.entries[0..self.count]) |entry| if (entry.? == .native and entry.?.native == state) {
+            duplicate = true;
+            break;
+        };
+        if (duplicate) return;
+        @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
+        defer state.lifetime_mutex.unlock();
+        if (state.marker == null or state.resources_closed.load(.monotonic)) return;
+        const overhead = state.source().ranges.retention_overhead_bytes;
+        // File ranges and resident memory have independent bounds.
+        // The overhead reserves both source and decoded cache capacity.
+        const charge = overhead;
+        if (charge > max_bytes -| self.bytes or state.value.length > @min(generation_bytes, max_range_bytes) -| self.range_bytes) return;
+        state.source_references += 1;
+        state.active_uses += 1;
+        self.entries[self.count] = .{ .native = state };
+        self.count += 1;
+        self.bytes += charge;
+        self.range_bytes += state.value.length;
+        self.inode = inode;
+        // Existing entries do not extend their deadline on every poll.
+        if (self.expires_ns == 0) self.expires_ns = now_ns +| lifetime_ns;
+    }
+};
+
+/// Fully owned small immutable data needs no durable page lease. Its resource
+/// owner and decoder leases outlive Store/runtime teardown independently.
+pub const OwnedBytes = struct {
+    const source_mod = @import("../../segment_source.zig");
+    const resources = @import("../resource_manager.zig");
+    const DecodeCache = source_mod.ImmutableDecodeCache;
+    const decode_limit = 1024 * 1024;
+    pub const maximum_length = 256 * 1024;
+    sealed: bool = false,
+    pool_slot: ?usize = null,
+    alloc: Allocator,
+    data: []u8,
+    registry: *Registry,
+    identity: [32]u8,
+    resource_manager: ?*resources.ResourceManager,
+    residency: ?resources.Reservation,
+    references: std.atomic.Value(usize) = .init(1),
+    cache_mutex: std.atomic.Mutex = .unlocked,
+    decoded_cache: ?*DecodeCache = null,
+    decoded_users: usize = 0,
+
+    pub fn allocate(registry: *Registry, manager: ?*resources.ResourceManager, length: usize) !*@This() {
+        return allocateWithPolicy(registry, manager, length, false);
+    }
+
+    fn allocateWithPolicy(registry: *Registry, manager: ?*resources.ResourceManager, length: usize, comptime allow_reclaim: bool) !*@This() {
+        if (length > maximum_length) return error.ArtifactTooLargeForResidency;
+        const a = registry.allocator;
+        var credit: ?resources.Reservation = if (manager) |owner|
+            if (allow_reclaim)
+                try owner.reserve(.lite_native_page_cache, @sizeOf(@This()) + length)
+            else
+                try owner.reserveWithoutReclaim(.lite_native_page_cache, @sizeOf(@This()) + length)
+        else
+            null;
+        errdefer if (credit) |*value| value.release();
+        const self = try a.create(@This());
+        errdefer a.destroy(self);
+        const data = try a.alloc(u8, length);
+        self.* = .{ .alloc = a, .data = data, .registry = registry, .identity = @splat(0), .resource_manager = manager, .residency = credit };
+        registry.retainOwner();
+        return self;
+    }
+    pub fn copy(registry: *Registry, manager: ?*resources.ResourceManager, bytes: []const u8) !*@This() {
+        const self = try allocate(registry, manager, bytes.len);
+        @memcpy(self.data, bytes);
+        self.seal();
+        return self;
+    }
+
+    /// Only independently owned preparation may invoke cache reclaimers.
+    /// Gate-held publication and reader callbacks keep the non-reclaiming API.
+    pub fn copyDetached(registry: *Registry, manager: ?*resources.ResourceManager, bytes: []const u8) !*@This() {
+        const self = try allocateWithPolicy(registry, manager, bytes.len, true);
+        @memcpy(self.data, bytes);
+        self.seal();
+        return self;
+    }
+    pub fn seal(self: *@This()) void {
+        std.debug.assert(!self.sealed);
+        std.crypto.hash.Blake3.hash(self.data, &self.identity, .{});
+        self.sealed = true;
+    }
+    pub fn deinit(self: *@This()) void {
+        close(self);
+    }
+
+    pub fn source(self: *@This()) Source {
+        std.debug.assert(self.sealed);
+        platform_sync.lockYielding(&resident_pool_mutex);
+        if (self.pool_slot == null) {
+            for (&resident_pool, 0..) |*slot, i| if (slot.* == null) {
+                slot.* = self;
+                self.pool_slot = i;
+                break;
+            };
+        }
+        resident_pool_mutex.unlock();
+        return self.rawSource();
+    }
+    fn rawSource(self: *@This()) Source {
+        return .{ .ranges = .{
+            .ptr = self,
+            .length = self.data.len,
+            .read_into = read,
+            .close = close,
+            .retain_owned = retain,
+            .retained_bytes = retained,
+            .retention_overhead_bytes = @sizeOf(@This()) + self.data.len + decode_limit + DecodeCache.metadata_overhead,
+            .retention_artifact_only = true,
+            .immutable_identity = self.identity,
+            .resource_manager = self.resource_manager,
+            .acquire_decoded = acquireDecoded,
+            .lookup_decoded = lookupDecoded,
+        } };
+    }
+    fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (offset > self.data.len or out.len > self.data.len - @as(usize, @intCast(offset))) return error.EndOfStream;
+        @memcpy(out, self.data[@intCast(offset)..][0..out.len]);
+    }
+    fn retain(raw: *anyopaque) !Source {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        _ = self.references.fetchAdd(1, .monotonic);
+        return self.source();
+    }
+    fn retained(raw: *anyopaque) usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        platform_sync.lockYielding(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        return self.data.len + if (self.decoded_cache) |cache| cache.retainedBytes() else @as(usize, 0);
+    }
+    fn pinDecoded(self: *@This()) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+        platform_sync.lockYielding(&self.cache_mutex);
+        self.decoded_users += 1;
+        self.cache_mutex.unlock();
+    }
+    fn releaseDecodedPin(self: *@This()) void {
+        platform_sync.lockYielding(&self.cache_mutex);
+        std.debug.assert(self.decoded_users != 0);
+        self.decoded_users -= 1;
+        self.cache_mutex.unlock();
+        close(self);
+    }
+    fn discardDeclinedDecode(self: *@This()) void {
+        platform_sync.lockYielding(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        // Another loader or returned lease owns its independent pin. A
+        // sole declined attempt refunds optional metadata before fallback.
+        if (self.decoded_users != 1) return;
+        if (self.decoded_cache) |cache| cache.deinit();
+        self.decoded_cache = null;
+    }
+    fn releaseDecoded(raw: *anyopaque, item: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        (DecodeCache.Lease{ .cache = self.decoded_cache.?, .entry = @ptrCast(@alignCast(item)) }).release();
+        self.releaseDecodedPin();
+    }
+    fn lookupDecoded(raw: *anyopaque, key: source_mod.DecodeKey) !?source_mod.Decoded {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.pinDecoded();
+        var transferred = false;
+        defer if (!transferred) self.releaseDecodedPin();
+        platform_sync.lockYielding(&self.cache_mutex);
+        const cache = self.decoded_cache;
+        self.cache_mutex.unlock();
+        const lease = (cache orelse return null).lookup(key) orelse return null;
+        transferred = true;
+        return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
+    }
+    fn acquireDecoded(raw: *anyopaque, request: source_mod.DecodeRequest) !?source_mod.Decoded {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.pinDecoded();
+        var transferred = false;
+        defer if (!transferred) self.releaseDecodedPin();
+        platform_sync.lockYielding(&self.cache_mutex);
+        if (self.decoded_cache == null) self.decoded_cache = DecodeCache.create(self.alloc, self.resource_manager, decode_limit) catch null;
+        const cache = self.decoded_cache;
+        self.cache_mutex.unlock();
+        const lease = (try (cache orelse return null).acquire(request)) orelse {
+            self.discardDeclinedDecode();
+            return null;
+        };
+        transferred = true;
+        return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        platform_sync.lockYielding(&resident_pool_mutex);
+        if (self.references.fetchSub(1, .acq_rel) != 1) {
+            resident_pool_mutex.unlock();
+            return;
+        }
+        if (self.pool_slot) |slot| {
+            std.debug.assert(resident_pool[slot] == self);
+            resident_pool[slot] = null;
+        }
+        resident_pool_mutex.unlock();
+        std.debug.assert(self.decoded_users == 0);
+        if (self.decoded_cache) |cache| cache.deinit();
+        if (self.residency) |*credit| credit.release();
+        const alloc = self.alloc;
+        const registry = self.registry;
+        alloc.free(self.data);
+        alloc.destroy(self);
+        registry.releaseOwner();
+    }
+};
+
 pub const Registry = struct {
     allocator: Allocator,
     io_impl: std.Io.Threaded,
-    path: []u8,
+    path: [:0]u8,
+    inode: u64,
+    marker_namespace_safe: bool = false,
     store: ?*docs.Store,
     publication_guard: ?std.Io.File = null,
     mutex: std.Io.Mutex = .init,
@@ -96,18 +430,49 @@ pub const Registry = struct {
     callbacks: usize = 0,
     references: std.atomic.Value(usize) = .init(1),
     first: ?*State = null,
+    borrowed: [128]ArtifactIdentity = undefined,
+    borrowed_count: usize = 0,
+    borrowed_next: usize = 0,
     retired_bytes: std.atomic.Value(u64) = .init(0),
+    coordinator: ?*native.ReaderCoordinator = null,
+    publication_gate: ?@import("publication_gate.zig").Gate = null,
     owned_resources: ?struct { manager: *@import("../resource_manager.zig").ResourceManager, allocator: Allocator } = null,
 
     pub fn create(allocator: Allocator, store: *docs.Store) !*Registry {
         const self = try allocator.create(Registry);
         errdefer allocator.destroy(self);
-        const path = try allocator.dupe(u8, store.file.path);
+        // Canonicalize symlinks before choosing a marker directory. Hard-link
+        // aliases remain distinct and must prove the persisted namespace below.
+        const path = try std.Io.Dir.cwd().realPathFileAlloc(store.file.runtime(), store.file.path, allocator);
         errdefer allocator.free(path);
-        self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .store = store };
+        const marker_namespace_safe = !store.read_only and try @import("reader_epochs.zig").namespaceMatches(allocator, store.file.runtime(), path, store.file.header.reader_epoch_namespace);
+        const inode = (try store.file.file.stat(store.file.runtime())).inode;
+        self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .inode = inode, .store = store, .marker_namespace_safe = marker_namespace_safe };
         errdefer self.io_impl.deinit();
+        self.coordinator = store.file.reader_coordinator;
+        if (self.coordinator) |coordinator| coordinator.retain();
+        errdefer if (self.coordinator) |coordinator| coordinator.release();
         if (!store.read_only) self.publication_guard = try openPublicationGuard(allocator, self.io(), path);
+        if (store.artifact_publication_gate) |gate| self.publication_gate = gate.retained();
         return self;
+    }
+
+    /// Installed once under the owner's path gate, before independent staging
+    /// is exposed. This reference owns no mutable runtime and survives detach.
+    pub fn installPublicationGate(self: *Registry, gate: @import("publication_gate.zig").Gate) void {
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
+        if (self.publication_gate) |current| {
+            std.debug.assert(current.ptr == gate.ptr);
+            return;
+        }
+        self.publication_gate = gate.retained();
+    }
+
+    pub fn capturePublicationGate(self: *Registry) ?@import("publication_gate.zig").Gate {
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
+        return if (self.publication_gate) |gate| gate.retained() else null;
     }
 
     /// Transfer the backend's resource owner before dropping the Store's
@@ -118,7 +483,7 @@ pub const Registry = struct {
         self.owned_resources = .{ .manager = manager, .allocator = allocator };
     }
 
-    fn io(self: *Registry) std.Io {
+    pub fn io(self: *Registry) std.Io {
         return self.io_impl.io();
     }
 
@@ -133,7 +498,13 @@ pub const Registry = struct {
             owner.manager.deinit(owner.allocator);
             owner.allocator.destroy(owner.manager);
         }
+        if (self.coordinator) |coordinator| coordinator.release();
+        for (self.borrowed[0..self.borrowed_count]) |identity| {
+            self.allocator.free(identity.key);
+            self.allocator.free(identity.inline_bytes);
+        }
         self.allocator.free(self.path);
+        if (self.publication_gate) |*gate| gate.deinit();
         self.allocator.destroy(self);
     }
 
@@ -164,7 +535,15 @@ pub const Registry = struct {
         self.release();
     }
 
-    fn beginCallback(self: *Registry) ?*docs.Store {
+    /// Immutable decoder metadata can outlive its Store even when its range
+    /// Source was pooled from a different registry. Keep this Store's resource
+    /// accounting owner alive until that metadata is released. Backend close
+    /// transfers the owned manager here before dropping its owner reference.
+    pub fn retainOwner(self: *Registry) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+
+    pub fn beginCallback(self: *Registry) ?*docs.Store {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         defer self.mutex.unlock(runtime);
@@ -174,7 +553,7 @@ pub const Registry = struct {
         return owner;
     }
 
-    fn endCallback(self: *Registry) void {
+    pub fn endCallback(self: *Registry) void {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         defer self.mutex.unlock(runtime);
@@ -288,8 +667,83 @@ pub const Registry = struct {
         return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
     }
 
+    fn createMarkerWithBudget(self: *Registry, path: []const u8, budget: *@import("../immutable_artifact.zig").AdmissionBudget) !std.Io.File {
+        const runtime = self.io();
+        const guard = blk: {
+            const started = std.Io.Clock.awake.now(runtime).nanoseconds;
+            defer budget.chargeElapsed(runtime, started);
+            const deadline = budget.deadline(runtime);
+            while (true) {
+                try runtime.checkCancel();
+                if (self.mutex.tryLock()) {
+                    const guard = self.publication_guard orelse {
+                        self.mutex.unlock(runtime);
+                        return error.ReadOnly;
+                    };
+                    const locked = guard.tryLock(runtime, .exclusive) catch |err| {
+                        self.mutex.unlock(runtime);
+                        return err;
+                    };
+                    if (locked) break :blk guard;
+                    self.mutex.unlock(runtime);
+                }
+                const remaining = deadline - std.Io.Clock.awake.now(runtime).nanoseconds;
+                if (remaining <= 0) return error.FileBusy;
+                try runtime.sleep(.fromNanoseconds(@min(remaining, std.time.ns_per_ms)), .awake);
+            }
+        };
+        defer self.mutex.unlock(runtime);
+        defer guard.unlock(runtime);
+        return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
+    }
+
+    pub fn beginConstruction(self: *Registry) !Construction {
+        const owner = self.beginCallback() orelse return error.ReadOnly;
+        defer self.endCallback();
+        if (owner.read_only) return error.ReadOnly;
+        if (!self.marker_namespace_safe) return error.UnsafeNativeReaderAlias;
+        owner.generation_lock.lockSharedUncancelable(owner.file.runtime());
+        defer owner.generation_lock.unlockShared(owner.file.runtime());
+        const inode = (try owner.file.file.stat(owner.file.runtime())).inode;
+        return self.beginOwnedConstruction(inode);
+    }
+
+    /// Owns only a locked marker, release ticket and Registry reference. The
+    /// independently admitted native writer checks inode and namespace before
+    /// publishing any construction bytes.
+    pub fn beginOwnedConstruction(self: *Registry, inode: u64) !Construction {
+        return self.beginOwnedConstructionImpl(inode, null);
+    }
+
+    pub fn beginOwnedConstructionWithBudget(self: *Registry, inode: u64, budget: *@import("../immutable_artifact.zig").AdmissionBudget) !Construction {
+        return self.beginOwnedConstructionImpl(inode, budget);
+    }
+
+    fn beginOwnedConstructionImpl(self: *Registry, inode: u64, budget: ?*@import("../immutable_artifact.zig").AdmissionBudget) !Construction {
+        if (!self.marker_namespace_safe or inode != self.inode) return error.StaleArtifactConstruction;
+        const runtime = self.io();
+        const a = self.allocator;
+        var random: [16]u8 = undefined;
+        try runtime.randomSecure(&random);
+        const id = std.fmt.bytesToHex(random, .lower);
+        const key = try std.mem.concat(a, u8, &.{ key_prefix, &id });
+        errdefer a.free(key);
+        const marker_name = try std.mem.concat(a, u8, &.{ marker_prefix, &id });
+        defer a.free(marker_name);
+        const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
+        errdefer a.free(path);
+        const marker = if (budget) |admission| try self.createMarkerWithBudget(path, admission) else try self.createMarker(path);
+        errdefer {
+            marker.close(runtime);
+            std.Io.Dir.cwd().deleteFile(runtime, path) catch {};
+        }
+        const ticket = if (self.coordinator) |coordinator| try coordinator.reserveArtifactRelease(inode, key) else null;
+        _ = self.references.fetchAdd(1, .monotonic);
+        return .{ .registry = self, .key = key, .marker_path = path, .marker = marker, .inode = inode, .release_ticket = ticket };
+    }
+
     fn findPooled(self: *Registry, owner: *docs.Store, key: []const u8) !?*State {
-        if (!owner.artifactPoolLookupAllowed()) return null;
+        if (!self.marker_namespace_safe or !owner.artifactPoolLookupAllowed()) return null;
         // The pin lasts only for lookup. A hit already owns a durable value
         // lease. Do not recursively acquire generation_lock around beginRead.
         var pin = try owner.beginRead();
@@ -298,7 +752,60 @@ pub const Registry = struct {
         var value = try file.openIndexValue(self.allocator, key, pin.checkpoint);
         defer value.deinit(self.allocator);
         const identity: ArtifactIdentity = .{ .path = self.path, .key = key, .inode = (try file.file.stat(file.runtime())).inode, .root = value.root, .length = value.length, .inline_bytes = value.inline_bytes };
-        return retainPooled(identity);
+        const state = retainPooled(identity) orelse return null;
+        // The returned source reference keeps the pooled identity alive while
+        // this optional cache bookkeeping runs, without holding the pool lock.
+        self.rememberBorrowed(identity) catch {};
+        return state;
+    }
+
+    fn rememberBorrowed(self: *Registry, identity: ArtifactIdentity) !void {
+        const runtime = self.io();
+        self.mutex.lockUncancelable(runtime);
+        defer self.mutex.unlock(runtime);
+        for (self.borrowed[0..self.borrowed_count]) |known|
+            if (identity.eql(known, identity)) return;
+        const key = try self.allocator.dupe(u8, identity.key);
+        errdefer self.allocator.free(key);
+        const inline_bytes = try self.allocator.dupe(u8, identity.inline_bytes);
+        const slot = if (self.borrowed_count < self.borrowed.len) self.borrowed_count else self.borrowed_next;
+        if (slot < self.borrowed_count) {
+            self.allocator.free(self.borrowed[slot].key);
+            self.allocator.free(self.borrowed[slot].inline_bytes);
+        } else self.borrowed_count += 1;
+        self.borrowed[slot] = identity;
+        self.borrowed[slot].path = self.path;
+        self.borrowed[slot].key = key;
+        self.borrowed[slot].inline_bytes = inline_bytes;
+        self.borrowed_next = (slot + 1) % self.borrowed.len;
+    }
+
+    /// Copy a bounded artifact under one short logical read pin. The returned
+    /// source owns every byte, so unlink/reuse and runtime refresh require no
+    /// persisted alias, inode fence, marker or coarse checkpoint retention.
+    /// Residency refusal is optional; operational read failures remain errors.
+    pub fn openResident(self: *Registry, key: []const u8) !?Source {
+        const owner = self.beginCallback() orelse return error.ReadOnly;
+        defer self.endCallback();
+        var pin = try owner.beginRead();
+        defer pin.abort();
+        var value = try pin.openIndexValue(self.allocator, key);
+        defer value.deinit(self.allocator);
+        if (value.length > OwnedBytes.maximum_length) return null;
+        const bytes = OwnedBytes.allocate(self, owner.resource_manager, value.length) catch |err| switch (err) {
+            error.ResourceBudgetExceeded, error.OutOfMemory => return null,
+            else => return err,
+        };
+        errdefer bytes.deinit();
+        try pin.readIndexValueInto(value, 0, bytes.data);
+        bytes.seal();
+        if (findResident(bytes)) |existing| {
+            bytes.deinit();
+            owner.recordArtifactSourceOpen(true);
+            return existing;
+        }
+        owner.recordArtifactSourceOpen(false);
+        return bytes.source();
     }
 
     pub fn open(self: *Registry, key: []const u8) !Source {
@@ -332,7 +839,7 @@ pub const Registry = struct {
         defer a.free(marker_name);
         const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
         errdefer a.free(marker_path);
-        const reader_fenced = owner.read_only or owner.artifact_reader_fence;
+        const reader_fenced = owner.read_only or owner.artifact_reader_fence or !self.marker_namespace_safe;
         const marker: ?std.Io.File = if (reader_fenced) null else try self.createMarker(marker_path);
         errdefer if (marker) |file| {
             file.close(runtime);
@@ -352,6 +859,11 @@ pub const Registry = struct {
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
         } else try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
         const captured_inode = (try reader.file.stat(reader.runtime())).inode;
+        const release_ticket = if (!reader_fenced and self.coordinator != null)
+            try self.coordinator.?.reserveArtifactRelease(captured_inode, lease_key)
+        else
+            null;
+        errdefer if (release_ticket) |ticket| self.coordinator.?.destroyArtifactReleases(ticket);
         state.* = .{
             .registry = self,
             .reader = reader,
@@ -359,19 +871,33 @@ pub const Registry = struct {
             .checkpoint = capture.checkpoint,
             .generation = owner.assessment_generation,
             .lease_key = lease_key,
+            .release_ticket = release_ticket,
             .marker_path = marker_path,
             .marker = marker,
             .resource_manager = owner.resource_manager,
             .artifact_key = artifact_key,
         };
-        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
+        try initializeSourceCache(self, state, captured_inode);
+        return self.registerSource(state, owner, captured_inode, false);
+    }
+
+    // Once the source is fully prepared, registration cannot fail. A sealed
+    // construction can transfer its existing registry reference and lease.
+    fn registerSource(self: *Registry, state: *State, owner: *docs.Store, captured_inode: u64, transfer_reference: bool) Source {
+        const source = self.registerOwnedSource(state, captured_inode, transfer_reference, owner.artifactPoolLookupAllowed());
+        owner.recordArtifactSourceOpen(false);
+        return source;
+    }
+
+    fn registerOwnedSource(self: *Registry, state: *State, captured_inode: u64, transfer_reference: bool, pool_allowed: bool) Source {
+        const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
         self.first = state;
-        _ = self.references.fetchAdd(1, .monotonic);
+        if (!transfer_reference) _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        if (marker != null and owner.artifactPoolLookupAllowed()) {
-            const identity: ArtifactIdentity = .{ .path = self.path, .key = artifact_key, .inode = captured_inode, .root = state.value.root, .length = state.value.length, .inline_bytes = state.value.inline_bytes };
+        if (state.marker != null and pool_allowed) {
+            const identity: ArtifactIdentity = .{ .path = self.path, .key = state.artifact_key, .inode = captured_inode, .root = state.value.root, .length = state.value.length, .inline_bytes = state.value.inline_bytes };
             @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
             // A closed old source can remain referenced by a weak LSM cache.
             // Replace its map key too, before its final close frees the bytes.
@@ -379,16 +905,335 @@ pub const Registry = struct {
             source_pool.putContext(std.heap.page_allocator, identity, state, identity) catch {
                 // Pooling is optional; the newly opened lease remains valid.
                 source_pool_mutex.unlock();
-                owner.recordArtifactSourceOpen(false);
                 return state.source();
             };
             state.pool_identity = identity;
             source_pool_mutex.unlock();
         }
-        owner.recordArtifactSourceOpen(false);
         return state.source();
     }
 };
+
+/// A bounded unpublished native value. Its locked marker, release hint, and
+/// registry reference outlive Store refresh. Appends use the current admitted
+/// Store and are idempotent after an ambiguous successful publication.
+pub const Construction = struct {
+    registry: ?*Registry,
+    key: []u8,
+    marker_path: []u8,
+    marker: std.Io.File,
+    inode: u64,
+    release_ticket: ?*native.ReaderCoordinator.ArtifactRelease,
+    length: usize = 0,
+    sealed: bool = false,
+
+    pub fn append(self: *Construction, owner: *docs.Store, bytes: []const u8) !void {
+        if (self.registry == null or self.sealed) return error.InvalidArtifactConstructionState;
+        const Request = struct {
+            construction: *Construction,
+            bytes: []const u8,
+            fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(raw));
+                const building = request.construction;
+                if ((try file.file.stat(file.runtime())).inode != building.inode) return error.StaleArtifactConstruction;
+                try file.appendArtifactConstruction(building.key, building.length, request.bytes);
+            }
+        };
+        var request: Request = .{ .construction = self, .bytes = bytes };
+        try owner.submitArtifactLeaseMutation(&request, Request.apply);
+        self.length += bytes.len;
+    }
+
+    pub fn seal(self: *Construction, expected_length: usize) !void {
+        if (self.registry == null or expected_length == 0 or self.length != expected_length) return error.InvalidArtifactConstructionState;
+        self.sealed = true;
+    }
+
+    pub fn link(self: *Construction, owner: *docs.Store, path: []const u8) !void {
+        if (self.registry == null or !self.sealed) return error.InvalidArtifactConstructionState;
+        const Request = struct {
+            construction: *const Construction,
+            path: []const u8,
+            fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(raw));
+                const building = request.construction;
+                if ((try file.file.stat(file.runtime())).inode != building.inode) return error.StaleArtifactConstruction;
+                try file.linkArtifactConstruction(building.key, request.path, building.length);
+            }
+        };
+        var request: Request = .{ .construction = self, .path = path };
+        try owner.submitIndexMutation(&request, Request.apply, true);
+    }
+
+    /// Caller retains final writer admission while inspecting the lease catalog.
+    /// Prepare the immutable reader before linking, then transfer this
+    /// construction's durable value lease into that reader. A second lease
+    /// publication would protect the very same root and require another commit.
+    /// No fallible operation follows link success, so cleanup never removes a
+    /// path whose creation failed or whose publication outcome is uncertain.
+    pub fn linkSource(self: *Construction, owner: *docs.Store, path: []const u8) !Source {
+        return self.prepareSource(owner, path, true);
+    }
+
+    pub fn prepareSource(self: *Construction, owner: *docs.Store, path: []const u8, link_now: bool) !Source {
+        const registry = self.registry orelse return error.InvalidArtifactConstructionState;
+        if (!self.sealed) return error.InvalidArtifactConstructionState;
+        const captured_owner = registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer registry.endCallback();
+        if (captured_owner != owner) return error.StaleArtifactConstruction;
+        owner.generation_lock.lockSharedUncancelable(owner.file.runtime());
+        defer owner.generation_lock.unlockShared(owner.file.runtime());
+        return self.prepareSourceAt(&owner.file, owner.resource_manager, owner.assessment_generation, path, if (link_now) owner else null, owner);
+    }
+
+    /// Caller owns the independent native publication gate. No mutable Store
+    /// callback or snapshot is needed to transfer this construction's exact
+    /// durable lease into an immutable reader.
+    pub fn prepareOwnedSource(self: *Construction, file: *native.NativeFile, manager: ?*@import("../resource_manager.zig").ResourceManager) !Source {
+        if (!self.sealed) return error.InvalidArtifactConstructionState;
+        return self.prepareSourceAt(file, manager, 0, self.key, null, null);
+    }
+
+    fn prepareSourceAt(self: *Construction, file: *native.NativeFile, manager: ?*@import("../resource_manager.zig").ResourceManager, generation: u64, path: []const u8, link_owner: ?*docs.Store, stats_owner: ?*docs.Store) !Source {
+        const registry = self.registry orelse return error.InvalidArtifactConstructionState;
+        const runtime = registry.io();
+        if ((try file.file.stat(file.runtime())).inode != self.inode) return error.StaleArtifactConstruction;
+        const a = registry.allocator;
+        const state = try a.create(State);
+        errdefer a.destroy(state);
+        const artifact_key = try a.dupe(u8, path);
+        errdefer a.free(artifact_key);
+        var reader = try native.NativeFile.openWithIo(a, runtime, registry.path, .{ .read_only = true, .internal_reader = true, .reader_coordinator = registry.coordinator, .no_sync = true });
+        errdefer reader.close();
+        reader.reader_coordinator = null;
+        reader.page_cache_enabled.store(false, .monotonic);
+        const captured_inode = (try reader.file.stat(reader.runtime())).inode;
+        if (captured_inode != self.inode) return error.StaleArtifactConstruction;
+        const checkpoint = reader.activeCheckpoint();
+        var value = try reader.openArtifactLeaseValue(a, self.key, checkpoint);
+        errdefer value.deinit(a);
+        if (value.length != self.length) return error.StaleArtifactConstruction;
+        state.* = .{
+            .registry = registry,
+            .reader = reader,
+            .value = value,
+            .checkpoint = checkpoint,
+            .generation = generation,
+            .lease_key = self.key,
+            .release_ticket = self.release_ticket,
+            .marker_path = self.marker_path,
+            .marker = self.marker,
+            .resource_manager = manager,
+            .artifact_key = artifact_key,
+        };
+        try initializeSourceCache(registry, state, captured_inode);
+        errdefer state.cache.?.deinit();
+        if (link_owner) |owner| try self.link(owner, path);
+        self.registry = null;
+        self.release_ticket = null;
+        if (stats_owner) |owner| return registry.registerSource(state, owner, captured_inode, true);
+        return registry.registerOwnedSource(state, captured_inode, true, true);
+    }
+
+    pub fn deinit(self: *Construction) void {
+        const registry = self.registry orelse return;
+        self.registry = null;
+        self.marker.close(registry.io());
+        std.Io.Dir.cwd().deleteFile(registry.io(), self.marker_path) catch {};
+        if (self.release_ticket) |ticket| {
+            registry.coordinator.?.enqueueArtifactReleases(ticket);
+            self.release_ticket = null;
+        }
+        registry.allocator.free(self.key);
+        registry.allocator.free(self.marker_path);
+        registry.release();
+    }
+};
+
+test "lite artifact working set recaptures pooled sources through a new registry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/recapture.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var first = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    first.maintenance_start_suppressed = true;
+    var first_live = true;
+    defer if (first_live) first.close();
+    try first.file.putIndexCatalogRecord("/index/kept", "immutable payload");
+    var original = try first.openArtifactSource("/index/kept");
+    defer original.close();
+    const inode = (try first.file.file.stat(first.file.runtime())).inode;
+    var working: WorkingSet = .{};
+    defer working.clear();
+    working.capture(first.artifact_registry.?, inode, 1024 * 1024, 1);
+    try std.testing.expectEqual(@as(usize, 1), working.count);
+    first.close();
+    first_live = false;
+    var second = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    second.maintenance_start_suppressed = true;
+    defer second.close();
+    var pooled = try second.openArtifactSource("/index/kept");
+    defer pooled.close();
+    try std.testing.expect(pooled.acquireUse());
+    defer pooled.releaseUse();
+    try std.testing.expectEqual(@as(usize, 1), second.artifact_registry.?.borrowed_count);
+    try std.testing.expect(second.artifact_registry.?.first == null);
+    const expiry = working.expires_ns;
+    working.capture(second.artifact_registry.?, inode, 1024 * 1024, expiry);
+    try std.testing.expectEqual(@as(usize, 1), working.count);
+    try std.testing.expect(working.expires_ns > expiry);
+    var bytes: [17]u8 = undefined;
+    try pooled.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("immutable payload", &bytes);
+    working.observe(inode + 1, expiry + 1);
+    try std.testing.expectEqual(@as(usize, 0), working.count);
+}
+
+test "lite artifact construction transfers its lease without another publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/construction-transfer.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    var store_live = true;
+    defer if (store_live) store.close();
+    var construction = try store.beginArtifactConstruction();
+    defer construction.deinit();
+    const lease_key = try a.dupe(u8, construction.key);
+    defer a.free(lease_key);
+    const payload: [65536]u8 = @splat('p');
+    try construction.append(&store, &payload);
+    try construction.seal(payload.len);
+    try store.file.putIndexCatalogRecord("/taken", "foreign");
+    const before = store.file.activeCheckpoint();
+    try std.testing.expectError(error.PathAlreadyExists, construction.linkSource(&store, "/taken"));
+    try std.testing.expect(construction.registry != null);
+    try std.testing.expectEqual(before.commit_sequence, store.file.activeCheckpoint().commit_sequence);
+    store.file.test_page_write_fail_after = 0;
+    const failed = construction.linkSource(&store, "/activated");
+    store.file.test_page_write_fail_after = null;
+    try std.testing.expectError(error.TestPageWriteFailure, failed);
+    try std.testing.expect(construction.registry != null);
+    var source = try construction.linkSource(&store, "/activated");
+    var source_live = true;
+    defer if (source_live) source.close();
+    try std.testing.expect(construction.registry == null);
+    try std.testing.expectEqual(before.commit_sequence + 1, store.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqualSlices(u8, &before.logical.metadata, &store.file.activeCheckpoint().logical.metadata);
+    // The prepared wrapper can close immediately: the source now owns its
+    // existing marker, value lease, release ticket and registry reference.
+    construction.deinit();
+    store.close();
+    store_live = false;
+    store = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    store_live = true;
+    var sweep: SweepCursor = .{};
+    try std.testing.expectEqual(@as(usize, 0), try cleanupOrphans(&store.file, &sweep));
+    try store.file.deleteIndexCatalogRecord("/activated");
+    _ = try store.file.reclaimPages(4096);
+    var got: [65536]u8 = undefined;
+    try source.readInto(0, &got);
+    try std.testing.expectEqualSlices(u8, &payload, &got);
+    const foreign = (try store.file.getIndexCatalogRecordAlloc(a, "/taken")).?;
+    defer a.free(foreign);
+    try std.testing.expectEqualStrings("foreign", foreign);
+    source.close();
+    source_live = false;
+    sweep = .{};
+    _ = try cleanupOrphans(&store.file, &sweep);
+    try std.testing.expect((try store.file.getCatalogRecordAlloc(a, lease_key)) == null);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite artifact construction survives Store refresh and releases orphan ownership after close" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/construction.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    // This fixture services orphan records explicitly through the NativeFile.
+    store.maintenance_start_suppressed = true;
+    var store_live = true;
+    defer if (store_live) store.close();
+    var construction = try store.beginArtifactConstruction();
+    defer construction.deinit();
+    const lease_key = try a.dupe(u8, construction.key);
+    defer a.free(lease_key);
+    const first: [131072]u8 = @splat('a');
+    const second: [65536]u8 = @splat('b');
+    try construction.append(&store, &first);
+    store.close();
+    store_live = false;
+    store = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    store_live = true;
+    var sweep: SweepCursor = .{};
+    try std.testing.expectEqual(@as(usize, 0), try cleanupOrphans(&store.file, &sweep));
+    try construction.append(&store, &second);
+    try construction.seal(first.len + second.len);
+    try std.testing.expectError(error.InvalidArtifactConstructionState, construction.append(&store, "late"));
+    try construction.link(&store, "/index/activated");
+    var source = try store.openArtifactSource("/index/activated");
+    var source_live = true;
+    defer if (source_live) source.close();
+    store.close();
+    store_live = false;
+    // Closing construction after its original Store is gone only closes its
+    // marker and queues a preallocated hint; it must never call that Store.
+    construction.deinit();
+    store = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    store_live = true;
+    sweep = .{};
+    _ = try cleanupOrphans(&store.file, &sweep);
+    try std.testing.expect((try store.file.getCatalogRecordAlloc(a, lease_key)) == null);
+    try store.file.deleteIndexCatalogRecord("/index/activated");
+    var got: [8]u8 = undefined;
+    try source.readInto(first.len - 4, &got);
+    try std.testing.expectEqualStrings("aaaabbbb", &got);
+    try std.testing.expect((try store.file.check()).valid);
+    source.close();
+    source_live = false;
+    sweep = .{};
+    _ = try cleanupOrphans(&store.file, &sweep);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite artifact construction rejects publication on a replacement inode" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/construction-replace.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    defer store.close();
+    var construction = try store.beginArtifactConstruction();
+    defer construction.deinit();
+    try construction.append(&store, "staged");
+    _ = try store.vacuum();
+    try std.testing.expectError(error.StaleArtifactConstruction, construction.append(&store, "refused"));
+    try construction.seal("staged".len);
+    try std.testing.expectError(error.StaleArtifactConstruction, construction.link(&store, "/index/never"));
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(a, "/index/never")) == null);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+fn initializeSourceCache(registry: *Registry, state: *State, captured_inode: u64) !void {
+    var identity_digest = std.crypto.hash.sha2.Sha256.init(.{});
+    identity_digest.update("antfly native immutable artifact v1");
+    identity_digest.update(std.mem.asBytes(&captured_inode));
+    identity_digest.update(std.mem.asBytes(&state.value.root));
+    identity_digest.update(std.mem.asBytes(&state.value.length));
+    identity_digest.update(state.value.inline_bytes);
+    state.immutable_identity = identity_digest.finalResult();
+    state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(registry.allocator, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = state.resource_manager } }, source_cache_bytes);
+}
 
 const Capture = struct {
     allocator: Allocator,
@@ -410,6 +1255,7 @@ const Capture = struct {
 };
 
 const State = struct {
+    immutable_identity: [32]u8 = undefined,
     registry: *Registry,
     artifact_key: []u8,
     reader: native.NativeFile,
@@ -417,14 +1263,17 @@ const State = struct {
     checkpoint: native.CheckpointSlot,
     generation: u64,
     lease_key: []u8,
+    release_ticket: ?*native.ReaderCoordinator.ArtifactRelease = null,
     marker_path: []u8,
     marker: ?std.Io.File,
     next: ?*State = null,
     retired_size: u64 = 0,
     retired_claim: u64 = 0,
     cache: ?@import("../../segment_source.zig").ConcurrentBlockCache = null,
+    decoded_cache: ?*DecodedCache = null,
     lifetime_mutex: std.atomic.Mutex = .unlocked,
     active_uses: usize = 0,
+    decoded_users: usize = 0, // lifetime_mutex; distinct from general source uses
     idle_expiry: bool = false,
     retired: bool = false,
     resources_closed: std.atomic.Value(bool) = .init(false),
@@ -434,11 +1283,25 @@ const State = struct {
     resource_manager: ?*@import("../resource_manager.zig").ResourceManager = null,
 
     fn source(self: *State) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry } };
+        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retain_owned = retainOwned, .retained_bytes = retainedBytes, .retention_overhead_bytes = 2 * source_cache_bytes + decoded_cache_bytes + DecodedCache.metadata_overhead + 64 * 1024 + @sizeOf(State) + self.value.inline_bytes.len + self.artifact_key.len + self.lease_key.len + self.marker_path.len, .retention_artifact_only = self.marker != null, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry, .immutable_identity = self.immutable_identity, .acquire_decoded = acquireDecoded, .lookup_decoded = lookupDecoded } };
+    }
+
+    fn retainOwned(ptr: *anyopaque) !Source {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+        defer source_pool_mutex.unlock();
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        if (self.resources_closed.load(.monotonic)) return error.EnrichmentWaitCanceled;
+        self.source_references += 1;
+        self.shared = true;
+        return self.source();
     }
 
     fn closeResources(self: *State) void {
         if (self.resources_closed.load(.monotonic)) return;
+        if (self.decoded_cache) |cache| cache.deinit();
+        self.decoded_cache = null;
         self.cache.?.deinit();
         self.cache = null;
         self.reader.close();
@@ -446,6 +1309,10 @@ const State = struct {
             marker.close(self.registry.io());
             self.marker = null;
             std.Io.Dir.cwd().deleteFile(self.registry.io(), self.marker_path) catch {};
+        }
+        if (self.release_ticket) |ticket| {
+            self.release_ticket = null;
+            self.registry.coordinator.?.enqueueArtifactReleases(ticket);
         }
         self.resources_closed.store(true, .release);
     }
@@ -503,7 +1370,77 @@ const State = struct {
         const self: *State = @ptrCast(@alignCast(ptr));
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         defer self.lifetime_mutex.unlock();
-        return if (self.cache) |*cache| cache.retainedBytes() else 0;
+        return (if (self.cache) |*cache| cache.retainedBytes() else 0) +| (if (self.decoded_cache) |cache| cache.retainedBytes() else 0);
+    }
+
+    fn pinDecoded(self: *State) bool {
+        @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+        defer source_pool_mutex.unlock();
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        if (self.resources_closed.load(.monotonic)) return false;
+        self.active_uses += 1;
+        self.decoded_users += 1;
+        // A decoded lease may outlive its caller's Source. Its use prevents
+        // idle expiry, and its reference keeps this provider/accounting owner.
+        self.source_references += 1;
+        return true;
+    }
+
+    fn releaseDecodedPin(self: *State) void {
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        std.debug.assert(self.decoded_users != 0);
+        self.decoded_users -= 1;
+        self.lifetime_mutex.unlock();
+        releaseUse(self);
+        close(self);
+    }
+
+    fn discardDeclinedDecode(self: *State) void {
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        // This caller still owns its pin. All other decoders and returned
+        // leases count separately, even when a handoff also uses this source.
+        // Give the fallback its original host headroom, including metadata.
+        if (self.decoded_users != 1) return;
+        if (self.decoded_cache) |cache| cache.deinit();
+        self.decoded_cache = null;
+    }
+
+    fn releaseDecoded(raw: *anyopaque, item: *anyopaque) void {
+        const self: *State = @ptrCast(@alignCast(raw));
+        (DecodedCache.Lease{ .cache = self.decoded_cache.?, .entry = @ptrCast(@alignCast(item)) }).release();
+        self.releaseDecodedPin();
+    }
+
+    fn lookupDecoded(raw: *anyopaque, key: @import("../../segment_source.zig").DecodeKey) !?@import("../../segment_source.zig").Decoded {
+        const self: *State = @ptrCast(@alignCast(raw));
+        if (!self.pinDecoded()) return null;
+        var transferred = false;
+        defer if (!transferred) self.releaseDecodedPin();
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        const cache = self.decoded_cache;
+        self.lifetime_mutex.unlock();
+        const lease = (cache orelse return null).lookup(key) orelse return null;
+        transferred = true;
+        return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
+    }
+
+    fn acquireDecoded(raw: *anyopaque, request: @import("../../segment_source.zig").DecodeRequest) !?@import("../../segment_source.zig").Decoded {
+        const self: *State = @ptrCast(@alignCast(raw));
+        if (!self.pinDecoded()) return null;
+        var transferred = false;
+        defer if (!transferred) self.releaseDecodedPin();
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        if (self.decoded_cache == null) self.decoded_cache = DecodedCache.create(self.registry.allocator, self.resource_manager, decoded_cache_bytes) catch null;
+        const cache = self.decoded_cache;
+        self.lifetime_mutex.unlock();
+        const lease = (try (cache orelse return null).acquire(request)) orelse {
+            self.discardDeclinedDecode();
+            return null;
+        };
+        transferred = true;
+        return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
     }
 
     fn visit(ptr: *anyopaque, offset: u64, length: u64, visitor_port: @import("../../segment_source.zig").SourceVisitor) !void {
@@ -601,6 +1538,9 @@ pub const SweepCursor = struct {
 pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
     const a = file.allocator;
     const runtime = file.runtime();
+    if (!try @import("reader_epochs.zig").namespaceMatches(a, runtime, file.path, file.header.reader_epoch_namespace)) return 0;
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(runtime, file.path, a);
+    defer a.free(canonical);
     const checkpoint = try file.materializeTransactionCheckpoint();
     var cursor = try file.metadataCatalogCursor(checkpoint, key_prefix);
     defer cursor.deinit();
@@ -623,7 +1563,7 @@ pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
         sweep.valid = true;
         const name = try std.mem.concat(a, u8, &.{ marker_prefix, id });
         defer a.free(name);
-        const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(file.path) orelse ".", name });
+        const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(canonical) orelse ".", name });
         defer a.free(path);
         const marker = std.Io.Dir.cwd().openFile(runtime, path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
             error.WouldBlock => continue,
@@ -676,7 +1616,9 @@ pub const MarkerSweep = struct {
         try guard.lock(runtime, .exclusive);
         defer guard.unlock(runtime);
         if (self.iterator == null) {
-            const dir = try std.Io.Dir.cwd().openDir(runtime, std.fs.path.dirname(file.path) orelse ".", .{ .iterate = true });
+            const canonical = try std.Io.Dir.cwd().realPathFileAlloc(runtime, file.path, file.allocator);
+            defer file.allocator.free(canonical);
+            const dir = try std.Io.Dir.cwd().openDir(runtime, std.fs.path.dirname(canonical) orelse ".", .{ .iterate = true });
             self.iterator = dir.iterate();
         }
         errdefer self.resetIterator(runtime);
@@ -708,7 +1650,16 @@ pub const MarkerSweep = struct {
 // This persistent inode is deliberately outside the UUID marker namespace.
 // Never unlink it: replacing its inode could split cross-process coordination.
 fn openPublicationGuard(allocator: Allocator, io: std.Io, root: []const u8) !std.Io.File {
-    const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(root) orelse ".", ".aflite-lease-publication.lock" });
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator) catch |err| switch (err) {
+        error.FileNotFound => missing: {
+            const parent = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(root) orelse ".", allocator);
+            defer allocator.free(parent);
+            break :missing try std.fs.path.joinZ(allocator, &.{ parent, std.fs.path.basename(root) });
+        },
+        else => return err,
+    };
+    defer allocator.free(canonical);
+    const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(canonical) orelse ".", ".aflite-lease-publication.lock" });
     defer allocator.free(path);
     return std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
 }
@@ -783,4 +1734,234 @@ test "lite persistent mapped lease publication excludes cross-root marker sweepi
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, marker_path, .{}));
     try std.testing.expect(try probe.tryLock(io, .exclusive));
     probe.unlock(io);
+}
+
+test "lite artifact path aliases retain snapshot protection across orphan cleanup" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |symlink_alias| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/original.aflite", .{tmp.sub_path});
+        defer a.free(path);
+        const other = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/alias", .{tmp.sub_path});
+        defer a.free(other);
+        try std.Io.Dir.cwd().createDirPath(io, other);
+        const alias = try std.fs.path.join(a, &.{ other, "reader.aflite" });
+        defer a.free(alias);
+        var writer = try docs.Store.createWithOptions(a, path, .{ .io = io, .no_sync = true });
+        var writer_live = true;
+        defer if (writer_live) writer.close();
+        writer.maintenance_start_suppressed = true;
+        const bytes: [8192]u8 = @splat('h');
+        try writer.file.putIndexCatalogRecord("/index/kept", &bytes);
+        if (symlink_alias) {
+            const target = try std.Io.Dir.cwd().realPathFileAlloc(io, path, a);
+            defer a.free(target);
+            try std.Io.Dir.cwd().symLink(io, target, alias, .{});
+        } else try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+        writer.close();
+        writer_live = false;
+        var alias_store = try docs.Store.openWithOptions(a, alias, .{ .io = io, .no_sync = true });
+        var alias_live = true;
+        defer if (alias_live) alias_store.close();
+        alias_store.maintenance_start_suppressed = true;
+        var source = try alias_store.openArtifactSource("/index/kept");
+        defer source.close();
+        var adapter = @import("index_storage.zig").Store.init(a, &alias_store);
+        if (try adapter.storage().acquireImmutableStager(a)) |value| {
+            var stager = value;
+            defer stager.deinit();
+            try std.testing.expect(symlink_alias);
+        } else try std.testing.expect(!symlink_alias);
+        if (!symlink_alias) try std.testing.expectError(error.UnsafeNativeReaderAlias, alias_store.beginArtifactConstruction());
+        alias_store.close();
+        alias_live = false;
+        writer = try docs.Store.openWithOptions(a, path, .{ .io = io, .no_sync = true });
+        writer_live = true;
+        writer.maintenance_start_suppressed = true;
+        var sweep: SweepCursor = .{};
+        // A locked live source through another path must never look orphaned.
+        try std.testing.expectEqual(@as(usize, 0), try cleanupOrphans(&writer.file, &sweep));
+        try writer.file.deleteIndexCatalogRecord("/index/kept");
+        for (0..8) |i| {
+            var key: [32]u8 = undefined;
+            try writer.file.putIndexCatalogRecord(try std.fmt.bufPrint(&key, "/other/{d}", .{i}), &bytes);
+        }
+        var actual: [64]u8 = undefined;
+        try source.readInto(4096, &actual);
+        try std.testing.expectEqualSlices(u8, bytes[4096..][0..actual.len], &actual);
+        try std.testing.expect((try writer.file.check()).valid);
+    }
+}
+
+test "lite detached resident staging reclaims clean cache credit outside publication" {
+    const resources = @import("../resource_manager.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resident-credit.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const registry = try store.artifactRegistry();
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.lite_native_page_cache)] = .{ .hard_limit_bytes = 4096 };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    const CleanCache = struct {
+        credit: ?resources.Reservation,
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            var credit = self.credit orelse return 0;
+            self.credit = null;
+            const released = credit.bytes;
+            credit.release();
+            return released;
+        }
+    };
+    var clean: CleanCache = .{ .credit = try manager.reserveWithoutReclaim(.lite_native_page_cache, 4096) };
+    defer if (clean.credit) |*credit| credit.release();
+    const reclaim_id = try manager.registerReclaimer(.lite_native_page_cache, &clean, CleanCache.reclaim);
+    defer manager.unregisterReclaimer(reclaim_id);
+    try std.testing.expectError(error.ResourceBudgetExceeded, OwnedBytes.copy(registry, &manager, "normalized postings"));
+    try std.testing.expectEqual(@as(usize, 0), clean.calls);
+    const resident = try OwnedBytes.copyDetached(registry, &manager, "normalized postings");
+    try std.testing.expect(clean.calls > 0);
+    try std.testing.expectEqualStrings("normalized postings", resident.data);
+    resident.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
+}
+
+test "lite resident source handoff shares exact bytes across runtime close and rejects digest collisions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resident-handoff.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var first = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    var first_live = true;
+    defer if (first_live) first.close();
+    first.maintenance_start_suppressed = true;
+    try first.file.putIndexCatalogRecord("/segment", "unchanged postings");
+    const first_registry = try first.artifactRegistry();
+    var source = (try first_registry.openResident("/segment")).?;
+    const pointer = source.ranges.ptr;
+    const identity = source.ranges.immutable_identity.?;
+    var source_live = true;
+    defer if (source_live) source.close();
+    var working: WorkingSet = .{};
+    defer working.clear();
+    working.capture(first_registry, first_registry.inode, 0, 1);
+    try std.testing.expectEqual(@as(usize, 1), working.count);
+    try std.testing.expectEqual(@as(u64, 0), working.range_bytes);
+    source.close();
+    source_live = false;
+    first.close();
+    first_live = false;
+    var second = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer second.close();
+    second.maintenance_start_suppressed = true;
+    const registry = try second.artifactRegistry();
+    var reused = (try registry.openResident("/segment")).?;
+    defer reused.close();
+    try std.testing.expectEqual(pointer, reused.ranges.ptr);
+    working.capture(registry, registry.inode, 0, working.expires_ns);
+    try std.testing.expectEqual(@as(usize, 1), working.count);
+    // A root or pathname can be reused, while its content has changed.
+    try second.file.putIndexCatalogRecord("/segment", "different postings");
+    var changed = (try registry.openResident("/segment")).?;
+    defer changed.close();
+    try std.testing.expect(changed.ranges.ptr != pointer);
+    const collision = try OwnedBytes.copy(registry, null, "different postings");
+    defer collision.deinit();
+    collision.identity = identity;
+    try std.testing.expect(findResident(collision) == null);
+    var bytes: [18]u8 = undefined;
+    try reused.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("unchanged postings", &bytes);
+    working.observe(registry.inode + 1, working.expires_ns);
+    try std.testing.expectEqual(@as(usize, 0), working.count);
+}
+
+test "lite resident source handoff bounds weak registration and retained memory without file ranges" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resident-handoff-bounds.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const registry = try store.artifactRegistry();
+    var sources: [130]Source = undefined;
+    var initialized: usize = 0;
+    defer for (sources[0..initialized]) |*source| source.close();
+    for (&sources, 0..) |*source, i| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, i, .little);
+        const owned = try OwnedBytes.copy(registry, null, &bytes);
+        source.* = owned.source();
+        initialized += 1;
+    }
+    const checkpoint = store.file.activeCheckpoint();
+    var working: WorkingSet = .{};
+    defer working.clear();
+    working.capture(registry, registry.inode, 0, 1);
+    try std.testing.expect(working.count != 0 and working.count <= WorkingSet.max_entries);
+    try std.testing.expect(working.bytes <= WorkingSet.max_bytes);
+    try std.testing.expectEqual(@as(u64, 0), working.range_bytes);
+    try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+    working.observe(registry.inode, working.expires_ns);
+    try std.testing.expectEqual(@as(usize, 0), working.count);
+}
+
+test "lite immutable construction source pooling follows exact extents across numerical aliases" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/construction-alias-pool.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var construction = try store.beginArtifactConstruction();
+    defer construction.deinit();
+    const payload: [65536]u8 = @splat('p');
+    try construction.append(&store, &payload);
+    try construction.seal(payload.len);
+    const key = try a.dupe(u8, construction.key);
+    defer a.free(key);
+    var frozen = try construction.prepareSource(&store, key, false);
+    defer frozen.close();
+    const Link = struct {
+        key: []const u8,
+        path: []const u8,
+        fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            try file.linkArtifactConstruction(request.key, request.path, payload.len);
+        }
+    };
+    var link: Link = .{ .key = key, .path = "/index/first" };
+    try store.submitIndexMutation(&link, Link.apply, true);
+    link.path = "/index/second";
+    try store.submitIndexMutation(&link, Link.apply, true);
+    var first = try store.openArtifactSource("/index/first");
+    defer first.close();
+    var second = try store.openArtifactSource("/index/second");
+    defer second.close();
+    try std.testing.expectEqual(frozen.ranges.ptr, first.ranges.ptr);
+    try std.testing.expectEqual(frozen.ranges.ptr, second.ranges.ptr);
+    try store.file.putIndexCatalogRecord("/index/first", "different physical value");
+    var changed = try store.openArtifactSource("/index/first");
+    defer changed.close();
+    try std.testing.expect(changed.ranges.ptr != frozen.ranges.ptr);
+    try store.file.deleteIndexCatalogRecord("/index/second");
+    var actual: [32]u8 = undefined;
+    try second.readInto(1024, &actual);
+    try std.testing.expectEqualSlices(u8, payload[1024..][0..actual.len], &actual);
 }

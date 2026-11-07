@@ -1,0 +1,645 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-03",
+  "pr": 1454,
+  "issue": 1431,
+  "reviewed_head": "bc6f685247705e5c6c51bba3219c503f6408c531",
+  "verdict": "Several distinct causes are established. The dominant remaining optimized E2E bottleneck has not yet been isolated; the branch is not qualified.",
+  "scope": [
+    "Original importer and its public C API call sequence",
+    "Foreground admission and SQL/primary staging",
+    "Detached replay capture, computation, publication, and progress",
+    "Allocator certificates, cache transfer, and checkpoint adoption",
+    "Maintenance scheduling, retirement, and reader epochs",
+    "Existing private candidate profiles and numeric benchmark receipts"
+  ],
+  "constraints": [
+    "No baseline compilation or reference execution; reuse frozen artifacts and completed observations",
+    "Local Debug diagnosis; wolfspider only for final optimized qualification",
+    "Unchanged original importer; sibling retry/timeout edits excluded",
+    "Private payloads, database contents, paths, and identifiers are not included",
+    "No factory launches; full factory is owned by Beads"
+  ],
+  "cost_model": {
+    "foreground": "Local-gate wait + path-queue/flock wait + refresh/recovery + primary/SQL preparation + durable publication + requested visibility. Only admission/capacity waiting belongs to Busy budget.",
+    "replay": "Capture + source collection/hydration + index preparation + repeated admission/validation/publication + durable consumer progress + retirement.",
+    "feedback": "If replay throughput falls below admitted production, live journal/control debt grows. Long source epochs can additionally delay physical reuse; appends enlarge the allocator, making any allocator-wide reload more expensive. These are coupled mechanisms, not proof that every link dominates this workload.",
+    "counters": "Nested/concurrent counters cannot be summed as exclusive wall time. replay_publication_overhead includes waits, validation, and publication hold, and path hold includes reader-registration cleanup. Completed batch profiles omit failed calls."
+  },
+  "established": [
+    {
+      "cause": "Cross-process unfair flock acquisition",
+      "status": "FIFO queue implementation and component/process tests address starvation; it does not explain single-importer failure."
+    },
+    {
+      "cause": "Quadratic borrowed-input ownership accounting",
+      "status": "Fixed in cde20c990e2a62922fb2db7d1169c077cb7e52a6; interval-index tests and Debug C API integration pass. Populated importer still fails after this fix."
+    },
+    {
+      "cause": "Redundant full allocator digest rebuild after verified cache transfer",
+      "status": "Fixed in 39406ce4e3c5fdf4e9062da653abad2686c78a08. Exact certified-replacement regression failed before (one rebuild) and passes after with unchanged ledger/cache/counters. Four targeted contracts pass. Populated importer still fails."
+    },
+    {
+      "cause": "Replay cannot yield within an oversized journal record",
+      "status": "Confirmed from code and immutable inventory: a record can contain 1024 changed keys. First-record overflow exception accepts it, and the time check occurs after apply. Full-text apply splitting loops through every subchunk before returning; the bounded async caller also does not pass a nonzero max_items_per_window.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig:391",
+        "zig/pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig:432",
+        "zig/pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig:444",
+        "zig/pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig:786",
+        "zig/pkg/antfly-embedded/src/storage/db/db.zig:55885"
+      ]
+    },
+    {
+      "cause": "Expensive preparation can precede quota refusal",
+      "status": "Public-batch cold-open probe spends 20\u201350 seconds in refused preparation before the five-second capacity wait, under local host load. This proves the path exists, not that it explains the warm importer failure."
+    }
+  ],
+  "latest_completed_importer_evidence": {
+    "head": "bc6f685247705e5c6c51bba3219c503f6408c531",
+    "mode": "Debug",
+    "qualification": false,
+    "result": {
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 337.48673891602084,
+      "peak_native_builds": 18,
+      "metrics_enabled": true,
+      "library_sha256": "a44cc07f9c2f3a66ed6dcf76918b3839af5afae1406ec6ade981162a4c96fa9b",
+      "public_errors": [
+        "LiteReplayBacklogExceeded"
+      ],
+      "seed_sha256": "2002c183a24efebf17a7bc1d1a0e90658d5b7c9270857b874a7b0528e43fc8d1",
+      "seed_copy_method": "native_stable_snapshot",
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+    },
+    "completed_primary_batch_profiles": 32,
+    "completed_primary_documents": 32768,
+    "completed_primary_profile_seconds": 48.294,
+    "completed_primary_store_seconds": 34.241,
+    "identity_metadata_write_operations": 163968,
+    "store_write_operations": 269184,
+    "completed_text_worker_profiles": 55,
+    "completed_text_worker_documents": 15228,
+    "completed_text_worker_seconds": 82.257,
+    "completed_text_prepare_seconds": 35.086,
+    "longest_completed_text_worker_seconds": 10.49,
+    "admission_stage_refusals": {},
+    "physical_replay_quota_refusals": 3,
+    "maintenance_failure_enums": {
+      "storage/EnrichmentWaitCanceled": 42
+    },
+    "limits": [
+      "Corrected native snapshot publication preserves the source hash and safely binds destination reader coordination.",
+      "No completed owner-close summary was emitted in this run, so owner/path totals and SQL overlay totals are unavailable; unknown is not zero.",
+      "Successful-operation profiles omit failed operations and do not cover all SQL work. Nested and parallel times are not additive elapsed time.",
+      "Eighteen native builds overlap; no timing comparison or optimized performance conclusion.",
+      "This still reproduces quota refusal after correcting the raw-copy artifact."
+    ],
+    "private_receipts": [
+      "root-cause/local-populated-input7-bc6-native-copy/result.json",
+      "root-cause/local-populated-input7-bc6-native-copy/seed-copy.json",
+      "root-cause/local-populated-input7-bc6-native-copy/numeric-stage-evidence.json",
+      "root-cause/local-populated-input7-bc6-native-copy/debt-after-failure.json"
+    ],
+    "read_only_inspection": {
+      "integrity_valid": true,
+      "file_bytes": 1480339456,
+      "backlog": {
+        "bytes": 16760435,
+        "records": 359,
+        "limits": {
+          "bytes": 16777216,
+          "records": 4096
+        }
+      },
+      "namespaces": 45,
+      "namespaces_with_index_debt": 2,
+      "qualification": false
+    }
+  },
+  "hypotheses": [
+    {
+      "id": "H1",
+      "priority": 1,
+      "hypothesis": "Allocator authority is repeatedly reconstructed when foreground and detached publication alternate.",
+      "confidence": "Allocator loading and digest rebuilding are now also observed in admission in the correctly bound original-importer sample. Repeated-work counts and optimized E2E share still require current-run totals.",
+      "mechanism": "Verification flag and mutable ledger/digest have different ownership. Maintenance entry rebinds checkpoints and may admit a certificate without borrowing the latest quiescent cache. Active roots are deliberately excluded from takeAvailableAllocator; a verified flag alone does not guarantee a warm ledger. Cold ledger load/certificate hashing can execute while the writer fence is held.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:1609",
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:1784",
+        "zig/pkg/antfly-embedded/src/storage/lite/native.zig:5399",
+        "zig/pkg/antfly-embedded/src/storage/lite/native.zig:5600"
+      ],
+      "discriminator": "Measure full_loads, digest_rebuilds, journal rebase hit/miss, ledger-covered pages, and their time separately for foreground refresh, maintenance admission, and first allocation. Alternate those writers on a fixed logical dataset with progressively larger allocator ledgers. A warm fixed-tip publication should not perform allocator-wide work.",
+      "solution": "Separate the per-path mutable writer allocator/cache from logical serving runtimes and immutable readers. Give it explicit exclusive ownership and checkpoint/inode identity. Transfer or rebase checked state once at writer admission; validate foreign ancestry with the existing certificate protocol. Detached graph proofs run off the writer gate. Never share a mutable ledger with active readers/tasks or skip independent integrity authentication."
+    },
+    {
+      "id": "H2",
+      "priority": 1,
+      "hypothesis": "Runtime refresh, catalog/input checks, and registration churn occupy a broad writer critical section.",
+      "confidence": "Gate-held foreground table/index opening by maintenance is observed in both the corrected original-importer sample and earlier quiet-service sample. Its optimized E2E share remains unmeasured.",
+      "mechanism": "The owner/path fence covers probing/adoption, recovery, index runtime opens and artifact lease publication as well as the mutation. A background publication moves the tip; later foreground or detached work can reopen logical state. Lease acquisition time alone does not measure this service cost. The maintenanceTurn scheduling path first calls tables.get on the foreground root, then refreshMaintenanceSnapshotAt creates an independent source runtime. Source captures deliberately do not reuse artifact-only logical wrappers. This can load serving and detached index state for background work. Retain existing logical-generation fast paths; avoid requiring a serving table open merely to discover/schedule detached work.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:1061",
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:242",
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:2639",
+        "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig:3154"
+      ],
+      "discriminator": "Attribute gate wait, queue/flock wait, file open/stat/header reads, recovery checks, allocator adoption, index opens/lease writes, publication body, sync, and registration cleanup with nonoverlapping intervals. Test logical metadata unchanged versus changed, and one versus many namespaces/segments.",
+      "solution": "Keep stable serving objects keyed by logical catalog/index generation, and a separate physical commit coordinator keyed by admitted checkpoint. Prepare immutable output off the fence. Revalidate only affected namespace/incarnation/index/source dependencies under the fence. Capture safe index read windows once per operation instead of repeatedly requiring exclusive admission. Preserve recovery and no-ABA identity fences; do not skip them."
+    },
+    {
+      "id": "H11",
+      "priority": 1,
+      "hypothesis": "A file-wide primary witness repeatedly invalidates incremental SQL constraint overlays on unrelated writes.",
+      "confidence": "Reproduced on a fresh, correctly bound current-candidate database with operation counters; current original-importer sample also reaches this path. Its optimized E2E share is not yet measured.",
+      "mechanism": "overlayWitness includes whole-file logical.primary and logical.metadata. stampLogicalGenerations advances primary whenever the document/index/namespace-directory roots change, including unrelated namespaces and control records. A changed witness rebuilds requestsThrough(previous entry_count). Interleaving unrelated writes between N staged statements can therefore revisit N*(N-1)/2 prior entries. The existing incremental fold/overlay helps only while its broad witness remains valid.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/capi/sql_session.zig:100",
+        "zig/pkg/antfly-embedded/src/capi/sql_session.zig:111",
+        "zig/pkg/antfly-embedded/src/storage/lite/native.zig:6145"
+      ],
+      "probe": {
+        "statements": 16,
+        "quiet_overlay_hits": 15,
+        "quiet_rebuilds": 1,
+        "quiet_prior_entries_rebuilt": 0,
+        "interleaved_unrelated_writes_overlay_hits": 0,
+        "interleaved_rebuilds": 16,
+        "interleaved_prior_entries_rebuilt": 120,
+        "both_cases_acknowledged_rows": 16,
+        "both_integrity_valid": true,
+        "warning": "Same-candidate operation-count probe; no historical reference or timing benchmark. An earlier preliminary run saw three quiet invalidations, consistent with background work also affecting the broad witness."
+      },
+      "discriminator": "Vary statements at fixed row width and interleave writes to an unrelated table/control family versus a referenced/unique-constraint table. Track rebuilt entries, catalog opens, version conflicts, and commit validation. Require peer changes to relevant rows, constraints, catalog, incarnation or replacement inode to invalidate the cache.",
+      "solution": "Retain incremental staged effects, but validate them against durable identities for the affected namespace/constraint dependency set, excluding unrelated replay/control publications. A dependency witness must include relevant table incarnations, schema/constraint generations and committed row state actually consulted, including FK/cascade/unique dependencies and repair coverage. Revalidate these under admission and at commit; rebuild only on relevant changes. Do not simply delete the global witness or keep stale cascades. Avoid pinning an entire old database snapshot for a long SQL transaction as a shortcut.",
+      "private_receipt": "root-cause/sql-overlay-scope-cli-bc6/result.json",
+      "reproducer": "scripts/bench/lite_sql_overlay_scope.py --library <frozen-candidate> --directory <fresh-directory> --statements 16"
+    },
+    {
+      "id": "H3",
+      "priority": 1,
+      "hypothesis": "Oversized work units defeat replay scheduling and prolong source epochs.",
+      "confidence": "Atomicity/budget mismatch confirmed; contribution to optimized throughput not quantified.",
+      "mechanism": "The 25 ms target is checked only after whole-record apply. Key/descriptor bytes do not predict hydrated document text, token expansion, graph work, or publication cost. Reducing a record-count budget cannot make a 1024-document record small.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/storage/db/derived/replay_budget.zig:43",
+        "zig/pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig:786",
+        "zig/pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig:903"
+      ],
+      "discriminator": "Keep total logical data fixed while varying documents per record, text bytes per document, projected fields, and graph fanout. Measure whole-turn maximum duration, source-epoch age, output bytes, committed cursor movement, and stale-output discard rate; do not use only median throughput.",
+      "solution": "Represent durable replay progress below the whole-batch level: namespace incarnation + index generation + journal sequence + fragment/item cursor, with bounded source hydration and output staging. Publish each durable fragment with its continuation atomically. Preserve public applied-sequence/visibility only when all preceding fragments are durable. An alternative is bounded journal fragments appended atomically with the primary transaction and an explicit completion manifest. Choose one schema/protocol, not an in-memory offset. Long individual documents need streaming analysis/spooling; time limits remain soft around OS sync."
+    },
+    {
+      "id": "H4",
+      "priority": 2,
+      "hypothesis": "Metadata/write and durability amplification dominates serialized work.",
+      "confidence": "Operation amplification observed; physical I/O and sync dominance unproven.",
+      "mechanism": "11 completed primary batches report 11264 documents, 56364 identity-metadata writes, and 92347 store writes. Replay adds index files, manifests, leases, watermarks and retirement transactions. Many small durable publications can pay repeated admission, checkpoint and fsync overhead. Store already implements bounded group commit (up to 64 queued compatible requests), and syncIndexContents skips an already-durable checkpoint. Investigate remaining sequential transitions; adding another generic group-commit mechanism is not the initial fix.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/storage/db/mutation_commit.zig:2467",
+        "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig:358",
+        "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig:647"
+      ],
+      "discriminator": "Count physical page writes, checkpoint publications and sync calls/time per successful primary batch and per replayed source byte. Separate log/control writes from user payload. An unsynced candidate ablation may diagnose sync cost, but cannot qualify production durability.",
+      "solution": "Publish prepared immutable index output, manifest and its durable consumer progress in bounded groups under one checked native transaction where representable. Batch identity/metadata updates and avoid duplicate checkpoint/sync transitions. Preserve write-ahead/data-before-watermark ordering and acknowledged-write durability. Add group commit only after sync count/time supports it."
+    },
+    {
+      "id": "H5",
+      "priority": 2,
+      "hypothesis": "A global replay quota is blocked by a namespace/consumer that is not scheduled promptly enough.",
+      "confidence": "Cold probe confirms unrelated startup turns before quota relief; warm importer causality unresolved.",
+      "mechanism": "The quota is file-wide, while runnable source notifications and scheduling state are owner-local and startup recovery audits namespaces. A newly opened/foreign owner may spend its wait budget elsewhere before servicing the minimum retention watermark.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:2330",
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:2380",
+        "zig/pkg/antfly-embedded/src/capi/db.zig:4759"
+      ],
+      "discriminator": "Populate many healthy namespaces and one debt-heavy namespace. Reopen a writer and record time-to-first-credit-release, queue visits by opaque namespace ordinal, and each blocking consumer watermark. Repeat warm and cold separately.",
+      "solution": "Persist bounded runnable/debt summaries atomically with source append and consumer progress, so foreign owners can identify work without whole-catalog rediscovery. Under quota pressure prioritize consumers that release the oldest retained debt, with aging so other namespaces progress. Keep explicit reserved capacity for consumers/recovery and crash-safe maintenance ownership."
+    },
+    {
+      "id": "H6",
+      "priority": 2,
+      "hypothesis": "Source hydration, repeated analysis bookkeeping, and segment construction consume replay CPU.",
+      "confidence": "Older Debug profiles show these paths; accounting algorithm fixed; remaining dominance unknown.",
+      "mechanism": "Source payload reads, extraction/identity lookup, hashing text for reuse, tokenization/stemming and output construction are real work. Cache discovery, lookups and hash-map growth can hash the same text repeatedly. The source-token reuse cache is document-scoped, so repeated content across unrelated documents is intentionally not a global semantic cache.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/section/analysis_reuse.zig:27",
+        "zig/pkg/antfly-embedded/src/section/analysis_reuse.zig:102",
+        "zig/pkg/antfly-embedded/src/storage/db/mutation_materialization.zig:3515"
+      ],
+      "discriminator": "Sample foreground and maintenance independently on the current candidate; separate runnable CPU from blocking. Sweep text length, number of distinct projected fields, duplicate source aliases, unique values, multilingual input, and graph fanout. Count source bytes hydrated and bytes hashed/analyzed, not just keys replayed.",
+      "solution": "Retain the new bounded alias index. If repeated hash work remains material, precompute a collision-safe reusable analysis key/digest once per source contribution and retain content equality plus analyzer signature/field/offset semantics. Batch source hydration and bound scratch memory. Preserve analyzer output for all configured languages; changing English stemming is not a contention fix."
+    },
+    {
+      "id": "H7",
+      "priority": 2,
+      "hypothesis": "Long read/artifact lifetimes amplify growth and thereby increase allocator and I/O service costs.",
+      "confidence": "General retention mechanism is established; the new quiet probe blocked reuse due to its mismatched clone namespace, so it does not demonstrate a live-reader lifetime defect.",
+      "mechanism": "A long detached turn retains a source epoch until every replay cursor closes. Data retirement may be safe only after that epoch advances. Artifact leases additionally protect immutable inputs. File growth can therefore coexist with a bounded journal quota.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:2545",
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:2629",
+        "zig/pkg/antfly-embedded/src/storage/lite/reclamation.zig:85"
+      ],
+      "discriminator": "Time-series pending/reusable pages, blocked appends, oldest data and metadata epochs, oldest reader age, artifact bytes, live replay/control bytes and compact size while writers remain active. Correlate epoch release with reuse without relying on idle shrink.",
+      "solution": "Give source windows and immutable artifacts separate explicit lifetimes; release primary epochs between durable replay fragments. Ensure bounded retirement service gets writer opportunities during traffic. Preserve full metadata fences for allocator/integrity inspection and inode-stable alias protection."
+    },
+    {
+      "id": "H8",
+      "priority": 2,
+      "hypothesis": "Late capacity refusal wastes primary preparation and holds the gate before yielding to consumers.",
+      "confidence": "Confirmed in focused near-capacity cold public-batch probe; not latest below-cap FileBusy.",
+      "mechanism": "Exact quota increase is checked at the physical writer after substantial extraction, identity and SQL work. Refused preparation is excluded from the wait budget, but still delays the consumer while admission is held. Increasing Busy timeout does not remove this work.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/storage/lite/native.zig:8336",
+        "zig/pkg/antfly-embedded/src/capi/db.zig:4782",
+        "zig/pkg/antfly-embedded/src/storage/db/mutation_commit.zig:3021"
+      ],
+      "discriminator": "Near quota, measure primary preparation before a refusal and before any durable commit, plus consumer progress during the released wait. Test plain batches and SQL transaction reservations separately, including non-idempotent transforms.",
+      "solution": "Derive/reserve replay growth before expensive physical staging, within the same rollback/atomic-commit protocol. Prepare safe reusable work outside publication admission and revalidate affected versions on entry. Once refused, wait on capacity progress outside registry/runtime/path locks rather than rebuilding the request or polling whole metadata. Preserve applied/not-applied/unknown outcomes."
+    },
+    {
+      "id": "H9",
+      "priority": 3,
+      "hypothesis": "Unbounded proof-lane wait or mandatory drain masks the exact source of Busy/tail latency.",
+      "confidence": "Static gap: Connection.refresh waits unconditionally for another allocator proof after releasing the gate. This is not evidence it fired in the failing importer.",
+      "sources": [
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig:3318"
+      ],
+      "discriminator": "Use stage-tagged refusals and separately time proof-mutex wait, actual detached proof, gate reacquisition and stale-tip retry. The tested owner proof counters are zero in several failed imports, so do not assume a whole-file proof.",
+      "solution": "Bound contention waits by the shared admission deadline while keeping actual proof time outside the wait budget. Cancellation must drain owned tasks before releasing borrowed state; timeout must not authorize an already committed replay. Reconcile overlapping changes in draft PR1479 before landing both."
+    },
+    {
+      "id": "H10",
+      "priority": 3,
+      "hypothesis": "Host CPU/memory/I/O pressure inflates measured service time and changes which stage times out.",
+      "confidence": "Confirmed confound: 8\u201318 native builds overlap diagnostic imports; current local build is frequently I/O-blocked.",
+      "discriminator": "Record CPU/runnable versus blocked time and host pressure. Use operation counts and deterministic invariants locally; measure production performance only with final candidate on reserved wolfspider.",
+      "solution": "Do not tune architecture to noisy Debug wall times. Avoid simultaneous qualification/compilation and reuse cached references. This confound does not erase functional failure under load."
+    }
+  ],
+  "recommended_architecture": {
+    "direction": "Stable per-path commit/allocator authority, generation-scoped serving runtimes, namespace/dependency-scoped SQL witnesses, durable bounded replay continuations, and capacity-aware fair scheduling.",
+    "order": [
+      "Use the corrected fixture and failure-stage evidence: the current importer reaches replay-capacity refusal, not a traced local/path Busy refusal. Attribute the dominant writer-held and SQL service operation before a broad ownership rewrite.",
+      "Prove remaining allocator/cache or runtime-admission work with a focused regression before modifying its ownership protocol.",
+      "Remove file-wide invalidation of incremental SQL overlays only after implementing complete durable dependency witnesses and testing relevant cross-table changes, DDL, replacement, savepoints and commit validation.",
+      "Introduce genuinely resumable replay units with crash-safe progress, bounded hydration/staging, and atomic visibility rules.",
+      "Remove measured publication/sync amplification and prioritize quota-releasing work without starving other consumers.",
+      "Verify bounded live retention and reuse while traffic continues, then run candidate-only optimized qualification.",
+      "Expose explicit coordination/reuse refusal reasons so a portable raw file copy cannot be mistaken for a reader-retention performance regression; use native snapshot publication in repeatable fixtures."
+    ],
+    "avoid": [
+      "Another timeout increase as evidence of fixing service throughput",
+      "Changing analyzer/language semantics to speed one corpus",
+      "Disabling reuse validation or snapshot protection",
+      "Raising/removing the journal cap without consumer-progress proof",
+      "Sharing mutable allocator state with active snapshots",
+      "Holding a writer lease across unrelated public API calls",
+      "Adding a broker/daemon or a new WAL architecture before the remaining service cost is established"
+    ],
+    "larger_options": "A writer broker or separate append-first WAL may be reasonable if direct multiprocess coordination or primary page publication remains dominant after bounded work/cache ownership fixes. Either introduces a new crash/recovery and deployment protocol; present evidence does not justify that jump."
+  },
+  "local_experiment_plan": [
+    {
+      "experiment": "Current stage-tagged original importer on the immutable populated prefix",
+      "purpose": "Identify the actual Busy refusal; original importer and inputs unchanged; candidate only."
+    },
+    {
+      "experiment": "Alternating foreground/maintenance fixed-tip allocator ownership probe",
+      "purpose": "Assert no new full load/digest rebuild for warm exact-tip admission; then exercise authenticated foreign rebase, stale/corrupt caches, active readers and replacement inode."
+    },
+    {
+      "experiment": "Fixed-total replay work with varying record size, hydrated text and fields",
+      "purpose": "Demonstrate real bounded continuation and separate collection-memory limits from source/analysis work."
+    },
+    {
+      "experiment": "Many idle namespaces plus one quota-blocking namespace, cold and warm",
+      "purpose": "Measure first useful consumer progress and no-starvation scheduling."
+    },
+    {
+      "experiment": "Publication operation counters and independent current-candidate CPU samples",
+      "purpose": "Separate allocator, source lookup, analysis, page writes and sync; exclude failed-call profiling blind spots."
+    },
+    {
+      "experiment": "Crash/reopen and structural-mutation cases for every continuation/cache change",
+      "purpose": "No skipped fragment, duplicate non-idempotent transform, watermark-ahead-of-output, stale generation publication, or reader corruption."
+    }
+  ],
+  "qualification_acceptance": [
+    "The known populated/full original-importer workload completes without Busy/backlog failure; preserve original-importer hash and frozen-input hashes.",
+    "Compare candidate-only optimized results with cached historical observations, with source/compiler/artifact provenance and no compilation overlap.",
+    "Verify acknowledged writes, integrity, logical field identities, index catch-up/search canary and reopen; primary-write survival alone is insufficient.",
+    "Original importer contention, large graph, append and indexed churn all make progress with bounded tails; record every participant rather than aggregate throughput only.",
+    "Ten-minute active-write soak shows stable throughput and bounded live/control/retired storage, with reclamation making progress during traffic.",
+    "Complete applicable CI/model gates; full factory remains Beads. Keep PR1454 draft and issue1431 open until qualification is complete."
+  ],
+  "new_work_this_investigation": [
+    "Traced current admission, allocator transfer, maintenance/replay, physical quota and importer projection call paths.",
+    "Extracted a numeric-only stage report from existing private current-candidate logs; no baseline rerun.",
+    "Prepared this falsifiable hypothesis/architecture report; no speculative production architecture patch.",
+    "Ran one candidate-only 60-second quiet-service diagnostic on an immutable failed-candidate snapshot clone, with before/after allocator, publication and reclamation counters.",
+    "Collected a two-second external system sample without debugger attachment; raw stacks remain private.",
+    "Repository cache GC finished successfully, reclaiming approximately 0.8 GiB; active build caches preserved.",
+    "Found and reproduced a fixture identity error: raw cp clones disable reuse. Switched the original-importer helper to native snapshot publication, and explicitly invalidated raw-clone performance/retention attribution.",
+    "Corrected native-snapshot original-importer sample corroborates allocator admission, gate-held maintenance index opening, and SQL overlay work without the raw-copy namespace artifact.",
+    "Fresh synthetic SQL operation-count probe reproduces broad invalidation: unrelated primary writes force 120 prior-entry rebuilds for 16 statements; rows and integrity pass in both cases.",
+    "Updated the tracked segment-admission benchmark to publish native snapshots instead of raw filesystem clones.",
+    "Completed the corrected native-snapshot original importer: failed with LiteReplayBacklogExceeded after 32 completed primary batches; zero recorded admission-stage refusals. The failure survives correction of the fixture identity issue.",
+    "Read-only inspection of the correctly bound failed importer snapshot completed: physical integrity passes; replay/index debt remains. This does not qualify import completion or index catch-up."
+  ],
+  "pending": "The local causal investigation and targeted checks are complete. Production architectural fixes, their regression validation, and candidate-only final optimized qualification remain pending. Keep PR1454 draft and issue1431 open.",
+  "new_quiet_service_evidence": {
+    "library_source": "39406ce4e3c5fdf4e9062da653abad2686c78a08",
+    "mode": "Debug",
+    "qualification": false,
+    "scope": "Stopped candidate snapshot; cold open then quiet service. Status observations may perturb service. Not original-importer or reference performance qualification.",
+    "source_sha256": "73c3a942012cba7b9aeb6fa73966d2d4123f2e3c3780c81810913a0c4f82a4cf",
+    "seconds": 71.60115712496918,
+    "service_observation_window_seconds": 60.17026933399029,
+    "summary": {
+      "observation_seconds": [
+        0.13089350005611777,
+        1.6235652080504224
+      ],
+      "duration_seconds": 71.60115712496918,
+      "backlogs": [
+        {
+          "bytes": 16727202,
+          "records": 366,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        },
+        {
+          "bytes": 14975942,
+          "records": 338,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        }
+      ],
+      "allocator_delta": {
+        "full_loads": 11,
+        "full_load_ns": 13239981544,
+        "journal_rebases": 0,
+        "journal_rebase_ns": 0,
+        "journal_rebase_attempts": 0,
+        "journal_rebase_misses": 0,
+        "journal_rebase_auth_refusals": 0,
+        "journal_rebase_digest_mismatches": 0,
+        "retained_rebase_bases": 0,
+        "pending_base_transfers": 0,
+        "cache_transfers": 105,
+        "artifact_source_opens": 70,
+        "artifact_source_reuses": 386,
+        "digest_rebuilds": 11,
+        "digest_rebuild_ns": 10266333750,
+        "reuse_lock_refusals": 269,
+        "appended_pages": 14237,
+        "reuse_blocked_append_pages": 14237
+      },
+      "reclamation_before": {
+        "pending_retirement_objects": 385901,
+        "reusable_pages": 4640,
+        "retired_objects_serviced": 0,
+        "reused_pages": 0,
+        "current_file_bytes": 2931298304
+      },
+      "reclamation_after": {
+        "pending_retirement_objects": 387382,
+        "reusable_pages": 4640,
+        "retired_objects_serviced": 0,
+        "reused_pages": 0,
+        "current_file_bytes": 2989613056
+      },
+      "owner_delta": {
+        "maintenance_database_turns": 18,
+        "maintenance_source_turns": 18,
+        "maintenance_priority_turns": 14,
+        "maintenance_audit_turns": 12,
+        "maintenance_artifact_only_turns": 0,
+        "maintenance_idle_namespace_turns": 0,
+        "maintenance_capture_ns": 4066990000,
+        "maintenance_proof_ns": 16000,
+        "maintenance_replay_ns": 28087791000,
+        "maintenance_artifacts_ns": 1000997000,
+        "text_merge_prepare_ns": 0,
+        "text_merge_staging_ns": 23891960000,
+        "text_merge_publication_ns": 0,
+        "maintenance_storage_ns": 356651000,
+        "generated_storage_groups": 40,
+        "serving_runtime_refreshes": 18,
+        "serving_runtime_refresh_ns": 651926000,
+        "replay_refused_preparation_ns": 0,
+        "replay_index_groups": 7,
+        "replay_publication_overhead_ns": 2474830532,
+        "replay_index_admission_ns": 3733000,
+        "replay_metadata_admission_ns": 3440000,
+        "maintenance_publication_overhead_ns": 2633645202,
+        "publication_hold_ns": 3139719124,
+        "replay_metadata_groups": 7,
+        "maintenance_errors": 0,
+        "maintenance_queue_timeouts": 0,
+        "allocator_proof_ns": 0,
+        "allocator_proof_max_ns": 0,
+        "mutation_admission_ns": 0,
+        "mutation_admission_max_ns": 0
+      }
+    },
+    "sample": {
+      "duration_seconds": 2,
+      "sample_exit_code": 0,
+      "observation": "The maintenance thread is sampled in maintenanceTurn -> tables.get -> openTable -> DB.open -> loadIndexesDeferredBackfill; it also enters refreshMaintenanceSnapshotAt. Index opening reaches reader-fence registration, immutable-source opens, text dictionary metadata publication and sync. Inclusive samples are not additive or percentages of the whole importer. The sample is from stopped-snapshot service with status observation, not the original importer."
+    },
+    "interpretation": [
+      "Residual allocator-wide work remains after the verified-refresh fix: 11 full loads and 11 digest rebuilds despite 105 cache transfers, across 18 source turns. These are allocator ledger/certificate operations, not whole-file graph proof walks.",
+      "The observed full-load and digest timers total about 23.5 seconds in this local service window, nested inside other stage timers; no ReleaseFast dominance claim.",
+      "All 14237 newly appended pages were marked reuse-blocked; the foreground status view reported zero reused pages and no serviced retirements. The precise blocking reader/lease is not attributed. This is a retention/reclamation investigation lead, not proof of corruption or no global service.",
+      "Quiet replay does release journal credit: bytes fall from 16727202 to 14975942. Consumers are slow, not completely unable to progress."
+    ],
+    "private_receipts": [
+      "root-cause/allocator-handoff-394-quiet/result.json",
+      "root-cause/allocator-handoff-394-quiet/summary.json",
+      "root-cause/allocator-handoff-394-quiet/sample.txt"
+    ],
+    "fixture_warning": "Raw clone namespace mismatch confirmed. The blocked-reuse result is explained by the fixture; allocator/index-opening paths require reproduction with native snapshot publication."
+  },
+  "fixture_correction": {
+    "status": "Confirmed with a current-candidate synthetic counter probe",
+    "mechanism": "Raw filesystem clones retain reader_epoch_namespace in the header but have no matching namespace authority at their destination. reader_epochs.scan returns WouldBlock and the safe fallback denies retirement/reuse. Namespace identity includes a directory inode, so copying the sidecar directory is not a valid repair. Native copy_stable_snapshot prepares a private destination and safely binds its final namespace.",
+    "sources": [
+      "zig/pkg/antfly-embedded/src/storage/lite/reader_epochs.zig:38",
+      "zig/pkg/antfly-embedded/src/storage/lite/reader_epochs.zig:156",
+      "zig/pkg/antfly-embedded/src/storage/lite/native.zig:12043"
+    ],
+    "probe": {
+      "raw_binding_preserved": true,
+      "native_binding_changed": true,
+      "raw_reused_pages_before": 0,
+      "raw_reused_pages_after": 0,
+      "raw_file_bytes_after": 4096000,
+      "native_reused_pages_before": 24,
+      "native_reused_pages_after": 392,
+      "native_file_bytes_after": 2113536,
+      "both_integrity_valid": true
+    },
+    "private_receipt": "root-cause/snapshot-binding-394-probe-v2/result.json",
+    "impact": [
+      "The earlier cp-based populated-prefix imports, near-quota probes, and quiet-service probes are path diagnostics on a conservatively append-only clone, not faithful evidence for ordinary writer reuse or storage plateau.",
+      "The observed repeated allocator loads and gate-held index opens remain real executed paths, but their magnitude/frequency may be amplified by clone-induced append/retirement behavior. Reproduce on a native snapshot before attributing them to the ordinary workload.",
+      "The earlier optimized full original-importer failure created a fresh database and remains valid; this correction does not establish that the production E2E issue is fixed.",
+      "The local original-importer helper now uses native copy_stable_snapshot and verifies the source hash remains unchanged. No reference binary is rerun."
+    ]
+  },
+  "diagnostic_validation": {
+    "source": "bc6f685247705e5c6c51bba3219c503f6408c531",
+    "whole_build_exit_code": 0,
+    "contracts_passed": 26,
+    "skipped": 0,
+    "failed": 0,
+    "leaked": 0,
+    "exports": 134,
+    "linkage": "passed",
+    "library_sha256": "a44cc07f9c2f3a66ed6dcf76918b3839af5afae1406ec6ade981162a4c96fa9b"
+  },
+  "corrected_native_snapshot_importer_sample": {
+    "head": "bc6f685247705e5c6c51bba3219c503f6408c531",
+    "sample_exit_code": 0,
+    "duration_seconds": 4,
+    "seed_copy_method": "native_stable_snapshot",
+    "observed_paths": [
+      "Foreground SQL: executePreparedEmbeddedSql -> resolveConflictOwners / Session.preparedConstraintOverlay / validateStaged.",
+      "Admission: Owner.refresh -> inheritAllocatorCertificate -> loadLedgerForDigest and State.rebuildFingerprintWithCancel.",
+      "Maintenance: maintenanceTurn -> tables.get -> openTable -> DB.open -> loadIndexesDeferredBackfill.",
+      "Second two-second sample: detached full-text segment preparation and configured analyzer CPU run concurrently with foreground SQL COMMIT/primary preparation. This shows real off-gate CPU work as well as serialized work; do not classify every replay second as contention."
+    ],
+    "limits": "A short inclusive stack sample verifies execution paths, not their fraction of the entire run. Debug host load prevents throughput attribution. Raw stacks remain local.",
+    "private_receipt": [
+      "root-cause/local-populated-input7-bc6-native-copy/sample.txt",
+      "root-cause/local-populated-input7-bc6-native-copy/sample-02.txt"
+    ]
+  },
+  "benchmark_validation": {
+    "native_snapshot_segment_admission": {
+      "seed": "diagnostic_completed",
+      "open": "diagnostic_completed",
+      "library_source": "bc6f685247705e5c6c51bba3219c503f6408c531",
+      "rows": 16,
+      "fields": 2,
+      "measured_opens": 3,
+      "reference_runs": 0,
+      "timing_qualification": false
+    },
+    "sql_overlay_scope": {
+      "qualification": false,
+      "scope": "Same-candidate SQL overlay operation counts; no throughput claim",
+      "library_sha256": "a44cc07f9c2f3a66ed6dcf76918b3839af5afae1406ec6ade981162a4c96fa9b",
+      "benchmark_sha256": "cda933ab33e499defb894fa783be0f136e382e6a70967260b19b139f44890d11",
+      "statements": 16,
+      "status": "diagnostic_completed",
+      "cases": {
+        "quiet": {
+          "delta": {
+            "sql_constraint_overlay_hits": 15,
+            "sql_constraint_overlay_rebuilds": 1,
+            "sql_constraint_overlay_rebuild_entries": 0,
+            "sql_constraint_overlay_evictions": 0,
+            "sql_constraint_staged_statements": 16
+          },
+          "rows": 16,
+          "integrity_valid": true
+        },
+        "unrelated_primary_writes": {
+          "delta": {
+            "sql_constraint_overlay_hits": 0,
+            "sql_constraint_overlay_rebuilds": 16,
+            "sql_constraint_overlay_rebuild_entries": 120,
+            "sql_constraint_overlay_evictions": 0,
+            "sql_constraint_staged_statements": 16
+          },
+          "rows": 16,
+          "integrity_valid": true
+        }
+      },
+      "committed_benchmark_sha256": "1607e8da17d35a28dd0fea6cbee6590027cd72df541d5bb566dca1b97e85edd7",
+      "post_run_source_change": "Required license header and repository formatting only; executed and committed Python ASTs compare equal.",
+      "executed_and_committed_ast_equal": true
+    }
+  },
+  "superseded_raw_clone_importer_evidence": {
+    "head": "39406ce4e3c5fdf4e9062da653abad2686c78a08",
+    "mode": "Debug",
+    "input_index": 7,
+    "populated_prefix_inputs": 7,
+    "result": "FileBusy; no completion; not censored",
+    "seconds": 266.7538852500729,
+    "peak_overlapping_native_builds": 8,
+    "backlog_bytes_after": 12104714,
+    "backlog_limit_bytes": 16777216,
+    "capacity_waits": 0,
+    "maintenance_queue_timeouts": 0,
+    "closed_path_leases": 763,
+    "path_acquisition_seconds": 0.13641784,
+    "path_hold_seconds": 175.606140289,
+    "longest_path_hold_seconds": 10.413540959,
+    "source_turns": 36,
+    "replay_seconds": 144.151,
+    "replay_publication_overhead_seconds": 100.949601578,
+    "runtime_refresh_seconds": 19.118739,
+    "completed_primary_batch_profiles": 11,
+    "completed_primary_documents": 11264,
+    "completed_primary_profile_seconds": 27.844,
+    "completed_primary_store_seconds": 17.724,
+    "identity_metadata_write_operations": 56364,
+    "total_store_write_operations": 92347,
+    "completed_text_worker_profiles": 21,
+    "completed_text_worker_documents": 8123,
+    "completed_text_worker_seconds": 42.055,
+    "completed_text_prepare_seconds": 18.914,
+    "warning": "Functional/stage diagnosis only. Debug, metrics, and host load prohibit a performance comparison with earlier runs. A ten-second hold is consistent with local admission pressure but does not identify the refusing stage.",
+    "private_receipts": [
+      "root-cause/local-populated-input7-394-debug-unattached/result.json",
+      "root-cause/local-populated-input7-394-debug-unattached/numeric-stage-evidence.json",
+      "root-cause/local-populated-input7-394-debug-unattached/debt-after-failure.json"
+    ],
+    "fixture_warning": "This run used a raw cp clone with a mismatched reader namespace; do not infer ordinary-workload performance, retention, or optimized bottleneck dominance from it."
+  },
+  "required_observability": {
+    "intervals": [
+      "Local gate wait",
+      "Cross-process queue/flock wait",
+      "Header/inode probing and recovery",
+      "Allocator full load, digest rebuild and authenticated rebase, by admission stage",
+      "Serving and detached namespace/index opens",
+      "Primary/SQL planning, constraint overlay reconstruction, physical staging and durability",
+      "Detached source hydration/analysis",
+      "Prepared artifact staging, validation, durable publication and progress retirement",
+      "Reader registration/release cleanup"
+    ],
+    "reasons": [
+      "SQL overlay invalidation: affected dependency changed versus unrelated file generation",
+      "Allocator cache: active donor, absent donor, stale header, missing ancestry, digest mismatch, replacement inode",
+      "Reuse refusal: ordinary inode reader, missing reader namespace, binding mismatch, guard contention, registration limit, old epoch",
+      "Maintenance cancellation: source changed, index input changed, writer contention, shutdown"
+    ],
+    "invariants": [
+      "Use owner-level monotonic totals that survive cache movement without omission or duplication; cache-local stats alone are not a complete global profile.",
+      "Report failed-operation preparation too: success-only batch logs miss the expensive refusal path.",
+      "Record source bytes/tokens, page edits, publication/sync counts and durable progress per turn, not only journal key bytes or configured budgets.",
+      "Keep diagnostics numeric/enum-only and bounded; raw private payloads and names are unnecessary."
+    ]
+  }
+}

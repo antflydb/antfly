@@ -1,0 +1,65 @@
+{
+  "qualified": false,
+  "source_commit": "973bc63de647762014ead5ab7df72ddf7abfeac7",
+  "mode": "Debug",
+  "scope": "Local diagnostic with metrics; no overlapping builds or SDK validation. Not an optimized performance qualification.",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "library_sha256": "02c1e35c3a80a8b464d1f25f7a9e4c7f8c10f9b13e836d82aa317c48369f1609",
+  "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+  "validation": {
+    "selected_capi_and_sql_tests_passed": 160,
+    "sdk_sql_and_concurrency_tests_passed": 209,
+    "strict_executor_and_budget_tests_passed": 7,
+    "skipped": 0,
+    "leaks": 0,
+    "abi_exports_smoke_and_linkage": "passed",
+    "native_fragment_regression": "Eight then sixteen families across real maintenance runtime replacement, unchanged complete-record coverage, followed by all 1024 documents and physical integrity."
+  },
+  "populated_database_import": {
+    "input_index": 7,
+    "exit_code": 1,
+    "seconds": 114.21854008396622,
+    "successful_primary_batches": 20,
+    "successful_primary_writes": 20480,
+    "public_errors": ["LiteReplayBacklogExceeded"],
+    "invalid_manifest_errors": 0,
+    "overlapping_builds": 0,
+    "censored": false,
+    "source_turns": 109,
+    "path_lease_hold_ns": 93851606511,
+    "path_lease_hold_max_ns": 1394894417
+  },
+  "durable_replay_credits": {
+    "bytes": 16765457,
+    "records": 365,
+    "byte_limit": 16777216,
+    "record_limit": 4096,
+    "independent_scan_matches_aggregate": true,
+    "unresolved_reservations": 0
+  },
+  "persisted_fragment_positions": [
+    {"sequence": 34, "next_item": 200, "total_items": 1024, "applied": true},
+    {"sequence": 64, "next_item": 96, "total_items": 309, "applied": true}
+  ],
+  "completed_text_profiles": {
+    "count": 74,
+    "documents": 1683,
+    "total_ms": 15099,
+    "projection_planning_ms": 97,
+    "segment_preparation_ms": 430,
+    "document_collection_separately_measured": false,
+    "note": "Nested stage counters are not additive wall time. Costs outside these preparation timers are not all established as publication cost."
+  },
+  "quiescent_budget_probe": {
+    "disposable_native_snapshot": true,
+    "foreground_writes": 0,
+    "samples": 30,
+    "one_active_namespace_family_budget": 8,
+    "one_active_namespace_overruns": 48,
+    "retention_pressure": false,
+    "qualification": false
+  },
+  "reference_policy": "Preserved reference artifacts and results only; no baseline build or execution. Wolfspider was not used.",
+  "conclusion": "Registered-worker fragment bounds now hold, but incomplete records retain their credits and the original importer still fails. Whole-catch-up timing includes fixed work outside family preparation and can shrink windows despite cheap projection/encoding. Explicit collection/preparation timing and separate wall-clock yielding are the next follow-up; no complete root-cause or throughput fix is claimed."
+}

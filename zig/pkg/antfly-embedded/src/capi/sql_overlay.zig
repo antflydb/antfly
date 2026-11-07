@@ -127,7 +127,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, session: *Session,
         self.native_arena.deinit();
     }
     const a = self.arena.allocator();
-    const entries = try session.merged(a);
+    const entries = try session.stagedForScan(a, table, request.primary_key);
     var rows: std.ArrayList(catalog.Row) = .empty;
     for (entries) |entry| {
         if (!std.mem.eql(u8, entry.table.physical_name, table.physical_name)) continue;

@@ -513,7 +513,7 @@ pub const Store = struct {
         checkpoint.wal_committed_bytes = self.wal_committed_bytes;
         const encoded = checkpoint.encode();
         generation_publication.publishControlFile(self.alloc, self.storage, current_path, &encoded) catch |err| {
-            self.poisoned = true;
+            self.poisoned = err == error.GenerationPublicationDurabilityUncertain;
             return err;
         };
         self.checkpoint = checkpoint;
@@ -527,7 +527,7 @@ pub const Store = struct {
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, authority_name });
         defer self.alloc.free(path);
         generation_publication.publishControlFile(self.alloc, self.storage, path, authority_value) catch |err| {
-            self.poisoned = true;
+            self.poisoned = err == error.GenerationPublicationDurabilityUncertain;
             return err;
         };
     }
@@ -1028,7 +1028,7 @@ pub const Store = struct {
             self.last_committed_batch != prepared.previous_batch)
             return error.InvalidPostingWalBoundary;
         generation_publication.publishControlFile(self.alloc, self.storage, prepared.current_path, &prepared.encoded) catch |err| {
-            self.poisoned = true;
+            self.poisoned = err == error.GenerationPublicationDurabilityUncertain;
             return err;
         };
         std.mem.swap(Store, self, &prepared.next);
@@ -1968,6 +1968,17 @@ test "storage.posting prepared checkpoint leaves CURRENT writable on reader fail
     var replay = try readers.store.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("tail", replay.replay.latest(7, .base).?.payload);
+    // Failure to allocate the control sink precedes publication. Keep the
+    // previous store and prepared candidate usable for an exact retry.
+    var control_failure = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    {
+        store.alloc = control_failure.allocator();
+        defer store.alloc = alloc;
+        try std.testing.expectError(error.OutOfMemory, store.commitPrepared(&refreshed));
+    }
+    try std.testing.expect(control_failure.has_induced_failure);
+    try std.testing.expect(!store.poisoned and !refreshed.committed);
+    try std.testing.expectEqual(@as(?u64, 1), store.latestSegmentGeneration());
     try store.commitPrepared(&refreshed);
     try std.testing.expectEqual(@as(?u64, 2), store.latestSegmentGeneration());
     try std.testing.expectError(error.PostingPublicationAlreadyCommitted, store.commitPrepared(&refreshed));

@@ -28,15 +28,13 @@ const mem_backend_mod = @import("../../mem_backend.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
 
+pub const replay_fragment = @import("replay_fragment.zig");
+pub const LoadFragmentFn = *const fn (*anyopaque, []const u8) anyerror!?replay_fragment.Position;
+pub const ApplyFragmentFn = *const fn (*anyopaque, derived_types.DerivedBatch, index_manager_mod.ManagedIndexRef, replay_fragment.Position) anyerror!bool;
+pub const SaveFragmentFn = *const fn (*anyopaque, []const u8, replay_fragment.Position) anyerror!void;
+
 pub const ApplyFn = batcher.ApplyFn;
 pub const PersistProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64) anyerror!void;
-/// Resume point inside one record: items of `sequence` before `offset` are
-/// already applied and published.
-pub const PartialCursor = struct { sequence: u64, offset: u64 };
-pub const LoadPartialFn = *const fn (ctx: *anyopaque, index_name: []const u8) anyerror!?PartialCursor;
-/// Called after the window that applied the prefix has been published. An
-/// `offset` of 0 clears the resume point (its record completed).
-pub const SavePartialFn = *const fn (ctx: *anyopaque, index_name: []const u8, cursor: PartialCursor) anyerror!void;
 pub const ProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, progress: CatchUpProgress) anyerror!void;
 pub const BeginWindowFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!void;
 pub const FinishWindowFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) anyerror!void;
@@ -45,16 +43,21 @@ pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager
 
 pub const CatchUpStats = struct {
     scanned_entries: usize = 0,
+    collected_items: usize = 0,
+    collected_families: usize = 0,
+    collection_budget_exhausted: bool = false,
     applied_entries: usize = 0,
     replay_scan_batches: usize = 0,
     replay_hint_filter_skips: usize = 0,
     last_sequence: u64 = 0,
     last_applied_sequence: u64 = 0,
+    partial_sequence: u64 = 0,
     window_collect_ns: u64 = 0,
     apply_ns: u64 = 0,
-    /// The call stopped inside a record and saved a resume point; that record
-    /// still has unapplied items.
-    partial_yields: u64 = 0,
+
+    pub fn budgetWorkItems(self: @This(), fragmented: bool) usize {
+        return if (fragmented) @max(self.scanned_entries, self.collected_families) else @max(self.scanned_entries, self.collected_items);
+    }
 
     pub fn appliedSequenceAdvance(self: @This(), from_sequence: u64) ?u64 {
         if (self.last_applied_sequence <= from_sequence) return null;
@@ -62,8 +65,7 @@ pub const CatchUpStats = struct {
     }
 
     pub fn shouldTryTargetAdvance(self: @This(), from_sequence: u64, target_sequence: u64) bool {
-        // A partially applied record must never be skipped by a target advance.
-        return self.applied_entries == 0 and self.partial_yields == 0 and target_sequence > from_sequence;
+        return self.partial_sequence == 0 and self.applied_entries == 0 and target_sequence > from_sequence;
     }
 };
 
@@ -132,7 +134,19 @@ pub const CatchUpOptions = struct {
     max_records_per_window: usize = catch_up_max_records_per_window_default,
     max_chunk_bytes: u64 = catch_up_max_chunk_bytes_default,
     max_items_per_window: usize = 0,
+    /// Durable sub-record progress for full-text replay. Each family retains
+    /// its row, tombstones and asset effects in one apply invocation.
+    max_fragment_families: usize = 0,
+    fragment_ctx: ?*anyopaque = null,
+    load_fragment_fn: ?LoadFragmentFn = null,
+    save_fragment_fn: ?SaveFragmentFn = null,
+    apply_fragment_fn: ?ApplyFragmentFn = null,
+    /// Bound expanded work across complete journal records, without splitting
+    /// an apply callback's input-ownership boundary. One oversized record is
+    /// still admitted so the cursor can always advance.
+    max_collected_items_per_window: usize = 0,
     max_windows_per_call: usize = 0,
+    release_read_snapshot_after_collect: bool = false,
     /// Cooperative publication quantum; expires only between complete chunks.
     max_call_ns: u64 = 0,
     max_call_bytes: u64 = 0,
@@ -144,13 +158,6 @@ pub const CatchUpOptions = struct {
     /// new apply window once this deadline is reached. Callers must still size
     /// windows so an individual backend apply fits within their service SLO.
     deadline_ns: ?u64 = null,
-    /// Durable resume points inside one oversized full-text record. With both
-    /// set and `max_items_per_window` nonzero, a single-record window may stop
-    /// between item subchunks once `max_call_ns` or `deadline_ns` is reached,
-    /// publish what it applied, and resume at that offset on the next call.
-    partial_ctx: ?*anyopaque = null,
-    load_partial_fn: ?LoadPartialFn = null,
-    save_partial_fn: ?SavePartialFn = null,
 };
 
 pub const catch_up_max_records_per_window_default: usize = 2048;
@@ -181,6 +188,7 @@ fn logCatchUpError(
 ) void {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return;
     if (err == error.ReplayDocumentNotVisible) return;
+    if (err == error.ReplayAlreadyPublished) return;
     if (err == error.ArtifactRepairRequired) return;
     if (err == error.CatchUpDeadlineExceeded) return;
     // Superseded snapshots retain replay debt for a later maintenance turn.
@@ -235,7 +243,8 @@ fn catchUpIndexFromReplaySource(
 ) !CatchUpStats {
     const hint = targetHintForManagedIndex(index_ref);
     var stats = CatchUpStats{};
-    const next_sequence = from_sequence;
+    var next_sequence = from_sequence;
+    var completed_fragment: ?replay_fragment.Position = null;
     var catch_up_open = false;
     errdefer if (catch_up_open) {
         if (options.finish_catch_up_fn) |finish_catch_up| {
@@ -249,7 +258,18 @@ fn catchUpIndexFromReplaySource(
         };
         catch_up_open = true;
     }
-    var replay_cursor = replay_source.openMatchingCursor(alloc, from_sequence, hint) catch |err| {
+    if (options.max_fragment_families != 0 and options.load_fragment_fn != null and options.save_fragment_fn != null) {
+        if (try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name)) |saved| if (saved.sequence > from_sequence) {
+            if (saved.next_item == saved.total_items) {
+                next_sequence = saved.sequence;
+                if (saved.applied) {
+                    if (options.persist_progress_fn) |persist| try persist(options.persist_ctx.?, index_ref.name, saved.sequence);
+                    completed_fragment = saved;
+                }
+            } else next_sequence = saved.sequence - 1;
+        };
+    }
+    var replay_cursor = replay_source.openMatchingCursor(alloc, next_sequence, hint) catch |err| {
         logCatchUpError(index_ref, "replay_source_open", next_sequence, stats.scanned_entries, stats.applied_entries, err);
         return err;
     };
@@ -258,6 +278,11 @@ fn catchUpIndexFromReplaySource(
         logCatchUpError(index_ref, "replay_source_iterate", next_sequence, stats.scanned_entries, stats.applied_entries, err);
         return err;
     };
+    if (completed_fragment) |saved| {
+        stats.applied_entries += 1;
+        stats.last_applied_sequence = @max(stats.last_applied_sequence, saved.sequence);
+        stats.last_sequence = @max(stats.last_sequence, saved.sequence);
+    }
     if (catch_up_open) {
         if (options.finish_catch_up_fn) |finish_catch_up| {
             finish_catch_up(options.catch_up_ctx.?, index_ref, true) catch |err| {
@@ -278,6 +303,8 @@ pub fn catchUpIndexFromMatchingCursor(
     options: CatchUpOptions,
 ) !CatchUpStats {
     var stats = CatchUpStats{};
+    const fragments = options.max_fragment_families != 0 and options.load_fragment_fn != null and options.save_fragment_fn != null;
+    if (fragments) std.debug.assert(index_ref.kind == .full_text);
     var completed_windows: usize = 0;
     const call_started_ns = monotonicTimeNs();
     var call_bytes: u64 = 0;
@@ -291,11 +318,6 @@ pub fn catchUpIndexFromMatchingCursor(
     const scratch_alloc = if (scratch_budget) |*budget| budget.allocator() else alloc;
     var decode_scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
     defer decode_scratch.deinit(scratch_alloc);
-    const partial_enabled = options.max_items_per_window != 0 and options.save_partial_fn != null and index_ref.kind == .full_text;
-    // A saved resume point ends the first window at that record, so its items
-    // line up exactly with the offset. Records before it in the window have no
-    // work for this index: the call that saved it collected them ahead of it.
-    var resume_cursor: ?PartialCursor = if (partial_enabled) if (options.load_partial_fn) |load| try load(options.partial_ctx.?, index_ref.name) else null else null;
     while (true) {
         // Oversized records may need more scratch once, but cannot establish
         // a large retained high-water mark for subsequent windows.
@@ -311,14 +333,22 @@ pub fn catchUpIndexFromMatchingCursor(
             if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
         }
         var builder = ReplayChunkBuilder.init(alloc, index_ref, options.resource_manager, options.max_chunk_bytes);
-        if (options.max_call_bytes != 0)
-            builder.max_chunk_bytes = @min(builder.max_chunk_bytes, options.max_call_bytes -| call_bytes);
+        if (options.max_call_bytes != 0) {
+            const remaining = options.max_call_bytes -| call_bytes;
+            builder.max_chunk_bytes = if (builder.max_chunk_bytes == 0) remaining else @min(builder.max_chunk_bytes, remaining);
+        }
         builder.max_items = options.max_items_per_window;
+        const item_cap = if (fragments)
+            if (options.max_collected_items_per_window == 0) options.max_fragment_families else @min(options.max_fragment_families, options.max_collected_items_per_window)
+        else
+            options.max_collected_items_per_window;
+        if (item_cap != 0) {
+            builder.max_items = if (builder.max_items == 0) item_cap else @min(builder.max_items, item_cap);
+        }
         builder.estimated_dense_vector_bytes = options.estimated_dense_vector_bytes;
         builder.max_work_chunk_bytes = options.max_work_chunk_bytes;
         builder.dense_replay_working_set_factor = @max(@as(u64, 1), options.dense_replay_working_set_factor);
         builder.target_sequence = options.target_sequence;
-        if (resume_cursor) |cursor| builder.target_sequence = if (builder.target_sequence == 0) cursor.sequence else @min(builder.target_sequence, cursor.sequence);
         builder.decode_scratch = &decode_scratch;
         builder.scratch_alloc = scratch_alloc;
         builder.scratch_budget = if (scratch_budget) |*budget| budget else null;
@@ -327,10 +357,32 @@ pub fn catchUpIndexFromMatchingCursor(
         const collect_started_ns = monotonicTimeNs();
         const had_retained_scratch = decode_scratch.retainedCapacityBytes() != 0;
         var retried_fresh = false;
+        const saved_fragment = if (fragments) try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name) else null;
+        // An unfinished record must retain its own fingerprint/offset. Whole
+        // small records can share one complete atomic publication. The effect
+        // cap above also bounds their families, so a combined window cannot
+        // accidentally become a resumable prefix of several records.
         var collection_limit = options.max_records_per_window;
+        if (saved_fragment) |saved| if (saved.next_item != saved.total_items) {
+            collection_limit = 1;
+        };
         var retry_stats = replay_source_mod.MatchingRecordStats{};
-        const chunk_stats = collect: while (true) {
-            const collected = replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord) catch |err| {
+        const seekable_slice = if (fragments)
+            if (options.apply_fragment_fn != null)
+                try replay_cursor.readFamilyWindowWithBudget(scratch_alloc, index_ref.name, saved_fragment, options.max_fragment_families, builder.max_chunk_bytes, options.target_sequence, collection_limit)
+            else
+                try replay_cursor.readFamilySliceWithBudget(scratch_alloc, index_ref.name, saved_fragment, options.max_fragment_families, builder.max_chunk_bytes, options.target_sequence)
+        else
+            null;
+        defer if (seekable_slice) |slice| scratch_alloc.free(slice.payload);
+        const chunk_stats = if (seekable_slice) |slice| bounded: {
+            try replayChunkConsumeRecord(&builder, slice.position.sequence, slice.payload);
+            break :bounded replay_source_mod.MatchingRecordStats{ .scan_batches = 1, .scanned_entries = slice.records, .matched_entries = slice.records, .last_sequence = slice.position.sequence };
+        } else collect: while (true) {
+            const collected = (if (fragments)
+                replay_cursor.forEachWholeRecordWindow(collection_limit, &builder, replayChunkConsumeRecord)
+            else
+                replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord)) catch |err| {
                 // An empty window gets one retry after reclaiming cached
                 // scratch and key-block slack. The failed record has not
                 // advanced the cursor; a fresh exact-sized retry is bounded.
@@ -355,14 +407,9 @@ pub fn catchUpIndexFromMatchingCursor(
             break :collect retry_stats;
         };
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
+        stats.collection_budget_exhausted = stats.collection_budget_exhausted or builder.soft_limit_reached or
+            (options.max_records_per_window != 0 and chunk_stats.matched_entries >= options.max_records_per_window);
         if (chunk_stats.last_sequence == 0) {
-            // A resume point at or below the next record bounded this window
-            // to nothing; it is stale. The stopped record is still at the
-            // cursor: collect again without the bound.
-            if (resume_cursor != null) {
-                resume_cursor = null;
-                continue;
-            }
             break;
         }
         // Never begin a storage mutation after the caller's deadline. The
@@ -386,11 +433,54 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const collected_bytes = builder.tracked_bytes;
-        // No-op records stay in the window, so their progress is saved with
-        // the record they precede; they must not stop it from yielding.
-        const single_record = builder.work_records == 1;
-        const work_sequence = builder.work_sequence;
         const batch = try builder.finishBorrowed(chunk_stats.last_sequence);
+        var fragment_plan: ?replay_fragment.Plan = null;
+        defer if (fragment_plan) |*plan| plan.deinit(scratch_alloc);
+        var fragment_piece: ?replay_fragment.Piece = null;
+        defer if (fragment_piece) |*piece| piece.deinit(scratch_alloc);
+        var fragment_position: ?replay_fragment.Position = null;
+        var previously_applied = false;
+        var fragment_complete = true;
+        var apply_batch = batch;
+        if (seekable_slice) |slice| {
+            previously_applied = slice.position.applied;
+            fragment_position = slice.position;
+            fragment_complete = slice.position.next_item == slice.position.total_items;
+            stats.collected_items += builder.item_count;
+            stats.collected_families += slice.families;
+            stats.collection_budget_exhausted = stats.collection_budget_exhausted or slice.budget_exhausted;
+        } else if (fragments) {
+            var saved = try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name);
+            if (saved) |previous| if (previous.sequence < batch.sequence and previous.next_item == previous.total_items) {
+                saved = null;
+            };
+            const total = batch.documents.len + batch.deleted_keys.len + batch.overwritten_doc_keys.len + batch.changed_artifact_keys.len;
+            if (options.apply_fragment_fn != null or saved != null or total > options.max_fragment_families) {
+                fragment_plan = try replay_fragment.Plan.init(scratch_alloc, batch, index_ref.name);
+                const continuation = try fragment_plan.?.startPosition(saved);
+                previously_applied = continuation.applied;
+                fragment_piece = try fragment_plan.?.piece(scratch_alloc, continuation.start, options.max_fragment_families);
+                apply_batch = fragment_piece.?.batch;
+                fragment_complete = fragment_piece.?.next_item == total;
+                fragment_position = .{ .sequence = batch.sequence, .next_item = fragment_piece.?.next_item, .total_items = total, .fingerprint = fragment_plan.?.fingerprint, .applied = previously_applied };
+                stats.collected_items += fragment_piece.?.next_item - continuation.start;
+                stats.collected_families += fragment_piece.?.families;
+                stats.collection_budget_exhausted = stats.collection_budget_exhausted or fragment_piece.?.families == options.max_fragment_families;
+            } else {
+                stats.collected_items += builder.item_count;
+                var complete_plan = try replay_fragment.Plan.init(scratch_alloc, batch, index_ref.name);
+                defer complete_plan.deinit(scratch_alloc);
+                stats.collected_families += complete_plan.familyCount();
+            }
+        } else stats.collected_items += builder.item_count;
+        // A partial fingerprint belongs to one source record. Earlier no-op
+        // records are harmless, but output from several records must publish
+        // as a complete window, never as an unresumable combined prefix.
+        if (!fragment_complete and builder.prior_record_had_output) return error.InvalidDerivedApplyState;
+        if (options.release_read_snapshot_after_collect) {
+            std.debug.assert(options.max_windows_per_call == 1);
+            replay_cursor.releaseReadSnapshot();
+        }
         var window_open = false;
         errdefer if (window_open) {
             if (options.finish_window_fn) |finish_window| {
@@ -405,46 +495,18 @@ pub fn catchUpIndexFromMatchingCursor(
             window_open = true;
         }
 
-        const resume_offset: usize = if (resume_cursor) |cursor|
-            (if (single_record and cursor.sequence == work_sequence) @intCast(cursor.offset) else 0)
-        else
-            0;
-        resume_cursor = null;
-        // Only a window with one record of work can stop inside it: its items
-        // are exactly that record's, in a deterministic order.
-        const yield_deadline: ?u64 = if (partial_enabled and single_record) blk: {
-            var limit: ?u64 = options.deadline_ns;
-            if (options.max_call_ns != 0) {
-                const quantum_end = call_started_ns +| options.max_call_ns;
-                limit = if (limit) |value| @min(value, quantum_end) else quantum_end;
-            }
-            break :blk limit;
-        } else null;
         const apply_started_ns = monotonicTimeNs();
-        const outcome = applyBatchBounded(apply_ctx, apply_fn, batch, index_ref, options.max_items_per_window, resume_offset, yield_deadline) catch |err| {
+        const application = if (fragment_position != null and options.apply_fragment_fn != null)
+            options.apply_fragment_fn.?(apply_ctx, apply_batch, index_ref, fragment_position.?)
+        else
+            applyBatchBounded(apply_ctx, apply_fn, apply_batch, index_ref, if (fragments) 0 else options.max_items_per_window);
+        const new_effects = application catch |err| {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             logCatchUpError(index_ref, "journal_apply", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
             return err;
         };
-        if (outcome.next_offset) |next_offset| {
-            // Publish the applied prefix, then record where to resume. The
-            // record's sequence is not persisted as applied.
-            stats.apply_ns += monotonicTimeNs() - apply_started_ns;
-            if (options.finish_window_fn) |finish_window| {
-                finish_window(options.window_ctx.?, index_ref, true) catch |err| {
-                    logCatchUpError(index_ref, "finish_window", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
-                    return err;
-                };
-                window_open = false;
-            }
-            options.save_partial_fn.?(options.partial_ctx.?, index_ref.name, .{ .sequence = work_sequence, .offset = next_offset }) catch |err| {
-                logCatchUpError(index_ref, "persist_partial", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
-                return err;
-            };
-            stats.partial_yields += 1;
-            break;
-        }
-        const applied = outcome.applied;
+        const applied = (new_effects or previously_applied) and fragment_complete;
+        if (fragment_position) |*position| position.applied = new_effects or previously_applied;
         if (applied) {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             stats.applied_entries += 1;
@@ -468,6 +530,22 @@ pub fn catchUpIndexFromMatchingCursor(
             };
             window_open = false;
         }
+        if (fragments and !new_effects and fragment_position == null) {
+            // Preserve bounded scan progress across records irrelevant to this
+            // index, without asserting corpus-wide coverage. Otherwise one
+            // no-op before an unfinished record could monopolize every turn.
+            fragment_plan = try replay_fragment.Plan.init(scratch_alloc, batch, index_ref.name);
+            fragment_position = .{ .sequence = batch.sequence, .next_item = fragment_plan.?.items.len, .total_items = fragment_plan.?.items.len, .fingerprint = fragment_plan.?.fingerprint };
+        }
+        if (fragment_position) |position| {
+            try options.save_fragment_fn.?(options.fragment_ctx.?, index_ref.name, position);
+            if (!fragment_complete) {
+                stats.partial_sequence = chunk_stats.last_sequence;
+                if (options.max_windows_per_call != 0) return stats;
+                continue;
+            }
+        }
+        stats.partial_sequence = 0;
         if (options.persist_progress_fn) |persist| {
             if (applied) {
                 persist(options.persist_ctx.?, index_ref.name, chunk_stats.last_sequence) catch |err| {
@@ -476,10 +554,6 @@ pub fn catchUpIndexFromMatchingCursor(
                 };
             }
         }
-        // A resumed record completed: drop its resume point. Best effort, as
-        // applied progress now passes it and progress resets clear it too.
-        if (resume_offset != 0) options.save_partial_fn.?(options.partial_ctx.?, index_ref.name, .{ .sequence = work_sequence, .offset = 0 }) catch |err|
-            logCatchUpError(index_ref, "clear_partial", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
         completed_windows += 1;
         call_bytes +|= collected_bytes;
         // Oversized single records retain the existing one-record progress
@@ -497,73 +571,59 @@ pub fn catchUpIndexFromMatchingCursor(
     return stats;
 }
 
-const BoundedApply = struct {
-    applied: bool,
-    /// Set when the call stopped inside the record: the first unapplied item.
-    next_offset: ?usize = null,
-};
-
-/// Applies one window, splitting a large full-text record into subchunks of
-/// at most `max_items`, in a fixed order: deleted keys, overwritten keys,
-/// then documents. Items before `resume_offset` are skipped (already applied).
-/// With `yield_deadline`, stops between subchunks once it has passed, after
-/// at least one subchunk, and reports where to resume.
 fn applyBatchBounded(
     apply_ctx: *anyopaque,
     apply_fn: ApplyFn,
     batch: derived_types.DerivedBatch,
     index_ref: index_manager_mod.ManagedIndexRef,
     max_items: usize,
-    resume_offset: usize,
-    yield_deadline: ?u64,
-) !BoundedApply {
-    if (index_ref.kind != .full_text or max_items == 0) return .{ .applied = try apply_fn(apply_ctx, batch, index_ref) };
-    // Asset artifact keys are a fourth part, after the documents: full-text
-    // replay uses them only to clear repair issues for published assets, so
-    // they apply on their own, in bounded subchunks within the same budget.
-    if (batch.graph_doc_clears.len != 0 or
+) !bool {
+    if (index_ref.kind != .full_text or max_items == 0) return try apply_fn(apply_ctx, batch, index_ref);
+    if (batch.changed_artifact_keys.len != 0 or
+        batch.graph_doc_clears.len != 0 or
         batch.dense_embeddings.len != 0 or
         batch.sparse_embeddings.len != 0 or
         batch.generated_enrichment_refs.len != 0 or
         batch.graph_writes.len != 0 or
         batch.graph_deletes.len != 0)
     {
-        return .{ .applied = try apply_fn(apply_ctx, batch, index_ref) };
+        return try apply_fn(apply_ctx, batch, index_ref);
     }
 
-    const total_items = batch.deleted_keys.len +| batch.overwritten_doc_keys.len +| batch.documents.len +| batch.changed_artifact_keys.len;
-    if (total_items <= max_items and resume_offset == 0) return .{ .applied = try apply_fn(apply_ctx, batch, index_ref) };
+    const total_items = batch.deleted_keys.len +| batch.overwritten_doc_keys.len +| batch.documents.len;
+    if (total_items <= max_items) return try apply_fn(apply_ctx, batch, index_ref);
 
-    const Part = enum { deleted, overwritten, documents, artifacts };
-    const parts = [_]struct { part: Part, len: usize }{
-        .{ .part = .deleted, .len = batch.deleted_keys.len },
-        .{ .part = .overwritten, .len = batch.overwritten_doc_keys.len },
-        .{ .part = .documents, .len = batch.documents.len },
-        .{ .part = .artifacts, .len = batch.changed_artifact_keys.len },
-    };
     var applied_any = false;
-    var subchunks: usize = 0;
-    var base: usize = 0;
-    for (parts) |part| {
-        defer base += part.len;
-        var start = if (resume_offset > base) @min(resume_offset - base, part.len) else 0;
-        while (start < part.len) {
-            if (yield_deadline) |deadline| if (subchunks != 0 and monotonicTimeNs() >= deadline)
-                return .{ .applied = applied_any, .next_offset = base + start };
-            const end = @min(start + max_items, part.len);
-            const chunk: derived_types.DerivedBatch = switch (part.part) {
-                .deleted => .{ .sequence = batch.sequence, .deleted_keys = batch.deleted_keys[start..end] },
-                .overwritten => .{ .sequence = batch.sequence, .overwritten_doc_keys = batch.overwritten_doc_keys[start..end] },
-                .documents => .{ .sequence = batch.sequence, .documents = batch.documents[start..end] },
-                .artifacts => .{ .sequence = batch.sequence, .changed_artifact_keys = batch.changed_artifact_keys[start..end] },
-            };
-            applied_any = (try apply_fn(apply_ctx, chunk, index_ref)) or applied_any;
-            subchunks += 1;
-            start = end;
-        }
+    var start: usize = 0;
+    while (start < batch.deleted_keys.len) {
+        const end = @min(start + max_items, batch.deleted_keys.len);
+        applied_any = (try apply_fn(apply_ctx, .{
+            .sequence = batch.sequence,
+            .deleted_keys = batch.deleted_keys[start..end],
+        }, index_ref)) or applied_any;
+        start = end;
     }
-    // A resumed record counts as applied even if this call's suffix was empty.
-    return .{ .applied = applied_any or resume_offset != 0 };
+
+    start = 0;
+    while (start < batch.overwritten_doc_keys.len) {
+        const end = @min(start + max_items, batch.overwritten_doc_keys.len);
+        applied_any = (try apply_fn(apply_ctx, .{
+            .sequence = batch.sequence,
+            .overwritten_doc_keys = batch.overwritten_doc_keys[start..end],
+        }, index_ref)) or applied_any;
+        start = end;
+    }
+
+    start = 0;
+    while (start < batch.documents.len) {
+        const end = @min(start + max_items, batch.documents.len);
+        applied_any = (try apply_fn(apply_ctx, .{
+            .sequence = batch.sequence,
+            .documents = batch.documents[start..end],
+        }, index_ref)) or applied_any;
+        start = end;
+    }
+    return applied_any;
 }
 
 fn monotonicTimeNs() u64 {
@@ -599,12 +659,9 @@ const ReplayChunkBuilder = struct {
     tracked_bytes: u64 = 0,
     tracked_dense_vector_bytes: u64 = 0,
     item_count: usize = 0,
-    /// Records in this window with work for the index, and the last one's
-    /// sequence. Bounded replay can yield inside a window holding exactly one
-    /// such record: no-op records add no items, so every batch item is its.
-    work_records: usize = 0,
-    work_sequence: u64 = 0,
     max_items: usize = 0,
+    soft_limit_reached: bool = false,
+    prior_record_had_output: bool = false,
     estimated_dense_vector_bytes: u64 = 0,
     max_work_chunk_bytes: u64 = 0,
     dense_replay_working_set_factor: u64 = 1,
@@ -643,12 +700,6 @@ const ReplayChunkBuilder = struct {
         if (self.resource_manager) |manager|
             manager.adjustUsage(.derived_replay_window, &self.tracked_bytes, 0) catch {};
         self.* = undefined;
-    }
-
-    fn noteWork(self: *@This(), sequence: u64, record: change_journal_mod.Record) void {
-        if (recordItemCountForIndex(record, self.index_ref.kind) == 0) return;
-        self.work_records += 1;
-        self.work_sequence = sequence;
     }
 
     fn resetEmptyWindow(self: *@This()) void {
@@ -868,7 +919,10 @@ const ReplayChunkBuilder = struct {
         if (self.tracked_bytes == 0 and self.item_count == 0) return false;
         if (self.max_chunk_bytes > 0 or self.max_work_chunk_bytes != 0) {
             const incoming_bytes = recordEstimatedBytesForIndex(record, self.index_ref.kind, self.estimatedDenseVectorBytes());
-            if (self.max_chunk_bytes > 0 and self.tracked_bytes +| incoming_bytes > self.max_chunk_bytes) return true;
+            if (self.max_chunk_bytes > 0 and self.tracked_bytes +| incoming_bytes > self.max_chunk_bytes) {
+                self.soft_limit_reached = true;
+                return true;
+            }
             if (self.max_work_chunk_bytes != 0) {
                 const vector_bytes = if (self.index_ref.kind == .dense_vector)
                     @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) *| self.estimatedDenseVectorBytes()
@@ -877,10 +931,16 @@ const ReplayChunkBuilder = struct {
                 const factor = @max(@as(u64, 1), self.dense_replay_working_set_factor);
                 const work_bytes = (self.tracked_bytes -| self.tracked_dense_vector_bytes) +| (self.tracked_dense_vector_bytes / factor);
                 const incoming_work = (incoming_bytes -| vector_bytes) +| (vector_bytes / factor);
-                if (work_bytes +| incoming_work > self.max_work_chunk_bytes) return true;
+                if (work_bytes +| incoming_work > self.max_work_chunk_bytes) {
+                    self.soft_limit_reached = true;
+                    return true;
+                }
             }
         }
-        if (self.max_items > 0 and self.item_count + recordItemCountForIndex(record, self.index_ref.kind) > self.max_items) return true;
+        if (self.max_items > 0 and self.item_count + recordItemCountForIndex(record, self.index_ref.kind) > self.max_items) {
+            self.soft_limit_reached = true;
+            return true;
+        }
         if (self.resource_manager) |manager| {
             // The hard limit also covers shared decode scratch and other replay
             // workers. Size the next record against available admission, rather
@@ -1035,8 +1095,10 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
     if (builder.target_sequence != 0 and sequence > builder.target_sequence) return replay_source_mod.StopReplayChunk.StopReplayChunk;
     // A full window does not need to allocate descriptors for a lookahead
     // record. StopReplayChunk leaves that record at the cursor for the retry.
-    if (builder.max_items != 0 and builder.item_count >= builder.max_items)
+    if (builder.max_items != 0 and builder.item_count >= builder.max_items) {
+        builder.soft_limit_reached = true;
         return replay_source_mod.StopReplayChunk.StopReplayChunk;
+    }
     if (change_journal_mod.looksLikeBinaryRecord(payload)) {
         const denial_generation = if (builder.scratch_budget) |budget| budget.denialGeneration() else 0;
         const record = change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(builder.scratch_alloc, payload, builder.decode_scratch, .{
@@ -1065,20 +1127,22 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
         // aggregate budget is configured. Retained buffers stay charged.
         if (builder.scratch_budget) |budget| _ = budget.releaseUnusedCredit();
         if (builder.wouldOverflowWithRecord(record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+        const prior_output = builder.hasOutput();
         try builder.appendRecord(record);
+        builder.prior_record_had_output = prior_output;
         if (!builder.has_accepted_work) builder.has_accepted_work = builder.hasOutput();
         builder.accepted_records += 1;
-        builder.noteWork(sequence, record);
         return;
     }
 
     var record = try change_journal_mod.decodeRecord(builder.alloc, payload);
     defer record.deinit();
     if (builder.wouldOverflowWithRecord(record.record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+    const prior_output = builder.hasOutput();
     try builder.appendRecord(record.record);
+    builder.prior_record_had_output = prior_output;
     if (!builder.has_accepted_work) builder.has_accepted_work = builder.hasOutput();
     builder.accepted_records += 1;
-    builder.noteWork(sequence, record.record);
 }
 
 fn recordEstimatedBytesForIndex(record: change_journal_mod.Record, kind: db_types.IndexKind, estimated_dense_vector_bytes: u64) u64 {
@@ -1871,6 +1935,137 @@ test "catchUpIndex chunks dense replay by item budget" {
     try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, capture.sequences.items);
 }
 
+test "catchUpIndex durable full text fragments resume after lost progress without early coverage" {
+    @import("antfly_test_error_logs").expectErrorLogs(1);
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/durable-fragments", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    try appendChangeJournalRecord(&journal, a, .{ .sequence = 1, .changed_doc_keys = &.{ "a", "b", "c", "d", "e" }, .overwritten_doc_keys = &.{ "a", "b", "c", "d", "e" }, .target_hints = &.{.full_text} });
+    const State = struct {
+        encoded: ?[replay_fragment.encoded_size]u8 = null,
+        counts: [5]usize = @splat(0),
+        scalar: u64 = 0,
+        fail_save: bool = true,
+        window_closed: bool = false,
+
+        fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.window_closed = false;
+            try std.testing.expect(batch.documents.len <= 2);
+            try std.testing.expectEqual(batch.documents.len, batch.overwritten_doc_keys.len);
+            for (batch.documents) |doc| self.counts[doc.key[0] - 'a'] += 1;
+            return batch.documents.len != 0;
+        }
+        fn finish(ptr: *anyopaque, _: index_manager_mod.ManagedIndexRef, success: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(success);
+            self.window_closed = true;
+        }
+        fn load(ptr: *anyopaque, _: []const u8) !?replay_fragment.Position {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // No cursor or borrowed batch is retained between catch-up calls.
+            return if (self.encoded) |encoded| (try replay_fragment.decode(&encoded)).position else null;
+        }
+        fn save(ptr: *anyopaque, _: []const u8, position: replay_fragment.Position) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.window_closed);
+            try std.testing.expectEqual(@as(u64, 0), self.scalar);
+            if (self.fail_save) {
+                self.fail_save = false;
+                return error.TestFragmentPersistFailure;
+            }
+            self.encoded = replay_fragment.encode(.{ .position = position, .identity = .{ .generation = 1, .config_hash = 2, .incarnation = 3 } });
+        }
+        fn scalarProgress(ptr: *anyopaque, _: []const u8, sequence: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const position = (try replay_fragment.decode(&self.encoded.?)).position;
+            try std.testing.expectEqual(position.total_items, position.next_item);
+            self.scalar = sequence;
+        }
+    };
+    var state: State = .{};
+    const options: CatchUpOptions = .{ .max_windows_per_call = 1, .max_fragment_families = 2, .fragment_ctx = &state, .load_fragment_fn = State.load, .save_fragment_fn = State.save, .window_ctx = &state, .finish_window_fn = State.finish, .persist_ctx = &state, .persist_progress_fn = State.scalarProgress };
+    const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
+    try std.testing.expectError(error.TestFragmentPersistFailure, catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, 0, &state, State.apply, options));
+    try std.testing.expect(state.encoded == null);
+    for (0..3) |turn| {
+        const stats = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, 0, &state, State.apply, options);
+        if (turn < 2) {
+            try std.testing.expectEqual(@as(u64, 1), stats.partial_sequence);
+            try std.testing.expectEqual(@as(?u64, null), stats.appliedSequenceAdvance(0));
+            try std.testing.expect(!stats.shouldTryTargetAdvance(0, 1));
+            try std.testing.expectEqual(@as(u64, 0), state.scalar);
+        } else {
+            try std.testing.expectEqual(@as(?u64, 1), stats.appliedSequenceAdvance(0));
+            try std.testing.expectEqual(@as(u64, 1), state.scalar);
+        }
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 2, 2, 1, 1, 1 }, &state.counts);
+}
+
+test "catchUpIndex durable fragments cross irrelevant records and recover final watermark failure" {
+    @import("antfly_test_error_logs").expectErrorLogs(2);
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/fragment-noops", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    try appendChangeJournalRecord(&journal, a, .{ .sequence = 1, .changed_doc_keys = &.{"z"}, .target_hints = &.{.full_text} });
+    try appendChangeJournalRecord(&journal, a, .{ .sequence = 2, .changed_doc_keys = &.{ "a", "b", "c", "d", "e" }, .target_hints = &.{.full_text} });
+    try appendChangeJournalRecord(&journal, a, .{ .sequence = 3, .target_hints = &.{.full_text} });
+    const State = struct {
+        saved: ?replay_fragment.Position = null,
+        documents: usize = 0,
+        scalar: u64 = 0,
+        fail_scalar: bool = true,
+        fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (batch.documents.len == 0 or std.mem.eql(u8, batch.documents[0].key, "z")) return false;
+            self.documents += batch.documents.len;
+            return true;
+        }
+        fn load(ptr: *anyopaque, _: []const u8) !?replay_fragment.Position {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.saved) |saved| if (saved.sequence > self.scalar) saved else null else null;
+        }
+        fn save(ptr: *anyopaque, _: []const u8, position: replay_fragment.Position) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.saved = position;
+        }
+        fn persist(ptr: *anyopaque, _: []const u8, sequence: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_scalar) {
+                self.fail_scalar = false;
+                return error.TestScalarPersistFailure;
+            }
+            self.scalar = sequence;
+        }
+    };
+    var state: State = .{};
+    const options: CatchUpOptions = .{ .max_windows_per_call = 1, .max_fragment_families = 2, .fragment_ctx = &state, .load_fragment_fn = State.load, .save_fragment_fn = State.save, .persist_ctx = &state, .persist_progress_fn = State.persist };
+    const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
+    for (0..3) |_| {
+        const stats = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, state.scalar, &state, State.apply, options);
+        try std.testing.expectEqual(@as(?u64, null), stats.appliedSequenceAdvance(0));
+    }
+    try std.testing.expectError(error.TestScalarPersistFailure, catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, state.scalar, &state, State.apply, options));
+    try std.testing.expectEqual(@as(usize, 5), state.documents);
+    try std.testing.expectEqual(@as(u64, 0), state.scalar);
+    const recovered = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, state.scalar, &state, State.apply, options);
+    try std.testing.expectEqual(@as(u64, 2), state.scalar);
+    try std.testing.expectEqual(@as(?u64, 2), recovered.appliedSequenceAdvance(0));
+    try std.testing.expectEqual(@as(usize, 5), state.documents);
+    const tail = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromJournal(&journal), index, state.scalar, &state, State.apply, options);
+    try std.testing.expectEqual(@as(usize, 0), tail.scanned_entries);
+    try std.testing.expect(tail.shouldTryTargetAdvance(state.scalar, 3));
+}
+
 test "catchUpIndex subchunks one oversized full text record before advancing its sequence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1912,216 +2107,6 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
     try std.testing.expectEqual(@as(usize, 3), capture.call_count);
     try std.testing.expectEqual(@as(usize, 5), capture.applied_documents);
     try std.testing.expectEqualSlices(u64, &.{ 1, 1, 1 }, capture.sequences.items);
-}
-
-const TestPartialStore = struct {
-    cursor: ?PartialCursor = null,
-    saves: usize = 0,
-    persisted: ?u64 = null,
-
-    fn load(ctx: *anyopaque, _: []const u8) !?PartialCursor {
-        const self: *TestPartialStore = @ptrCast(@alignCast(ctx));
-        return self.cursor;
-    }
-    fn save(ctx: *anyopaque, _: []const u8, cursor: PartialCursor) !void {
-        const self: *TestPartialStore = @ptrCast(@alignCast(ctx));
-        self.cursor = if (cursor.offset == 0) null else cursor;
-        self.saves += 1;
-    }
-    fn persist(ctx: *anyopaque, _: []const u8, sequence: u64) !void {
-        const self: *TestPartialStore = @ptrCast(@alignCast(ctx));
-        self.persisted = sequence;
-    }
-};
-
-test "catchUpIndex yields inside an oversized full text record and resumes at its offset" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-full-text-partial-journal", .{tmp.sub_path});
-    defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
-    defer alloc.free(journal_path_z);
-    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
-    defer journal.close();
-    try appendChangeJournalRecord(&journal, alloc, .{
-        .sequence = 1,
-        .changed_doc_keys = &.{ "doc:a", "doc:b", "doc:c", "doc:d", "doc:e" },
-        .target_hints = &.{.full_text},
-    });
-    var store: TestPartialStore = .{};
-    const options: CatchUpOptions = .{
-        .max_items_per_window = 2,
-        .max_chunk_bytes = 512,
-        // Already past: the call stops after its first subchunk.
-        .max_call_ns = 1,
-        .persist_ctx = &store,
-        .persist_progress_fn = TestPartialStore.persist,
-        .partial_ctx = &store,
-        .load_partial_fn = TestPartialStore.load,
-        .save_partial_fn = TestPartialStore.save,
-    };
-
-    var first = TestApplyCapture{ .alloc = alloc };
-    defer first.deinit();
-    const yielded = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, 0, &first, testApplyCapture, options);
-    try std.testing.expectEqual(@as(u64, 1), yielded.partial_yields);
-    try std.testing.expectEqual(@as(usize, 1), first.call_count);
-    try std.testing.expectEqual(@as(usize, 2), first.applied_documents);
-    // The record is not applied yet: no progress, and no target advance.
-    try std.testing.expectEqual(@as(?u64, null), store.persisted);
-    try std.testing.expect(!yielded.shouldTryTargetAdvance(0, 1));
-    try std.testing.expectEqual(PartialCursor{ .sequence = 1, .offset = 2 }, store.cursor.?);
-
-    // Each further call makes progress and resumes exactly where it stopped.
-    var calls: usize = 1;
-    var applied_total: usize = first.applied_documents;
-    while (store.persisted == null) : (calls += 1) {
-        var next = TestApplyCapture{ .alloc = alloc };
-        defer next.deinit();
-        const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, 0, &next, testApplyCapture, options);
-        try std.testing.expect(next.applied_documents > 0);
-        try std.testing.expectEqualStrings((&[_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:d", "doc:e" })[applied_total + next.applied_documents - 1], next.last_batch.?.documents[next.last_batch.?.documents.len - 1].key);
-        applied_total += next.applied_documents;
-        if (stats.partial_yields == 0) try std.testing.expectEqual(@as(usize, 1), stats.applied_entries);
-        try std.testing.expect(calls < 10);
-    }
-    // Every item applied exactly once across the turns, then progress saved
-    // and the resume point dropped.
-    try std.testing.expectEqual(@as(usize, 5), applied_total);
-    try std.testing.expectEqual(@as(?u64, 1), store.persisted);
-    try std.testing.expectEqual(@as(?PartialCursor, null), store.cursor);
-}
-
-test "catchUpIndex yields inside an oversized full text record behind a no-op record" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-full-text-noop-journal", .{tmp.sub_path});
-    defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
-    defer alloc.free(journal_path_z);
-    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
-    defer journal.close();
-    // A matching record with no full-text work, then an oversized one.
-    try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 1, .target_hints = &.{.full_text} });
-    const keys = [_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:d", "doc:e" };
-    try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 2, .changed_doc_keys = &keys, .target_hints = &.{.full_text} });
-    var store: TestPartialStore = .{};
-    const options: CatchUpOptions = .{
-        .max_items_per_window = 2,
-        .max_chunk_bytes = 512,
-        // Already past: every call may apply at most one subchunk.
-        .max_call_ns = 1,
-        // Background turns run one window each.
-        .max_windows_per_call = 1,
-        .persist_ctx = &store,
-        .persist_progress_fn = TestPartialStore.persist,
-        .partial_ctx = &store,
-        .load_partial_fn = TestPartialStore.load,
-        .save_partial_fn = TestPartialStore.save,
-    };
-    var applied_total: usize = 0;
-    var yields: u64 = 0;
-    var calls: usize = 0;
-    while (store.persisted != @as(?u64, 2)) : (calls += 1) {
-        var capture = TestApplyCapture{ .alloc = alloc };
-        defer capture.deinit();
-        const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, store.persisted orelse 0, &capture, testApplyCapture, options);
-        // The no-op record must not let the large one bypass its subchunks.
-        try std.testing.expect(capture.applied_documents <= 2);
-        applied_total += capture.applied_documents;
-        yields += stats.partial_yields;
-        try std.testing.expect(calls < 10);
-    }
-    try std.testing.expect(yields > 0);
-    try std.testing.expectEqual(keys.len, applied_total);
-    try std.testing.expectEqual(@as(?PartialCursor, null), store.cursor);
-}
-
-test "catchUpIndex bounds a full text record carrying asset artifact keys" {
-    const alloc = std.testing.allocator;
-    var capture = TestApplyCapture{ .alloc = alloc };
-    defer capture.deinit();
-    const documents = [_]derived_types.DerivedDocument{ .{ .key = "doc:a" }, .{ .key = "doc:b" }, .{ .key = "doc:c" } };
-    var artifacts: [9][]const u8 = undefined;
-    var names: [9][16]u8 = undefined;
-    for (&artifacts, &names, 0..) |*artifact, *name, i| artifact.* = std.fmt.bufPrint(name, "asset:{d}", .{i}) catch unreachable;
-    const batch: derived_types.DerivedBatch = .{ .sequence = 4, .documents = &documents, .changed_artifact_keys = &artifacts };
-    const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
-    // Every call is past its deadline: each applies one subchunk of at most
-    // two items, documents first, then the asset keys, and reports where to
-    // resume. Asset cleanup is inside the same resumable budget.
-    var offset: usize = 0;
-    var calls: usize = 0;
-    var largest: usize = 0;
-    while (true) : (calls += 1) {
-        const before_docs = capture.applied_documents;
-        const before_artifacts = capture.applied_changed_artifact_keys;
-        const outcome = try applyBatchBounded(&capture, testApplyCapture, batch, index_ref, 2, offset, 1);
-        largest = @max(largest, (capture.applied_documents - before_docs) + (capture.applied_changed_artifact_keys - before_artifacts));
-        offset = outcome.next_offset orelse break;
-        try std.testing.expect(calls < 20);
-    }
-    try std.testing.expectEqual(@as(usize, 2), largest);
-    try std.testing.expectEqual(@as(usize, 3), capture.applied_documents);
-    try std.testing.expectEqual(@as(usize, 9), capture.applied_changed_artifact_keys);
-    // Documents never share a subchunk with asset keys.
-    try std.testing.expectEqual(@as(usize, 0), capture.last_batch.?.documents.len);
-}
-
-test "catchUpIndex ignores a resume point for a record it did not collect" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-full-text-stale-partial-journal", .{tmp.sub_path});
-    defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
-    defer alloc.free(journal_path_z);
-    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
-    defer journal.close();
-    try appendChangeJournalRecord(&journal, alloc, .{
-        .sequence = 1,
-        .changed_doc_keys = &.{ "doc:a", "doc:b", "doc:c" },
-        .target_hints = &.{.full_text},
-    });
-    // A resume point for another record must not skip items of record 1.
-    var store: TestPartialStore = .{ .cursor = .{ .sequence = 5, .offset = 2 } };
-    var capture = TestApplyCapture{ .alloc = alloc };
-    defer capture.deinit();
-    _ = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, 0, &capture, testApplyCapture, .{
-        .max_items_per_window = 2,
-        .max_chunk_bytes = 512,
-        .persist_ctx = &store,
-        .persist_progress_fn = TestPartialStore.persist,
-        .partial_ctx = &store,
-        .load_partial_fn = TestPartialStore.load,
-        .save_partial_fn = TestPartialStore.save,
-    });
-    try std.testing.expectEqual(@as(usize, 3), capture.applied_documents);
-    try std.testing.expectEqual(@as(?u64, 1), store.persisted);
-
-    // A point at or below the applied sequence is ignored too, rather than
-    // ending every window before the next record.
-    try appendChangeJournalRecord(&journal, alloc, .{
-        .sequence = 2,
-        .changed_doc_keys = &.{ "doc:d", "doc:e" },
-        .target_hints = &.{.full_text},
-    });
-    store.cursor = .{ .sequence = 1, .offset = 1 };
-    var next = TestApplyCapture{ .alloc = alloc };
-    defer next.deinit();
-    _ = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, 1, &next, testApplyCapture, .{
-        .max_items_per_window = 2,
-        .max_chunk_bytes = 512,
-        .persist_ctx = &store,
-        .persist_progress_fn = TestPartialStore.persist,
-        .partial_ctx = &store,
-        .load_partial_fn = TestPartialStore.load,
-        .save_partial_fn = TestPartialStore.save,
-    });
-    try std.testing.expectEqual(@as(usize, 2), next.applied_documents);
-    try std.testing.expectEqual(@as(?u64, 2), store.persisted);
 }
 
 test "catchUpIndex chunks dense replay by estimated vector byte budget" {
@@ -2882,6 +2867,33 @@ test "catchUpIndex delivers root-only asset repair metadata to serving consumers
         try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
         try std.testing.expectEqualStrings(root, capture.last_batch.?.changed_artifact_keys[0]);
     }
+}
+
+test "catchUpIndex durable fragments count a complete small window without an atomic callback" {
+    const a = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"small"}, .target_hints = &.{.full_text} });
+    defer a.free(payload);
+    try store.appendReplayOpaque(a, 1, payload);
+    const State = struct {
+        fn load(_: *anyopaque, _: []const u8) !?replay_fragment.Position {
+            return null;
+        }
+        fn save(_: *anyopaque, _: []const u8, _: replay_fragment.Position) !void {
+            return error.UnexpectedPartialCheckpoint;
+        }
+        fn apply(_: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef) !bool {
+            try std.testing.expectEqual(@as(usize, 1), batch.documents.len);
+            return true;
+        }
+    };
+    var state: u8 = 0;
+    const stats = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromPrimaryStore(&store, null, null), .{ .name = "text", .kind = .full_text }, 0, &state, State.apply, .{ .max_windows_per_call = 1, .max_fragment_families = 8, .fragment_ctx = &state, .load_fragment_fn = State.load, .save_fragment_fn = State.save });
+    try std.testing.expectEqual(@as(usize, 1), stats.collected_families);
+    try std.testing.expectEqual(@as(?u64, 1), stats.appliedSequenceAdvance(0));
 }
 
 test "privacy index replay preserves empty changed and deleted document IDs" {

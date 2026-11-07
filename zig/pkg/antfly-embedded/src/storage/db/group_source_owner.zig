@@ -19,7 +19,27 @@ const work = @import("group_source_worker.zig");
 /// Namespace maintenance continuation belongs to the scheduling owner, not a reopened DB.
 /// Native Lite preserves group cursor/lease identity and replay feedback per table.
 pub const State = struct {
+    publication_overhead_ns: std.atomic.Value(u64) = .init(0),
+    /// Alternate durable backfill and normal replay even when DB wrappers
+    /// are reconstructed between turns. A moving tail must not starve repair.
+    resolution_backfill_turn: std.atomic.Value(u8) = .init(0),
+    /// Rotate independent consumers, producers and dependent consumers across
+    /// interrupted turns; a slow stage must not always occupy the deadline.
+    source_replay_stage: std.atomic.Value(u32) = .init(0),
+    control_maintenance_slot: u4 = 0,
+    control_maintenance_changed: bool = false,
+    /// Runnable control continuation must not inherit an unrelated LSM timer.
+    control_maintenance_pending: bool = false,
+    replay_retirement: @import("../docstore.zig").ReplayRetirement = .{},
     replay_budget: @import("derived/replay_budget.zig").Controller = .{},
+    producer_replay_budget: @import("derived/replay_budget.zig").Controller = .{
+        .lanes = @splat(.{ .records = 8, .bytes = 256 * 1024 }),
+        .max_records = 128,
+        .max_bytes = 4 * 1024 * 1024,
+    },
+    /// Serializes replay/retirement scopes borrowing the DocStore's deferred
+    /// retirement pointer. Group command discovery retains its separate lock.
+    replay_service_mutex: std.atomic.Mutex = .unlocked,
     slice_mutex: std.atomic.Mutex = .unlocked,
     allocator: ?std.mem.Allocator = null,
     worker: ?work.Worker = null,

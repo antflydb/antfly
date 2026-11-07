@@ -14,13 +14,22 @@
 // limitations under the License.
 
 test {
+    _ = @import("antfly_local_sources").storage_lite_semantic_revision;
     _ = @import("antfly_local_sources").storage_lite_backup_preflight;
     _ = @import("standalone/backup_inspection.zig");
     _ = @import("antfly_local_sources").storage_lite_backend;
     _ = @import("antfly_local_sources").storage_lite_conformance_test;
     _ = @import("antfly_local_sources").storage_lite_docstore;
+    _ = @import("antfly_local_sources").storage_lite_artifact_source;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
+    _ = @import("antfly_local_sources").storage_native_publication_value;
+    _ = @import("antfly_local_sources").storage_native_metadata_batch;
+    _ = @import("antfly_local_sources").storage_control_key;
+    _ = @import("antfly_local_sources").storage_doc_ordinal_binding;
+    _ = @import("antfly_local_sources").storage_lite_namespace_store;
     _ = @import("antfly_local_sources").storage_lite_native;
+    _ = @import("antfly_local_sources").storage_lite_reader_epochs;
+    _ = @import("antfly_local_sources").storage_lite_reader_coordinator;
     _ = @import("antfly_local_sources").storage_lite_benchmark;
     _ = @import("antfly_local_sources").storage_lite_snapshot_test;
     _ = @import("antfly_local_sources").storage_lite_secret_store;

@@ -158,12 +158,16 @@ fn runUntilIdleWithGroupSourceState(self: *DB, state: *DB.GroupSourceMaintenance
     return .{ .value = self.runUntilIdleWithGroupSourceState(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn runExplicitReplayDrainTurn(self: *DB, state: *DB.GroupSourceMaintenanceState, producer_after: u64) engine.Outcome(bool) {
+    return .{ .value = self.runExplicitReplayDrainTurn(state, producer_after) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(bool) {
     return .{ .value = self.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) engine.Outcome(bool) {
-    return .{ .value = self.runBackgroundTurnWithCancellation(cancellation, shadow) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase) engine.Outcome(bool) {
+    return .{ .value = self.runBackgroundTurnWithCancellation(cancellation, phase) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) engine.Outcome(bool) {
@@ -597,6 +601,14 @@ fn enrichmentWaitForAppliedWithVisibilityDeadline(self: *@import("db/enrichment/
     return .{ .value = self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn enrichmentCatchUpTurnWithCancellation(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64, cancellation: types.CancellationToken) engine.Outcome(void) {
+    return .{ .value = self.catchUpTurnWithCancellation(sequence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn enrichmentCatchUpTurnWithLimits(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64, cancellation: types.CancellationToken, limits: @import("db/derived/replay_source.zig").Source.EnrichmentWindowLimits) engine.Outcome(@import("db/enrichment/enrichment_runtime.zig").ReplayTurnStats) {
+    return .{ .value = self.catchUpTurnWithLimits(sequence, cancellation, limits) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn enrichmentCatchUpUntil(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64) engine.Outcome(void) {
     return .{ .value = self.catchUpUntil(sequence) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -615,6 +627,10 @@ fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequ
 
 fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) engine.Outcome(void) {
     return .{ .value = self.waitForResolvedTransactionSyncWithCancellation(sync_level, sequence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn pollBatchVisibilityCompletion(self: *DB, completion: *const @import("db/execution_resources.zig").BatchVisibilityCompletion, cursor: *@import("db/execution_resources.zig").BatchVisibilityCursor) engine.Outcome(bool) {
+    return .{ .value = self.pollBatchVisibilityCompletion(completion, cursor) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) engine.Outcome(void) {
@@ -645,6 +661,9 @@ fn tryEmbeddedBackupReadFence(self: *DB) engine.Outcome(?DB.StatementReadFence) 
     return .{ .value = self.tryEmbeddedBackupReadFence() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn loadReplayFragmentState(self: *DB, name: []const u8) engine.Outcome(?@import("db/derived/replay_fragment.zig").Position) {
+    return .{ .value = self.loadReplayFragmentState(name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn catchUpPendingDerivedReplay(self: *DB) engine.Outcome(void) {
     return .{ .value = self.catchUpPendingDerivedReplay() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1950,8 +1969,8 @@ fn resolutionCatchUp(self: *@import("db/resolution_runtime.zig").ResolutionRunti
     return .{ .value = self.catchUp() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn resolutionCatchUpOnce(self: *@import("db/resolution_runtime.zig").ResolutionRuntime, deadline_ns: u64) engine.Outcome(void) {
-    return .{ .value = self.catchUpOnce(deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn resolutionCatchUpOnce(self: *@import("db/resolution_runtime.zig").ResolutionRuntime, deadline_ns: u64, prefer_backfill: bool) engine.Outcome(void) {
+    return .{ .value = self.catchUpOnce(deadline_ns, prefer_backfill) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn resolutionRequestReresolveBacklog(self: *@import("db/resolution_runtime.zig").ResolutionRuntime) engine.Outcome(void) {
@@ -1984,6 +2003,10 @@ fn promotionStop(self: *@import("db/promotion_runtime.zig").PromotionRuntime) en
 
 fn promotionCatchUp(self: *@import("db/promotion_runtime.zig").PromotionRuntime) engine.Outcome(void) {
     return .{ .value = self.catchUp() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn promotionCatchUpOnce(self: *@import("db/promotion_runtime.zig").PromotionRuntime, deadline_ns: u64) engine.Outcome(void) {
+    return .{ .value = self.catchUpOnce(deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn pinnedSnapshotDeinit(self: *@import("db/core.zig").PinnedStoreSnapshot) engine.Outcome(void) {

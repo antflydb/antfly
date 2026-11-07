@@ -45,7 +45,15 @@ pub const Charge = struct {
         return result;
     }
 };
-pub const Reservation = struct { key: Digest, attempt: u64, nonce: [8]u8, upper: Charge };
+pub const Reservation = struct {
+    key: Digest,
+    attempt: u64,
+    nonce: [8]u8,
+    upper: Charge,
+    /// Persisted before any stage output upload. Older reservations lack this
+    /// witness and conservatively retain their possible artifact output.
+    output_may_exist: bool = true,
+};
 pub const Record = struct {
     format: u32 = 1,
     run_id: []const u8,
@@ -79,19 +87,27 @@ pub const Record = struct {
     sequence: u64 = 0,
     result: ?Ref = null,
     pending: []const Reservation = &.{},
-    /// Retire an attempt without charging an unpublished source twice. Source
-    /// bytes are logical snapshot occupancy, unlike uncertain physical calls,
-    /// tokens, pixels and artifact output. Accepted checkpoints stay charged.
+    /// Retire an attempt without charging unpublished source/output capacity.
+    /// Calls, tokens, pixels and possibly uploaded artifacts remain uncertain.
+    /// Accepted checkpoints stay charged.
     /// Older records may already carry source uncertainty; normalize it here.
     pub fn abandonPending(self: *Record) !void {
         self.used.source_bytes = std.math.sub(u64, self.used.source_bytes, self.uncertain.source_bytes) catch return error.InvalidDocumentCheckpoint;
         self.uncertain.source_bytes = 0;
-        for (self.pending) |pending| try self.abandonCharge(pending.upper);
+        for (self.pending) |pending| try self.abandonCharge(pending);
         self.pending = &.{};
     }
-    fn abandonCharge(self: *Record, upper: Charge) !void {
+    fn abandonCharge(self: *Record, reservation: Reservation) !void {
+        const upper = reservation.upper;
         var physical = upper;
         physical.source_bytes = 0;
+        if (!reservation.output_may_exist) {
+            // The executor must durably arm output before calling put(). A
+            // failed provider, cancelled warmup or crashed computation cannot
+            // have produced stage artifacts without that publication intent.
+            physical.output_bytes = 0;
+            self.used.output_bytes = std.math.sub(u64, self.used.output_bytes, upper.output_bytes) catch return error.InvalidDocumentCheckpoint;
+        }
         self.uncertain = try self.uncertain.plus(physical);
         self.used.source_bytes = std.math.sub(u64, self.used.source_bytes, upper.source_bytes) catch return error.InvalidDocumentCheckpoint;
     }
@@ -107,6 +123,12 @@ pub fn validateIdentityTransition(previous: Record, next: Record) !void {
     const preparing = !previous.prepared and next.prepared and previous.used.calls == 0 and previous.pending.len == 0 and previous.attempt == next.attempt and previous.state == .running and next.state == .running;
     if (!preparing and (!std.meta.eql(previous.identity, next.identity) or !std.meta.eql(previous.limits, next.limits))) return error.InvalidDocumentCheckpoint;
     if (previous.prepared and !next.prepared) return error.InvalidDocumentCheckpoint;
+    for (previous.pending) |before| if (before.output_may_exist) {
+        for (next.pending) |after| {
+            if (before.attempt == after.attempt and std.mem.eql(u8, &before.nonce, &after.nonce) and std.mem.eql(u8, &before.key, &after.key) and !after.output_may_exist)
+                return error.InvalidDocumentCheckpoint;
+        }
+    };
     if (preparing) {
         if (!std.mem.eql(u8, &previous.identity.request, &next.identity.request) or !std.meta.eql(previous.used, next.used)) return error.InvalidDocumentCheckpoint;
         inline for (@typeInfo(Charge).@"struct".field_names) |field| if (@field(next.limits, field) > @field(previous.limits, field) or @field(next.used, field) > @field(next.limits, field)) return error.InvalidDocumentCheckpoint;
@@ -225,7 +247,7 @@ pub const Store = struct {
             if (count > 256) return error.DocumentBudgetExhausted;
             const pending = try a.alloc(Reservation, count);
             @memcpy(pending[0..record.pending.len], record.pending);
-            pending[existing orelse record.pending.len] = .{ .key = key, .attempt = lease.attempt, .nonce = lease.nonce, .upper = upper };
+            pending[existing orelse record.pending.len] = .{ .key = key, .attempt = lease.attempt, .nonce = lease.nonce, .upper = upper, .output_may_exist = false };
             const expected = record.version();
             const previous = record.revision;
             record.pending = pending;
@@ -236,7 +258,7 @@ pub const Store = struct {
         return error.DocumentRunBusy;
     }
     /// A known failed worker will never reconcile its intent. Preserve physical
-    /// charges as uncertainty and release only unpublished source occupancy.
+    /// charges as uncertainty and release provably unpublished capacity.
     /// Missing intents are already committed or settled; repeated cleanup is safe.
     pub fn abandonReservation(self: Store, a: A, lease: Lease, key: Digest, now_ms: u64) !void {
         for (0..16) |_| {
@@ -248,7 +270,7 @@ pub const Store = struct {
             @memcpy(pending[0..index], record.pending[0..index]);
             @memcpy(pending[index..], record.pending[index + 1 ..]);
             const expected = record.version();
-            try record.abandonCharge(record.pending[index].upper);
+            try record.abandonCharge(record.pending[index]);
             record.pending = pending;
             record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
             if (try self.cas_fn(self.ptr, expected, record)) return;
@@ -265,11 +287,32 @@ pub const Store = struct {
             const index = for (record.pending, 0..) |intent, i| {
                 if (intent.attempt == lease.attempt and std.mem.eql(u8, &intent.nonce, &lease.nonce) and std.mem.eql(u8, &intent.key, &key)) break i;
             } else return;
+            if (record.pending[index].output_may_exist) return error.InvalidDocumentCheckpoint;
             const pending = try a.alloc(Reservation, record.pending.len - 1);
             @memcpy(pending[0..index], record.pending[0..index]);
             @memcpy(pending[index..], record.pending[index + 1 ..]);
             const expected = record.version();
             record.used = try record.used.minus(record.pending[index].upper);
+            record.pending = pending;
+            record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
+            if (try self.cas_fn(self.ptr, expected, record)) return;
+        }
+        return error.DocumentRunBusy;
+    }
+
+    /// A separate durable intent distinguishes computation from output
+    /// publication. Lost acknowledgements and failed uploads remain charged;
+    /// only an intent which never reached this transition can release output.
+    fn beginOutput(self: Store, a: A, lease: Lease, key: Digest, now_ms: u64) !void {
+        for (0..16) |_| {
+            var record = try self.current(a, lease, now_ms);
+            const index = for (record.pending, 0..) |intent, i| {
+                if (intent.attempt == lease.attempt and std.mem.eql(u8, &intent.nonce, &lease.nonce) and std.mem.eql(u8, &intent.key, &key)) break i;
+            } else return error.InvalidDocumentCheckpoint;
+            if (record.pending[index].output_may_exist or record.pending[index].upper.output_bytes == 0) return;
+            const pending = try a.dupe(Reservation, record.pending);
+            pending[index].output_may_exist = true;
+            const expected = record.version();
             record.pending = pending;
             record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
             if (try self.cas_fn(self.ptr, expected, record)) return;
@@ -320,6 +363,7 @@ pub const Store = struct {
             if (pending.attempt == lease.attempt and std.mem.eql(u8, &pending.nonce, &lease.nonce) and std.mem.eql(u8, &pending.key, &key)) break pending;
         } else return error.InvalidDocumentCheckpoint;
         if (!actual.within(reservation.upper)) return error.DocumentBudgetExhausted;
+        try self.beginOutput(a, lease, key, now_ms);
         const value = try self.put(a, lease, payload);
         const event_ref = if (events.len > 0) try self.put(a, lease, events) else null;
         for (0..16) |_| {
@@ -1231,6 +1275,100 @@ test "document durable cancellation fences pending publication and identity chan
     try std.testing.expect(record.head == null);
 }
 
+test "document durable interrupted computations retain model spend without consuming unstarted output" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |crash| {
+        var memory = TestStore{ .a = a };
+        defer memory.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const store = memory.interface();
+        const request: [824]u8 = @splat('x');
+        var identity: Identity = .{ .request = undefined, .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+        std.crypto.hash.sha2.Sha256.hash(&request, &identity.request, .{});
+        try store.create(.{ .run_id = "interrupted", .owner = "alice", .identity = identity, .prepared = false, .limits = .{ .calls = 256, .tokens = 1_000_000, .output_bytes = 256 * 1024 * 1024, .source_bytes = 1024 }, .inputs = &.{} });
+        var now_ms: u64 = 1;
+        var lease = try store.claim(work, "interrupted", "alice", identity, now_ms, 10);
+        const source = try store.installRequest(work, lease, @splat(1), .{ .source_bytes = request.len, .output_bytes = request.len }, &request, now_ms);
+        try store.prepare(work, lease, identity, (try store.load(work, "interrupted", "alice")).limits, &.{source}, now_ms);
+        const upper: Charge = .{ .calls = 1, .tokens = 131072, .output_bytes = 64 * 1024 * 1024 };
+        for (0..3) |_| {
+            try std.testing.expect(try store.reserve(work, lease, @splat(7), upper, now_ms));
+            if (!crash) {
+                try store.abandonReservation(work, lease, @splat(7), now_ms);
+                try store.yieldLease(work, lease, now_ms);
+            }
+            now_ms += 11;
+            lease = try store.claim(work, "interrupted", "alice", identity, now_ms, 10);
+        }
+        const resumed = try store.load(work, "interrupted", "alice");
+        try std.testing.expectEqual(@as(u64, 3), resumed.uncertain.calls);
+        try std.testing.expectEqual(@as(u64, 3 * 131072), resumed.uncertain.tokens);
+        try std.testing.expectEqual(@as(u64, 0), resumed.uncertain.output_bytes);
+        try std.testing.expectEqual(@as(u64, request.len), resumed.used.output_bytes);
+        try std.testing.expect(try store.reserve(work, lease, @splat(7), upper, now_ms));
+        const result = try store.complete(work, lease, @splat(7), .{ .calls = 1, .tokens = 173, .output_bytes = 2 }, "{}", now_ms);
+        try store.finish(work, lease, result, now_ms);
+        const completed = try store.load(work, "interrupted", "alice");
+        try std.testing.expectEqual(@as(u64, 3 * 131072 + 173), completed.used.tokens);
+        try std.testing.expectEqual(@as(u64, 4), completed.used.calls);
+        try std.testing.expectEqual(@as(u64, request.len + 2), completed.used.output_bytes);
+    }
+}
+
+test "document durable output intent preserves lost acknowledgements uploads and legacy uncertainty" {
+    const a = std.testing.allocator;
+    for ([_]enum { intent_ack_lost, upload_commit_failed, legacy }{ .intent_ack_lost, .upload_commit_failed, .legacy }) |mode| {
+        var memory = TestStore{ .a = a };
+        defer memory.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const store = memory.interface();
+        const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+        try store.create(.{ .run_id = "output", .owner = "alice", .identity = identity, .limits = .{ .calls = 2, .tokens = 100, .output_bytes = 64 }, .inputs = &.{} });
+        const first = try store.claim(work, "output", "alice", identity, 1, 10);
+        const key: Digest = @splat(7);
+        const upper: Charge = .{ .calls = 1, .tokens = 20, .output_bytes = 64 };
+        try std.testing.expect(try store.reserve(work, first, key, upper, 1));
+        switch (mode) {
+            .intent_ack_lost => memory.cas_ack_error_once = true,
+            .upload_commit_failed => {
+                try store.beginOutput(work, first, key, 1);
+                memory.cas_error_once = true;
+            },
+            .legacy => {
+                // Missing witnesses in older records must remain conservative.
+                const bytes = try std.json.Stringify.valueAlloc(work, .{ .key = key, .attempt = first.attempt, .nonce = first.nonce, .upper = upper }, .{});
+                const old = try std.json.parseFromSliceLeaky(Reservation, work, bytes, .{});
+                try std.testing.expect(old.output_may_exist);
+                var record = try store.load(work, "output", "alice");
+                const expected = record.version();
+                record.pending = try work.dupe(Reservation, &.{old});
+                record.revision += 1;
+                try std.testing.expect(try store.cas_fn(store.ptr, expected, record));
+            },
+        }
+        if (mode != .legacy) try std.testing.expectError(error.TestStorageUnavailable, store.complete(work, first, key, .{ .calls = 1, .tokens = 7, .output_bytes = 4 }, "data", 1));
+        try std.testing.expectEqual(mode == .upload_commit_failed, memory.blobs.count() > 0);
+        try std.testing.expectError(error.InvalidDocumentCheckpoint, store.releaseReservation(work, first, key, 1));
+        const before = try store.load(work, "output", "alice");
+        var changed = before;
+        const pending = try work.dupe(Reservation, before.pending);
+        pending[0].output_may_exist = false;
+        changed.pending = pending;
+        try std.testing.expectError(error.InvalidDocumentCheckpoint, validateIdentityTransition(before, changed));
+        const second = try store.claim(work, "output", "alice", identity, 12, 10);
+        const resumed = try store.load(work, "output", "alice");
+        try std.testing.expectEqual(upper, resumed.uncertain);
+        try std.testing.expectError(error.DocumentBudgetExhausted, store.reserve(work, second, key, upper, 12));
+        const blobs = memory.blobs.count();
+        try std.testing.expectError(error.DocumentRunLeaseLost, store.complete(work, first, key, .{ .output_bytes = 4 }, "late", 12));
+        try std.testing.expectEqual(blobs, memory.blobs.count());
+    }
+}
+
 test "document durable attempt nonces fence old workers after metadata rollback" {
     const a = std.testing.allocator;
     var memory = TestStore{ .a = a };
@@ -1706,6 +1844,7 @@ test "document durable source capacity survives yield crash and legacy uncertain
         const prepared = try store.load(work, "sources", "alice");
         try store.prepare(work, second, identity, prepared.limits, &.{ request, source_ref }, 12);
         try std.testing.expect(try store.reserve(work, second, @splat(3), .{ .calls = 1, .tokens = 11, .pixels = 5, .output_bytes = 10 }, 12));
+        try store.beginOutput(work, second, @splat(3), 12);
         try store.yieldLease(work, second, 13);
         Clock.value = 14;
         const third = try store.claim(work, "sources", "alice", identity, 14, 100);
@@ -1832,24 +1971,28 @@ test "document durable admission never waits for failed or untracked reservation
         var pixels = PixelMeter{};
         try std.testing.expectError(error.DocumentPixelLimitExceeded, pixels.charge(&session, 1));
         const after = try store.load(work, "wait", "alice");
-        try std.testing.expectEqual(upper, after.used);
+        // Computation remains charged; output was never eligible for upload.
+        var abandoned = upper;
+        abandoned.output_bytes = 0;
+        const settled = mode == .dispatch_failure or mode == .ambiguous_reservation;
+        try std.testing.expectEqual(if (settled) abandoned else upper, after.used);
         if (mode == .dispatch_failure or mode == .ambiguous_reservation) {
             try std.testing.expectEqual(@as(usize, 0), after.pending.len);
-            try std.testing.expectEqual(upper, after.uncertain);
+            try std.testing.expectEqual(abandoned, after.uncertain);
             // A partial result can finish with conservative failed-work usage.
             const final = try session.publish(work, @splat(3), "", "");
             try store.finish(work, lease, final, 1);
             const finished = try store.load(work, "wait", "alice");
             try std.testing.expectEqual(.succeeded, finished.state);
-            try std.testing.expectEqual(upper, finished.used);
-            try std.testing.expectEqual(upper, finished.uncertain);
+            try std.testing.expectEqual(abandoned, finished.used);
+            try std.testing.expectEqual(abandoned, finished.uncertain);
             continue;
         }
         try std.testing.expectEqual(@as(usize, 1), after.pending.len);
         const next = try store.claim(work, "wait", "alice", identity, 12, 100);
         const reclaimed = try store.load(work, next.run_id, next.owner);
-        try std.testing.expectEqual(upper, reclaimed.used);
-        try std.testing.expectEqual(upper, reclaimed.uncertain);
+        try std.testing.expectEqual(abandoned, reclaimed.used);
+        try std.testing.expectEqual(abandoned, reclaimed.uncertain);
     }
 }
 

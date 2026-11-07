@@ -524,9 +524,25 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_model_filters = [_][]const u8{"capi local model "};
     const capi_default_filters = [_][]const u8{
+        "index manager forced native compaction uses bounded task admission",
+        "capi native",
+        "background enrichment turn",
+        "inline resolver replacement background replay yields",
+        "db multi-source graph precedence falls back",
+        "db graph relation artifact materializer deletes",
+        "db graph source artifact deletion",
+        "db graph primary publication serializes",
+        "ordered artifact inventory accepted asset callback waits for graph publication",
+        "durable enrichment retry progress",
+        "asset preparation is lazy",
+        "stale embedding cleanup guards",
+        "grouped sources production plans deleted unit descendants",
+        "replay budget ",
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",
+        "capi owned relational postimages",
+        "text merge file provenance resolves deletion races",
         "capi path gate",
         "storage owner runtime status",
         "storage owner remote content source",
@@ -575,6 +591,26 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native marker sweep",
         "capi native unbounded writer admits reusable pool before a large request",
         "capi native allocator proof",
+        "capi native readonly lease timing",
+        "capi native artifact maintenance",
+        "capi native asynchronous text merge",
+        "capi native SQL constraint overlay",
+        "relational statement overlay",
+        "mutation fold",
+        "capi native replay publication guards",
+        "capi native replay admission",
+        "manual replay background budget",
+        "lite persistent cache lifecycle preserves",
+        "capi native artifact continuation survives",
+        "lite wal accounting ignores unrelated",
+        "lite wal metadata revisions invalidate",
+        "lsm backend wal retention generation",
+        "lsm obsolete retry starts",
+        "docstore replay retirement defers",
+        "docstore replay retirement atomically",
+        "capi native retirement coalesces",
+        "native projection progress and status",
+        "lite artifact construction transfers",
         "capi native recovery agenda",
         "capi native logical generations",
         "capi native close bounds proof work",
@@ -597,6 +633,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite run until idle drains a standalone chunk enrichment with no owning index",
         "capi lite AddIndexJSON registers a graph config",
         "inline resolver replacement",
+        "catchUpWindow preserves a bounded fallback prefix before a late match",
+        "db manual resolver observations follow durable peer control progress",
+        "db detached replay leaves optional maintenance to its retained continuation",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
     const memory_capi_check = linked_tests.add(b, .{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
@@ -661,6 +700,29 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // regressions to avoid compiling unrelated resolver replay fixtures.
     b.step("capi-contract-test", "Run hermetic C API contracts without resolver replay suites")
         .dependOn(&run_capi_tests.step);
+    const admission_step = b.step("lite-writer-admission-test", "Test fair Lite admission, cancellation and process death without database/model builds");
+    for ([_][]const u8{
+        "pkg/antfly-embedded/src/storage/lite/path_admission.zig",
+        "pkg/antfly-embedded/src/capi/admission_mutex.zig",
+    }) |path| {
+        const module = b.createModule(.{ .root_source_file = b.path(path), .target = target, .optimize = optimize, .link_libc = link_libc });
+        module.addImport("antfly_platform", platform_mod);
+        const tests = b.addTest(.{ .root_module = module });
+        admission_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+    if (target.result.os.tag == .linux or target.result.os.tag == .macos) {
+        const queue_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/lite/writer_queue.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
+        queue_module.addImport("antfly_platform", platform_mod);
+        const queue_tests = b.addTest(.{ .root_module = queue_module });
+        admission_step.dependOn(&b.addRunArtifact(queue_tests).step);
+        const fixture_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/tests/writer_queue_process_fixture.zig"), .target = target, .optimize = optimize, .link_libc = link_libc });
+        fixture_module.addImport("writer_queue", queue_module);
+        fixture_module.addImport("antfly_platform", platform_mod);
+        const fixture = b.addExecutable(.{ .name = "lite-writer-admission-fixture", .root_module = fixture_module });
+        admission_step.dependOn(@import("antfly_platform").addNativeProcessTest(b, fixture, b.path("pkg/antfly-embedded/tests/test_writer_queue_process.py")));
+    }
+    capi_test_step.dependOn(admission_step);
+    b.top_level_steps.get("capi-contract-test").?.step.dependOn(admission_step);
     // Physical C API regressions can build their existing implementation owner
     // directly. The ordinary gate still audits and runs both partitions.
     @import("../antfly/test_partitions.zig").installLocalArtifact(b, capi_tests.executable, "capi-contract-owner-test-build", "Build physical C API contract tests without consumer discovery", "capi-contract-owner-tests");

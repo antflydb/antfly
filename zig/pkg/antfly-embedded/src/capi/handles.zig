@@ -75,6 +75,10 @@ pub const Handle = struct {
     sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     maintenance_references: usize = 0,
+    /// Strong ownership of internal detached runtimes: the cache, active
+    /// turns and immutable merge jobs release independently. Foreground and
+    /// public handles do not participate in this internal ownership domain.
+    maintenance_runtime_references: std.atomic.Value(usize) = .init(0),
     /// Independent proof readers borrow allocator/executor lifetime only;
     /// they do not require detaching the foreground DB runtime.
     allocator_verification_references: usize = 0,
@@ -87,6 +91,7 @@ pub const Handle = struct {
     maintenance_writer_scope: u8 = 0,
     maintenance_writer_held_from: i96 = 0,
     maintenance_writer_references: usize = 0,
+    maintenance_publication_started_ns: ?i96 = null,
     maintenance_admission_mutex: std.Io.Mutex = .init,
     embedded_path: ?[]u8 = null,
     embedded_open_options: db_mod.OpenOptions = .{},
@@ -141,6 +146,9 @@ pub const Handle = struct {
     query_producer_mutex: std.Io.Mutex = .init,
     /// Protected by the native path gate; pins provider and extractor lifetime.
     query_borrows: usize = 0,
+    /// Keep predecessor inputs alive only while an admitted API call opens
+    /// its replacement namespaces. This borrows neither allocator nor queries.
+    refresh_references: usize = 0,
 
     // Serialized threading mode (see CAPI.md "Thread Safety"): every export
     // enters through `enterHandle`, which takes `api_lock` shared for reads

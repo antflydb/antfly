@@ -21,7 +21,7 @@ const std = h.std;
 const dependencies = h.antfly.capi_dependencies;
 const contract = dependencies.api_distributed_txn_contract;
 const catalog = dependencies.sql_catalog;
-const key = "\x00antfly/embedded/sql-commit/v1";
+pub const key = @import("../storage/lite/replay_admission.zig").coordinator_key;
 const Record = struct { id: h.db_mod.types.TxnId, timestamp: u64, tables: []const []const u8 };
 
 /// Serializes recovery with live preparation/decision and promotion's
@@ -211,6 +211,12 @@ fn prepareDecision(handle: *h.Handle, requests: []const contract.TableCommitRequ
     defer handle.alloc.free(names);
     for (requests, names) |request, *name| name.* = request.table_name;
     const record: Record = .{ .id = id, .timestamp = now, .tables = names };
+    // Refuse a new coordinator before recording a decision when the journal
+    // is full. Once admitted, its bounded transaction must remain completable
+    // across every participant, even if the final replay record crosses the
+    // ordinary producer high-water mark. Recovery excludes a second producer.
+    if (handle.owned_lite_backend) |backend| if (backend.native_docstore) |native_store|
+        try native_store.file.requireReplayCoordinatorCapacity();
     if (comptime h.builtin.is_test) if (test_before_store) |hook| try hook.run(hook.ptr);
     try store(handle, record);
     // From here a failure leaves a hint and possibly pending intents; abort
@@ -295,6 +301,155 @@ test "capi coordinator recovery waits for a live prepared decision" {
     try std.testing.expectEqualStrings("{\"name\":\"Ada\"}", row.json);
 }
 
+test "capi SQL COMMIT reports a predecision refusal without applying an increment" {
+    const api = @import("db.zig");
+    var tmp = try api.TestDirectory.init("sql-commit-predecision-outcome");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const id = try api.publishHandle(root);
+    defer api.antfly_db_close(id);
+    const Probe = struct {
+        failure: anyerror = error.FileBusy,
+        fn refuse(ptr: *anyopaque) !void {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).failure;
+        }
+        fn call(handle: *anyopaque, session: ?u64, statement: []const u8, expected: h.capi.ErrorCode) !std.json.Parsed(std.json.Value) {
+            const a = std.testing.allocator;
+            const request = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .session_id = session }, .{});
+            defer a.free(request);
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&out);
+            try std.testing.expectEqual(expected, api.antfly_db_sql_json(handle, .fromSlice(request), &out));
+            return std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+        }
+        fn ok(handle: *anyopaque, session: ?u64, statement: []const u8) !void {
+            const result = try call(handle, session, statement, .ok);
+            result.deinit();
+        }
+    };
+    try Probe.ok(id, null, "CREATE TABLE numbers (n BIGINT)");
+    try Probe.ok(id, null, "INSERT INTO numbers (_id,n) VALUES ('counter',0)");
+    var session: u64 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("sql_session.zig").antfly_db_sql_session_open(id, &session));
+    var probe: Probe = .{};
+    defer test_after_prepare = null;
+    for ([_]struct { failure: anyerror, code: h.capi.ErrorCode, sqlstate: []const u8 }{
+        .{ .failure = error.FileBusy, .code = .busy, .sqlstate = "55P03" },
+        .{ .failure = error.OutOfMemory, .code = .internal, .sqlstate = "53200" },
+        .{ .failure = error.TestInjectedCommitFailure, .code = .internal, .sqlstate = "58000" },
+    }) |case| {
+        try Probe.ok(id, session, "BEGIN");
+        try Probe.ok(id, session, "UPDATE numbers SET n=n+1 WHERE _id='counter'");
+        probe.failure = case.failure;
+        test_after_prepare = .{ .ptr = &probe, .run = Probe.refuse };
+        const failed = try Probe.call(id, session, "COMMIT", case.code);
+        defer failed.deinit();
+        test_after_prepare = null;
+        try std.testing.expectEqualStrings("not_applied", failed.value.object.get("commit_outcome").?.string);
+        try std.testing.expectEqualStrings(case.sqlstate, failed.value.object.get("error").?.object.get("code").?.string);
+        try std.testing.expect(failed.value.object.get("transaction_id") == null);
+        try Probe.ok(id, session, "ROLLBACK");
+        const row = try Probe.call(id, null, "SELECT n FROM numbers WHERE _id='counter'", .ok);
+        defer row.deinit();
+        const cell = row.value.object.get("rows").?.array.items[0].array.items[0];
+        try std.testing.expectEqualStrings("0", cell.string);
+    }
+    try Probe.ok(id, session, "BEGIN");
+    try Probe.ok(id, session, "UPDATE numbers SET n=n+1 WHERE _id='counter'");
+    const applied = try Probe.call(id, session, "COMMIT", .ok);
+    defer applied.deinit();
+    try std.testing.expectEqualStrings("applied", applied.value.object.get("commit_outcome").?.string);
+}
+
+test "capi SQL COMMIT uncertain checkpoint returns a token reconciled once after reopen" {
+    const api = @import("db.zig");
+    const Fault = struct {
+        var armed = false;
+        fn arm(_: *anyopaque) !void {
+            armed = true;
+        }
+        fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const written = try std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            // The selector byte is format-owned at offset 20. Publish it,
+            // then lose the acknowledgement, matching native crash probes.
+            if (armed and offset == 20) {
+                armed = false;
+                return error.Canceled;
+            }
+            return written;
+        }
+        fn call(handle: *anyopaque, session: ?u64, statement: []const u8, expected: h.capi.ErrorCode) !std.json.Parsed(std.json.Value) {
+            const request = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = statement, .session_id = session }, .{});
+            defer std.testing.allocator.free(request);
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&out);
+            try std.testing.expectEqual(expected, api.antfly_db_sql_json(handle, .fromSlice(request), &out));
+            return std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+        }
+        fn ok(handle: *anyopaque, session: ?u64, statement: []const u8) !void {
+            const response = try call(handle, session, statement, .ok);
+            response.deinit();
+        }
+    };
+    var tmp = try api.TestDirectory.init("sql-commit-uncertain-token");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = Fault.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var runtime = try h.db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual, .borrowed_io = .{ .general = io } });
+    defer runtime.deinit();
+    var transaction: h.db_mod.types.TxnId = undefined;
+    {
+        const root = try api.openLiteHandleAllocWithRuntime(std.testing.allocator, path, .{ .no_sync = true, .profile = .hosted }, true, io, runtime.ptr());
+        const id = try api.publishHandle(root);
+        defer api.antfly_db_close(id);
+        try Fault.ok(id, null, "CREATE TABLE numbers (n BIGINT)");
+        try Fault.ok(id, null, "INSERT INTO numbers (_id,n) VALUES ('counter',0)");
+        var session: u64 = 0;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("sql_session.zig").antfly_db_sql_session_open(id, &session));
+        try Fault.ok(id, session, "BEGIN");
+        try Fault.ok(id, session, "UPDATE numbers SET n=n+1 WHERE _id='counter'");
+        test_after_prepare = .{ .ptr = &Fault.armed, .run = Fault.arm };
+        defer {
+            test_after_prepare = null;
+            Fault.armed = false;
+        }
+        const result = try Fault.call(id, session, "COMMIT", .outcome_unknown);
+        defer result.deinit();
+        try std.testing.expectEqualStrings("unknown", result.value.object.get("commit_outcome").?.string);
+        try std.testing.expectEqualStrings("40003", result.value.object.get("error").?.object.get("code").?.string);
+        _ = try std.fmt.hexToBytes(&transaction, result.value.object.get("transaction_id").?.string);
+        try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain);
+        // Model process loss without publishing close-time index state. Native
+        // owners already retire captured runtimes this way; the direct hosted
+        // fixture must explicitly abandon its in-memory views before reopen.
+        root.lease_snapshot = true;
+    }
+    const reopened = try api.openLiteHandleAllocWithRuntime(std.testing.allocator, path, .{ .no_sync = true, .profile = .hosted }, false, std.testing.io, runtime.ptr());
+    const id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(id);
+    var status: u8 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_transaction_status(id, &transaction, &status));
+    // An unknown decision can reconcile as committed or aborted. The first
+    // native publication can precede the coordinator decision; never infer a
+    // commit merely because its selector write reached the file.
+    try std.testing.expect(status == 1 or status == 2);
+    const row = try Fault.call(id, null, "SELECT n FROM numbers WHERE _id='counter'", .ok);
+    defer row.deinit();
+    try std.testing.expectEqualStrings(if (status == 1) "1" else "0", row.value.object.get("rows").?.array.items[0].array.items[0].string);
+    if (status == 2) {
+        // Retry only after the durable receipt establishes an abort. The
+        // non-idempotent increment must then appear exactly once.
+        try Fault.ok(id, null, "UPDATE numbers SET n=n+1 WHERE _id='counter'");
+    }
+    const final = try Fault.call(id, null, "SELECT n FROM numbers WHERE _id='counter'", .ok);
+    defer final.deinit();
+    try std.testing.expectEqualStrings("1", final.value.object.get("rows").?.array.items[0].array.items[0].string);
+}
+
 // ---------------------------------------------------------------------------
 // Outcome boundaries. Each case injects one failure at one boundary of one
 // path and checks the reported outcome against what is actually stored.
@@ -333,6 +488,23 @@ const OutcomeFixture = struct {
         api.antfly_db_close(self.id);
         std.testing.allocator.free(self.path);
         self.directory.cleanup();
+    }
+
+    fn reopen(self: *OutcomeFixture) !void {
+        const wrapper = try api.openLiteHandleAlloc(self.path, .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 }, false);
+        const id = api.publishHandle(wrapper) catch |err| {
+            h.closeHandle(wrapper);
+            return err;
+        };
+        api.antfly_db_close(self.id);
+        self.id = id;
+        self.wrapper = wrapper;
+        const owner = wrapper.lite_connection.?.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(h.handleLockIo());
+        if (owner.worker) |worker| worker.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
     }
 
     /// The current storage root. Arm faults immediately before a call.
@@ -447,8 +619,12 @@ test "capi SQL outcome autocommit failure inside checkpoint publication is unkno
         // Never "cancelled" or a retryable code: the commit may be durable.
         try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, reply.code);
         try std.testing.expectEqualStrings("40003", reply.state().?);
-        // The connection reconciles on its next call: the injected failure
-        // came before the slot write, so the row is durably absent.
+        // The uncertain owner stays fenced. Reopen reconstructs durable
+        // truth: this injected failure preceded the checkpoint slot write.
+        var refused = try f.sql(insert_one);
+        defer refused.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.stalled, refused.code);
+        try f.reopen();
         try std.testing.expectEqual(@as(usize, 0), try f.rows());
         try f.expectOk(insert_one);
     }
@@ -693,14 +869,17 @@ test "capi SQL outcome receipt resolves a Lite autocommit write of unknown outco
         const receipt = try lastReceiptAlloc();
         errdefer std.testing.allocator.free(receipt);
         // The SQL error body carries the same receipt, naming table `t`
-        // (hex 74) and its id, whose database holds the marker.
+        // and its durable id, whose database holds the marker.
         try std.testing.expectEqualStrings(receipt, reply.parsed.?.value.object.get("outcome_receipt").?.string);
-        var expected_buf: [32]u8 = undefined;
-        try std.testing.expect(std.mem.endsWith(u8, receipt, try std.fmt.bufPrint(&expected_buf, ":74:{d}", .{(try tableT(f.id)).id})));
+        const parsed_receipt = try @import("outcome_receipts.zig").parse(receipt);
+        const target = parsed_receipt.table().?;
+        try std.testing.expectEqualStrings("t", target.name);
         break :blk receipt;
     };
     defer std.testing.allocator.free(receipt);
-    // Querying enters (and so reconciles) the connection, then answers exactly.
+    // The uncertain owner stays fenced. Reopen before resolving durable truth.
+    try std.testing.expectEqual(h.capi.ErrorCode.stalled, (try receiptStatus(f.id, receipt)).code);
+    try f.reopen();
     const first = try receiptStatus(f.id, receipt);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, first.code);
     const expected: u8 = if (try f.rows() == 1) @import("db.zig").ANTFLY_OUTCOME_RECEIPT_APPLIED else @import("db.zig").ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED;
@@ -856,8 +1035,9 @@ test "capi SQL outcome receipt for a named table on a directory handle resolves 
     try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, code);
     const receipt = try lastReceiptAlloc();
     defer std.testing.allocator.free(receipt);
-    // Names table `t` (hex 74) and its durable id.
-    try std.testing.expect(std.mem.indexOf(u8, receipt, ":74:") != null);
+    const parsed_receipt = try @import("outcome_receipts.zig").parse(receipt);
+    const target = parsed_receipt.table().?;
+    try std.testing.expectEqualStrings("t", target.name);
     api.antfly_db_close(id);
     open = false;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
@@ -875,6 +1055,7 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     defer f.deinit();
     var fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
     fault.arm();
+    defer PrimaryFault.disarm();
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
     const code = api.antfly_db_batch_json(f.id, .fromSlice("{\"inserts\":{\"receipt-key\":{\"v\":1}}}"), &out);
@@ -882,6 +1063,8 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     try std.testing.expectEqual(h.capi.ErrorCode.outcome_unknown, code);
     const receipt = try lastReceiptAlloc();
     defer std.testing.allocator.free(receipt);
+    try std.testing.expectEqual(h.capi.ErrorCode.stalled, (try receiptStatus(f.id, receipt)).code);
+    try f.reopen();
     const resolved = try receiptStatus(f.id, receipt);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, resolved.code);
     var lookup: h.capi.Buffer = .{};
@@ -890,6 +1073,7 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     // The same-call variant returns a receipt in its output parameter.
     var again: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
     again.arm();
+    defer PrimaryFault.disarm();
     var out2: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out2);
     var receipt_out: h.capi.Buffer = .{};
@@ -900,9 +1084,12 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     try std.testing.expect(std.mem.startsWith(u8, second, "or1:"));
     try std.testing.expect(!std.mem.eql(u8, second, receipt));
     try std.testing.expectEqual(if (found) api.ANTFLY_OUTCOME_RECEIPT_APPLIED else api.ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED, resolved.status);
-    // The struct batch has a same-call variant too.
+    // The second uncertain write fenced this owner. A third mutation needs
+    // a fresh recovery boundary, including for the struct same-call variant.
+    try f.reopen();
     var third_fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
     third_fault.arm();
+    defer PrimaryFault.disarm();
     var struct_receipt: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&struct_receipt);
     const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("receipt-key-3"), .value = .fromSlice("{\"v\":1}") }};

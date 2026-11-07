@@ -103,6 +103,9 @@ pub const AtomicWriteSink = struct {
         finish_source: ?*const fn (*anyopaque) anyerror!@import("../../segment_source.zig").Source = null,
         finish_mapped: ?*const fn (*anyopaque) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
         abort: *const fn (*anyopaque) void,
+        /// Consumes the sink on every path. False certifies that a failed
+        /// finish did not publish; true remains conservatively uncertain.
+        finish_with_publication_state: ?*const fn (*anyopaque, *bool) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -154,6 +157,16 @@ pub const AtomicWriteSink = struct {
 
     pub fn finish(self: *AtomicWriteSink) !void {
         try BoundaryAbi.call("finish", self.boundary_dispatch, self.vtable.finish, .{self.ptr});
+    }
+
+    /// Legacy sinks cannot certify an unchanged destination after failure.
+    /// Implementations must capture this state before releasing publication
+    /// serialization; inspecting their mutable store after return is unsafe.
+    pub fn finishWithPublicationState(self: *AtomicWriteSink, publication_possible: *bool) !void {
+        publication_possible.* = true;
+        if (self.vtable.finish_with_publication_state) |finish_with_state|
+            return BoundaryAbi.call("finish_with_publication_state", self.boundary_dispatch, finish_with_state, .{ self.ptr, publication_possible });
+        try self.finish();
     }
 
     /// Discard all bytes and remove any temporary object.
@@ -566,7 +579,16 @@ pub const FileTrailer = struct {
 /// that retain a Storage view itself must retain a NativeStorage.Lease and
 /// obtain the view from that lease.
 pub const Storage = struct {
+    pub const ContentRevision = [16]u8;
     pub const Trailer = FileTrailer;
+    pub const max_atomic_file_deletions: usize = 64;
+    /// A bounded native cleanup page. IDs are returned only after the entire
+    /// page commits; callers may then retire their corresponding retry entries.
+    pub const TextRetirementSweep = struct {
+        ids: [max_atomic_file_deletions]u64 = undefined,
+        count: usize = 0,
+        complete: bool = false,
+    };
 
     pub const Lease = struct {
         view: Storage,
@@ -583,6 +605,23 @@ pub const Storage = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        /// Direct transactional namespaces owned by the physical engine. Null
+        /// preserves the filesystem LSM provider, including unmigrated roots.
+        open_native_namespaces: ?*const fn (*anyopaque, Allocator, []const u8, bool) anyerror!?@import("../backend_erased.zig").NamespaceStore = null,
+        /// No-ABA identity of the loaded logical file view. Equal non-null
+        /// tokens permit owned metadata-cache reuse until local mutation or
+        /// external generation adoption. Providers without such a view return null.
+        loaded_content_revision: ?*const fn (*anyopaque) ?ContentRevision = null,
+        /// Narrow no-ABA identity for this root's primary/replay WAL metadata.
+        /// Unrelated immutable-file mutations must preserve a returned token.
+        loaded_wal_metadata_revision: ?*const fn (*anyopaque, []const u8) ?ContentRevision = null,
+        /// Short, consistent metadata read batch. The provider must outlive the
+        /// returned scope; callers release it before computation/publication.
+        acquire_read_snapshot: ?*const fn (*anyopaque) anyerror!Lease = null,
+        /// Cache-owner knowledge of a completed durable WAL checkpoint. Null
+        /// retains conservative restart recovery; this never authorizes reuse.
+        recovered_wal_idle_deadline: ?*const fn (*anyopaque, []const u8, u64) ?u64 = null,
+        wal_checkpoint_completed: ?*const fn (*anyopaque, []const u8, u64) void = null,
         /// Physical directory for private build files; null disables filesystem staging.
         private_scratch_directory: ?*const fn (*anyopaque) ?[]const u8 = null,
         /// Exact immutable native checkpoint, owned by the returned buffer.
@@ -595,8 +634,14 @@ pub const Storage = struct {
         open_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         /// Artifact-specific reclamation lease with provider-independent
         /// descriptor/runtime ownership. Persistent readers use this capability.
+        /// Optional bounded owned copy. It retains no native extents; null
+        /// selects the normal leased source without changing serving semantics.
+        open_resident_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?@import("../../segment_source.zig").Source = null,
         open_leased_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
+        acquire_immutable_stager: ?*const fn (*anyopaque, Allocator) anyerror!?@import("../immutable_artifact.zig").Stager = null,
+        acquire_immutable_resources: ?*const fn (*anyopaque) anyerror!?@import("../immutable_artifact.zig").BuildResources = null,
+        fence_uncertain_publication: ?*const fn (*anyopaque) void = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         /// Directories are inferred from child files and have no independent
         /// entry to publish. Creating one needs no parent durability barrier.
@@ -614,6 +659,7 @@ pub const Storage = struct {
         read_file_trailer_alloc: ?*const fn (*anyopaque, Allocator, []const u8, usize) anyerror!FileTrailer = null,
         write_file_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_file_absolute: ?*const fn (*anyopaque, []const u8, []const u8, bool) anyerror!void = null,
+        append_publication: ?*const fn (*anyopaque, []const u8, []const u8, bool, @import("../native_publication.zig").Participant) anyerror!void = null,
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
         begin_cold_sequential_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
         begin_cold_random_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
@@ -625,6 +671,18 @@ pub const Storage = struct {
         sync_parent_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
         rename_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete_file_absolute: *const fn (*anyopaque, []const u8) anyerror!void,
+        /// Atomically remove a bounded set of files, accepting absent files.
+        /// Providers with publication admission can amortize its lease and
+        /// durability barrier. Borrowed paths remain live through this call.
+        delete_files_absolute: ?*const fn (*anyopaque, []const []const u8) anyerror!void = null,
+        /// Atomically verify durable inactive/retired membership, unlink text
+        /// artifacts and remove retirement markers without changing semantics.
+        /// False means this generation uses the compatibility metadata backend.
+        retire_text_segments: ?*const fn (*anyopaque, []const u8, []const u64) anyerror!bool = null,
+        /// Discover and settle a bounded page against current native state.
+        /// Active aliases survive stale retirement markers. Null selects the
+        /// compatibility backend; no semantic generation is changed.
+        sweep_text_retirements: ?*const fn (*anyopaque, []const u8, ?u64) anyerror!?TextRetirementSweep = null,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
         list_file_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
         /// Immediate child directories, including virtual directories inferred
@@ -646,6 +704,27 @@ pub const Storage = struct {
         supports_host_path_generation_publication: bool = false,
         supports_native_path_locks: bool = false,
     };
+    /// Retain immutable decoder/accounting resources without requiring a
+    /// writable artifact capability. Read-only index snapshots use this too.
+    pub fn acquireImmutableResources(self: Storage) !?@import("../immutable_artifact.zig").BuildResources {
+        const acquire = self.vtable.acquire_immutable_resources orelse return null;
+        return try BoundaryAbi.call("acquire_immutable_resources", self.boundary_dispatch, acquire, .{self.ptr});
+    }
+
+    pub fn acquireImmutableStager(self: Storage, alloc: Allocator) !?@import("../immutable_artifact.zig").Stager {
+        const acquire = self.vtable.acquire_immutable_stager orelse return null;
+        return try BoundaryAbi.call("acquire_immutable_stager", self.boundary_dispatch, acquire, .{ self.ptr, alloc });
+    }
+
+    pub fn openNativeNamespaces(self: Storage, a: Allocator, root: []const u8, read_only: bool) !?@import("../backend_erased.zig").NamespaceStore {
+        const operation = self.vtable.open_native_namespaces orelse return null;
+        return BoundaryAbi.call("open_native_namespaces", self.boundary_dispatch, operation, .{ self.ptr, a, root, read_only });
+    }
+
+    pub fn fenceUncertainPublication(self: Storage) void {
+        if (self.vtable.fence_uncertain_publication) |fence| fence(self.ptr);
+    }
+
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn privateScratchDirectory(self: Storage, fallback: []const u8) ?[]const u8 {
@@ -725,6 +804,11 @@ pub const Storage = struct {
         return BoundaryAbi.call("map_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path });
     }
 
+    pub fn openResidentImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !?@import("../../segment_source.zig").Source {
+        const operation = self.vtable.open_resident_immutable_source orelse return null;
+        return BoundaryAbi.call("open_resident_immutable_source", self.boundary_dispatch, operation, .{ self.ptr, allocator, path });
+    }
+
     pub fn openLeasedImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
         const open = self.vtable.open_leased_immutable_source orelse return error.ImmutableReadSourceUnsupported;
         return BoundaryAbi.call("open_leased_immutable_source", self.boundary_dispatch, open, .{ self.ptr, allocator, path });
@@ -758,6 +842,12 @@ pub const Storage = struct {
 
     pub fn writeFileAbsolute(self: Storage, path: []const u8, contents: []const u8) !void {
         return BoundaryAbi.call("write_file_absolute", self.boundary_dispatch, self.vtable.write_file_absolute, .{ self.ptr, path, contents });
+    }
+
+    /// No fallback: sequential staging plus append is not an atomic publication.
+    pub fn appendPublication(self: Storage, path: []const u8, contents: []const u8, sync: bool, participant: @import("../native_publication.zig").Participant) !void {
+        const operation = self.vtable.append_publication orelse return error.Unsupported;
+        return BoundaryAbi.call("append_publication", self.boundary_dispatch, operation, .{ self.ptr, path, contents, sync, participant });
     }
 
     pub fn appendFileAbsolute(self: Storage, allocator: Allocator, path: []const u8, contents: []const u8, sync: bool) !void {
@@ -875,6 +965,25 @@ pub const Storage = struct {
         return BoundaryAbi.call("delete_file_absolute", self.boundary_dispatch, self.vtable.delete_file_absolute, .{ self.ptr, path });
     }
 
+    pub fn deleteFilesAbsolute(self: Storage, paths: []const []const u8) !void {
+        if (paths.len > max_atomic_file_deletions) return error.FileDeletionBatchTooLarge;
+        if (paths.len == 0) return;
+        const remove = self.vtable.delete_files_absolute orelse return error.AtomicFileDeletionUnsupported;
+        return BoundaryAbi.call("delete_files_absolute", self.boundary_dispatch, remove, .{ self.ptr, paths });
+    }
+
+    pub fn retireTextSegments(self: Storage, root: []const u8, ids: []const u64) !bool {
+        if (ids.len > max_atomic_file_deletions) return error.FileDeletionBatchTooLarge;
+        if (ids.len == 0) return true;
+        const operation = self.vtable.retire_text_segments orelse return false;
+        return BoundaryAbi.call("retire_text_segments", self.boundary_dispatch, operation, .{ self.ptr, root, ids });
+    }
+
+    pub fn sweepTextRetirements(self: Storage, root: []const u8, after: ?u64) !?TextRetirementSweep {
+        const operation = self.vtable.sweep_text_retirements orelse return null;
+        return BoundaryAbi.call("sweep_text_retirements", self.boundary_dispatch, operation, .{ self.ptr, root, after });
+    }
+
     pub fn deleteTree(self: Storage, path: []const u8) !void {
         return BoundaryAbi.call("delete_tree", self.boundary_dispatch, self.vtable.delete_tree, .{ self.ptr, path });
     }
@@ -929,6 +1038,31 @@ pub const Storage = struct {
 
     pub fn nowNs(self: Storage) u64 {
         return self.vtable.now_ns(self.ptr);
+    }
+
+    pub fn acquireReadSnapshot(self: Storage) !?Lease {
+        const acquire = self.vtable.acquire_read_snapshot orelse return null;
+        return try BoundaryAbi.call("acquire_read_snapshot", self.boundary_dispatch, acquire, .{self.ptr});
+    }
+
+    pub fn recoveredWalIdleDeadline(self: Storage, root: []const u8, max_age_ns: u64) ?u64 {
+        const callback = self.vtable.recovered_wal_idle_deadline orelse return null;
+        return BoundaryAbi.call("recovered_wal_idle_deadline", self.boundary_dispatch, callback, .{ self.ptr, root, max_age_ns }) catch null;
+    }
+
+    pub fn walCheckpointCompleted(self: Storage, root: []const u8, now_ns: u64) void {
+        const callback = self.vtable.wal_checkpoint_completed orelse return;
+        BoundaryAbi.call("wal_checkpoint_completed", self.boundary_dispatch, callback, .{ self.ptr, root, now_ns }) catch {};
+    }
+
+    pub fn loadedWalMetadataRevision(self: Storage, root_dir: []const u8) ?ContentRevision {
+        const revision = self.vtable.loaded_wal_metadata_revision orelse return self.loadedContentRevision();
+        return BoundaryAbi.call("loaded_wal_metadata_revision", self.boundary_dispatch, revision, .{ self.ptr, root_dir }) catch null;
+    }
+
+    pub fn loadedContentRevision(self: Storage) ?ContentRevision {
+        const revision = self.vtable.loaded_content_revision orelse return null;
+        return BoundaryAbi.call("loaded_content_revision", self.boundary_dispatch, revision, .{self.ptr}) catch null;
     }
 
     pub fn requiresForegroundPublication(self: Storage) bool {

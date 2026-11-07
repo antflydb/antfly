@@ -322,6 +322,11 @@ pub const Gate = struct {
         const words = try sourceWords(allocator, text, options);
         try self.observe(text.len, words, 1, prepared);
     }
+
+    pub fn preferredWindowTokens(self: *const Gate) ?usize {
+        if (!self.long_document_qualified) return null;
+        return self.candidates.preferredWindowTokens(self.request_items);
+    }
 };
 
 test "boundary qualification request feature union respects whole-item replacements" {

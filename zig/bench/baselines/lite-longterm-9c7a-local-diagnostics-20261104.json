@@ -1,0 +1,53 @@
+{
+  "qualified": false,
+  "source_commit": "9c7a7ed88afe58b67d5a1bf10e339cd41bf0a111",
+  "mode": "Debug",
+  "scope": "Local metrics-enabled diagnosis on shared host with up to nine overlapping unrelated compiler processes. No throughput comparison or optimized qualification claim.",
+  "result": {
+    "input_index": 7,
+    "importer_exit_code": 1,
+    "censored": false,
+    "importer_succeeded": false,
+    "summary": [
+      0,
+      0,
+      1
+    ],
+    "seconds": 212.2188563339878,
+    "peak_native_builds": 9,
+    "metrics_enabled": true,
+    "library_sha256": "04e5b1f1cbd2cede74f37ee3ac9265037693dc58a2c7c3e3608eb38e71447fac",
+    "public_errors": [
+      "LiteReplayBacklogExceeded"
+    ],
+    "seed_sha256": "27ea0ac6beecde2ca727132143e214c17ef5f38010db3762f605551806673519",
+    "seed_copy_method": "native_stable_snapshot",
+    "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+  },
+  "primary_batches": 19,
+  "primary_writes": 19456,
+  "full_text_profiles": 69,
+  "full_text_sums": {
+    "documents": 1238,
+    "total_ms": 18865,
+    "full_text_collect_ms": 357,
+    "full_text_plan_ms": 125,
+    "full_text_prepare_ms": 427,
+    "full_text_apply_ms": 18865,
+    "full_text_apply_lock_wait_ms": 0,
+    "full_text_apply_lock_held_ms": 6352,
+    "index_sync_ms": 0
+  },
+  "invalid_manifest_errors": 0,
+  "confirmed_scaling_mechanism": {
+    "function": "IndexWriter.deleteAllByIdsTracked",
+    "prior_work": "For every segment and every replay fragment, fetch every retained stored document identity, including when all upsert IDs are new.",
+    "sample": "A separate quiescent service sample of the preceding 973bc63de6 Debug library resolves publication through PersistentIndex.deleteByIdsTracked to IndexWriter.deleteAllByIdsTracked and SegmentReader.storedIdAlloc.",
+    "sample_sha256": "474fc79274f3854f6249caee557c6acd5678881c3dd6d003c806966d18a0f5c2"
+  },
+  "limitations": [
+    "Nested or concurrent profile sums are not additive wall-clock attribution.",
+    "This receipt predates the indexed identity lookup change.",
+    "The importer and preserved reference artifacts were not rebuilt or modified."
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "base": "237a1976064cb47ee22e6f67bd7699488a50b8d2",
+  "source_patch_sha256": "755b0290f2980de1fd7eae6f3a1398c6ac5b60ea68964b344ceebabf9d511e0a",
+  "problem": "The native foreground transaction published text and its durable root progress, but left the serving executor watermark behind. Its visibility wait replayed the same text record again.",
+  "evidence": {
+    "source_commit": "3f1e5de62a4dcd0d17c80de31f02ca14ecffa80c",
+    "library_sha256": "60fbe810d8be788faf300ed467da5d22dca9827b3a873dddb04cc019b93ebaae",
+    "measured_indexed_updates": 16,
+    "trace": "owned-primary-all-thread-stacks.json",
+    "primary_and_text_publications": 16,
+    "duplicate_foreground_replay_publications": 16,
+    "note": "Candidate-only Debug operation attribution on a shared host; no reference reruns or throughput claim."
+  },
+  "change": [
+    "Successful owned native publication adopts the selected full-text workers\u2019 committed sequence during infallible activation, under the original catalog/apply lifetime fence.",
+    "Manual visibility waits now observe that committed frontier instead of replaying it. Progress adoption does not persist, reclaim, allocate or deliver callbacks under the publisher locks.",
+    "Threaded registrations receive an atomic committed frontier. Their worker drains superseded private sessions before changing its mutable replay/persisted frontier; source capture/apply checks reject superseded work.",
+    "Threaded waits omit redundant forced persistence only when the atomic publisher certified that registration\u2019s complete applied frontier. Ordinary persisted watermarks still take the forced visibility callback.",
+    "Physical retirement and credit return remain on the existing consumer retirement path; adoption alone never retires retained data."
+  ],
+  "validation": [
+    {
+      "report": "owned-progress-runtimes.json",
+      "passed": 30,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 3,
+      "coverage": [
+        "native foreground one-barrier regressions",
+        "manual progress adoption does not replay or persist and does not retire early",
+        "threaded publication racing a stale source capture",
+        "ordinary forced visibility persistence and cleanup failures",
+        "pause, retry, resource and backlog ownership"
+      ]
+    },
+    {
+      "report": "owned-progress-owner.json",
+      "log": "owned-progress-owner-tests.log",
+      "passed": 3,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "coverage": [
+        "native indexed exports retain owned eligibility after reopen",
+        "one checkpoint plus updated serving replay watermark",
+        "changed-base increment retries exactly once",
+        "shared preparation/admission budget"
+      ],
+      "scope": "Manual C API paths; the later threaded-only fixes are covered by the expanded runtime gate."
+    }
+  ],
+  "qualification": "The full architecture and current-candidate performance qualification are still incomplete. A rebuilt live Debug diagnostic is next."
+}

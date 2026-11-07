@@ -322,6 +322,11 @@ pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_vector_block_primary_snapshot_builds: usize = 0;
+pub var test_before_text_merge_step: ?struct {
+    manager: *IndexManager,
+    ptr: *anyopaque,
+    notify: *const fn (*anyopaque) anyerror!void,
+} = null;
 pub var test_before_vector_block_primary_snapshot_build: ?struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque) anyerror!void,
@@ -507,6 +512,7 @@ const PhaseTrackingAllocator = struct {
 /// allocation then competes inside that fixed byte ceiling, so post-snapshot
 /// writes cannot grow process memory beyond the admitted working set.
 const TextMergeBudgetAllocator = struct {
+    var diagnostic_refusals: std.atomic.Value(usize) = .init(0);
     backing: Allocator,
     reservation: ?resource_manager_mod.Reservation,
     /// All bytes competing inside the reservation, including persistent
@@ -586,6 +592,13 @@ const TextMergeBudgetAllocator = struct {
         while (true) {
             if (bytes > limit -| live) {
                 self.budget_denied.store(true, .release);
+                if (comptime builtin.link_libc) if (std.c.getenv("ANTFLY_RESOURCE_ALLOCATION_DIAGNOSTICS")) |raw| {
+                    if (std.mem.eql(u8, std.mem.span(raw), "1") and diagnostic_refusals.fetchAdd(1, .monotonic) < 8) {
+                        std.log.warn("text merge task allocation denied requested={d} live={d} reserved={d}", .{ bytes, live, limit });
+                        std.debug.dumpCurrentStackTrace(.{});
+                    }
+                };
+
                 return false;
             }
             live = self.live_bytes.cmpxchgWeak(live, live + bytes, .acq_rel, .acquire) orelse return true;
@@ -740,24 +753,511 @@ pub const TextPublicationChunk = struct {
 pub const TextPublicationPlan = struct {
     alloc: Allocator,
     chunks: []TextPublicationChunk,
+    input_end: usize = 0,
+    mapper_projection: ?*OwnedTextMapperProjection = null,
+
+    pub fn canPrepareDetached(self: *const TextPublicationPlan) bool {
+        return if (self.mapper_projection) |projection| projection.build != null else false;
+    }
+
+    /// The caller retains document inputs. All configuration, cache and IO
+    /// dependencies are owned; the originating DB may already be closed.
+    /// Publication still requires its independent catalog/input validation.
+    pub fn prepareDetached(self: *const TextPublicationPlan, alloc: Allocator, start: usize, end: usize) !?PreparedTextMapperPublication {
+        const projection = self.mapper_projection orelse return error.InvalidTextProjection;
+        const build = if (projection.build) |*value| value else return null;
+        return try buildPreparedProjectedText(alloc, build.resources.allocator, try projection.batch(start, end), build.analysis, build.options);
+    }
 
     pub fn deinit(self: *TextPublicationPlan) void {
+        if (self.mapper_projection) |projection| projection.destroy();
         if (self.chunks.len > 0) self.alloc.free(self.chunks);
         self.* = undefined;
     }
 };
 
-/// Immutable full-text artifacts built after producer admission but before
-/// entering the per-index apply section. The catalog and analysis read locks
-/// pin every borrowed projection dependency while the segments are built;
-/// callers then validate TextPublicationContext once more before publishing.
+/// One source-byte-bounded projection window. Document bodies borrow the
+/// caller's collected batch; every schema/analyzer dependency is owned here.
+/// Keep this object stable: the arena's backing allocator borrows its budget.
+const OwnedTextMapperProjection = struct {
+    alloc: Allocator,
+    budget: ?resource_manager_mod.BudgetedAllocator,
+    arena: std.heap.ArenaAllocator,
+    revision: u64 = 0,
+    instance_id: u64 = 0,
+    input_end: usize = 0,
+    docs: []introducer_mod.TextDocument = &.{},
+    original_ends: []usize = &.{},
+    observed: []const mapper.ObservedFieldAnalyzer = &.{},
+    observed_ends: []usize = &.{},
+    build: ?struct {
+        resources: @import("../../immutable_artifact.zig").BuildResources,
+        analysis: introducer_mod.TextAnalysisConfig = .{},
+        options: mapper.BuildTextSegmentsOptions = .{},
+    } = null,
+
+    fn batch(self: *const OwnedTextMapperProjection, start: usize, end: usize) !mapper.TextProjectionBatch {
+        if (start > end or end > self.input_end) return error.InvalidTextProjection;
+        var first: usize = 0;
+        while (first < self.docs.len and self.original_ends[first] <= start) first += 1;
+        var last = first;
+        while (last < self.docs.len and self.original_ends[last] <= end) last += 1;
+        return .{ .docs = self.docs[first..last], .observed_field_analyzers = self.observed[self.observed_ends[start]..self.observed_ends[end]] };
+    }
+
+    /// Configuration is plain tagged values and slices. Keep every nested
+    /// string/array in this region; reject future pointer-bearing extensions
+    /// rather than silently retaining a mutable runtime dependency.
+    fn ownValue(self: *OwnedTextMapperProjection, comptime T: type, value: T) !T {
+        const a = self.arena.allocator();
+        return switch (@typeInfo(T)) {
+            .pointer => |pointer| blk: {
+                if (pointer.size != .slice) @compileError("text preparation config requires an explicit owner for non-slice pointers");
+                const copy = try a.alloc(pointer.child, value.len);
+                for (value, copy) |item, *out| out.* = try self.ownValue(pointer.child, item);
+                break :blk copy;
+            },
+            .optional => |optional| if (value) |item| try self.ownValue(optional.child, item) else null,
+            .@"struct" => |record| blk: {
+                var copy = value;
+                inline for (record.field_names, record.field_types, record.field_attrs) |name, FieldType, attrs| if (!attrs.@"comptime") {
+                    @field(copy, name) = try self.ownValue(FieldType, @field(value, name));
+                };
+                break :blk copy;
+            },
+            .@"union" => switch (value) {
+                inline else => |item, tag| @unionInit(T, @tagName(tag), try self.ownValue(@TypeOf(item), item)),
+            },
+            .array => |array| blk: {
+                var copy = value;
+                for (value, &copy) |item, *out| out.* = try self.ownValue(array.child, item);
+                break :blk copy;
+            },
+            else => value,
+        };
+    }
+
+    fn create(a: Allocator, manager: ?*resource_manager_mod.ResourceManager) !*OwnedTextMapperProjection {
+        const self = try a.create(OwnedTextMapperProjection);
+        self.* = .{ .alloc = a, .budget = if (manager) |rm| resource_manager_mod.BudgetedAllocator.init(rm, .full_text_build_working_set, a, 1) else null, .arena = undefined };
+        self.arena = .init(if (self.budget) |*budget| budget.allocator() else a);
+        return self;
+    }
+
+    fn destroy(self: *OwnedTextMapperProjection) void {
+        const a = self.alloc;
+        self.arena.deinit();
+        if (self.budget) |*budget| budget.deinit();
+        if (self.build) |*build| {
+            if (build.options.contribution_cache) |cache| cache.deinit();
+            build.resources.deinit();
+        }
+        a.destroy(self);
+    }
+
+    fn ownConfiguration(self: *OwnedTextMapperProjection) !void {
+        const a = self.arena.allocator();
+        var analyzers: std.AutoHashMapUnmanaged(usize, *const analysis_mod.Analyzer) = .empty;
+        for (self.docs) |*doc| {
+            const fields = try a.dupe(introducer_mod.TextField, doc.text_fields);
+            for (fields) |*field| {
+                field.field_name = try a.dupe(u8, field.field_name);
+                if (field.source_field) |source| field.source_field = try a.dupe(u8, source);
+                if (field.analyzer) |original| {
+                    const cached = try analyzers.getOrPut(a, @intFromPtr(original));
+                    if (!cached.found_existing) {
+                        const owned = try a.create(analysis_mod.Analyzer);
+                        owned.* = .{ .char_filters = try a.dupe(analysis_mod.CharFilter, original.char_filters), .tokenizer = original.tokenizer, .filters = try a.dupe(analysis_mod.TokenFilter, original.filters) };
+                        cached.value_ptr.* = owned;
+                    }
+                    field.analyzer = cached.value_ptr.*;
+                }
+            }
+            doc.text_fields = fields;
+            if (doc.typed_fields) |values| {
+                const owned = try a.dupe(introducer_mod.TypedFieldValue, values);
+                for (owned) |*value| value.field_name = try a.dupe(u8, value.field_name);
+                doc.typed_fields = owned;
+            }
+            const order = try a.dupe(introducer_mod.NamedSortValue, doc.index_sort_values);
+            for (order) |*value| value.field_name = try a.dupe(u8, value.field_name);
+            doc.index_sort_values = order;
+            inline for (.{ "infer_type_dynamic_paths", "unindexed_paths" }) |name| {
+                const paths = try a.dupe([]const u8, @field(doc, name));
+                for (paths) |*path| path.* = try a.dupe(u8, path.*);
+                @field(doc, name) = paths;
+            }
+        }
+        const observed = try a.dupe(mapper.ObservedFieldAnalyzer, self.observed);
+        for (observed) |*item| {
+            item.field_name = try a.dupe(u8, item.field_name);
+            item.analyzer_name = try a.dupe(u8, item.analyzer_name);
+        }
+        self.observed = observed;
+    }
+};
+
+fn buildPreparedProjectedText(
+    alloc: Allocator,
+    segment_alloc: Allocator,
+    batch: mapper.TextProjectionBatch,
+    analysis: introducer_mod.TextAnalysisConfig,
+    options: mapper.BuildTextSegmentsOptions,
+) !PreparedTextMapperPublication {
+    var observed: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+    errdefer freeOwnedObservedFieldAnalyzers(alloc, &observed);
+    try appendOwnedObservedFieldAnalyzers(alloc, &observed, batch.observed_field_analyzers);
+    const built = try mapper.buildTextSegmentsFromProjectionBatch(segment_alloc, batch, analysis, options);
+    defer segment_alloc.free(built);
+    errdefer for (built) |segment| segment_alloc.free(segment);
+    const segments = try alloc.dupe([]u8, built);
+    errdefer alloc.free(segments);
+    return .{ .alloc = alloc, .segment_alloc = segment_alloc, .segments = segments, .observed_field_analyzers = try observed.toOwnedSlice(alloc) };
+}
+
+/// Immutable foreground configuration shared by a catalog extraction epoch.
+/// It owns all schema, analyzer, IO and accounting state; no live index or DB
+/// is needed to project documents or build their immutable posting artifacts.
+pub const ForegroundTextProjection = struct {
+    projection: *OwnedTextMapperProjection,
+    name: []const u8,
+    generation: u64,
+    config_hash: u64,
+    descriptor: []const u8,
+    schema: ?schema_mod.TableSchema,
+    selected_field: ?[]const u8,
+    retain_empty: bool,
+    source_options: mapper.TextProjectionOptions,
+    observed: []const mapper.ObservedFieldAnalyzer,
+    stager: @import("../../immutable_artifact.zig").Stager,
+
+    pub fn matches(self: ForegroundTextProjection, other: ForegroundTextProjection) bool {
+        return self.generation == other.generation and self.config_hash == other.config_hash and
+            std.mem.eql(u8, self.name, other.name) and std.mem.eql(u8, self.descriptor, other.descriptor);
+    }
+
+    pub fn deinit(self: *ForegroundTextProjection) void {
+        self.stager.deinit();
+        self.projection.destroy();
+        self.* = undefined;
+    }
+
+    pub fn prepareMetadata(self: *const ForegroundTextProjection, a: Allocator, observed: []const mapper.ObservedFieldAnalyzer) !?PreparedForegroundTextMetadata {
+        return PreparedForegroundTextMetadata.create(a, self, observed);
+    }
+
+    /// Document identities are deliberately absent from posting bytes. The
+    /// publisher binds authoritative ordinals after its primary read validation.
+    /// This projection can also be combined with sibling request deltas before
+    /// freezing segments, independently of request/RPC boundaries.
+    pub fn project(self: *const ForegroundTextProjection, alloc: Allocator, docs: []const mapper.MapperDoc) !TextPublicationPlan {
+        const captured = &self.projection.build.?;
+        const projection = try OwnedTextMapperProjection.create(alloc, captured.resources.resource_manager);
+        errdefer projection.destroy();
+        projection.build = .{ .resources = captured.resources.retained() };
+        const build = &projection.build.?;
+        const a = projection.arena.allocator();
+        build.analysis = try projection.ownValue(introducer_mod.TextAnalysisConfig, captured.analysis);
+        build.options = captured.options;
+        build.options.contribution_cache = null;
+        build.options.index_sort = try projection.ownValue(@TypeOf(captured.options.index_sort), captured.options.index_sort);
+        build.options.postings_run_directory = try a.dupe(u8, captured.options.postings_run_directory);
+        if (captured.options.contribution_cache) |cache| {
+            cache.retainOwner();
+            build.options.contribution_cache = cache;
+        }
+        projection.input_end = docs.len;
+        const inputs = try a.dupe(mapper.MapperDoc, docs);
+        for (inputs) |*doc| doc.doc_ordinal = null;
+        const source = try mapper.buildTextProjectionSourceBatchWithOptions(a, inputs, self.source_options);
+        var observed: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        var ends: std.ArrayListUnmanaged(usize) = .empty;
+        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(a, build.analysis, self.schema, &observed, self.selected_field);
+        defer builder.deinit();
+        projection.observed_ends = try a.alloc(usize, docs.len + 1);
+        projection.observed_ends[0] = 0;
+        for (source.docs, 0..) |doc, i| {
+            const before = builder.text_docs.items.len;
+            try builder.appendSourceDocForIndex(doc, self.selected_field, self.retain_empty);
+            if (builder.text_docs.items.len - before > 1) return error.InvalidTextProjection;
+            if (builder.text_docs.items.len != before) try ends.append(a, i + 1);
+            projection.observed_ends[i + 1] = observed.items.len;
+        }
+        projection.docs = try a.dupe(introducer_mod.TextDocument, builder.text_docs.items);
+        projection.original_ends = try ends.toOwnedSlice(a);
+        projection.observed = observed.items;
+        try projection.ownConfiguration();
+        const chunks = try alloc.alloc(TextPublicationChunk, 1);
+        errdefer alloc.free(chunks);
+        chunks[0] = .{ .end = docs.len, .estimate = if (projection.docs.len == 0) .{} else try IndexManager.estimateProjectedTextPublication(a, projection.docs) };
+        return .{ .alloc = alloc, .chunks = chunks, .input_end = docs.len, .mapper_projection = projection };
+    }
+};
+
+/// Replacement analyzer claims and their in-memory postimage are allocated
+/// before admission. Publication owns the durable writes; activation only swaps
+/// owned arrays under the caller's catalog/analysis lifetime fences.
+pub const PreparedForegroundTextMetadata = struct {
+    const FieldAnalyzer = std.meta.Child(@FieldType(introducer_mod.TextAnalysisConfig, "field_analyzers"));
+    alloc: Allocator,
+    name: []u8,
+    generation: u64,
+    config_hash: u64,
+    descriptor: []u8,
+    expected: []u8,
+    encoded: []u8,
+    key: []u8,
+    observed: []mapper.ObservedFieldAnalyzer,
+    bindings: []FieldAnalyzer,
+    activated: bool = false,
+
+    fn freeBindings(a: Allocator, bindings: []const FieldAnalyzer) void {
+        for (bindings) |binding| {
+            a.free(binding.field_name);
+            a.free(binding.analyzer_name);
+        }
+        if (bindings.len != 0) a.free(bindings);
+    }
+
+    fn create(a: Allocator, config: *const ForegroundTextProjection, observed: []const mapper.ObservedFieldAnalyzer) !?PreparedForegroundTextMetadata {
+        var additions: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        defer additions.deinit(a);
+        for (observed) |item| {
+            if (!containsObservedFieldAnalyzer(config.observed, item) and !containsObservedFieldAnalyzer(additions.items, item)) try additions.append(a, item);
+        }
+        if (additions.items.len == 0) return null;
+        var claims: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        errdefer freeOwnedObservedFieldAnalyzers(a, &claims);
+        try appendOwnedObservedFieldAnalyzers(a, &claims, config.observed);
+        try appendOwnedObservedFieldAnalyzers(a, &claims, additions.items);
+        var bindings: std.ArrayListUnmanaged(FieldAnalyzer) = .empty;
+        errdefer {
+            for (bindings.items) |binding| {
+                a.free(binding.field_name);
+                a.free(binding.analyzer_name);
+            }
+            bindings.deinit(a);
+        }
+        for (config.projection.build.?.analysis.field_analyzers) |binding| {
+            const field_name = try a.dupe(u8, binding.field_name);
+            errdefer a.free(field_name);
+            const analyzer_name = try a.dupe(u8, binding.analyzer_name);
+            errdefer a.free(analyzer_name);
+            try bindings.append(a, .{ .field_name = field_name, .analyzer_name = analyzer_name });
+        }
+        for (additions.items) |item| {
+            const present = for (bindings.items) |binding| {
+                if (std.mem.eql(u8, binding.field_name, item.field_name) and std.mem.eql(u8, binding.analyzer_name, item.analyzer_name)) break true;
+            } else false;
+            if (present) continue;
+            const field_name = try a.dupe(u8, item.field_name);
+            errdefer a.free(field_name);
+            const analyzer_name = try a.dupe(u8, item.analyzer_name);
+            errdefer a.free(analyzer_name);
+            try bindings.append(a, .{ .field_name = field_name, .analyzer_name = analyzer_name });
+        }
+        const name = try a.dupe(u8, config.name);
+        errdefer a.free(name);
+        const descriptor = try a.dupe(u8, config.descriptor);
+        errdefer a.free(descriptor);
+        const expected = try serializeObservedTextFieldAnalyzers(a, config.observed);
+        errdefer a.free(expected);
+        const encoded = try serializeObservedTextFieldAnalyzers(a, claims.items);
+        errdefer a.free(encoded);
+        const key = try textFieldAnalyzersKey(a, config.name);
+        errdefer a.free(key);
+        const owned_claims = try claims.toOwnedSlice(a);
+        errdefer freeObservedTextFieldAnalyzers(a, owned_claims);
+        const owned_bindings = try bindings.toOwnedSlice(a);
+        return .{ .alloc = a, .name = name, .generation = config.generation, .config_hash = config.config_hash, .descriptor = descriptor, .expected = expected, .encoded = encoded, .key = key, .observed = owned_claims, .bindings = owned_bindings };
+    }
+
+    pub fn matches(self: *const PreparedForegroundTextMetadata, config: ForegroundTextProjection, a: Allocator) bool {
+        return self.alloc.ptr == a.ptr and self.alloc.vtable == a.vtable and self.generation == config.generation and self.config_hash == config.config_hash and
+            std.mem.eql(u8, self.name, config.name) and std.mem.eql(u8, self.descriptor, config.descriptor);
+    }
+
+    /// Called by an owned metadata overlay before writer admission. Preserve
+    /// the distinction between a missing claim and a failed/canceled read.
+    pub fn plan(self: *const PreparedForegroundTextMetadata, txn: anytype) !void {
+        const raw: ?[]const u8 = txn.get(self.key) catch |err| if (@as(anyerror, err) == error.NotFound) null else return err;
+        if (raw) |bytes| {
+            const actual = try deserializeObservedTextFieldAnalyzers(self.alloc, bytes);
+            defer freeObservedTextFieldAnalyzers(self.alloc, actual);
+            const canonical = try serializeObservedTextFieldAnalyzers(self.alloc, actual);
+            defer self.alloc.free(canonical);
+            if (!std.mem.eql(u8, canonical, self.expected)) return error.TextProjectionChanged;
+        } else if (!std.mem.eql(u8, self.expected, &emptyObservedPayload())) return error.TextProjectionChanged;
+        try txn.put(self.key, self.encoded);
+        for (self.bindings) |binding| {
+            if (binding.field_name.len == 0 or binding.analyzer_name.len == 0) continue;
+            const identity = algebraic_mod.lexical.DictionaryIdentity.analyzedText(self.name, binding.field_name, binding.analyzer_name);
+            switch (try algebraic_mod.lexical.claimRegistryOwnerTxn(self.alloc, txn, identity, self.name, .fst_postings, "ready")) {
+                .claimed, .already_owned => {},
+                .owned_by_other => return error.InvalidIndexConfig,
+            }
+        }
+    }
+
+    fn emptyObservedPayload() [12]u8 {
+        return .{ 'A', 'T', 'F', 'A', 3, 0, 0, 0, 0, 0, 0, 0 };
+    }
+
+    pub fn activateAssumeAnalysisLocked(self: *PreparedForegroundTextMetadata, manager: *IndexManager, entry: *IndexManager.TextIndex) void {
+        std.debug.assert(!self.activated and self.alloc.ptr == manager.alloc.ptr and self.alloc.vtable == manager.alloc.vtable);
+        std.debug.assert(std.mem.eql(u8, self.name, entry.config.name));
+        const old_observed = entry.observed_field_analyzers;
+        const old_bindings = entry.text_analysis.field_analyzers;
+        entry.observed_field_analyzers = self.observed;
+        entry.text_analysis.field_analyzers = self.bindings;
+        self.observed = &.{};
+        self.bindings = &.{};
+        self.activated = true;
+        manager.invalidateWritePlanSnapshot();
+        freeObservedTextFieldAnalyzers(manager.alloc, old_observed);
+        freeBindings(manager.alloc, old_bindings);
+    }
+
+    pub fn deinit(self: *PreparedForegroundTextMetadata) void {
+        const a = self.alloc;
+        freeObservedTextFieldAnalyzers(a, self.observed);
+        freeBindings(a, self.bindings);
+        a.free(self.key);
+        a.free(self.expected);
+        a.free(self.encoded);
+        a.free(self.descriptor);
+        a.free(self.name);
+        self.* = undefined;
+    }
+};
+
+/// Immutable full-text artifacts built before entering the per-index apply
+/// section. Native plans own their build dependencies; foreign providers keep
+/// the existing catalog/analysis read fence. Callers revalidate the captured
+/// publication context under lifecycle admission before publishing.
+/// Request-owned native publication. Only its short final guard borrows a
+/// mutable runtime; posting bytes and durable read witnesses survive refresh.
+pub const OwnedForegroundTextPublication = struct {
+    alloc: Allocator,
+    sequence: u64,
+    previous_sequence: u64,
+    progress: ?apply_state.BoundProjectionProgress = null,
+    seal_builder: ?@import("../../native_publication_value.zig").Builder = null,
+    seal_template: ?@import("../../projection_seal.zig").Seal = null,
+    config: ForegroundTextProjection,
+    claims: ?PreparedForegroundTextMetadata,
+    root: @import("../../native_metadata_batch.zig").Prepared,
+    native: ?*persistent_mod.PersistentIndex.PreparedNativePublication = null,
+    inputs: ?persistent_mod.PersistentIndex.NativePreparation = null,
+    metadata: persistent_mod.PersistentIndex.ReplayPublicationMetadata,
+
+    pub fn deinit(self: *@This()) void {
+        const a = self.alloc;
+        if (self.native) |native| native.deinit();
+        if (self.inputs) |*inputs| inputs.deinit();
+        self.root.deinit();
+        if (self.progress) |*progress| progress.deinit();
+        if (self.seal_builder) |*builder| builder.deinit();
+        if (self.claims) |*claims| claims.deinit();
+        a.destroy(self);
+    }
+
+    /// Runs with owned immutable inputs only. No catalog, DB/runtime lifetime
+    /// lease, writer mutex or native data epoch is retained by the input seed.
+    pub fn finish(self: *@This(), built: *PreparedTextMapperPublication, delete_keys: []const []const u8) !void {
+        if (self.native != null) return;
+        var inputs = self.inputs orelse return error.InvalidDerivedApplyState;
+        self.inputs = null;
+        defer inputs.deinit();
+        self.native = try inputs.build(built.staged, delete_keys, self.metadata);
+    }
+
+    pub fn bindSequence(self: *@This(), sequence: u64) !void {
+        if (sequence <= self.previous_sequence or sequence == std.math.maxInt(u64)) return error.InvalidDerivedApplyState;
+        const progress = if (self.progress) |*value| value else return error.InvalidDerivedApplyState;
+        if (progress.bound_sequence != null) return progress.bind(sequence);
+        const encoded_seal = if (self.seal_builder != null) blk: {
+            var seal = self.seal_template orelse return error.InvalidProjectionSeal;
+            if (sequence < seal.applied_sequence) return error.EnrichmentWaitCanceled;
+            seal.applied_sequence = sequence;
+            break :blk try seal.encode();
+        } else null;
+        try progress.bind(sequence);
+        if (encoded_seal) |encoded| {
+            try self.seal_builder.?.write(0, &encoded);
+            try self.seal_builder.?.seal();
+        }
+        self.sequence = sequence;
+    }
+
+    pub const Guard = struct {
+        manager: *IndexManager,
+        entry: *IndexManager.TextIndex,
+        pub fn release(self: *Guard) void {
+            self.entry.analysis_mutex.unlockExclusive();
+            self.entry.apply_mutex.unlock();
+            self.manager.catalog_mutex.unlockShared();
+            self.* = undefined;
+        }
+    };
+
+    /// Writer admission must never wait behind a replay lane which may itself
+    /// need the native writer. Contention declines this optional foreground
+    /// candidate; the canonical journal still owns the complete async effect.
+    pub fn bind(self: *@This(), manager: *IndexManager) !?Guard {
+        if (self.alloc.ptr != manager.alloc.ptr or self.alloc.vtable != manager.alloc.vtable) return null;
+        var current = try manager.acquireWritePlanSnapshot();
+        defer current.release();
+        const config = for (current.plan().foreground_text) |config| {
+            if (std.mem.eql(u8, config.name, self.config.name)) break config;
+        } else return null;
+        if (!self.config.matches(config)) return null;
+        if (!manager.catalog_mutex.tryLockShared()) return null;
+        var catalog_owned = true;
+        defer if (catalog_owned) manager.catalog_mutex.unlockShared();
+        const entry = manager.textIndexEntry(self.config.name) orelse return null;
+        if (!entry.apply_mutex.tryLock()) return null;
+        var apply_owned = true;
+        defer if (apply_owned) entry.apply_mutex.unlock();
+        if (!entry.analysis_mutex.tryLockExclusive()) return null;
+        var analysis_owned = true;
+        defer if (analysis_owned) entry.analysis_mutex.unlockExclusive();
+        if (current.generation() != manager.writePlanGeneration() or !manager.foregroundTextServiceableAssumeCatalogLocked(self.config.name)) return null;
+        const native = self.native orelse return null;
+        // Inline publication shares the replay producer's durable fan-out
+        // budget. Recheck the actual prepared inventory under final admission;
+        // a request cannot bypass backpressure by choosing the foreground path.
+        const segment_limit = manager.text_merge_segment_limit.load(.acquire);
+        if (segment_limit != 0) if (native.snapshot) |candidate|
+            if (candidate.snapshot.segments.len > segment_limit) return null;
+        native.bindTarget(&entry.persistent) catch |err| switch (err) {
+            error.EnrichmentWaitCanceled => return null,
+            else => return err,
+        };
+        catalog_owned = false;
+        apply_owned = false;
+        analysis_owned = false;
+        return .{ .manager = manager, .entry = entry };
+    }
+
+    pub fn activate(self: *@This(), guard: *const Guard) void {
+        std.debug.assert(self.native.?.activated);
+        guard.entry.recordCommittedDeletes(self.native.?.infos);
+        if (self.claims) |*claims| claims.activateAssumeAnalysisLocked(guard.manager, guard.entry);
+    }
+};
+
 pub const PreparedTextMapperPublication = struct {
     alloc: Allocator,
     segment_alloc: Allocator,
     segments: [][]u8 = &.{},
     observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
+    staged: []persistent_mod.PreparedReplaySegment = &.{},
+    staged_bytes: u64 = 0,
 
     pub fn deinit(self: *PreparedTextMapperPublication) void {
+        for (self.staged) |*segment| segment.deinit();
+        if (self.staged.len > 0) self.alloc.free(self.staged);
         for (self.segments) |segment| {
             if (segment.len > 0) self.segment_alloc.free(segment);
         }
@@ -770,8 +1270,47 @@ pub const PreparedTextMapperPublication = struct {
         self.* = undefined;
     }
 
+    pub fn stage(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
+        return self.stageWithIdentities(stager, false, null);
+    }
+
+    pub fn stageNative(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
+        return self.stageWithIdentities(stager, true, null);
+    }
+
+    pub fn stageDetachedNative(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
+        var budget: @import("../../immutable_artifact.zig").AdmissionBudget = .{ .remaining_ns = 5 * std.time.ns_per_s };
+        return self.stageDetachedNativeWithBudget(stager, &budget);
+    }
+
+    pub fn stageDetachedNativeWithBudget(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager, budget: *@import("../../immutable_artifact.zig").AdmissionBudget) !void {
+        return self.stageWithIdentities(stager, true, budget);
+    }
+
+    fn stageWithIdentities(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager, native_identities: bool, detached: ?*@import("../../immutable_artifact.zig").AdmissionBudget) !void {
+        if (self.staged.len != 0 or self.segments.len == 0) return;
+        const staged = try self.alloc.alloc(persistent_mod.PreparedReplaySegment, self.segments.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (staged[0..initialized]) |*segment| segment.deinit();
+            self.alloc.free(staged);
+        }
+        for (self.segments, 0..) |*bytes, i| {
+            staged[i] = if (detached) |budget| try persistent_mod.prepareDetachedNativeTextSegmentWithBudget(self.alloc, stager, bytes.*, budget) else if (native_identities) try persistent_mod.prepareNativeTextSegment(self.alloc, stager, bytes.*) else try persistent_mod.prepareReplaySegment(self.alloc, stager, bytes.*);
+            initialized += 1;
+        }
+        // Staging succeeds as a unit. On refusal, the caller still owns all
+        // buffers; on success the immutable native values own their contents.
+        for (self.segments) |*bytes| {
+            self.staged_bytes +|= bytes.len;
+            self.segment_alloc.free(bytes.*);
+            bytes.* = &.{};
+        }
+        self.staged = staged;
+    }
+
     pub fn estimate(self: PreparedTextMapperPublication) TextPublicationEstimate {
-        var byte_count: u64 = 0;
+        var byte_count: u64 = self.staged_bytes;
         for (self.segments) |segment| byte_count +|= @intCast(segment.len);
         return .{ .segment_count = @intCast(self.segments.len), .byte_count = byte_count };
     }
@@ -782,8 +1321,10 @@ pub const TextPublicationContext = struct {
     instance_id: u64,
     projection_revision: u64,
     chunk_backed: bool,
+    stager: ?@import("../../immutable_artifact.zig").Stager = null,
 
     pub fn deinit(self: *TextPublicationContext) void {
+        if (self.stager) |*stager| stager.deinit();
         self.* = undefined;
     }
 };
@@ -1488,6 +2029,9 @@ pub const IndexManager = struct {
     artifact_projection_root: u128 = 0,
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
+    /// Inline/manual owners service optional generation cleanup separately
+    /// from opening a serving runtime under writer admission.
+    repair_cleanup_deferred: std.atomic.Value(bool) = .init(false),
     /// Durable generated-artifact cleanup uses the same single-flight shape,
     /// but runs in bounded pages so it cannot monopolize structural locks.
     artifact_cleanup_state: std.atomic.Value(u8) = .init(0),
@@ -1512,6 +2056,7 @@ pub const IndexManager = struct {
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
     text_merge_scheduler: TextMergeScheduler,
+    text_merge_segment_limit: std.atomic.Value(u64) = .init(0),
     dense_indexes: std.ArrayListUnmanaged(DenseIndex),
     retired_lsm_owner_stats: std.ArrayListUnmanaged(LsmOwnerStats) = .empty,
     retired_lsm_owner_overflow_stats: [2]lsm_backend_mod.Backend.MaintenanceStats = .{ .{}, .{} },
@@ -2018,8 +2563,16 @@ pub const IndexManager = struct {
             self.* = undefined;
         }
 
-        fn mergeAllocator(self: *const TextMergeTask) Allocator {
+        pub fn mergeAllocator(self: *const TextMergeTask) Allocator {
             return self.deletion_state.budget.allocator();
+        }
+
+        pub fn memoryObservation(self: *const TextMergeTask) struct { reserved_bytes: u64, peak_task_bytes: u64, denied: bool } {
+            return .{
+                .reserved_bytes = self.bufferReservationBytes() orelse 0,
+                .peak_task_bytes = self.deletion_state.budget.peakTaskLiveBytes(),
+                .denied = self.deletion_state.budget.denied(),
+            };
         }
 
         fn bufferReservationBytes(self: *const TextMergeTask) ?u64 {
@@ -2059,9 +2612,11 @@ pub const IndexManager = struct {
         output_ordinals: []OrdinalSlot = &.{},
         output_ids: []IdSlot = &.{},
         publication_lookup_built: bool = false,
+        unlinked_output_count: usize = 0,
         source_map: ?segment_mod.MergeSourceMap = null,
         prepared_delta_counts: []usize = &.{},
         prepared_output_deletes: []?roaring.RoaringBitmap = &.{},
+        mapped_input_deletes: []roaring.RoaringBitmap = &.{},
         pending_delta_counts: []usize = &.{},
         pending_deletes: []roaring.RoaringBitmap = &.{},
         prepared_deletion_documents: u64 = 0,
@@ -2223,6 +2778,8 @@ pub const IndexManager = struct {
             result_alloc.free(self.pending_deletes);
             for (self.prepared_output_deletes) |*deleted| if (deleted.*) |*bitmap| bitmap.deinit();
             result_alloc.free(self.prepared_output_deletes);
+            for (self.mapped_input_deletes) |*bitmap| bitmap.deinit();
+            result_alloc.free(self.mapped_input_deletes);
             if (self.source_map) |*map| map.deinit();
             if (self.output_ordinals.len > 0) result_alloc.free(self.output_ordinals);
             if (self.output_ids.len > 0) result_alloc.free(self.output_ids);
@@ -3569,6 +4126,29 @@ pub const IndexManager = struct {
 
     pub fn setSchemaRegistry(self: *IndexManager, registry: *schema_registry_mod.Registry) void {
         self.schema_registry = registry;
+    }
+
+    /// Data-plane controls that can alter an existing text runtime without
+    /// changing immutable segment inputs or the index definition directory.
+    /// Caller owns the returned keys; source-cache witnesses fence these too.
+    pub fn retainedTextRuntimeControlKeysAlloc(self: *IndexManager, a: Allocator) ![][]u8 {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const result = try a.alloc([]u8, 1 + 2 * self.text_indexes.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |key| a.free(key);
+            a.free(result);
+        }
+        result[0] = try a.dupe(u8, resolver_catalog.minimum_reader_key);
+        initialized = 1;
+        for (self.text_indexes.items) |entry| {
+            result[initialized] = try textFieldAnalyzersKey(a, entry.config.name);
+            initialized += 1;
+            result[initialized] = try internal_keys.managedIndexAdmissionKeyAlloc(a, entry.config.name);
+            initialized += 1;
+        }
+        return result;
     }
 
     /// Snapshot the active schema identity without borrowing catalog state.
@@ -5971,6 +6551,8 @@ pub const IndexManager = struct {
         has_text_consumers: bool = false,
         text_requires_root: bool = true,
         text_fields: [][]u8 = &.{},
+        foreground_text: []ForegroundTextProjection = &.{},
+        vector_store_fields: [][]u8 = &.{},
         dense_fields: []DenseFieldWritePlan,
         sparse_fields: []SparseFieldWritePlan,
         graph_fields: []GraphFieldWritePlan,
@@ -5988,6 +6570,8 @@ pub const IndexManager = struct {
         chunk_dependents: [][]u32,
 
         pub fn deinit(self: *WritePlanSnapshot) void {
+            for (self.foreground_text) |*projection| projection.deinit();
+            if (self.foreground_text.len != 0) self.alloc.free(self.foreground_text);
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
@@ -5998,6 +6582,8 @@ pub const IndexManager = struct {
                 self.alloc.free(field.field_name);
             }
             self.alloc.free(self.dense_fields);
+            for (self.vector_store_fields) |field| self.alloc.free(field);
+            self.alloc.free(self.vector_store_fields);
             for (self.sparse_fields) |field| {
                 self.alloc.free(field.index_name);
                 self.alloc.free(field.field_name);
@@ -6529,6 +7115,30 @@ pub const IndexManager = struct {
         errdefer alloc.free(catalog_resolvers);
         var completion_plan = try @import("../artifact_completion_plan.zig").Plan.init(alloc, .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers }, generated_templates);
         errdefer completion_plan.deinit();
+        var foreground: std.ArrayListUnmanaged(ForegroundTextProjection) = .empty;
+        errdefer {
+            for (foreground.items) |*projection| projection.deinit();
+            foreground.deinit(alloc);
+        }
+        for (self.text_indexes.items) |*entry| {
+            if (try self.captureForegroundTextProjectionAssumeCatalogLocked(alloc, entry)) |captured| {
+                var owned = captured;
+                foreground.append(alloc, captured) catch |err| {
+                    owned.deinit();
+                    return err;
+                };
+            }
+        }
+        const foreground_text = try foreground.toOwnedSlice(alloc);
+        errdefer {
+            for (foreground_text) |*projection| projection.deinit();
+            alloc.free(foreground_text);
+        }
+        const vector_store_fields = try self.vectorStoreFieldNamesAlloc(alloc);
+        errdefer {
+            for (vector_store_fields) |field| alloc.free(field);
+            alloc.free(vector_store_fields);
+        }
         return .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
@@ -6540,6 +7150,7 @@ pub const IndexManager = struct {
                 }
                 break :blk false;
             },
+            .vector_store_fields = vector_store_fields,
             .dense_fields = dense_fields,
             .sparse_fields = sparse_fields,
             .graph_fields = graph_fields,
@@ -6549,6 +7160,7 @@ pub const IndexManager = struct {
             .chunk_dependents = chunk_dependents,
             .text_requires_root = text_requires_root,
             .text_fields = try text_fields.toOwnedSlice(alloc),
+            .foreground_text = foreground_text,
         };
     }
 
@@ -7802,6 +8414,7 @@ pub const IndexManager = struct {
             entry.runtime_schema = runtime_schema_owned;
             entry.text_analysis = text_analysis;
             advanceTextProjectionRevisionAssumeAnalysisLocked(entry);
+            self.invalidateWritePlanSnapshot();
             runtime_schema_owned = null;
             text_analysis_owned = false;
 
@@ -9634,6 +10247,14 @@ pub const IndexManager = struct {
             }
         }
         return stats;
+    }
+
+    pub fn syncAppliedReplayBoundaryForManagedIndex(self: *IndexManager, index_ref: ManagedIndexRef) !void {
+        if (index_ref.kind != .full_text) return self.checkpointLsmWalForManagedIndex(index_ref);
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndex(index_ref.name) orelse return error.IndexNotFound;
+        try entry.syncAppliedReplayBoundary();
     }
 
     pub fn checkpointLsmWalForManagedIndex(self: *IndexManager, index_ref: ManagedIndexRef) !void {
@@ -20098,6 +20719,23 @@ pub const IndexManager = struct {
         alloc: Allocator,
         index_name: []const u8,
     ) !TextPublicationContext {
+        return self.captureTextPublicationContext(alloc, index_name, false);
+    }
+
+    pub fn acquireTextReplayPublicationContext(
+        self: *IndexManager,
+        alloc: Allocator,
+        index_name: []const u8,
+    ) !TextPublicationContext {
+        return self.captureTextPublicationContext(alloc, index_name, true);
+    }
+
+    fn captureTextPublicationContext(
+        self: *IndexManager,
+        alloc: Allocator,
+        index_name: []const u8,
+        prepare_artifacts: bool,
+    ) !TextPublicationContext {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
@@ -20108,6 +20746,7 @@ pub const IndexManager = struct {
             .instance_id = entry.instance_id,
             .projection_revision = entry.projection_revision,
             .chunk_backed = textEntryHasExplicitArtifactSources(entry),
+            .stager = if (prepare_artifacts) try entry.persistent.acquireReplayStager(alloc) else null,
         };
     }
 
@@ -20292,11 +20931,13 @@ pub const IndexManager = struct {
         return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
     }
 
-    /// Plan publication from an already-parsed document boundary. Relational
-    /// callers supply MapperDoc.root, so both admission estimation and the
-    /// eventual apply avoid reparsing a materialized JSON document.
+    /// Project one bounded source window once. Planning retains its owned
+    /// projection through producer admission and segment construction. A caller
+    /// advances input_end before requesting the next window, bounding residency
+    /// independently of the size of a complete journal record.
     pub fn planTextMapperDocsPublication(
         self: *IndexManager,
+        store: *docstore_mod.DocStore,
         index_name: []const u8,
         context: *TextPublicationContext,
         docs: []const mapper.MapperDoc,
@@ -20308,104 +20949,186 @@ pub const IndexManager = struct {
         if (entry.instance_id != context.instance_id) return error.IndexNotFound;
         entry.lockAnalysisShared();
         defer entry.unlockAnalysisShared();
-        // Planning has not reserved capacity or prepared segments yet. Sample
-        // the current projection under the same analysis lease used to build
-        // the plan; a revision change is not an index replacement. Admission
-        // still revalidates this context before publishing prepared work.
         context.projection_revision = entry.projection_revision;
         context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
 
-        var chunks = std.ArrayListUnmanaged(TextPublicationChunk).empty;
+        const projection = try OwnedTextMapperProjection.create(context.alloc, self.resource_manager);
+        errdefer projection.destroy();
+        projection.revision = entry.projection_revision;
+        projection.instance_id = entry.instance_id;
+        projection.input_end = if (docs.len == 0) 0 else splitMapperDocsEnd(docs, 0, textProjectionSourceBuildTargetBytes());
+        const a = projection.arena.allocator();
+        var filtered: std.ArrayListUnmanaged(mapper.MapperDoc) = .empty;
+        var original_ends: std.ArrayListUnmanaged(usize) = .empty;
+        for (docs[0..projection.input_end], 0..) |doc, i| {
+            if (!self.keyInRange(doc.key) or !try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            try filtered.append(a, doc);
+            try original_ends.append(a, i + 1);
+        }
+        const options = try self.textProjectionOptionsForSchema(a, entry.runtime_schema == null and !textIndexSelectsAnyField(entry));
+        const source = try mapper.buildTextProjectionSourceBatchWithOptions(a, filtered.items, options);
+        const with_ordinals = try self.textProjectionSourceDocsWithOrdinals(a, store, entry, source.docs);
+        var observed: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        var projected_ends: std.ArrayListUnmanaged(usize) = .empty;
+        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(a, entry.text_analysis, entry.runtime_schema, &observed, entry.selected_field);
+        defer builder.deinit();
+        projection.observed_ends = try a.alloc(usize, projection.input_end + 1);
+        @memset(projection.observed_ends, 0);
+        for (with_ordinals, original_ends.items) |doc, original_end| {
+            const before = builder.text_docs.items.len;
+            try builder.appendSourceDocForIndex(doc, textIndexSelectedFieldForKey(entry, doc.key), entry.retainsEmptyPrimaryDocument(doc.key));
+            const appended = builder.text_docs.items.len - before;
+            if (appended > 1) return error.InvalidTextProjection;
+            if (appended == 1) try projected_ends.append(a, original_end);
+            projection.observed_ends[original_end] = observed.items.len;
+        }
+        for (projection.observed_ends[1..], 0..) |*end, i| end.* = @max(end.*, projection.observed_ends[i]);
+        projection.docs = try a.dupe(introducer_mod.TextDocument, builder.text_docs.items);
+        projection.original_ends = try projected_ends.toOwnedSlice(a);
+        projection.observed = observed.items;
+        try projection.ownConfiguration();
+        try self.captureDetachedTextBuild(entry, projection);
+
+        var chunks: std.ArrayListUnmanaged(TextPublicationChunk) = .empty;
         errdefer chunks.deinit(context.alloc);
-        if (docs.len == 0) {
-            try chunks.append(context.alloc, .{ .end = 0, .estimate = .{} });
-            return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
-        }
-
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        var filtered = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
-        defer filtered.deinit(arena);
-        var original_ends = std.ArrayListUnmanaged(usize).empty;
-        defer original_ends.deinit(arena);
-        for (docs, 0..) |doc, doc_idx| {
-            if (!self.keyInRange(doc.key)) continue;
-            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
-            try filtered.append(arena, doc);
-            try original_ends.append(arena, doc_idx + 1);
-        }
-        if (filtered.items.len == 0) {
-            try chunks.append(context.alloc, .{ .end = docs.len, .estimate = .{} });
-            return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
-        }
-
-        const source_target_bytes = textProjectionSourceBuildTargetBytes();
-        const projection_options = try self.textProjectionOptionsForSchema(
-            arena,
-            entry.runtime_schema == null and !textIndexSelectsAnyField(entry),
-        );
-        var atomic_ranges = std.ArrayListUnmanaged(TextPublicationAtomicRange).empty;
-        defer atomic_ranges.deinit(arena);
-        var start: usize = 0;
-        while (start < filtered.items.len) {
-            const end = splitMapperDocsEnd(filtered.items, start, source_target_bytes);
-            var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
-            defer projection_arena_state.deinit();
-            const projection_arena = projection_arena_state.allocator();
-            const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
-                projection_arena,
-                filtered.items[start..end],
-                projection_options,
-            );
-            var projected_source_indices = std.ArrayListUnmanaged(usize).empty;
-            defer projected_source_indices.deinit(projection_arena);
-            const projection_batch = try buildTextProjectionBatchForEntry(
-                projection_arena,
-                entry,
-                source_batch.docs,
-                null,
-                &projected_source_indices,
-            );
-            if (projected_source_indices.items.len != projection_batch.docs.len)
-                return error.InvalidTextProjection;
-            var projected_original_ends = std.ArrayListUnmanaged(usize).empty;
-            defer projected_original_ends.deinit(projection_arena);
-            try projected_original_ends.ensureTotalCapacity(projection_arena, projection_batch.docs.len);
-            for (projected_source_indices.items) |source_idx| {
-                projected_original_ends.appendAssumeCapacity(original_ends.items[start + source_idx]);
+        if (projection.docs.len == 0) {
+            try chunks.append(context.alloc, .{ .end = projection.input_end, .estimate = .{} });
+        } else {
+            var ranges: std.ArrayListUnmanaged(TextPublicationAtomicRange) = .empty;
+            try appendProjectedTextPublicationAtomicRanges(projection.docs, projection.original_ends, projection.input_end, 0, projection.docs.len, try estimateProjectedTextPublication(a, projection.docs), reservation_limit, a, &ranges);
+            var current: TextPublicationEstimate = .{};
+            var current_end: usize = 0;
+            for (ranges.items) |range| {
+                if (current.segment_count > 0 and reservation_limit != std.math.maxInt(usize) and current.segment_count +| range.estimate.segment_count > reservation_limit) {
+                    try chunks.append(context.alloc, .{ .end = current_end, .estimate = current });
+                    current = .{};
+                }
+                current.segment_count +|= range.estimate.segment_count;
+                current.byte_count +|= range.estimate.byte_count;
+                current_end = range.end;
             }
-            try appendProjectedTextPublicationAtomicRanges(
-                projection_batch.docs,
-                projected_original_ends.items,
-                original_ends.items[end - 1],
-                0,
-                projection_batch.docs.len,
-                try estimateProjectedTextPublication(arena, projection_batch.docs),
-                reservation_limit,
-                arena,
-                &atomic_ranges,
-            );
-            start = end;
+            try chunks.append(context.alloc, .{ .end = projection.input_end, .estimate = current });
         }
+        return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc), .input_end = projection.input_end, .mapper_projection = projection };
+    }
 
-        var current = TextPublicationEstimate{};
-        var current_end: usize = 0;
-        for (atomic_ranges.items) |range| {
-            if (current.segment_count > 0 and reservation_limit != std.math.maxInt(usize) and
-                current.segment_count +| range.estimate.segment_count > reservation_limit)
-            {
-                try chunks.append(context.alloc, .{ .end = current_end, .estimate = current });
-                current = .{};
+    fn captureForegroundTextProjectionAssumeCatalogLocked(self: *IndexManager, alloc: Allocator, entry: *TextIndex) !?ForegroundTextProjection {
+        // Expensive/generated text stays asynchronous. A base foreground
+        // watermark must never certify unseen implicit chunk/artifact effects.
+        if (entry.persistent.read_only or textEntryHasExplicitArtifactSources(entry) or try self.textIndexIsChunkBacked(alloc, entry.config.name)) return null;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        var stager = (try entry.persistent.acquireReplayStager(alloc)) orelse return null;
+        var transferred = false;
+        defer if (!transferred) stager.deinit();
+        const projection = try OwnedTextMapperProjection.create(alloc, self.resource_manager);
+        defer if (!transferred) projection.destroy();
+        try self.captureDetachedTextBuild(entry, projection);
+        const build = if (projection.build) |*value| value else return null;
+        if (build.resources.native_metadata_revision < 16) return null;
+        const a = projection.arena.allocator();
+        const schema_bytes: ?[]const u8 = if (entry.runtime_schema) |schema| try schema_mod.serializeSchema(a, schema) else null;
+        const schema: ?schema_mod.TableSchema = if (schema_bytes) |bytes| try schema_mod.deserializeSchema(a, bytes) else null;
+        const selected = try projection.ownValue(@TypeOf(entry.selected_field), entry.selected_field);
+        const source_options = try projection.ownValue(mapper.TextProjectionOptions, try self.textProjectionOptionsForSchema(a, schema == null and selected == null));
+        // Configuration comparison is exact and independent of process-local
+        // instance counters, so a same-catalog runtime refresh can adopt it.
+        const observed = try projection.ownValue(@TypeOf(entry.observed_field_analyzers), entry.observed_field_analyzers);
+        const descriptor = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_bytes, .analysis = build.analysis, .observed = observed, .selected_field = selected, .source_options = source_options, .index_sort = build.options.index_sort, .normalized_postings = build.options.normalized_postings }, .{});
+        const name = try a.dupe(u8, entry.config.name);
+        if (self.analysis_contributions_enabled) {
+            @import("antfly_platform").sync.lockYielding(&self.analysis_contributions_mutex);
+            defer self.analysis_contributions_mutex.unlock();
+            if (self.analysis_contributions == null) if (self.resource_manager) |manager| {
+                self.analysis_contributions = introducer_mod.AnalyzedContributionCache.create(manager) catch null;
+            };
+            if (self.analysis_contributions) |cache| {
+                cache.retainOwner();
+                build.options.contribution_cache = cache;
             }
-            current.segment_count +|= range.estimate.segment_count;
-            current.byte_count +|= range.estimate.byte_count;
-            current_end = range.end;
         }
-        std.debug.assert(current_end > 0);
-        try chunks.append(context.alloc, .{ .end = docs.len, .estimate = current });
-        return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
+        transferred = true;
+        return .{ .projection = projection, .name = name, .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config), .descriptor = descriptor, .schema = schema, .selected_field = selected, .retain_empty = entry.coversPrimaryDocuments(), .source_options = source_options, .observed = observed, .stager = stager };
+    }
+
+    fn captureDetachedTextBuild(self: *IndexManager, entry: *TextIndex, projection: *OwnedTextMapperProjection) !void {
+        var stager = (try entry.persistent.acquireReplayStager(projection.alloc)) orelse return;
+        defer stager.deinit();
+        var resources = (try stager.acquireBuildResources()) orelse return;
+        if (resources.resource_manager != self.resource_manager) {
+            resources.deinit();
+            return;
+        }
+        projection.build = .{ .resources = resources };
+        const build = &projection.build.?;
+        const a = projection.arena.allocator();
+        build.analysis = try projection.ownValue(introducer_mod.TextAnalysisConfig, entry.text_analysis);
+        const sort = try textIndexSortFieldsForSegmentAlloc(a, if (entry.runtime_schema) |schema| schema.index_sort else &.{});
+        const directory = if (textBuildSpoolDirectory(entry)) |path| try a.dupe(u8, path) else null;
+        build.options = .{
+            .normalized_postings = resources.native_metadata_revision >= 17,
+            .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
+            .postings_run_io = if (directory != null) resources.io else null,
+            .postings_run_directory = directory orelse ".",
+            .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
+            .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
+            .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
+            .index_sort = try projection.ownValue(@TypeOf(sort), sort),
+            .resource_manager = resources.resource_manager,
+            .store_document_source = false,
+        };
+        if (self.analysisContributionCache(projection.docs)) |cache| {
+            cache.retainOwner();
+            build.options.contribution_cache = cache;
+        }
+    }
+
+    /// Consume the already projected window after capacity admission. Never
+    /// inspect its schema-derived pointers until the captured context matches.
+    pub fn preparePlannedTextMapperPublication(
+        self: *IndexManager,
+        alloc: Allocator,
+        index_name: []const u8,
+        context: *TextPublicationContext,
+        plan: *const TextPublicationPlan,
+        start: usize,
+        end: usize,
+    ) !PreparedTextMapperPublication {
+        const projection = plan.mapper_projection orelse return error.InvalidTextProjection;
+        if (start > end or end > projection.input_end) return error.InvalidTextProjection;
+        {
+            self.catalog_mutex.lockShared();
+            defer self.catalog_mutex.unlockShared();
+            const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+            if (entry.instance_id != projection.instance_id or entry.instance_id != context.instance_id) return error.IndexNotFound;
+            entry.lockAnalysisShared();
+            defer entry.unlockAnalysisShared();
+            if (entry.projection_revision != projection.revision or context.projection_revision != projection.revision) {
+                context.projection_revision = entry.projection_revision;
+                context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
+                return error.TextProjectionChanged;
+            }
+            if (!plan.canPrepareDetached()) {
+                var arena: std.heap.ArenaAllocator = .init(alloc);
+                defer arena.deinit();
+                const directory = textBuildSpoolDirectory(entry);
+                return buildPreparedProjectedText(alloc, entry.persistent.alloc, try projection.batch(start, end), entry.text_analysis, .{
+                    .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
+                    .contribution_cache = self.analysisContributionCache(projection.docs),
+                    .postings_run_io = if (directory != null) entry.io else null,
+                    .postings_run_directory = directory orelse ".",
+                    .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
+                    .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
+                    .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
+                    .index_sort = try textIndexSortFieldsForSegmentAlloc(arena.allocator(), if (entry.runtime_schema) |schema| schema.index_sort else &.{}),
+                    .resource_manager = self.resource_manager,
+                    .store_document_source = false,
+                });
+            }
+        }
+        // Tokenization and encoding borrow no manager/entry after the exact
+        // context check. Publication revalidates its independent input fence.
+        return (try plan.prepareDetached(alloc, start, end)).?;
     }
 
     /// Build immutable text segments while only read locks are held. This is
@@ -20816,9 +21539,16 @@ pub const IndexManager = struct {
     }
 
     pub fn runTextMergeScheduler(self: *IndexManager, max_steps: usize) !usize {
+        return self.runTextMergeSchedulerAboveSegmentCount(max_steps, 0);
+    }
+
+    /// Replay-pressure turns reserve the shared maintenance lane for consumers
+    /// unless an individual index approaches its producer admission bound.
+    /// Deferred policy merges retain their pending bit for ordinary service.
+    pub fn runTextMergeSchedulerAboveSegmentCount(self: *IndexManager, max_steps: usize, minimum_segments: u64) !usize {
         var completed: usize = 0;
         while (completed < max_steps) {
-            var task = (try self.beginTextMergeTask()) orelse break;
+            var task = (try self.beginTextMergeTaskAboveSegmentCount(minimum_segments)) orelse break;
             defer task.deinit(self.alloc);
             errdefer self.cancelTextMergeTask(&task);
             var result = executeTextMergeTask(self.alloc, &task) catch |err| switch (err) {
@@ -21293,6 +22023,20 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |*entry| {
             if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
 
+            if (try entry.persistent.acquireReplayStager(self.alloc)) |stager_value| {
+                var stager = stager_value;
+                defer stager.deinit();
+                if (prepared.observed_field_analyzers.len > 0) {
+                    try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
+                }
+                try prepared.stage(stager);
+                const infos = try entry.persistent.publishPreparedSegments(prepared.staged, delete_keys);
+                defer entry.persistent.freeDeleteInfos(infos);
+                entry.recordCommittedDeletes(infos);
+                try self.finalizeTextBatchMutations(entry, opts, .{ .indexed_any = prepared.staged.len != 0, .deleted_any = infos.len != 0 });
+                return;
+            }
+
             var stats = TextBatchMutationStats{};
             if (delete_keys.len > 0) {
                 stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);
@@ -21314,6 +22058,194 @@ pub const IndexManager = struct {
             return;
         }
         return error.IndexNotFound;
+    }
+
+    fn foregroundTextServiceableAssumeCatalogLocked(self: *IndexManager, name: []const u8) bool {
+        if (self.repair_unavailable_indexes.get(name)) |slot| if (slot.retained()) return false;
+        if (!self.managed_admission_mutex.tryLock()) return false;
+        defer self.managed_admission_mutex.unlock();
+        return !self.managed_admission_indexes.contains(name);
+    }
+
+    /// Capture an exact native index replacement and root-metadata postimage.
+    /// Projection/tokenization has already completed without writer admission.
+    /// No mutable DB/index reference survives this function.
+    pub fn captureOwnedForegroundTextPublication(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        config: ForegroundTextProjection,
+        built: *PreparedTextMapperPublication,
+        delete_keys: []const []const u8,
+        previous_sequence: u64,
+    ) !?*OwnedForegroundTextPublication {
+        if (previous_sequence == std.math.maxInt(u64)) return null;
+        var current = try self.acquireWritePlanSnapshot();
+        defer current.release();
+        const selected = for (current.plan().foreground_text) |item| {
+            if (std.mem.eql(u8, item.name, config.name)) break item;
+        } else return null;
+        if (!config.matches(selected)) return null;
+        if (!self.catalog_mutex.tryLockShared()) return null;
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndexEntry(config.name) orelse return null;
+        if (!entry.apply_mutex.tryLock()) return null;
+        defer entry.apply_mutex.unlock();
+        if (!entry.analysis_mutex.tryLockShared()) return null;
+        defer entry.analysis_mutex.unlockShared();
+        if (current.generation() != self.writePlanGeneration() or !self.foregroundTextServiceableAssumeCatalogLocked(config.name)) return null;
+        const segment_limit = self.text_merge_segment_limit.load(.acquire);
+        if (segment_limit != 0) {
+            const snapshot = entry.persistent.acquireSnapshot();
+            defer snapshot.release();
+            if (snapshot.segments.len +| built.staged.len > segment_limit) return null;
+        }
+        var scope = (try store.runtime_store.nativePublicationScope(self.alloc)) orelse return null;
+        defer scope.deinit(self.alloc);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const authority = try @import("../artifact_publication.zig").authority(&read);
+        const next_sequence = previous_sequence + 1;
+        const Planner = struct {
+            config: ForegroundTextProjection,
+            previous: u64,
+            admission_key: []const u8,
+            authority: ?@import("../artifact_publication.zig").Authority,
+            claims: ?*PreparedForegroundTextMetadata,
+            pub fn plan(planner: *const @This(), txn: anytype) !void {
+                const admission: ?[]const u8 = txn.get(planner.admission_key) catch |err| switch (@as(anyerror, err)) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                _ = admission orelse {
+                    try planner.planUnfenced(txn);
+                    return;
+                };
+                return error.ForegroundProjectionUnavailable;
+            }
+            fn planUnfenced(planner: *const @This(), txn: anytype) !void {
+                // Witness the committed source tip independently of a serving
+                // runtime's cached counter. A primary-only peer publication
+                // cannot be skipped just because index metadata is unchanged.
+                const next = txn.get(&internal_keys.replay_meta_next_sequence_key) catch |err| switch (@as(anyerror, err)) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (next) |raw| {
+                    if (raw.len != 8 or std.mem.readInt(u64, raw[0..8], .little) != planner.previous + 1) return error.EnrichmentSourceChanged;
+                } else if (planner.previous != 0) return error.EnrichmentSourceChanged;
+                const checkpoint = try apply_state.loadProjectionMetadataTxn(txn, planner.config.name);
+                if (checkpoint) |value| {
+                    if (value.status != .clean or value.applied_sequence != planner.previous or value.generation != planner.config.generation or value.config_hash != planner.config.config_hash) return error.ForegroundProjectionUnavailable;
+                } else return error.ForegroundProjectionUnavailable;
+                if (!std.meta.eql(planner.authority, try @import("../artifact_publication.zig").authority(txn))) return error.EnrichmentSourceChanged;
+                if (planner.claims) |claims| try claims.plan(txn);
+                try apply_state.advanceProjectionMetadataTxn(txn, &.{.{ .index_name = planner.config.name, .sequence = planner.previous + 1, .generation = planner.config.generation, .config_hash = planner.config.config_hash }});
+            }
+        };
+        const result = try self.alloc.create(OwnedForegroundTextPublication);
+        errdefer self.alloc.destroy(result);
+        var claims = try config.prepareMetadata(self.alloc, built.observed_field_analyzers);
+        errdefer if (claims) |*owned| owned.deinit();
+        const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, config.name);
+        defer self.alloc.free(admission_key);
+        const planner: Planner = .{ .config = config, .previous = previous_sequence, .admission_key = admission_key, .authority = authority, .claims = if (claims) |*owned| owned else null };
+        var root = @import("../../native_metadata_batch.zig").prepare(self.alloc, scope, &read, &planner) catch |err| switch (err) {
+            error.ForegroundProjectionUnavailable, error.TextProjectionChanged => {
+                if (claims) |*owned| owned.deinit();
+                self.alloc.destroy(result);
+                return null;
+            },
+            else => return err,
+        };
+        errdefer root.deinit();
+        result.* = .{ .alloc = self.alloc, .sequence = next_sequence, .previous_sequence = previous_sequence, .config = config, .claims = claims, .root = root, .metadata = undefined };
+        errdefer if (result.progress) |*progress| progress.deinit();
+        errdefer if (result.seal_builder) |*builder| builder.deinit();
+        const resources = config.projection.build.?.resources;
+        result.progress = try apply_state.bindPreparedProjectionProgress(resources, config.name, &result.root);
+        var metadata: persistent_mod.PersistentIndex.ReplayPublicationMetadata = .{
+            .participant = result.root.participant(),
+            .seal = if (authority) |selected_authority| if (self.artifact_projection_root != 0) .{ .root = self.artifact_projection_root, .namespace = selected_authority.namespace, .generation = config.generation, .config_hash = config.config_hash, .applied_sequence = next_sequence } else null else null,
+        };
+        if (metadata.seal != null) {
+            result.seal_builder = try resources.createPublicationValue(@sizeOf(@import("../../projection_seal.zig").Seal.Encoded));
+            var value = result.seal_builder.?.value();
+            defer value.deinit();
+            metadata.seal_binding = .{ .value = value, .template = &result.seal_template };
+        }
+        _ = delete_keys;
+        result.metadata = metadata;
+        result.inputs = try entry.persistent.captureNativePreparation(built.staged.len);
+        return result;
+    }
+
+    pub fn applyPreparedTextReplayPublication(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        name: []const u8,
+        delete_keys: []const []const u8,
+        prepared: []PreparedTextMapperPublication,
+        checkpoint: persistent_mod.ReplayFragment.Checkpoint,
+    ) !void {
+        const entry = self.textIndexEntry(name) orelse return error.IndexNotFound;
+        var segments = std.ArrayListUnmanaged(persistent_mod.PreparedReplaySegment).empty;
+        defer segments.deinit(self.alloc);
+        var observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+        defer observed.deinit(self.alloc);
+        for (prepared) |*item| {
+            try observed.appendSlice(self.alloc, item.observed_field_analyzers);
+            // These are borrowed immutable handles; the publications own and
+            // release their construction leases after activation or abort.
+            try segments.appendSlice(self.alloc, item.staged);
+        }
+        if (observed.items.len != 0) try mergeObservedTextFieldAnalyzers(self, store, entry, observed.items);
+        var checked_checkpoint = checkpoint;
+        checked_checkpoint.identity = .{ .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config), .incarnation = self.artifact_projection_root };
+        const native_publication = @import("../../native_publication.zig");
+        const artifact_publication = @import("../artifact_publication.zig");
+        var scope: ?native_publication.Scope = if (checkpoint.position.next_item == checkpoint.position.total_items and checkpoint.position.applied)
+            try store.runtime_store.nativePublicationScope(self.alloc)
+        else
+            null;
+        defer if (scope) |*owned| owned.deinit(self.alloc);
+        const Completion = struct {
+            alloc: Allocator,
+            scope: native_publication.Scope,
+            authority: ?artifact_publication.Authority,
+            update: apply_state.AppliedSequenceUpdate,
+            fn stage(raw: *anyopaque, view: native_publication.View) !void {
+                const completion: *@This() = @ptrCast(@alignCast(raw));
+                var txn: native_publication.MetadataTxn = .{ .alloc = completion.alloc, .view = view, .scope = completion.scope };
+                defer txn.deinit();
+                if (!std.meta.eql(completion.authority, try artifact_publication.authority(&txn))) return error.EnrichmentSourceChanged;
+                try apply_state.advanceProjectionMetadataTxn(&txn, &.{completion.update});
+            }
+        };
+        const authority = if (scope != null) blk: {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            break :blk try artifact_publication.authority(&read);
+        } else null;
+        var completion: Completion = .{
+            .alloc = self.alloc,
+            .scope = scope orelse .{ .inode = 0, .prefix = &.{} },
+            .authority = authority,
+            .update = .{ .index_name = name, .sequence = checkpoint.position.sequence, .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config) },
+        };
+        const joined: ?persistent_mod.PersistentIndex.ReplayPublicationMetadata = if (scope != null) .{
+            .participant = .{ .ptr = &completion, .stage = Completion.stage },
+            .seal = if (authority) |selected| if (self.artifact_projection_root != 0) .{
+                .root = self.artifact_projection_root,
+                .namespace = selected.namespace,
+                .generation = entry.config.coverage_generation,
+                .config_hash = types.indexConfigHash(entry.config),
+                .applied_sequence = checkpoint.position.sequence,
+            } else null else null,
+        } else null;
+        const infos = try entry.persistent.publishReplayWithMetadata(segments.items, delete_keys, checked_checkpoint, joined);
+        defer entry.persistent.freeDeleteInfos(infos);
+        entry.recordCommittedDeletes(infos);
+        try self.finalizeTextBatchMutations(entry, .{ .compact_text = false, .defer_text_compaction = true }, .{ .indexed_any = segments.items.len != 0, .deleted_any = infos.len != 0 });
     }
 
     pub fn indexDenseBatchByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const types.BatchWrite) !void {
@@ -25561,6 +26493,11 @@ pub const IndexManager = struct {
     }
 
     pub fn beginTextMergeTask(self: *IndexManager) !?TextMergeTask {
+        return self.beginTextMergeTaskAboveSegmentCount(0);
+    }
+
+    pub fn beginTextMergeTaskAboveSegmentCount(self: *IndexManager, minimum_segments: u64) !?TextMergeTask {
+        if (comptime builtin.is_test) if (test_before_text_merge_step) |hook| if (hook.manager == self) try hook.notify(hook.ptr);
         const now_ns = platform_time.monotonicNs();
         self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
         _ = self.textMergeStats();
@@ -25572,6 +26509,12 @@ pub const IndexManager = struct {
         while (attempts < self.text_indexes.items.len) : (attempts += 1) {
             const idx = self.text_merge_scheduler.select(self.text_indexes.items) orelse return null;
             const entry = &self.text_indexes.items[idx];
+            if (minimum_segments != 0) {
+                const snapshot = entry.persistent.acquireSnapshot();
+                const segment_count = snapshot.segments.len;
+                snapshot.release();
+                if (segment_count < minimum_segments) continue;
+            }
             const has_in_flight = self.text_merge_scheduler.indexHasInFlight(entry.config.name);
             const maybe_task = self.beginTextMergeTaskForEntry(entry) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
@@ -25600,6 +26543,63 @@ pub const IndexManager = struct {
             }
         }
         return null;
+    }
+
+    /// Reattach a detached immutable merge to the current runtime. Source IDs
+    /// alone do not establish identity: a namespace may have been recreated.
+    /// Reconstruct deletion deltas from the current snapshot, preserving newer
+    /// appended segments and every tombstone committed during construction.
+    pub fn adoptDetachedTextMergeTask(self: *IndexManager, task: *const TextMergeTask) !bool {
+        const entry = self.textIndexEntry(task.index_name) orelse return false;
+        if (!entry.apply_mutex.tryLock()) return error.IndexApplyBusy;
+        defer entry.apply_mutex.unlock();
+        const current = entry.persistent.acquireSnapshot();
+        defer current.release();
+        for (task.source, task.merge_indices, task.deletion_state.deltas) |source, source_idx, *delta| {
+            const segment = findSegmentById(current, source.id) orelse return false;
+            const original = &task.snapshot.segments[source_idx];
+            const expected = original.reader.immutableSource();
+            const actual = segment.reader.immutableSource();
+            if (expected != .ranges or actual != .ranges or expected.ranges.immutable_identity == null or
+                !std.meta.eql(expected.ranges.immutable_identity, actual.ranges.immutable_identity) or
+                original.reader.doc_count != segment.reader.doc_count) return false;
+            delta.bitmap.deinit();
+            delta.* = TextMergeDeletionDelta.init(task.mergeAllocator());
+            var deleted = try segment.cloneDeleted(task.mergeAllocator());
+            defer if (deleted) |*bitmap| bitmap.deinit();
+            if (source.deleted) |frozen| {
+                var frozen_iterator = frozen.iterator();
+                while (frozen_iterator.next()) |doc| {
+                    if (deleted == null or !deleted.?.contains(doc)) return false;
+                }
+            }
+            if (deleted) |bitmap| {
+                var iterator = bitmap.iterator();
+                while (iterator.next()) |doc| {
+                    if (source.deleted) |frozen| if (frozen.contains(doc)) continue;
+                    try delta.bitmap.add(doc);
+                    delta.count += 1;
+                }
+            }
+        }
+        task.deletion_state.valid = true;
+        try entry.attachMergeDeletionState(self.alloc, task.deletion_state);
+        errdefer entry.detachMergeDeletionState(task.deletion_state);
+        try self.text_merge_scheduler.registerSource(self.alloc, task.index_name, task.source, task.deletion_state);
+        return true;
+    }
+
+    pub fn executePrivateTextMergeTask(task: *const TextMergeTask, scratch: segment_mod.MergeScratchOptions, canceled: *const std.atomic.Value(bool)) !segment_mod.PrivateMergeResult {
+        const task_alloc = task.mergeAllocator();
+        const inputs = try task_alloc.alloc(segment_mod.MergeInput, task.source.len);
+        defer task_alloc.free(inputs);
+        for (task.source, task.merge_indices, inputs) |source, source_idx, *input| {
+            input.* = .{ .reader = &task.snapshot.segments[source_idx].reader, .deleted = source.deleted };
+        }
+        // Detached workers own their input snapshot and scratch context. They
+        // must not dereference the inline catalog entry after capture: optional
+        // control work can change that catalog while construction is running.
+        return segment_mod.preparePrivateMerge(task_alloc, inputs, scratch, canceled, std.math.maxInt(u32)) catch |err| task.deletion_state.allocationError(err);
     }
 
     pub fn executeTextMergeTask(alloc: Allocator, task: *const TextMergeTask) !TextMergeResult {
@@ -25712,13 +26712,34 @@ pub const IndexManager = struct {
         );
     }
 
+    /// Counts are monotone within an immutable source identity. A fresh
+    /// admitted runtime reconstructs cumulative deltas before this check; new
+    /// appends do not invalidate already resolved source coordinates.
+    pub fn textMergePublicationLookupCurrent(task: *const TextMergeTask, result: *const TextMergeResult) bool {
+        const map = result.source_map orelse return result.publication_lookup_built;
+        if (map.file == null) return result.publication_lookup_built;
+        const output_count = if (result.prepared_segments.len > 0) result.prepared_segments.len else if (result.segments.len > 0) result.segments.len else result.unlinked_output_count;
+        if (result.prepared_output_deletes.len != output_count) return false;
+        if (result.prepared_delta_counts.len == 0) {
+            for (task.deletion_state.deltas) |delta| if (delta.count != 0) return false;
+            return true;
+        }
+        if (result.prepared_delta_counts.len != task.deletion_state.deltas.len) return false;
+        for (task.deletion_state.deltas, result.prepared_delta_counts) |delta, delta_count| if (delta.count != delta_count) return false;
+        return true;
+    }
+
     fn prepareFileMergePublicationLookup(task: *const TextMergeTask, result: *TextMergeResult, map: *segment_mod.MergeSourceMap) !void {
         const alloc = task.mergeAllocator();
-        const output_count = if (result.prepared_segments.len > 0) result.prepared_segments.len else result.segments.len;
+        const output_count = if (result.prepared_segments.len > 0) result.prepared_segments.len else if (result.segments.len > 0) result.segments.len else result.unlinked_output_count;
         if (result.prepared_output_deletes.len == 0) {
             result.prepared_output_deletes = try alloc.alloc(?roaring.RoaringBitmap, output_count);
             @memset(result.prepared_output_deletes, null);
         } else if (result.prepared_output_deletes.len != output_count) return error.InvalidDeletionSnapshot;
+        if (result.mapped_input_deletes.len == 0) {
+            result.mapped_input_deletes = try alloc.alloc(roaring.RoaringBitmap, task.source.len);
+            for (result.mapped_input_deletes) |*bitmap| bitmap.* = roaring.RoaringBitmap.init(alloc);
+        } else if (result.mapped_input_deletes.len != task.source.len) return error.InvalidDeletionSnapshot;
         // Seal the current delta batch with an O(inputs) ownership swap. New
         // commits append to fresh bitmaps while the worker resolves this batch.
         // Keep the sealed batch until success so a read/allocation failure can
@@ -25741,16 +26762,16 @@ pub const IndexManager = struct {
         for (result.pending_deletes, 0..) |delta, input| {
             var iterator = delta.iterator();
             while (iterator.next()) |doc| {
+                if (result.mapped_input_deletes[input].contains(doc)) continue;
                 const location = (try map.lookupRead(input, doc)) orelse return error.MissingMergeDocumentIdentity;
                 if (location.segment >= output_count) return error.InvalidSegment;
                 if (result.prepared_output_deletes[location.segment] == null) result.prepared_output_deletes[location.segment] = roaring.RoaringBitmap.init(alloc);
                 try result.prepared_output_deletes[location.segment].?.add(location.doc);
+                try result.mapped_input_deletes[input].add(doc);
+                result.prepared_deletion_documents += 1;
             }
         }
-        for (result.pending_deletes) |*delta| {
-            result.prepared_deletion_documents += delta.cardinality();
-            delta.deinit();
-        }
+        for (result.pending_deletes) |*delta| delta.deinit();
         alloc.free(result.pending_deletes);
         result.pending_deletes = &.{};
         alloc.free(result.prepared_delta_counts);
@@ -26017,6 +27038,7 @@ pub const IndexManager = struct {
             const deletion_summary = seg.deletionSummary();
             try infos.append(self.alloc, .{
                 .index = i,
+                .normalized_delta = seg.reader.isNormalizedPostingDelta(),
                 .size = seg.data.len(),
                 .doc_count = seg.reader.doc_count,
                 .deleted_count = deletion_summary.count,
@@ -26025,7 +27047,8 @@ pub const IndexManager = struct {
         }
         if (infos.items.len < 2) return null;
 
-        const policy = activeTextMergePolicy();
+        var policy = activeTextMergePolicy();
+        policy.max_live_segments = self.text_merge_segment_limit.load(.acquire);
         const planned = (try policy.plan(self.alloc, infos.items)) orelse blk: {
             // The tiered policy found nothing to merge (for example every
             // eligible segment floors to the same effective size under
@@ -26035,17 +27058,27 @@ pub const IndexManager = struct {
             // segments so producer admission always has a merge in flight to
             // wait on instead of retrying TextMergeBackpressureTimeout
             // against a scheduler that gave up.
-            if (snap.segments.len <= policy.max_segments_per_tier) return null;
+            var frozen: std.ArrayListUnmanaged(merger_mod.SegmentInfo) = .empty;
+            defer frozen.deinit(self.alloc);
+            for (infos.items) |info| if (!info.normalized_delta) try frozen.append(self.alloc, info);
+            if (frozen.items.len <= policy.max_segments_per_tier) return null;
             self.text_merge_scheduler.forced_drains += 1;
             break :blk try text_index_maintenance.planForceDrainFromInfos(
                 self.alloc,
-                infos.items,
+                frozen.items,
                 force_merge_max_segments_at_once,
             );
         };
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
 
+        return try self.beginPlannedTextMergeTaskForEntry(entry, snap, planned);
+    }
+
+    // Both policy maintenance and explicit compaction use the same enforced
+    // allocator, adaptive source width, deletion tracking and publication.
+    // Caller holds the per-index apply mutex while capturing these inputs.
+    fn beginPlannedTextMergeTaskForEntry(self: *IndexManager, entry: *TextIndex, snap: *index_mod.IndexSnapshot, planned: []const usize) !TextMergeTask {
         // The tier policy optimizes write amplification by selecting a wider
         // group, but that group may exceed the merge-buffer slice even though
         // a smaller merge can make forward progress. Adapt admission down to
@@ -26140,12 +27173,16 @@ pub const IndexManager = struct {
         const manager = self.resource_manager orelse return null;
 
         var source_bytes: u64 = 0;
+        var largest_delta_bytes: u64 = 0;
+        var normalized_only = true;
         var deletion_tracking_bytes: u64 = 0;
         var merge_working_set_bytes: u64 = 8 * 1024 * 1024;
         const file_backed_merge = persistent.supportsFileBackedSegmentArtifacts();
         const native_scratch = file_backed_merge and persistent.io != null and persistent.privateScratchDirectory(".") != null;
         for (planned) |seg_idx| {
             const seg = &snap.segments[seg_idx];
+            normalized_only = normalized_only and seg.reader.isNormalizedPostingDelta();
+            if (native_scratch and seg.reader.isNormalizedPostingDelta()) largest_delta_bytes = @max(largest_delta_bytes, seg.reader.mergeLayoutStats().inverted_text_bytes);
             source_bytes = std.math.add(u64, source_bytes, @as(u64, @intCast(seg.data.len()))) catch return error.ResourceBudgetExceeded;
             merge_working_set_bytes = try std.math.add(u64, merge_working_set_bytes, if (native_scratch) 1024 else @as(u64, seg.reader.doc_count) * 8 + 64);
             deletion_tracking_bytes = std.math.add(
@@ -26163,6 +27200,10 @@ pub const IndexManager = struct {
             ) catch return error.ResourceBudgetExceeded;
         }
 
+        // Positions for one streamed term may expand while all compact input
+        // references remain live. Cover varint expansion, arena growth and
+        // the temporary input copy independently of the retained references.
+        merge_working_set_bytes = try std.math.add(u64, merge_working_set_bytes, try std.math.mul(u64, largest_delta_bytes, 8));
         const segment_overhead = std.math.mul(u64, @as(u64, @intCast(planned.len)), 1024) catch return error.ResourceBudgetExceeded;
         // File-backed output is streamed into its final artifact. Heap-backed
         // output remains resident alongside its builders and publication
@@ -26177,7 +27218,11 @@ pub const IndexManager = struct {
             ) catch return error.ResourceBudgetExceeded;
         var reservation_bytes = std.math.add(u64, reservation_base, segment_overhead) catch return error.ResourceBudgetExceeded;
         reservation_bytes = std.math.add(u64, reservation_bytes, deletion_tracking_bytes) catch return error.ResourceBudgetExceeded;
-        if (file_backed_merge) {
+        // Frozen legacy layout estimates remain conservative envelopes. A
+        // normalized-only plan has a direct encoded-size bound: do not clip
+        // that known demand to the cap and start a doomed task. Admission can
+        // select a smaller prefix before any construction is launched.
+        if (file_backed_merge and !normalized_only) {
             const hard_limit = manager.sliceStats(.text_merge_buffers).hard_limit_bytes;
             if (hard_limit > 0) {
                 const enforced_cap = std.math.mul(u64, hard_limit, 2) catch std.math.maxInt(u64);
@@ -26338,7 +27383,7 @@ pub const IndexManager = struct {
     }
 
     fn estimateTextMergeWorkingSetBytes(seg: *const index_mod.SegmentEntry, native_scratch: bool, provenance: bool) !u64 {
-        const layout = seg.layoutStats(false);
+        const layout = if (native_scratch and seg.reader.isNormalizedPostingDelta()) seg.reader.mergeLayoutStats() else seg.layoutStats(false);
 
         // Native plans retain per-input navigation and caches, not one
         // coordinate or sort-key object per document. The task allocator
@@ -26348,6 +27393,10 @@ pub const IndexManager = struct {
             768 * 1024 + (if (provenance and layout.index_sort_bytes == 0) @as(u64, seg.reader.doc_count) * 4 else 0)
         else
             try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
+        // Retain encoded bytes plus one eight-byte reference per
+        // contribution (at least two encoded bytes). No vocabulary hash map
+        // or complete decoded posting corpus remains resident during merging.
+        if (native_scratch and seg.reader.isNormalizedPostingDelta()) bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_text_bytes, 5));
         // Streamed posting block/impact navigation still scales with a term's
         // document frequency. Cover its compact tables even though coordinate
         // plans and position payloads spill to bounded private runs.
@@ -26511,8 +27560,44 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    /// One native retirement slice on the admitted serving owner. This never
+    /// constructs a merge, runs providers, or enters nested LSM maintenance.
+    /// The caller has ruled out mixed indexes and owns the publication fence.
+    pub fn serviceNativeTextStorageSlice(self: *IndexManager) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.text_indexes.items) |*entry| {
+            if (!entry.persistent.hasNativeMetadata()) return error.UnsupportedOperation;
+        }
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay| {
+                if (delay == 0) {
+                    _ = try entry.persistent.runLsmMaintenanceStep();
+                    break;
+                }
+            }
+        }
+        // A future retry is debt too; callers retain its timed continuation.
+        for (self.text_indexes.items) |*entry| if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort() != null) return true;
+        return false;
+    }
+
+    /// Scheduling probe over immutable inventories. No task, source runtime or
+    /// artifact is constructed; actual merges still capture owned inputs.
+    pub fn nativeTextMaintenanceNeedsMerge(self: *IndexManager) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.text_indexes.items) |*entry| {
+            if (!entry.persistent.hasNativeMetadata()) return true;
+            if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) return true;
+        }
+        return false;
+    }
+
     fn textIndexNeedsMerge(self: *IndexManager, index: *persistent_mod.PersistentIndex, policy: merger_mod.MergePolicy) !bool {
-        return try text_index_maintenance.needsMerge(self.alloc, index, policy);
+        var admitted = policy;
+        admitted.max_live_segments = self.text_merge_segment_limit.load(.acquire);
+        return try text_index_maintenance.needsMerge(self.alloc, index, admitted);
     }
 
     fn forceCompactTextIndexWithOptions(
@@ -26523,29 +27608,42 @@ pub const IndexManager = struct {
         self.text_merge_scheduler.supersedeInFlightForIndex(self.alloc, entry.config.name);
         entry.detachAllMergeDeletionStates();
         while (true) {
-            const snap = entry.persistent.snapshot();
-            if (snap.segments.len < 2) return true;
             if (options.mode == .best_effort and self.shouldDeferTextMergeForResourcePressure()) return false;
-
-            const planned = try text_index_maintenance.planForceCompactAlloc(self.alloc, snap, force_merge_max_segments_at_once);
-            defer self.alloc.free(planned);
-            var reservation = self.reserveTextMergeBuffers(&entry.persistent, snap, planned, .strict) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+            var task = blk: {
+                self.lockAtomicWithBackoff(entry.apply_mutex);
+                defer entry.apply_mutex.unlock();
+                if (entry.backfill_active.load(.acquire) != 0) return error.IndexApplyBusy;
+                const snap = entry.persistent.acquireSnapshot();
+                defer snap.release();
+                if (snap.segments.len < 2) return true;
+                const planned = try text_index_maintenance.planForceCompactAlloc(self.alloc, snap, force_merge_max_segments_at_once);
+                defer self.alloc.free(planned);
+                break :blk self.beginPlannedTextMergeTaskForEntry(entry, snap, planned) catch |err| switch (err) {
+                    error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
+                    else => return err,
+                };
+            };
+            defer task.deinit(self.alloc);
+            errdefer self.cancelTextMergeTask(&task);
+            var result = executeTextMergeTask(self.alloc, &task) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => {
+                    self.text_merge_scheduler.deferred_for_pressure += 1;
+                    self.noteTextMergeResourceBudgetExceeded(&task);
+                    if (options.mode == .best_effort) return false;
+                    // Actual scratch/deletion use can exceed the estimate.
+                    // Retry a narrower task, but never spin on a failing pair.
+                    if (task.merge_indices.len > 2) continue;
+                    return err;
+                },
                 else => return err,
             };
-            defer if (reservation) |*active| active.release();
-
-            const applied = text_index_maintenance.applyPlannedMerge(
-                self.alloc,
-                &entry.persistent,
-                snap,
-                planned,
-                activeTextMergePolicy().max_segment_size,
-                "force compact text index merge failed",
-                "force compact text index apply merge failed",
-            ) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => if (options.mode == .best_effort) return false else return err,
-                else => return err,
+            defer result.deinit(self.alloc);
+            const applied = while (true) {
+                break self.finishTextMergeTask(&task, &result) catch |err| {
+                    if (err != error.TextMergePublicationLookupRequired) return err;
+                    try prepareTextMergeTaskPublicationLookup(&task, &result);
+                    continue;
+                };
             };
             if (!applied) return false;
         }
@@ -35741,6 +36839,7 @@ fn mergeObservedTextFieldAnalyzers(
     const previous_analysis = entry.text_analysis.field_analyzers;
     entry.observed_field_analyzers = expanded_observed;
     entry.text_analysis.field_analyzers = expanded_analysis;
+    self.invalidateWritePlanSnapshot();
     observed_published = true;
     analysis_published = true;
     if (previous_observed.len > 0) self.alloc.free(previous_observed);
@@ -42100,6 +43199,62 @@ test "text query lease retains snapshot and analyzer across catalog removal" {
     try std.testing.expectEqual(@as(u32, 1), try lease.snapshot.termDocFreq(alloc, "body", "New York"));
 }
 
+test "text publication retains bounded mapper windows with custom analyzers and rejects replacement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const config: types.IndexConfig = .{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}" };
+    try manager.addAllNoBackfill(&store, &.{config});
+    const previous_target = text_projection_source_build_target_bytes_cache.swap(2, .monotonic);
+    defer text_projection_source_build_target_bytes_cache.store(previous_target, .monotonic);
+    const docs = [_]mapper.MapperDoc{
+        .{ .key = "one", .value = "{\"body\":\"résumé 日本語\"}" },
+        .{ .key = "two", .value = "{\"body\":\"İstanbul\"}" },
+        .{ .key = "three", .value = "{\"body\":\"مرحبا بالعالم\"}" },
+    };
+    var context = try manager.acquireTextPublicationContext(a, config.name);
+    defer context.deinit();
+    var start: usize = 0;
+    while (start < docs.len) {
+        var plan = try manager.planTextMapperDocsPublication(&store, config.name, &context, docs[start..], 1);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(usize, 1), plan.input_end);
+        try std.testing.expectEqual(@as(usize, 1), plan.mapper_projection.?.docs.len);
+        var prepared = try manager.preparePlannedTextMapperPublication(a, config.name, &context, &plan, 0, plan.input_end);
+        defer prepared.deinit();
+        {
+            var guard = try manager.lockManagedIndexApply(.{ .name = config.name, .kind = .full_text });
+            defer guard.unlock();
+            try manager.applyPreparedTextMapperPublicationByNameWithOptions(&store, config.name, &.{}, &prepared, .{});
+        }
+        start += plan.input_end;
+    }
+    const snapshot = manager.textIndex(config.name).?.snapshot();
+    try std.testing.expectEqual(@as(u32, 3), snapshot.liveDocCount());
+    try std.testing.expectEqual(@as(u32, 1), try snapshot.termDocFreq(a, "body", "résumé 日本語"));
+    const empty_config: types.IndexConfig = .{ .name = "ft_empty", .kind = .full_text, .config_json = "{}" };
+    try manager.addAllNoBackfill(&store, &.{empty_config});
+    var empty_context = try manager.acquireTextPublicationContext(a, empty_config.name);
+    defer empty_context.deinit();
+    var stale = try manager.planTextMapperDocsPublication(&store, empty_config.name, &empty_context, &docs, 1);
+    defer stale.deinit();
+    const fields = [_]schema_mod.FullTextField{.{ .path = "body", .emitted_name = "body", .analyzer = "keyword" }};
+    const documents = [_]schema_mod.FullTextDocument{.{ .name = "message", .fields = &fields }};
+    try std.testing.expect(try schema_mod.saveSchema(&store, a, .{ .version = 0, .default_type = "message", .full_text_documents = &documents }));
+    try manager.refreshEmptyTextIndexSchemas(&store);
+    try std.testing.expectError(error.TextProjectionChanged, manager.preparePlannedTextMapperPublication(a, empty_config.name, &empty_context, &stale, 0, stale.input_end));
+    try std.testing.expect(try manager.remove(&store, empty_config.name));
+    try manager.addAllNoBackfill(&store, &.{empty_config});
+    try std.testing.expectError(error.IndexNotFound, manager.preparePlannedTextMapperPublication(a, empty_config.name, &empty_context, &stale, 0, stale.input_end));
+}
+
 test "text publication planning rejects a same-name catalog replacement" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -42215,7 +43370,7 @@ test "text publication admission refreshes a projection revision change" {
         .value = writes[0].value,
         .root = parsed_doc.value,
     }};
-    var mapper_plan = try manager.planTextMapperDocsPublication(config.name, &stale_mapper_context, &mapper_docs, 1);
+    var mapper_plan = try manager.planTextMapperDocsPublication(&store, config.name, &stale_mapper_context, &mapper_docs, 1);
     defer mapper_plan.deinit();
     try std.testing.expectEqual(stale_context.projection_revision, stale_mapper_context.projection_revision);
     try std.testing.expectEqual(@as(u64, 1), mapper_plan.chunks[0].estimate.segment_count);
@@ -42225,7 +43380,7 @@ test "text publication admission refreshes a projection revision change" {
     const refresh = try manager.refreshTextPublicationContextAssumeCatalogLocked(config.name, &admission_context);
     manager.catalog_mutex.unlockShared();
     try std.testing.expectEqual(TextPublicationContextRefresh.projection_changed, refresh);
-    var prepared = try manager.prepareTextMapperDocsPublication(alloc, &store, config.name, &stale_mapper_context, &mapper_docs);
+    var prepared = try manager.preparePlannedTextMapperPublication(alloc, config.name, &stale_mapper_context, &mapper_plan, 0, mapper_plan.input_end);
     defer prepared.deinit();
     var guard = try manager.lockManagedIndexApply(.{ .name = config.name, .kind = .full_text });
     defer guard.unlock();
@@ -47163,13 +48318,23 @@ test "text merge file provenance resolves deletion races off lock and retries re
     try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
     try std.testing.expectEqual(@as(usize, 1), result.prepared_output_deletes[0].?.cardinality());
 
+    try std.testing.expect(IndexManager.textMergePublicationLookupCurrent(&task, &result));
+    // Reopening a publication runtime reconstructs cumulative source deletes.
+    // Previously resolved coordinates must not be read/count-charged again.
+    {
+        task.deletion_state.preparation_mutex.lockUncancelable(task.deletion_state.preparation_io);
+        defer task.deletion_state.preparation_mutex.unlock(task.deletion_state.preparation_io);
+        try task.deletion_state.deltas[0].bitmap.add(0); // "a", already resolved.
+    }
     // A new delete after preparation requires another off-lock pass rather
     // than an unexpected filesystem read in atomic publication.
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{"b"}, options);
+    try std.testing.expect(!IndexManager.textMergePublicationLookupCurrent(&task, &result));
     try std.testing.expectError(error.TextMergePublicationLookupRequired, manager.finishTextMergeTask(&task, &result));
     try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
     try std.testing.expectEqual(@as(usize, 2), result.prepared_output_deletes[0].?.cardinality());
     try std.testing.expectEqual(@as(u64, 2), result.prepared_deletion_documents);
+    try std.testing.expect(IndexManager.textMergePublicationLookupCurrent(&task, &result));
     const read_calls = mapping.read_calls;
     const lease = manager.tryTextMergePublicationLease(&task).?;
     try std.testing.expect(try manager.finishTextMergeTaskWithPublicationLease(&task, &result));
@@ -49028,6 +50193,51 @@ test "best effort force compact defers under text merge pressure" {
     try std.testing.expect(entry_after.compaction_pending.load(.acquire));
 }
 
+test "index manager forced native compaction uses bounded task admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_limit_bytes = 10 * 1024 * 1024,
+        .hard_limit_bytes = 10 * 1024 * 1024,
+    };
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .disk_safety_floor_bytes = 1024 * 1024,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer resources.deinit(a);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(a, path, .{ .resource_manager = &resources });
+    defer manager.deinit();
+    manager.setIo(std.testing.io);
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "text", .kind = .full_text, .config_json = "{}" }});
+    const options: IndexBatchOptions = .{ .compact_text = false, .compact_text_segment_threshold = 2, .defer_text_compaction = true };
+    for (0..16) |i| {
+        const key = try std.fmt.allocPrint(a, "doc-{d}", .{i});
+        defer a.free(key);
+        const value = try std.fmt.allocPrint(a, "{{\"title\":\"bounded forced compact canary {d}\"}}", .{i});
+        defer a.free(value);
+        try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+        try manager.indexTextBatchByNameWithOptions(&store, "text", &.{.{ .key = key, .value = value }}, options);
+    }
+    const entry = manager.textIndexEntry("text").?;
+    try std.testing.expect(entry.persistent.supportsFileBackedSegmentArtifacts());
+    try std.testing.expectEqual(@as(usize, 16), entry.persistent.snapshot().segments.len);
+    try manager.forceCompactAllTextIndexes();
+    try std.testing.expectEqual(@as(usize, 1), entry.persistent.snapshot().segments.len);
+    try std.testing.expectEqual(@as(u64, 16), entry.persistent.snapshot().liveDocCount());
+    try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.text_merge_buffers).used_bytes);
+    try std.testing.expectEqual(@as(u64, 10 * 1024 * 1024), resources.sliceStats(.text_merge_buffers).hard_limit_bytes);
+}
+
 test "best effort force compact stops on resource budget rejection" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -50694,6 +51904,61 @@ test "graph artifact rebuild lease drains scheduler pins and excludes new snapsh
     while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
     try std.testing.expect(!manager.catalog_mutex.tryLockShared());
     pending.release.store(true, .release);
+}
+
+test "text replay pressure defers optional merges per index without losing headroom or idle debt" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(a, path, .{});
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{
+        .{ .name = "optional", .kind = .full_text, .config_json = "{\"field\":\"title\"}" },
+        .{ .name = "headroom", .kind = .full_text, .config_json = "{\"field\":\"title\"}" },
+    });
+    const options: IndexBatchOptions = .{ .compact_text = false, .compact_text_segment_threshold = 2, .defer_text_compaction = true };
+    for (0..33) |i| {
+        var key: [32]u8 = undefined;
+        const write = types.BatchWrite{ .key = try std.fmt.bufPrint(&key, "doc:{d}", .{i}), .value = "{\"title\":\"replay headroom canary\"}" };
+        try store.putBatch(&.{.{ .key = write.key, .value = write.value }}, &.{});
+        if (i < 12) try manager.indexTextBatchByNameWithOptions(&store, "optional", &.{write}, options);
+        try manager.indexTextBatchByNameWithOptions(&store, "headroom", &.{write}, options);
+    }
+    const optional = manager.textIndexEntry("optional").?;
+    const headroom = manager.textIndexEntry("headroom").?;
+    try std.testing.expectEqual(@as(usize, 12), optional.persistent.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 33), headroom.persistent.snapshot().segments.len);
+    // Aggregate fan-out exceeds 34, but neither individual index does.
+    try std.testing.expectEqual(@as(usize, 0), try manager.runTextMergeSchedulerAboveSegmentCount(1, 34));
+    try std.testing.expect(optional.compaction_pending.load(.acquire));
+    try std.testing.expect(headroom.compaction_pending.load(.acquire));
+    // An optional index selected first cannot hide a pressured peer.
+    {
+        var task = (try manager.beginTextMergeTaskAboveSegmentCount(32)) orelse return error.MissingPressureMerge;
+        defer task.deinit(a);
+        defer manager.cancelTextMergeTask(&task);
+        try std.testing.expectEqualStrings("headroom", task.index_name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try manager.runTextMergeSchedulerAboveSegmentCount(1, 32));
+    try std.testing.expect(headroom.persistent.snapshot().segments.len < 33);
+    try std.testing.expectEqual(@as(usize, 12), optional.persistent.snapshot().segments.len);
+    try std.testing.expect(optional.compaction_pending.load(.acquire));
+    // Once replay pressure ends the ordinary tier policy still drains both.
+    try manager.drainScheduledTextMerges();
+    try std.testing.expect(optional.persistent.snapshot().segments.len <= default_text_merge_max_segments_per_tier);
+    try std.testing.expect(headroom.persistent.snapshot().segments.len <= default_text_merge_max_segments_per_tier);
+    for ([_]*IndexManager.TextIndex{ optional, headroom }, [_]u64{ 12, 33 }) |entry, expected| {
+        const snapshot = entry.persistent.acquireSnapshot();
+        defer snapshot.release();
+        var documents: u64 = 0;
+        for (snapshot.segments) |segment| documents += segment.reader.doc_count;
+        try std.testing.expectEqual(expected, documents);
+    }
 }
 
 test "text force drain schedules policy misses above the tier target" {
@@ -52727,4 +53992,235 @@ test "privacy text projection retains primary identity and removes private recei
     try std.testing.expect(std.mem.indexOf(u8, projected.stored_data, "private") == null);
     try std.testing.expect(projected.doc_ordinal == null and !projected.schema_less_fast_projection);
     try std.testing.expect(root.object.contains("_privacy"));
+}
+
+test "native text preparation builds from owned inputs after manager and backend close" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/detached-text.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    const backend_mod = @import("../../lite/backend.zig");
+    const native_indexes = @import("../../lite/index_storage.zig");
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{
+        .exclusive = true,
+        .no_sync = true,
+        .io = std.testing.io,
+        .reclamation = .{ .enabled = false },
+    });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var store = try docstore_mod.DocStore.openRuntime(a, backend.native_runtime_store.?);
+    var store_live = true;
+    defer if (store_live) store.close();
+    var provider = native_indexes.Store.init(a, backend.native_docstore.?);
+    var manager = try IndexManager.initWithOptions(a, "/detached", .{
+        .resource_manager = backend.owned_resource_manager.?,
+        .text_lsm_storage = provider.storage(),
+        .generation_storage = provider.storage(),
+    });
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    manager.setIo(std.testing.io);
+    manager.analysis_contributions_enabled = true;
+    manager.updateRange(.{ .start = "", .end = "" });
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}" };
+    try manager.addAllNoBackfill(&store, &.{config});
+    const content = try a.alloc(u8, 12 * 1024);
+    defer a.free(content);
+    for (content, 0..) |*byte, index| byte.* = "alpha beta "[index % "alpha beta ".len];
+    const value = try std.fmt.allocPrint(a, "{{\"body\":\"résumé 日本語\",\"content\":\"{s}\"}}", .{content});
+    defer a.free(value);
+    const docs = [_]mapper.MapperDoc{ .{ .key = "one", .value = value }, .{ .key = "two", .value = value } };
+    var immutable = try manager.acquireWritePlanSnapshot();
+    defer immutable.release();
+    try std.testing.expectEqual(@as(usize, 1), immutable.plan().foreground_text.len);
+    var shared = try manager.acquireWritePlanSnapshot();
+    try std.testing.expectEqual(immutable.epoch, shared.epoch);
+    shared.release();
+    var context = try manager.acquireTextPublicationContext(a, config.name);
+    var context_live = true;
+    defer if (context_live) context.deinit();
+    var plan = try manager.planTextMapperDocsPublication(&store, config.name, &context, &docs, std.math.maxInt(usize));
+    defer plan.deinit();
+    try std.testing.expect(plan.canPrepareDetached());
+    try std.testing.expect(plan.mapper_projection.?.build.?.options.contribution_cache != null);
+    context.deinit();
+    context_live = false;
+    manager.deinit();
+    manager_live = false;
+    store.close();
+    store_live = false;
+    backend.deinit();
+    backend_live = false;
+    // No runtime, schema/index entry, Store or primary snapshot remains.
+    // The request owns source bodies; the plan owns all build dependencies.
+    var prepared = (try plan.prepareDetached(a, 0, plan.input_end)).?;
+    defer prepared.deinit();
+    var count: usize = 0;
+    for (prepared.segments) |bytes| {
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        count += reader.doc_count;
+        var field = (try reader.invertedIndexScoped(a, "body")).?;
+        defer field.deinit();
+        const posting = (try field.lookup("résumé 日本語")).?;
+        var iterator = try posting.iterator(a);
+        defer iterator.deinit();
+        for (0..reader.doc_count) |_| try std.testing.expect((try iterator.next()) != null);
+        try std.testing.expect((try iterator.next()) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    // Project unseen inputs after every mutable runtime has been destroyed.
+    const captured = &immutable.plan().foreground_text[0];
+    var foreground = try captured.project(a, &docs);
+    defer foreground.deinit();
+    var built = (try foreground.prepareDetached(a, 0, foreground.input_end)).?;
+    defer built.deinit();
+    var foreground_docs: usize = 0;
+    for (built.segments) |bytes| {
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        foreground_docs += reader.doc_count;
+        try std.testing.expectEqual(@as(?u32, null), try reader.docOrdinal(0));
+        var field = (try reader.invertedIndexScoped(a, "body")).?;
+        defer field.deinit();
+        try std.testing.expect((try field.lookup("résumé 日本語")) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), foreground_docs);
+}
+
+test "native text preparation declines detachment from a borrowed resource manager" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/borrowed-text-resources.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(a);
+    const backend_mod = @import("../../lite/backend.zig");
+    const native_indexes = @import("../../lite/index_storage.zig");
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .exclusive = true, .no_sync = true, .io = std.testing.io, .resource_manager = &resources, .reclamation = .{ .enabled = false } });
+    defer backend.deinit();
+    try std.testing.expect(backend.owned_resource_manager == null);
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var store = try docstore_mod.DocStore.openRuntime(a, backend.native_runtime_store.?);
+    defer store.close();
+    var provider = native_indexes.Store.init(a, backend.native_docstore.?);
+    var manager = try IndexManager.initWithOptions(a, "/borrowed-text-resources", .{ .resource_manager = &resources, .text_lsm_storage = provider.storage(), .generation_storage = provider.storage() });
+    defer manager.deinit();
+    manager.setIo(std.testing.io);
+    manager.updateRange(.{ .start = "", .end = "" });
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    try manager.addAllNoBackfill(&store, &.{config});
+    var immutable = try manager.acquireWritePlanSnapshot();
+    defer immutable.release();
+    try std.testing.expectEqual(@as(usize, 0), immutable.plan().foreground_text.len);
+    var context = try manager.acquireTextPublicationContext(a, config.name);
+    defer context.deinit();
+    const docs = [_]mapper.MapperDoc{.{ .key = "one", .value = "{\"body\":\"résumé 日本語\"}" }};
+    var plan = try manager.planTextMapperDocsPublication(&store, config.name, &context, &docs, std.math.maxInt(usize));
+    defer plan.deinit();
+    try std.testing.expect(!plan.canPrepareDetached());
+    try std.testing.expect(try plan.prepareDetached(a, 0, plan.input_end) == null);
+    // A normal fenced build remains usable under the external owner's scope.
+    var prepared = try manager.preparePlannedTextMapperPublication(a, config.name, &context, &plan, 0, plan.input_end);
+    defer prepared.deinit();
+    try std.testing.expect(prepared.segments.len != 0);
+}
+
+test "foreground text metadata preparation releases every allocation failure and deduplicates dictionary bindings" {
+    const a = std.testing.allocator;
+    const projection = try OwnedTextMapperProjection.create(a, null);
+    defer projection.destroy();
+    const Owner = struct {
+        fn release(_: *anyopaque) void {}
+    };
+    projection.build = .{ .resources = .{ .ptr = projection, .allocator = a, .io = std.testing.io, .resource_manager = null, .retain_fn = Owner.release, .release_fn = Owner.release } };
+    const config: ForegroundTextProjection = .{ .projection = projection, .name = "text", .generation = 7, .config_hash = 11, .descriptor = "canonical-config", .schema = null, .selected_field = null, .retain_empty = true, .source_options = .{}, .observed = &.{}, .stager = undefined };
+    const observed = [_]mapper.ObservedFieldAnalyzer{
+        .{ .field_name = @constCast("body"), .analyzer_name = @constCast("standard") },
+        .{ .field_name = @constCast("body"), .analyzer_name = @constCast("standard") },
+        .{ .field_name = @constCast("body"), .analyzer_name = @constCast("standard"), .field_type = .keyword },
+    };
+    const Sweep = struct {
+        fn run(alloc: Allocator, captured: *const ForegroundTextProjection, claims: []const mapper.ObservedFieldAnalyzer) !void {
+            var prepared = (try captured.prepareMetadata(alloc, claims)).?;
+            defer prepared.deinit();
+            try std.testing.expect(prepared.matches(captured.*, alloc));
+            try std.testing.expectEqual(@as(usize, 2), prepared.observed.len);
+            try std.testing.expectEqual(@as(usize, 1), prepared.bindings.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{ &config, &observed });
+}
+
+test "foreground text metadata joins primary publication and activates preallocated analyzer claims" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../lite/backend.zig");
+    const native_indexes = @import("../../lite/index_storage.zig");
+    const metadata_batches = @import("../../native_metadata_batch.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/foreground-text-metadata.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .exclusive = true, .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var store = try docstore_mod.DocStore.openRuntime(a, backend.native_runtime_store.?);
+    defer store.close();
+    var adapter = native_indexes.Store.init(a, backend.native_docstore.?);
+    var manager = try IndexManager.initWithOptions(a, "/foreground-meta", .{ .resource_manager = backend.owned_resource_manager.?, .text_lsm_storage = adapter.storage(), .generation_storage = adapter.storage() });
+    defer manager.deinit();
+    manager.setIo(std.testing.io);
+    manager.updateRange(.{ .start = "", .end = "" });
+    try std.testing.expect(try schema_mod.saveSchema(&store, a, .{ .version = 0, .default_type = "doc", .full_text_documents = &.{.{ .name = "doc", .open_dynamic_paths = &.{"body"} }} }));
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "text", .kind = .full_text, .config_json = "{}" }});
+    var captured = try manager.acquireWritePlanSnapshot();
+    defer captured.release();
+    const config = &captured.plan().foreground_text[0];
+    const docs = [_]mapper.MapperDoc{.{ .key = "one", .value = "{\"body\":\"résumé 日本語\"}" }};
+    var projection = try config.project(a, &docs);
+    defer projection.deinit();
+    var built = (try projection.prepareDetached(a, 0, projection.input_end)).?;
+    defer built.deinit();
+    try std.testing.expect(built.observed_field_analyzers.len > 0);
+    const maybe_metadata = try config.prepareMetadata(a, built.observed_field_analyzers);
+    try std.testing.expect(maybe_metadata != null);
+    var metadata = maybe_metadata.?;
+    defer metadata.deinit();
+    const maybe_scope = try store.runtime_store.nativePublicationScope(a);
+    try std.testing.expect(maybe_scope != null);
+    var scope = maybe_scope.?;
+    defer scope.deinit(a);
+    var read = try store.beginReadTxn();
+    var read_live = true;
+    defer if (read_live) read.abort();
+    var batch = try metadata_batches.prepare(a, scope, &read, &metadata);
+    defer batch.deinit();
+    read.abort();
+    read_live = false;
+    const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    try store.putBatchWithPublications(std.testing.io, &.{.{ .key = "one", .value = docs[0].value }}, &.{}, null, .{}, null, batch.participant());
+    try std.testing.expectEqual(before + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    const persisted = try loadObservedTextFieldAnalyzers(a, &store, "text");
+    defer freeObservedTextFieldAnalyzers(a, persisted);
+    try std.testing.expect(persisted.len > 0);
+    manager.catalog_mutex.lockShared();
+    {
+        defer manager.catalog_mutex.unlockShared();
+        const entry = manager.textIndexEntry("text").?;
+        entry.analysis_mutex.lockExclusive();
+        defer entry.analysis_mutex.unlockExclusive();
+        metadata.activateAssumeAnalysisLocked(&manager, entry);
+        try std.testing.expectEqual(persisted.len, entry.observed_field_analyzers.len);
+    }
+    var after = try manager.acquireWritePlanSnapshot();
+    defer after.release();
+    try std.testing.expect(!config.matches(after.plan().foreground_text[0]));
+    var repeated = try after.plan().foreground_text[0].prepareMetadata(a, built.observed_field_analyzers);
+    defer if (repeated) |*owned| owned.deinit();
+    try std.testing.expect(repeated == null);
+    try std.testing.expect((try backend.native_docstore.?.file.check()).valid);
 }

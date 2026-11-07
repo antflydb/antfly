@@ -132,8 +132,8 @@ When `batch`, `batch_json`, or an autocommit `sql_json` write fails with
 `SqlError::outcome_receipt()`). Resolve it on any handle for the same
 database with `db.outcome_receipt_status(receipt)`, which returns
 `OutcomeReceiptStatus::Applied` or `NotApplied`, or `Error::Stalled` while
-the uncertain commit is not reconciled yet (Lite: retry; directory database:
-close the issuing handle and reopen first). Call
+the uncertain commit is not reconciled yet (close the issuing handle and
+reopen first). Call
 `db.forget_outcome_receipt(receipt)` once resolved; afterwards the receipt can
 no longer be resolved.
 

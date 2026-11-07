@@ -1,0 +1,141 @@
+{
+  "qualified": false,
+  "source_commit": "8ecd5bf70ae56ac170ead558bc0467df8c68cb16",
+  "host": "wolfspider",
+  "mode": "ReleaseFast",
+  "library_sha256": "c7b94f35c9f9b85eaf9f7f4dd1cc8de89a7f6af355e6c93b12a0388223c93e1d",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "frozen_input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276",
+  "reference_policy": "Existing artifacts and reports only; no reference build or workload execution.",
+  "optimized_build": {
+    "exit_code": 0,
+    "seconds": 1304.158,
+    "peak_build_tree_rss_bytes": 25210519552
+  },
+  "completed_preflights": {
+    "real_extractor_history_windows": true,
+    "repeated_sdk_vector_graph_pipeline_cases": 10,
+    "indexed_sql_pressure": true
+  },
+  "active_namespace_replay": [
+    {
+      "idle_namespaces": 0,
+      "successful_batches": 1062,
+      "p50_ms": 25.117208,
+      "p95_ms": 58.161833,
+      "active_visibility_deadline_passed": true,
+      "acknowledged_integrity_search_and_reopen_passed": true
+    },
+    {
+      "idle_namespaces": 8,
+      "successful_batches": 927,
+      "p50_ms": 29.900417,
+      "p95_ms": 64.484834,
+      "active_visibility_deadline_passed": true,
+      "acknowledged_integrity_search_and_reopen_passed": true
+    },
+    {
+      "idle_namespaces": 45,
+      "successful_batches": 949,
+      "active_visibility_deadline_passed": true,
+      "acknowledged_integrity_search_and_reopen_passed": true
+    }
+  ],
+  "sql_staging": {
+    "rows_per_table": [
+      512,
+      1024
+    ],
+    "tables": 2,
+    "transactions": 1,
+    "text_bytes": 4096,
+    "key_bytes": 512,
+    "prepare_seconds": [
+      0.08741404069587588,
+      0.18123270804062486
+    ],
+    "commit_seconds": [
+      0.10909275012090802,
+      0.21733625000342727
+    ],
+    "both_passed": true,
+    "unsupported_case": {
+      "rows_per_table": 2048,
+      "sqlstate": "54000",
+      "committed_rows_per_table": [
+        0,
+        0
+      ],
+      "classification": "Retained relational preparation exceeds its existing 16 MiB budget; not a performance result.",
+      "local_debug_reproduction": {
+        "text_bytes": 1024,
+        "work_rows": 4096,
+        "observed_prepared_bytes": 16779664,
+        "limit_bytes": 16777216,
+        "refusal_caller": "Builder.expandWork queryCapacity"
+      }
+    }
+  },
+  "full_import": {
+    "planned_inputs": 15,
+    "successful_inputs": 7,
+    "attempted_inputs": 8,
+    "total_import_seconds": 343.54,
+    "failed_input_index": 7,
+    "failed_input_seconds": 288.89954241737723,
+    "failed_input_exit_code": 1,
+    "failed_input_summary": [
+      0,
+      0,
+      1
+    ],
+    "failed_input_child_user_seconds": 214.655975,
+    "failed_input_child_system_seconds": 79.736457,
+    "failed_input_max_rss_bytes": 1620230144,
+    "file_bytes_after_failure": 4237766656,
+    "sqlstate": "55P03",
+    "reported_commit_outcome": "not_applied",
+    "failed_operation": "INSERT INTO codex_threads",
+    "censored": false,
+    "overlapping_compilers": 0,
+    "cause": "Underlying native refusal is not yet confirmed; SQL coordinator capacity admission is a code-confirmed gap being tested separately.",
+    "comparison_eligibility": "The candidate did not complete; no speedup or successful-run latency comparison is claimed."
+  },
+  "sql_admission_followup": {
+    "status": "Implemented; targeted and full native/SQL C API contract checks passed; shared-library and end-to-end validation pending.",
+    "behavior": "Wait for foreground SQL coordinator capacity before evaluation, releasing runtime and writer gates. Do not replay evaluated SQL. Active staging, reads, rollback and empty COMMIT bypass producer waits.",
+    "regressions": {
+      "autocommit_and_session_waits": true,
+      "concurrent_capacity_release_acquires_same_gates": true,
+      "timed_out_commit_reports_not_applied": true,
+      "increment_applied_exactly_once_after_retry": true
+    },
+    "capi_contracts": {
+      "passed": 183,
+      "skipped": 1,
+      "failed": 0,
+      "leaked": 0,
+      "skip": "Memory semantic-quality test requires an explicitly configured qualified embedder."
+    },
+    "runtime_file_sha256": {
+      "zig/pkg/antfly-embedded/src/capi/db.zig": "461932f13d871f2a0a41c5c704a9c10ff9fe46fd44de49542108223029ea8701",
+      "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "aba067681711ed6bbb26642e631117f7043e513065d6abe45d2f8afa55cf59fe",
+      "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "7cea91cee9345700eee5ae628d7dc2b037a7db3eff23b81a79b040f10b4c0a9f"
+    }
+  },
+  "not_run_after_failed_import": [
+    "full-corpus field and primary parity",
+    "cold semantic drains and payload attribution",
+    "original-importer contention",
+    "short churn and append reuse",
+    "ten-minute constant-vocabulary soak",
+    "ten-minute changing-vocabulary soak",
+    "large-graph warm writes"
+  ],
+  "separate_requirements": [
+    "Human-approved aggregate CI at the final pushed SHA",
+    "Full factory remains assigned to Beads"
+  ],
+  "conclusion": "Preserve the failed optimized candidate. Synthetic active replay and bounded SQL scaling passed, but the unchanged full importer failed. Do not merge or declare #1431 fixed on this evidence."
+}

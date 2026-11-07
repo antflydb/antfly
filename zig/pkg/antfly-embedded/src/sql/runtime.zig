@@ -83,7 +83,7 @@ pub const Output = struct {
     /// representation. Keep the public result envelope explicit at every ABI.
     pub fn jsonStringify(self: Output, writer: anytype) !void {
         if (self.native_rows != null) return error.WriteFailed;
-        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt });
+        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .commit_outcome = if (self.mutation_outcome != null) @as(?[]const u8, "applied") else null, .ddl_receipt = self.ddl_receipt });
     }
 };
 /// An execution-scoped allocator whose control state outlives returned rows or

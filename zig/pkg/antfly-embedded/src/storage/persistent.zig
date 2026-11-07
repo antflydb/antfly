@@ -66,6 +66,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 const index_mod = @import("../index.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const segment_mod = @import("../segment.zig");
+const segment_admission = @import("segment_admission.zig");
 const inverted_mod = @import("../section/inverted.zig");
 const introducer_mod = @import("../introducer.zig");
 const roaring = @import("../encoding/roaring.zig");
@@ -202,6 +203,7 @@ test "persistent index routes wal lsm profile options" {
 
     switch (idx.wal.store_owner) {
         .lsm => |handle| try std.testing.expectEqual(@as(usize, 88), handle.backend.options.flush_threshold),
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -443,12 +445,19 @@ const RetiredSegmentFileDeleter = struct {
     const completed_markers_per_boundary: usize = 64;
     const retry_base_delay_ns: u64 = 10 * std.time.ns_per_ms;
     const retry_max_delay_ns: u64 = 5 * std.time.ns_per_s;
+    const retry_audit_delay_ns: u64 = 100 * std.time.ns_per_ms;
 
     allocator: Allocator,
     root_dir: []u8,
     storage: storage_io.Storage,
     native_storage_lease: ?storage_io.NativeStorage.Lease = null,
+    // Captured while the provider is alive. A late, disarmed cleanup callback
+    // may not inspect the borrowed provider's vtable after index shutdown.
+    defer_deletions: bool = false,
     refs: std.atomic.Value(usize) = .init(1),
+    // IO/draining has a separate lock: releasing a reader only queues work
+    // and must not wait behind a deletion's writer admission or fsync.
+    io_mu: std.atomic.Mutex = .unlocked,
     delete_mu: std.atomic.Mutex = .unlocked,
     delete_enabled: bool = true,
     completed_ids: std.ArrayListUnmanaged(u64) = .empty,
@@ -465,11 +474,13 @@ const RetiredSegmentFileDeleter = struct {
         var native_storage_lease: ?storage_io.NativeStorage.Lease = null;
         errdefer if (native_storage_lease) |*lease| lease.deinit();
         if (store.storage_owner) |owner| native_storage_lease = try owner.acquireLease();
+        const storage = if (native_storage_lease) |*lease| lease.storage() else store.storage;
         deleter.* = .{
             .allocator = allocator,
             .root_dir = try allocator.dupe(u8, store.root_dir),
-            .storage = if (native_storage_lease) |*lease| lease.storage() else store.storage,
+            .storage = storage,
             .native_storage_lease = native_storage_lease,
+            .defer_deletions = storage.vtable.delete_files_absolute != null,
         };
         return deleter;
     }
@@ -502,6 +513,8 @@ const RetiredSegmentFileDeleter = struct {
     /// unlink files from the restored generation, even if a snapshot is
     /// released concurrently with teardown.
     fn disarm(self: *RetiredSegmentFileDeleter) void {
+        platform_sync.lockYielding(&self.io_mu);
+        defer self.io_mu.unlock();
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
         self.delete_enabled = false;
@@ -524,6 +537,15 @@ const RetiredSegmentFileDeleter = struct {
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
         self.removeCompletedLocked(seg_id);
+    }
+
+    fn acknowledgeNativeSweep(self: *RetiredSegmentFileDeleter, ids: []const u64) void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        for (ids) |id| {
+            self.removeCompletedLocked(id);
+            self.removeRetryLocked(id);
+        }
     }
 
     fn appendCompletedLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
@@ -558,6 +580,16 @@ const RetiredSegmentFileDeleter = struct {
         try self.enqueueRetryLocked(seg_id);
     }
 
+    fn enqueueFailedDelete(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        if (!self.delete_enabled) return;
+        try self.enqueueRetryLocked(seg_id);
+        const entry = &self.retry_entries.items[self.retry_positions.get(seg_id).?];
+        entry.failure_count = @max(entry.failure_count, 1);
+        entry.next_attempt_ns = platform_time.monotonicNs() +| retryDelayNs(entry.failure_count);
+    }
+
     fn removeRetryLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
         const removed = self.retry_positions.fetchRemove(seg_id) orelse return;
         const position = removed.value;
@@ -580,6 +612,8 @@ const RetiredSegmentFileDeleter = struct {
     /// Record a stale retirement marker for a segment which is still active.
     /// Any queued unlink must be cancelled before the marker is cleared.
     fn completeWithoutDelete(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.io_mu);
+        defer self.io_mu.unlock();
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
         if (!self.delete_enabled) return;
@@ -590,32 +624,60 @@ const RetiredSegmentFileDeleter = struct {
     /// Attempt one unlink and retain failures in the live owner. The durable
     /// retirement marker remains authoritative if even queue allocation fails.
     fn deleteOrQueue(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.io_mu);
+        defer self.io_mu.unlock();
         platform_sync.lockYielding(&self.delete_mu);
-        defer self.delete_mu.unlock();
-        if (!self.delete_enabled) return;
+        const enabled = self.delete_enabled;
+        self.delete_mu.unlock();
+        if (!enabled) return;
 
         const path = self.pathAlloc(seg_id) catch {
-            try self.enqueueRetryLocked(seg_id);
+            try self.enqueueFailedDelete(seg_id);
             return;
         };
         defer self.allocator.free(path);
         self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {
-                try self.enqueueRetryLocked(seg_id);
+                try self.enqueueFailedDelete(seg_id);
                 if (builtin.os.tag != .freestanding) {
                     std.log.warn("retired text segment cleanup deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
                 }
                 return;
             },
         };
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
         try self.appendCompletedLocked(seg_id);
         self.removeRetryLocked(seg_id);
     }
 
+    fn failAttemptLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
+        const position = self.retry_positions.get(seg_id) orelse return;
+        const entry = &self.retry_entries.items[position];
+        entry.failure_count +|= 1;
+        entry.next_attempt_ns = platform_time.monotonicNs() +| retryDelayNs(entry.failure_count);
+        self.retry_failures +|= 1;
+    }
+
+    fn finishAttemptLocked(self: *RetiredSegmentFileDeleter, seg_id: u64, failed: bool) void {
+        if (failed) return self.failAttemptLocked(seg_id);
+        self.appendCompletedLocked(seg_id) catch return self.failAttemptLocked(seg_id);
+        self.removeRetryLocked(seg_id);
+    }
+
     fn retryFailedDeletes(self: *RetiredSegmentFileDeleter) void {
+        // Optional maintenance never waits behind another unlink. Disarm takes
+        // this same lock to drain IO before a restored generation is exposed.
+        if (!self.io_mu.tryLock()) return;
+        defer self.io_mu.unlock();
+        var ids: [retry_attempts_per_boundary]u64 = undefined;
+        var paths: [retry_attempts_per_boundary][]const u8 = undefined;
+        var count: usize = 0;
+        defer for (paths[0..count]) |path| self.allocator.free(path);
         platform_sync.lockYielding(&self.delete_mu);
-        defer self.delete_mu.unlock();
+        var locked = true;
+        defer if (locked) self.delete_mu.unlock();
         if (!self.delete_enabled) return;
 
         const now_ns = platform_time.monotonicNs();
@@ -627,10 +689,10 @@ const RetiredSegmentFileDeleter = struct {
             self.retry_entries.items.len > 0)
         {
             const position = self.retry_cursor % self.retry_entries.items.len;
-            const entry = &self.retry_entries.items[position];
+            const entry = self.retry_entries.items[position];
             inspections += 1;
+            self.retry_cursor = (position + 1) % self.retry_entries.items.len;
             if (entry.next_attempt_ns > now_ns) {
-                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
                 continue;
             }
 
@@ -638,34 +700,77 @@ const RetiredSegmentFileDeleter = struct {
             attempts += 1;
             self.retry_attempts +|= 1;
             const path = self.pathAlloc(seg_id) catch {
-                entry.failure_count +|= 1;
-                entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
-                self.retry_failures +|= 1;
-                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
+                self.failAttemptLocked(seg_id);
                 continue;
             };
-            const delete_result = self.storage.deleteFileAbsolute(path);
-            self.allocator.free(path);
-            delete_result catch |err| switch (err) {
+            ids[count] = seg_id;
+            paths[count] = path;
+            count += 1;
+        }
+        self.delete_mu.unlock();
+        locked = false;
+        if (count == 0) return;
+        // No queue lock survives admission or IO. Native catalog deletion is
+        // one atomic publication, so a failed batch retains every retry and
+        // every durable retirement marker. Standalone files retain per-file
+        // outcomes and their existing missing-file semantics.
+        if (self.defer_deletions) {
+            const index_root = std.fs.path.dirname(self.root_dir) orelse self.root_dir;
+            const retired_atomically = self.storage.retireTextSegments(index_root, ids[0..count]) catch {
+                platform_sync.lockYielding(&self.delete_mu);
+                defer self.delete_mu.unlock();
+                for (ids[0..count]) |seg_id| self.finishAttemptLocked(seg_id, true);
+                return;
+            };
+            if (retired_atomically) {
+                // The capability removed the durable markers in the same
+                // publication. Do not restage their deletion through a stale
+                // namespace snapshot or manufacture a semantic generation.
+                platform_sync.lockYielding(&self.delete_mu);
+                defer self.delete_mu.unlock();
+                for (ids[0..count]) |seg_id| self.removeRetryLocked(seg_id);
+                return;
+            }
+            var failed = false;
+            self.storage.deleteFilesAbsolute(paths[0..count]) catch {
+                failed = true;
+            };
+            platform_sync.lockYielding(&self.delete_mu);
+            defer self.delete_mu.unlock();
+            for (ids[0..count]) |seg_id| self.finishAttemptLocked(seg_id, failed);
+        } else for (ids[0..count], paths[0..count]) |seg_id, path| {
+            var failed = false;
+            self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => {
-                    entry.failure_count +|= 1;
-                    entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
-                    self.retry_failures +|= 1;
-                    self.retry_cursor = (position + 1) % self.retry_entries.items.len;
-                    continue;
+                    failed = true;
                 },
             };
-            self.appendCompletedLocked(seg_id) catch {
-                entry.failure_count +|= 1;
-                entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
-                self.retry_failures +|= 1;
-                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
-                continue;
-            };
-            self.removeRetryLocked(seg_id);
-            if (self.retry_entries.items.len > 0) self.retry_cursor = position % self.retry_entries.items.len;
+            platform_sync.lockYielding(&self.delete_mu);
+            self.finishAttemptLocked(seg_id, failed);
+            self.delete_mu.unlock();
         }
+    }
+
+    fn nextWakeDelayNs(self: *RetiredSegmentFileDeleter) ?u64 {
+        if (!self.io_mu.tryLock()) return retry_audit_delay_ns;
+        defer self.io_mu.unlock();
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        if (!self.delete_enabled) return null;
+        if (self.completed_ids.items.len != 0) return 0;
+        const count = @min(retry_inspections_per_boundary, self.retry_entries.items.len);
+        if (count == 0) return null;
+        const now = platform_time.monotonicNs();
+        var delay: u64 = std.math.maxInt(u64);
+        for (0..count) |offset| {
+            const entry = self.retry_entries.items[(self.retry_cursor + offset) % self.retry_entries.items.len];
+            delay = @min(delay, entry.next_attempt_ns -| now);
+        }
+        // Large queues retain bounded inspection. A timed audit advances past
+        // delayed entries to ready work beyond this page without busy polling.
+        if (count < self.retry_entries.items.len) delay = @min(delay, retry_audit_delay_ns);
+        return delay;
     }
 
     fn hasRetirementWork(self: *RetiredSegmentFileDeleter) bool {
@@ -689,7 +794,8 @@ const RetiredSegmentFileDeleter = struct {
 
     fn delete(ptr: *anyopaque, seg_id: u64) void {
         const self: *RetiredSegmentFileDeleter = @ptrCast(@alignCast(ptr));
-        self.deleteOrQueue(seg_id) catch |err| {
+        const result = if (self.defer_deletions) self.enqueueRetry(seg_id) else self.deleteOrQueue(seg_id);
+        result catch |err| {
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment cleanup could not be queued segment={d}: {s}", .{ seg_id, @errorName(err) });
             }
@@ -887,7 +993,95 @@ pub const PreparedMergeSegment = struct {
     }
 };
 
+pub const ReplayFragment = @import("db/derived/replay_fragment.zig");
+const immutable_artifact = @import("immutable_artifact.zig");
+pub const PreparedReplaySegment = struct {
+    artifact: immutable_artifact.Prepared,
+    key_range: SegmentKeyRange,
+    alloc: Allocator,
+    ordinals: ?NativeOrdinalPreparation = null,
+    pub fn deinit(self: *@This()) void {
+        if (self.ordinals) |*plan| plan.deinit();
+        self.artifact.deinit();
+        self.key_range.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn prepareReplaySegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
+    var range = try extractSegmentKeyRange(alloc, bytes);
+    errdefer range.deinit(alloc);
+    return .{ .artifact = try stager.stage(bytes), .key_range = range, .alloc = alloc };
+}
+
+/// Owned foreground identities follow physical segment order, including
+/// index sorting. Assignment changes only native metadata, never posting bytes.
+pub const NativeOrdinalPreparation = struct {
+    resources: immutable_artifact.BuildResources,
+    keys: [][]u8,
+    assigned: []u32,
+    metadata: ?segment_admission.PreparedBinding = null,
+    segment_id: ?u64 = null,
+
+    pub fn bind(self: *NativeOrdinalPreparation, ordinals: []const u32) !void {
+        const metadata = if (self.metadata) |*value| value else return error.InvalidDerivedApplyState;
+        try metadata.bind(ordinals);
+    }
+    pub fn deinit(self: *NativeOrdinalPreparation) void {
+        if (self.metadata) |*metadata| metadata.deinit();
+        for (self.keys) |key| self.resources.allocator.free(key);
+        self.resources.allocator.free(self.keys);
+        self.resources.allocator.free(self.assigned);
+        self.resources.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn prepareNativeTextSegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
+    return prepareNativeTextSegmentWithStaging(alloc, stager, bytes, null);
+}
+
+pub fn prepareDetachedNativeTextSegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
+    var budget: immutable_artifact.AdmissionBudget = .{ .remaining_ns = 5 * std.time.ns_per_s };
+    return prepareDetachedNativeTextSegmentWithBudget(alloc, stager, bytes, &budget);
+}
+
+pub fn prepareDetachedNativeTextSegmentWithBudget(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8, budget: *immutable_artifact.AdmissionBudget) !PreparedReplaySegment {
+    return prepareNativeTextSegmentWithStaging(alloc, stager, bytes, budget);
+}
+
+fn prepareNativeTextSegmentWithStaging(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8, detached: ?*immutable_artifact.AdmissionBudget) !PreparedReplaySegment {
+    var result = if (detached) |budget| blk: {
+        var range = try extractSegmentKeyRange(alloc, bytes);
+        errdefer range.deinit(alloc);
+        break :blk PreparedReplaySegment{ .artifact = try stager.stageDetachedWithBudget(bytes, budget), .key_range = range, .alloc = alloc };
+    } else try prepareReplaySegment(alloc, stager, bytes);
+    errdefer result.deinit();
+    var resources = (try stager.acquireBuildResources()) orelse return error.Unsupported;
+    errdefer resources.deinit();
+    if (resources.native_metadata_revision < 16) return error.Unsupported;
+    const a = resources.allocator;
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const keys = try a.alloc([]u8, reader.doc_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| a.free(key);
+        a.free(keys);
+    }
+    for (keys, 0..) |*key, i| {
+        const stored = (try reader.storedDoc(@intCast(i))) orelse return error.InvalidSegment;
+        key.* = try a.dupe(u8, stored.id);
+        initialized += 1;
+    }
+    const assigned = try a.alloc(u32, reader.doc_count);
+    @memset(assigned, 0);
+    result.ordinals = .{ .resources = resources, .keys = keys, .assigned = assigned };
+    return result;
+}
+
 /// Meta keys in persistent storage.
+const meta_replay_fragment = "replay_fragment_v1";
 const meta_committed_lsn = "committed_lsn";
 const meta_rebuild_cursor = "rebuild_snapshot_cursor";
 const meta_next_seg_id = "next_seg_id";
@@ -958,28 +1152,45 @@ fn mapRuntimeNamespace(namespace: backend_types.Namespace) !MainKeyspace {
 fn runtimeNamespace(keyspace: MainKeyspace) backend_types.Namespace {
     return switch (keyspace) {
         .segments => .{ .name = "segments" },
-        .meta => .{ .name = "meta" },
+        .meta => .{ .name = "meta", .transient_storage_snapshot = true },
         .deletions => .{ .name = "deletions" },
     };
 }
 
 const MainStoreOwner = union(enum) {
     mem: *mem_backend.Backend,
+    native: void,
     lsm: lsm_backend.BackendHandle,
+
+    fn supportsAtomicNativePublication(self: *const MainStoreOwner) bool {
+        return switch (self.*) {
+            .native => true,
+            .mem => false,
+            .lsm => |handle| handle.backend.options.wal_enabled and
+                if (handle.backend.storage) |storage| storage.requiresForegroundPublication() else false,
+        };
+    }
 
     fn close(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
+            .native => {},
             .mem => |backend| {
                 backend.close();
                 alloc.destroy(backend);
             },
-            .lsm => |*handle| handle.close(),
+            .lsm => |*handle| {
+                // These handles are reconstructible caches of committed WAL
+                // state. Cache teardown must not publish a new generation from
+                // replayed mutable state while a detached owner is computing.
+                if (self.supportsAtomicNativePublication()) handle.closePreservingWal() else handle.close();
+            },
         }
         self.* = undefined;
     }
 
     fn abandonAfterCrash(self: *MainStoreOwner, alloc: Allocator) void {
         switch (self.*) {
+            .native => {},
             .mem => |backend| {
                 backend.close();
                 alloc.destroy(backend);
@@ -991,77 +1202,84 @@ const MainStoreOwner = union(enum) {
 
     fn sync(self: *MainStoreOwner, force: bool) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native => {},
             .lsm => |*handle| try handle.backend.sync(force),
+        }
+    }
+
+    fn syncReplayState(self: *MainStoreOwner) !void {
+        switch (self.*) {
+            .mem, .native => {},
+            .lsm => |*handle| try handle.backend.syncReplayState(),
         }
     }
 
     fn lsmMaintenanceScore(self: *const MainStoreOwner) u64 {
         return switch (self.*) {
-            .mem => 0,
+            .mem, .native => 0,
             .lsm => |handle| handle.backend.maintenanceScore(),
         };
     }
 
     fn snapshotLsmMaintenanceStats(self: *const MainStoreOwner) ?lsm_backend.Backend.MaintenanceStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
         };
     }
 
     fn snapshotLsmWriteStats(self: *const MainStoreOwner) ?lsm_backend.Backend.WriteStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.snapshotWriteStats(),
         };
     }
 
     fn snapshotLsmOpenStats(self: *const MainStoreOwner) ?lsm_backend.Backend.OpenStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.snapshotOpenStats(),
         };
     }
 
     fn checkpointLsmWalAfterDurableBoundary(self: *MainStoreOwner) !void {
         switch (self.*) {
-            .mem => {},
+            .mem, .native => {},
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
         }
     }
 
     fn pinNativeCheckpoint(self: *MainStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.*) {
-            .mem => error.Unsupported,
+            .mem, .native => error.Unsupported,
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
         };
     }
 
     fn snapshotLsmNativeStorageStats(self: *const MainStoreOwner) ?lsm_backend.NativeStorageStats {
         return switch (self.*) {
-            .mem => null,
+            .mem, .native => null,
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
         };
     }
 
     fn runLsmMaintenanceStep(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .mem => false,
+            .mem, .native => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStep(),
         };
     }
 
     fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
         return switch (self.*) {
-            .mem => false,
+            .mem, .native => false,
             .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
         };
     }
 
     fn commitStatsSnapshot(self: *MainStoreOwner) ?CommitStats {
         return switch (self.*) {
-            .mem, .lsm => null,
+            .mem, .native, .lsm => null,
         };
     }
 };
@@ -1081,9 +1299,14 @@ pub const PersistentIndex = struct {
     writer: index_mod.IndexWriter,
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
+    native_snapshot_identity: ?@import("native_publication.zig").NamespaceIdentity = null,
     segment_files: ?SegmentFileStore,
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
+    retirement_reconcile_after: ?u64 = null,
+    retirement_retry_at_ns: u64 = 0,
+    retirement_failures: u8 = 0,
+    deferred_retirement_maintenance: bool = false,
     active_rebuild_page: ?*RebuildPage = null,
     wal: wal_mod.WAL,
     committed_lsn: u64,
@@ -1102,6 +1325,7 @@ pub const PersistentIndex = struct {
         cursor: []const u8,
         segments: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
         active: bool = false,
+        uncertain: bool = false,
 
         pub fn begin(self: *RebuildPage) !void {
             if (self.index.read_only) return error.ReadOnly;
@@ -1114,7 +1338,7 @@ pub const PersistentIndex = struct {
             if (self.active) self.index.active_rebuild_page = null;
             for (self.segments.items) |*segment| {
                 segment.data.deinit(self.index.alloc);
-                self.index.deleteSegmentFile(segment.id);
+                if (!self.uncertain) self.index.deleteSegmentFile(segment.id);
             }
             self.segments.deinit(self.index.alloc);
             self.* = undefined;
@@ -1142,7 +1366,8 @@ pub const PersistentIndex = struct {
             }
             try saveNextSegmentId(&txn, index.writer.next_segment_id);
             try txn.put(.meta, meta_rebuild_cursor, self.cursor);
-            try txn.commit();
+            if (publication) |*prepared| try index.savePreparedSegmentAdmissions(&txn, prepared);
+            try index.commitPreparedPublication(&txn, &self.uncertain);
             if (publication) |*prepared| prepared.publish();
             self.segments.clearRetainingCapacity(); // ownership moved to writer
             index.active_rebuild_page = null;
@@ -1179,9 +1404,692 @@ pub const PersistentIndex = struct {
         return fallback;
     }
 
+    pub fn hasNativeMetadata(self: *const PersistentIndex) bool {
+        return self.main_store_owner == .native;
+    }
+
     pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
         const store = self.segment_files orelse return false;
         return store.storage_owner != null or store.storage.vtable.open_leased_immutable_source != null or store.storage.vtable.map_immutable_artifact != null;
+    }
+
+    pub fn acquireReplayStager(self: *PersistentIndex, alloc: Allocator) !?immutable_artifact.Stager {
+        if (!self.main_store_owner.supportsAtomicNativePublication()) return null;
+        const files = self.segment_files orelse return null;
+        return files.storage.acquireImmutableStager(alloc);
+    }
+
+    pub fn loadReplayFragment(self: *PersistentIndex, identity: ReplayFragment.Identity) !?ReplayFragment.Position {
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        const raw = txn.get(.meta, meta_replay_fragment) catch |err| return if (err == error.NotFound) null else err;
+        const checkpoint = try ReplayFragment.decode(raw);
+        if (!std.meta.eql(checkpoint.identity, identity)) return null;
+        return checkpoint.position;
+    }
+
+    /// Artifacts were staged outside admission. This commit activates every
+    /// replacement, its private deletion bitmap and its continuation in one WAL
+    /// record. Every allocation for reader publication precedes that commit.
+    pub fn publishReplay(
+        self: *PersistentIndex,
+        segments: []PreparedReplaySegment,
+        delete_keys: []const []const u8,
+        checkpoint: ReplayFragment.Checkpoint,
+    ) ![]index_mod.IndexWriter.DeleteInfo {
+        return self.publishReplayWithMetadata(segments, delete_keys, checkpoint, null);
+    }
+
+    pub const ReplayPublicationMetadata = struct {
+        participant: @import("native_publication.zig").Participant,
+        seal: ?projection_seal.Seal = null,
+        /// Borrowed from the request until publication completes. Preparation
+        /// fills the merged template, including the existing baseline. The
+        /// publisher seals its fixed value only after choosing the logical cut.
+        seal_binding: ?struct {
+            value: @import("native_publication_value.zig").Value,
+            template: *?projection_seal.Seal,
+        } = null,
+    };
+
+    fn saveProjectionSealInTxn(txn: *MainTxn, metadata: ReplayPublicationMetadata) !void {
+        const seal = metadata.seal orelse {
+            if (metadata.seal_binding != null) return error.InvalidDerivedApplyState;
+            return;
+        };
+        var next = seal;
+        const previous = txn.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
+        if (previous) |raw| {
+            const old = try projection_seal.Seal.decode(raw);
+            if (!old.sameIdentity(seal)) return error.ProjectionSealIdentityChanged;
+            if (next.baseline == null) next.baseline = old.baseline;
+            next.applied_sequence = @max(next.applied_sequence, old.applied_sequence);
+        }
+        if (metadata.seal_binding) |binding| {
+            if (binding.value.initialization_view.len != @sizeOf(projection_seal.Seal.Encoded)) return error.InvalidNativePublicationValue;
+            binding.template.* = next;
+            const write = if (txn.write) |*value| value else return error.ReadOnly;
+            try write.putPreparedValue(runtimeNamespace(.meta), projection_seal.metadata_key, binding.value);
+        } else try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
+    }
+
+    /// Ordinary prepared text effects use the same atomic physical activation
+    /// without manufacturing or advancing a journal continuation.
+    pub fn publishPreparedSegments(self: *PersistentIndex, segments: []PreparedReplaySegment, delete_keys: []const []const u8) ![]index_mod.IndexWriter.DeleteInfo {
+        self.lockStorage();
+        defer self.unlockStorage();
+        return self.publishPreparedNativeLocked(segments, delete_keys, null, null, null);
+    }
+
+    pub fn publishReplayWithMetadata(self: *PersistentIndex, segments: []PreparedReplaySegment, delete_keys: []const []const u8, checkpoint: ReplayFragment.Checkpoint, metadata: ?ReplayPublicationMetadata) ![]index_mod.IndexWriter.DeleteInfo {
+        return self.publishReplayWithCommitter(segments, delete_keys, checkpoint, metadata, null);
+    }
+
+    /// The primary owner supplies the only commit boundary. Namespace metadata,
+    /// artifacts, primary writes and progress are staged atomically; memory
+    /// activation below remains infallible and follows durable success.
+    pub fn publishReplayWithCommitter(
+        self: *PersistentIndex,
+        segments: []PreparedReplaySegment,
+        delete_keys: []const []const u8,
+        checkpoint: ReplayFragment.Checkpoint,
+        metadata: ?ReplayPublicationMetadata,
+        committer: ?@import("native_publication.zig").Committer,
+    ) ![]index_mod.IndexWriter.DeleteInfo {
+        if (committer) |primary| {
+            const prepared = try self.prepareNativePublication(segments, delete_keys, checkpoint, metadata);
+            defer prepared.deinit();
+            try commitNativePublications(&.{prepared}, primary);
+            return prepared.takeDeleteInfos();
+        }
+        self.lockStorage();
+        defer self.unlockStorage();
+        return self.publishPreparedNativeLocked(segments, delete_keys, checkpoint, metadata, null);
+    }
+
+    /// Borrowed preparations retain local storage serialization and the
+    /// caller's index lifetime. Owned preparations release both and can bind
+    /// to a freshly opened runtime with the exact same durable namespace.
+    /// Artifacts and metadata closures remain request-owned until deinit.
+    /// Bind multiple targets in catalog order before one native group commit.
+    pub const PreparedNativePublication = struct {
+        index: ?*PersistentIndex,
+        alloc: Allocator,
+        resources: ?immutable_artifact.BuildResources = null,
+        runtime_detached: bool = false,
+        namespace: @import("native_publication.zig").Prepared,
+        snapshot: ?index_mod.IndexWriter.PreparedSegmentReplacement,
+        replacements: []index_mod.ReplacementSegmentData,
+        segments: []PreparedReplaySegment,
+        metadata: ?ReplayPublicationMetadata,
+        infos: []index_mod.IndexWriter.DeleteInfo,
+        activated: bool = false,
+        staged: bool = false,
+
+        fn validate(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.namespace.participant.validate(view);
+            if (self.metadata) |joined| try joined.participant.validate(view);
+            for (self.segments) |segment| try segment.artifact.validateLink(view);
+        }
+
+        fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.activated or self.staged or self.index == null) return error.InvalidDerivedApplyState;
+            // A failed stage belongs to an aborted transaction. Recreate the
+            // handle rather than attempting to bind the snapshot twice.
+            self.staged = true;
+            try self.namespace.participant.apply(view);
+            const index = self.index.?;
+            if (self.snapshot) |*candidate| {
+                if (self.runtime_detached) try candidate.bindNative(&index.writer, self.namespace.before.?, index.native_snapshot_identity) else try candidate.bind(&index.writer);
+            }
+            for (self.segments) |segment| try segment.artifact.stageLink(view);
+            if (self.snapshot) |*candidate| candidate.guardExternalVisibility();
+            if (self.metadata) |joined| try joined.participant.apply(view);
+        }
+
+        fn activate(self: *@This()) void {
+            std.debug.assert(self.staged and !self.activated);
+            if (self.snapshot) |*candidate| candidate.publishRetainingExternalVisibility();
+            self.index.?.native_snapshot_identity = self.namespace.after;
+            self.activated = true;
+        }
+
+        /// Borrowed-mode callers release these with their originating index.
+        /// Owned-mode callers observe `infos` and let this handle free them.
+        pub fn takeDeleteInfos(self: *@This()) []index_mod.IndexWriter.DeleteInfo {
+            std.debug.assert(self.activated and !self.runtime_detached);
+            const result = self.infos;
+            self.infos = &.{};
+            return result;
+        }
+
+        fn detachRuntime(self: *@This()) void {
+            std.debug.assert(!self.staged and !self.activated and !self.runtime_detached);
+            const index = self.index.?;
+            self.resources = index.writer.native_resources.?.retained();
+            self.index = null;
+            self.runtime_detached = true;
+            index.unlockStorage();
+        }
+
+        /// The caller fences this live target through commit and deinit. A
+        /// runtime refresh is safe; a changed index, inode or namespace is not.
+        pub fn bindTarget(self: *@This(), index: *PersistentIndex) !void {
+            if (!self.runtime_detached or self.index != null or self.staged or self.activated) return error.InvalidDerivedApplyState;
+            index.lockStorage();
+            errdefer index.unlockStorage();
+            const expected = self.namespace.before orelse return error.Unsupported;
+            var current = index.native_snapshot_identity orelse return error.EnrichmentWaitCanceled;
+            if (!expected.eql(current)) {
+                if (!expected.sameRetainedState(current)) return error.EnrichmentWaitCanceled;
+                // Authenticate a compaction rebase against the live namespace.
+                // The prepared host still requires the exact captured inode.
+                var witness = try index.beginWriteMainTxn();
+                defer witness.abort();
+                current = index.native_snapshot_identity orelse return error.EnrichmentWaitCanceled;
+                if (!expected.eql(current)) return error.EnrichmentWaitCanceled;
+            }
+            self.index = index;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            const a = self.alloc;
+            const index = self.index;
+            var resources = self.resources;
+            self.namespace.deinit();
+            if (!self.activated) {
+                if (self.snapshot) |*candidate| candidate.abort();
+                for (self.replacements) |*replacement| replacement.data.deinit(a);
+            }
+            a.free(self.replacements);
+            index_mod.IndexWriter.freeDeleteInfos(a, self.infos);
+            if (index) |target| target.unlockStorage();
+            a.destroy(self);
+            if (resources) |*owner| owner.deinit();
+        }
+    };
+
+    pub fn prepareNativePublication(
+        self: *PersistentIndex,
+        segments: []PreparedReplaySegment,
+        delete_keys: []const []const u8,
+        checkpoint: ?ReplayFragment.Checkpoint,
+        metadata: ?ReplayPublicationMetadata,
+    ) !*PreparedNativePublication {
+        self.lockStorage();
+        errdefer self.unlockStorage();
+        const result = try self.alloc.create(PreparedNativePublication);
+        errdefer self.alloc.destroy(result);
+        _ = try self.publishPreparedNativeLocked(segments, delete_keys, checkpoint, metadata, result);
+        return result;
+    }
+
+    /// All mutable runtime references are released before returning. Binding
+    /// later needs only a live target with the same exact native namespace.
+    pub fn prepareOwnedNativePublication(self: *PersistentIndex, segments: []PreparedReplaySegment, delete_keys: []const []const u8, checkpoint: ?ReplayFragment.Checkpoint, metadata: ?ReplayPublicationMetadata) !*PreparedNativePublication {
+        if (self.writer.native_resources == null) return error.Unsupported;
+        const prepared = try self.prepareNativePublication(segments, delete_keys, checkpoint, metadata);
+        errdefer prepared.deinit();
+        if (prepared.namespace.before == null or prepared.namespace.after == null) return error.Unsupported;
+        prepared.detachRuntime();
+        return prepared;
+    }
+
+    /// Owned input to native index publication. Capturing reads only a finite
+    /// namespace witness, reserves numerical aliases and retains immutable
+    /// reader state. All replacement CPU work runs after the caller releases
+    /// its current-runtime lifetime/admission fence.
+    pub const NativePreparation = struct {
+        alloc: Allocator,
+        resources: immutable_artifact.BuildResources,
+        inputs: index_mod.IndexWriter.Preparation,
+        txn: MainTxn,
+        root: []u8,
+        ids: []u64,
+        identity: @import("native_publication.zig").NamespaceIdentity,
+        building: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            self.txn.abort();
+            self.inputs.deinit();
+            self.alloc.free(self.root);
+            self.alloc.free(self.ids);
+            self.resources.deinit();
+            self.* = undefined;
+        }
+
+        /// One attempt only: failure leaves private owned state for deinit,
+        /// never a partly committed index or a borrowed writer lock.
+        pub fn build(self: *@This(), segments: []PreparedReplaySegment, delete_keys: []const []const u8, metadata: ?ReplayPublicationMetadata) !*PreparedNativePublication {
+            if (self.building or segments.len != self.ids.len) return error.InvalidDerivedApplyState;
+            self.building = true;
+            const a = self.alloc;
+            const result = try a.create(PreparedNativePublication);
+            errdefer a.destroy(result);
+            const infos = try self.inputs.prepareDeleteInfos(a, delete_keys);
+            errdefer index_mod.IndexWriter.freeDeleteInfos(a, infos);
+            const replacements = try a.alloc(index_mod.ReplacementSegmentData, infos.len + segments.len);
+            errdefer a.free(replacements);
+            const deleted = try a.alloc(roaring.RoaringBitmap, infos.len);
+            var deleted_count: usize = 0;
+            defer {
+                for (deleted[0..deleted_count]) |*bitmap| bitmap.deinit();
+                a.free(deleted);
+            }
+            const old_ids = try a.alloc(u64, infos.len);
+            defer a.free(old_ids);
+            var initialized: usize = 0;
+            errdefer for (replacements[0..initialized]) |*replacement| {
+                if (replacement.prepared_reader) |*reader| reader.deinit();
+                replacement.data.deinit(a);
+            };
+            for (infos, 0..) |info, i| {
+                deleted[i] = try roaring.RoaringBitmap.fromBytes(a, info.bitmap_bytes);
+                deleted_count += 1;
+                old_ids[i] = info.seg_id;
+                const entry = for (self.inputs.base.segments) |*item| {
+                    if (item.id == info.seg_id) break item;
+                } else return error.InvalidDeletionSnapshot;
+                if (entry.data != .native) return error.Unsupported;
+                replacements[initialized] = .{ .id = info.seg_id, .data = .fromNative(try entry.data.native.retainOwned()), .deleted = &deleted[i] };
+                initialized += 1;
+                if (entry.reader.ordinal_binding) |binding| {
+                    var reader = try replacements[initialized - 1].data.initReader(a);
+                    errdefer reader.deinit();
+                    try reader.attachOrdinalBinding(binding);
+                    replacements[initialized - 1].prepared_reader = reader;
+                }
+            }
+            const target: immutable_artifact.AliasTarget = .{ .inode = self.identity.inode, .file_namespace = self.identity.file_namespace, .prefix = self.root };
+            for (segments, self.ids) |*segment, id| {
+                const path = try std.fmt.allocPrint(a, "{s}/{d}.seg", .{ self.root, id });
+                defer a.free(path);
+                replacements[initialized] = .{ .id = id, .data = .fromNative(try segment.artifact.prepareLinkAt(target, path)) };
+                initialized += 1;
+                if (segment.ordinals) |*plan| {
+                    var reader = try replacements[initialized - 1].data.initReader(a);
+                    errdefer reader.deinit();
+                    const navigation = try reader.admission(a);
+                    defer navigation.deinit(a);
+                    if (plan.metadata) |*previous| previous.deinit();
+                    plan.metadata = null;
+                    plan.segment_id = null;
+                    plan.metadata = try segment_admission.prepareBound(plan.resources, id, navigation, try segment_mod.SegmentReader.nativeCatalogFooter(reader.source()));
+                    plan.segment_id = id;
+                    var binding = try plan.metadata.?.binding();
+                    defer binding.deinit();
+                    try reader.attachOrdinalBinding(binding);
+                    replacements[initialized - 1].prepared_reader = reader;
+                }
+            }
+            var candidate_snapshot: ?index_mod.IndexWriter.PreparedSegmentReplacement = if (replacements.len != 0)
+                try self.inputs.prepareReplacement(a, old_ids, replacements)
+            else
+                null;
+            errdefer if (candidate_snapshot) |*candidate| candidate.abort();
+            for (infos) |info| {
+                const key = std.mem.toBytes(std.mem.nativeToBig(u64, info.seg_id));
+                try self.txn.put(.deletions, &key, info.bitmap_bytes);
+            }
+            for (segments, self.ids) |segment, id| {
+                try saveSegmentRangeOwned(a, &self.txn, id, segment.key_range);
+                const marker = activeSegmentMetaKey(id);
+                try self.txn.put(.meta, &marker, &.{1});
+            }
+            if (segments.len != 0) try self.txn.delete(.meta, meta_active_segments);
+            try saveNextSegmentId(&self.txn, self.inputs.next_segment_id);
+            if (candidate_snapshot) |*candidate| try savePreparedNativeAdmissions(a, &self.txn, candidate, segments);
+            if (metadata) |joined| try saveProjectionSealInTxn(&self.txn, joined);
+            try self.inputs.requireCurrentRevisions();
+            const prepared = try self.txn.write.?.prepareNativePublication();
+            self.txn.write = null;
+            result.* = .{ .index = null, .alloc = a, .resources = self.resources.retained(), .runtime_detached = true, .namespace = prepared, .snapshot = candidate_snapshot, .replacements = replacements, .segments = segments, .metadata = metadata, .infos = infos };
+            return result;
+        }
+    };
+
+    pub fn captureNativePreparation(self: *PersistentIndex, segment_count: usize) !NativePreparation {
+        self.lockStorage();
+        defer self.unlockStorage();
+        if (!self.main_store_owner.supportsAtomicNativePublication()) return error.Unsupported;
+        const resources = self.writer.native_resources orelse return error.Unsupported;
+        const files = if (self.segment_files) |*value| value else return error.Unsupported;
+        if (files.storage.vtable.open_leased_immutable_source == null) return error.Unsupported;
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        const frontier = txn.get(.meta, meta_next_seg_id) catch |err| if (err == error.NotFound) null else return err;
+        if (frontier) |bytes| {
+            if (bytes.len != 8) return error.InvalidDerivedApplyState;
+            if (self.writer.next_segment_id < std.mem.readInt(u64, bytes[0..8], .little)) return error.EnrichmentWaitCanceled;
+        }
+        // Unreferenced aliases from an interrupted older publisher can outlive
+        // its volatile ID frontier without changing the semantic namespace.
+        // Select free IDs under this short capture; publish their frontier in
+        // the same transaction as activation. No artifact bodies are loaded.
+        const ids = try self.alloc.alloc(u64, segment_count);
+        errdefer self.alloc.free(ids);
+        var selected: usize = 0;
+        var collisions: usize = 0;
+        while (selected < ids.len) {
+            const id = self.reserveSegmentId();
+            const path = try files.pathAlloc(id);
+            defer self.alloc.free(path);
+            if (files.storage.fileSize(path)) |_| {
+                collisions += 1;
+                if (collisions == 64) return error.EnrichmentWaitCanceled;
+                continue;
+            } else |err| if (err != error.FileNotFound) return err;
+            ids[selected] = id;
+            selected += 1;
+        }
+        var inputs = try self.writer.capturePreparation();
+        errdefer inputs.deinit();
+        const root = try self.alloc.dupe(u8, files.root_dir);
+        errdefer self.alloc.free(root);
+        const identity = try txn.write.?.detachForPreparation(&.{
+            .{ .namespace = runtimeNamespace(.meta), .key = meta_next_seg_id },
+            .{ .namespace = runtimeNamespace(.meta), .key = projection_seal.metadata_key },
+        });
+        txn.owner = null;
+        return .{ .alloc = self.alloc, .resources = resources.retained(), .inputs = inputs, .txn = txn, .root = root, .ids = ids, .identity = identity };
+    }
+
+    /// Exactly one host commit for all prepared indexes and its primary writes.
+    /// Every allocation precedes this call. Host failure never activates a
+    /// subset, and an uncertain result fences every potentially changed index.
+    pub fn commitNativePublications(prepared: []const *PreparedNativePublication, primary: @import("native_publication.zig").Committer) !void {
+        for (prepared, 0..) |candidate, i| {
+            if (candidate.staged or candidate.activated or candidate.index == null) return error.InvalidDerivedApplyState;
+            for (prepared[0..i]) |previous| if (previous.index == candidate.index) return error.InvalidDerivedApplyState;
+        }
+        const Group = struct {
+            items: []const *PreparedNativePublication,
+            fn validate(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                for (self.items) |item| try PreparedNativePublication.validate(item, view);
+            }
+            fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                for (self.items) |item| try PreparedNativePublication.stage(item, view);
+            }
+        };
+        var group: Group = .{ .items = prepared };
+        var progress: backend_types.CommitProgress = .{};
+        const parent_progress = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = parent_progress;
+        primary.commit(.{ .ptr = &group, .stage = Group.stage, .validate_fn = Group.validate }) catch |err| {
+            if (progress.maybe_applied) {
+                if (parent_progress) |parent| parent.maybe_applied = true;
+                for (prepared) |item| if (item.index.?.segment_files) |files| files.storage.fenceUncertainPublication();
+            }
+            return err;
+        };
+        for (prepared) |item| item.activate();
+        // All snapshots are installed before any reader can cross a group's
+        // external visibility fence. This phase cannot fail or allocate.
+        for (prepared) |item| if (item.snapshot) |*candidate| candidate.finishExternalVisibility();
+    }
+
+    /// Shared physical publication for replay and ordinary foreground index
+    /// mutations. Non-replay operations never overwrite a replay checkpoint.
+    fn publishPreparedNativeLocked(
+        self: *PersistentIndex,
+        segments: []PreparedReplaySegment,
+        delete_keys: []const []const u8,
+        checkpoint: ?ReplayFragment.Checkpoint,
+        metadata: ?ReplayPublicationMetadata,
+        detached: ?*PreparedNativePublication,
+    ) ![]index_mod.IndexWriter.DeleteInfo {
+        if (metadata != null) {
+            if (checkpoint) |point| {
+                if (!point.position.applied or point.position.next_item != point.position.total_items) return error.InvalidDerivedApplyState;
+            } else if (detached == null) return error.InvalidDerivedApplyState;
+        }
+        if (!self.main_store_owner.supportsAtomicNativePublication()) return error.Unsupported;
+        const files = if (self.segment_files) |*value| value else return error.Unsupported;
+        // Capture one exact namespace witness before inspecting either the
+        // frontier or continuation. A later snapshot must not legitimize a
+        // replacement prepared from an older foreign index generation.
+        var txn = try self.beginWriteMainTxn();
+        defer txn.abort();
+        {
+            const next = txn.get(.meta, meta_next_seg_id) catch |err|
+                if (err == error.NotFound) null else return err;
+            if (next) |bytes| {
+                if (bytes.len < @sizeOf(u64)) return error.InvalidDerivedApplyState;
+                if (self.writer.next_segment_id < std.mem.readInt(u64, bytes[0..8], .little)) return error.EnrichmentWaitCanceled;
+            }
+            if (checkpoint) |point| {
+                const raw = txn.get(.meta, meta_replay_fragment) catch |err|
+                    if (err == error.NotFound) null else return err;
+                if (raw) |bytes| {
+                    const previous = try ReplayFragment.decode(bytes);
+                    if (std.meta.eql(previous.identity, point.identity)) {
+                        if (previous.position.sequence > point.position.sequence) return error.EnrichmentWaitCanceled;
+                        if (previous.position.sequence == point.position.sequence) {
+                            if (previous.position.total_items != point.position.total_items or
+                                !std.mem.eql(u8, &previous.position.fingerprint, &point.position.fingerprint)) return error.InvalidDerivedApplyState;
+                            if (previous.position.next_item > point.position.next_item) return error.EnrichmentWaitCanceled;
+                            if (previous.position.next_item == point.position.next_item) {
+                                if (detached != null) return error.EnrichmentWaitCanceled;
+                                return self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        const infos = try self.writer.prepareDeleteInfos(self.alloc, delete_keys);
+        errdefer self.freeDeleteInfos(infos);
+        const count = infos.len + segments.len;
+        if (count == 0 and checkpoint == null and metadata == null and detached == null) return infos;
+        const replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, count);
+        var replacements_transferred = false;
+        defer if (!replacements_transferred) self.alloc.free(replacements);
+        const deleted = try self.alloc.alloc(roaring.RoaringBitmap, infos.len);
+        var deleted_count: usize = 0;
+        defer {
+            for (deleted[0..deleted_count]) |*bitmap| bitmap.deinit();
+            self.alloc.free(deleted);
+        }
+        const old_ids = try self.alloc.alloc(u64, infos.len);
+        defer self.alloc.free(old_ids);
+        var initialized: usize = 0;
+        var published = false;
+        var uncertain = false;
+        defer if (!published) {
+            // The native host rolls back uncommitted aliases atomically.
+            // A possibly committed alias remains for fresh-owner reconciliation.
+            for (replacements[0..initialized]) |*replacement| {
+                if (replacement.prepared_reader) |*reader| reader.deinit();
+                replacement.data.deinit(self.alloc);
+            }
+        };
+        const captured = self.writer.acquireSnapshot();
+        defer captured.release();
+        // An unpublished alias can outlive its allocating runtime.
+        // Reusing its numerical ID must neither overwrite nor unlink it.
+        // Bound collision work and durably advance the allocation frontier
+        // before yielding, so reopening cannot retry the same occupied prefix.
+        var collided_ids: [64]u64 = undefined;
+        var collided_count: usize = 0;
+        for (infos, 0..) |info, i| {
+            deleted[i] = try roaring.RoaringBitmap.fromBytes(self.alloc, info.bitmap_bytes);
+            deleted_count += 1;
+            old_ids[i] = info.seg_id;
+            const entry = for (captured.segments) |*entry| {
+                if (entry.id == info.seg_id) break entry;
+            } else return error.InvalidDeletionSnapshot;
+            if (entry.data != .native) return error.Unsupported;
+            const source = try entry.data.native.retainOwned();
+            replacements[initialized] = .{ .id = info.seg_id, .data = .fromNative(source), .deleted = &deleted[i] };
+            initialized += 1;
+            if (entry.reader.ordinal_binding) |binding| {
+                var reader = try replacements[initialized - 1].data.initReader(self.alloc);
+                errdefer reader.deinit();
+                try reader.attachOrdinalBinding(binding);
+                replacements[initialized - 1].prepared_reader = reader;
+            }
+        }
+        for (segments) |*segment| {
+            replacements[initialized] = while (true) {
+                const id = self.reserveSegmentId();
+                const path = try files.pathAlloc(id);
+                defer self.alloc.free(path);
+                const source = segment.artifact.prepareLink(path) catch |err| {
+                    // No ownership was transferred on failure. In particular,
+                    // deleting this ID would delete the colliding artifact.
+                    if (err != error.PathAlreadyExists) return err;
+                    for (captured.segments) |active| if (active.id == id) return error.EnrichmentWaitCanceled;
+                    collided_ids[collided_count] = id;
+                    collided_count += 1;
+                    if (collided_count == collided_ids.len) {
+                        // Owned preparation must never publish a separate
+                        // durable frontier reservation. The in-memory frontier
+                        // has advanced for the next bounded attempt.
+                        if (detached != null) return error.EnrichmentWaitCanceled;
+                        var reservation = try self.beginWriteMainTxn();
+                        errdefer reservation.abort();
+                        try self.checkReplayAliasCollisions(&reservation, collided_ids[0..collided_count]);
+                        try saveNextSegmentId(&reservation, self.writer.next_segment_id);
+                        try self.commitPreparedPublication(&reservation, &uncertain);
+                        return error.EnrichmentWaitCanceled;
+                    }
+                    continue;
+                };
+                break .{ .id = id, .data = .fromNative(source) };
+            };
+            initialized += 1;
+            if (segment.ordinals) |*plan| {
+                if (detached == null) return error.InvalidDerivedApplyState;
+                var reader = try replacements[initialized - 1].data.initReader(self.alloc);
+                errdefer reader.deinit();
+                const navigation = try reader.admission(self.alloc);
+                defer navigation.deinit(self.alloc);
+                if (plan.metadata) |*previous| previous.deinit();
+                plan.metadata = null;
+                plan.segment_id = null;
+                plan.metadata = try segment_admission.prepareBound(plan.resources, replacements[initialized - 1].id, navigation, try segment_mod.SegmentReader.nativeCatalogFooter(reader.source()));
+                plan.segment_id = replacements[initialized - 1].id;
+                var binding = try plan.metadata.?.binding();
+                defer binding.deinit();
+                try reader.attachOrdinalBinding(binding);
+                replacements[initialized - 1].prepared_reader = reader;
+            }
+        }
+        var publication: ?index_mod.IndexWriter.PreparedSegmentReplacement = if (count != 0)
+            try self.writer.prepareSegmentsManyData(old_ids, replacements)
+        else
+            null;
+        defer if (publication) |*prepared| prepared.abort();
+        try self.checkReplayAliasCollisions(&txn, collided_ids[0..collided_count]);
+        for (infos) |info| {
+            const key = std.mem.toBytes(std.mem.nativeToBig(u64, info.seg_id));
+            try txn.put(.deletions, &key, info.bitmap_bytes);
+        }
+        for (segments, replacements[infos.len..]) |*segment, replacement| {
+            try self.saveSegmentRange(&txn, replacement.id, segment.key_range);
+            try self.updateActiveSegments(&txn, replacement.id, .add);
+        }
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        if (publication) |*prepared| try self.savePreparedSegmentAdmissionsWithBindings(&txn, prepared, segments);
+        if (checkpoint) |point| {
+            const encoded = ReplayFragment.encode(point);
+            try txn.put(.meta, meta_replay_fragment, &encoded);
+        }
+        if (metadata) |joined| try saveProjectionSealInTxn(&txn, joined);
+        if (publication) |*prepared| try prepared.detach();
+        if (detached) |result| {
+            const namespace_txn = if (txn.write) |*value| value else return error.ReadOnly;
+            const prepared_namespace = try namespace_txn.prepareNativePublication();
+            txn.write = null;
+            result.* = .{
+                .index = self,
+                .alloc = self.alloc,
+                .namespace = prepared_namespace,
+                .snapshot = publication,
+                .replacements = replacements,
+                .segments = segments,
+                .metadata = metadata,
+                .infos = infos,
+            };
+            publication = null;
+            replacements_transferred = true;
+            published = true;
+            return infos;
+        }
+        const Participation = struct {
+            segments: []PreparedReplaySegment,
+            metadata: ?ReplayPublicationMetadata,
+            snapshot_publication: ?*index_mod.IndexWriter.PreparedSegmentReplacement,
+            target_writer: *index_mod.IndexWriter,
+            guard_visibility: bool,
+            fn validate(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                if (self_.metadata) |joined| try joined.participant.validate(view);
+            }
+            fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                if (self_.snapshot_publication) |prepared| try prepared.bind(self_.target_writer);
+                for (self_.segments) |segment| try segment.artifact.stageLink(view);
+                // New primary bytes or progress must not authorize a fresh
+                // old-index capture during the durable-to-memory handoff.
+                if (self_.guard_visibility) if (self_.snapshot_publication) |prepared| prepared.guardExternalVisibility();
+                if (self_.metadata) |joined| try joined.participant.apply(view);
+            }
+        };
+        var participation: Participation = .{
+            .segments = segments,
+            .metadata = metadata,
+            .snapshot_publication = if (publication) |*prepared| prepared else null,
+            .target_writer = &self.writer,
+            .guard_visibility = metadata != null,
+        };
+        try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage, .validate_fn = Participation.validate });
+        if (publication) |*prepared| prepared.publish();
+        published = true;
+        return infos;
+    }
+
+    fn checkReplayAliasCollisions(_: *PersistentIndex, txn: *MainTxn, ids: []const u64) !void {
+        for (ids) |id| {
+            // A current active marker contradicts the captured writer. Refuse
+            // that stale runtime. An inactive alias can still belong to an
+            // in-flight construction, so allocation never reclaims it.
+            const active_key = activeSegmentMetaKey(id);
+            if (txn.get(.meta, &active_key)) |_| {
+                return error.EnrichmentWaitCanceled;
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+        }
+    }
+
+    /// A failed durable boundary can still contain this activation. Preserve
+    /// its immutable inputs and propagate uncertainty to every serving wrapper.
+    fn commitPreparedPublication(self: *PersistentIndex, txn: *MainTxn, uncertain: *bool) !void {
+        return self.commitPreparedPublicationWithParticipant(txn, uncertain, null);
+    }
+
+    fn commitPreparedPublicationWithParticipant(self: *PersistentIndex, txn: *MainTxn, uncertain: *bool, participant: ?@import("native_publication.zig").Participant) !void {
+        var progress: backend_types.CommitProgress = .{};
+        const parent_progress = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = parent_progress;
+        txn.commitWithPublication(participant) catch |err| {
+            uncertain.* = progress.maybe_applied;
+            if (uncertain.*) {
+                if (parent_progress) |parent| parent.maybe_applied = true;
+                if (self.segment_files) |files| files.storage.fenceUncertainPublication();
+            }
+            return err;
+        };
     }
 
     pub fn attachResourceManager(self: *PersistentIndex, manager: *resource_manager_mod.ResourceManager) void {
@@ -1189,6 +2097,7 @@ pub const PersistentIndex = struct {
     }
 
     const MainTxn = struct {
+        owner: ?*PersistentIndex = null,
         read: ?backend_erased.NamespaceReadTxn = null,
         write: ?backend_erased.NamespaceWriteTxn = null,
         retirement_cleanup_started: bool = false,
@@ -1224,8 +2133,15 @@ pub const PersistentIndex = struct {
         }
 
         pub fn commit(self: *MainTxn) !void {
+            return self.commitWithPublication(null);
+        }
+
+        pub fn commitWithPublication(self: *MainTxn, participant: ?@import("native_publication.zig").Participant) !void {
             if (self.write) |*txn| {
-                try txn.commit();
+                if (txn.vtable.commit_native_identity != null) {
+                    const identity = try txn.commitWithNativeIdentity(participant);
+                    if (self.owner) |owner| owner.native_snapshot_identity = identity;
+                } else if (participant) |value| try txn.commitWithPublication(value) else try txn.commit();
                 self.write = null;
                 return;
             }
@@ -1276,7 +2192,19 @@ pub const PersistentIndex = struct {
     }
 
     fn beginWriteMainTxn(self: *PersistentIndex) !MainTxn {
-        return try MainTxn.open(&self.main_store, false);
+        var txn = try MainTxn.open(&self.main_store, false);
+        errdefer txn.abort();
+        if (txn.write) |*write| if (try write.nativeIdentity()) |actual| {
+            const loaded = self.native_snapshot_identity orelse return error.EnrichmentWaitCanceled;
+            if (!loaded.eql(actual)) {
+                if (!loaded.sameRetainedState(actual)) return error.EnrichmentWaitCanceled;
+                // Only the physical container changed. Preparation captures the
+                // new exact inode below; its publication never weakens that fence.
+                self.native_snapshot_identity = actual;
+            }
+        };
+        txn.owner = self;
+        return txn;
     }
 
     fn backendCapabilities(_: *PersistentIndex) backend_types.Capabilities {
@@ -1377,14 +2305,14 @@ pub const PersistentIndex = struct {
             }
         }
         // Even an idempotent retry must finish a previously failed seal sync.
-        try self.main_store_owner.sync(true);
+        try self.syncMainReplayBoundary();
         if (already_covered) return;
-        try self.wal.sync(true);
+        if (self.deferred_retirement_maintenance) try self.wal.syncReplayState() else try self.wal.sync(true);
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
         try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
         try txn.commit();
-        try self.main_store_owner.sync(true);
+        try self.syncMainReplayBoundary();
     }
 
     /// Physical segments, including fully-deleted segments, are projection
@@ -1422,6 +2350,9 @@ pub const PersistentIndex = struct {
                 };
             },
             .lsm => {
+                if (opts.main_lsm_storage orelse opts.main_lsm_options.storage) |storage| {
+                    if (try storage.openNativeNamespaces(alloc, index_path, opts.read_only)) |store| return .{ .store = store, .owner = .{ .native = {} } };
+                }
                 var handle = try lsm_backend.BackendHandle.open(alloc, index_path, resolvedMainLsmOptions(opts, false));
                 errdefer handle.close();
 
@@ -1504,8 +2435,11 @@ pub const PersistentIndex = struct {
             opened_main.owner.close(alloc);
         }
 
-        // Open namespaces eagerly on writable backends
-        if (!opts.read_only) {
+        const cache_lifecycle = opened_main.owner.supportsAtomicNativePublication();
+        // Managed Native caches already recover committed namespaces from WAL.
+        // An empty setup commit can otherwise flush that recovered state and
+        // invalidate a concurrent detached publication merely by opening.
+        if (!opts.read_only and !cache_lifecycle) {
             var setup_txn = try MainTxn.open(&opened_main.store, false);
             errdefer setup_txn.abort();
             try setup_txn.commit();
@@ -1513,14 +2447,23 @@ pub const PersistentIndex = struct {
 
         var writer = try index_mod.IndexWriter.init(alloc);
         errdefer writer.deinit();
+        if (cache_lifecycle) if (segment_files) |*files| {
+            if (try files.storage.acquireImmutableResources()) |owned| {
+                var resources = owned;
+                defer resources.deinit();
+                writer.setNativeResources(resources);
+            }
+        };
         var stale_active_ids = std.ArrayListUnmanaged(u64).empty;
         defer stale_active_ids.deinit(alloc);
 
         // Recovery: load existing segments from metadata plus immutable files.
         var committed_lsn: u64 = 0;
+        var native_snapshot_identity: ?@import("native_publication.zig").NamespaceIdentity = null;
         {
             var read_txn = try MainTxn.open(&opened_main.store, true);
             defer read_txn.abort();
+            if (read_txn.read) |*native| native_snapshot_identity = try native.nativeIdentity();
 
             // Read committed_lsn
             const lsn_bytes = read_txn.get(.meta, meta_committed_lsn) catch |err| switch (err) {
@@ -1533,6 +2476,8 @@ pub const PersistentIndex = struct {
 
             const active_ids = try loadActiveSegmentIdsFromTxn(&read_txn, alloc);
             defer alloc.free(active_ids);
+            var recovery: RecoveredSegments = .{ .alloc = alloc };
+            defer recovery.deinit();
             for (active_ids) |seg_id| {
                 const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
                 const seg_bytes = read_txn.get(.segments, &seg_key) catch |err| switch (err) {
@@ -1558,6 +2503,13 @@ pub const PersistentIndex = struct {
                             });
                         }
                     }
+                    if (store.storage.openResidentImmutableSource(alloc, segment_path) catch |err| switch (err) {
+                        error.FileNotFound => {
+                            try stale_active_ids.append(alloc, seg_id);
+                            continue;
+                        },
+                        else => return err,
+                    }) |source| break :blk index_mod.SegmentData.fromNative(source);
                     if (store.storage.vtable.open_leased_immutable_source != null) {
                         const source = store.storage.openLeasedImmutableSource(alloc, segment_path) catch |err| switch (err) {
                             error.FileNotFound => {
@@ -1595,30 +2547,54 @@ pub const PersistentIndex = struct {
                 };
                 segment_data.?.madviseAccessPattern();
                 errdefer if (segment_data) |*data| data.deinit(alloc);
-                writer.addSegmentWithIdData(seg_id, segment_data.?) catch |err| {
-                    if (isStaleActiveSegmentDataError(err)) {
-                        segment_data.?.deinit(alloc);
-                        segment_data = null;
-                        try stale_active_ids.append(alloc, seg_id);
-                        continue;
-                    }
-                    return err;
+                const marker_key = activeSegmentMetaKey(seg_id);
+                const marker = if (segment_data.? == .native) read_txn.get(.meta, &marker_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                } else null;
+                var admission = if (marker) |value| try segment_admission.decode(alloc, value, seg_id, segment_data.?.len()) else null;
+                defer if (admission) |*owned| owned.deinit();
+                var reader: ?segment_mod.SegmentReader = if (admission) |*owned| blk: {
+                    // Descriptor and active ID belong to this same catalog
+                    // transaction. Payloads retain independent native range
+                    // leases and authentication. No source pointers are cached.
+                    break :blk owned.initReader(alloc, segment_data.?.source()) catch |err| switch (err) {
+                        error.InvalidSegment => return error.InvalidSegmentAdmission,
+                        else => return err,
+                    };
+                } else blk: {
+                    var ordinary = segment_data.?.initReader(alloc) catch |err| {
+                        if (isStaleActiveSegmentDataError(err)) {
+                            segment_data.?.deinit(alloc);
+                            segment_data = null;
+                            try stale_active_ids.append(alloc, seg_id);
+                            continue;
+                        }
+                        return err;
+                    };
+                    if (segment_data.? == .owned_view) ordinary.postings_loader = segment_data.?.owned_view.postings_loader;
+                    break :blk ordinary;
                 };
-                segment_data = null;
+                defer if (reader) |*unconsumed| unconsumed.deinit();
 
+                var deleted: ?roaring.RoaringBitmap = null;
+                defer if (deleted) |*bitmap| bitmap.deinit();
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
                 if (deletion_bytes) |bytes| {
-                    var bitmap = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
-                    if (!bitmap.isEmpty()) {
-                        writer.setDeletionBitmap(seg_id, bitmap);
-                    } else {
-                        bitmap.deinit();
-                    }
+                    deleted = try roaring.RoaringBitmap.fromBytes(alloc, bytes);
                 }
+                try recovery.append(seg_id, segment_data.?, reader.?, deleted);
+                segment_data = null;
+                reader = null;
+                deleted = null;
             }
+            // Recovery has no visible intermediate snapshots. Admit every
+            // reader once and publish the complete catalog in linear work,
+            // rather than copying the growing segment list for each entry.
+            try recovery.publish(&writer);
 
             const next_seg_id_bytes = read_txn.get(.meta, meta_next_seg_id) catch |err| switch (err) {
                 error.NotFound => null,
@@ -1646,8 +2622,10 @@ pub const PersistentIndex = struct {
             .io = opts.io,
             .alloc = alloc,
             .writer = writer,
+            .native_snapshot_identity = native_snapshot_identity,
             .main_store = opened_main.store,
             .main_store_owner = opened_main.owner,
+            .deferred_retirement_maintenance = cache_lifecycle,
             .segment_files = segment_files,
             .wal = wal,
             .committed_lsn = committed_lsn,
@@ -1679,7 +2657,9 @@ pub const PersistentIndex = struct {
         if (pi.segment_files) |*store| {
             pi.retired_segment_file_deleter = try RetiredSegmentFileDeleter.init(alloc, store);
             pi.writer.setRetiredSegmentCleanup(pi.retired_segment_file_deleter.?.cleanup());
-            if (!opts.read_only) pi.reconcileRetiredSegmentFilesLocked();
+            if (!opts.read_only) {
+                if (cache_lifecycle) pi.retirement_reconcile_pending = true else pi.reconcileRetiredSegmentFilesLocked();
+            }
         }
 
         return pi;
@@ -1696,7 +2676,7 @@ pub const PersistentIndex = struct {
     pub fn close(self: *PersistentIndex) void {
         self.lockStorage();
         self.writer.deinit();
-        self.flushCompletedRetirementMarkersLocked();
+        if (!self.deferred_retirement_maintenance) self.flushCompletedRetirementMarkersLocked();
         if (self.retired_segment_file_deleter) |deleter| {
             if (deleter.native_storage_lease == null) deleter.disarm();
         }
@@ -1748,13 +2728,9 @@ pub const PersistentIndex = struct {
         const deleter = self.retired_segment_file_deleter orelse return;
         const store = &(self.segment_files orelse return);
 
-        // Retry work discovered by an earlier transaction once per subsequent
-        // publication boundary. Newly discovered failures wait for the next
-        // boundary, avoiding a tight retry loop on a persistent I/O failure.
-        deleter.retryFailedDeletes();
         if (self.retirement_reconcile_pending) {
-            if (self.discoverRetiredSegmentFilesInTxn(txn)) {
-                self.retirement_reconcile_pending = false;
+            if (self.discoverRetiredSegmentFilesInTxn(txn)) |complete| {
+                self.retirement_reconcile_pending = !complete;
             } else |err| {
                 // Reconciliation is maintenance, not a publication
                 // prerequisite. Preserve the pending bit and let the write
@@ -1764,6 +2740,11 @@ pub const PersistentIndex = struct {
                 }
             }
         }
+        // Service one bounded batch, including newly discovered native work,
+        // before a cache generation can close. Failure deadlines prevent an
+        // immediate second attempt after a standalone discovery unlink fails.
+        // Durable markers retain every unserviced ID across runtime refresh.
+        deleter.retryFailedDeletes();
         const completed_ids = deleter.snapshotCompletedIds(self.alloc, RetiredSegmentFileDeleter.completed_markers_per_boundary) catch return;
         defer self.alloc.free(completed_ids);
         if (completed_ids.len == 0) return;
@@ -1802,7 +2783,28 @@ pub const PersistentIndex = struct {
         if (self.read_only) return;
         const deleter = self.retired_segment_file_deleter orelse return;
         if (!self.retirement_reconcile_pending and !deleter.hasRetirementWork()) return;
+        if (platform_time.monotonicNs() < self.retirement_retry_at_ns) return;
+        // Native cleanup reads current markers under its own bounded physical
+        // publication. A detached serving snapshot is not cleanup authority.
+        const root = std.fs.path.dirname(deleter.root_dir) orelse deleter.root_dir;
+        const native_page = deleter.storage.sweepTextRetirements(root, self.retirement_reconcile_after) catch |err| {
+            self.deferRetirementRetry();
+            if (builtin.os.tag != .freestanding) std.log.warn("native text retirement sweep deferred: {s}", .{@errorName(err)});
+            return;
+        };
+        if (native_page) |page| {
+            self.retirement_retry_at_ns = 0;
+            self.retirement_failures = 0;
+            deleter.acknowledgeNativeSweep(page.ids[0..page.count]);
+            self.retirement_reconcile_pending = !page.complete;
+            self.retirement_reconcile_after = if (page.complete or page.count == 0) null else page.ids[page.count - 1];
+            // Snapshot callbacks may queue already swept IDs. The typed retry
+            // path proves them absent idempotently, without rotating semantics.
+            deleter.retryFailedDeletes();
+            return;
+        }
         var txn = self.beginWriteMainTxn() catch |err| {
+            self.deferRetirementRetry();
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment marker flush deferred: {s}", .{@errorName(err)});
             }
@@ -1811,18 +2813,22 @@ pub const PersistentIndex = struct {
         var txn_open = true;
         defer if (txn_open) txn.abort();
         self.clearCompletedRetirementMarkersInTxn(&txn) catch |err| {
+            self.deferRetirementRetry();
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment marker flush deferred: {s}", .{@errorName(err)});
             }
             return;
         };
         txn.commit() catch |err| {
+            self.deferRetirementRetry();
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment marker flush commit deferred: {s}", .{@errorName(err)});
             }
             return;
         };
         txn_open = false;
+        self.retirement_retry_at_ns = 0;
+        self.retirement_failures = 0;
     }
 
     /// Discover durable retirement work on open. Failed scans stay pending;
@@ -1832,14 +2838,14 @@ pub const PersistentIndex = struct {
         if (self.read_only) return;
         if (self.segment_files == null or self.retired_segment_file_deleter == null) return;
         self.retirement_reconcile_pending = true;
+        self.retirement_reconcile_after = null;
         self.flushCompletedRetirementMarkersLocked();
     }
 
-    fn discoverRetiredSegmentFilesInTxn(self: *PersistentIndex, txn: *MainTxn) !void {
-        const deleter = self.retired_segment_file_deleter orelse return;
-        const retired_ids = try loadRetiredSegmentIdsFromTxn(txn, self.alloc);
-        defer self.alloc.free(retired_ids);
-        for (retired_ids) |seg_id| {
+    fn discoverRetiredSegmentFilesInTxn(self: *PersistentIndex, txn: *MainTxn) !bool {
+        const deleter = self.retired_segment_file_deleter orelse return true;
+        const page = try loadRetiredSegmentIdsPage(txn, self.retirement_reconcile_after);
+        for (page.ids[0..page.count]) |seg_id| {
             const active_key = activeSegmentMetaKey(seg_id);
             const is_active = if (txn.get(.meta, &active_key)) |_| true else |err| switch (err) {
                 error.NotFound => false,
@@ -1847,10 +2853,18 @@ pub const PersistentIndex = struct {
             };
             if (is_active) {
                 try deleter.completeWithoutDelete(seg_id);
+            } else if (deleter.defer_deletions) {
+                try deleter.enqueueRetry(seg_id);
             } else {
                 try deleter.deleteOrQueue(seg_id);
             }
         }
+        // Advance only after every marker in this page has a recorded result.
+        // An allocation/read failure retries the page, preserving all durable
+        // markers; the live queues deduplicate already accepted IDs.
+        if (page.count != 0) self.retirement_reconcile_after = page.ids[page.count - 1];
+        if (page.exhausted) self.retirement_reconcile_after = null;
+        return page.exhausted;
     }
 
     pub fn resetAllForRebuild(self: *PersistentIndex) !void {
@@ -1934,27 +2948,44 @@ pub const PersistentIndex = struct {
         try self.main_store_owner.sync(force);
     }
 
+    fn deferRetirementRetry(self: *PersistentIndex) void {
+        self.retirement_failures +|= 1;
+        const exponent: u6 = @intCast(@min(@as(u8, 10), self.retirement_failures -| 1));
+        const delay = @min(@as(u64, std.time.ns_per_ms) << exponent, std.time.ns_per_s);
+        self.retirement_retry_at_ns = platform_time.monotonicNs() +| delay;
+    }
+
+    fn retirementWakeDelayNs(self: *const PersistentIndex) ?u64 {
+        const queued = if (self.retired_segment_file_deleter) |deleter| deleter.nextWakeDelayNs() else null;
+        const delay: u64 = if (self.retirement_reconcile_pending) 0 else queued orelse return null;
+        return @max(delay, self.retirement_retry_at_ns -| platform_time.monotonicNs());
+    }
+
     pub fn lsmMaintenanceScore(self: *const PersistentIndex) u64 {
-        return self.main_store_owner.lsmMaintenanceScore();
+        const due = if (self.retirementWakeDelayNs()) |delay| delay == 0 else false;
+        return self.main_store_owner.lsmMaintenanceScore() +| @intFromBool(due);
     }
 
     pub fn lsmMaintenanceDebtHint(self: *const PersistentIndex) u64 {
         return switch (self.main_store_owner) {
-            .mem => 0,
+            .mem, .native => 0,
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
         };
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
-        return switch (self.main_store_owner) {
-            .mem => null,
+        const storage_delay: ?u64 = switch (self.main_store_owner) {
+            .mem, .native => null,
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
+        const retirement_delay = self.retirementWakeDelayNs();
+        if (storage_delay) |delay| return if (retirement_delay) |other| @min(delay, other) else delay;
+        return retirement_delay;
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *PersistentIndex) void {
         switch (self.main_store_owner) {
-            .mem => {},
+            .mem, .native => {},
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
         }
     }
@@ -1969,6 +3000,24 @@ pub const PersistentIndex = struct {
 
     pub fn snapshotLsmOpenStats(self: *const PersistentIndex) ?lsm_backend.Backend.OpenStats {
         return self.main_store_owner.snapshotLsmOpenStats();
+    }
+
+    fn syncMainReplayBoundary(self: *PersistentIndex) !void {
+        if (self.deferred_retirement_maintenance) try self.main_store_owner.syncReplayState() else try self.main_store_owner.sync(true);
+    }
+
+    /// Replay coverage needs durable effects, not a new immutable SST cut.
+    /// Physical snapshot capture still flushes its own exact checkpoint below.
+    pub fn syncAppliedReplayBoundary(self: *PersistentIndex) !void {
+        self.lockStorage();
+        defer self.unlockStorage();
+        if (self.deferred_retirement_maintenance) {
+            try self.main_store_owner.syncReplayState();
+            try self.wal.syncReplayState();
+        } else {
+            try self.main_store_owner.checkpointLsmWalAfterDurableBoundary();
+            try self.wal.checkpointLsmWalAfterDurableBoundary();
+        }
     }
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *PersistentIndex) !void {
@@ -2096,12 +3145,14 @@ pub const PersistentIndex = struct {
     pub fn runLsmMaintenanceStep(self: *PersistentIndex) !bool {
         self.lockStorage();
         defer self.unlockStorage();
+        if (self.deferred_retirement_maintenance) self.flushCompletedRetirementMarkersLocked();
         return try self.main_store_owner.runLsmMaintenanceStep();
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex) !bool {
         self.lockStorage();
         defer self.unlockStorage();
+        if (self.deferred_retirement_maintenance) self.flushCompletedRetirementMarkersLocked();
         return try self.main_store_owner.runLsmMaintenanceStepBestEffort();
     }
 
@@ -2133,6 +3184,16 @@ pub const PersistentIndex = struct {
                 self.deleteSegmentFile(id);
             }
             try page.segments.append(self.alloc, .{ .id = id, .data = data });
+            return;
+        }
+
+        if (self.main_store_owner == .native) {
+            var stager = (try self.acquireReplayStager(self.alloc)) orelse return error.Unsupported;
+            defer stager.deinit();
+            var staged = [_]PreparedReplaySegment{try prepareReplaySegment(self.alloc, stager, owned.?)};
+            defer staged[0].deinit();
+            const infos = try self.publishPreparedNativeLocked(&staged, &.{}, null, null, null);
+            defer self.freeDeleteInfos(infos);
             return;
         }
 
@@ -2197,7 +3258,7 @@ pub const PersistentIndex = struct {
 
         // 4. Persist metadata.
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+        try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn, &writer_publication);
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
         // 5. Every fallible snapshot allocation was staged before catalog
@@ -2377,6 +3438,7 @@ pub const PersistentIndex = struct {
             if (builtin.os.tag != .freestanding) std.log.err("text segment checkpoint publish failed: {s}", .{@errorName(err)});
             return err;
         };
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         txn.commit() catch |err| {
             if (builtin.os.tag != .freestanding) std.log.err("text segment catalog commit failed: {s}", .{@errorName(err)});
             return err;
@@ -2681,6 +3743,7 @@ pub const PersistentIndex = struct {
             for (owned_doc_keys) |key| alloc.free(key);
             alloc.free(owned_doc_keys);
         }
+        if (writer_publication) |*publication| try dest.savePreparedSegmentAdmissions(&dest_txn, publication);
         try dest_txn.commit();
         if (writer_publication) |*publication| publication.publish();
         writer_published = true;
@@ -2738,6 +3801,8 @@ pub const PersistentIndex = struct {
         if (doc_ids.len == 0) return try self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
         self.lockStorage();
         defer self.unlockStorage();
+
+        if (self.main_store_owner == .native) return self.publishPreparedNativeLocked(&.{}, doc_ids, null, null, null);
 
         const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, doc_ids);
         errdefer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
@@ -3021,6 +4086,29 @@ pub const PersistentIndex = struct {
         return prepared;
     }
 
+    /// The expensive construction and key-range scan have already completed
+    /// privately. Reserve the logical ID only in the current runtime, then
+    /// share the staged native value root instead of copying its payload.
+    pub fn prepareLinkedMergeSegment(self: *PersistentIndex, staging_alloc: Allocator, native_store: *@import("lite/docstore.zig").Store, construction: *@import("lite/artifact_source.zig").Construction, range: *SegmentKeyRange) ![]PreparedMergeSegment {
+        const files = self.segment_files orelse return error.Unsupported;
+        const id = self.reserveSegmentId();
+        const path = try files.pathAlloc(id);
+        defer files.allocator.free(path);
+        try construction.link(native_store, path);
+        errdefer self.deleteSegmentFile(id);
+        var data = index_mod.SegmentData.fromNative(try native_store.openArtifactSource(path));
+        errdefer data.deinit(self.alloc);
+        const prepared = try staging_alloc.alloc(PreparedMergeSegment, 1);
+        prepared[0] = .{ .id = id, .data = data, .key_range = range.*, .staging_alloc = staging_alloc };
+        prepared[0].key_range.seg_id = id;
+        range.* = .{ .seg_id = 0, .min_doc_key = &.{}, .max_doc_key = &.{} };
+        return prepared;
+    }
+
+    pub fn privateMergeKeyRange(allocator: Allocator, source: segment_mod.SegmentSource, canceled: *const std.atomic.Value(bool)) !SegmentKeyRange {
+        return extractSegmentDataKeyRangeWithCancellation(allocator, index_mod.SegmentData.fromNative(source), canceled);
+    }
+
     pub fn replaceSegmentsIfActiveManyPrepared(self: *PersistentIndex, old_seg_ids: []const u64, prepared_segments: []PreparedMergeSegment) !bool {
         return try self.replaceSegmentsIfActiveManyPreparedWithDeletes(old_seg_ids, prepared_segments, null);
     }
@@ -3139,6 +4227,7 @@ pub const PersistentIndex = struct {
                 }
             }
         }
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         try txn.commit();
 
         writer_publication.publish();
@@ -3206,7 +4295,50 @@ pub const PersistentIndex = struct {
         return index_mod.SegmentData.fromOwnedHeap(try self.alloc.dupe(u8, segment_bytes));
     }
 
+    /// Split/export consumers require a self-contained segment. Materialize
+    /// native identities only at this cold portability boundary, preserving
+    /// physical document order so the independent deletion bitmap stays valid.
     fn readSegmentBytesAlloc(self: *PersistentIndex, txn: *MainTxn, alloc: Allocator, seg_id: u64) ![]u8 {
+        const raw = try self.readRawSegmentBytesAlloc(txn, alloc, seg_id);
+        var raw_transferred = false;
+        defer if (!raw_transferred) alloc.free(raw);
+        const marker_key = activeSegmentMetaKey(seg_id);
+        const marker = txn.get(.meta, &marker_key) catch |err| switch (err) {
+            error.NotFound => {
+                raw_transferred = true;
+                return raw;
+            },
+            else => return err,
+        };
+        var admission = (try segment_admission.decode(alloc, marker, seg_id, raw.len)) orelse {
+            raw_transferred = true;
+            return raw;
+        };
+        defer admission.deinit();
+        if (admission.bound_column == null) {
+            raw_transferred = true;
+            return raw;
+        }
+        var reader = try admission.initReader(alloc, .{ .contiguous = raw });
+        defer reader.deinit();
+        const portable = try segment_mod.mergeSegmentInputs(alloc, &.{.{ .reader = &reader }});
+        errdefer alloc.free(portable);
+        var output = try segment_mod.SegmentReader.init(alloc, portable);
+        defer output.deinit();
+        if (output.doc_count != reader.doc_count) return error.InvalidSegment;
+        var identities = std.heap.ArenaAllocator.init(alloc);
+        defer identities.deinit();
+        for (0..reader.doc_count) |i| {
+            _ = identities.reset(.retain_capacity);
+            const doc: u32 = @intCast(i);
+            const before = (try reader.storedIdScoped(identities.allocator(), doc)) orelse return error.InvalidSegment;
+            const after = (try output.storedIdScoped(identities.allocator(), doc)) orelse return error.InvalidSegment;
+            if (!std.mem.eql(u8, before, after) or try reader.docOrdinal(doc) != try output.docOrdinal(doc)) return error.InvalidSegment;
+        }
+        return portable;
+    }
+
+    fn readRawSegmentBytesAlloc(self: *PersistentIndex, txn: *MainTxn, alloc: Allocator, seg_id: u64) ![]u8 {
         const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
         if (txn.get(.segments, &seg_key)) |segment_bytes| {
             return try alloc.dupe(u8, segment_bytes);
@@ -3336,6 +4468,7 @@ pub const PersistentIndex = struct {
 
         try self.saveSegmentRange(&txn, new_seg_id, key_range);
         try self.updateActiveSegments(&txn, new_seg_id, .add);
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         try txn.commit();
 
         writer_publication.publish();
@@ -3484,6 +4617,7 @@ pub const PersistentIndex = struct {
             try self.saveSegmentRangeWithAllocator(scratch_alloc, &txn, key_range.seg_id, key_range);
             try self.updateActiveSegments(&txn, key_range.seg_id, .add);
         }
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         try txn.commit();
 
         writer_publication.publish();
@@ -3527,11 +4661,12 @@ pub const PersistentIndex = struct {
         }
 
         try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         try txn.commit();
         writer_publication.publish();
     }
 
-    fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !void {
+    fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64, publication: *const index_mod.IndexWriter.PreparedSegmentReplacement) !void {
         var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
         defer key_range.deinit(self.alloc);
 
@@ -3549,9 +4684,109 @@ pub const PersistentIndex = struct {
         // Update committed_lsn
         const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, lsn));
         try txn.put(.meta, meta_committed_lsn, &lsn_bytes);
-
+        try self.savePreparedSegmentAdmissions(&txn, publication);
         try txn.commit();
         self.committed_lsn = lsn;
+    }
+
+    /// The caller retains data until publication. Preparation clears a reader
+    /// only after allocating its scratch array, so an earlier failure leaves
+    /// that reader here; later failures clean up the consumed reader internally.
+    fn publishCatalogAdmittedSegment(writer: *index_mod.IndexWriter, id: u64, data: index_mod.SegmentData, reader: segment_mod.SegmentReader) !void {
+        var replacement = [_]index_mod.ReplacementSegmentData{.{ .id = id, .data = data, .prepared_reader = reader }};
+        defer if (replacement[0].prepared_reader) |*unconsumed| unconsumed.deinit();
+        var publication = try writer.prepareSegmentsManyData(&.{}, &replacement);
+        defer publication.abort();
+        publication.publish();
+    }
+
+    const RecoveredSegments = struct {
+        alloc: Allocator,
+        replacements: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
+        deleted: std.ArrayListUnmanaged(?roaring.RoaringBitmap) = .empty,
+        published: bool = false,
+
+        /// Takes ownership only on success. Bitmap pointers are bound after
+        /// collection, when growing these staging arrays can no longer move them.
+        fn append(self: *@This(), id: u64, data: index_mod.SegmentData, reader: segment_mod.SegmentReader, bitmap: ?roaring.RoaringBitmap) !void {
+            try self.replacements.ensureUnusedCapacity(self.alloc, 1);
+            try self.deleted.ensureUnusedCapacity(self.alloc, 1);
+            self.replacements.appendAssumeCapacity(.{ .id = id, .data = data, .prepared_reader = reader });
+            self.deleted.appendAssumeCapacity(bitmap);
+        }
+
+        fn publish(self: *@This(), writer: *index_mod.IndexWriter) !void {
+            if (self.replacements.items.len == 0) return;
+            for (self.replacements.items, self.deleted.items) |*entry, *bitmap| {
+                entry.deleted = if (bitmap.*) |*value| value else null;
+            }
+            // Preparation consumes readers, including on failure; data stays
+            // ours until publication. The writer clones the caller's bitmaps.
+            var publication = try writer.prepareSegmentsManyData(&.{}, self.replacements.items);
+            defer publication.abort();
+            publication.publish();
+            self.published = true;
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.replacements.items) |*entry| {
+                if (entry.prepared_reader) |*reader| reader.deinit();
+                if (!self.published) entry.data.deinit(self.alloc);
+            }
+            for (self.deleted.items) |*bitmap| if (bitmap.*) |*value| value.deinit();
+            self.replacements.deinit(self.alloc);
+            self.deleted.deinit(self.alloc);
+            self.* = undefined;
+        }
+    };
+
+    /// Navigation and active membership publish atomically. Legacy/oversized
+    /// descriptors retain ordinary source admission. Optional allocation
+    /// pressure may omit acceleration, but storage errors abort publication.
+    fn savePreparedSegmentAdmissions(self: *PersistentIndex, txn: *MainTxn, publication: *const index_mod.IndexWriter.PreparedSegmentReplacement) !void {
+        return self.savePreparedSegmentAdmissionsWithBindings(txn, publication, &.{});
+    }
+
+    fn savePreparedSegmentAdmissionsWithBindings(self: *PersistentIndex, txn: *MainTxn, publication: *const index_mod.IndexWriter.PreparedSegmentReplacement, late_segments: []PreparedReplaySegment) !void {
+        if (self.segment_files == null or self.segment_files.?.storage.vtable.open_leased_immutable_source == null) return;
+        return savePreparedNativeAdmissions(self.alloc, txn, publication, late_segments);
+    }
+
+    fn savePreparedNativeAdmissions(alloc: Allocator, txn: *MainTxn, publication: *const index_mod.IndexWriter.PreparedSegmentReplacement, late_segments: []PreparedReplaySegment) !void {
+        for (publication.snapshot.segments[publication.carried_count..]) |segment| {
+            if (segment.data != .native) continue;
+            const marker_key = activeSegmentMetaKey(segment.id);
+            const late = for (late_segments) |*candidate| {
+                if (candidate.ordinals) |*plan| if (plan.segment_id == segment.id) break plan;
+            } else null;
+            if (late) |plan| {
+                var value = plan.metadata.?.builder.value();
+                defer value.deinit();
+                const namespace_txn = if (txn.write) |*write| write else return error.ReadOnly;
+                try namespace_txn.putPreparedValue(runtimeNamespace(.meta), &marker_key, value);
+                continue;
+            }
+            if (segment.reader.ordinal_binding) |*binding| {
+                const metadata = try segment.reader.admission(alloc);
+                defer metadata.deinit(alloc);
+                const encoded = try segment_admission.encodeBound(alloc, segment.id, metadata, try segment_mod.SegmentReader.nativeCatalogFooter(segment.data.source()), try binding.column());
+                defer alloc.free(encoded);
+                try txn.put(.meta, &marker_key, encoded);
+                continue;
+            }
+            const metadata = segment.reader.admission(alloc) catch |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded, error.InvalidSegment => continue,
+                else => return err,
+            };
+            defer metadata.deinit(alloc);
+            const footer = try segment_mod.SegmentReader.nativeCatalogFooter(segment.data.source());
+            const encoded = segment_admission.encode(alloc, segment.id, metadata, footer) catch |err| switch (err) {
+                error.OutOfMemory => continue,
+                else => return err,
+            } orelse continue;
+            defer alloc.free(encoded);
+            try txn.put(.meta, &marker_key, encoded);
+        }
     }
 
     fn updateActiveSegments(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, op: enum { add, remove }) !void {
@@ -3597,7 +4832,7 @@ pub const PersistentIndex = struct {
         }};
         var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
         defer writer_publication.abort();
-        try self.persistSegment(seg_id, segment_bytes, lsn);
+        try self.persistSegment(seg_id, segment_bytes, lsn, &writer_publication);
         writer_publication.publish();
         segment_data = null;
         rollback_segment = false;
@@ -3621,6 +4856,10 @@ pub const PersistentIndex = struct {
         key_range: SegmentKeyRange,
     ) !void {
         _ = self;
+        return saveSegmentRangeOwned(alloc, txn, seg_id, key_range);
+    }
+
+    fn saveSegmentRangeOwned(alloc: Allocator, txn: *MainTxn, seg_id: u64, key_range: SegmentKeyRange) !void {
         const range_key = segmentRangeMetaKey(seg_id);
         var buf = try alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
         defer alloc.free(buf);
@@ -3742,8 +4981,34 @@ fn loadActiveSegmentIdsFromTxn(txn: *PersistentIndex.MainTxn, alloc: Allocator) 
     return try loadSegmentIdsForMetaPrefix(txn, alloc, meta_active_segment_prefix);
 }
 
-fn loadRetiredSegmentIdsFromTxn(txn: *PersistentIndex.MainTxn, alloc: Allocator) ![]u64 {
-    return try loadSegmentIdsForMetaPrefix(txn, alloc, meta_retired_segment_prefix);
+const RetiredSegmentPage = struct {
+    ids: [RetiredSegmentFileDeleter.retry_inspections_per_boundary]u64 = undefined,
+    count: usize = 0,
+    exhausted: bool = false,
+};
+
+fn loadRetiredSegmentIdsPage(txn: *PersistentIndex.MainTxn, after: ?u64) !RetiredSegmentPage {
+    var cursor = txn.openCursor(.meta) catch |err| switch (err) {
+        error.NotFound => return .{ .exhausted = true },
+        else => return err,
+    };
+    defer cursor.close();
+    var page: RetiredSegmentPage = .{};
+    const key = retiredSegmentMetaKey(after orelse 0);
+    var entry = try cursor.seekAtOrAfter(if (after != null) &key else meta_retired_segment_prefix);
+    if (after != null) if (entry) |item| if (std.mem.eql(u8, item.key, &key)) {
+        entry = try cursor.next();
+    };
+    while (entry) |item| {
+        if (!std.mem.startsWith(u8, item.key, meta_retired_segment_prefix)) break;
+        if (item.key.len != meta_retired_segment_prefix.len + 8) return error.InvalidRetiredSegmentMetadata;
+        page.ids[page.count] = std.mem.readInt(u64, item.key[meta_retired_segment_prefix.len..][0..8], .big);
+        page.count += 1;
+        entry = try cursor.next();
+        if (page.count == page.ids.len) break;
+    }
+    page.exhausted = if (entry) |item| !std.mem.startsWith(u8, item.key, meta_retired_segment_prefix) else true;
+    return page;
 }
 
 fn loadSegmentIdsForMetaPrefix(txn: *PersistentIndex.MainTxn, alloc: Allocator, prefix: []const u8) ![]u64 {
@@ -3803,6 +5068,11 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
 }
 
 fn extractSegmentDataKeyRange(alloc: Allocator, data: index_mod.SegmentData) !SegmentKeyRange {
+    return extractSegmentDataKeyRangeWithCancellation(alloc, data, null);
+}
+
+fn extractSegmentDataKeyRangeWithCancellation(alloc: Allocator, data: index_mod.SegmentData, canceled: ?*const std.atomic.Value(bool)) !SegmentKeyRange {
+    if (canceled) |flag| if (flag.load(.acquire)) return error.Canceled;
     var reader = try data.initReader(alloc);
     defer reader.deinit();
 
@@ -3828,6 +5098,7 @@ fn extractSegmentDataKeyRange(alloc: Allocator, data: index_mod.SegmentData) !Se
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
     for (0..reader.doc_count) |doc_idx| {
+        if (canceled) |flag| if (flag.load(.acquire)) return error.Canceled;
         identity_scratch.reset();
         const stored = .{ .id = (try reader.storedIdScoped(identity_scratch.allocator(), @intCast(doc_idx))) orelse continue };
         if (min_key == null or std.mem.order(u8, stored.id, min_key.?) == .lt) {
@@ -4571,6 +5842,213 @@ test "retired segment cleanup outlives persistent index close" {
         error.FileNotFound,
         verifier.storage().readFileAlloc(alloc, retired_path_b, 64),
     );
+}
+
+test "retired segment callbacks do not wait for native cleanup IO" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const State = struct {
+        memory: storage_io.MemoryStorage,
+        entered: std.Io.Event = .unset,
+        release_io: std.Io.Event = .unset,
+        queued: std.Io.Event = .unset,
+        single_calls: usize = 0,
+        batch_calls: usize = 0,
+        fn batch(ptr: *anyopaque, paths: []const []const u8) !void {
+            const memory: *storage_io.MemoryStorage = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("memory", memory);
+            try std.testing.expectEqual(@as(usize, 1), paths.len);
+            self.batch_calls += 1;
+            self.entered.set(std.testing.io);
+            self.release_io.waitUncancelable(std.testing.io);
+        }
+        fn single(ptr: *anyopaque, _: []const u8) !void {
+            const memory: *storage_io.MemoryStorage = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("memory", memory);
+            self.single_calls += 1;
+            return error.UnexpectedSynchronousDeletion;
+        }
+        fn drain(deleter: *RetiredSegmentFileDeleter) void {
+            deleter.retryFailedDeletes();
+        }
+        fn queue(self: *@This(), deleter: *RetiredSegmentFileDeleter) void {
+            RetiredSegmentFileDeleter.delete(deleter, 2);
+            self.queued.set(std.testing.io);
+        }
+    };
+    var state: State = .{ .memory = .init(a) };
+    defer state.memory.deinit();
+    var storage = state.memory.storage();
+    var vtable = storage.vtable.*;
+    vtable.delete_file_absolute = State.single;
+    vtable.delete_files_absolute = State.batch;
+    storage.vtable = &vtable;
+    var files = try SegmentFileStore.open(a, "/text", storage, false, .threaded, null);
+    defer files.close();
+    const deleter = try RetiredSegmentFileDeleter.init(a, &files);
+    defer deleter.release();
+    RetiredSegmentFileDeleter.delete(deleter, 1);
+    try std.testing.expectEqual(@as(usize, 0), state.single_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.batch_calls);
+    const worker = try std.Thread.spawn(.{}, State.drain, .{deleter});
+    defer worker.join();
+    defer state.release_io.set(io);
+    try state.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    const callback = try std.Thread.spawn(.{}, State.queue, .{ &state, deleter });
+    defer callback.join();
+    var returned = true;
+    state.queued.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } }) catch {
+        returned = false;
+    };
+    state.release_io.set(io);
+    try std.testing.expect(returned);
+    try std.testing.expectEqual(@as(usize, 0), state.single_calls);
+}
+
+test "retired segment native batches bound work and preserve failed retries" {
+    const a = std.testing.allocator;
+    const State = struct {
+        memory: storage_io.MemoryStorage,
+        calls: usize = 0,
+        largest: usize = 0,
+        fail: bool = true,
+        fn batch(ptr: *anyopaque, paths: []const []const u8) !void {
+            const memory: *storage_io.MemoryStorage = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("memory", memory);
+            self.calls += 1;
+            self.largest = @max(self.largest, paths.len);
+            if (self.fail) return error.TestCleanupFailure;
+        }
+    };
+    var state: State = .{ .memory = .init(a) };
+    defer state.memory.deinit();
+    var storage = state.memory.storage();
+    var vtable = storage.vtable.*;
+    vtable.delete_files_absolute = State.batch;
+    storage.vtable = &vtable;
+    var files = try SegmentFileStore.open(a, "/text", storage, false, .threaded, null);
+    defer files.close();
+    const deleter = try RetiredSegmentFileDeleter.init(a, &files);
+    defer deleter.release();
+    const n = RetiredSegmentFileDeleter.retry_attempts_per_boundary;
+    for (0..n * 3) |id| RetiredSegmentFileDeleter.delete(deleter, id);
+    deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectEqual(n, state.largest);
+    try std.testing.expectEqual(n * 3, deleter.retry_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deleter.completed_ids.items.len);
+    for (deleter.retry_entries.items) |*entry| entry.next_attempt_ns = std.math.maxInt(u64);
+    try std.testing.expect(deleter.nextWakeDelayNs().? > 0);
+    deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    state.fail = false;
+    for (deleter.retry_entries.items) |*entry| entry.next_attempt_ns = 0;
+    for (0..3) |_| deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+    try std.testing.expectEqual(@as(usize, 0), deleter.retry_entries.items.len);
+    try std.testing.expectEqual(n * 3, deleter.completed_ids.items.len);
+    deleter.disarm();
+    // Simulate the borrowed provider and its vtable being destroyed. Late
+    // callbacks and maintenance must use only the disarmed owned context.
+    deleter.storage.vtable = @ptrFromInt(@alignOf(storage_io.Storage.VTable));
+    RetiredSegmentFileDeleter.delete(deleter, 999);
+    deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+    try std.testing.expectEqual(@as(?u64, null), deleter.nextWakeDelayNs());
+}
+
+test "retired segment refused native sweeps back off without losing recovery progress" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try PersistentIndex.open(a, .{ .path = path });
+    defer pi.close();
+    const deleter = pi.retired_segment_file_deleter.?;
+    const original = deleter.storage;
+    defer deleter.storage = original;
+    const Probe = struct {
+        calls: usize = 0,
+        refuse: bool = true,
+        fn sweep(raw: *anyopaque, _: []const u8, after: ?u64) !?storage_io.Storage.TextRetirementSweep {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(?u64, 73), after);
+            if (self.refuse) return error.EnrichmentWaitCanceled;
+            return .{ .complete = true };
+        }
+    };
+    var probe: Probe = .{};
+    var vtable = original.vtable.*;
+    vtable.sweep_text_retirements = Probe.sweep;
+    deleter.storage = .{ .ptr = &probe, .vtable = &vtable };
+    pi.retirement_reconcile_pending = true;
+    pi.retirement_reconcile_after = 73;
+    pi.flushCompletedRetirementMarkersLocked();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(u8, 1), pi.retirement_failures);
+    try std.testing.expect(pi.retirement_retry_at_ns != 0);
+    try std.testing.expectEqual(@as(?u64, 73), pi.retirement_reconcile_after);
+    try std.testing.expect(pi.retirement_reconcile_pending);
+    // Hold the test's retry clock safely ahead even on a heavily shared host.
+    pi.retirement_retry_at_ns = std.math.maxInt(u64);
+    for (0..100) |_| pi.flushCompletedRetirementMarkersLocked();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(pi.retirementWakeDelayNs().? > 0);
+    try std.testing.expectEqual(pi.main_store_owner.lsmMaintenanceScore(), pi.lsmMaintenanceScore());
+    pi.retirement_retry_at_ns = 0;
+    probe.refuse = false;
+    pi.flushCompletedRetirementMarkersLocked();
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expect(!pi.retirement_reconcile_pending);
+    try std.testing.expectEqual(@as(?u64, null), pi.retirement_reconcile_after);
+    try std.testing.expectEqual(@as(u8, 0), pi.retirement_failures);
+    try std.testing.expectEqual(@as(?u64, null), pi.retirementWakeDelayNs());
+}
+
+test "retired segment recovery pages keep their cursor after interrupted discovery" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try PersistentIndex.open(a, .{ .path = path });
+    defer pi.close();
+    const deleter = pi.retired_segment_file_deleter.?;
+    const Batch = struct {
+        fn remove(_: *anyopaque, _: []const []const u8) !void {}
+    };
+    var vtable = deleter.storage.vtable.*;
+    vtable.delete_files_absolute = Batch.remove;
+    deleter.storage.vtable = &vtable;
+    deleter.defer_deletions = true;
+    const n = RetiredSegmentFileDeleter.retry_inspections_per_boundary;
+    {
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        for (0..n * 2 + 1) |id| try txn.put(.meta, &retiredSegmentMetaKey(id), "");
+        try txn.commit();
+    }
+    pi.retirement_reconcile_pending = true;
+    var read = try pi.beginReadMainTxn();
+    defer read.abort();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    deleter.allocator = failing.allocator();
+    const interrupted = pi.discoverRetiredSegmentFilesInTxn(&read);
+    deleter.allocator = a;
+    try std.testing.expectError(error.OutOfMemory, interrupted);
+    try std.testing.expectEqual(@as(?u64, null), pi.retirement_reconcile_after);
+    try std.testing.expect(pi.retirement_reconcile_pending);
+    try std.testing.expect(!try pi.discoverRetiredSegmentFilesInTxn(&read));
+    try std.testing.expectEqual(@as(?u64, n - 1), pi.retirement_reconcile_after);
+    try std.testing.expectEqual(n, deleter.retry_entries.items.len);
+    try std.testing.expect(!try pi.discoverRetiredSegmentFilesInTxn(&read));
+    try std.testing.expectEqual(n * 2, deleter.retry_entries.items.len);
+    try std.testing.expect(try pi.discoverRetiredSegmentFilesInTxn(&read));
+    try std.testing.expectEqual(@as(?u64, null), pi.retirement_reconcile_after);
+    try std.testing.expectEqual(n * 2 + 1, deleter.retry_entries.items.len);
 }
 
 test "retired segment cleanup bounds maintenance work per publication boundary" {
@@ -6129,8 +7607,8 @@ test "persistent modeled full-text compaction publish faults stay green" {
         pi.abandonAfterCrash();
 
         // The first writable owner sees the durable retirement marker, but its
-        // initial unlink fails. The next ordinary segment publication must
-        // retry from live-owner state rather than requiring another restart.
+        // initial unlink fails. After its backoff expires, an ordinary segment
+        // publication must retry from live state without requiring a restart.
         try device_model.injectDeleteFailureForPathContains("1.seg");
         pi = try PersistentIndex.open(alloc, opts);
         try expectPersistentTextCompactionView(alloc, &pi, 1, 0, 1, 1);
@@ -6142,6 +7620,12 @@ test "persistent modeled full-text compaction publish faults stay green" {
             _ = try txn.get(.meta, &retired_key);
         }
 
+        // Advance the fault fixture to the retry boundary without a wall-clock
+        // sleep. Production retries preserve their bounded failure backoff.
+        const deleter = pi.retired_segment_file_deleter.?;
+        platform_sync.lockYielding(&deleter.delete_mu);
+        for (deleter.retry_entries.items) |*entry| entry.next_attempt_ns = 0;
+        deleter.delete_mu.unlock();
         const followup = try buildSimpleSegment(alloc, "doc:followup", "followup");
         defer alloc.free(followup);
         try pi.indexSegment(followup);
@@ -6408,6 +7892,206 @@ test "persistent rebuild page publication scaling benchmark" {
     }
 }
 
+test "persistent segment admission publication allocation failures release consumed and unconsumed readers" {
+    const a = std.testing.allocator;
+    const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(bytes);
+    var source_reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer source_reader.deinit();
+    const metadata = try source_reader.admission(a);
+    defer metadata.deinit(a);
+    const footer = try segment_mod.SegmentReader.nativeCatalogFooter(.{ .contiguous = bytes });
+    const Run = struct {
+        fn run(alloc: Allocator, input: []const u8, descriptor: segment_mod.SegmentReader.Admission, expected_footer: segment_mod.SegmentReader.NativeCatalogFooter) !void {
+            var writer = try index_mod.IndexWriter.init(alloc);
+            defer writer.deinit();
+            const data = index_mod.SegmentData.fromNative(.{ .contiguous = input });
+            const reader = try segment_mod.SegmentReader.initNativeCatalogAdmission(alloc, data.source(), descriptor, expected_footer);
+            try PersistentIndex.publishCatalogAdmittedSegment(&writer, 17, data, reader);
+            try std.testing.expectEqual(@as(usize, 1), writer.snapshot().segments.len);
+            try std.testing.expectEqual(@as(u64, 17), writer.snapshot().segments[0].id);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ bytes, metadata, footer });
+}
+
+test "persistent recovery batches admitted and ordinary readers with allocation failure cleanup" {
+    const a = std.testing.allocator;
+    const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(bytes);
+    var source_reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer source_reader.deinit();
+    const metadata = try source_reader.admission(a);
+    defer metadata.deinit(a);
+    const footer = try segment_mod.SegmentReader.nativeCatalogFooter(.{ .contiguous = bytes });
+    const Run = struct {
+        fn run(alloc: Allocator, input: []const u8, descriptor: segment_mod.SegmentReader.Admission, expected_footer: segment_mod.SegmentReader.NativeCatalogFooter) !void {
+            var writer = try index_mod.IndexWriter.init(alloc);
+            defer writer.deinit();
+            var recovered: PersistentIndex.RecoveredSegments = .{ .alloc = alloc };
+            defer recovered.deinit();
+            for (0..3) |i| {
+                var data: ?index_mod.SegmentData = if (i == 1)
+                    index_mod.SegmentData.fromOwnedHeap(try alloc.dupe(u8, input))
+                else
+                    index_mod.SegmentData.fromNative(.{ .contiguous = input });
+                defer if (data) |*owned| owned.deinit(alloc);
+                var reader: ?segment_mod.SegmentReader = if (i == 1)
+                    try data.?.initReader(alloc)
+                else
+                    try segment_mod.SegmentReader.initNativeCatalogAdmission(alloc, data.?.source(), descriptor, expected_footer);
+                defer if (reader) |*owned| owned.deinit();
+                var bitmap: ?roaring.RoaringBitmap = if (i == 1) .init(alloc) else null;
+                defer if (bitmap) |*owned| owned.deinit();
+                if (bitmap) |*owned| try owned.add(0);
+                try recovered.append(17 + i, data.?, reader.?, bitmap);
+                data = null;
+                reader = null;
+                bitmap = null;
+            }
+            const epoch = writer.snapshot().epoch;
+            try recovered.publish(&writer);
+            try std.testing.expectEqual(epoch + 1, writer.snapshot().epoch);
+            try std.testing.expectEqual(@as(usize, 3), writer.snapshot().segments.len);
+            try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
+            try std.testing.expectEqual(@as(u64, 20), writer.next_segment_id);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ bytes, metadata, footer });
+}
+
+test "persistent reopen publishes one complete recovered snapshot with deletions" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        for (0..32) |i| {
+            var key: [32]u8 = undefined;
+            const bytes = try buildSimpleSegment(a, try std.fmt.bufPrint(&key, "doc:{d}", .{i}), "alpha");
+            defer a.free(bytes);
+            try index.indexSegment(bytes);
+        }
+        _ = try index.deleteById("doc:7");
+        try index.sync(true);
+    }
+    var reopened = try PersistentIndex.open(a, .{ .path = path });
+    defer reopened.close();
+    // IndexWriter starts with epoch 0; all 32 recovered entries publish once.
+    try std.testing.expectEqual(@as(u64, 1), reopened.snapshot().epoch);
+    try std.testing.expectEqual(@as(usize, 32), reopened.snapshot().segments.len);
+    try std.testing.expectEqual(@as(u32, 31), reopened.snapshot().liveDocCount());
+    // Raw segment statistics include tombstones, as before recovery batching.
+    try std.testing.expectEqual(@as(u32, 32), try reopened.snapshot().termDocFreq(a, "body", "alpha"));
+}
+
+test "lite persistent segment admission survives merge reopen and aborted catalog publication with legacy fallback" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/segment-admission.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const options: PersistentIndexOptions = .{
+        .path = "/admitted/index",
+        .io = std.testing.io,
+        .main_backend = .lsm,
+        .main_lsm_storage = storage.storage(),
+        .wal_backend = .lsm,
+        .wal_storage = storage.storage(),
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, options);
+    var live = true;
+    defer if (live) index.close();
+    const first = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(first);
+    const second = try buildSimpleSegment(a, "doc:b", "beta");
+    defer a.free(second);
+    try index.indexSegment(first);
+    const Builder = struct {
+        bytes: []const u8,
+        fn build(raw: *anyopaque, sink: *segment_mod.SegmentSink) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try sink.appendSlice(self.bytes);
+        }
+    };
+    var builder = Builder{ .bytes = second };
+    _ = try index.indexSegmentFromSinkBuilder(&builder, Builder.build);
+    try index.syncMain(true);
+    index.close();
+    live = false;
+    index = try PersistentIndex.open(a, options);
+    live = true;
+    for (index.snapshot().segments) |segment| try std.testing.expect(segment.reader.native.?.catalog_admitted);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    {
+        const snapshot = index.acquireSnapshot();
+        defer snapshot.release();
+        const ids = [_]u64{ snapshot.segments[0].id, snapshot.segments[1].id };
+        const merged = try index.prepareMergedSegmentToFile(snapshot, &.{ 0, 1 });
+        try std.testing.expect(try index.replaceSegmentsIfActiveManyPrepared(&ids, merged));
+    }
+    const id = index.snapshot().segments[0].id;
+    const marker_key = activeSegmentMetaKey(id);
+    const descriptor = (try index.readGenerationMetadataAlloc(a, &marker_key)).?;
+    defer a.free(descriptor);
+    try std.testing.expect(descriptor.len > 1);
+    // Navigation may be staged, but an aborted transaction publishes neither
+    // a phantom active ID nor its descriptor.
+    {
+        var txn = try index.beginWriteMainTxn();
+        defer txn.abort();
+        const phantom = activeSegmentMetaKey(id + 123);
+        try txn.put(.meta, &phantom, descriptor);
+    }
+    try index.syncMain(true);
+    index.close();
+    live = false;
+    index = try PersistentIndex.open(a, options);
+    live = true;
+    try std.testing.expectEqual(@as(usize, 1), index.snapshot().segments.len);
+    try std.testing.expect(index.snapshot().segments[0].reader.native.?.catalog_admitted);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    {
+        var txn = try index.beginWriteMainTxn();
+        errdefer txn.abort();
+        try txn.put(.meta, &marker_key, &.{1});
+        try txn.commit();
+    }
+    try index.syncMain(true);
+    index.close();
+    live = false;
+    index = try PersistentIndex.open(a, options);
+    live = true;
+    try std.testing.expect(!index.snapshot().segments[0].reader.native.?.catalog_admitted);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    {
+        var txn = try index.beginWriteMainTxn();
+        errdefer txn.abort();
+        descriptor[descriptor.len - 1] ^= 1;
+        try txn.put(.meta, &marker_key, descriptor);
+        try txn.commit();
+    }
+    try index.syncMain(true);
+    index.close();
+    live = false;
+    // Corrupt rich navigation is an admission failure, not permission to
+    // silently delete an acknowledged index segment from its active set.
+    try std.testing.expectError(error.InvalidSegmentAdmission, PersistentIndex.open(a, options));
+}
+
 test "lite persistent owned publication merge recovery and retained snapshot ownership without mapping" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -6576,7 +8260,9 @@ test "persistent reopen falls back to heap reads when foreign mapping is unavail
     }
     var foreign_storage = storage.storage();
     var vtable = foreign_storage.vtable.*;
-    // Exercise the existing heap fallback on a provider without native leases.
+    // Exercise the heap fallback on a provider without owned-copy or lease
+    // capabilities, even when the underlying adapter supports both.
+    vtable.open_resident_immutable_source = null;
     vtable.open_leased_immutable_source = null;
     vtable.map_immutable_artifact = Foreign.map;
     foreign_storage.vtable = &vtable;
@@ -6920,4 +8606,881 @@ test "empty lite persistent reopen preserves checkpoint" {
     defer reopened.close();
     try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
     try std.testing.expectEqual(@as(u32, 0), reopened.snapshot().liveDocCount());
+}
+
+test "lite persistent cache lifecycle preserves replayed WAL without publication" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/persistent-cache.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    // This regression exercises recovery of the compatibility LSM's WAL.
+    // Native namespaces have no main-store WAL or flush counter.
+    var compatibility_vtable = storage.storage().vtable.*;
+    compatibility_vtable.open_native_namespaces = null;
+    var compatibility = storage.storage();
+    compatibility.vtable = &compatibility_vtable;
+    const opts = PersistentIndexOptions{ .path = "/lite-text", .io = std.testing.io, .main_lsm_options = .{ .flush_threshold = 1024 }, .main_lsm_storage = compatibility, .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    for ([_][]const u8{ "first", "replacement" }) |value| {
+        {
+            var index = try PersistentIndex.open(a, opts);
+            defer index.close();
+            var txn = try index.beginWriteMainTxn();
+            errdefer txn.abort();
+            try txn.put(.meta, "cache-lifecycle-fixture", value);
+            try txn.commit();
+            const before_sync = index.snapshotLsmWriteStats().?.flushes;
+            const before_barrier = docs.file.activeCheckpoint();
+            try index.syncAppliedReplayBoundary();
+            try std.testing.expectEqualDeep(before_barrier, docs.file.activeCheckpoint());
+            try index.publishProjectionSeal(.{ .root = 1, .namespace = @splat(1), .generation = 1, .config_hash = 1, .applied_sequence = if (std.mem.eql(u8, value, "first")) 1 else 2 });
+            try std.testing.expectEqual(before_sync, index.snapshotLsmWriteStats().?.flushes);
+        }
+        const before = docs.file.activeCheckpoint();
+        for (0..8) |_| {
+            {
+                var index = try PersistentIndex.open(a, opts);
+                defer index.close();
+                try std.testing.expectEqualDeep(before.logical, docs.file.activeCheckpoint().logical);
+                try std.testing.expectEqual(before.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
+                var txn = try index.beginReadMainTxn();
+                defer txn.abort();
+                try std.testing.expectEqualStrings(value, try txn.get(.meta, "cache-lifecycle-fixture"));
+                const seal = (try index.loadProjectionSeal(a)).?;
+                try std.testing.expectEqual(@as(u64, if (std.mem.eql(u8, value, "first")) 1 else 2), seal.applied_sequence);
+            }
+            // Includes teardown: replayed, already durable mutable WAL state
+            // must not be flushed as a new physical index generation.
+            // Immutable reader leases may publish separate catalog metadata.
+            try std.testing.expectEqualDeep(before.logical, docs.file.activeCheckpoint().logical);
+            try std.testing.expectEqual(before.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
+        }
+    }
+}
+
+test "lite atomic replay preserves colliding aliases and advances bounded allocation across reopen" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/replay-collisions.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts: PersistentIndexOptions = .{
+        .path = "/collision/index",
+        .io = std.testing.io,
+        .main_backend = .lsm,
+        .main_lsm_storage = storage.storage(),
+        .wal_backend = .lsm,
+        .wal_storage = storage.storage(),
+        .main_lsm_options = .{ .flush_threshold = 32 * 1024 * 1024 },
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    try index.indexSegment(alpha);
+    var stager = (try index.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    const beta = try buildSimpleSegment(a, "doc:b", "beta");
+    defer a.free(beta);
+    var staged = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, beta)};
+    defer staged[0].deinit();
+    const identity: ReplayFragment.Identity = .{ .generation = 4, .config_hash = 5, .incarnation = 6 };
+    const checkpoint: ReplayFragment.Checkpoint = .{ .identity = identity, .position = .{ .sequence = 1, .next_item = 1, .total_items = 1, .fingerprint = @splat(7), .applied = true } };
+    const first = index.writer.next_segment_id;
+    const active_id = index.snapshot().segments[0].id;
+    index.writer.next_segment_id = active_id;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, index.publishReplay(&staged, &.{}, checkpoint));
+    index.writer.next_segment_id = first;
+    const active_path = try index.segment_files.?.pathAlloc(active_id);
+    defer a.free(active_path);
+    {
+        const raw = (try docs.file.getIndexCatalogRecordAlloc(a, active_path)).?;
+        defer a.free(raw);
+        try std.testing.expectEqualSlices(u8, alpha, raw);
+    }
+    // Simulate aliases left after physical staging but before metadata commit.
+    // Their contents must survive allocation, even when no active marker is
+    // present: another construction can still own the unpublished bytes.
+    for (0..70) |offset| {
+        const orphan_path = try index.segment_files.?.pathAlloc(first + offset);
+        defer a.free(orphan_path);
+        try docs.file.putIndexCatalogRecord(orphan_path, alpha);
+    }
+    try std.testing.expectError(error.EnrichmentWaitCanceled, index.publishReplay(&staged, &.{}, checkpoint));
+    try std.testing.expectEqual(first + 64, index.writer.next_segment_id);
+    try std.testing.expectEqual(@as(?ReplayFragment.Position, null), try index.loadReplayFragment(identity));
+    {
+        const orphan_path = try index.segment_files.?.pathAlloc(first);
+        defer a.free(orphan_path);
+        const raw = (try docs.file.getIndexCatalogRecordAlloc(a, orphan_path)).?;
+        defer a.free(raw);
+        try std.testing.expectEqualSlices(u8, alpha, raw);
+    }
+    index.close();
+    index_live = false;
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expectEqual(first + 64, index.writer.next_segment_id);
+    const infos = try index.publishReplay(&staged, &.{}, checkpoint);
+    index.freeDeleteInfos(infos);
+    try std.testing.expectEqual(first + 71, index.writer.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    for (0..70) |offset| {
+        const occupied_path = try index.segment_files.?.pathAlloc(first + offset);
+        defer a.free(occupied_path);
+        const raw = (try docs.file.getIndexCatalogRecordAlloc(a, occupied_path)).?;
+        defer a.free(raw);
+        try std.testing.expectEqualSlices(u8, alpha, raw);
+    }
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite atomic replay activates deletion segments and continuation together across uncertain commit" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/atomic-replay.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var docs_live = true;
+    defer if (docs_live) docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    // Exercise the compatibility WAL fault points deliberately. The direct
+    // native backend is covered independently and never appends this LSM WAL.
+    var compatibility_vtable = storage.storage().vtable.*;
+    compatibility_vtable.open_native_namespaces = null;
+    var compatibility = storage.storage();
+    compatibility.vtable = &compatibility_vtable;
+    const opts: PersistentIndexOptions = .{
+        .path = "/atomic/index",
+        .io = std.testing.io,
+        .main_backend = .lsm,
+        .main_lsm_storage = compatibility,
+        .wal_backend = .lsm,
+        .wal_storage = compatibility,
+        .main_lsm_options = .{ .flush_threshold = 32 * 1024 * 1024 },
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    try index.indexSegment(alpha);
+    const old = index.acquireSnapshot();
+    defer old.release();
+    var stager = (try index.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    const beta = try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    const multilingual = try buildSimpleSegment(a, "doc:b", "κόσμος");
+    defer a.free(multilingual);
+    var staged = [_]PreparedReplaySegment{ try prepareReplaySegment(a, stager, beta), try prepareReplaySegment(a, stager, multilingual) };
+    defer for (&staged) |*segment| segment.deinit();
+    const identity: ReplayFragment.Identity = .{ .generation = 4, .config_hash = 5, .incarnation = 6 };
+    var checkpoint: ReplayFragment.Checkpoint = .{ .identity = identity, .position = .{ .sequence = 1, .next_item = 1, .total_items = 2, .fingerprint = @splat(7), .applied = true } };
+    lsm_backend.Backend.test_commit_fault = .{ .at = .before_wal_append, .err = error.TestAtomicReplayCommitFailure };
+    defer lsm_backend.Backend.test_commit_fault = null;
+    try std.testing.expectError(error.TestAtomicReplayCommitFailure, index.publishReplay(&staged, &.{"doc:a"}, checkpoint));
+    try std.testing.expectEqual(@as(?ReplayFragment.Position, null), try index.loadReplayFragment(identity));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    const before_publication = index.snapshotLsmWriteStats().?.wal_append_records;
+    const before_checkpoint = docs.file.activeCheckpoint().commit_sequence;
+    const deletes = try index.publishReplay(&staged, &.{"doc:a"}, checkpoint);
+    try std.testing.expectEqual(before_publication + 1, index.snapshotLsmWriteStats().?.wal_append_records);
+    try std.testing.expectEqual(before_checkpoint + 1, docs.file.activeCheckpoint().commit_sequence);
+    index.freeDeleteInfos(deletes);
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));
+    var stale = checkpoint;
+    stale.position.next_item = 0;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, index.publishReplay(&.{}, &.{"doc:a"}, stale));
+    // A retained pre-commit reader sees neither the replacement nor its deletes.
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, old, "beta"));
+    const gamma = try buildSimpleSegment(a, "doc:a", "gamma");
+    defer a.free(gamma);
+    var uncertain = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, gamma)};
+    defer uncertain[0].deinit();
+    checkpoint.position.next_item = 2;
+    lsm_backend.Backend.test_commit_fault = .{ .at = .after_wal_append, .err = error.TestAtomicReplayCommitFailure };
+    try std.testing.expectError(error.TestAtomicReplayCommitFailure, index.publishReplay(&uncertain, &.{"doc:a"}, checkpoint));
+    try std.testing.expect(docs.file.checkpoint_publication_uncertain);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    index.prepareForCrashRollback();
+    index.abandonAfterCrash();
+    index_live = false;
+    docs.close();
+    docs_live = false;
+    docs = try lite_docs.Store.openWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    docs_live = true;
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    storage = lite_indexes.Store.init(a, &docs);
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "gamma"));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));
+    checkpoint.position = .{ .sequence = 2, .next_item = 1, .total_items = 1, .fingerprint = @splat(8), .applied = true };
+    const before_delete = index.snapshotLsmWriteStats().?.wal_append_records;
+    var primary = try docs.runtimeStore(a);
+    defer primary.deinit();
+    var scope = (try primary.nativePublicationScope(a)).?;
+    defer scope.deinit(a);
+    const Metadata = struct {
+        writer: *index_mod.IndexWriter,
+        scope: @import("native_publication.zig").Scope,
+        observed_guard: bool = false,
+        fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.writer.external_visibility_gate.tryLock()) {
+                self.writer.external_visibility_gate.unlock();
+                return error.TestMissingExternalVisibilityGuard;
+            }
+            self.observed_guard = true;
+            try view.putMetadata(self.scope, "\x00\x00replay-progress-test", "complete");
+        }
+    };
+    var metadata: Metadata = .{ .writer = &index.writer, .scope = scope };
+    const before_delete_checkpoint = docs.file.activeCheckpoint().commit_sequence;
+    const delete_only = try index.publishReplayWithMetadata(&.{}, &.{"doc:b"}, checkpoint, .{ .participant = .{ .ptr = &metadata, .stage = Metadata.stage } });
+    try std.testing.expect(metadata.observed_guard);
+    try std.testing.expectEqual(before_delete_checkpoint + 1, docs.file.activeCheckpoint().commit_sequence);
+    const durable_progress = (try docs.file.getDocumentAlloc(a, "\x00\x00replay-progress-test")).?;
+    defer a.free(durable_progress);
+    try std.testing.expectEqualStrings("complete", durable_progress);
+    index.freeDeleteInfos(delete_only);
+    try std.testing.expectEqual(before_delete + 1, index.snapshotLsmWriteStats().?.wal_append_records);
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+}
+
+test "persistent rebuild page preserves possibly committed artifacts across reopen" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    for ([_]bool{ false, true }) |after_wal| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rebuild-fault.aflite", .{tmp.sub_path});
+        defer a.free(path);
+        var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+        docs.maintenance_start_suppressed = true;
+        docs.file.externally_locked = true;
+        var docs_live = true;
+        defer if (docs_live) docs.close();
+        var storage = lite_indexes.Store.init(a, &docs);
+        var compatibility_vtable = storage.storage().vtable.*;
+        compatibility_vtable.open_native_namespaces = null;
+        var compatibility = storage.storage();
+        compatibility.vtable = &compatibility_vtable;
+        const opts: PersistentIndexOptions = .{
+            .path = "/rebuild/index",
+            .io = std.testing.io,
+            .main_backend = .lsm,
+            .main_lsm_storage = compatibility,
+            .wal_backend = .lsm,
+            .wal_storage = compatibility,
+            .main_lsm_options = .{ .flush_threshold = 32 * 1024 * 1024 },
+            .main_no_sync = true,
+            .wal_no_sync = true,
+        };
+        var index = try PersistentIndex.open(a, opts);
+        var index_live = true;
+        defer if (index_live) index.close();
+        var page: PersistentIndex.RebuildPage = .{ .index = &index, .cursor = "doc:a" };
+        var page_live = true;
+        defer if (page_live) page.deinit();
+        try page.begin();
+        const segment = try buildSimpleSegment(a, "doc:a", "recovered");
+        defer a.free(segment);
+        try index.indexSegment(segment);
+        lsm_backend.Backend.test_commit_fault = .{ .at = if (after_wal) .after_wal_append else .before_wal_append, .err = error.TestRebuildCommitFailure };
+        defer lsm_backend.Backend.test_commit_fault = null;
+        try std.testing.expectError(error.TestRebuildCommitFailure, page.commit());
+        try std.testing.expectEqual(after_wal, page.uncertain);
+        try std.testing.expectEqual(after_wal, docs.file.checkpoint_publication_uncertain);
+        try std.testing.expectEqual(@as(u32, 0), index.snapshot().liveDocCount());
+        page.deinit();
+        page_live = false;
+        index.prepareForCrashRollback();
+        index.abandonAfterCrash();
+        index_live = false;
+        docs.close();
+        docs_live = false;
+        docs = try lite_docs.Store.openWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+        docs_live = true;
+        docs.maintenance_start_suppressed = true;
+        docs.file.externally_locked = true;
+        storage = lite_indexes.Store.init(a, &docs);
+        index = try PersistentIndex.open(a, opts);
+        index_live = true;
+        const cursor = try index.rebuildCursorAlloc(a);
+        defer if (cursor) |value| a.free(value);
+        if (after_wal) try std.testing.expectEqualStrings("doc:a", cursor.?) else try std.testing.expect(cursor == null);
+        try std.testing.expectEqual(@as(usize, if (after_wal) 1 else 0), try persistentSearchHitCount(a, index.snapshot(), "recovered"));
+        try std.testing.expect((try docs.file.check()).valid);
+    }
+}
+
+test "lite direct native replay publishes metadata and artifacts in one checkpoint and reopens" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/direct-native-replay.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts: PersistentIndexOptions = .{
+        .path = "/indexes/text",
+        .io = std.testing.io,
+        .main_backend = .lsm,
+        .main_lsm_storage = storage.storage(),
+        .wal_backend = .lsm,
+        .wal_storage = storage.storage(),
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    try std.testing.expect(index.main_store_owner == .native);
+    try std.testing.expect(index.wal.store_owner == .native);
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    const initial_checkpoint = docs.file.activeCheckpoint().commit_sequence;
+    try index.indexSegment(alpha);
+    try std.testing.expectEqual(initial_checkpoint + 1, docs.file.activeCheckpoint().commit_sequence);
+    const old = index.acquireSnapshot();
+    defer old.release();
+    var stager = (try index.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    const beta = try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    var staged = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, beta)};
+    defer for (&staged) |*segment| segment.deinit();
+    const identity: ReplayFragment.Identity = .{ .generation = 4, .config_hash = 5, .incarnation = 6 };
+    const checkpoint: ReplayFragment.Checkpoint = .{ .identity = identity, .position = .{ .sequence = 1, .next_item = 1, .total_items = 1, .fingerprint = @splat(7), .applied = true } };
+    var primary_store = try @import("docstore.zig").DocStore.openRuntime(a, docs.backendStore());
+    defer primary_store.close();
+    const Primary = struct {
+        store: *@import("docstore.zig").DocStore,
+        writer: *index_mod.IndexWriter,
+        fail: bool = true,
+        fn commit(raw: *anyopaque, participant: @import("native_publication.zig").Participant) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const Joined = struct {
+                index: @import("native_publication.zig").Participant,
+                writer: *index_mod.IndexWriter,
+                fail: bool,
+                fn stage(ctx: *anyopaque, view: @import("native_publication.zig").View) !void {
+                    const joined: *@This() = @ptrCast(@alignCast(ctx));
+                    try joined.index.apply(view);
+                    if (joined.writer.external_visibility_gate.tryLock()) {
+                        joined.writer.external_visibility_gate.unlock();
+                        return error.MissingPrimaryVisibilityGuard;
+                    }
+                    if (joined.fail) return error.InjectedFailure;
+                }
+            };
+            var joined: Joined = .{ .index = participant, .writer = self.writer, .fail = self.fail };
+            try self.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "doc:a", .value = "beta" }}, &.{}, null, .{}, null, .{ .ptr = &joined, .stage = Joined.stage });
+        }
+    };
+    var primary: Primary = .{ .store = &primary_store, .writer = &index.writer };
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    try std.testing.expectError(error.InjectedFailure, index.publishReplayWithCommitter(&staged, &.{"doc:a"}, checkpoint, null, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+    try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expect((try docs.file.getDocumentAlloc(a, "doc:a")) == null);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    primary.fail = false;
+    const deletes = try index.publishReplayWithCommitter(&staged, &.{"doc:a"}, checkpoint, null, .{ .ptr = &primary, .commit_fn = Primary.commit });
+    index.freeDeleteInfos(deletes);
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expect(index.snapshotLsmWriteStats() == null);
+    index.close();
+    index_live = false;
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expect(index.main_store_owner == .native);
+    try std.testing.expect(index.wal.store_owner == .native);
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    const before_delete = docs.file.activeCheckpoint().commit_sequence;
+    try std.testing.expect(try index.deleteById("doc:a"));
+    try std.testing.expectEqual(before_delete + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    const primary_value = (try docs.file.getDocumentAlloc(a, "doc:a")).?;
+    defer a.free(primary_value);
+    try std.testing.expectEqualStrings("beta", primary_value);
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "native prepared group commits primary and two indexes atomically with stale and failure refusal" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-native-group.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    var indexes: [2]PersistentIndex = undefined;
+    var opened: usize = 0;
+    defer for (indexes[0..opened]) |*index| index.close();
+    const paths = [_][*:0]const u8{ "/indexes/first", "/indexes/second" };
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    const beta = try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    for (&indexes, paths) |*index, root| {
+        index.* = try PersistentIndex.open(a, .{ .path = root, .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = storage.storage(), .wal_backend = .lsm, .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true });
+        opened += 1;
+        try index.indexSegment(alpha);
+    }
+    var primary_store = try @import("docstore.zig").DocStore.openRuntime(a, docs.backendStore());
+    defer primary_store.close();
+    const Primary = struct {
+        store: *@import("docstore.zig").DocStore,
+        fail: bool,
+        fn commit(raw: *anyopaque, participant: @import("native_publication.zig").Participant) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const Joined = struct {
+                participant: @import("native_publication.zig").Participant,
+                fail: bool,
+                fn stage(ctx: *anyopaque, view: @import("native_publication.zig").View) !void {
+                    const joined: *@This() = @ptrCast(@alignCast(ctx));
+                    try joined.participant.apply(view);
+                    if (joined.fail) return error.InjectedFailure;
+                }
+            };
+            var joined: Joined = .{ .participant = participant, .fail = self.fail };
+            try self.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "doc:a", .value = "beta" }}, &.{}, null, .{}, null, .{ .ptr = &joined, .stage = Joined.stage });
+        }
+    };
+    var primary: Primary = .{ .store = &primary_store, .fail = true };
+    // Recreate failed handles; the logical artifacts remain reusable.
+    for (0..3) |attempt| {
+        var first_stager = (try indexes[0].acquireReplayStager(a)).?;
+        defer first_stager.deinit();
+        var second_stager = (try indexes[1].acquireReplayStager(a)).?;
+        defer second_stager.deinit();
+        var first_segments = [_]PreparedReplaySegment{try prepareReplaySegment(a, first_stager, beta)};
+        defer first_segments[0].deinit();
+        var second_segments = [_]PreparedReplaySegment{try prepareReplaySegment(a, second_stager, beta)};
+        defer second_segments[0].deinit();
+        var before: u64 = undefined;
+        {
+            const first = try indexes[0].prepareNativePublication(&first_segments, &.{"doc:a"}, null, null);
+            defer first.deinit();
+            const second = try indexes[1].prepareNativePublication(&second_segments, &.{"doc:a"}, null, null);
+            defer second.deinit();
+            if (attempt == 1) {
+                // Foreign metadata changes after preparation invalidate the exact
+                // second namespace. The first namespace must roll back too.
+                var foreign = try indexes[1].beginWriteMainTxn();
+                defer foreign.abort();
+                try foreign.put(.meta, "foreign-change", "new");
+                try foreign.commit();
+            }
+            before = docs.file.activeCheckpoint().commit_sequence;
+            if (attempt == 0) {
+                try std.testing.expectError(error.InjectedFailure, PersistentIndex.commitNativePublications(&.{ first, second }, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+            } else if (attempt == 1) {
+                primary.fail = false;
+                try std.testing.expectError(error.FileBusy, PersistentIndex.commitNativePublications(&.{ first, second }, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+            } else {
+                try PersistentIndex.commitNativePublications(&.{ first, second }, .{ .ptr = &primary, .commit_fn = Primary.commit });
+            }
+        }
+        try std.testing.expectEqual(before + @as(u64, if (attempt == 2) 1 else 0), docs.file.activeCheckpoint().commit_sequence);
+        if (attempt == 2) {
+            const value = (try docs.file.getDocumentAlloc(a, "doc:a")).?;
+            defer a.free(value);
+            try std.testing.expectEqualStrings("beta", value);
+        } else try std.testing.expect((try docs.file.getDocumentAlloc(a, "doc:a")) == null);
+        for (&indexes) |*index| {
+            try std.testing.expectEqual(@as(usize, if (attempt == 2) 0 else 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+            try std.testing.expectEqual(@as(usize, if (attempt == 2) 1 else 0), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+        }
+    }
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "native owned publication preparation never commits a collision frontier" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-collision-frontier.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    var index = try PersistentIndex.open(a, .{ .path = "/indexes/text", .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = storage.storage(), .wal_backend = .lsm, .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true });
+    defer index.close();
+    const start = index.writer.next_segment_id;
+    const files = &index.segment_files.?;
+    for (0..64) |offset| {
+        const occupied = try files.pathAlloc(start + offset);
+        defer a.free(occupied);
+        try files.storage.writeFileAbsolute(occupied, "occupied unpublished alias");
+    }
+    const beta = try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    var stager = (try index.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    var segments = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, beta)};
+    defer segments[0].deinit();
+    const checkpoint = docs.file.activeCheckpoint();
+    try std.testing.expectError(error.EnrichmentWaitCanceled, index.prepareNativePublication(&segments, &.{}, null, null));
+    try std.testing.expectEqualDeep(checkpoint, docs.file.activeCheckpoint());
+    try std.testing.expectEqual(start + 64, index.writer.next_segment_id);
+    // A new bounded preparation starts beyond the occupied prefix. Neither
+    // attempt needs an independent durability boundary for ID allocation.
+    const prepared = try index.prepareNativePublication(&segments, &.{}, null, null);
+    defer prepared.deinit();
+    try std.testing.expectEqualDeep(checkpoint, docs.file.activeCheckpoint());
+}
+
+test "native foreground identity binding publishes once and survives reopen deletion and merge" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-identity-binding.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts: PersistentIndexOptions = .{ .path = "/indexes/text", .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = storage.storage(), .wal_backend = .lsm, .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    var primary_store = try @import("docstore.zig").DocStore.openRuntime(a, docs.backendStore());
+    defer primary_store.close();
+    const Primary = struct {
+        store: *@import("docstore.zig").DocStore,
+        fn commit(raw: *anyopaque, participant: @import("native_publication.zig").Participant) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "doc:a", .value = "alpha" }}, &.{}, null, .{}, null, participant);
+        }
+    };
+    var primary: Primary = .{ .store = &primary_store };
+    const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(bytes);
+    // An unsealed identity cannot commit primary bytes or make postings visible.
+    for (0..2) |attempt| {
+        var stager = (try index.acquireReplayStager(a)).?;
+        defer stager.deinit();
+        var staged = [_]PreparedReplaySegment{try prepareNativeTextSegment(a, stager, bytes)};
+        defer staged[0].deinit();
+        const before = docs.file.activeCheckpoint().commit_sequence;
+        const prepared = try index.prepareNativePublication(&staged, &.{}, null, null);
+        defer prepared.deinit();
+        try std.testing.expectEqualStrings("doc:a", staged[0].ordinals.?.keys[0]);
+        try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+        if (attempt == 0) {
+            try std.testing.expectError(error.NativePublicationValueNotBound, PersistentIndex.commitNativePublications(&.{prepared}, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+            try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+            try std.testing.expect((try docs.file.getDocumentAlloc(a, "doc:a")) == null);
+            try std.testing.expectEqual(@as(usize, 0), index.snapshot().segments.len);
+        } else {
+            try staged[0].ordinals.?.bind(&.{913});
+            try PersistentIndex.commitNativePublications(&.{prepared}, .{ .ptr = &primary, .commit_fn = Primary.commit });
+            try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+            try std.testing.expectEqual(@as(?u32, 913), try index.snapshot().segments[0].reader.docOrdinal(0));
+        }
+    }
+    index.close();
+    index_live = false;
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expectEqual(@as(?u32, 913), try index.snapshot().segments[0].reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    // Portable segment consumers (mixed splits) receive an inline column.
+    var exported = try index.readStoredSegment(a, index.snapshot().segments[0].id);
+    defer exported.deinit(a);
+    var portable_reader = try segment_mod.SegmentReader.init(a, exported.segment_bytes);
+    defer portable_reader.deinit();
+    try std.testing.expectEqual(@as(?u32, 913), try portable_reader.docOrdinal(0));
+    // Whole-segment handoff must retain the same identities too.
+    var child_opts = opts;
+    child_opts.path = "/indexes/child";
+    var child = try PersistentIndex.open(a, child_opts);
+    var child_live = true;
+    defer if (child_live) child.close();
+    try std.testing.expectEqual(@as(usize, 1), try index.handoffRightOnlySegmentsToChild(&child, "doc:0"));
+    try std.testing.expectEqual(@as(?u32, 913), try child.snapshot().segments[0].reader.docOrdinal(0));
+    child.close();
+    child_live = false;
+    child = try PersistentIndex.open(a, child_opts);
+    child_live = true;
+    try std.testing.expectEqual(@as(?u32, 913), try child.snapshot().segments[0].reader.docOrdinal(0));
+    const old = index.acquireSnapshot();
+    defer old.release();
+    try std.testing.expect(try index.deleteById("doc:a"));
+    try std.testing.expectEqual(@as(?u32, 913), try index.snapshot().segments[0].reader.docOrdinal(0));
+    index.close();
+    index_live = false;
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expectEqual(@as(?u32, 913), try index.snapshot().segments[0].reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    // Real compaction consumes the bound ordinal through the ordinary merger.
+    const merged = try segment_mod.mergeSegmentInputs(a, &.{.{ .reader = &old.segments[0].reader }});
+    defer a.free(merged);
+    var merged_reader = try segment_mod.SegmentReader.init(a, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqual(@as(?u32, 913), try merged_reader.docOrdinal(0));
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "owned native publication survives complete backend replacement and activates with its original accounting owner" {
+    try testOwnedPublicationRuntimeReplacement(false, false);
+}
+
+test "owned native publication retains large staged extents across complete backend replacement" {
+    try testOwnedPublicationRuntimeReplacement(true, false);
+}
+
+test "owned native input preparation builds resident replacements after complete backend teardown" {
+    try testOwnedPublicationRuntimeReplacement(false, true);
+}
+
+test "owned native input preparation builds extent replacements after complete backend teardown" {
+    try testOwnedPublicationRuntimeReplacement(true, true);
+}
+
+fn testOwnedPublicationRuntimeReplacement(large: bool, detached_inputs: bool) !void {
+    const a = std.testing.allocator;
+    const backend_mod = @import("lite/backend.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/owned-publication-runtime.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .externally_locked = true, .reclamation = .{ .enabled = false } });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    const original_manager = backend.owned_resource_manager.?;
+    var adapter = lite_indexes.Store.init(a, backend.native_docstore.?);
+    var opts: PersistentIndexOptions = .{ .path = "/indexes/text", .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = adapter.storage(), .wal_backend = .lsm, .wal_storage = adapter.storage(), .main_no_sync = true, .wal_no_sync = true };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    const beta = if (large) large_segment: {
+        const small = try buildSimpleSegment(a, "doc:a", "beta");
+        defer a.free(small);
+        var reader = try segment_mod.SegmentReader.init(a, small);
+        defer reader.deinit();
+        const body = try a.alloc(u8, 1024 * 1024 + 12);
+        defer a.free(body);
+        @memcpy(body[0..10], "{\"noise\":\"");
+        var random = std.Random.DefaultPrng.init(17019);
+        random.random().bytes(body[10 .. body.len - 2]);
+        for (body[10 .. body.len - 2]) |*byte| byte.* = "0123456789abcdef"[byte.* & 15];
+        @memcpy(body[body.len - 2 ..], "\"}");
+        var builder = segment_mod.SegmentWriter.init(a);
+        defer builder.deinit();
+        try builder.addStoredDoc("doc:a", body);
+        try builder.addSection(try builder.addField("body"), .inverted_text, (try reader.getSection("body", .inverted_text)).?);
+        const built = try builder.build();
+        errdefer a.free(built);
+        try std.testing.expect(built.len > @import("lite/artifact_source.zig").OwnedBytes.maximum_length);
+        break :large_segment built;
+    } else try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    try index.indexSegment(alpha);
+    const old = index.acquireSnapshot();
+    defer old.release();
+    var stager = (try index.acquireReplayStager(a)).?;
+    var stager_live = true;
+    defer if (stager_live) stager.deinit();
+    var staged = [_]PreparedReplaySegment{try prepareNativeTextSegment(a, stager, beta)};
+    defer staged[0].deinit();
+    var seal_builder: ?@import("native_publication_value.zig").Builder = null;
+    defer if (seal_builder) |*builder| builder.deinit();
+    var seal_template: ?projection_seal.Seal = null;
+    var metadata: ?PersistentIndex.ReplayPublicationMetadata = null;
+    {
+        seal_builder = try index.writer.native_resources.?.createPublicationValue(@sizeOf(projection_seal.Seal.Encoded));
+        var value = seal_builder.?.value();
+        defer value.deinit();
+        const Noop = struct {
+            fn stage(_: *anyopaque, _: @import("native_publication.zig").View) !void {}
+        };
+        metadata = .{ .participant = .{ .ptr = &seal_template, .stage = Noop.stage }, .seal = .{ .root = 1, .namespace = @splat(1), .generation = 1, .config_hash = 2, .applied_sequence = 1 }, .seal_binding = .{ .value = value, .template = &seal_template } };
+    }
+    var inputs: ?PersistentIndex.NativePreparation = if (detached_inputs) try index.captureNativePreparation(staged.len) else null;
+    var inputs_live = inputs != null;
+    defer if (inputs_live) inputs.?.deinit();
+    var prepared_optional: ?*PersistentIndex.PreparedNativePublication = if (detached_inputs) null else try index.prepareOwnedNativePublication(&staged, &.{"doc:a"}, null, metadata);
+    var prepared_live = prepared_optional != null;
+    defer if (prepared_live) prepared_optional.?.deinit();
+    index.close();
+    index_live = false;
+    stager.deinit();
+    stager_live = false;
+    backend.deinit();
+    backend_live = false;
+    if (inputs) |*seed| {
+        prepared_optional = try seed.build(&staged, &.{"doc:a"}, metadata);
+        prepared_live = true;
+        seed.deinit();
+        inputs_live = false;
+    }
+    const prepared = prepared_optional.?;
+    try std.testing.expect(prepared.index == null);
+    try std.testing.expect(prepared.runtime_detached);
+    // Fixed native metadata can receive authoritative identities with no
+    // originating runtime, mutable index, primary Store or writer gate left.
+    try staged[0].ordinals.?.bind(&.{913});
+    if (seal_builder) |*builder| {
+        var seal = seal_template.?;
+        seal.applied_sequence = 19;
+        try builder.write(0, &try seal.encode());
+        try builder.seal();
+    }
+    backend = try backend_mod.Handle.open(a, path, .{ .io = std.testing.io, .no_sync = true, .externally_locked = true, .reclamation = .{ .enabled = false } });
+    backend_live = true;
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    try std.testing.expect(original_manager != backend.owned_resource_manager.?);
+    adapter = lite_indexes.Store.init(a, backend.native_docstore.?);
+    opts.main_lsm_storage = adapter.storage();
+    opts.wal_storage = adapter.storage();
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    {
+        var primary_store = try @import("docstore.zig").DocStore.openRuntime(a, backend.native_runtime_store.?);
+        defer primary_store.close();
+        const Primary = struct {
+            store: *@import("docstore.zig").DocStore,
+            fn commit(raw: *anyopaque, participant: @import("native_publication.zig").Participant) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "doc:a", .value = "beta" }}, &.{}, null, .{}, null, participant);
+            }
+        };
+        var primary: Primary = .{ .store = &primary_store };
+        const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        try prepared.bindTarget(&index);
+        try PersistentIndex.commitNativePublications(&.{prepared}, .{ .ptr = &primary, .commit_fn = Primary.commit });
+        try std.testing.expectEqual(before + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(@as(usize, 1), prepared.infos.len);
+        prepared.deinit();
+        prepared_live = false;
+    }
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    try std.testing.expect(index.snapshot().native_resources.?.resource_manager.? == original_manager);
+    try std.testing.expectEqual(@as(u64, 19), (try index.loadProjectionSeal(a)).?.applied_sequence);
+    const retained = index.acquireSnapshot();
+    defer retained.release();
+    try std.testing.expect((try backend.native_docstore.?.file.check()).valid);
+    index.close();
+    index_live = false;
+    backend.deinit();
+    backend_live = false;
+    try std.testing.expectEqual(@as(?u32, 913), try retained.segments[retained.segments.len - 1].reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, retained, "beta"));
+    _ = original_manager.sliceStats(.graph_predicate_cache);
+}
+
+test "native index publication refuses stale loaded snapshots despite an advanced reserved ID frontier" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("lite/backend.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/stale-loaded-index.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .externally_locked = true, .reclamation = .{ .enabled = false } });
+    defer backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var adapter = lite_indexes.Store.init(a, backend.native_docstore.?);
+    const options: PersistentIndexOptions = .{ .path = "/indexes/text", .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = adapter.storage(), .wal_backend = .lsm, .wal_storage = adapter.storage(), .main_no_sync = true, .wal_no_sync = true };
+    var old = try PersistentIndex.open(a, options);
+    defer old.close();
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    try old.indexSegment(alpha);
+    var current = try PersistentIndex.open(a, options);
+    defer current.close();
+    const beta = try buildSimpleSegment(a, "doc:b", "beta");
+    defer a.free(beta);
+    try current.indexSegment(beta);
+    try std.testing.expect(!old.native_snapshot_identity.?.eql(current.native_snapshot_identity.?));
+    // Reservations do not prove that this serving snapshot incorporated a
+    // peer publication. A high local frontier must not bypass that witness.
+    old.writer.next_segment_id += 1024;
+    const gamma = try buildSimpleSegment(a, "doc:c", "gamma");
+    defer a.free(gamma);
+    var stager = (try old.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    var segments = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, gamma)};
+    defer segments[0].deinit();
+    const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    if (old.publishPreparedSegments(&segments, &.{})) |infos| {
+        old.freeDeleteInfos(infos);
+        return error.StaleLoadedIndexSnapshotWasPublished;
+    } else |err| try std.testing.expectEqual(error.EnrichmentWaitCanceled, err);
+    try std.testing.expectEqual(before, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, current.snapshot(), "beta"));
+    try std.testing.expect((try backend.native_docstore.?.file.check()).valid);
 }

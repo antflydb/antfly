@@ -1,0 +1,59 @@
+{
+  "scope": "Independent local correctness qualification for scoped replay admission; not end-to-end performance qualification.",
+  "parent_commit": "59523dde609174edf8b34b31332316162d540209",
+  "mode": "Debug",
+  "library_sha256": "255d55a476fce224f41db9348751163a17793b7f8903bb907211cdeac0f544f5",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "3222345f4a90c0a8250ca6b50b3489cfd609255b944ce78b9dad302e74020e6f",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "3ee448c6dfbee0a60ce2e5a5d6326b3f9b011d7c66cbbf92a97f99356145544a",
+    "zig/pkg/antfly-embedded/src/storage/db/execution_resources.zig": "e690e30016bd156772acf236f7185ec6dc1ab497799629947f0b82819b0cfe28",
+    "zig/pkg/antfly-embedded/src/storage/db/mutation_materialization.zig": "b125a369d10af04dc6abbac0c34e688112722f4a9be4675b492308e70f2cc73b",
+    "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "827e3950e4303cac979ff37b9ca55d6bc32fe1899a32d4ac1a8139ec028ff214",
+    "zig/pkg/antfly-embedded/src/storage/lite/index_scope.zig": "d3382678a25470af84bd3aafb903b55c0c4cecf206a2aef87623b00d295a7977",
+    "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig": "5495a1c58115c9e3cd8895f049452dddc24ab0cab06aa749eeea735a1d70d282",
+    "scripts/bench/lite_catalog_accounting.py": "eb1c623829d292fb4cde3be8a96a8a69a9f0991330b5c564ccea9fd4c637c1d4"
+  },
+  "format_revision": 12,
+  "regressions": [
+    "Unrelated index changes before every publication permit text progress; table-wide admission refuses on the same captured runtime.",
+    "Target-index changes refuse publication.",
+    "Catalog changes refuse publication even after allocator-only admission has adopted the current header.",
+    "Dropped and recreated target refuses activation.",
+    "Fragment continuation remains observable and survives runtime replacement.",
+    "Scope identities and file effects commit and abort together; cross-domain rename invalidates both domains.",
+    "Unchanged inline file writes preserve the identity and checkpoint count.",
+    "Existing long-key update/delete page-read budgets remain unchanged."
+  ],
+  "validation": {
+    "native": {
+      "passed": 791,
+      "skipped_benchmarks": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_local": {
+      "passed": 361,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_owner": {
+      "passed": 87,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    "native_accounting_parity_and_corruption_detection": {
+      "passed": 1
+    },
+    "gate_wall_seconds": 498.961
+  },
+  "qualified": false,
+  "limitations": [
+    "The original-importer backlog failure has not been rerun on this candidate.",
+    "No new throughput, latency or storage-plateau claim.",
+    "Final optimized qualification on wolfspider remains pending.",
+    "Queued retirement, combined primary/index commit groups and one-sync native commits remain separate unfinished architecture work."
+  ],
+  "retention": "Accounting and unit fixtures were closed and removed; existing failed import fixture remains in place. No new database archive or baseline run."
+}

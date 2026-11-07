@@ -1,0 +1,101 @@
+{
+  "scope": "Native primary/index prepared publication, native graph/sparse/HBC metadata, logical namespace snapshots, atomic ordinary text activation; full architecture remains in progress.",
+  "parent_commit": "ff26ffd949bad0bf8396aa1c0a9efa672c1d8cba",
+  "mode": "Debug",
+  "format_revision": 14,
+  "namespace_layout": "AFNS1",
+  "library_sha256": "a82b51c2d5cd9fb99fab79e37aa5f6b3e5424bfa7fbd4249950b2d0515c7a873",
+  "source_sha256": {
+    "docs/design/lite-performance/native-index-publication.md": "9781d15e53481ce1c88c38f06fc7e6ce292145c03efdcbe3ff698567143b091b",
+    "scripts/bench/lite_catalog_accounting.py": "bc47611c8636e83f526f7bb6b8d3f462d7caf4a7eab173a0bfaddc01fe516650",
+    "scripts/bench/test_lite_catalog_accounting.py": "0f837bbebf09c5372b72b8b86643c8a61c306bb1137cd1a2d4c8dbcbe66ff63d",
+    "zig/LITE.md": "a851feaaaa87c178153e4d7d5f11e1f25676fc9f4ce40ac2d0bc2f1fbaf7a918",
+    "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "a27fa237508ff054e68a1ce3d51b51e59d1238ae56321413f8f359f6bdaf1eb2",
+    "zig/pkg/antfly-embedded/src/graph/graph.zig": "789c59b1b4d304691f9609f561362eccf16504d4ae60d35ce11b87009e146c6e",
+    "zig/pkg/antfly-embedded/src/sparse/sparse.zig": "fcc935bef97b4aa7bc4e2b1349aa72f0178e9532347afecb5a4c87b3e0c81e1a",
+    "zig/pkg/antfly-embedded/src/storage/backend_erased.zig": "720ba2e8593a714e1b7b83a9b59af6c210003528e5f43c10df7131bb41e48818",
+    "zig/pkg/antfly-embedded/src/storage/backend_types.zig": "85faf1a51b1ec3f5fd25aba3f257560f0f72a66df05bb8e4ab106e36292c6277",
+    "zig/pkg/antfly-embedded/src/storage/db/catalog/index_manager.zig": "34b43373e15d4f3890ebc03769150a8a49f0245a0fad0c9fcdb2430a4419c17d",
+    "zig/pkg/antfly-embedded/src/storage/docstore.zig": "f466af644404e9ffde14cbec7c3fbfc05c7ab00dfb3b0bbc86088120726c7e5e",
+    "zig/pkg/antfly-embedded/src/storage/hbc_adapter.zig": "a7da64ef823315472dac21ed93072fd5859de12c01a285acf4afb19d04020c01",
+    "zig/pkg/antfly-embedded/src/storage/hbc_backend.zig": "59e6687d37d764273ad4ac9a3da4e35c70822c6ac1803f32b1b2eb6f807f5766",
+    "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig": "c67941cd42891fbdc0b22744788095173ea8546328bdd95afb813b9396a3f6d6",
+    "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig": "e324b2ef594f957e644fd96b8c800a66848e2d8ccccdeee5c8245a748687ac1f",
+    "zig/pkg/antfly-embedded/src/storage/lite/namespace_store.zig": "3f0f0a28e5f3ec593c74dd3112996e9b4ab5067c25c24c81f99a975897e80a88",
+    "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "88331982b83d4e68392b65e34321bbb88e2f99a4eab867cf80978efc6d8e943d",
+    "zig/pkg/antfly-embedded/src/storage/lite/publication_host.zig": "bbf23e8196a1496434bec626cc67536774059cfc8e445efdefff584b288028f6",
+    "zig/pkg/antfly-embedded/src/storage/native_publication.zig": "37a88fa2c5d2428bf7628be32af94b7b5b10d984005967cc133f14e503318df0",
+    "zig/pkg/antfly-embedded/src/storage/persistent.zig": "0c5f31c7bef8711e16dd6137a3315170c78c9f5770672639cac03808680a2b3f",
+    "zig/pkg/antfly/src/storage_batch_contract_test_root.zig": "35e30eebfbb79b8d064415b7074f08e3c4eec18f93cf61abb44b9a5d450a4a53",
+    "zig/pkg/antfly-embedded/src/storage/namespace_bound_store.zig": "2be76d8a22fb7f8ec42dc18ed075b0a88150f905a5c96ebf3f7874d1b7e94637",
+    "zig/pkg/antfly-embedded/src/storage/native_catalog_mutation.zig": "a5979a19c572b44a84d0cb621b3269677ad16c7b2f36498235d685034dbb3359"
+  },
+  "implemented": [
+    "Owned namespace transactions detach after refusing live cursors and releasing their metadata snapshots; a primary native transaction can stage them with document effects.",
+    "Prepared persistent text publication accepts a primary committer and guards new snapshot captures until infallible activation after durability; group uncertainty is returned to the originating primary caller.",
+    "Namespace frontier and continuation checks retain one exact generation witness throughout preparation.",
+    "New hosted graph, sparse and HBC metadata roots use native namespaces; existing LSM roots retain authority.",
+    "Native ordinary text insertion/deletion and prepared multi-segment sets use atomic artifact/metadata activation, preserving replay checkpoints.",
+    "Logical namespace snapshots retain data frontiers and reject allocator inspection; full inspection snapshots retain metadata fences.",
+    "Revision 14 fences older graph/vector implementations while preserving revision-13 decoding and the existing atomic owner migration protocol.",
+    "The mixed-index handoff regression now exercises an actual range-backed text artifact rather than depending on removed graph SST files."
+  ],
+  "validation": {
+    "complete_debug_gate_exit_code": 0,
+    "complete_debug_gate_wall_seconds": 681.018,
+    "native": {
+      "passed": 803,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_local": {
+      "passed": 362,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "capi_owner": {
+      "passed": 87,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    "persistent": {
+      "passed": 81,
+      "skipped": 1,
+      "failed": 0,
+      "leaked": 0
+    },
+    "wal": {
+      "passed": 110,
+      "failed": 0,
+      "leaked": 0
+    },
+    "wal_portable": {
+      "passed": 4,
+      "failed": 0,
+      "leaked": 0
+    },
+    "focused_native_prepared_activation": {
+      "passed": 9,
+      "failed": 0,
+      "leaked": 0
+    },
+    "abi_exports": 138,
+    "accounting_parity_and_corruption_detection": {
+      "passed": 1
+    },
+    "post_gate_changes": "Repository license-header normalization only; runtime code unchanged."
+  },
+  "qualified": false,
+  "remaining": [
+    "Integrate foreground owned text preparation and primary/index publication across complete logical requests, preserving identities, predicates, transforms and consumer ordering.",
+    "Compose same-index publication cohorts before writer admission; separate prepared replacements must not deadlock a shared commit group.",
+    "Batch posting deltas independently of RPC boundaries.",
+    "Integrate and crash-model the one-sync proof/anchor protocol; current production code retains safe existing barriers.",
+    "Complete semantic generation and physical retirement/resource separation.",
+    "Unchanged importer, SDKs and final optimized wolfspider qualification using retained references; no baseline rerun."
+  ],
+  "retention": "No per-run database archive; synthetic unit fixtures clean themselves. Existing failed qualification inputs stay in place. Full factory belongs to Beads."
+}

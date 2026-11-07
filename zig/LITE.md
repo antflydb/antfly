@@ -195,6 +195,9 @@ The implementation now consists of:
   and vacuum copies stage pages by address and coalesce contiguous runs into
   positional writes. When the buffer fills, it drains the earliest contiguous
   run and retains later pages so late packed-record pages can fill their gaps.
+  Page payloads stay in fixed slots; only bounded descriptors move. Out-of-order
+  contiguous runs gather each flushed page at most once in a second 64 KiB
+  buffer, while ordered runs write directly and retained pages are never copied.
   Fragmented free-page runs flush separately. Value-chain writers retain only
   one next-page ID. A completed tree is flushed before its root can be read or
   published. A failed flush admits none of its requested pages and poisons its batch; abort drops
@@ -684,13 +687,14 @@ Antfly Lite should match the familiar embedded database model:
 - Serialized threading within a process: one handle may be shared by any
   number of threads, with reads running in parallel and alongside writes. See
   `CAPI.md` "Thread Safety" for the per-call access classes.
-- Background full-text replay holds the writer lease only briefly. One journal
-  record can carry about a thousand changed documents; bounded replay applies
-  it in subchunks (`ANTFLY_LITE_FULL_TEXT_REPLAY_SUBCHUNK_ITEMS`, default 128)
-  and, once a turn exceeds its quantum (`ANTFLY_LITE_FULL_TEXT_REPLAY_QUANTUM_MS`,
-  default 100), publishes the applied prefix, records a durable resume point
-  `(sequence, offset)` and continues the record on the next turn. The record's
-  sequence is marked applied only when all of its items are.
+- Background full-text replay splits oversized journal records into durable
+  document-family fragments. Deletions, overwrites and asset keys for a primary
+  document stay in the same fragment. The adaptive preparation budget targets
+  25 ms of preparation initially and adapts up to 200 ms to amortize measured
+  publication cost. Retention pressure restores the 25 ms target immediately.
+  These are sizing targets, not latency guarantees for storage publication. Resume
+  state is bound to the index generation, configuration and table incarnation,
+  and the record's applied sequence advances only after every fragment is durable.
 
 The CLI should expose this plainly:
 
@@ -1164,16 +1168,144 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-7 files (`AFLITE\x07P`) with packed records and
+Native owners create revision-17 files (`AFLITE\x11P`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revision 3 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8, 9, 10, 11, 12, 13, 14, 15 and 16 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-7 signature before checkpoint selection.
+and older binaries reject the revision-17 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-7 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-17 image.
+
+
+Revision 17 permits normalized text posting deltas in authenticated segment-v7
+containers. Small native text publications retain the selected analyzer's exact
+terms, frequencies, positions and field lengths, together with ordinary typed
+values and native document identities. Tail queries decode bounded immutable
+posting arrays without compiling a compressed term dictionary or FST. Window
+freezing targets 256 contributed documents or 4 MiB, with a 32-fragment
+cap independent of request boundaries. Native producer admission still bounds
+total live segments and retained bytes while a freeze is in flight. Its configured
+watermark also limits window fanout, so small limits cannot deadlock waiting for
+a window that cannot fill. Frozen output uses the existing segment-v6 posting
+format; old containers remain readable. Activating a window replacement and
+retiring its source aliases uses the same checked native publication and reader
+leases as ordinary merges. Revision-16 binaries reject the new file signature
+before they can incorrectly treat a normalized tail as an empty text index.
+
+Revision 16 adds native-owned document-ordinal columns for prepared text
+publication, independently of immutable posting bytes. Older inline ordinal
+sections remain readable. Active metadata and its ordinal column publish in
+the same native transaction as primary document identities.
+
+Revision 15 adds authenticated per-checkpoint physical postimage manifests.
+Eligible synced native transactions write their pages, allocator seal, manifest
+and checked recovery slot before one file sync. An exact inode/namespace-bound
+witness is written after that sync; losing the optional witness requires a
+recovery sync before another transaction can anchor the recovered state. Recovery
+validates the complete selected manifest when its witness is absent, and falls
+back to the older checkpoint if any required postimage is missing or torn.
+Both recovery slots retain all physical postimages through their prior sequence.
+Proof metadata has bounded retirement independent of logical-only readers.
+
+Manifest collection is limited to 16,384 physical pages and 64 MiB per transaction.
+Allocation failure or overflow disables this optimization rather than publishing
+an incomplete manifest. Verified allocator maintenance uses the same checked
+one-sync protocol. Unverified maintenance, private namespace rebinding, raw
+writes, deferred durability and overflow retain the data-before-checkpoint
+protocol. `no_sync` retains its weaker
+contract and never publishes durability witnesses. Private snapshot and generation
+publication drop proofs before changing the file namespace or allocator seal.
+See [the native commit protocol](../docs/design/lite-performance/native-commit-proofs.md)
+for recovery and retention invariants.
+
+
+New hosted native text indexes store their main namespaces and logical WAL
+entries directly in the native index catalog. Graph forward/reverse stores, sparse
+indexes and HBC vector metadata use the same native namespace engine. Revision 14
+fences older binaries that would otherwise interpret these new graph/vector roots
+as empty filesystem LSMs. They do not create inner LSM
+manifests, mutable tables or replay WALs for those stores. The `AFNS1` generation
+record identifies this namespace layout. Namespace names and keys use ordered
+hex encoding with bounded path components, keeping binary keys compatible with
+generation manifests, subtree deletion and repair. Existing LSM roots retain
+the compatibility backend until their generation is rebuilt; selecting an empty
+native namespace must never bypass an existing LSM root.
+
+Native namespace transactions prepare owned changes and generation witnesses
+before queuing publication, release their metadata snapshot before waiting for
+writer admission, and validate the exact inode, file namespace and generation at
+commit. Artifact activation and projection progress participate in that same
+native transaction. Prepared text snapshots release writer serialization while
+waiting, then validate both base-snapshot identity and deletion revisions before
+binding the live writer for durable publication and allocation-free activation.
+Eligible owned document plans publish primary changes, native text activation,
+document ordinals, replay progress and request receipts in one native transaction.
+A bounded file-lifetime queue groups compatible, disjoint logical requests before
+writer admission. Each request retains its own sequence, receipt and result;
+conflicting key sets currently use ordered individual publication. Revision 15's
+checked postimage protocol supplies the one-sync durability boundary for eligible
+groups. Overflow and unsupported preparation retain the conservative commit path.
+
+Struct and JSON document batches capture an owned catalog plan under a short
+lifetime guard, then map document, graph-field and direct embedding inputs before
+writer admission. The commit validates exact catalog and namespace identities;
+transforms and predicates still resolve against the authoritative transaction.
+Prepared allocations use the database owner's allocator, including across the
+shared-library boundary. Benchmark profiles report consumed and fallback document
+counts so an unused preparation plan cannot masquerade as a performance gain.
+
+Revision 12 adds durable per-index mutation identities in the index catalog.
+Identity changes publish in the same native transaction as index files, including
+append, rename and deletion. Detached text publication validates its own index
+identity under writer admission, so an unrelated index cannot invalidate its
+prepared work. Structural catalog and inode checks remain mandatory. The new
+signature fences older writers that do not maintain these identities.
+
+Revision 11 adds seekable canonical family chunks with a fixed-size Merkle-root
+manifest. Each physical chunk decodes at most 64 families. A replay turn reads
+only the chunks needed by its current family and byte budget; physical chunk
+boundaries do not force additional publication turns. One oversized family can
+progress alone. All effects of one document family remain together. Adaptive
+sizing counts document families, charges journal decoding and text preparation,
+and excludes publication admission/hold costs. Gradual recovery after a cold
+overrun avoids permanently shrinking healthy windows. Chunk
+bytes retain their physical replay charge until safe deletion; chunk rows do
+not multiply logical record credits. A checked retirement turn takes the minimum
+of every index instance's durable progress and the producer, resolver, replacement
+and repair fences. It deletes completed chunks and advances the retained frontier
+atomically; an in-memory cursor alone returns no quota. Full drains resume durable
+family continuations too, including after a restart or earlier prefix retirement. A maximum of 256 chunks keeps each record's
+final retirement bounded and atomic; exceptionally large records retain the
+inline representation. Revisions 9 and 10 remain readable without rewriting on
+read-only opens.
+
+Retirement uses keys-only scans and fixed-size manifest prefixes through the
+generic storage facade as well as the native API; inline legacy records are
+not hydrated just to delete them. Namespaces with no managed index consumers
+still schedule separately admitted retirement, subject to producer, resolver,
+replacement and repair fences. Quota is returned by the physical transaction,
+not by scheduling a retirement watermark. A bounded batch may retire references
+and their canonical payload together, but only if every surviving reference is
+included in that same atomic deletion. Interrupted preparation preserves the
+retirement continuation and all previously retained credits.
+
+Revision 10 stores one canonical replay payload with checksummed hint-lane
+references. Readers resolve each reference in the same captured checkpoint.
+Retirement removes references before their canonical payload and returns quota
+only for physically removed bytes. Older inline hint lanes remain readable;
+read-only revision-9 opens preserve their representation.
+
+Revision 9 maintains a semantic revision for each schema-bearing native document namespace in
+the same transaction as its row, identity or relational-constraint changes.
+Replay cursors, immutable artifacts and columnar housekeeping do not invalidate
+that revision. SQL statement overlays combine these revisions for their
+foreign-key-connected dependency set with schema-directory and namespace
+incarnation witnesses. They remain speculative: COMMIT revalidates native
+constraints and predicates. Revision 7/8 readers retain conservative file-wide
+overlay invalidation until writable maintenance upgrades the generation.
 
 Revision 7 records separate opaque identities for primary data, runtime metadata,
 and index inputs in each recovery slot. Allocator-only checkpoints and scoped
@@ -1183,6 +1315,27 @@ validate journal ancestry and the current seal; a repeated physical root ID does
 not establish a cache hit. Compaction assigns fresh identities to every logical
 root family before sealing its replacement generation; allocator-only publication
 normalization preserves those identities.
+
+A connection path owns one checked allocator cache independently of serving
+and detached DB wrappers. A serialized native transaction or page-allocation
+operation loans that mutable state and returns it only at a clean boundary.
+Readers keep independent protected snapshots. The cache has no reader epoch or
+artifact lease, cannot pin reuse, checks inode/checkpoint identity on handoff,
+and authenticates foreign journal rebases before reuse. Its work counters remain
+with the path across serving/maintenance replacements.
+
+Bounded full-text replay can persist a continuation inside one journal record.
+A fragment keeps a primary document's row, deletion, overwrite and asset effects
+together. Index output crosses its durability barrier before the continuation is
+written. The continuation binds the namespace incarnation, index coverage
+generation/configuration and deterministic input fingerprint. Only a completed
+record advances the public applied sequence or full-text completion seal; replay
+truncation continues to use that sequence. Lost progress writes safely replay the
+last fragment. Irrelevant-record scan progress is retained without certifying
+corpus completeness. The scheduling limit counts document families; one large
+family still uses existing projection memory limits and is a soft time bound.
+Legacy index configurations without a coverage generation keep whole-record
+replay until their generation is replaced.
 
 Schema and SQL recovery-state writes atomically mark their namespace in a durable
 recovery agenda. Admission checks pending namespaces instead of opening every
@@ -1199,12 +1352,273 @@ sweep from certifying cleanliness, including when its cursor has already advance
 Revision-3 conversion bootstraps this agenda before
 publishing the replacement generation.
 
+Revision 8 retains the revision-7 reader and logical-identity contracts and adds
+file-wide durable replay admission. Older writers reject its signature because
+they cannot maintain these totals. Read-only revision-7 opens remain supported;
+writable owners replace the generation before enabling the new protocol.
+Replay records and prepared transaction reservations charge the same atomic
+checkpoint as their primary effects. Default high-water marks are 16 MiB and
+4,096 record credits across all namespaces and hint lanes. Retirement returns
+credits, including namespaces with no managed indexes. Those namespaces use the
+durable replay head with the same enrichment, resolver, replacement, repair and
+failed-index fences; they cannot strand producers at the watermark. Control-only changes and deletion remain admissible. An empty journal
+can accept one oversized atomic record, and an already-admitted distributed
+transaction can finish above the watermark rather than deadlocking recovery.
+Prepared votes reserve their future replay credits. Consumer work has reserved
+headroom; new producers wait with the configured Busy timeout while releasing
+runtime and file leases. Batch waits also release registry pins. SQL waits retain
+only the lifetime pins for their independently owned preparation, bounded by the
+remaining Busy budget. Autocommit DML and nonempty session commits check capacity
+before evaluation or coordinator locking; they never retry evaluated SQL. Active
+transaction staging, reads, rollback and empty commits do not wait for producer
+credits. The physical commit still checks exact admission. Refusal occurs before commit. Visibility errors
+after commit retain the committed outcome and must not trigger a blind retry.
+A refused batch carries an observed positive replay footprint. Waiting polls the
+small durable aggregate through a short read-only file pin, releasing that pin
+before sleeping; it does not rebuild serving indexes merely to discover the
+same refusal. Inode or catalog changes request ordinary revalidation. The hint
+never grants or reserves credits: the retried physical transaction repeats exact
+accounting, including prepared-decision and consumer rules. Polls and admission
+share one deadline, cancellation stops re-entry, and close retains no registry
+pins while a batch waits.
+
+Replay prepares full-text inputs and stages immutable artifacts outside writer
+admission. Native publication selects fresh segment aliases under admission,
+then commits the complete activation set, private deletion bitmaps and family
+continuation in one index-metadata WAL record. Readers adopt the prepared snapshot
+only after that commit. An uncertain commit retains the referenced artifacts and
+fences the owner until close/reopen. Portable backends retain output-before-cursor
+ordering. Native continuation reads prefer the identity-checked activation record;
+a duplicate primary progress write is unnecessary.
+The source snapshot remains pinned until the replay turn returns and all journal
+cursors close; preparing the last segment does not end those cursors' borrowing
+lifetimes. Native publication
+checks exact inode, logical metadata identity, SQL decision, table mapping and
+selected catalog fingerprints before reusing prepared output. Runtime opening and
+tokenization do not run inside these publication groups. Replay sizing excludes
+admission and publication time while continuing to charge input and compute work.
+Under backlog pressure, source replay receives three turns between artifact
+service turns; retirement remains eligible on every turn.
+
+Native maintenance records runnable work per namespace. An owner wakeup does
+not make unrelated tables replay or rewrite idle status records. Each visit
+checks durable replay/projection debt and source-sequence advancement, including
+unindexed journal retirement; TTL, group commands and recovery retain their
+bounded visits. Interrupted work stays pending for its namespace. Idle lifecycle
+audits follow the next known index/WAL deadline, with a 30-second fallback audit.
+Artifact continuations have a separate pending flag and deadline. Running an LSM
+slice or retiring journal rows does not restart providers, replay or source
+status publication. Artifact-only turns retain the catalog publication fence,
+but acquire no primary source epoch; future LSM work respects its wake deadline.
+Optional control cleanup coalesces empty checks in the same turn. It checks at
+most nine services, yielding at the first reported work/continuation or after a
+check consumes the replay time quantum (25 ms by default). Interrupted checks
+leave the cursor at that service; quiescence still requires an entire unchanged
+sweep. Empty services therefore do not manufacture nine separate runtime captures
+and writer-admission rounds for every otherwise idle namespace.
+Source replay can retain eligible immutable text inputs after catching its
+target and across namespace rotation. Residency is bounded to the root and eight
+named namespaces; selecting a ninth evicts the least recently selected runtime.
+Every reuse checks inode, logical index identity, all resident catalog witnesses
+and replay control records, resets mutable primary observations, and acquires a
+fresh source epoch. Idle visits retire invalidated inputs as well. Active merge
+borrows retain independent ownership, and unsupported provider/index runtimes
+still reopen. An artifact-only continuation cannot grant source reuse authority.
+When a named runtime needs replacement, its successor opens the selected table
+before releasing the predecessor. Unchanged immutable artifact ranges transfer
+through the inode/root-fenced source pool, so fresh mutable replay actors do not
+require fresh durable leases for every unchanged segment. Failed construction
+leaves the predecessor owned; an active merge keeps its independent reference.
+Foreground admission also pins its predecessor's lifetime while opening the
+replacement namespace requested by that export. This reference grants no old
+query, publication or allocator capability. Named child admission releases it
+as soon as the replacement table has acquired its exact immutable inputs;
+root table-open exports release it on exit. Error and detached-query paths
+release it too. Retired wrappers remain eligible to donate an exclusive
+allocator loan, so preserving immutable inputs does not restore ledger reloads.
+
+Text upserts and deletions seek immutable external-ID routing instead of
+scanning all retained stored identities for every replay fragment. Segment
+version 6 persists a sorted table of 64-bit Wyhash IDs (seed zero) and local
+document numbers. Native readers authenticate only the pages they touch and
+compare each candidate's exact stored ID, so collisions cannot tombstone a
+different document. Every live duplicate remains eligible for deletion, and
+bitmap persistence retains its atomic rollback contract. Both append and
+sorted merges rebuild routing in output coordinates; native merges spill-sort
+within their existing scratch budget. Version-4/5 inputs remain readable and
+build compatibility routing once per immutable physical reader, charged to
+that reader's allocator and freed with it. Compaction replaces those inputs
+with persisted routing. A process or reader reconstruction can rebuild this
+compatibility routing; this fallback is not a persistent migration cache.
+
+Persisted routing tables up to 256 KiB can also use the artifact owner's
+bounded decoded-navigation cache. Their exact source identity, section bounds
+and interpretation bind the cached entries; private deletion bitmaps remain
+runtime-local. Chunked decoding validates entry bounds and ordering once, so
+repeated hash probes and runtime reopening reuse navigation without repeated
+native range reads. Larger tables retain a fixed navigation cache of 64 pages
+with 128 entries per page, rather than decoding the entire table or repeatedly
+reading individual binary-search probes. Cold page loads request at most 1,536
+encoded bytes; a first touch may authenticate an underlying 64 KiB integrity
+frame. They validate the entries and publish them only on success. The
+artifact's existing decoded-cache budget accounts for the cache; exact section
+identity and interpretation bind it across runtime reconstruction. Its
+synchronized slots retain no source callbacks, query capabilities, allocators,
+or deletion state. Each access borrows the current view and checks its read
+authority, including warm hits. A refused cache admission uses persisted seeks.
+Empty deletion sets do not open routing or touch segment storage.
+
+When providers require ending the old runtime before replacement, a separate
+handoff pins individual immutable text readers. Its independent file-wide
+limits are 256 MiB of admitted reader memory, 1,024 segment visits, and protected
+ranges totaling no more than one captured native file generation. Admission
+counts decoder navigation, compatibility ID routing, bitmap capacity and
+provider-declared cache/state overhead. An artifact's logical file length is
+not its resident memory cost; large disk-backed artifacts can share their small
+readers. Oversized metadata or ranges beyond the captured-generation bound are
+skipped. Only artifact-lease sources are eligible: inode/epoch-fenced and query
+sources cannot enter either immutable runtime cache. It retains no entire
+inventory, primary epoch or provider/query capability. The accounting owner stays
+alive until its decoder metadata is released, even across pooled generations.
+The successor consumes the pins after opening the same namespace; unused pins
+expire after five seconds and are released by the maintenance audit or close.
+This optional bridge grants no runtime reuse or publication authority: new
+readers still match inode and immutable value identity through the source pool.
+Private merge staging preserves the runtime's original logical witnesses even
+when allocator admission adopts a newer physical checkpoint. Private bytes do
+not grant authority over a foreign index publication. Nested writer leases also
+retain index-input and uncertain-outcome fences; only completed primary progress
+may be recorded after an index-input change.
+Text planning owns one bounded projection window through capacity admission;
+preparation builds segments from that projection without parsing/projecting its
+documents again. Configuration changes replan only the unpublished suffix.
+Producer replay services one
+adaptive prefix per background turn, initially eight document groups and 256 KiB,
+with ceilings of 128 groups and 4 MiB. Only indexes whose configuration consumes
+generated artifacts inherit the completed producer prefix. Raw-document indexes
+can advance independently while inference or group work is pending. Bounded
+turns rotate their starting stage across independent indexes, producers and
+dependent indexes, preserving that rotation across runtime replacement. An
+interrupted slow stage therefore cannot always consume the deadline before
+another stage starts. Replay-capacity pressure yields to consumers without
+charging a provider retry. The direct replay fallback without registered workers
+obeys the same dependency cuts and document-fan-out bounds as the registered
+manual executor.
+Explicit idle drains continue to inspect and complete all relevant work.
+Durable document invocations distinguish computation from artifact upload.
+An output intent is committed under the current attempt fence before any stage
+payload is stored. Cancellation, failure or restart before that intent releases
+the unused output allowance, while ambiguous calls, tokens and pixels remain
+charged. Once upload may have started, its upper bound remains charged through
+lost acknowledgements and takeover. Older reservations without this witness stay
+conservative. This prevents repeated interruptions of a small extraction from
+consuming several whole-response output allowances before any result exists;
+it does not increase limits or forgive ambiguous model work.
+Resolver query inference releases writer admission. Candidate, policy and
+embedding-cache callbacks continue to read primary storage, so resolution pins a
+logical-data snapshot under admission before releasing it. The pin survives
+through resumed admission and is released before its runtime can be collected;
+abandoned queries release it too. This closes the gap where a callback could
+register its reader only after a peer had reused the captured primary roots.
+Owned extraction plans retain only their provider lifetime while detached.
+Registered manual workers receive the same generation-bound fragment callbacks
+as workerless replay. Their budgets bound complete document families within a
+large journal record. A replacement worker loads the durable continuation;
+neither partial index output nor a failed continuation write advances the
+complete-record watermark or releases that record's retention credits. Complete
+records share one atomic window, bounded by family/effect count and payload
+bytes. Seekable canonical records can share a window when each additional
+record fits completely; a manifest that cannot fit remains unhydrated. An
+unfinished record completes under its own fingerprint and offset before another
+record can join, preserving scan-only no-op recovery witnesses too. A durable
+complete-window receipt recovers progress even if its coarse metadata mirror
+fails, without publishing the window twice.
+Logical alias allocation preserves occupied destinations, including inactive
+aliases that another construction may still own. A turn skips at most 64
+collisions and checkpoints its allocation frontier before yielding, so reopen
+cannot repeat the same occupied prefix. This checkpoint activates no segments
+and advances no replay receipt. Cleanup after failed source acquisition applies
+only to an alias whose exclusive creation succeeded in that attempt.
+Native text-window sizing measures document collection, projection and segment
+preparation directly. Its bounded publication-cost feedback includes the entire
+remaining window interval, including staging and sync outside writer leases,
+capture completion and the coarse progress publication on both wait paths;
+lease timing alone omits those fixed costs. Cursor setup, capacity waits, publication and continuation
+sync remain fixed service costs, rather than reasons to shrink cheap preparation
+windows. The call still obeys its wall-clock yield and cancellation checks, and
+memory failures and allocator-retention pressure retain their existing bounds.
+Promotion's SQL coordinator uses the same bounded consumer reserve as its
+replay caller. A full producer quota still refuses new foreground decisions,
+but cannot refuse a consumer decision while that reserve has headroom. Once
+the durable decision exists, participant recovery retains its completion fence.
+Group retirement pages enumerate keys without reading or hashing unrelated
+document payloads; apply rechecks current ownership and catalog membership.
+Source baseline pages retain their afterimage hashes and stale-source checks.
+
+Bounded allocator reuse, retirement and orphan service run independently of
+optional whole-generation shrinking. Automatic shrink assessments wait for the
+file-wide replay journal to empty and for a primary quiet interval. Pending
+replay debt is checked during the required allocator service lease, before
+entering optional shrink admission; required reuse and retirement still run. That cadence
+survives runtime refresh without retaining checkpoint roots. Assessment and copy
+work periodically probe the on-disk primary identity and named inode, yielding
+when a local or peer writer publishes. The probe grants no read/publication
+authority; retained snapshots and exact vacuum publication checks still apply.
+Explicit maintenance keeps its requested behavior. Replay therefore does not
+queue behind a whole-file assessment or retain its primary pages for the scan.
+
+Generated-enrichment preparation caches document plans by an owning hash map
+within each preparation quantum. Large windows do not linearly scan every
+previous document key for each request. Dispatch still clones borrowed requests
+into their execution lanes before clearing the cache; source/catalog changes
+retain the existing replan boundaries.
+
+Provider control-record leases borrow the captured raw store under checked
+writer admission. Generated document/result publication uses that same writer
+when its native catalog/recovery proof and namespace identity remain valid.
+The transaction rechecks source digests, document incarnations and lease tenure;
+changed index inputs fence later index publication. Shadow and external resolver
+dependencies retain the serving-runtime validation path. These groups avoid
+alternating between serving and captured writers for each output/control record.
+Before reserving an output sequence, the captured writer reconciles its separate
+DocStore sequence caches with the durable head under that same admission lease.
+Adopting physical roots alone does not update those caches. Output publication
+explicitly defers index replay instead of changing shared callback state.
+Independent local copies share a bounded output window. Provider calls,
+dependencies and existing retry debt retain publication barriers. Legacy
+missing-source cleanup carries source/output guards and commits its deletes with
+the replay notification. Never-produced legacy graph sources leave empty state
+and zero-count records absent; existing state/count repair and ordered-publication
+receipts remain explicit.
+Already absent artifacts emit no delete/change record when no full-text or graph
+effect needs publication. Their sequence-aware coverage can settle directly;
+existing output or stale projections still take the guarded retirement path.
+Producer sizing measures preparation separately from writer admission and
+publication, using the same cumulative publication-time counter as index replay.
+Contention must not force cheap preparation into ever smaller windows and
+multiply its fixed checkpoint/publication costs.
+Resolver replay and durable backfill receive alternating bounded turns while
+both have work. Native namespace scheduling retains this choice across runtime
+refresh, and resident workers keep it with their lifecycle. Backfill does not
+wait for a moving replay head to become idle, and a refused backfill turn cannot
+prevent ordinary replay from freeing capacity on its next turn. Sparse repair
+has separate limits for key probes and materialized artifacts, plus a deadline.
+Publication recovery witnesses admit the affected
+namespace and fence global SQL/FK decisions; unrelated unfinished DDL does not
+require a global clean-sweep witness. Quiescent allocator caches move through an
+authenticated checkpoint rebase when maintenance captures are replaced.
+
 Detached replay uses per-index-kind feedback retained by the namespace scheduling
-owner. Cheap full windows can grow up to 2,048 records and 16 MiB; slow or failed
-windows shrink, and observed blocked reuse lowers retention limits. The 25 ms
-quantum is a sizing target, not preemption of an individual record/provider call.
+owner. Cheap full windows can grow up to 2,048 records and 16 MiB. Collection
+also bounds expanded document/artifact keys, allowing one complete oversized
+record; it does not split ownership-completion callbacks. Slow or failed windows
+shrink, and observed blocked reuse lowers retention limits. Measured publication
+cost adjusts the preparation target between 25 and 200 ms, under independent
+record and memory ceilings. Retention pressure immediately restores the 25 ms
+target. None of these targets preempts an individual record/provider call.
 Background and foreground retirement work remains capped per publication. Pending
-work diagnostics report replay budgets and the current retirement-work limit.
+work diagnostics report producer and consumer replay budgets and the current
+retirement-work limit. Each complete document group remains atomic.
 Explicit integrity reports split logical bytes among documents, control documents,
 metadata catalogs, and index artifacts; allocator checks independently load disk
 state rather than using a writer's transient traversal inventory. Document bytes
@@ -1301,7 +1715,7 @@ proof. Mutations still require allocator admission.
 
 Full-text catch-up treats `CapacityUnavailable` and `CapacityObservationStale` as
 recoverable admission failures, with bounded backoff and persisted progress after
-successful retry. Owners that drive replay without optional workers run synchronous
+successful retry. Manual runtimes without a native path owner run synchronous
 merges when text-publication admission is blocked. A reduction in the blocked
 segment or heap-byte dimension renews their no-progress wait budget; unrelated or
 stale work does not. Total merge time remains visible in backpressure telemetry.
@@ -1317,6 +1731,419 @@ ready. Failures in retryable admission after that commit are reported as
 committed/visibility-pending diagnostic. Resume derived work rather than replaying
 the batch, especially for transforms such as `$inc`. Pre-commit Busy refusals keep
 their existing retry behavior. SQL retains its committed-pending outcome.
+
+Native C/SQL sessions retain an owned statement overlay indexed by table/row and
+constraint address. Previously validated postimages and claim effects extend
+incrementally while the inode and nonzero primary/catalog logical cuts remain
+unchanged. Any data change, DDL, replacement, rollback or interrupted staging
+invalidates that speculation. Ordinary preparation remains available when a
+native witness cannot be established. The original mutation fold retains first
+observations and latest postimages; point reads also verify table identity when
+the requested key is absent. Cache storage is charged to the transaction budget
+and optional allocation failures evict it. COMMIT still performs authoritative
+constraint preparation and checks every original version/digest predicate.
+Background publication statistics expose SQL overlay hits, rebuilds, rebuilt
+staged entries, evictions and staged statements; rebuilt entries distinguish work avoided
+across statements from an arbiter and validator sharing one statement's input.
+
+Native revision-7 background turns separate source-derived replay from immutable
+artifact maintenance. After the replay window and its source-dependent lifecycle
+work, the owner releases its primary snapshot before running one LSM maintenance
+slice and admitting immutable text-merge construction. Owned LSM
+continuations can survive primary-only changes after validating their logical
+identities; changed inputs open a fresh runtime. Immutable inputs retain their
+own range leases. Artifact catalog reads first acquire short owner/path admission, validate
+the namespace and logical index identity, refresh the checkpoint, and register a
+read pin before releasing admission. They never traverse an old catalog root
+without a retained epoch: matching page numbers can conceal page reuse. Any
+foreign logical index change invalidates the detached artifact work, including a
+physical-root ABA. Hosted owners, legacy files without logical identities, and
+explicit idle drains preserve their existing complete maintenance lifecycle.
+
+Native database turns enqueue physical allocator/orphan service on the separate
+storage lane instead of executing it inline as well. The owner alternates that
+lane with database work while storage is pending, so sustained replay cannot
+starve reclamation. Physical service captures a fresh checkpoint after source
+pins are released; no extra physical pass is charged to each replay window.
+
+The native manual executor uses the same per-kind adaptive replay controller as
+other detached replay paths: one bounded window per worker, with a cooperative
+preparation target initially set to 25 ms and bounded record/payload budgets.
+The target adapts to measured fixed publication cost with a 200 ms ceiling;
+retention pressure immediately restores 25 ms. Writer-gate and
+path-lease queueing plus fixed catalog validation are measured separately:
+shrinking windows because of admission overhead would create more publications
+and starve consumers. Partial applied watermarks are persisted before yielding; a background turn never waits again for the original
+full visibility target. Explicit foreground visibility waits still complete their
+requested target. An individual indivisible record can exceed the quantum.
+
+Storage-only background turns authenticate the current inode and checkpoint
+without refreshing the serving DB. They transfer the detached allocator cache
+and digest after certificate validation, then perform physical maintenance
+without opening query indexes or providers. A peer's logical publication stays
+unadopted by the serving wrapper until ordinary logical admission refreshes it;
+physical service cannot grant a clean schema or recovery witness.
+
+Replay-journal retirement records its requested watermark during source work,
+then runs after releasing the primary snapshot. Short owner/path admission
+revalidates the catalog and clamps deletion against current enrichment,
+resolver, graph-replacement and repair checkpoints. Each turn scans at most one
+round of journal lanes and commits at most 4,096 key deletions. Empty lanes do not
+consume separate turns; the namespace continuation advances only after successful
+publication, and blocked consumer watermarks do not force an idle spin. While
+retirement is outstanding, replay's record cap allows cleanup to service even the
+maximum fan-out of journal lanes. Errors and partial progress retain safe retry
+state across runtime refresh.
+
+Native index storage tracks runtime-local revision tokens for exact paths and
+directory prefixes. WAL-retention accounting watches its WAL directory and legacy
+WAL path, so unrelated immutable-file churn preserves its owned snapshot, even when contended I/O took longer than the ordinary 250 ms TTL.
+Local WAL mutations invalidate or update the cache; foreign index-generation
+adoption invalidates every path watch. Collection spanning an identity change is
+never cached. Mutation invalidation visits only path ancestors, not all watches
+or the allocator ledger. Providers without a logical identity retain
+TTL-based refresh. Cold WAL-accounting reads share one short consistent metadata
+snapshot and admission, released before computation or publication. Read scopes
+reject writes and preserve their captured bytes across later index changes.
+Obsolete-file backoff begins after a completed sweep, so slow
+I/O cannot leave its next retry deadline already expired.
+
+Admitted short metadata scans explicitly opt into a native catalog read snapshot
+for their cursor lifetime. Ordinary scans keep artifact-specific source leases. Table-index and data-block misses both read that captured view, even
+if a peer removes the run's catalog name. Shared block caches retain owned bytes,
+never the snapshot. Closing the cursor releases its epoch. Short metadata scans
+therefore do not publish durable artifact aliases per SST; persistent text
+segments continue to use artifact-specific leases rather than retaining a whole
+checkpoint in an idle runtime.
+
+Closed artifact leases enqueue preallocated release hints after their reader
+and marker are closed. The next artifact publication drains at most 64 hints in
+its transaction, and physical maintenance also services a bounded batch. Hints
+survive registry refresh through the shared connection coordinator, requeue on
+failed publication, and compare the captured inode before deleting a unique
+lease key. The bounded orphan sweep remains the crash-recovery fallback.
+
+Native persistent index handles are caches of committed index state. Opening or
+closing a cache preserves durable, replayed mutable WAL state without publishing
+an empty transaction or flushing that state into a new physical generation.
+Required WAL recovery and catalog repair still run on open. Native owners retain
+the last successful durable WAL checkpoint time for each LSM root and inode.
+Recovered cache state keeps that original maximum-age boundary instead of
+forcing another tiny SST on every runtime open or renewing its grace period.
+Unknown ages and changed inodes retain conservative immediate checkpointing.
+Only a completed WAL reset advances the remembered time; no-op barriers and
+failed checkpoints do not. Directory retirement removes the corresponding age
+hints. Optional retired segment reconciliation runs under explicit index maintenance admission instead.
+This prevents foreground cache refresh from repeatedly invalidating detached
+background work. Replay processing budgets exclude fixed publication admission
+and catalog validation overhead; they continue to charge actual replay work.
+
+Native retired text-segment readers enqueue cleanup instead of taking writer
+admission from their release callbacks. Maintenance deletes at most eight files
+in one atomic native catalog transaction per boundary, with separate queue and
+I/O locks so reader release can continue while admission or storage is blocked.
+Failed publications retain both retry state and durable retirement markers.
+Discovery checks at most 64 markers per page, advances only after recording the
+whole page, and services a deletion batch before a detached runtime can close.
+Retry deadlines participate in maintenance wake scheduling. Shutdown disables
+new cleanup and drains in-flight I/O before releasing the storage provider;
+late callbacks never dereference that provider. Standalone storage retains its
+existing per-file deletion behavior.
+
+Native text-segment active markers may also carry owned immutable navigation
+and field statistics. The descriptor publishes in the same LSM transaction as
+active membership, so runtime reconstruction can copy admitted navigation
+instead of reparsing every field's source sections. It contains no provider,
+runtime, or decoder pointers. The leased source's footer must match the captured
+footer; AFSM envelope, directory, and lazy payload integrity checks remain in
+force. Corrupt descriptors fail admission without pruning an active segment.
+Legacy one-byte markers retain ordinary source admission, and oversized
+descriptors or optional encoding allocation pressure preserve that fallback.
+Physical compaction preserves these source-content bindings. The marker value
+is internal metadata; this does not change the C ABI or native physical format.
+
+`scripts/bench/lite_segment_admission.py` generates a public multi-field seed
+for matched open and replay-service comparisons using prebuilt libraries in
+separate processes. Each case clones the same immutable database and checks
+acknowledged rows, search, integrity, replay completion, and reopening after
+measurement. This is a short local diagnostic, not original-importer or
+sustained-write qualification.
+
+Coordinated text-index applied watermarks and replay seals sync their durable WAL
+state before publishing coverage. They do not force a new SST generation for
+every bounded replay window. Cache shutdown preserves that WAL, and recovery
+reconstructs it before serving queries. Physical checkpoint/export capture still
+flushes its exact immutable cut; other index kinds retain their existing boundary.
+
+Native WAL synchronization uses the storage durability barrier directly. It must
+not implement fsync by appending an empty logical value, which would unnecessarily
+publish an index generation and invalidate unrelated detached inputs.
+
+Artifact maintenance runs one LSM slice per turn. Native text merges use one
+independent construction job per file, retaining its immutable inputs and task
+resource reservation until publication or cancellation. Its worker binds separate
+reader caches and builds private seekable scratch; it never writes a native
+catalog or reserves a logical segment ID. Replay, retirement and reclamation
+continue while construction runs. Native replay yields immediately when text
+producer capacity is unavailable, allowing the owner to return to merge staging.
+
+Completed output is appended in bounded transactions to an unpublished native
+artifact lease. A locked marker owns construction across Store refresh and makes
+crash leftovers eligible for the existing orphan sweep. Repeating an ambiguously
+successful append compares the exact bytes at the expected offset before
+accepting it. Final publication assigns an ID from the current runtime and shares
+the completed value root into its segment catalog name without copying the
+payload again. Admission rechecks inode, catalog/recovery state and each active
+input's immutable backing identity; current tombstones are reconciled through
+source-to-output provenance, and newer appended segments remain active. Changed
+DDL or replaced inputs cancel the result. Shutdown cancels and joins construction
+before releasing its readers or owning runtime. Failed resource admissions retain
+smaller-plan hints across runtime refresh; a successful merge restores normal
+planning. Automatic vacuum waits for construction, while in-place retirement and
+page reuse continue. An explicit peer replacement invalidates the construction.
+
+If every captured document is already deleted, construction returns an empty
+replacement without creating scratch output. It retains the input leases and
+validates deletion coverage just like a nonempty merge. Publication removes only
+the validated captured inputs; segments appended after capture remain active.
+An empty result is successful maintenance, so it cannot repeatedly select the
+same dead inputs through an `EmptySegment` retry.
+
+Background publication statistics separate merge preparation, native staging and
+final publication time, along with started/applied/discarded jobs and staged bytes.
+Preparation overlaps ordinary replay; its duration is not additive wall time.
+Artifact lease commits are kept separate from queued ordinary mutations so that
+physical bookkeeping preserves logical metadata identities.
+
+An unfinished artifact runtime retains
+only its owned immutable index inputs and continuations. It resumes after primary
+commits only when the inode and nonzero logical catalog/index identities match;
+changed inputs open a fresh runtime. Source read epochs and catalog proofs are
+released each turn. This gives replay another scheduling turn without discarding
+compaction progress or retaining primary history for an entire index drain.
+
+Idle namespace readiness is checked before opening its DB/index runtime. The
+owner compares durable replay and catalog fingerprints for the same table ID and
+root incarnation, and also honors TTL, artifact and periodic audit deadlines.
+Grouped-source control queues have an independent polling deadline: cursor and
+lease observations can make them runnable without appending a replay record.
+Matching controls are a scheduling hint only: they do not authorize admission,
+skip affected-namespace recovery, or waive any publication fence. Source writes
+(including unindexed writes) and catalog changes invalidate the hint; timed
+audits revisit control-only work without manufacturing replay on every wakeup.
+
+A native wrapper retains its original verified allocator rebase base when several
+physical headers are adopted before the ledger is needed again. Inheriting a
+proof for an intermediate header does not relabel the cached ledger. The complete
+journal suffix and the latest certificate must still authenticate before reuse;
+unknown ancestry, reused anchors or a mismatching digest retain the independent
+reload/verification path. A quiescent wrapper can donate that older checked base
+while its current tip is still unverified; the receiver gets no allocation
+authority until it authenticates the latest checkpoint. Allocator work counters
+distinguish retained and transferred pending bases,
+rebase attempts, ancestry misses, authentication refusals and digest mismatches.
+
+Transaction preparation records a separate bound for thin replay key references.
+Primary JSON/AROW values and the per-row memory-admission allowance remain in
+intent/retained-frame accounting; they are not multiplied into replay credits.
+The replay estimate covers all four key lists, every possible hint lane, and
+server-derived vector artifact keys. Replacing a prepared value for the same
+keys updates memory accounting without increasing replay reservation size.
+Resolution atomically exchanges the durable reservation for its replay records;
+abort releases it. Legacy intent/member descriptors retain conservative credits
+until replacement or resolution, including after reopening.
+
+The private replay-admission aggregate now publishes the `RAB2` writer fence
+and accepts both `RAB1` and `RAB2` on read. The physical `.aflite` format and C ABI
+are unchanged. Builds that understand only `RAB1` reject replay mutations after
+the upgrade; use one compatible library version for every writer of a file.
+New intent descriptors contain 40 bytes and member accounting contains 32 bytes;
+the new reader also accepts the prior descriptor sizes.
+
+The batch capacity retry charges the Busy timeout only for admission and
+capacity waits. Active preparation in a refused pre-commit attempt is excluded;
+otherwise a large batch can exhaust its timeout while holding the gate and fail
+before consumers receive any opportunity to free credit. A committed visibility
+failure remains a distinct nonretryable outcome. The
+`replay_refused_preparation_ns` counter reports this discarded active work.
+
+For a short local feedback loop, use an existing Debug library:
+
+```sh
+python3 scripts/bench/lite_namespace_replay.py \
+  --library zig/zig-out/lib/libantfly.dylib \
+  --idle-namespaces 0 8 45 --output .tools/namespace-replay-run
+```
+
+Each case creates synthetic indexed namespaces in a fresh directory and runs in
+its own process. The report separates fixture setup, a write burst plus quiet
+background observation, and explicit verification. The observation avoids
+database-status polling; it records latency, CPU, file growth, replay progress
+and available maintenance counters. Missing instrumentation remains absent.
+Acknowledged rows, search visibility, catch-up, integrity and reopening are
+checked after measurement. `--active-table default` also exercises the root
+namespace. `--grouped-copy` adds grouped-source fan-in and the built-in copy
+producer, so the same feedback loop also exercises enrichment and downstream
+index replay without models or private inputs. Reverse the namespace order and repeat comparisons on a quiet host;
+these short diagnostics do not establish importer or sustained-load qualification.
+The parent watchdog marks incomplete cases as failures and preserves any
+completed measurement before a stalled verification.
+
+For active-write diagnosis, add `--active-seconds 30 --progress-interval 1
+--visibility-deadline 10`. The duration is a soft bound: an in-flight call may
+finish later. The report records status-sampling overhead and follows fixed
+earlier index targets while writes continue, rather than requiring a moving
+target to become idle. Every observed index must advance, and a later quiet
+drain cannot erase a missed active deadline. The deadline is a diagnostic
+parameter, not a database visibility guarantee. `--measurement-only` explicitly
+skips drain, integrity and reopen checks and reports `verified: false` and
+`qualification: false`; omit it for verification. The fixture reuses an existing
+default full-text index instead of adding a duplicate source-text index.
+
+Committed replay writes notify a process-local, deduplicated runnable-namespace
+queue. Tickets contain table identity and incarnation, and are resolved against
+the admitted catalog before service. Notification cannot allocate or fail an
+already committed operation. Three priority selections are followed by a catalog
+audit; audits still discover foreign writes, recovery, timers and cleanup. A
+partial source turn requeues itself only after an applied replay watermark or
+durable intra-record/backfill cursor advances. Failed/provider-delayed work returns to audits rather than spinning.
+Bounded background turns use the resolver's resumable record/backfill page and
+one atomic promotion record, rather than invoking their full-drain APIs. Repair
+discovery scans keys without loading unrelated payload values. Explicit idle
+requests retain full-drain behavior. Physical storage service alternates with
+namespace service when both are pending.
+These scheduling hints grant no publication or recovery authority.
+
+Manual runtimes defer repair-generation cleanup instead of executing an inline
+job during serving-runtime open. A separate optional maintenance slot rechecks
+durable repair intents and advances cleanup; explicit idle drains complete it.
+Failed checks preserve the request and rollback protection. Native directory
+discovery seeks past each live child subtree, so discovering generation names
+does not decode every nested SST or segment record. Artifact continuations
+preserve the same bounded immutable-source handoff when they eventually release
+a runtime after its source replay has already caught up.
+
+Artifact leases also verify the file's immutable reader-namespace binding.
+Symlink paths resolve to the canonical marker directory; unsafe hard-link aliases
+retain inode fencing and decline fine-grained staging/pooling. Orphan collection
+cannot treat a live marker in another directory as dead. Journal retirement reads
+only the fixed-size chunk manifest or a bounded legacy discriminator, preserving
+bounded memory even for multi-megabyte legacy records and failing closed on an
+oversized malformed manifest.
+
+The `maintenance_priority_turns`, `maintenance_audit_turns` and
+`maintenance_progress_requeues` counters distinguish source service from catalog
+rotation. Compare useful applied prefixes/publications with capture, artifact-open
+and admission counts; queue selection counts alone do not prove replay progress.
+
+Add `--resolver-backfill --active-seconds 30` to exercise a curation revision over
+a populated corpus while writes continue. The fixture warms 2,048 rows of 8 KiB
+by default (`--warm-documents` and `--warm-text-bytes` adjust it), and configures
+an extraction stream with no outputs, as with semantic extraction disabled.
+The report requires the accepted policy generation, completed corpus backfill,
+and its captured replay prefix within the visibility deadline. The intentionally
+empty extraction graph is excluded from the advancing full-text index check;
+its resolver/backfill progress is checked separately. Setup and final explicit
+draining cannot satisfy the active-write backfill deadline.
+
+`background_publications.maintenance_failures` separates capture, source replay,
+journal retirement, artifact work and storage failures. These are phase counts,
+including normal contention yielding; a cancellation count alone does not
+establish lost replay progress. Phase elapsed times also include waiting and
+must not be interpreted as CPU time.
+
+Create reusable benchmark seeds with `copy_stable_snapshot_file` (or the matching
+C snapshot operation), rather than copying only the `.aflite` bytes to a new
+pathname. The native operation binds the unpublished destination to its reader
+coordination directory and preserves a valid allocator seal. A raw copy retains
+the source binding without its authority at the destination; page reuse is then
+conservatively refused. Such a fixture measures that fallback and cannot isolate
+normal replay/reclamation performance. Record the seed hash, snapshot-library
+hash and destination snapshot report separately from measured import time.
+
+Cross-run SQL payload comparisons use declared SQL primary keys rather than
+generated storage row IDs. `scripts/bench/lite_logical_projection.py` hashes
+every present field under that logical identity, independently of scan order,
+and rejects duplicate, missing or null keys. Fixture-specific clock/path
+normalization must remain explicit in the caller. Missing fields and explicit
+nulls remain distinct; reports retain hashes rather than private fixture values.
+
+The original importer in issue #1431 still declares local graph extractors when
+run with `--no-semantic`; that flag only disables embeddings. Before measuring,
+run `scripts/bench/lite_extractor_preflight.py --library <library> --directory
+<fresh-directory>` for every tested library. It checks standalone extraction,
+database producer publication, index catch-up, integrity and reopening using
+public synthetic text. The required model is `fastino/gliner2.5-base-v1`; missing
+models fail the gate rather than skip it. Explicit database drains must enable
+`local_runtime=True` and generated replay so they can service those producers.
+For a candidate that changes extractor planning, add `--history-windows` to
+exercise a public 1,025-word history turn and a larger composition-profile
+document before full imports. Record historical libraries' geometry rejections
+as qualification failures rather than treating them as missing-model setup.
+
+Issue #1431 qualification includes the full unchanged-importer corpus against
+both current main and the original pinned reference, plus three original
+importer writers at the original five-second native Busy timeout. Exercise a
+concurrent status reader that repeatedly opens, reads status and closes, as well
+as a persistent logical reader. Require every writer to progress, distinguish
+committed outcomes from retryable refusals, and verify all acknowledged data,
+derived catch-up, search visibility and reopen integrity. Compare retained
+document, index and control bytes after equivalent settling and compaction;
+physical file size alone cannot explain a live-payload regression. Verify reuse
+of available capacity during active writes to cover the related #1362 append
+behavior. Preserve failed controls and incomplete qualification explicitly.
+
+For a shorter local replay-pressure diagnostic, run:
+
+```sh
+python3 scripts/bench/lite_sql_replay_pressure.py \
+  --library zig/zig-out/lib/libantfly.dylib \
+  --directory .tools/replay-pressure-candidate --require-no-busy
+```
+
+Use the same prebuilt optimization mode and workload arguments for both
+libraries, with no concurrent compilation. This public synthetic workload
+commits SQL transactions across two indexed tables, immediately probes batch
+admission at a five-second Busy timeout, then checks every acknowledged row,
+index catch-up, physical integrity and reopening. It never retries an ambiguous
+COMMIT. The default 512-byte keys deliberately amplify replay pressure; record
+key width, text size and transaction size with results. The diagnostic is useful
+for iteration, but does not replace the original importer or sustained active
+write qualification. Compare replay wall time with
+`background_publications.replay_publication_overhead_ns` (admission, validation
+and storage-publication hold) before attributing elapsed time to analysis CPU.
+`maintenance_publication_overhead_ns` also includes subsequent retirement and
+artifact work; keep its larger scope separate from replay time.
+Successful index and watermark admission waits are also reported separately as
+`replay_index_admission_ns` and `replay_metadata_admission_ns`; compare their
+respective group counts before changing publication grouping.
+
+For SQL statement scaling, add `--on-conflict --relational-key --no-text-index
+--transactions 1`, keep `--block-rows` fixed, and vary `--rows`. The declared SQL
+primary key exercises coordinated unique claims; the follow-up batch uses a
+separate unconstrained table. Reports include each block's elapsed time and its
+preceding staged row count. Two tables share the 4,096-entry transaction bound,
+so a single transaction supports at most 2,048 rows per table. This mode still
+verifies primary data, integrity and reopening after measurement.
+
+Sustained-write qualification must measure progress and storage while writers
+remain active. `scripts/bench/lite_contention.py native --require-sustained`
+requires at least ten minutes of churn, acknowledged-write and integrity checks,
+per-worker minute progress, bounded file growth after a three-minute warmup, and
+late throughput of at least 75% of the early steady window. Its recorded policy
+allows tail growth of 25% of the warm file size or 16 MiB, whichever is larger.
+These are workload-specific regression tolerances; an idle shrink or a successful
+integrity check alone does not establish a storage plateau. Index catch-up,
+visibility under active load, search and reopen checks remain separate gates.
+Run both the historical `--text-payload words` workload and
+`--text-payload changing-words`. The latter adds a different searchable token
+to every acknowledged replacement, so replay cannot qualify by only advancing
+through unchanged text. Once indexes catch up, run
+`scripts/bench/lite_churn_visibility.py --library <library> --report <jsonl>
+--database <database.aflite> --output <receipt.json>` to verify every retained
+key's latest token and the absence of its replaced token through a read-only
+open. Keep workload variants separate in comparisons; the verifier requires the
+same library hash as the measured run.
 
 Physical maintenance releases detached catalog/source pins before starting
 allocator service or a vacuum assessment. Bounded allocator/orphan service joins
@@ -1643,3 +2470,14 @@ result set, never its historical versions; legacy indexed tombstones are filtere
 before returning. Regressions cover allocation churn, scattered pages, distinct
 file/output allocators, pinned external values, mixed tombstones, and exhaustive
 allocation-failure cleanup.
+
+
+Producer discovery uses the canonical journal's authenticated family chunks as
+well as index replay. Its durable retry header (`ESQ3`, with `ESQ2` read
+compatibility) carries the exact manifest fingerprint and next family position.
+Partial discovery never advances the complete-record watermark or releases
+journal credits. Restart, provider failure and cancellation can repeat an
+unfinished window; they cannot skip its unchecked suffix. Discovery filters
+catalog-inapplicable documents before assigning retry slots, while preserving
+rows with durable artifact-unit outbox work. Record, byte and family scan limits
+also bound turns whose documents are all inapplicable.

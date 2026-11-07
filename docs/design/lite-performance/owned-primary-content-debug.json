@@ -1,0 +1,67 @@
+{
+  "base": "2fd6fad3607cab469f0658742956af0d3fd2e646",
+  "source_patch_sha256": "3c346ca6ca2d27b0b25a99271a889ea210bec2e6daa835d24d378486b9901331",
+  "build": "Debug, strip=true, j1, worktree caches",
+  "behavior": [
+    "A request-local contention budget spans catalog captures and every detached artifact staging turn; active computation and IO remain outside that waiting budget.",
+    "Owned document plans prebuild exact stored postimages, including direct vector-field stripping, SHA256 content proofs and projection/source certificates before writer admission.",
+    "Synchronous DocStore batches borrow prebuilt authorities only for matching physical document identity, kind and exact bytes; mismatches retain authoritative computation.",
+    "Borrowed proofs remain request-owned through commit/abort, preserving actual per-transaction mutation revision assignment.",
+    "Prepared content proofs enter DocStore through a direct synchronous typed capability; request-owned pointers never cross the erased storage backend ABI.",
+    "Authored TTL timestamps are parsed with the shared pure timestamp rules outside admission. Missing/null timestamps keep the actual commit-attempt fallback; schema changes invalidate the plan."
+  ],
+  "validation": [
+    {
+      "report": "owned-staging-budget-owner3.json",
+      "log": "owned-staging-budget-owner3-tests.log",
+      "passed": 5,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "coverage": [
+        "gate-held staging refusal and subsequent queue acquisition",
+        "last-connection-close survival",
+        "shared catalog/batch wait budget",
+        "stale transform retry applies increment once",
+        "root and table registry pin cleanup"
+      ]
+    },
+    {
+      "report": "owned-content-batch3.json",
+      "log": "owned-content-batch3.log",
+      "passed": 12,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "coverage": [
+        "exact proof binding and all allocation failures",
+        "direct dense/sparse vector postimages and retained embedding artifacts",
+        "native primary/text one checkpoint and one durable barrier",
+        "dynamic multi-index and sequence holes",
+        "owned transform conflict and allocation cleanup"
+      ]
+    },
+    {
+      "report": "owned-ttl-batch.json",
+      "log": "owned-ttl-batch.log",
+      "passed": 10,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "coverage": [
+        "authored date/numeric/zero TTL timestamps",
+        "missing/null and discarded invalid TTL values",
+        "schema change invalidation",
+        "native foreground single-barrier and prepared content-proof regressions"
+      ]
+    }
+  ],
+  "qualification": "Component correctness only. No new end-to-end or optimized performance result. Final current-source gates and wolfspider qualification remain pending.",
+  "remaining": [
+    "SQL owned relational preparation integration",
+    "before-gate same-index publication cohorts with individual logical outcomes",
+    "durable normalized text delta windows and query-visible hot tail",
+    "full current-source correctness, crash, SDK, ABI and importer gates",
+    "final optimized wolfspider qualification against existing references"
+  ]
+}

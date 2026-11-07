@@ -1,0 +1,53 @@
+{
+  "scope": "Shared SQL normalization and native commit row authority; correctness qualification only. Final end-to-end performance qualification remains pending.",
+  "library_sha256": "49eeb5838b760649361d69301cbd693d096ce9abb40bda7b150f4ca8ebe2948c",
+  "build": "Debug,strip=true,j1",
+  "validation": {
+    "default_capi_contracts": {
+      "passed": 398,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "native_storage": {
+      "passed": 843,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "backup_inspection": {
+      "passed": 2,
+      "failed": 0
+    },
+    "generic_storage": {
+      "passed": 12,
+      "failed": 0
+    },
+    "sdk_sql_outcomes_concurrency_crash": {
+      "passed": 209,
+      "seconds": 67.62
+    },
+    "focused_regressions": {
+      "passed": 3,
+      "failed": 0,
+      "leaked": 0,
+      "includes": [
+        "every-allocation-failure preparation and normalized rendering",
+        "exact JSON-null provenance and single-use transfer across equivalent independent layouts",
+        "single normalization handoff on successful SQL commit",
+        "stable allocator proof survives SQL release/reacquisition",
+        "file-backed deletion lookup failure/retry and cumulative coordinate reuse"
+      ]
+    },
+    "abi_exports": 138
+  },
+  "design": "Normalization renders SQL postimages from the packed row authority retained by the bounded SQL request. Final commit reuses it only for exact key/value/null bytes, namespace/incarnation, schema and catalog witnesses. Changed conflict postimages and unsupported plans retain independently validated preparation. Request lifetime ends after SQL result and native commit cleanup; session-owned staged state never borrows this request authority.",
+  "default_gate": "Both the owned-row fault test and file-backed deletion lookup regression now belong to the default C API owner gate.",
+  "admission_counter": "SQL owned preparation intentionally records an initial writer entry and a validation re-entry. Stable slow-proof tests still require one proof capture and immediate reuse afterward.",
+  "remaining": [
+    "unchanged original importer end-to-end qualification",
+    "optimized final qualification on wolfspider against existing references",
+    "external aggregate CI and Beads-owned full factory"
+  ],
+  "database_archives_created": false
+}

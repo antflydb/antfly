@@ -1,0 +1,108 @@
+{
+  "status": "qualification_pending",
+  "qualified": false,
+  "scope": "Independent replay service and bounded normalized-delta merge construction",
+  "main_included": "9256338b2eda89acfd051e217eb7c20b9efa6691",
+  "prior_optimized_candidate": {
+    "source": "017b0513e1a81f44290e55968d63dfb2d4750e7d",
+    "original_importer_successful_inputs": 10,
+    "original_importer_attempted_inputs": 11,
+    "failure": "LiteReplayBacklogExceeded",
+    "reference_rebuilds_or_runs": false
+  },
+  "confirmed_mechanisms": [
+    "Optional control refusal prevented capacity-restoring text merges from starting.",
+    "A capacity-parked consumer aborted independent replay consumers in the manual executor used by Lite.",
+    "A graph maintenance refusal prevented later cleanup services from receiving turns.",
+    "Normalized posting deltas expanded every input vocabulary into posting accumulators, exhausting admitted merge memory."
+  ],
+  "corrections": [
+    "Capture private merge before optional control and retain owned scratch context across catalog relocation.",
+    "Give independent consumers and source stages bounded turns before reporting capacity deferral; retain exact minimum reclamation frontier.",
+    "Retain blocked graph service continuation while advancing the control sweep.",
+    "Use merge-only encoded term references and decode positions for the selected term; reserve actual normalized input demand and choose a smaller prefix when needed.",
+    "Preserve native page error identities across provider RPC; stop provider workers on storage faults and expose qualification fault markers."
+  ],
+  "format_or_public_sdk_change": false,
+  "local_validation": {
+    "posting_delta_tests": {
+      "passed": 13,
+      "failed": 0,
+      "leaks": 0
+    },
+    "reader_tests_before_main_integration": {
+      "passed": 545,
+      "skipped": 2,
+      "failed": 0,
+      "leaks": 0
+    },
+    "native_tests_before_main_integration": {
+      "passed": 847,
+      "skipped": 5,
+      "failed": 0,
+      "leaks": 0
+    },
+    "pre_main_full_capi": {
+      "embedded_passed": 383,
+      "embedded_skipped": 3,
+      "core_passed": 87,
+      "failed": 0,
+      "leaks": 0
+    },
+    "reporting_tests": {
+      "total": 53,
+      "skipped": 1,
+      "failed": 0
+    },
+    "main_integrated_capi": {
+      "embedded_passed": 383,
+      "embedded_skipped": 3,
+      "core_passed": 87,
+      "failed": 0,
+      "leaks": 0,
+      "seconds": 606.352,
+      "peak_build_tree_rss_bytes": 7827079168
+    },
+    "main_integrated_control": {
+      "passed": 2,
+      "failed": 0,
+      "leaks": 0
+    },
+    "provider_rpc_standalone_gate": {
+      "passed": true,
+      "seconds": 19.922,
+      "regression_import_explicit": true
+    },
+    "abi": {
+      "exports": 138,
+      "c_executable_linkage": true,
+      "shared_library_linkage": true
+    },
+    "sdk_sql_catalog_outcomes_concurrency": {
+      "passed": 209,
+      "failed": 0,
+      "initial_sandbox_localhost_refusal": 1,
+      "localhost_fixture_rerun_passed": true
+    }
+  },
+  "diagnostic_only": {
+    "original_input_10_on_reused_failed_fixture": {
+      "completed": true,
+      "seconds": 201.000609958,
+      "optimization": "Debug",
+      "library_sha256": "a1d337e436d3d02a3c2cecf7e5eb5c7c4c27507d3b24a643a530383db09ab7f1",
+      "merge_started": 28,
+      "merge_applied": 27,
+      "merge_canceled_at_close": 1,
+      "maintenance_page_errors": 0
+    },
+    "comparison_limit": "Different fixture history and optimization mode; this is not a throughput improvement claim."
+  },
+  "correctness_caveat": "A prior failed local fixture persisted seven provider UnexpectedNativePageKind errors. Their origin is unproven. Fresh full import, provider status, catch-up and integrity are required; smaller targeted success alone does not resolve this signal.",
+  "remaining": [
+    "Fresh candidate-only original importer and semantic verification.",
+    "Final optimized qualification on wolfspider using retained references.",
+    "Human repository CI and Beads-owned full factory qualification."
+  ],
+  "data_retention": "Reuse one local working fixture; no database archive per candidate or run. Private logs and inputs remain uncommitted."
+}

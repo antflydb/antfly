@@ -84,7 +84,11 @@ fn publishControlAttempt(
     defer if (active) sink.abort();
     sink.appendSlice(contents) catch |err| return .{ .definitive_error = err };
     active = false;
-    sink.finish() catch |err| return .{ .ambiguous_error = err };
+    var publication_possible = true;
+    sink.finishWithPublicationState(&publication_possible) catch |err| return if (publication_possible)
+        .{ .ambiguous_error = err }
+    else
+        .{ .definitive_error = err };
     if (consumeTestPostPublishFailure()) return .{ .ambiguous_error = error.InjectedPostPublishFailure };
     return .success;
 }

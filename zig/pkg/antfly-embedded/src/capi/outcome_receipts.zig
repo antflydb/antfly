@@ -26,9 +26,8 @@
 //! absent means not applied.
 //!
 //! Reconciliation:
-//! - Lite connections mark an uncertain runtime and reconcile it by reopening
-//!   on their next call; a status query enters the handle the same way and
-//!   refuses while the runtime still needs reconciliation.
+//! - Lite connections keep an uncertain owner fenced. A fresh database handle
+//!   reconstructs durable state; a status query on the old owner refuses.
 //! - Directory (LSM) handles have no such flag: a WAL record may be durable
 //!   but unpublished until the handle is reopened. Their receipts stay pending
 //!   in a process-wide registry until the issuing handle closes.
@@ -128,6 +127,33 @@ pub const Writer = struct {
     pub fn retire(self: *Writer, marker: Marker, target: ?TableRef) void {
         self.lock();
         const pending = self.pending_until_close;
+        self.retireLocked(marker);
+        self.mutex.unlock();
+        last_receipt = Receipt.init(marker, target);
+        if (pending) registerPending(marker.writer, self);
+    }
+
+    /// The publication leader fences every origin before waking any caller or
+    /// selecting another cohort. Receipt TLS belongs to each origin's thread.
+    pub fn fenceUnknown(self: *Writer, marker: Marker) void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.retireLocked(marker);
+    }
+
+    pub fn accepts(self: *Writer, marker: Marker) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return if (self.id) |id| std.mem.eql(u8, &id, &marker.writer) else false;
+    }
+
+    pub fn setPendingUntilClose(self: *Writer, pending: bool) void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.pending_until_close = pending;
+    }
+
+    fn retireLocked(self: *Writer, marker: Marker) void {
         if (self.id) |id| if (std.mem.eql(u8, &id, &marker.writer)) {
             self.id = null;
             // The retired writer's markers stay: the receipt needs one, and
@@ -135,9 +161,6 @@ pub const Writer = struct {
             self.marker_written = false;
             self.clearTables();
         };
-        self.mutex.unlock();
-        last_receipt = Receipt.init(marker, target);
-        if (pending) registerPending(marker.writer, self);
     }
 
     fn clearTables(self: *Writer) void {
@@ -370,5 +393,29 @@ test "capi SQL outcome receipt that cannot be recorded as pending never reads as
     writer.deinit();
     try std.testing.expect(!isPending(marker.writer));
     try std.testing.expect(!isPending(@splat(0x11)));
+    clearLast();
+}
+
+test "capi native publication cohort fences shared writers before publishing origin receipts" {
+    var writer: Writer = .{};
+    defer writer.deinit();
+    clearLast();
+    const first = writer.next(null);
+    const last = writer.next(null);
+    const queued = writer.next(null);
+    try std.testing.expect(writer.accepts(queued));
+    writer.fenceUnknown(last);
+    try std.testing.expect(!writer.accepts(first));
+    try std.testing.expect(!writer.accepts(queued));
+    try std.testing.expect(lastReceipt() == null);
+    // Every member of an atomic decision uses the shared writer's final
+    // committed marker; receipt state is installed only on its origin thread.
+    writer.retire(last, null);
+    try std.testing.expectEqual(last.sequence, lastReceipt().?.marker.sequence);
+    const fresh = writer.next(null);
+    try std.testing.expect(!std.mem.eql(u8, &fresh.writer, &last.writer));
+    try std.testing.expect(writer.accepts(fresh));
+    writer.retire(last, null);
+    try std.testing.expect(writer.accepts(fresh));
     clearLast();
 }

@@ -1,0 +1,95 @@
+{
+  "runtime_commit": "7a76cb6a8781940ec38e6a7b74a0ba90808bffe4",
+  "build_mode": "Debug",
+  "strip": true,
+  "qualification": "Owned index preparation and native/persistent correctness milestone. Full architecture and end-to-end performance qualification remain incomplete.",
+  "implemented": [
+    "Owned immutable index preparation, exact deletion revision validation and replacement building after writer shutdown.",
+    "Finite native namespace preparation read sets release broad data epochs before replacement CPU work.",
+    "C API batch preparation releases its current-runtime admission guard before private replacement construction.",
+    "Prepared native aliases work after original backend teardown; resident and large sources retain their actual accounting owners.",
+    "Exact physical source pooling supports construction and numerical aliases without trusting alias names.",
+    "Linear coalesced-effect and authoritative-ordinal overlay validation.",
+    "Loaded namespace witnesses reject stale snapshots and authenticate compaction inode rebasing; prepared hosts retain exact inode checks."
+  ],
+  "gates": {
+    "native": {
+      "passed": 828,
+      "benchmark_skips": 5,
+      "failures": 0,
+      "leaks": 0,
+      "companion_roots_passed": [
+        2,
+        12
+      ],
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 264.967,
+        "cpu_seconds": 180.436,
+        "peak_build_tree_rss_bytes": 3577364480
+      }
+    },
+    "persistent": {
+      "passed": 91,
+      "benchmark_skips": 1,
+      "failures": 0,
+      "leaks": 0,
+      "owner_root_passed": 1,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 39.008,
+        "cpu_seconds": 27.213,
+        "peak_build_tree_rss_bytes": 854638592
+      }
+    },
+    "focused_owned_inputs": {
+      "passed": 10,
+      "skipped": 0,
+      "failures": 0,
+      "leaks": 0,
+      "build": {
+        "status": "completed",
+        "returncode": 0,
+        "wall_seconds": 77.009,
+        "cpu_seconds": 62.599,
+        "peak_build_tree_rss_bytes": 2474426368
+      }
+    },
+    "public_capi_compile": {
+      "status": "completed",
+      "returncode": 0,
+      "wall_seconds": 41.919,
+      "cpu_seconds": 19.584,
+      "peak_build_tree_rss_bytes": 545882112
+    }
+  },
+  "durability_contract": "Real foreground insert, overwrite and delete tests assert one native checkpoint; the durable variant asserts one sync, including dynamic claims across two text indexes. This is an operation-count contract, not an end-to-end performance result.",
+  "remaining_capi_qualification": {
+    "earlier_full_local_gate": {
+      "source_base": "ca77fa8703",
+      "compiled_source_patch_sha256": "195caa927a12b1ebc00369dea17d7c1d035f4cecadf459f7ec3a0d6df2951072",
+      "passed": 361,
+      "skipped": 3,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "The 32-handle issue1015 test returned invalid_argument once. The native error detail was not captured; its cause is not established."
+    },
+    "isolated_rechecks": "The existing candidate test passed under the debugger, and a freshly compiled diagnostic candidate passed. Per-worker operation and native-error diagnostics remain in the regression. These checks predate this milestone and do not replace a final full C API gate."
+  },
+  "outstanding": [
+    "Late-bound actual replay progress and exact committed source-tip admission witnesses.",
+    "Independent bounded staging and publication service, with requests queued before writer admission.",
+    "Compatible same-index group commit, individual logical outcomes and receipts, and owned SQL/transform readsets.",
+    "Durable normalized posting-delta windows and query-visible hot tails, freezing by bounded byte/document limits rather than RPC boundaries.",
+    "Native reclamation progress independent of stale index runtimes; remaining retention and accounting audits.",
+    "Final coherent library, full C API/SDK/ABI/crash gates, unchanged original-importer comparisons, and optimized wolfspider qualification using existing references.",
+    "Full factory remains owned by the Beads task; aggregate repository CI remains separately required."
+  ],
+  "retention": {
+    "obsolete_task_test_build_bytes_removed": 21225533440,
+    "obsolete_task_test_build_directories_removed": 184,
+    "policy": "Only closed obsolete task-local test executable/object directories older than thirty minutes were removed. Reference binaries, installed libraries, frozen inputs and databases were preserved. No per-run database archive was created."
+  }
+}

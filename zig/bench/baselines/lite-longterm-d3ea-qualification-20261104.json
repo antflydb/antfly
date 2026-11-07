@@ -1,0 +1,57 @@
+{
+  "qualified": false,
+  "source_commit": "d3ea7d70e5aa89523db77adc8ef2b33d186ea203",
+  "runtime_source_commit": "d296a057ac6ec27568cffbbe4479c7dc075ffd8d",
+  "host": "wolfspider",
+  "mode": "ReleaseFast",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "library_sha256": "b8974a2c5765d5c4e118c699ac8c34b29d66eecf77c0c3954196bf248b94f8e9",
+  "cli_sha256": "66f3ca961355873cd7dac655c3a1c717255786096ba3bba3509d965a2e9891f3",
+  "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+  "frozen_input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276",
+  "build": {
+    "exit_code": 0,
+    "seconds": 3867.0099289999343,
+    "abi_exports_and_smoke": "passed",
+    "report_sha256": "083e9442df1ae742fb5135fb3f559b4923be4d5ed461ffce29b77e2531e8cdbc",
+    "peak_build_tree_rss_bytes": 12666404864
+  },
+  "fresh_input_7": {
+    "exit_code": 0,
+    "seconds": 222.37224770803005,
+    "summary": [1, 0, 0],
+    "file_bytes_after_import": 3321126912,
+    "child_user_seconds": 193.346957,
+    "child_system_seconds": 67.196317,
+    "max_rss_bytes": 1693122560
+  },
+  "first_input_repeats": "both passed",
+  "full_corpus": {
+    "planned_inputs": 15,
+    "successful_inputs": 7,
+    "attempted_inputs": 8,
+    "failed_input_index": 7,
+    "failed_input_seconds": 424.1868627499789,
+    "failed_input_summary": [0, 0, 1],
+    "failed_input_child_user_seconds": 181.268308,
+    "failed_input_child_system_seconds": 85.363386,
+    "failed_input_max_rss_bytes": 2177269760,
+    "total_import_seconds": 494.2662287899293,
+    "file_bytes_after_failure": 3510345728,
+    "public_errors": ["LiteReplayBacklogExceeded", "ANTFLY_BUSY"],
+    "failed_stderr_sha256": "e37b449a88a4a86eace68f450bafb3ede352fdf13b0bb11808501a91c8d97c3a"
+  },
+  "overlapping_native_build_samples": 0,
+  "censored": false,
+  "frozen_inputs_unchanged": true,
+  "reference_policy": "Existing artifacts and observations reused; no reference build or execution.",
+  "unrun_after_first_failure": [
+    "full-corpus primary, semantic drain, field hashes and accounting",
+    "original-importer contention",
+    "short sustained and append tests",
+    "large-graph warm writes",
+    "ten-minute constant-vocabulary soak",
+    "ten-minute changing-vocabulary soak"
+  ],
+  "conclusion": "Fresh input success does not qualify populated-database replay capacity. The same input fails after seven preceding imports without compiler overlap. Preserve the frozen artifact and private logs; reproduce and diagnose locally before another final-host qualification. The specific remaining mechanism is not yet established."
+}

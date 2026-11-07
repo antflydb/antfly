@@ -43,6 +43,9 @@ pub const Config = struct {
     /// producer capacity. Productive merges renew their no-progress budget;
     /// the total elapsed work is still included in backpressure telemetry.
     manual_producer_assistance: bool = false,
+    /// A native path owner runs immutable construction independently. Its
+    /// replay actor must yield rather than wait for itself to free capacity.
+    defer_producer_to_owner: bool = false,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
@@ -151,6 +154,10 @@ const UnsupportedTextMergeRuntime = struct {
     }
     pub fn acquireProducerPermitAssumeApply(_: *@This(), _: []const u8, _: u64, _: u64) !ProducerPermit {
         return .{};
+    }
+
+    pub fn acquireAtomicProducerPermit(self: *@This(), name: []const u8, count: u64, bytes: u64) !ProducerPermit {
+        return self.acquireProducerPermit(name, count, bytes);
     }
 
     pub fn producerSegmentReservationLimit(_: *const @This()) usize {
@@ -273,6 +280,7 @@ const PlatformTextMergeRuntime = struct {
         {
             return error.InvalidTextMergeBackpressureConfig;
         }
+        index_manager.text_merge_segment_limit.store(if (config.enabled) config.max_pending_segments else 0, .release);
         return .{
             .alloc = alloc,
             .io = io,
@@ -768,16 +776,20 @@ const PlatformTextMergeRuntime = struct {
         segment_count: u64,
         byte_count: u64,
     ) !ProducerPermit {
-        return self.acquireProducerPermitWithApplyOwnership(index_name, segment_count, byte_count, false);
+        return self.acquireProducerPermitWithOptions(index_name, segment_count, byte_count, false, false);
     }
 
-    /// Inline replay already owns apply-exclusive. Never reacquire it or wait
-    /// for a merger that needs it; leave durable replay debt for the next pass.
+    pub fn acquireAtomicProducerPermit(self: *TextMergeRuntime, index_name: []const u8, segment_count: u64, byte_count: u64) !ProducerPermit {
+        return self.acquireProducerPermitWithOptions(index_name, segment_count, byte_count, true, false);
+    }
+
+    /// Inline replay owns apply-exclusive. Yield rather than reacquiring
+    /// apply or waiting for a merge which needs that same ownership.
     pub fn acquireProducerPermitAssumeApply(self: *TextMergeRuntime, index_name: []const u8, segment_count: u64, byte_count: u64) !ProducerPermit {
-        return self.acquireProducerPermitWithApplyOwnership(index_name, segment_count, byte_count, true);
+        return self.acquireProducerPermitWithOptions(index_name, segment_count, byte_count, false, true);
     }
 
-    fn acquireProducerPermitWithApplyOwnership(self: *TextMergeRuntime, index_name: []const u8, segment_count: u64, byte_count: u64, apply_owned: bool) !ProducerPermit {
+    fn acquireProducerPermitWithOptions(self: *TextMergeRuntime, index_name: []const u8, segment_count: u64, byte_count: u64, allow_oversized: bool, apply_owned: bool) !ProducerPermit {
         const producer_io = self.io;
         if (producer_io) |io| {
             self.mutex.lockUncancelable(io);
@@ -816,7 +828,7 @@ const PlatformTextMergeRuntime = struct {
         {
             return .{ .runtime = self, .index_name = null, .segment_count = 0, .byte_count = 0, .active = false };
         }
-        if (self.config.max_pending_segments > 0 and segment_count > self.config.max_pending_segments)
+        if (!allow_oversized and self.config.max_pending_segments > 0 and segment_count > self.config.max_pending_segments)
             return error.TextPublicationExceedsSegmentLimit;
 
         const started_ns = self.backpressureNowNs();
@@ -844,6 +856,10 @@ const PlatformTextMergeRuntime = struct {
                 if (apply_owned) {
                     self.mutex.unlock(io);
                     return error.EnrichmentRetryInProgress;
+                }
+                if (self.config.defer_producer_to_owner) {
+                    self.mutex.unlock(io);
+                    return error.TextMergeProducerDeferred;
                 }
                 if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
                 if (!recorded_wait) {
@@ -903,7 +919,14 @@ const PlatformTextMergeRuntime = struct {
             const request_oversized_bytes = self.config.max_pending_bytes > 0 and byte_count > self.config.max_pending_bytes;
             const no_existing_debt = stats_snapshot.pending_heap_bytes == 0 and
                 self.producer_segment_reservations == 0 and self.producer_byte_reservations == 0;
-            const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments;
+            // A bounded atomic fragment cannot be split after activation. As
+            // with an oversized byte request, admit one explicitly charged
+            // group only while no producer debt exists and this index is below
+            // its segment watermark. The next producer waits for its merge.
+            const oversized_atomic = allow_oversized and self.config.max_pending_segments > 0 and
+                segment_count > self.config.max_pending_segments and no_existing_debt and
+                active_segments < self.config.max_pending_segments;
+            const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments or oversized_atomic;
             const bytes_admissible = self.config.max_pending_bytes == 0 or admitted_bytes <= self.config.max_pending_bytes;
             const request_bytes_admissible = if (request_oversized_bytes) no_existing_debt else bytes_admissible;
             if (segments_admissible and request_bytes_admissible) {
@@ -941,6 +964,10 @@ const PlatformTextMergeRuntime = struct {
             if (apply_owned) {
                 self.mutex.unlock(io);
                 return error.EnrichmentRetryInProgress;
+            }
+            if (self.config.defer_producer_to_owner) {
+                self.mutex.unlock(io);
+                return error.TextMergeProducerDeferred;
             }
             if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
             // The shared byte dimension imposes cross-index FIFO whenever it

@@ -585,135 +585,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             });
         }
 
-        pub fn appendGraphTransformDelete(
-            alloc: Allocator,
-            writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
-            deletes: *std.ArrayListUnmanaged(types.GraphEdgeDelete),
-            source: []const u8,
-            path: transform_mod.GraphProjectionPath,
-            value_json: []const u8,
-        ) !void {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
-            defer parsed.deinit();
-            if (parsed.value != .object) return error.InvalidGraphEdges;
-            const target_value = parsed.value.object.get("target") orelse return error.InvalidGraphEdges;
-            if (target_value != .string or target_value.string.len == 0) return error.InvalidGraphEdges;
+        pub const appendGraphTransformDelete = @import("mutation_effects.zig").appendGraphTransformDelete;
 
-            const index_name = try alloc.dupe(u8, path.index_name);
-            errdefer alloc.free(index_name);
-            const owned_source = try alloc.dupe(u8, source);
-            errdefer alloc.free(owned_source);
-            const target = try alloc.dupe(u8, target_value.string);
-            errdefer alloc.free(target);
-            const edge_type = try alloc.dupe(u8, path.edge_type);
-            errdefer alloc.free(edge_type);
-            const edge_id = if (parsed.value.object.get("edge_id")) |value| blk: {
-                if (value != .string or value.string.len == 0) return error.InvalidGraphEdges;
-                break :blk try alloc.dupe(u8, value.string);
-            } else "";
-            errdefer if (edge_id.len > 0) alloc.free(edge_id);
-
-            // A later pull overrides every earlier projected write for the same
-            // physical relationship before the split graph mutation batch is built.
-            var write_index = writes.items.len;
-            while (write_index > 0) {
-                write_index -= 1;
-                const prior = writes.items[write_index];
-                if (!graphMutationIdentityEql(prior, .{
-                    .index_name = index_name,
-                    .source = owned_source,
-                    .target = target,
-                    .edge_type = edge_type,
-                    .edge_id = edge_id,
-                })) continue;
-                var removed = writes.orderedRemove(write_index);
-                deinitOwnedGraphEdgeWrite(alloc, &removed);
-            }
-            try deletes.append(alloc, .{
-                .index_name = index_name,
-                .source = owned_source,
-                .target = target,
-                .edge_type = edge_type,
-                .edge_id = edge_id,
-            });
-        }
-
-        pub fn appendGraphTransformWrite(
-            alloc: Allocator,
-            writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
-            deletes: *std.ArrayListUnmanaged(types.GraphEdgeDelete),
-            source: []const u8,
-            path: transform_mod.GraphProjectionPath,
-            value_json: []const u8,
-        ) !void {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
-            defer parsed.deinit();
-            if (parsed.value != .object) return error.InvalidGraphEdges;
-
-            const target_value = parsed.value.object.get("target") orelse return error.InvalidGraphEdges;
-            if (target_value != .string or target_value.string.len == 0) return error.InvalidGraphEdges;
-
-            const weight: f64 = if (parsed.value.object.get("weight")) |value| switch (value) {
-                .integer => |integer| @floatFromInt(integer),
-                .float => |float| float,
-                .number_string => |number| try std.fmt.parseFloat(f64, number),
-                else => return error.InvalidGraphEdges,
-            } else 1.0;
-            if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
-
-            const metadata_json: []const u8 = if (parsed.value.object.get("metadata")) |metadata| blk: {
-                // Edge metadata has one stable public shape across ingestion,
-                // storage, graph queries, and generated SDKs. Reject scalar or
-                // array values before they become durable artifacts rather than
-                // allowing a later response to violate the object contract.
-                if (metadata != .object) return error.InvalidGraphEdges;
-                break :blk try std.json.Stringify.valueAlloc(alloc, metadata, .{});
-            } else "";
-            errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
-
-            const index_name = try alloc.dupe(u8, path.index_name);
-            errdefer alloc.free(index_name);
-            const owned_source = try alloc.dupe(u8, source);
-            errdefer alloc.free(owned_source);
-            const target = try alloc.dupe(u8, target_value.string);
-            errdefer alloc.free(target);
-            const edge_type = try alloc.dupe(u8, path.edge_type);
-            errdefer alloc.free(edge_type);
-            const edge_id = if (parsed.value.object.get("edge_id")) |value| blk: {
-                if (value != .string or value.string.len == 0) return error.InvalidGraphEdges;
-                break :blk try alloc.dupe(u8, value.string);
-            } else "";
-            errdefer if (edge_id.len > 0) alloc.free(edge_id);
-
-            // Transform operations are ordered. Since the storage batch carries
-            // graph writes and deletes in separate slices (deletes execute first),
-            // discard any earlier projected delete for this identity so a later
-            // push/addToSet remains the final operation.
-            var delete_index = deletes.items.len;
-            while (delete_index > 0) {
-                delete_index -= 1;
-                const prior = deletes.items[delete_index];
-                if (!graphMutationIdentityEql(prior, .{
-                    .index_name = index_name,
-                    .source = owned_source,
-                    .target = target,
-                    .edge_type = edge_type,
-                    .edge_id = edge_id,
-                })) continue;
-                var removed = deletes.orderedRemove(delete_index);
-                deinitOwnedGraphEdgeDelete(alloc, &removed);
-            }
-
-            try writes.append(alloc, .{
-                .index_name = index_name,
-                .source = owned_source,
-                .target = target,
-                .edge_type = edge_type,
-                .edge_id = edge_id,
-                .weight = weight,
-                .metadata_json = metadata_json,
-            });
-        }
+        pub const appendGraphTransformWrite = @import("mutation_effects.zig").appendGraphTransformWrite;
 
         pub fn applyDenseArtifactCounterDelta(
             alloc: Allocator,
@@ -805,28 +679,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
-        pub fn deinitOwnedGraphEdgeDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
-            alloc.free(@constCast(delete.index_name));
-            alloc.free(@constCast(delete.source));
-            alloc.free(@constCast(delete.target));
-            alloc.free(@constCast(delete.edge_type));
-            if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
-            if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
-            if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
-            delete.* = undefined;
-        }
+        pub const deinitOwnedGraphEdgeDelete = @import("mutation_effects.zig").deinitOwnedGraphEdgeDelete;
 
-        pub fn deinitOwnedGraphEdgeWrite(alloc: Allocator, write: *types.GraphEdgeWrite) void {
-            alloc.free(@constCast(write.index_name));
-            alloc.free(@constCast(write.source));
-            alloc.free(@constCast(write.target));
-            alloc.free(@constCast(write.edge_type));
-            if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
-            if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
-            if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
-            write.* = undefined;
-        }
+        pub const deinitOwnedGraphEdgeWrite = @import("mutation_effects.zig").deinitOwnedGraphEdgeWrite;
 
         pub fn deleteDocumentArtifactChildRangeOutboxEntry(self: anytype, key: []const u8) !void {
             var replication_mutation = self.acquireReplicationMutationShared();
@@ -924,14 +779,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             std.mem.writeInt(i64, out[offset..][0..@sizeOf(i64)], value.delta, .little);
         }
 
-        pub fn graphMutationIdentityEql(left: anytype, right: anytype) bool {
-            return std.mem.eql(u8, left.index_name, right.index_name) and
-                std.mem.eql(u8, left.source, right.source) and
-                std.mem.eql(u8, left.target, right.target) and
-                std.mem.eql(u8, left.edge_type, right.edge_type) and
-                std.mem.eql(u8, left.edge_id, if (@hasField(@TypeOf(right), "edge_id")) right.edge_id else "") and
-                std.mem.eql(u8, left.owner_document, if (@hasField(@TypeOf(right), "owner_document")) right.owner_document else "");
-        }
+        pub const graphMutationIdentityEql = @import("mutation_effects.zig").graphMutationIdentityEql;
 
         pub fn hasConfiguredResolvers(self: anytype) bool {
             return S.ownerField(self, "core").*.index_manager.resolvers.items.len > 0;
@@ -3451,6 +3299,72 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false, null);
         }
 
+        fn applyAtomicTextReplayFragment(
+            ctx: *const AsyncContext,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            context: *index_manager_mod.TextPublicationContext,
+            docs: []const mapper.MapperDoc,
+            position: apply_state.replay_fragment.Position,
+            profile: ?*BatchProfile,
+        ) !void {
+            // The family piece is already bounded by replay admission. Keep
+            // source-byte windows for projection residency, but stage all of
+            // this piece's immutable output before a single activation commit.
+            var publications = std.ArrayListUnmanaged(index_manager_mod.PreparedTextMapperPublication).empty;
+            defer {
+                for (publications.items) |*item| item.deinit();
+                publications.deinit(ctx.alloc);
+            }
+            const expected_revision = context.projection_revision;
+            var estimate: index_manager_mod.TextPublicationEstimate = .{};
+            var offset: usize = 0;
+            while (true) {
+                const planned_at = monotonicTimeNs();
+                var plan = try ctx.index_manager.planTextMapperDocsPublication(ctx.store, index_ref.name, context, docs[offset..], std.math.maxInt(usize));
+                if (profile) |p| recordProfileNs(profile, &p.full_text_plan_ns, planned_at);
+                defer plan.deinit();
+                if (context.projection_revision != expected_revision) return error.TextProjectionChanged;
+                const prepared_at = monotonicTimeNs();
+                var prepared = try ctx.index_manager.preparePlannedTextMapperPublication(ctx.alloc, index_ref.name, context, &plan, 0, plan.input_end);
+                var prepared_owned = true;
+                defer if (prepared_owned) prepared.deinit();
+                if (profile) |p| recordProfileNs(profile, &p.full_text_prepare_ns, prepared_at);
+                const size = prepared.estimate();
+                estimate.segment_count +|= size.segment_count;
+                estimate.byte_count +|= size.byte_count;
+                try prepared.stage(context.stager.?);
+                try publications.append(ctx.alloc, prepared);
+                prepared_owned = false;
+                offset += plan.input_end;
+                if (offset == docs.len) break;
+                if (plan.input_end == 0) return error.InvalidTextProjection;
+            }
+            var permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = if (ctx.text_merge_runtime) |runtime|
+                try runtime.acquireAtomicProducerPermit(index_ref.name, estimate.segment_count, estimate.byte_count)
+            else
+                null;
+            defer if (permit) |*value| value.release();
+            // No catalog lock survives waiting for the owner writer gate.
+            const port = ctx.replay_index_publication;
+            if (port) |publication| try publication.enter(publication.ptr, index_ref.name);
+            defer if (port) |publication| publication.leave(publication.ptr);
+            var guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+            defer guard.unlock();
+            if (try ctx.index_manager.refreshTextPublicationContextAssumeCatalogLocked(index_ref.name, context) != .current)
+                return error.TextProjectionChanged;
+            const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, ctx.index_manager, batch, index_ref.name, context.*);
+            defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
+            const cfg = ctx.index_manager.get(index_ref.name) orelse return error.IndexNotFound;
+            var committed_position = position;
+            committed_position.applied = true;
+            try ctx.index_manager.applyPreparedTextReplayPublication(ctx.store, index_ref.name, delete_keys, publications.items, .{
+                .identity = .{ .generation = cfg.coverage_generation, .config_hash = types.indexConfigHash(cfg.*), .incarnation = ctx.index_manager.artifact_projection_root },
+                .position = committed_position,
+            });
+            if (ctx.text_merge_runtime) |runtime| runtime.notify();
+        }
+
         pub fn applyDerivedBatchToIndexContextProfiled(
             ctx: *const AsyncContext,
             batch: derived_types.DerivedBatch,
@@ -3458,6 +3372,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             profile: ?*BatchProfile,
             borrow_active_source_capture: bool,
             admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        ) !void {
+            return applyDerivedBatchToIndexContextProfiledWithFragment(ctx, batch, index_ref, profile, borrow_active_source_capture, admitted_replay, null);
+        }
+
+        pub fn applyDerivedBatchToIndexContextProfiledWithFragment(
+            ctx: *const AsyncContext,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            profile: ?*BatchProfile,
+            borrow_active_source_capture: bool,
+            admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
+            fragment: ?apply_state.replay_fragment.Position,
         ) !void {
             // Generated files and their publication metadata are one physical
             // generation. Native capture takes the exclusive side of this admission
@@ -3477,7 +3403,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .compact_text_segment_threshold = null,
                     .defer_text_compaction = true,
                 };
-                var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
+                var publication_context = if (fragment != null)
+                    try ctx.index_manager.acquireTextReplayPublicationContext(ctx.alloc, index_ref.name)
+                else
+                    try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
                 defer publication_context.deinit();
                 if (!ctx.projection_only) try invalidateLocalArtifactProducerCoverage(ctx, batch, index_ref);
                 // A document that can never gain visible content (issue #938: an
@@ -3498,7 +3427,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     manager.shouldEscalateReplayDocumentNotVisible(replay_owner, index_ref.name, batch.sequence)
                 else
                     false;
-                var collected = try collectTextDocumentWritesForIndex(
+                const collect_started = if (profile != null) monotonicTimeNs() else 0;
+                var collected = collectTextDocumentWritesForIndex(
                     ctx.alloc,
                     ctx.store,
                     ctx.index_manager,
@@ -3511,30 +3441,45 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .relational_base_rows = ctx.relational_base_rows,
                         .tolerate_missing_replay_documents = tolerate_missing_replay_documents,
                     },
-                );
+                ) catch |err| {
+                    if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_collect_ns, collect_started);
+                    return err;
+                };
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_collect_ns, collect_started);
                 defer collected.deinit();
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
                 if (ctx.index_manager.resource_manager) |manager|
                     manager.clearReplayDocumentNotVisibleEscalation(replay_owner, index_ref.name, batch.sequence);
+
+                if (fragment) |position| if (publication_context.stager != null) {
+                    try applyAtomicTextReplayFragment(ctx, batch, index_ref, &publication_context, collected.docs.items, position, profile);
+                    if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
+                    return;
+                };
 
                 const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
                 var write_start: usize = 0;
                 var applied_first_chunk = false;
                 while (!applied_first_chunk or write_start < collected.docs.items.len) {
                     const plan_base = write_start;
-                    var publication_plan = try ctx.index_manager.planTextMapperDocsPublication(
+                    const plan_started = monotonicTimeNs();
+                    var publication_plan = ctx.index_manager.planTextMapperDocsPublication(
+                        ctx.store,
                         index_ref.name,
                         &publication_context,
                         collected.docs.items[plan_base..],
                         reservation_limit,
-                    );
+                    ) catch |err| {
+                        if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_plan_ns, plan_started);
+                        return err;
+                    };
+                    if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_plan_ns, plan_started);
                     defer publication_plan.deinit();
 
                     var relative_start: usize = 0;
                     var replan_suffix = false;
                     for (publication_plan.chunks) |planned| {
                         const write_end = plan_base + planned.end;
-                        const write_chunk = collected.docs.items[plan_base + relative_start .. write_end];
                         var applied_chunk = false;
                         var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
                         if (ctx.text_merge_runtime) |runtime| {
@@ -3551,12 +3496,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // analysis lease inside preparation pins every borrowed config
                         // pointer for the duration of the build.
                         const prepare_start_ns = monotonicTimeNs();
-                        var prepared_publication = ctx.index_manager.prepareTextMapperDocsPublication(
+                        var prepared_publication = ctx.index_manager.preparePlannedTextMapperPublication(
                             ctx.alloc,
-                            ctx.store,
                             index_ref.name,
                             &publication_context,
-                            write_chunk,
+                            &publication_plan,
+                            relative_start,
+                            planned.end,
                         ) catch |err| switch (err) {
                             error.TextProjectionChanged => {
                                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_prepare_ns, prepare_start_ns);
@@ -3568,6 +3514,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_prepare_ns, prepare_start_ns);
                         defer prepared_publication.deinit();
 
+                        // Input collection and segment construction finished
+                        // outside native writer admission. Publish this bounded
+                        // prepared chunk under one exact catalog/input fence.
+                        const native_publication = ctx.replay_index_publication;
+                        if (native_publication) |port| {
+                            try port.enter(port.ptr, index_ref.name);
+                        }
+                        defer if (native_publication) |port| port.leave(port.ptr);
                         const apply_lock_wait_start_ns = monotonicTimeNs();
                         var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
                         if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_lock_wait_ns, apply_lock_wait_start_ns);
@@ -3623,7 +3577,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
 
                     if (write_start == collected.docs.items.len) break;
-                    std.debug.assert(replan_suffix);
+                    std.debug.assert(replan_suffix or write_start == plan_base + publication_plan.input_end);
                 }
                 std.debug.assert(applied_first_chunk and write_start == collected.docs.items.len);
                 if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);

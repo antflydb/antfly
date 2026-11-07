@@ -133,8 +133,8 @@ When `Batch`, `BatchJSON`, or an autocommit SQL write fails with
 `lite.OutcomeReceiptOf(err)`). Resolve it later on any handle for the same
 database with `db.OutcomeReceiptStatus(receipt)`, which returns
 `OutcomeReceiptApplied` or `OutcomeReceiptNotApplied`, or `Stalled` while the
-uncertain commit is not reconciled yet (Lite: retry; directory database: close
-the issuing handle and reopen first). Call `db.ForgetOutcomeReceipt(receipt)`
+uncertain commit is not reconciled yet (close the issuing handle and reopen
+first). Call `db.ForgetOutcomeReceipt(receipt)`
 once resolved; afterwards the receipt can no longer be resolved.
 
 `OpenInference` opens a standalone `*Inference` handle that runs models with
