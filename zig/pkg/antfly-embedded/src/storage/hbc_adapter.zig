@@ -51,6 +51,17 @@ fn atomicFetchAddU64(value: *u64, operand: u64, comptime order: std.builtin.Atom
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const hbc_backend = @import("hbc_backend.zig");
+const native_catalog_backend = @import("native_catalog_backend.zig");
+// Diagnostic-only (test-build-gated); see write_amplification_trace.zig.
+// Pushed around every call into the vectorindex library's own commit
+// (`batchApplyOptions`/`batchInsertWithMetadataOptions`) and around
+// `saveProjectionCheckpointMetadata`'s own commit, so dense's write-
+// amplification harness mode can distinguish HBC's own native-catalog
+// commits from the generic `native_catalog_backend.zig` fallback tag (see
+// `write_amplification_trace.zig`'s `scopeDefault`) without any change to
+// the vectorindex library itself, which this file is the only antfly-
+// embedded-side caller of.
+const wal_trace = @import("write_amplification_trace.zig");
 const posting_segment_store_mod = @import("posting_segment_store.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
@@ -14891,18 +14902,325 @@ pub const HBCIndex = struct {
         return self.metadata.projectionCheckpoint();
     }
 
+    /// Persists this dense index's projection-checkpoint/catch-up-progress
+    /// record. Design doc §3.2a lists "catch-up progress" as safe to lose
+    /// and redo on crash (replay restarts from durable progress, and the
+    /// work is idempotent) -- and this record always lags the postings it
+    /// describes: `setProjectionCheckpoint` only ever runs after the
+    /// postings/vector row it checkpoints are already durable (the
+    /// `.hbc_vector_commit`-tagged commit in `batchApplyOptions`/
+    /// `batchInsertWithMetadataOptions` above always precedes this call in
+    /// every caller), so a crash that loses this ride-along commit can
+    /// never leave the checkpoint pointing past unwritten postings -- only
+    /// behind them, which replay/catch-up already tolerates. Committing it
+    /// `.ride_along` (WS2/§3.2a) removes its own `syncData` from the
+    /// per-write sync count: lite-single-commit-write-path.md §3.3a, task 2
+    /// ("background HBC work... uses `.durability = .ride_along`").
+    ///
+    /// On `.native_catalog`, this writes directly through `env_owner.
+    /// native_catalog.boundWrite` + `setDurable(false)` instead of the
+    /// usual `beginRuntimeBatchTxnOptions`/`flushMetadataNow`/`putNamespaced`
+    /// path: the vectorindex library's own `NamespaceBatch`/`BatchOptions`
+    /// (`zig/lib/vectorindex/src/store.zig`) has no durability concept at
+    /// all -- only `mode`/`defer_commit_flush` -- so ride-along durability
+    /// is unreachable through it without a library change. Bypassing
+    /// `putNamespaced`'s capture dispatch here is safe: `
+    /// experimentalPostingMutationIdentity(.meta, meta_key)` never
+    /// recognizes this key (it only matches posting/node/vector-leaf
+    /// identities), so `captureOrStageNamespacedPut` is a no-op pass-
+    /// through for this exact namespace/key pair regardless -- this
+    /// replicates its other effect, `noteNamespacePut`'s write-profile
+    /// bookkeeping, manually below. On `.lsm`/`.native`, this keeps the
+    /// original always-durable path: ride-along is only ever meaningful
+    /// for `.native_catalog`.
     pub fn saveProjectionCheckpointMetadata(self: *HBCIndex, checkpoint: ProjectionCheckpointMetadata) !void {
         const posting_capture = try self.beginExperimentalPostingMaintenanceCapture();
         errdefer if (posting_capture != null) self.cancelExperimentalPostingMaintenanceCapture();
-        var txn = try self.beginRuntimeBatchTxnOptions(.{});
-        var active = true;
-        errdefer if (active) txn.abort();
-        self.metadata.setProjectionCheckpoint(checkpoint);
-        try self.flushMetadataNow(&txn);
-        try txn.commit();
+        const trace_scope = wal_trace.scope(.hbc_checkpoint_commit);
+        defer trace_scope.end();
+
+        if (std.meta.activeTag(self.env_owner) == .native_catalog) {
+            var updated = self.metadata;
+            updated.setProjectionCheckpoint(checkpoint);
+            var buf: [IndexMetadata.encoded_size]u8 = undefined;
+            const encoded = updated.encode(&buf);
+
+            var txn = try self.env_owner.native_catalog.boundWrite(runtimeNamespace(.meta));
+            var active = true;
+            errdefer if (active) txn.abort();
+            txn.setDurable(false);
+            try txn.put(meta_key, encoded);
+            try txn.commit();
+            active = false;
+            self.noteNamespacePut(.meta, meta_key.len, encoded.len, false);
+            self.metadata = updated;
+        } else {
+            var txn = try self.beginRuntimeBatchTxnOptions(.{});
+            var active = true;
+            errdefer if (active) txn.abort();
+            self.metadata.setProjectionCheckpoint(checkpoint);
+            try self.flushMetadataNow(&txn);
+            try txn.commit();
+            active = false;
+        }
         self.noteExperimentalPostingWalAuthorityCommit();
-        active = false;
         if (posting_capture) |capture| try self.finishExperimentalPostingMaintenanceCapture(capture);
+    }
+
+    // ------------------------------------------------------------------
+    // Inline projection-checkpoint publication (design doc §3.3a's dense
+    // extension; task 3 of lite-single-commit-write-path.md's dense-one-
+    // commit work).
+    //
+    // Mirrors `persistent.zig`'s `prepareInlineSegmentPublication`/
+    // `installInlineSegmentPublication` and `graph/graph.zig`'s
+    // `prepareInlineEdgePublication`/`installInlineEdgePublication`: build
+    // a small, bounded mutation set OUTSIDE any durable commit (via
+    // `native_catalog_backend.Backend.boundWrite`/`BoundTxn.
+    // pendingMutations`, never `commit()`), hand it to a caller that folds
+    // it into an externally-owned native transaction (one
+    // `commit_participant.View.putIndexCatalog` call against this index's
+    // own `.native_catalog` scope, "hbc_meta" namespace), then publish this
+    // index's own in-memory metadata only once that external commit has
+    // returned successfully.
+    //
+    // Scope is deliberately narrow, matching `saveProjectionCheckpointMetadata`
+    // itself: only the dense index's projection-checkpoint/catch-up-progress
+    // record, and only when `env_owner` is already `.native_catalog`. This
+    // does NOT cover the vector-insert commit itself
+    // (`batchApplyOptions`/`batchInsertWithMetadataOptions`, tagged
+    // `.hbc_vector_commit` above): that commit happens inside the
+    // vectorindex library (`zig/lib/vectorindex/src/hbc_index.zig`), which
+    // has no stage-without-commit mode today -- giving it one is follow-up
+    // work for whoever extends this past the checkpoint record, not
+    // something this change attempts.
+    //
+    // NOT wired into the production ack path (no caller in
+    // `storage/db/mutation_commit.zig` references this yet): doing that
+    // safely needs `applyDenseEmbeddingWritesEntry`'s own per-write call
+    // sequence (`index_manager.zig`) to run synchronously inside the
+    // primary write's own commit, the same restructuring `InlineTextPublication`
+    // needed for full_text in `mutation_commit.zig`'s
+    // `batchInternalPreparedOwned` -- out of scope for this HBC-adapter-only
+    // change. This is the API + tests half of that follow-up, intentionally
+    // stopped short of the wiring.
+    pub const InlineProjectionCheckpointPublicationError = error{InlineProjectionCheckpointPublicationUnsupported};
+
+    /// One `saveProjectionCheckpointMetadata` call's mutation, staged but
+    /// not yet durable. Exactly one of `install` (now durable in an
+    /// externally-owned commit) or `abort` (not durable) must run exactly
+    /// once for every value this returns.
+    pub const InlineProjectionCheckpointPublication = struct {
+        alloc: Allocator,
+        mutations: []native_catalog_backend.Mutation,
+        checkpoint: ProjectionCheckpointMetadata,
+
+        /// This publication's mutations, to fold into an externally-owned
+        /// native transaction via `commit_participant.View.putIndexCatalog
+        /// (scope, mutations)`, where `scope` is this index's own
+        /// `.native_catalog` backend scope (the same string the caller
+        /// already knows from opening this index; not re-derived here).
+        pub fn pendingMutations(self: *const InlineProjectionCheckpointPublication) []const native_catalog_backend.Mutation {
+            return self.mutations;
+        }
+
+        /// Discards a publication whose mutations were never committed
+        /// durably (or whose commit failed): this index's in-memory
+        /// metadata (and its own `.native_catalog` backend's read mirror)
+        /// stay exactly as they were before `prepareInlineProjectionCheckpointPublication`
+        /// was called.
+        pub fn abort(self: *InlineProjectionCheckpointPublication) void {
+            freeOwnedNativeCatalogMutations(self.alloc, self.mutations);
+            self.* = undefined;
+        }
+    };
+
+    fn dupeOwnedNativeCatalogMutationsAlloc(alloc: Allocator, items: []const native_catalog_backend.Mutation) ![]native_catalog_backend.Mutation {
+        // Deep copy: `items` is `BoundTxn.pendingMutations()`, whose key/
+        // value/namespace bytes live in that transaction's own arena, freed
+        // the moment the caller aborts it below.
+        const out = try alloc.alloc(native_catalog_backend.Mutation, items.len);
+        var filled: usize = 0;
+        errdefer freeOwnedNativeCatalogMutations(alloc, out[0..filled]);
+        for (items, 0..) |m, i| {
+            out[i] = .{
+                .namespace = if (m.namespace) |n| try alloc.dupe(u8, n) else null,
+                .key = try alloc.dupe(u8, m.key),
+                .value = if (m.is_delete) "" else try alloc.dupe(u8, m.value),
+                .is_delete = m.is_delete,
+            };
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    fn freeOwnedNativeCatalogMutations(alloc: Allocator, items: []const native_catalog_backend.Mutation) void {
+        for (items) |m| {
+            if (m.namespace) |n| alloc.free(n);
+            alloc.free(m.key);
+            if (!m.is_delete) alloc.free(m.value);
+        }
+        alloc.free(items);
+    }
+
+    /// Builds one `saveProjectionCheckpointMetadata` call's
+    /// `InlineProjectionCheckpointPublication`, without touching this
+    /// index's own durable sink (see `native_catalog_backend.Backend.
+    /// boundWrite`'s "never talks to sink" note) or its in-memory
+    /// `self.metadata`. Returns
+    /// `error.InlineProjectionCheckpointPublicationUnsupported` when
+    /// `env_owner` is not `.native_catalog` (the raw `.native`/`.lsm`
+    /// backends have no `boundWrite`/harvest mechanism); the caller falls
+    /// back to `saveProjectionCheckpointMetadata` in that case.
+    pub fn prepareInlineProjectionCheckpointPublication(self: *HBCIndex, checkpoint: ProjectionCheckpointMetadata) !InlineProjectionCheckpointPublication {
+        if (std.meta.activeTag(self.env_owner) != .native_catalog) return error.InlineProjectionCheckpointPublicationUnsupported;
+        const backend = self.env_owner.native_catalog;
+
+        var updated = self.metadata;
+        updated.setProjectionCheckpoint(checkpoint);
+        var buf: [IndexMetadata.encoded_size]u8 = undefined;
+        const encoded = updated.encode(&buf);
+
+        var txn = try backend.boundWrite(runtimeNamespace(.meta));
+        defer txn.abort();
+        try txn.put(meta_key, encoded);
+
+        const mutations = try dupeOwnedNativeCatalogMutationsAlloc(self.alloc, txn.pendingMutations());
+        return .{ .alloc = self.alloc, .mutations = mutations, .checkpoint = checkpoint };
+    }
+
+    /// Runs only after `publication`'s mutations (`pendingMutations()`) are
+    /// already durable in an externally-owned native transaction's commit.
+    /// Syncs this `.native_catalog` backend's in-memory read mirror (so
+    /// this index's own subsequent reads see the new checkpoint) and
+    /// updates `self.metadata` in place -- the step after which a
+    /// synchronous write waiting on this checkpoint's durability may ack.
+    pub fn installInlineProjectionCheckpointPublication(self: *HBCIndex, publication: *InlineProjectionCheckpointPublication) !void {
+        try self.env_owner.native_catalog.applyExternallyCommittedMutations(publication.mutations);
+        self.metadata.setProjectionCheckpoint(publication.checkpoint);
+        freeOwnedNativeCatalogMutations(self.alloc, publication.mutations);
+        publication.* = undefined;
+    }
+
+    test "prepareInlineProjectionCheckpointPublication stages without a durable commit; install applies externally-committed mutations" {
+        // A local, minimal `native_catalog_backend.Sink`: mirrors
+        // `native_catalog_backend.zig`'s own private `TestSink` (and
+        // `graph/graph.zig`'s equivalent inline-publication tests), since this
+        // index-level test needs to assert what reached (or did not reach) the
+        // durable sink around `prepare`/`abort`/`install`, not just the
+        // in-memory mirror `applyExternallyCommittedMutations` updates.
+        const TestSink = struct {
+            allocator: Allocator,
+            entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
+            submit_calls: usize = 0,
+
+            fn deinit(self: *@This()) void {
+                for (self.entries.items) |e| {
+                    if (e.namespace) |n| self.allocator.free(n);
+                    self.allocator.free(e.key);
+                    self.allocator.free(e.value);
+                }
+                self.entries.deinit(self.allocator);
+            }
+
+            fn findIndex(self: *@This(), namespace: ?[]const u8, key: []const u8) ?usize {
+                for (self.entries.items, 0..) |e, i| {
+                    const same_ns = (e.namespace == null and namespace == null) or
+                        (e.namespace != null and namespace != null and std.mem.eql(u8, e.namespace.?, namespace.?));
+                    if (same_ns and std.mem.eql(u8, e.key, key)) return i;
+                }
+                return null;
+            }
+
+            fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                _ = scope;
+                _ = durable;
+                self.submit_calls += 1;
+                for (mutations) |m| {
+                    if (m.is_delete) continue;
+                    if (self.findIndex(m.namespace, m.key)) |i| {
+                        self.allocator.free(self.entries.items[i].value);
+                        self.entries.items[i].value = try self.allocator.dupe(u8, m.value);
+                        continue;
+                    }
+                    try self.entries.append(self.allocator, .{
+                        .namespace = if (m.namespace) |n| try self.allocator.dupe(u8, n) else null,
+                        .key = try self.allocator.dupe(u8, m.key),
+                        .value = try self.allocator.dupe(u8, m.value),
+                    });
+                }
+            }
+
+            fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                _ = scope;
+                return try allocator.dupe(native_catalog_backend.Entry, self.entries.items);
+            }
+
+            fn sink(self: *@This()) native_catalog_backend.Sink {
+                return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+            }
+        };
+
+        const a = std.testing.allocator;
+        var test_sink = TestSink{ .allocator = a };
+        defer test_sink.deinit();
+
+        var idx = try HBCIndex.openWithLsmOptions(a, "test-dense-checkpoint-inline-publication", .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .storage_backend = .native_catalog,
+        }, .{ .native_catalog_sink = test_sink.sink() });
+        defer idx.close();
+
+        const before = idx.projectionCheckpointMetadata();
+        try std.testing.expectEqual(@as(u64, 0), before.applied_sequence);
+
+        const submits_before_prepare = test_sink.submit_calls;
+        var publication = try idx.prepareInlineProjectionCheckpointPublication(.{
+            .applied_sequence = 7,
+            .status = before.status,
+            .generation = before.generation + 1,
+            .config_hash = before.config_hash,
+        });
+        // `prepare` must stage without touching the durable sink or this
+        // index's own in-memory metadata.
+        try std.testing.expectEqual(submits_before_prepare, test_sink.submit_calls);
+        try std.testing.expectEqual(@as(u64, 0), idx.projectionCheckpointMetadata().applied_sequence);
+        try std.testing.expect(publication.pendingMutations().len > 0);
+
+        // `abort`: still nothing durable, nothing in-memory changed.
+        publication.abort();
+        try std.testing.expectEqual(submits_before_prepare, test_sink.submit_calls);
+        try std.testing.expectEqual(@as(u64, 0), idx.projectionCheckpointMetadata().applied_sequence);
+
+        // Prepare again, actually commit the harvested mutations through a
+        // SEPARATE call into the sink (standing in for an externally-owned
+        // primary commit folding them in via `commit_participant.View.
+        // putIndexCatalog`), then install.
+        var publication2 = try idx.prepareInlineProjectionCheckpointPublication(.{
+            .applied_sequence = 7,
+            .status = before.status,
+            .generation = before.generation + 1,
+            .config_hash = before.config_hash,
+        });
+        try TestSink.submit(&test_sink, "external-commit-scope", publication2.pendingMutations(), true);
+        try idx.installInlineProjectionCheckpointPublication(&publication2);
+
+        try std.testing.expectEqual(@as(u64, 7), idx.projectionCheckpointMetadata().applied_sequence);
+
+        // A fresh read through this index's own backend must see it too (not
+        // just the publication's own bookkeeping): proves the namespace/key
+        // the publication wrote under really is the one `flushMetadataNow`/
+        // `saveProjectionCheckpointMetadata` reads back.
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        const raw = try txn.get(.meta, meta_key);
+        const decoded = IndexMetadata.decode(raw);
+        try std.testing.expectEqual(@as(u64, 7), decoded.projection_applied_sequence);
     }
 
     fn persistBulkPublishState(self: *HBCIndex) !void {
@@ -17763,6 +18081,8 @@ pub const HBCIndex = struct {
             options.coalesce_leaf_writes = true;
         try self.captureExactVectorBatch(writes, deletes);
         self.admitBatchVectorsToBulkSplitWorkspace(writes, options.assume_absent_ids);
+        const trace_scope = wal_trace.scope(.hbc_vector_commit);
+        defer trace_scope.end();
         if (writes.len == 0 or options.batch_vectors != null) {
             try vectorindex_hbc_index.batchApplyOptions(self, writes, deletes, options, nowNs, elapsedSince);
             return;
@@ -17779,6 +18099,8 @@ pub const HBCIndex = struct {
             options.coalesce_leaf_writes = true;
         try self.captureExactVectorBatch(items, &.{});
         self.admitBatchVectorsToBulkSplitWorkspace(items, options.assume_absent_ids);
+        const trace_scope = wal_trace.scope(.hbc_vector_commit);
+        defer trace_scope.end();
         if (items.len == 0 or options.batch_vectors != null) {
             try vectorindex_hbc_index.batchInsertWithMetadataOptions(self, items, options, nowNs, elapsedSince);
             return;

@@ -31,6 +31,14 @@ const platform_time = @import("antfly_platform").time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const backend_types = @import("../../backend_types.zig");
 const backend_erased = @import("../../backend_erased.zig");
+// Diagnostic-only (test-build-gated); see write_amplification_trace.zig.
+// Pushed around the dense-vector-id<->document-key mapping commit
+// (`commitDenseVectorMappingsWithRollback`) so the write-amplification
+// harness's dense mode can distinguish it from the primary document
+// commit it follows (both go through the same primary docstore, but are
+// two separate round trips today -- see lite-single-commit-write-path.md
+// §3.3a).
+const wal_trace = @import("../../write_amplification_trace.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
 const doc_identity = @import("../doc_identity.zig");
@@ -29785,6 +29793,8 @@ pub const IndexManager = struct {
             self.rollbackPendingDenseVectors(entry, pending);
             return err;
         };
+        const trace_scope = wal_trace.scope(.hbc_metadata_commit);
+        defer trace_scope.end();
         batch.commit() catch |err| {
             if (active_dense_vector_load_session) |session| {
                 session.detachTxnOverrideAfterCommitFailure();
