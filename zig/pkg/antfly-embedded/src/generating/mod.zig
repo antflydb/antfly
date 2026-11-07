@@ -377,7 +377,6 @@ const BackendState = struct {
         try cfg.validate();
         if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
         state.require_completion = require_completion;
-        if (require_completion and cfg.provider == .apple) return error.UnsupportedInferenceFeature;
         state.limits = limits;
         state.usage_observer = usage_observer;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
@@ -2390,3 +2389,16 @@ test "generating backend Cloudflare configuration owns routing through parse clo
 }
 
 pub const dictation = lib.dictation;
+
+test "Apple strict completion factory accepts completion-aware native bridge" {
+    if (!lib.apple_native.enabled) return error.SkipZigTest;
+    try lib.apple_native.checkAvailable();
+    const a = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(a, &client, .{ .require_completion = true });
+    var generator = try factory.factory().create(a, .{ .provider = .apple, .model = "", .url = "" });
+    defer generator.deinit();
+    const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
+    try std.testing.expect(state.require_completion);
+}

@@ -159,7 +159,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, producer_readiness_tests).step);
     const apple_provider_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native" },
+        .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native", "Apple strict completion factory" },
     });
     const apple_provider_test_step = b.step("antfly-apple-provider-test", "Run Apple OCR provider and PDF integration tests");
     const run_apple_provider_tests = b.addRunArtifact(apple_provider_tests);
@@ -173,7 +173,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, apple_local_test_mod, true, true);
     const apple_local_tests = b.addTest(.{
         .root_module = apple_local_test_mod,
-        .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native" },
+        .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native", "Apple strict completion factory" },
     });
     const run_apple_local_tests = b.addRunArtifact(apple_local_tests);
     @import("../../../lib/apple_native/build_support.zig").configureTest(b, run_apple_local_tests, options.apple_bridge);
